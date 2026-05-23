@@ -1,0 +1,16 @@
+namespace: inference-cache-system
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+
+labels:
+- includeSelectors: true
+  pairs:
+    app.kubernetes.io/name: inference-cache
+
+images:
+- name: controller
+  newName: ghcr.io/cachebox-project/inference-cache-controller
+  newTag: dev

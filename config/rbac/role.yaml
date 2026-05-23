@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: inference-cache-manager-role
+rules:
+- apiGroups:
+  - cache.cache.oci.com
+  resources:
+  - cachebackends
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cache.cache.oci.com
+  resources:
+  - cachebackends/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - cache.cache.oci.com
+  resources:
+  - cachebackends/status
+  verbs:
+  - get
+  - patch
+  - update

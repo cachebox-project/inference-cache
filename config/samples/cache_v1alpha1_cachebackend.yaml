@@ -1,0 +1,9 @@
+apiVersion: cache.cache.oci.com/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/managed-by: kustomize
+  name: cachebackend-sample
+spec:
+  type: memory

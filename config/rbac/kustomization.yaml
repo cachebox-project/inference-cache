@@ -1,0 +1,8 @@
+resources:
+- service_account.yaml
+- role.yaml
+- role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
+- cachebackend_editor_role.yaml
+- cachebackend_viewer_role.yaml
