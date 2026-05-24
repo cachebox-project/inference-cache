@@ -2,8 +2,6 @@
 
 A Kubernetes-native cache plane for LLM inference.
 
-This repo is standalone and OSS-ready, while mirroring OME's kubebuilder conventions so the team can reuse familiar controller workflows.
-
 ## What Is Here
 
 - `api/v1alpha1`: Kubernetes API types for `CacheBackend`
