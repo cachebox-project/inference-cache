@@ -75,3 +75,12 @@ make verify-naming    # run the same check on demand (also wire into CI)
 ```
 
 The pre-commit hook (`.githooks/pre-commit`) blocks any commit that introduces a banned token into a core-identity path. Run `make install-hooks` after cloning regardless of which editor or AI assistant you use.
+
+## Before pushing / opening a PR
+
+Run `make install-hooks` once per clone. Thereafter:
+
+- **On every push**, the `pre-push` hook runs `make ci` (naming + format + vet + test + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`.
+- **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then prints the review checklist. Review the diff against the tech spec before submitting.
+
+Emergency override for the push gate: `git push --no-verify` (discouraged). CI runs the full `make ci-lint` (golangci-lint) in addition to the above.
