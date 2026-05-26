@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: cachebackends.cache.cache.oci.com
+  name: cachebackends.inferencecache.io
 spec:
-  group: cache.cache.oci.com
+  group: inferencecache.io
   names:
     kind: CacheBackend
     listKind: CacheBackendList

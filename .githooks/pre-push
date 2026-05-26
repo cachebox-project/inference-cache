@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# Local CI gate — runs the CI-equivalent checks before a push is allowed.
+# Installed via: make install-hooks   (core.hooksPath=.githooks)
+# Emergency override: git push --no-verify   (discouraged)
+#
+set -euo pipefail
+
+echo "==> pre-push: running local CI gate (make ci)"
+if ! make ci; then
+  echo ""
+  echo "✗ pre-push: CI gate failed — fix the above before pushing."
+  echo "  (emergency override: git push --no-verify)"
+  exit 1
+fi
+echo "✓ pre-push: CI gate passed"

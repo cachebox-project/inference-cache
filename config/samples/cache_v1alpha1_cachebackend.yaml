@@ -1,4 +1,4 @@
-apiVersion: cache.cache.oci.com/v1alpha1
+apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
   labels:

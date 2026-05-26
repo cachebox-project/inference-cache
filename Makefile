@@ -140,3 +140,46 @@ dev-cluster: kind ## Create a local kind cluster for development.
 .PHONY: clean
 clean: ## Remove local build outputs.
 	rm -rf bin dist
+
+.PHONY: install-hooks
+install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooksPath.
+	git config core.hooksPath .githooks
+	@chmod +x .githooks/* 2>/dev/null || true
+	@echo "git hooks installed (core.hooksPath=.githooks)"
+
+.PHONY: verify-naming
+verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
+	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
+		api proto pkg/server/proto config/crd config/rbac internal PROJECT go.mod 2>/dev/null || true); \
+	if [ -n "$$bad" ]; then \
+		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
+		echo "$$bad" | sed 's/^/    /'; \
+		exit 1; \
+	fi; \
+	echo "✓ core identity is vendor-neutral"
+
+.PHONY: fmt-check
+fmt-check: ## Check Go formatting without modifying files.
+	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './bin/*' -not -path './.cache/*')); \
+	if [ -n "$$unformatted" ]; then echo "✗ gofmt needed on:"; echo "$$unformatted"; exit 1; fi; \
+	echo "✓ gofmt clean"
+
+.PHONY: ci
+ci: verify-naming fmt-check vet test build ## Local CI gate (naming + fmt + vet + test + build). Run by the pre-push hook.
+
+.PHONY: pre-pr
+pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
+	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
+	@gen='config/crd config/rbac/role.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
+	if ! git diff --quiet -- $$gen; then \
+		echo "✗ generated-code drift — regenerate and commit these files:"; \
+		git --no-pager diff --name-only -- $$gen; \
+		exit 1; \
+	fi
+	@echo "✓ no generated-code drift"
+	@echo ""
+	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
+	@echo "  [ ] Vendor-neutral naming — no oci/oracle in core identity"
+	@echo "  [ ] Change matches the tech spec; CRD/proto backward-compatible for v1alpha1 consumers"
+	@echo "  [ ] New/changed behavior has unit tests"
+	@echo "  [ ] CI is green"
