@@ -2,16 +2,29 @@
 
 A Kubernetes-native cache plane for LLM inference.
 
-## What Is Here
+## Repository layout
 
-- `api/v1alpha1`: Kubernetes API types for `CacheBackend`
-- `cmd/controller`: controller-runtime manager with a no-op `CacheBackend` reconciler
-- `cmd/server`: empty gRPC server with HTTP `/healthz`
-- `proto`: protobuf definitions for cache service APIs
-- `pkg/adapters`: integration seams for engines, runtimes, and backends
-- `pkg/render`: Kubernetes object rendering helpers
-- `pkg/index`: cache index abstractions
-- `config`: CRD, RBAC, manager, and sample manifests
+One operator, split across two binaries plus the CRDs.
+
+**CRDs — the API**
+- `api/v1alpha1/` — Go types (`CacheBackend`; `CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex` as they land) + generated deepcopy
+- `config/` — generated CRD, RBAC, and sample manifests
+
+**`inferencecache-controller`** (`cmd/controller`) — watches CRDs and provisions cache backends
+- `cmd/controller/` — controller-runtime manager entrypoint
+- `internal/controller/` — reconcilers
+- `pkg/adapters/runtime/` — runtime adapter library: inject backend config into engine pods
+- `pkg/adapters/backend/` — cache-backend provisioning helpers
+
+**`inferencecache-server`** (`cmd/server`) — gRPC policy server + cache-state index + metrics
+- `cmd/server/` — gRPC + HTTP server entrypoint
+- `pkg/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
+- `proto/` (+ generated stubs) — the gRPC contract
+- `pkg/index/` — cache-state aggregator (`CacheIndex`)
+- `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
+- `pkg/adapters/engine/` — engine KV-event hook (feeds the index)
+
+**Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
 
 ## Quick Start
 
