@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Vendor-neutral naming guard (see CLAUDE.md).
+# Vendor-neutral naming guard (see CONTRIBUTING.md).
 # Blocks a commit if staged core-identity files reference OCI / Oracle.
 #
 # Install once per clone:   make install-hooks   (sets core.hooksPath=.githooks)
@@ -34,7 +34,7 @@ done <<< "$staged"
 if [ "$violations" -ne 0 ]; then
   cat <<'MSG'
 
-Commit blocked: OCI/Oracle reference found in core-identity files (banned per CLAUDE.md).
+Commit blocked: OCI/Oracle reference found in core-identity files (banned per CONTRIBUTING.md).
 
   Use the vendor-neutral identity:
     API group / domain : inferencecache.io

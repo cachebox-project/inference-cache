@@ -10,7 +10,7 @@
 
 ## Checklist
 
-### Vendor-neutral naming (required — see CLAUDE.md)
+### Vendor-neutral naming (required — see CONTRIBUTING.md)
 - [ ] No `oci` / `oracle` / `*.oci.com` / `oraclecloud.com` in any API group, CRD group, proto package, gRPC service/package, Kubernetes namespace, image registry, Helm chart, or Go module path.
 - [ ] Any cloud-specific (incl. OCI) integration lives in an isolated, optional adapter (`pkg/adapters/.../`) — never in core controllers, CRD types, the proto contract, or default config.
 - [ ] No Oracle/OCI domain or namespace in sample manifests, README, or default values.
