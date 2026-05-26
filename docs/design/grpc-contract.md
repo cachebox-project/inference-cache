@@ -1,6 +1,6 @@
 # Design: gRPC contract (`InferenceCache` service)
 
-Status: proposed · Implements: B4 · Tracks: InferenceCache tech spec §4.2–4.4
+Status: implemented (Phase 1 — proto + fail-open server stubs) · Implements: B4 · Tracks: InferenceCache tech spec §4.2–4.4
 
 This is the public API gateways and engines integrate against — the load-bearing contract that unblocks the cache index (B6), engine KV-event hook (C1), and gateway clients (E1). Get the signature right early; the bytes behind it are filled in by later modules.
 

@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package inferencecache.v1alpha1;
+
+option go_package = "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1;inferencecachev1alpha1pb";
+
+// InferenceCache is the cache-policy control-plane API. See
+// docs/design/grpc-contract.md.
+//
+// Guarantees:
+//   - RenderTemplate / LookupRoute / LookupPDRoute / GetCacheState are
+//     side-effect-free apart from emitting metrics.
+//   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
+//     treat it as a no-op and route as they normally would.
+//   - prefix_hash bytes are engine-defined and only matched within a matching
+//     hash_scheme; the server never interprets them.
+//   - RenderTemplate is deterministic for a fixed
+//     (template_ref, variables, template_revision).
+//   - CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or
+//     prompt text.
+service InferenceCache {
+  // Consumer side (gateways).
+  rpc RenderTemplate(RenderTemplateRequest) returns (RenderTemplateResponse);
+  rpc LookupRoute(LookupRouteRequest) returns (LookupRouteResponse);
+  rpc LookupPDRoute(LookupPDRouteRequest) returns (LookupPDRouteResponse);
+  rpc GetCacheState(GetCacheStateRequest) returns (GetCacheStateResponse);
+
+  // Producer side (engine adapters).
+  rpc ReportCacheState(stream CacheStateUpdate) returns (Ack);
+  rpc PublishEvent(CacheEvent) returns (Ack);
+
+  // Observer side (dashboards, debug tooling).
+  rpc StreamCacheEvents(StreamEventsRequest) returns (stream CacheEvent);
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream Metric);
+}
+
+message RenderTemplateRequest {
+  string template_ref = 1; // PromptTemplate name (namespace/name)
+  map<string, string> variables = 2; // slot values
+  string tenant_id = 3;
+}
+
+message RenderTemplateResponse {
+  bytes rendered_prompt = 1; // tokens or raw text
+  bytes stable_prefix_hash = 2; // for cache lookup
+  bytes tenant_namespace = 3; // HMAC-keyed in Phase 2 isolation mode
+  string reason_code = 4; // OK | TEMPLATE_NOT_FOUND | RENDER_ERROR
+  string template_revision = 5; // for cache invalidation
+}
+
+message SLO {
+  int32 ttft_ms = 1;
+  int32 tbt_ms = 2;
+}
+
+message LookupRouteRequest {
+  string model_id = 1;
+  string tenant_id = 2;
+  bytes prefix_hash = 3;
+  int32 prefix_token_count = 4;
+  string hash_scheme = 5; // engine-defined compatibility tag
+  SLO slo = 6;
+}
+
+message ReplicaScore {
+  string replica_id = 1;
+  float score = 2; // higher is better
+  int32 matched_tokens = 3;
+  float estimated_cache_hit_prob = 4;
+}
+
+message LookupRouteResponse {
+  repeated ReplicaScore replica_scores = 1;
+  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT
+  int64 lookup_latency_us = 3;
+}
+
+message LookupPDRouteRequest {
+  string model_id = 1;
+  string tenant_id = 2;
+  bytes prefix_hash = 3;
+  int32 prefix_token_count = 4;
+  string pd_topology_ref = 5; // namespace/name
+}
+
+message LookupPDRouteResponse {
+  string prefill_replica_id = 1;
+  string decode_replica_id = 2;
+  string transport_hint = 3; // Mooncake | NIXL | Direct
+  string reason_code = 4;
+}
+
+message PrefixEntry {
+  bytes prefix_hash = 1;
+  int32 token_count = 2;
+}
+
+message ReplicaStats {
+  string replica_id = 1;
+  int64 cache_memory_bytes = 2;
+  float hit_rate = 3;
+  float pressure = 4;
+}
+
+message CacheStateUpdate {
+  string replica_id = 1;
+  string model_id = 2;
+  string tenant_id = 3;
+  string hash_scheme = 4; // engine-defined
+  int64 timestamp_us = 5;
+  repeated PrefixEntry prefixes = 6;
+  ReplicaStats stats = 7;
+}
+
+message CacheSummary {
+  int64 total_prefixes = 1;
+  int64 hot_prefixes = 2; // access count > threshold
+}
+
+message GetCacheStateRequest {
+  string model_id = 1;
+  string tenant_id = 2;
+}
+
+message GetCacheStateResponse {
+  repeated ReplicaStats replicas = 1;
+  CacheSummary summary = 2;
+}
+
+message CacheEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    PREFIX_ADDED = 1;
+    PREFIX_EVICTED = 2;
+    REPLICA_UPDATED = 3;
+    ALL_CLEARED = 4;
+  }
+  Type type = 1;
+  string replica_id = 2;
+  string model_id = 3;
+  string tenant_id = 4;
+  bytes prefix_hash = 5;
+  int64 timestamp_us = 6;
+}
+
+message StreamEventsRequest {
+  string model_id = 1;
+  string tenant_id = 2;
+  repeated CacheEvent.Type types = 3; // empty = all
+}
+
+message StreamMetricsRequest {
+  repeated string names = 1; // empty = all
+}
+
+message Metric {
+  string name = 1;
+  string type = 2; // gauge | counter | histogram
+  map<string, string> labels = 3;
+  double value = 4;
+  int64 timestamp_us = 5;
+}
+
+message Ack {
+  bool accepted = 1;
+  string reason_code = 2;
+}

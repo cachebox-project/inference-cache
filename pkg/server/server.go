@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
-	cachev1alpha1pb "github.com/cachebox-project/inference-cache/pkg/server/proto/cache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // Config controls the cache server listeners.
@@ -41,7 +41,7 @@ func New() *Service {
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	cachev1alpha1pb.RegisterCacheBackendServiceServer(grpcServer, CacheBackendService{})
+	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
