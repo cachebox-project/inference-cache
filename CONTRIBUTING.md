@@ -84,3 +84,21 @@ Run `make install-hooks` once per clone. Thereafter:
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged). CI runs the full `make ci-lint` (golangci-lint) in addition to the above.
+
+## Repository layout — where new code goes
+
+See the README's "Repository layout" for the full map. In short:
+
+| You're adding… | Put it in |
+|---|---|
+| A CRD field / new API type | `api/v1alpha1/` → then `make manifests generate` |
+| Controller / reconciler logic | `internal/controller/` |
+| gRPC handlers, server wiring | `pkg/server/` |
+| Cache-state index logic | `pkg/index/` |
+| Mutable-slot rendering (the wedge) | `pkg/render/` |
+| Engine / runtime / backend adapters | `pkg/adapters/{engine,runtime,backend}/` |
+| The gRPC contract | `proto/` → then `make proto-gen` |
+
+Each package's `doc.go` states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to.
+
+**Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
