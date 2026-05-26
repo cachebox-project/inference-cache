@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Vendor-neutral naming guard (see CONTRIBUTING.md).
-# Blocks a commit if staged core-identity files reference OCI / Oracle.
+# Pre-commit guards (see CONTRIBUTING.md):
+#   1. Vendor-neutral naming — no OCI/Oracle tokens in core-identity files.
+#   2. gRPC contract doc (docs/design/grpc-contract.md) stays in sync with proto changes.
 #
 # Install once per clone:   make install-hooks   (sets core.hooksPath=.githooks)
 # Emergency override:       git commit --no-verify   (discouraged)
@@ -45,6 +46,17 @@ Commit blocked: OCI/Oracle reference found in core-identity files (banned per CO
   (pkg/adapters/.../), never in core API / CRD / proto / default config.
 
   Emergency override (discouraged): git commit --no-verify
+MSG
+  exit 1
+fi
+
+# 2. Keep the gRPC contract doc in sync with the proto.
+if echo "$staged" | grep -qE '^proto/.*\.proto$' && ! echo "$staged" | grep -qxF 'docs/design/grpc-contract.md'; then
+  cat <<'MSG'
+
+Commit blocked: a .proto changed but docs/design/grpc-contract.md was not updated.
+  Update the gRPC contract design doc to match (it tracks the proto contract).
+  Override only if the change does not affect the contract: git commit --no-verify
 MSG
   exit 1
 fi

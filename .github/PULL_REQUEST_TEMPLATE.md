@@ -26,3 +26,4 @@
 ### Contracts (only if touching CRDs or proto)
 - [ ] Change matches the tech spec (or the spec is updated in the same PR).
 - [ ] Backward compatibility considered for `v1alpha1` consumers (engines, gateway clients).
+- [ ] If `proto/` changed, `docs/design/grpc-contract.md` is updated to match (the pre-commit hook enforces this).
