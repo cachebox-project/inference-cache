@@ -1,4 +1,4 @@
-domain: cache.oci.com
+domain: inferencecache.io
 layout:
 - go.kubebuilder.io/v4
 projectName: inference-cache
@@ -8,8 +8,8 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: cache.oci.com
-  group: cache
+  domain: inferencecache.io
+  group: ""
   kind: CacheBackend
   path: github.com/cachebox-project/inference-cache/api/v1alpha1
   version: v1alpha1

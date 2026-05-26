@@ -1,2 +1,2 @@
 resources:
-- bases/cache.cache.oci.com_cachebackends.yaml
+- bases/inferencecache.io_cachebackends.yaml

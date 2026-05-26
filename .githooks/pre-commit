@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# Vendor-neutral naming guard (see CLAUDE.md).
+# Blocks a commit if staged core-identity files reference OCI / Oracle.
+#
+# Install once per clone:   make install-hooks   (sets core.hooksPath=.githooks)
+# Emergency override:       git commit --no-verify   (discouraged)
+#
+set -euo pipefail
+
+# Paths that define the project's public/core identity — OCI/Oracle banned here.
+# (Cloud-specific integration is allowed, but only in isolated adapters under
+#  pkg/adapters/.../ — those are NOT matched below.)
+CORE_RE='^(api/|proto/|pkg/server/proto/|config/crd/|config/rbac/|internal/|PROJECT$|go\.mod$)'
+
+# Banned tokens, word-bounded to avoid false positives like "associate"/"logic".
+BAN_RE='\boci\b|oci\.com|oraclecloud|\boracle\b'
+
+staged=$(git diff --cached --name-only --diff-filter=ACM || true)
+[ -z "${staged}" ] && exit 0
+
+violations=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  echo "$f" | grep -qE "$CORE_RE" || continue
+  [ -f "$f" ] || continue
+  if hits=$(grep -niEI "$BAN_RE" "$f"); then
+    echo "✗ $f"
+    echo "$hits" | sed 's/^/    /'
+    violations=1
+  fi
+done <<< "$staged"
+
+if [ "$violations" -ne 0 ]; then
+  cat <<'MSG'
+
+Commit blocked: OCI/Oracle reference found in core-identity files (banned per CLAUDE.md).
+
+  Use the vendor-neutral identity:
+    API group / domain : inferencecache.io
+    proto package      : inferencecache.v1alpha1
+    gRPC service       : InferenceCache
+
+  Cloud-specific integration (incl. OCI) is allowed ONLY in isolated adapters
+  (pkg/adapters/.../), never in core API / CRD / proto / default config.
+
+  Emergency override (discouraged): git commit --no-verify
+MSG
+  exit 1
+fi
+exit 0

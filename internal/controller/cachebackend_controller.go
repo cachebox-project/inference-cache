@@ -19,9 +19,9 @@ type CacheBackendReconciler struct {
 	Log    logr.Logger
 }
 
-// +kubebuilder:rbac:groups=cache.cache.oci.com,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cache.cache.oci.com,resources=cachebackends/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=cache.cache.oci.com,resources=cachebackends/finalizers,verbs=update
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/finalizers,verbs=update
 
 // Reconcile observes CacheBackend resources and intentionally performs no writes yet.
 func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

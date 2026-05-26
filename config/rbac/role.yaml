@@ -5,7 +5,7 @@ metadata:
   name: inference-cache-manager-role
 rules:
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends
   verbs:
@@ -17,13 +17,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends/finalizers
   verbs:
   - update
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends/status
   verbs:

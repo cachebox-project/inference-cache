@@ -4,7 +4,7 @@ metadata:
   name: cachebackend-viewer-role
 rules:
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends
   verbs:
@@ -12,7 +12,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends/status
   verbs:

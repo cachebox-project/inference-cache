@@ -4,7 +4,7 @@ metadata:
   name: cachebackend-editor-role
 rules:
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends
   verbs:
@@ -16,7 +16,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - cache.cache.oci.com
+  - inferencecache.io
   resources:
   - cachebackends/status
   verbs:

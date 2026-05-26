@@ -140,3 +140,20 @@ dev-cluster: kind ## Create a local kind cluster for development.
 .PHONY: clean
 clean: ## Remove local build outputs.
 	rm -rf bin dist
+
+.PHONY: install-hooks
+install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooksPath.
+	git config core.hooksPath .githooks
+	@chmod +x .githooks/* 2>/dev/null || true
+	@echo "git hooks installed (core.hooksPath=.githooks)"
+
+.PHONY: verify-naming
+verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CLAUDE.md).
+	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
+		api proto pkg/server/proto config/crd config/rbac internal PROJECT go.mod 2>/dev/null || true); \
+	if [ -n "$$bad" ]; then \
+		echo "✗ OCI/Oracle reference in core-identity files (banned per CLAUDE.md):"; \
+		echo "$$bad" | sed 's/^/    /'; \
+		exit 1; \
+	fi; \
+	echo "✓ core identity is vendor-neutral"
