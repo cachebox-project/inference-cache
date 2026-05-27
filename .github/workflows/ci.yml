@@ -34,11 +34,28 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
 
+    - name: Verify vendor-neutral naming
+      run: make verify-naming
+
+    - name: Set up buf
+      uses: bufbuild/buf-setup-action@v1
+      with:
+        version: 1.69.0
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Lint proto contract
+      run: make proto-lint
+
     - name: Lint
       run: |
         make lint
         git diff --exit-code
         make ci-lint
+
+    - name: Verify CRDs & deepcopy up to date
+      run: |
+        make manifests generate
+        git diff --exit-code -- config api
 
     - name: Generate protobufs
       run: make proto-gen

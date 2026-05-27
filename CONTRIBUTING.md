@@ -16,12 +16,15 @@ Run the baseline checks before sending a PR:
 
 ```bash
 make proto-gen
+make proto-lint
 make lint
 make test
 make build
 ```
 
-`make ci-lint` runs the golangci-lint configuration used by CI.
+`make ci-lint` runs the golangci-lint configuration used by CI. `make proto-lint`
+lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
+buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 
 ## Development Cluster
 
@@ -46,6 +49,7 @@ After changing protobuf files, run:
 
 ```bash
 make proto-gen
+make proto-lint
 ```
 
 Commit generated artifacts with the source changes.
@@ -102,3 +106,5 @@ See the README's "Repository layout" for the full map. In short:
 Each package's `doc.go` states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to.
 
 **Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
+
+**gRPC contract:** when you change `proto/`, update [`docs/design/grpc-contract.md`](docs/design/grpc-contract.md) in the same commit so the design doc stays accurate. The pre-commit hook blocks a commit that touches a `.proto` without touching that doc (override with `--no-verify` only if the change truly doesn't affect the contract).
