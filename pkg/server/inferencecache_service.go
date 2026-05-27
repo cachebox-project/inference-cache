@@ -96,8 +96,9 @@ func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCa
 	return resp, nil
 }
 
-// ReportCacheState ingests authoritative replica updates into the index until
-// the client half-closes, then acks. A non-EOF Recv error is propagated.
+// ReportCacheState ingests replica update deltas (adds/refreshes; removals
+// arrive via PublishEvent or expire by TTL) into the index until the client
+// half-closes, then acks. A non-EOF Recv error is propagated.
 func (s *inferenceCacheService) ReportCacheState(stream icpb.InferenceCache_ReportCacheStateServer) error {
 	for {
 		update, err := stream.Recv()

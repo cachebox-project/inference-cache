@@ -197,9 +197,13 @@ func (i *Index) Start(ctx context.Context) {
 // Engine-warm gating (waiting for initial sync) arrives with the C1 hook.
 func (i *Index) Ready() bool { return i.ready.Load() }
 
-// Ingest applies an authoritative replica update (from ReportCacheState).
-// Idempotent on (replica_id, hash_scheme, prefix_hash): re-reporting a prefix
-// refreshes its freshness rather than duplicating it.
+// Ingest applies a replica update (from ReportCacheState). Updates are
+// additive deltas, NOT snapshots: each call adds or refreshes the reported
+// prefixes (idempotent on (replica_id, hash_scheme, prefix_hash)). A prefix's
+// absence from a later update does NOT remove it — removals arrive as explicit
+// CacheEvents (PREFIX_EVICTED / ALL_CLEARED) or expire via TTL. This matches the
+// engine KV-event model (e.g. vLLM BlockStored / BlockRemoved) and the soft-state
+// guarantee: a stale hint causes a cache miss, never a wrong answer.
 func (i *Index) Ingest(u Update) {
 	ts := u.Timestamp
 	if ts.IsZero() {
