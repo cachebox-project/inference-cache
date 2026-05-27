@@ -326,3 +326,85 @@ func TestReportThenLookupReturnsPrefixMatch(t *testing.T) {
 		t.Fatalf("cross-scheme reason = %q, want NO_HINT", other.GetReasonCode())
 	}
 }
+
+func TestLookupPDRouteFailsOpen(t *testing.T) {
+	resp, err := newTestService().LookupPDRoute(context.Background(), &icpb.LookupPDRouteRequest{ModelId: "m"})
+	if err != nil {
+		t.Fatalf("LookupPDRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT", resp.GetReasonCode())
+	}
+}
+
+func TestGetCacheStateReturnsAggregate(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+		Stats:    &index.ReplicaStats{ReplicaID: "replica-a", CacheMemoryBytes: 2048, HitRate: 0.5},
+	})
+
+	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{ModelId: "m", TenantId: "t"})
+	if err != nil {
+		t.Fatalf("GetCacheState: %v", err)
+	}
+	if resp.GetSummary().GetTotalPrefixes() != 1 {
+		t.Fatalf("total_prefixes = %d, want 1", resp.GetSummary().GetTotalPrefixes())
+	}
+	if len(resp.GetReplicas()) != 1 || resp.GetReplicas()[0].GetReplicaId() != "replica-a" {
+		t.Fatalf("expected replica-a stats, got %+v", resp.GetReplicas())
+	}
+	if resp.GetReplicas()[0].GetCacheMemoryBytes() != 2048 {
+		t.Fatalf("cache_memory_bytes = %d, want 2048", resp.GetReplicas()[0].GetCacheMemoryBytes())
+	}
+}
+
+func TestPublishEventAppliesToIndex(t *testing.T) {
+	svc := newTestService()
+	// Seed two replicas holding the same prefix, then evict one via PublishEvent.
+	for _, r := range []string{"replica-a", "replica-b"} {
+		svc.index.Ingest(index.Update{
+			ReplicaID: r, Model: "m", Tenant: "t", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+		})
+	}
+	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
+		Type: icpb.CacheEvent_PREFIX_EVICTED, ReplicaId: "replica-a",
+		ModelId: "m", TenantId: "t", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("ack.Accepted = false, want true")
+	}
+	got := svc.index.Lookup(index.LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: []byte("p")})
+	if len(got) != 1 || got[0].ReplicaID != "replica-b" {
+		t.Fatalf("after PREFIX_EVICTED of replica-a, expected only replica-b; got %+v", got)
+	}
+}
+
+func TestEventTypeFromProto(t *testing.T) {
+	cases := map[icpb.CacheEvent_Type]index.EventType{
+		icpb.CacheEvent_PREFIX_ADDED:     index.EventPrefixAdded,
+		icpb.CacheEvent_PREFIX_EVICTED:   index.EventPrefixEvicted,
+		icpb.CacheEvent_REPLICA_UPDATED:  index.EventReplicaUpdated,
+		icpb.CacheEvent_ALL_CLEARED:      index.EventAllCleared,
+		icpb.CacheEvent_TYPE_UNSPECIFIED: 0,
+	}
+	for in, want := range cases {
+		if got := eventTypeFromProto(in); got != want {
+			t.Errorf("eventTypeFromProto(%v) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestMicrosToTime(t *testing.T) {
+	if got := microsToTime(0); !got.IsZero() {
+		t.Fatalf("microsToTime(0) = %v, want zero time", got)
+	}
+	if got := microsToTime(1_000_000); got.IsZero() {
+		t.Fatalf("microsToTime(1e6) should be non-zero")
+	}
+}
