@@ -354,6 +354,93 @@ func (i *Index) CacheState(tenant, model string) (replicas []ReplicaStats, total
 	return replicas, totalPrefixes
 }
 
+// Snapshot is a point-in-time, cluster-wide view of the index for the
+// CacheIndex status surface (consumed by the controller). Metadata only.
+type Snapshot struct {
+	Replicas      []ReplicaSnapshot `json:"replicas"`
+	Tenants       []TenantSnapshot  `json:"tenants"`
+	TotalPrefixes int               `json:"totalPrefixes"`
+	HotPrefixes   int               `json:"hotPrefixes"` // 0 until access-counting exists
+}
+
+// ReplicaSnapshot is the latest reported state for one replica, cluster-wide.
+type ReplicaSnapshot struct {
+	ReplicaID        string    `json:"replicaId"`
+	CacheMemoryBytes int64     `json:"cacheMemoryBytes"`
+	HitRate          float32   `json:"hitRate"`
+	Pressure         float32   `json:"pressure"`
+	LastUpdate       time.Time `json:"lastUpdate"`
+}
+
+// TenantSnapshot is the aggregate footprint for one tenant.
+type TenantSnapshot struct {
+	TenantID   string  `json:"tenantId"`
+	MemoryUsed int64   `json:"memoryUsed"`
+	HitRate    float32 `json:"hitRate"`
+}
+
+// Snapshot returns the current cluster-wide aggregate. Replicas use the latest
+// stats reported for each replica id; tenant memory/hit-rate dedup replicas
+// within a tenant (it is an approximation — a replica serving multiple models
+// for a tenant is counted once). Results are sorted for deterministic output.
+func (i *Index) Snapshot() Snapshot {
+	i.mu.RLock()
+
+	type tenantReplica struct{ tenant, replica string }
+	latestByReplica := make(map[string]statEntry)
+	latestByTenantReplica := make(map[tenantReplica]statEntry)
+	for sk, s := range i.stats {
+		if cur, ok := latestByReplica[sk.replicaID]; !ok || s.lastSeen.After(cur.lastSeen) {
+			latestByReplica[sk.replicaID] = s
+		}
+		tr := tenantReplica{sk.tenant, sk.replicaID}
+		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
+			latestByTenantReplica[tr] = s
+		}
+	}
+
+	snap := Snapshot{TotalPrefixes: len(i.prefixes)}
+
+	for id, s := range latestByReplica {
+		snap.Replicas = append(snap.Replicas, ReplicaSnapshot{
+			ReplicaID:        id,
+			CacheMemoryBytes: s.stats.CacheMemoryBytes,
+			HitRate:          s.stats.HitRate,
+			Pressure:         s.stats.Pressure,
+			LastUpdate:       s.lastSeen,
+		})
+	}
+
+	type tenantAgg struct {
+		mem    int64
+		sumHit float64
+		n      int
+	}
+	byTenant := make(map[string]*tenantAgg)
+	for tr, s := range latestByTenantReplica {
+		a := byTenant[tr.tenant]
+		if a == nil {
+			a = &tenantAgg{}
+			byTenant[tr.tenant] = a
+		}
+		a.mem += s.stats.CacheMemoryBytes
+		a.sumHit += float64(s.stats.HitRate)
+		a.n++
+	}
+	for t, a := range byTenant {
+		var hit float32
+		if a.n > 0 {
+			hit = float32(a.sumHit / float64(a.n))
+		}
+		snap.Tenants = append(snap.Tenants, TenantSnapshot{TenantID: t, MemoryUsed: a.mem, HitRate: hit})
+	}
+	i.mu.RUnlock()
+
+	sort.Slice(snap.Replicas, func(a, b int) bool { return snap.Replicas[a].ReplicaID < snap.Replicas[b].ReplicaID })
+	sort.Slice(snap.Tenants, func(a, b int) bool { return snap.Tenants[a].TenantID < snap.Tenants[b].TenantID })
+	return snap
+}
+
 // EntryCountsByModel returns the number of distinct prefixes per model.
 func (i *Index) EntryCountsByModel() map[string]int {
 	i.mu.RLock()

@@ -8,6 +8,7 @@ rules:
   - inferencecache.io
   resources:
   - cachebackends
+  - cacheindices
   verbs:
   - create
   - delete
@@ -26,6 +27,7 @@ rules:
   - inferencecache.io
   resources:
   - cachebackends/status
+  - cacheindices/status
   verbs:
   - get
   - patch

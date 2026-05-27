@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -145,6 +146,53 @@ func getString(t *testing.T, url string) (int, string) {
 		t.Fatalf("read body from %s: %v", url, err)
 	}
 	return resp.StatusCode, string(body)
+}
+
+// TestSnapshotEndpointReflectsIngest ingests state over gRPC and confirms the
+// internal /snapshot HTTP endpoint reflects it as JSON (the controller scrapes
+// this to populate the CacheIndex status).
+func TestSnapshotEndpointReflectsIngest(t *testing.T) {
+	grpcClient, baseURL, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := grpcClient.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId:  "replica-a",
+		ModelId:    "llama-3-8b",
+		TenantId:   "tenant-a",
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 64}},
+		Stats:      &icpb.ReplicaStats{ReplicaId: "replica-a", CacheMemoryBytes: 1234, HitRate: 0.75},
+	}); err != nil {
+		t.Fatalf("send update: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	code, body := getString(t, baseURL+"/snapshot")
+	if code != http.StatusOK {
+		t.Fatalf("/snapshot status = %d, want 200", code)
+	}
+	var snap index.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode snapshot JSON: %v (body=%s)", err, body)
+	}
+	if snap.TotalPrefixes != 1 {
+		t.Fatalf("totalPrefixes = %d, want 1", snap.TotalPrefixes)
+	}
+	if len(snap.Replicas) != 1 || snap.Replicas[0].ReplicaID != "replica-a" || snap.Replicas[0].CacheMemoryBytes != 1234 {
+		t.Fatalf("replicas = %+v, want replica-a with 1234 bytes", snap.Replicas)
+	}
+	if len(snap.Tenants) != 1 || snap.Tenants[0].TenantID != "tenant-a" {
+		t.Fatalf("tenants = %+v, want tenant-a", snap.Tenants)
+	}
 }
 
 // TestInferenceCacheServiceOverGRPC exercises the service over a real gRPC
