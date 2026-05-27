@@ -114,6 +114,16 @@ func TestDecodeBlockStoredMissingBlockSizeIsError(t *testing.T) {
 	}
 }
 
+// A nil element in block_hashes must be rejected cleanly (returned as an error
+// and skipped by the subscriber), never panic the sidecar.
+func TestDecodeNilBlockHashIsError(t *testing.T) {
+	payload := encodeVLLMBatch(t, 1,
+		[]interface{}{"BlockStored", []interface{}{nil}, nil, []int64{}, int32(16), nil})
+	if _, err := DecodeEventBatch(payload); err == nil {
+		t.Error("expected error for nil block hash")
+	}
+}
+
 // A non-positive block_size is malformed; reject it so a bogus PREFIX_MATCH hint
 // (token_count <= 0) is never produced.
 func TestDecodeBlockStoredNonPositiveBlockSizeIsError(t *testing.T) {

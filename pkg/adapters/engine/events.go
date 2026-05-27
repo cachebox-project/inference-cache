@@ -170,6 +170,9 @@ func decodeHashes(raw msgpack.RawMessage) ([][]byte, error) {
 // hashToBytes normalizes one decoded block hash to opaque bytes. Binary/string
 // hashes pass through; integer hashes become 8-byte big-endian.
 func hashToBytes(v interface{}) ([]byte, error) {
+	if v == nil { // a nil element (msgpack nil) is malformed — reject, don't reflect on it
+		return nil, fmt.Errorf("block hash is nil")
+	}
 	switch x := v.(type) {
 	case []byte:
 		return x, nil
