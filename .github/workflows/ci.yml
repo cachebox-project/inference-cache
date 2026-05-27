@@ -69,13 +69,10 @@ jobs:
     - name: Coverage gate
       run: make cover-check
 
-    # Advisory for now: govulncheck currently reports known CVEs in the Go
-    # toolchain stdlib + x/net + grpc that require a deliberate Go 1.25 / grpc
-    # upgrade (tracked separately). Surfaced here for visibility; flip to
-    # blocking (drop continue-on-error) once the upgrade lands and it's clean.
-    - name: Vulnerability scan (advisory)
+    # Blocking: the dependency graph (Go toolchain, x/net, grpc) is clear of
+    # called vulnerabilities. A regression here fails CI.
+    - name: Vulnerability scan
       run: make vulncheck
-      continue-on-error: true
 
     - name: Build binaries
       run: make build
