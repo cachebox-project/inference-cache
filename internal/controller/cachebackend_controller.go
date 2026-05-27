@@ -189,6 +189,10 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	reconcileManagedContainer(live, desired)
 
+	// Volumes are builder-owned (e.g. the shm size differs by profile) and are not
+	// API-server-defaulted in a Deployment template, so copying them is churn-free.
+	live.Volumes = desired.Volumes
+
 	live.NodeSelector = desired.NodeSelector
 	live.Affinity = desired.Affinity
 	live.Tolerations = desired.Tolerations
@@ -215,6 +219,9 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 			live.Containers[i].Command = want.Command
 			live.Containers[i].Args = want.Args
 			live.Containers[i].Env = want.Env
+			// Resources are builder-owned (the GPU limit differs by profile) and not
+			// API-server-defaulted, so reconciling them is churn-free.
+			live.Containers[i].Resources = want.Resources
 			return
 		}
 	}

@@ -130,8 +130,11 @@ func TestLMCacheBuildCPUProfile(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			BackendConfig: map[string]string{cfgKeyProfile: "cpu"},
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			BackendConfig: map[string]string{
+				cfgKeyProfile: "cpu",
+				cfgKeyImage:   "vllm/vllm-openai-cpu:latest-arm64",
+			},
 		},
 	}
 	b, _ := For(cachev1alpha1.CacheBackendTypeLMCache)
@@ -141,8 +144,8 @@ func TestLMCacheBuildCPUProfile(t *testing.T) {
 	}
 
 	c := w.Deployment.Spec.Template.Spec.Containers[0]
-	if c.Image != defaultCPUImage {
-		t.Fatalf("image = %q, want CPU default %q", c.Image, defaultCPUImage)
+	if c.Image != "vllm/vllm-openai-cpu:latest-arm64" {
+		t.Fatalf("image = %q, want the supplied CPU image", c.Image)
 	}
 	if c.Command[len(c.Command)-1] != defaultCPUModel {
 		t.Fatalf("model = %v, want CPU default %q", c.Command, defaultCPUModel)
@@ -201,6 +204,20 @@ func TestLMCacheBuildCPUProfileOverrides(t *testing.T) {
 	}
 	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
 		t.Fatalf("CPU profile must not request a GPU")
+	}
+}
+
+func TestLMCacheBuildCPUProfileRequiresImage(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			BackendConfig: map[string]string{cfgKeyProfile: "cpu"}, // no image
+		},
+	}
+	b, _ := For(cachev1alpha1.CacheBackendTypeLMCache)
+	if _, err := b.Build(cb); err == nil {
+		t.Fatalf("expected an error: profile=cpu without an image has no safe default")
 	}
 }
 

@@ -29,13 +29,12 @@ const (
 	defaultLMCacheMaxLocalCPUSize = "20"
 	defaultHFTokenSecretName      = "hf-token"
 
-	// CPU profile (backendConfig profile=cpu) defaults: a GPU-free vLLM engine for
-	// substrate validation off-GPU. It keeps prefix caching + the KV-event publisher
-	// but drops the LMCache connector — real LMCache offload requires a GPU, so the
-	// default (gpu) profile owns that. Mirrors docs/reference-stack/manifests/cpu-local.
-	// The CPU image is arch-tagged upstream (latest-arm64/latest-x86_64); the bare
-	// :latest default is meant to be overridden via backendConfig.image per host arch.
-	defaultCPUImage        = "vllm/vllm-openai-cpu:latest"
+	// CPU profile (backendConfig profile=cpu): a GPU-free vLLM engine for substrate
+	// validation off-GPU. It keeps prefix caching + the KV-event publisher but drops
+	// the LMCache connector — real LMCache offload requires a GPU, so the default
+	// (gpu) profile owns that. Mirrors docs/reference-stack/manifests/cpu-local.
+	// The upstream CPU image is arch-tagged (latest-arm64 / latest-x86_64) with no
+	// safe multi-arch default, so backendConfig.image is REQUIRED for this profile.
 	defaultCPUModel        = "Qwen/Qwen2.5-0.5B-Instruct"
 	defaultCPUKVCacheSpace = "4"
 
@@ -95,7 +94,12 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 	var container corev1.Container
 	var shmSize resource.Quantity
 	if strings.EqualFold(configOr(cfg, cfgKeyProfile, profileGPU), profileCPU) {
-		image := configOr(cfg, cfgKeyImage, defaultCPUImage)
+		// The CPU image is arch-tagged upstream with no safe multi-arch default,
+		// so it must be supplied explicitly (e.g. vllm/vllm-openai-cpu:latest-arm64).
+		image := configOr(cfg, cfgKeyImage, "")
+		if image == "" {
+			return nil, fmt.Errorf("backendConfig.profile=cpu requires backendConfig.image (an arch-tagged CPU image, e.g. vllm/vllm-openai-cpu:latest-arm64)")
+		}
 		model := configOr(cfg, cfgKeyModel, defaultCPUModel)
 		container = cpuEngineContainer(image, model, hfSecret)
 		shmSize = resource.MustParse("4Gi")
