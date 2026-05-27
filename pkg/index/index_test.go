@@ -2,6 +2,8 @@ package index
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -282,6 +284,32 @@ func TestStatsKeyedByTopLevelReplicaID(t *testing.T) {
 	}
 	if replicas[0].CacheMemoryBytes != 42 {
 		t.Fatalf("stats payload lost: cacheMemoryBytes = %d, want 42", replicas[0].CacheMemoryBytes)
+	}
+}
+
+func TestConcurrentIngestReportsFinalCount(t *testing.T) {
+	m := &countingMetrics{}
+	idx := New(WithMetrics(m))
+
+	const n = 50
+	var wg sync.WaitGroup
+	for k := 0; k < n; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+				Prefixes: []PrefixRef{{PrefixHash: []byte(fmt.Sprintf("p%d", k)), TokenCount: 1}}})
+		}(k)
+	}
+	wg.Wait()
+
+	if got := idx.EntryCountsByModel()["m"]; got != n {
+		t.Fatalf("index has %d entries, want %d", got, n)
+	}
+	// After all reporters have run (serialized by reportMu), the gauge must equal
+	// the live count — never a stale earlier snapshot.
+	if m.last["m"] != n {
+		t.Fatalf("reported gauge = %d, want %d (stale report ordering)", m.last["m"], n)
 	}
 }
 

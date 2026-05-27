@@ -442,14 +442,20 @@ func (i *Index) enforceCapLocked() {
 // reportEntries pushes live per-model counts to the metrics sink, if wired.
 // Models that have drained to zero since the last report are explicitly set to
 // 0 so their gauge series doesn't go stale.
+//
+// The snapshot is taken while holding reportMu so concurrent reporters can't
+// publish out of order: reportMu serializes them, and because each snapshot
+// reads live index state at publish time, whichever reporter runs last writes
+// the current count (mutations complete under i.mu before reportEntries is
+// called). Lock order is always reportMu → i.mu, never the reverse.
 func (i *Index) reportEntries() {
 	if i.metrics == nil {
 		return
 	}
-	counts := i.EntryCountsByModel()
 
 	i.reportMu.Lock()
 	defer i.reportMu.Unlock()
+	counts := i.EntryCountsByModel()
 	for model := range i.reportedModels {
 		if _, ok := counts[model]; !ok {
 			i.metrics.SetIndexEntries(model, 0)
