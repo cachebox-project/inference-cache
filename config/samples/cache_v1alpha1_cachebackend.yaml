@@ -6,4 +6,19 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: cachebackend-sample
 spec:
-  type: memory
+  type: LMCache
+  deploymentKind: StatefulSet
+  replicas: 1
+  storage:
+    pvc:
+      size: 10Gi
+  integration:
+    engine: SGLang
+    role: ReadWrite
+    lookupTimeoutMs: 20
+    minimumPrefixTokens: 32
+  engineSelector:
+    matchLabels:
+      inferencecache.io/cache-enabled: "true"
+  backendConfig:
+    evictionPolicy: LRU
