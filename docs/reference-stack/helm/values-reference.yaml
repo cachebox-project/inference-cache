@@ -1,0 +1,55 @@
+# Upstream "reference Helm chart" path (vLLM Production Stack).
+#
+#   helm repo add vllm https://vllm-project.github.io/production-stack
+#   helm install vllm-substrate vllm/vllm-stack \
+#     --version <pin>  -n cache-substrate --create-namespace \
+#     -f values-reference.yaml
+#
+# This is the ticket's "reference Helm chart" option. It is the upstream-blessed
+# way to deploy vLLM+LMCache and is useful for cross-checking our hand-written
+# manifests (../manifests). The reconciler template is the RAW manifests, not
+# this chart — the chart also ships a router we don't want (the gateway owns
+# routing; we only describe cache state).
+#
+# Requires a GPU node advertising nvidia.com/gpu and an `hf-token` secret with
+# key `token`.
+#
+# NOTE: field names below (extraArgs, extraPorts, lmcacheConfig, vllmConfig)
+# follow the Production-Stack chart schema as of the pinned version — verify
+# against `helm show values vllm/vllm-stack --version <pin>` before relying on
+# them; the chart's schema evolves. The hand-written ../manifests are the
+# canonical M5 template; this chart path is an optional upstream cross-check.
+servingEngineSpec:
+  runtimeClassName: ""        # set to "nvidia" if your cluster requires it
+  modelSpec:
+    - name: "llama8b"
+      repository: "lmcache/vllm-openai"
+      tag: "latest"           # pin to a digest before the fleet run (see ../VERSIONS.md)
+      modelURL: "meta-llama/Llama-3.1-8B-Instruct"
+      replicaCount: 1
+      requestGPU: 1
+      vllmConfig:
+        v1: 1                 # required for KV events + LMCacheConnectorV1
+        enablePrefixCaching: true
+        maxModelLen: 16384
+        # The chart does not template --kv-events-config; inject it verbatim:
+        extraArgs:
+          - "--kv-events-config"
+          - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+      lmcacheConfig:
+        enabled: true
+        cpuOffloadingBufferSize: "20"   # GiB
+      hf_token:
+        secretName: "hf-token"
+        secretKey: "token"
+      # Expose the ZMQ PUB port on the engine pod/Service (chart default exposes 8000 only).
+      extraPorts:
+        - name: kv-events
+          containerPort: 5557
+        - name: kv-replay
+          containerPort: 5558
+
+# We do NOT use the chart's router — the gateway decides routing; inference-cache
+# only describes cache state.
+routerSpec:
+  enableRouter: false

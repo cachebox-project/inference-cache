@@ -1,0 +1,84 @@
+# CPU-only sanity variant — runs WITHOUT a GPU and WITHOUT LMCache.
+#
+# Purpose: validate the two things that are engine-config, not GPU-dependent —
+#   1. the vLLM KV-event ZMQ publisher wiring (BlockStored/BlockRemoved), and
+#   2. a prefix-cache hit on a repeated long prefix.
+# It deliberately drops --kv-transfer-config (LMCacheConnectorV1): LMCache's
+# offload tiers are GPU-oriented and are NOT exercised here. This proves the
+# C1-facing signal and the cache behaviour; the real LMCache run is the GPU path.
+#
+# CAVEAT (best-effort): the published vLLM images target CUDA + linux/amd64.
+# CPU execution may need a CPU-built image/tag, and on Apple Silicon the amd64
+# image runs under emulation (slow; model load may time out). If the engine
+# won't start, the reliable local check is the synthetic ZMQ publisher — see
+# ../../README.md "CPU-only local sanity". The authoritative cache-hit + real
+# event capture happen on the GPU path regardless.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-cpu-sanity
+  namespace: cache-substrate
+  labels:
+    app: vllm-cpu-sanity
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-cpu-sanity
+  template:
+    metadata:
+      labels:
+        app: vllm-cpu-sanity
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest      # stock vLLM, no LMCache
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--device=cpu"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_USE_V1
+              value: "1"
+            - name: VLLM_CPU_KVCACHE_SPACE     # GiB of CPU KV cache
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 120
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-cpu-sanity
+  namespace: cache-substrate
+  labels:
+    app: vllm-cpu-sanity
+spec:
+  type: NodePort
+  selector:
+    app: vllm-cpu-sanity
+  ports:
+    - { name: http, port: 8000, targetPort: http, nodePort: 30080 }
+    - { name: kv-events, port: 5557, targetPort: kv-events, nodePort: 30557 }

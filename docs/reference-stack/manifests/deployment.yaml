@@ -1,0 +1,85 @@
+# vLLM + LMCache reference backend (GPU).
+#
+# This is the canonical hand-written template that the M5 (C2) CacheBackend
+# reconciler will learn to generate (Deployment + Service). Keep it minimal and
+# explicit: every flag here maps to a CacheBackend spec field.
+#
+# CacheBackend → manifest mapping (tech-spec §3.1):
+#   spec.type: LMCache                  -> image + --kv-transfer-config connector
+#   spec.replicas                       -> .spec.replicas
+#   spec.integration.engine: VLLM       -> command `vllm serve`
+#   spec.backendConfig.connector        -> LMCacheConnectorV1
+#   spec.backendConfig.chunk_size: 256  -> LMCACHE_CHUNK_SIZE
+#   (KV-event publisher is always on so C1 can subscribe)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-lmcache-llama-8b
+  namespace: cache-substrate
+  labels:
+    app: vllm-lmcache-llama-8b
+    inferencecache.io/backend-type: lmcache
+    inferencecache.io/engine: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-lmcache-llama-8b
+  template:
+    metadata:
+      labels:
+        app: vllm-lmcache-llama-8b
+        inferencecache.io/backend-type: lmcache
+        inferencecache.io/engine: vllm
+    spec:
+      containers:
+        - name: vllm
+          image: lmcache/vllm-openai:latest   # re-pin to a digest before the GPU run (see VERSIONS.md)
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--enable-prefix-caching"                 # on by default on v1; explicit for the reference
+            # LMCache connector: vLLM reads/writes KV through LMCache (kv_both).
+            - "--kv-transfer-config"
+            - '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+            # KV-cache event publisher over ZMQ — the signal C1 subscribes to.
+            # Emits BlockStored / BlockRemoved / AllBlocksCleared (msgpack).
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_USE_V1                # KV events + LMCacheConnectorV1 require the v1 engine
+              value: "1"
+            - name: LMCACHE_CHUNK_SIZE         # spec.backendConfig.chunk_size
+              value: "256"
+            - name: LMCACHE_LOCAL_CPU          # Phase-1 reference: CPU offload tier
+              value: "True"
+            - name: LMCACHE_MAX_LOCAL_CPU_SIZE # GiB of CPU offload buffer
+              value: "20"
+            - name: HF_TOKEN                   # gated model pull
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 60   # model load + weight download can be slow
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}            # swap for a PVC (spec.storage.pvc) on the fleet
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi        # vLLM needs a large /dev/shm

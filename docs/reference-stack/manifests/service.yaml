@@ -1,0 +1,30 @@
+# Exposes the reference backend. NodePorts line up with the kind extraPortMappings
+# (kind/cluster.yaml) so the host can reach the API on :30080 and subscribe to
+# KV events on :30557 without port-forwarding.
+#
+# On a real cluster (OKE) the M5 reconciler emits a ClusterIP Service; the
+# CacheBackend.status.endpoint then points the gateway/server at it. NodePort
+# here is purely a local-kind convenience.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-lmcache-llama-8b
+  namespace: cache-substrate
+  labels:
+    app: vllm-lmcache-llama-8b
+spec:
+  type: NodePort
+  selector:
+    app: vllm-lmcache-llama-8b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: 30080
+    - name: kv-events
+      port: 5557
+      targetPort: kv-events
+      nodePort: 30557
+    - name: kv-replay
+      port: 5558
+      targetPort: kv-replay
