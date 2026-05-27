@@ -126,6 +126,117 @@ func TestLMCacheBuildNil(t *testing.T) {
 	}
 }
 
+func TestLMCacheBuildCPUProfile(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			BackendConfig: map[string]string{cfgKeyProfile: "cpu"},
+		},
+	}
+	b, _ := For(cachev1alpha1.CacheBackendTypeLMCache)
+	w, err := b.Build(cb)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	c := w.Deployment.Spec.Template.Spec.Containers[0]
+	if c.Image != defaultCPUImage {
+		t.Fatalf("image = %q, want CPU default %q", c.Image, defaultCPUImage)
+	}
+	if c.Command[len(c.Command)-1] != defaultCPUModel {
+		t.Fatalf("model = %v, want CPU default %q", c.Command, defaultCPUModel)
+	}
+	// No GPU limit on the CPU profile.
+	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
+		t.Fatalf("CPU profile must not request a GPU: %v", c.Resources.Limits)
+	}
+	// LMCache connector is dropped; prefix caching + KV events stay on.
+	if argsContain(c.Args, "--kv-transfer-config") {
+		t.Fatalf("CPU profile must not set the LMCache connector: %v", c.Args)
+	}
+	if !argsContain(c.Args, "--enable-prefix-caching") || !argsContain(c.Args, "--kv-events-config") || !argsContain(c.Args, "--enforce-eager") {
+		t.Fatalf("CPU profile args missing expected flags: %v", c.Args)
+	}
+	// CPU env, not the LMCache/GPU env.
+	if findEnv(c.Env, "VLLM_CPU_KVCACHE_SPACE") == nil {
+		t.Fatalf("CPU profile missing VLLM_CPU_KVCACHE_SPACE: %v", c.Env)
+	}
+	if findEnv(c.Env, "VLLM_USE_V1") != nil || findEnv(c.Env, "LMCACHE_CHUNK_SIZE") != nil {
+		t.Fatalf("CPU profile must not carry LMCache/GPU env: %v", c.Env)
+	}
+	// HF_TOKEN still optional (for overridden gated models).
+	if hf := findEnv(c.Env, "HF_TOKEN"); hf == nil || hf.ValueFrom == nil || hf.ValueFrom.SecretKeyRef.Optional == nil || !*hf.ValueFrom.SecretKeyRef.Optional {
+		t.Fatalf("HF_TOKEN should remain an optional secret ref: %+v", hf)
+	}
+	// Same wiring as GPU: 3 ports + readiness probe.
+	if len(c.Ports) != 3 || c.ReadinessProbe == nil {
+		t.Fatalf("CPU profile lost ports/probe: ports=%d probe=%v", len(c.Ports), c.ReadinessProbe)
+	}
+}
+
+func TestLMCacheBuildCPUProfileOverrides(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			BackendConfig: map[string]string{
+				cfgKeyProfile: "CPU", // case-insensitive
+				cfgKeyImage:   "vllm/vllm-openai-cpu:latest-arm64",
+				cfgKeyModel:   "org/tiny",
+			},
+		},
+	}
+	b, _ := For(cachev1alpha1.CacheBackendTypeLMCache)
+	w, err := b.Build(cb)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	c := w.Deployment.Spec.Template.Spec.Containers[0]
+	if c.Image != "vllm/vllm-openai-cpu:latest-arm64" {
+		t.Fatalf("image = %q, want CPU override", c.Image)
+	}
+	if c.Command[len(c.Command)-1] != "org/tiny" {
+		t.Fatalf("model = %v, want override", c.Command)
+	}
+	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
+		t.Fatalf("CPU profile must not request a GPU")
+	}
+}
+
+func TestLMCacheBuildDefaultProfileIsGPU(t *testing.T) {
+	for _, profile := range []string{"", "gpu", "unknown"} {
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:          cachev1alpha1.CacheBackendTypeLMCache,
+				BackendConfig: map[string]string{cfgKeyProfile: profile},
+			},
+		}
+		b, _ := For(cachev1alpha1.CacheBackendTypeLMCache)
+		w, err := b.Build(cb)
+		if err != nil {
+			t.Fatalf("build profile=%q: %v", profile, err)
+		}
+		c := w.Deployment.Spec.Template.Spec.Containers[0]
+		if gpu := c.Resources.Limits["nvidia.com/gpu"]; gpu.Value() != 1 {
+			t.Fatalf("profile=%q should default to GPU (gpu limit=%v)", profile, gpu.Value())
+		}
+		if !argsContain(c.Args, "--kv-transfer-config") {
+			t.Fatalf("profile=%q should keep the LMCache connector", profile)
+		}
+	}
+}
+
+func argsContain(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func findEnv(env []corev1.EnvVar, name string) *corev1.EnvVar {
 	for i := range env {
 		if env[i].Name == name {

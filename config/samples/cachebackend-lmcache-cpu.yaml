@@ -1,0 +1,26 @@
+# GPU-free LMCache backend for substrate validation (backendConfig profile=cpu).
+#
+# Renders a vLLM CPU engine with prefix caching + the KV-cache event publisher,
+# but WITHOUT the LMCache connector and WITHOUT a GPU resource request — real
+# LMCache offload needs a GPU (use the default gpu profile for that). This lets
+# the reconciler stand up a healthy, serving backend on a CPU-only cluster (e.g.
+# kind) to validate the engine-config + KV-event path end to end.
+#
+# The CPU image is arch-tagged upstream; use latest-x86_64 on x86 hosts.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-lmcache-cpu
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    engine: vLLM
+    role: ReadWrite
+  backendConfig:
+    profile: cpu
+    image: vllm/vllm-openai-cpu:latest-arm64
+    model: Qwen/Qwen2.5-0.5B-Instruct

@@ -142,6 +142,27 @@ run it after changing the subscriber.
 
 ---
 
+## CacheBackend reconciler canary (CPU)
+
+[`scripts/canary_c2_reconcile.sh`](scripts/canary_c2_reconcile.sh) is a GPU-free,
+on-demand canary for the **C2 reconciler**: it brings up a kind cluster, runs the
+controller, applies a `CacheBackend` with `backendConfig.profile: cpu`, and asserts
+the controller stands up a healthy serving backend (`status.health=Ready`, endpoint
+published), an engine prefix-cache hit through the Service, and owner-ref garbage
+collection when the CR is deleted. It exercises the reconciler against real pods —
+the gap the envtest unit tests can't cover.
+
+```bash
+docs/reference-stack/scripts/canary_c2_reconcile.sh
+```
+
+Like the full-chain canary it is **on-demand**, not a blocking gate: it needs
+Docker + kind, pulls the vLLM CPU image, and wants ~10+ GiB of Docker VM RAM. The
+`cpu` profile runs a GPU-free vLLM engine (prefix caching + KV events, no LMCache
+offload); real LMCache offload still needs a GPU (the default `gpu` profile).
+
+---
+
 ## Teardown
 
 ```bash
