@@ -1,0 +1,40 @@
+# kind cluster for the vLLM + LMCache reference substrate.
+#
+# kind nodes are containers on the host's Docker daemon. kind does NOT expose
+# host GPUs to node containers out of the box, so the GPU path below has two
+# documented options. The CPU-only path (../manifests/cpu-local) needs no GPU.
+#
+#   kind create cluster --name inference-cache-substrate --config cluster.yaml
+#
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: inference-cache-substrate
+nodes:
+  - role: control-plane
+    # Expose the vLLM OpenAI API (30080) and the ZMQ KV-event PUB port (30557)
+    # on localhost so the host can curl the API and subscribe to events without
+    # `kubectl port-forward`. These map to the NodePort Service in
+    # ../manifests/service.yaml.
+    extraPortMappings:
+      - containerPort: 30080   # vLLM OpenAI API
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30557   # vLLM KV-event ZMQ PUB
+        hostPort: 30557
+        protocol: TCP
+# -----------------------------------------------------------------------------
+# GPU on kind (for the real LMCache + vLLM run on an NVIDIA GPU host).
+# kind has no first-class GPU flag; the supported approaches are:
+#
+#   (A) NVIDIA k8s-device-plugin on a GPU host. Install the NVIDIA Container
+#       Toolkit on the host, set `nvidia` as the default Docker runtime, create
+#       the kind cluster, then `helm install` the device plugin so pods can
+#       request `nvidia.com/gpu`. See ../README.md "GPU on kind".
+#
+#   (B) Skip kind on the GPU box and run the same Pod spec on a managed cluster
+#       (OKE) that already advertises `nvidia.com/gpu`. The manifests in
+#       ../manifests are identical; only the cluster differs.
+#
+# This file is the CPU-friendly local-dev cluster. GPU node wiring is host- and
+# environment-specific and lives in the runbook, not here.
+# -----------------------------------------------------------------------------

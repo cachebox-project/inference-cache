@@ -1,12 +1,12 @@
-<!-- Title: imperative, concise. Prefix the branch with the Linear key (e.g. cac-15-...) so it auto-links. -->
+<!-- Title: imperative, concise. -->
 
 ## Summary
 
 <!-- What does this PR do, and why? -->
 
-## Linear
+## Linked issues
 
-<!-- e.g. Closes CAC-123 -->
+<!-- e.g. Closes #123 -->
 
 ## Checklist
 
