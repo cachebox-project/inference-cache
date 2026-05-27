@@ -105,6 +105,15 @@ func TestDecodeByteHashes(t *testing.T) {
 	}
 }
 
+// A known tag with a truncated tuple (no block_size) must be rejected, not
+// silently indexed with token_count=0.
+func TestDecodeBlockStoredMissingBlockSizeIsError(t *testing.T) {
+	payload := encodeVLLMBatch(t, 1, []interface{}{"BlockStored", []uint64{1}, nil})
+	if _, err := DecodeEventBatch(payload); err == nil {
+		t.Error("expected error for truncated BlockStored (missing block_size)")
+	}
+}
+
 func TestDecodeMalformed(t *testing.T) {
 	if _, err := DecodeEventBatch([]byte{0xff, 0x00, 0x01}); err == nil {
 		t.Error("expected error decoding garbage payload")

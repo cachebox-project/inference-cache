@@ -56,6 +56,9 @@ func NewSubscriber(endpoint, topic string, opts ...SubscriberOption) *Subscriber
 	for _, o := range opts {
 		o(s)
 	}
+	if s.backoff <= 0 {
+		s.backoff = time.Second // avoid a tight reconnect loop
+	}
 	return s
 }
 

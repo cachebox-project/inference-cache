@@ -108,34 +108,31 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 
 	switch tag {
 	case "BlockStored":
-		// [tag, block_hashes, parent_block_hash, token_ids, block_size, lora_id]
-		ev := BlockStored{}
-		if len(fields) > 1 {
-			hashes, err := decodeHashes(fields[1])
-			if err != nil {
-				return nil, fmt.Errorf("BlockStored.block_hashes: %w", err)
-			}
-			ev.BlockHashes = hashes
+		// [tag, block_hashes, parent_block_hash, token_ids, block_size, lora_id].
+		// Require through block_size so we never index a zero token_count from a
+		// truncated/malformed tuple.
+		if len(fields) < 5 {
+			return nil, fmt.Errorf("BlockStored: want >=5 fields, got %d", len(fields))
 		}
-		if len(fields) > 4 {
-			var bs int32
-			if err := msgpack.Unmarshal(fields[4], &bs); err != nil {
-				return nil, fmt.Errorf("BlockStored.block_size: %w", err)
-			}
-			ev.BlockSize = bs
+		hashes, err := decodeHashes(fields[1])
+		if err != nil {
+			return nil, fmt.Errorf("BlockStored.block_hashes: %w", err)
 		}
-		return ev, nil
+		var bs int32
+		if err := msgpack.Unmarshal(fields[4], &bs); err != nil {
+			return nil, fmt.Errorf("BlockStored.block_size: %w", err)
+		}
+		return BlockStored{BlockHashes: hashes, BlockSize: bs}, nil
 	case "BlockRemoved":
 		// [tag, block_hashes]
-		ev := BlockRemoved{}
-		if len(fields) > 1 {
-			hashes, err := decodeHashes(fields[1])
-			if err != nil {
-				return nil, fmt.Errorf("BlockRemoved.block_hashes: %w", err)
-			}
-			ev.BlockHashes = hashes
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("BlockRemoved: want >=2 fields, got %d", len(fields))
 		}
-		return ev, nil
+		hashes, err := decodeHashes(fields[1])
+		if err != nil {
+			return nil, fmt.Errorf("BlockRemoved.block_hashes: %w", err)
+		}
+		return BlockRemoved{BlockHashes: hashes}, nil
 	case "AllBlocksCleared":
 		return AllBlocksCleared{}, nil
 	default:
