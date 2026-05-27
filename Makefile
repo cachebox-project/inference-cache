@@ -29,6 +29,7 @@ SETUP_ENVTEST_VERSION ?= v0.0.0-20241105200929-48ec3b71211f
 KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
+GOVULNCHECK_VERSION ?= v1.1.4
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -37,6 +38,7 @@ PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
 SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
 LOCAL_BUF := $(LOCALBIN)/buf
+GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 
 .PHONY: all
@@ -129,6 +131,15 @@ build: ## Build controller and server binaries.
 test: ## Run unit tests.
 	$(GO_CMD) test ./...
 
+.PHONY: test-race
+test-race: ## Run unit tests with the race detector (fresh, no cache).
+	$(GO_CMD) test -race -count=1 ./...
+
+.PHONY: vulncheck
+vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulnerabilities. Needs network.
+	@test -s $(GOVULNCHECK) || GOBIN=$(LOCALBIN) $(GO_CMD) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	$(GOVULNCHECK) ./...
+
 .PHONY: test-env
 test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
@@ -180,7 +191,7 @@ fmt-check: ## Check Go formatting without modifying files.
 	echo "✓ gofmt clean"
 
 .PHONY: ci
-ci: verify-naming fmt-check vet test build ## Local CI gate (naming + fmt + vet + test + build). Run by the pre-push hook.
+ci: verify-naming fmt-check vet test-race build ## Local CI gate (naming + fmt + vet + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
