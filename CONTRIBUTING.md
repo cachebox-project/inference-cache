@@ -20,7 +20,9 @@ make proto-lint
 make lint
 make test-race
 make build
-make vulncheck   # known-vulnerability scan (needs network)
+make vulncheck   # advisory: vulnerability scan (needs network); currently
+                 # reports known CVEs pending a Go/grpc upgrade, so CI does not
+                 # fail on it yet
 ```
 
 `make test-race` runs the unit tests under the race detector — it's what the
