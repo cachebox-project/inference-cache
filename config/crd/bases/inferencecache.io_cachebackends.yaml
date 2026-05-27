@@ -1627,6 +1627,12 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              observedGeneration:
+                description: ObservedGeneration is the .metadata.generation last reconciled
+                  by the controller.
+                format: int64
+                minimum: 0
+                type: integer
             type: object
         type: object
     served: true
