@@ -69,6 +69,27 @@ func TestHashSchemeIsolatesMatches(t *testing.T) {
 	}
 }
 
+func TestEmptyHashSchemeFailsOpen(t *testing.T) {
+	idx := New()
+
+	// An update without a hash_scheme must not be indexed (can't be matched safely).
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("entries indexed without a hash_scheme = %d, want 0", n)
+	}
+
+	// A lookup without a hash_scheme returns no hint, even if a real entry exists.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "", PrefixHash: hash("p")}); len(got) != 0 {
+		t.Fatalf("lookup without a hash_scheme should fail open, got %+v", got)
+	}
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")}); len(got) != 1 {
+		t.Fatalf("sanity: scoped lookup should still match, got %d", len(got))
+	}
+}
+
 func TestTenantIsolation(t *testing.T) {
 	idx := New()
 	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "tenant-a", HashScheme: "vllm",

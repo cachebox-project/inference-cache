@@ -219,17 +219,22 @@ func (i *Index) Ingest(u Update) {
 	}
 
 	i.mu.Lock()
-	for _, p := range u.Prefixes {
-		key := prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}
-		replicas := i.prefixes[key]
-		if replicas == nil {
-			replicas = make(map[string]replicaEntry)
-			i.prefixes[key] = replicas
+	// prefix_hash is engine-opaque and only safe within a known hash_scheme; an
+	// empty/unspecified scheme would collapse all engines into one domain, so we
+	// do not index prefixes without one (fail open). Stats are scheme-independent.
+	if u.HashScheme != "" {
+		for _, p := range u.Prefixes {
+			key := prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}
+			replicas := i.prefixes[key]
+			if replicas == nil {
+				replicas = make(map[string]replicaEntry)
+				i.prefixes[key] = replicas
+			}
+			if _, existed := replicas[u.ReplicaID]; !existed {
+				i.totalEntries++
+			}
+			replicas[u.ReplicaID] = replicaEntry{tokenCount: p.TokenCount, lastSeen: ts}
 		}
-		if _, existed := replicas[u.ReplicaID]; !existed {
-			i.totalEntries++
-		}
-		replicas[u.ReplicaID] = replicaEntry{tokenCount: p.TokenCount, lastSeen: ts}
 	}
 	if u.Stats != nil {
 		st := *u.Stats
@@ -294,6 +299,11 @@ func (i *Index) ApplyEvent(ev Event) {
 // the same hash_scheme), ranked by matched tokens × freshness, best first.
 // Empty result means "no hint" — the caller fails open.
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
+	// Without a known hash_scheme, the opaque prefix_hash cannot be matched
+	// safely (it would span engines), so fail open with no hint.
+	if req.HashScheme == "" {
+		return nil
+	}
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 
