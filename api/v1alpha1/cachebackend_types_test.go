@@ -1,0 +1,430 @@
+package v1alpha1
+
+import (
+	"encoding/json"
+	"os"
+	"reflect"
+	"strconv"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+)
+
+func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
+	schema := loadCacheBackendOpenAPISchema(t)
+	specSchema := mustPath[map[string]any](t, schema, "properties", "spec")
+	statusSchema := mustPath[map[string]any](t, schema, "properties", "status")
+
+	requireNotRequired(t, schema, "spec")
+
+	for _, field := range []string{
+		"type",
+		"deploymentKind",
+		"replicas",
+		"storage",
+		"integration",
+		"engineSelector",
+		"backendConfig",
+		"template",
+	} {
+		if !hasProperty(specSchema, field) {
+			t.Fatalf("spec.%s is missing from CRD schema", field)
+		}
+	}
+
+	for _, field := range []string{"endpoint", "health", "indexEntries", "conditions"} {
+		if !hasProperty(statusSchema, field) {
+			t.Fatalf("status.%s is missing from CRD schema", field)
+		}
+	}
+
+	requireNoEnum(t, mustProperty(t, specSchema, "type"))
+	requireEnum(t, mustProperty(t, specSchema, "deploymentKind"), []string{
+		"Deployment",
+		"StatefulSet",
+	})
+	integrationSchema := mustProperty(t, specSchema, "integration")
+	requireEnum(t, mustPath[map[string]any](t, integrationSchema, "properties", "role"), []string{
+		"ReadOnly",
+		"WriteOnly",
+		"ReadWrite",
+	})
+	requireNoProperty(t, integrationSchema, "failOpen")
+	requireEnum(t, mustProperty(t, statusSchema, "health"), []string{
+		"Pending",
+		"Ready",
+		"Degraded",
+		"Failed",
+	})
+	templateSchema := mustProperty(t, specSchema, "template")
+	requireNoPreserveUnknownFields(t, templateSchema)
+	for _, field := range []string{"nodeSelector", "tolerations", "affinity"} {
+		if !hasProperty(templateSchema, field) {
+			t.Fatalf("spec.template.%s is missing from CRD schema", field)
+		}
+	}
+	requireNoProperty(t, templateSchema, "containers")
+
+	requireNotRequired(t, specSchema, "type")
+	requireRequired(t, mustPath[map[string]any](t, specSchema, "properties", "storage", "properties", "pvc"), "size")
+	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
+	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "lookupTimeoutMs"), 0)
+	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "minimumPrefixTokens"), 0)
+	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
+	requireMinimum(t, mustProperty(t, statusSchema, "indexEntries"), 0)
+}
+
+func TestCacheBackendCRDPrintColumns(t *testing.T) {
+	version := loadCacheBackendCRDVersion(t, "v1alpha1")
+	columns := mustPath[[]any](t, version, "additionalPrinterColumns")
+
+	for _, column := range columns {
+		columnSchema, ok := column.(map[string]any)
+		if !ok {
+			t.Fatalf("print column has type %T, want object", column)
+		}
+		if columnSchema["name"] != "Endpoint" {
+			continue
+		}
+		if columnSchema["jsonPath"] != ".status.endpoint" {
+			t.Fatalf("Endpoint print column jsonPath = %v, want .status.endpoint", columnSchema["jsonPath"])
+		}
+		return
+	}
+
+	t.Fatalf("CRD does not contain Endpoint print column")
+}
+
+func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
+	replicas := int32(2)
+	storageClassName := "fast"
+	lookupTimeoutMs := int32(25)
+	minimumPrefixTokens := int32(64)
+	indexEntries := int64(42)
+	runAsNonRoot := true
+	runtimeClassName := "runc"
+	terminationGracePeriodSeconds := int64(30)
+	backend := &CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: CacheBackendSpec{
+			Type:           CacheBackendTypeLMCache,
+			DeploymentKind: CacheBackendDeploymentKindStatefulSet,
+			Replicas:       &replicas,
+			Storage: &CacheBackendStorageSpec{
+				PVC: &CacheBackendPVCSpec{
+					Size:             resource.MustParse("10Gi"),
+					StorageClassName: &storageClassName,
+				},
+			},
+			Integration: &CacheBackendIntegrationSpec{
+				Engine:              "SGLang",
+				Role:                CacheBackendIntegrationRoleReadWrite,
+				LookupTimeoutMs:     &lookupTimeoutMs,
+				MinimumPrefixTokens: &minimumPrefixTokens,
+			},
+			EngineSelector: &CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
+			},
+			BackendConfig: map[string]string{"evictionPolicy": "LRU"},
+			Template: &CacheBackendPodSpecOverride{
+				NodeSelector: map[string]string{"pool": "cache"},
+				Tolerations: []corev1.Toleration{{
+					Key:      "cache",
+					Operator: corev1.TolerationOpExists,
+				}},
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsNonRoot: &runAsNonRoot,
+				},
+				RuntimeClassName:              &runtimeClassName,
+				TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+			},
+			Endpoint: "external-cache.default.svc:8080",
+		},
+		Status: CacheBackendStatus{
+			Endpoint:     "cache.default.svc:8080",
+			Health:       CacheBackendHealthReady,
+			IndexEntries: &indexEntries,
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Available",
+				Message:            "backend is ready",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	copied := backend.DeepCopy()
+	*backend.Spec.Replicas = 3
+	backend.Spec.Storage.PVC.Size.Add(resource.MustParse("1Gi"))
+	*backend.Spec.Storage.PVC.StorageClassName = "slow"
+	*backend.Spec.Integration.LookupTimeoutMs = 50
+	*backend.Spec.Integration.MinimumPrefixTokens = 128
+	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
+	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
+	backend.Spec.Template.NodeSelector["pool"] = "general"
+	backend.Spec.Template.Tolerations[0].Key = "general"
+	*backend.Spec.Template.SecurityContext.RunAsNonRoot = false
+	*backend.Spec.Template.RuntimeClassName = "kata"
+	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
+	*backend.Status.IndexEntries = 100
+	backend.Status.Conditions[0].Message = "changed"
+
+	if copied.Spec.Replicas == nil || *copied.Spec.Replicas != 2 {
+		t.Fatalf("replicas was not deep-copied")
+	}
+	if copied.Spec.Storage == nil || copied.Spec.Storage.PVC == nil {
+		t.Fatalf("storage.pvc was not deep-copied")
+	}
+	if copied.Spec.Storage.PVC.Size.Cmp(resource.MustParse("10Gi")) != 0 {
+		t.Fatalf("storage.pvc.size was not deep-copied")
+	}
+	if copied.Spec.Storage.PVC.StorageClassName == nil || *copied.Spec.Storage.PVC.StorageClassName != "fast" {
+		t.Fatalf("storage.pvc.storageClassName was not deep-copied")
+	}
+	if copied.Spec.Integration == nil {
+		t.Fatalf("integration was not deep-copied")
+	}
+	if copied.Spec.Integration.LookupTimeoutMs == nil || *copied.Spec.Integration.LookupTimeoutMs != 25 {
+		t.Fatalf("integration.lookupTimeoutMs was not deep-copied")
+	}
+	if copied.Spec.Integration.MinimumPrefixTokens == nil || *copied.Spec.Integration.MinimumPrefixTokens != 64 {
+		t.Fatalf("integration.minimumPrefixTokens was not deep-copied")
+	}
+	if copied.Spec.BackendConfig["evictionPolicy"] != "LRU" {
+		t.Fatalf("backendConfig was not deep-copied")
+	}
+	if copied.Spec.EngineSelector == nil {
+		t.Fatalf("engineSelector was not deep-copied")
+	}
+	if copied.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] != "true" {
+		t.Fatalf("engineSelector.matchLabels was not deep-copied")
+	}
+	if copied.Spec.Template == nil {
+		t.Fatalf("template was not deep-copied")
+	}
+	if copied.Spec.Template.NodeSelector["pool"] != "cache" {
+		t.Fatalf("template.nodeSelector was not deep-copied")
+	}
+	if copied.Spec.Template.Tolerations[0].Key != "cache" {
+		t.Fatalf("template.tolerations was not deep-copied")
+	}
+	if copied.Spec.Template.SecurityContext == nil ||
+		copied.Spec.Template.SecurityContext.RunAsNonRoot == nil ||
+		!*copied.Spec.Template.SecurityContext.RunAsNonRoot {
+		t.Fatalf("template.securityContext was not deep-copied")
+	}
+	if copied.Spec.Template.RuntimeClassName == nil || *copied.Spec.Template.RuntimeClassName != "runc" {
+		t.Fatalf("template.runtimeClassName was not deep-copied")
+	}
+	if copied.Spec.Template.TerminationGracePeriodSeconds == nil ||
+		*copied.Spec.Template.TerminationGracePeriodSeconds != 30 {
+		t.Fatalf("template.terminationGracePeriodSeconds was not deep-copied")
+	}
+	if copied.Status.IndexEntries == nil || *copied.Status.IndexEntries != 42 {
+		t.Fatalf("status.indexEntries was not deep-copied")
+	}
+	if copied.Status.Conditions[0].Message != "backend is ready" {
+		t.Fatalf("conditions were not deep-copied")
+	}
+}
+
+func TestCacheBackendJSONOmitEmptySpecPointers(t *testing.T) {
+	data, err := json.Marshal(CacheBackendSpec{})
+	if err != nil {
+		t.Fatalf("marshal empty spec: %v", err)
+	}
+	if string(data) != "{}" {
+		t.Fatalf("empty spec JSON = %s, want {}", data)
+	}
+}
+
+func TestCacheBackendStatusJSONIncludesExplicitZeroIndexEntries(t *testing.T) {
+	indexEntries := int64(0)
+	status := CacheBackendStatus{IndexEntries: &indexEntries}
+
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal status: %v", err)
+	}
+	if string(data) != `{"indexEntries":0}` {
+		t.Fatalf("status JSON = %s, want explicit zero indexEntries", data)
+	}
+}
+
+func loadCacheBackendOpenAPISchema(t *testing.T) map[string]any {
+	t.Helper()
+
+	version := loadCacheBackendCRDVersion(t, "v1alpha1")
+	return mustPath[map[string]any](t, version, "schema", "openAPIV3Schema")
+}
+
+func loadCacheBackendCRDVersion(t *testing.T, name string) map[string]any {
+	t.Helper()
+
+	data, err := os.ReadFile("../../config/crd/bases/inferencecache.io_cachebackends.yaml")
+	if err != nil {
+		t.Fatalf("read generated CRD: %v", err)
+	}
+
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("unmarshal generated CRD: %v", err)
+	}
+	versions := mustPath[[]any](t, crd, "spec", "versions")
+	for _, version := range versions {
+		versionSchema, ok := version.(map[string]any)
+		if !ok {
+			t.Fatalf("CRD version entry has type %T, want object", version)
+		}
+
+		versionName, ok := versionSchema["name"].(string)
+		if !ok {
+			t.Fatalf("CRD version entry has name type %T, want string", versionSchema["name"])
+		}
+		if versionName == name {
+			return versionSchema
+		}
+	}
+
+	t.Fatalf("CRD does not contain version %s", name)
+	return nil
+}
+
+func hasProperty(schema map[string]any, field string) bool {
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = properties[field]
+	return ok
+}
+
+func mustProperty(t *testing.T, schema map[string]any, field string) map[string]any {
+	t.Helper()
+	return mustPath[map[string]any](t, schema, "properties", field)
+}
+
+func requireEnum(t *testing.T, schema map[string]any, expected []string) {
+	t.Helper()
+
+	values := mustPath[[]any](t, schema, "enum")
+	actual := make([]string, 0, len(values))
+	for index, value := range values {
+		stringValue, ok := value.(string)
+		if !ok {
+			t.Fatalf("enum[%d] = %v (%T), want string", index, value, value)
+		}
+		actual = append(actual, stringValue)
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("enum = %v, want %v", actual, expected)
+	}
+}
+
+func requireNoEnum(t *testing.T, schema map[string]any) {
+	t.Helper()
+
+	if _, ok := schema["enum"]; ok {
+		t.Fatalf("schema unexpectedly has enum validation: %v", schema["enum"])
+	}
+}
+
+func requireNoProperty(t *testing.T, schema map[string]any, field string) {
+	t.Helper()
+
+	if hasProperty(schema, field) {
+		t.Fatalf("schema properties unexpectedly contain %q", field)
+	}
+}
+
+func requireNoPreserveUnknownFields(t *testing.T, schema map[string]any) {
+	t.Helper()
+
+	if value, ok := schema["x-kubernetes-preserve-unknown-fields"]; ok {
+		t.Fatalf("schema unexpectedly preserves unknown fields: %v", value)
+	}
+}
+
+func requireRequired(t *testing.T, schema map[string]any, field string) {
+	t.Helper()
+
+	values := mustPath[[]any](t, schema, "required")
+	for _, value := range values {
+		if value == field {
+			return
+		}
+	}
+	t.Fatalf("required fields = %v, want %q", values, field)
+}
+
+func requireNotRequired(t *testing.T, schema map[string]any, field string) {
+	t.Helper()
+
+	if !hasProperty(schema, field) {
+		t.Fatalf("schema properties do not contain %q", field)
+	}
+
+	requiredValue, ok := schema["required"]
+	if !ok {
+		return
+	}
+	values, ok := requiredValue.([]any)
+	if !ok {
+		t.Fatalf("required has type %T, want array", requiredValue)
+	}
+	for _, value := range values {
+		if value == field {
+			t.Fatalf("required fields = %v, did not want %q", values, field)
+		}
+	}
+}
+
+func requireMinimum(t *testing.T, schema map[string]any, expected int64) {
+	t.Helper()
+
+	minimum := mustPath[float64](t, schema, "minimum")
+	if int64(minimum) != expected {
+		t.Fatalf("minimum = %v, want %d", minimum, expected)
+	}
+}
+
+func mustPath[T any](t *testing.T, root any, path ...any) T {
+	t.Helper()
+
+	current := root
+	for _, segment := range path {
+		switch typedSegment := segment.(type) {
+		case string:
+			object, ok := current.(map[string]any)
+			if !ok {
+				t.Fatalf("path %v: got %T, want object before %q", path, current, typedSegment)
+			}
+			value, ok := object[typedSegment]
+			if !ok {
+				t.Fatalf("path %v: missing %q", path, typedSegment)
+			}
+			current = value
+		case int:
+			array, ok := current.([]any)
+			if !ok {
+				t.Fatalf("path %v: got %T, want array before %d", path, current, typedSegment)
+			}
+			if typedSegment < 0 || typedSegment >= len(array) {
+				t.Fatalf("path %v: index %d outside array length %d", path, typedSegment, len(array))
+			}
+			current = array[typedSegment]
+		default:
+			t.Fatalf("unsupported path segment %s", strconv.Quote(reflect.TypeOf(segment).String()))
+		}
+	}
+
+	typed, ok := current.(T)
+	if !ok {
+		t.Fatalf("path %v: got %T, want requested type", path, current)
+	}
+	return typed
+}
