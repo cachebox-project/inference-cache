@@ -18,6 +18,9 @@ var (
 	SchemeBuilder = &runtime.SchemeBuilder{}
 
 	// AddToScheme adds the types in this group-version to the given scheme.
+	// AddToScheme has a pointer receiver, so binding it here (before the init
+	// registrations below run) still observes them: the method value captures
+	// *SchemeBuilder and dereferences it at call time.
 	AddToScheme = SchemeBuilder.AddToScheme
 )
 
