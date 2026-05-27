@@ -206,6 +206,26 @@ func TestMetricsSinkReceivesCounts(t *testing.T) {
 	}
 }
 
+func TestStatsKeyedByTopLevelReplicaID(t *testing.T) {
+	idx := New()
+	// The nested stats.ReplicaID disagrees with the authoritative top-level one;
+	// CacheState must report the top-level id (the key), not the nested value.
+	idx.Ingest(Update{ReplicaID: "real-replica", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}},
+		Stats:    &ReplicaStats{ReplicaID: "mismatched", CacheMemoryBytes: 42}})
+
+	replicas, total := idx.CacheState("t", "m")
+	if total != 1 {
+		t.Fatalf("total prefixes = %d, want 1", total)
+	}
+	if len(replicas) != 1 || replicas[0].ReplicaID != "real-replica" {
+		t.Fatalf("stats should carry the top-level replica id, got %+v", replicas)
+	}
+	if replicas[0].CacheMemoryBytes != 42 {
+		t.Fatalf("stats payload lost: cacheMemoryBytes = %d, want 42", replicas[0].CacheMemoryBytes)
+	}
+}
+
 func TestMetricsZeroedWhenModelDrains(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(4_000_000, 0)}
 	m := &countingMetrics{}

@@ -153,7 +153,9 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 	}
 	if st := u.GetStats(); st != nil {
 		out.Stats = &index.ReplicaStats{
-			ReplicaID:        st.GetReplicaId(),
+			// Use the top-level replica id (the index key); the nested
+			// stats.replica_id is redundant and not trusted for identity.
+			ReplicaID:        u.GetReplicaId(),
 			CacheMemoryBytes: st.GetCacheMemoryBytes(),
 			HitRate:          st.GetHitRate(),
 			Pressure:         st.GetPressure(),

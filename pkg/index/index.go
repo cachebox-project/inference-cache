@@ -224,7 +224,9 @@ func (i *Index) Ingest(u Update) {
 		replicas[u.ReplicaID] = replicaEntry{tokenCount: p.TokenCount, lastSeen: ts}
 	}
 	if u.Stats != nil {
-		i.stats[statsKey{u.Tenant, u.Model, u.ReplicaID}] = statEntry{stats: *u.Stats, lastSeen: ts}
+		st := *u.Stats
+		st.ReplicaID = u.ReplicaID // top-level replica id is authoritative — it is the index key
+		i.stats[statsKey{u.Tenant, u.Model, u.ReplicaID}] = statEntry{stats: st, lastSeen: ts}
 	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
