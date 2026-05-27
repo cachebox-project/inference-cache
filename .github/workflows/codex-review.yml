@@ -1,0 +1,115 @@
+name: Codex Review
+
+# Automated code review on pull requests using OpenAI Codex.
+#
+# Requires a repository secret OPENAI_API_KEY (Settings → Secrets and variables
+# → Actions). The review is advisory: it posts a comment, it does NOT gate the
+# merge. The build/test gate lives in ci.yml.
+#
+# Forked PRs are skipped — pull_request does not expose secrets to forks, and we
+# deliberately avoid pull_request_target (which would run untrusted code with
+# secret access).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    name: Codex Review
+    runs-on: ubuntu-latest
+    # Skip forks (no secret access) so they don't show a spurious failure.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        # Check out the PR's merge commit.
+        ref: refs/pull/${{ github.event.pull_request.number }}/merge
+        persist-credentials: false
+
+    - name: Pre-fetch base and head refs for the PR
+      env:
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        git fetch --no-tags origin \
+          "$PR_BASE_REF" \
+          "+refs/pull/$PR_NUMBER/head"
+
+    - name: Run Codex
+      id: run_codex
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+        sandbox: read-only
+        prompt: |
+          You are reviewing PR #${{ github.event.pull_request.number }} for ${{ github.repository }},
+          a vendor-neutral, open-source Kubernetes-native cache plane for LLM inference.
+
+          Review ONLY the changes introduced by this PR:
+            git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+          Read the full diff and the surrounding code, then check against this project's standard:
+
+          1. Vendor-neutral naming (HARD RULE — see CONTRIBUTING.md). No `oci`, `oracle`,
+             `*.oci.com`, or `oraclecloud.com` may appear in any core-identity surface:
+             API/CRD group, kubebuilder domain, proto package, gRPC service/package, Go module
+             path, default namespace, image registry, Helm chart, or any user-facing default.
+             Cloud-specific integration is allowed ONLY in an isolated optional adapter under
+             pkg/adapters/.../ — never in core controllers, CRD types, the proto contract, or
+             default config/samples.
+          2. Contract & spec. Changes should match the design docs under docs/design/. Any
+             change to proto/ MUST be mirrored in docs/design/grpc-contract.md (field numbers,
+             reason-code enums, RPC signatures). v1alpha1 must stay backward-compatible: no
+             renumbered/removed proto fields, no breaking CRD field changes.
+          3. gRPC fail-open semantics. Lookups (RenderTemplate, LookupRoute, LookupPDRoute,
+             GetCacheState) must be side-effect-free and fail open (empty result + NO_HINT/OK),
+             never erroring on the hot path. prefix_hash is engine-opaque bytes;
+             CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or prompt text.
+          4. Quality. New/changed behavior has tests (control-flow paths exercised, ideally over
+             the wire); errors are wrapped not swallowed; code lands in the right package;
+             generated code (config/crd, zz_generated*, pkg/server/proto) is regenerated, not
+             hand-edited.
+
+          Be concise and specific. Group findings by severity (Blocking / Should-fix / Nit) with
+          file:line references, then give a verdict (approve / approve-with-nits / changes-requested).
+          If there are no issues, say so briefly.
+
+          Pull request title and body:
+          ----
+          ${{ github.event.pull_request.title }}
+          ${{ github.event.pull_request.body }}
+
+  post_feedback:
+    name: Post Codex feedback
+    runs-on: ubuntu-latest
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+    - name: Report Codex feedback
+      uses: actions/github-script@v7
+      env:
+        CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            body: `### Codex review\n\n${process.env.CODEX_FINAL_MESSAGE}`,
+          });
