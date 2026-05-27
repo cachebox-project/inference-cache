@@ -38,7 +38,9 @@ Run the server locally:
 
 ```bash
 bin/server --grpc-bind-address=:9090 --http-bind-address=:8080
-curl -i http://localhost:8080/healthz
+curl -i http://localhost:8080/healthz   # liveness
+curl -i http://localhost:8080/readyz    # readiness
+curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
 ```
 
 ## Local Development Cluster

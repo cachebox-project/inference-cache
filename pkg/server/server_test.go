@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,47 +18,34 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
-func TestHealthzReturnsOK(t *testing.T) {
-	grpcListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen grpc: %v", err)
-	}
-	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen http: %v", err)
-	}
+func TestHealthAndReadinessReturnOK(t *testing.T) {
+	_, baseURL, stop := startInProcessServer(t)
+	defer stop()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- New().Serve(ctx, grpcListener, httpListener)
-	}()
+	for _, path := range []string{"/healthz", "/readyz"} {
+		status, body := getString(t, baseURL+path)
+		if status != http.StatusOK {
+			t.Errorf("%s status = %d, want %d", path, status, http.StatusOK)
+		}
+		if body != "ok\n" {
+			t.Errorf("%s body = %q, want %q", path, body, "ok\n")
+		}
+	}
+}
 
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + httpListener.Addr().String() + "/healthz")
-	if err != nil {
-		cancel()
-		t.Fatalf("get /healthz: %v", err)
-	}
-	defer resp.Body.Close()
+// TestMetricsExposesServerUp checks the Prometheus endpoint is mounted and
+// emits the documented inferencecache_server_up gauge (tech spec §4.3), set to
+// 1 while the server is serving.
+func TestMetricsExposesServerUp(t *testing.T) {
+	_, baseURL, stop := startInProcessServer(t)
+	defer stop()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		cancel()
-		t.Fatalf("read body: %v", err)
+	status, body := getString(t, baseURL+"/metrics")
+	if status != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want %d", status, http.StatusOK)
 	}
-	if resp.StatusCode != http.StatusOK {
-		cancel()
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	if string(body) != "ok\n" {
-		cancel()
-		t.Fatalf("body = %q, want ok", string(body))
-	}
-
-	cancel()
-	if err := <-errCh; err != nil {
-		t.Fatalf("serve shutdown: %v", err)
+	if !strings.Contains(body, "inferencecache_server_up 1") {
+		t.Fatalf("/metrics missing 'inferencecache_server_up 1'; body:\n%s", body)
 	}
 }
 
@@ -88,13 +76,14 @@ func TestRenderTemplateFailsOpen(t *testing.T) {
 }
 
 // startInProcessServer starts the service on an in-memory gRPC listener
-// (bufconn) plus a loopback HTTP listener and returns a connected client. The
-// returned stop func tears the server down and fails the test if Serve
-// reported an error. bufSize is the size of bufconn's in-memory pipe buffer —
-// it bounds bytes in flight on the fake socket, unrelated to the size of any
-// individual CacheStateUpdate; 1 MiB is the standard bufconn default and is
-// ample for these metadata-only messages.
-func startInProcessServer(t *testing.T) (icpb.InferenceCacheClient, func()) {
+// (bufconn) plus a loopback HTTP listener. It returns a connected gRPC client,
+// the HTTP base URL ("http://host:port") for the health/metrics endpoints, and
+// a stop func that tears the server down and fails the test if Serve reported
+// an error. bufSize is the size of bufconn's in-memory pipe buffer — it bounds
+// bytes in flight on the fake socket, unrelated to the size of any individual
+// CacheStateUpdate; 1 MiB is the standard bufconn default and is ample for
+// these metadata-only messages.
+func startInProcessServer(t *testing.T) (client icpb.InferenceCacheClient, httpBaseURL string, stop func()) {
 	t.Helper()
 
 	const bufSize = 1024 * 1024
@@ -123,14 +112,31 @@ func startInProcessServer(t *testing.T) (icpb.InferenceCacheClient, func()) {
 		t.Fatalf("dial bufnet: %v", err)
 	}
 
-	stop := func() {
+	stop = func() {
 		_ = conn.Close()
 		cancel()
 		if err := <-errCh; err != nil {
 			t.Errorf("serve shutdown: %v", err)
 		}
 	}
-	return icpb.NewInferenceCacheClient(conn), stop
+	return icpb.NewInferenceCacheClient(conn), "http://" + httpListener.Addr().String(), stop
+}
+
+// getString issues a GET against the server's HTTP endpoint and returns the
+// status code and body.
+func getString(t *testing.T, url string) (int, string) {
+	t.Helper()
+	httpClient := http.Client{Timeout: 2 * time.Second}
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body from %s: %v", url, err)
+	}
+	return resp.StatusCode, string(body)
 }
 
 // TestInferenceCacheServiceOverGRPC exercises the service over a real gRPC
@@ -139,7 +145,7 @@ func startInProcessServer(t *testing.T) (icpb.InferenceCacheClient, func()) {
 // ReportCacheState client-stream — the one handler with non-trivial control
 // flow — drains updates and returns an Ack over the wire.
 func TestInferenceCacheServiceOverGRPC(t *testing.T) {
-	client, stop := startInProcessServer(t)
+	client, _, stop := startInProcessServer(t)
 	defer stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -179,7 +185,7 @@ func TestInferenceCacheServiceOverGRPC(t *testing.T) {
 // returns a cancellation error — not io.EOF — and the handler propagates it
 // rather than acking. The happy-path test only exercises the EOF→Ack branch.
 func TestReportCacheStateClientCancel(t *testing.T) {
-	client, stop := startInProcessServer(t)
+	client, _, stop := startInProcessServer(t)
 	defer stop()
 
 	ctx, cancel := context.WithCancel(context.Background())

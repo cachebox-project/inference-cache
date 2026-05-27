@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -29,10 +30,11 @@ func DefaultConfig() Config {
 	}
 }
 
-// Service hosts the empty gRPC API and HTTP health endpoints.
+// Service hosts the gRPC API and the HTTP health/metrics endpoints.
 type Service struct {
 	grpcServer *grpc.Server
 	httpServer *http.Server
+	metrics    *serverMetrics
 }
 
 // New constructs a cache service.
@@ -43,11 +45,17 @@ func New() *Service {
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService())
 
+	metrics := newServerMetrics()
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	// /healthz — liveness: the process is up.
+	mux.HandleFunc("/healthz", writeOK)
+	// /readyz — readiness: the server is ready to take traffic. The stub server
+	// has no external dependencies to gate on yet, so readiness tracks liveness;
+	// real dependency checks (index warm, backends reachable) land with B6.
+	mux.HandleFunc("/readyz", writeOK)
+	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
 
 	return &Service{
 		grpcServer: grpcServer,
@@ -55,7 +63,14 @@ func New() *Service {
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
+		metrics: metrics,
 	}
+}
+
+// writeOK is the handler for the plain-text health/readiness probes.
+func writeOK(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // ListenAndServe starts both listeners from the supplied config.
@@ -74,6 +89,11 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 
 // Serve starts gRPC and HTTP servers on existing listeners.
 func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.Listener) error {
+	// Mark the server up before launching the listeners so a scrape can never
+	// observe inferencecache_server_up=0 while Serve is already running.
+	s.metrics.up.Set(1)
+	defer s.metrics.up.Set(0)
+
 	errCh := make(chan error, 2)
 	go func() {
 		if err := s.grpcServer.Serve(grpcListener); err != nil {
