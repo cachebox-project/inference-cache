@@ -28,9 +28,10 @@ const (
 
 // CacheIndexPoller periodically scrapes the server's internal /snapshot endpoint
 // and reflects the cluster-wide cache aggregate into the singleton CacheIndex
-// CR status (server pushes the data; the controller writes the CR). It is a
-// leader-elected manager Runnable, not an event-driven reconciler, because the
-// data source is the server's in-memory index, not the CR itself.
+// CR status — the server exposes the data, the controller scrapes it and writes
+// the CR. It is a leader-elected manager Runnable, not an event-driven
+// reconciler, because the data source is the server's in-memory index, not the
+// CR itself.
 type CacheIndexPoller struct {
 	Client      client.Client
 	Log         logr.Logger
