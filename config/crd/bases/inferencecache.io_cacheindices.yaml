@@ -122,8 +122,12 @@ spec:
                         reported the state).
                       type: string
                     lastUpdate:
-                      description: LastUpdate is when the replica's state was last
-                        observed.
+                      description: |-
+                        LastUpdate is when this replica's reported state last *changed*. Like the
+                        top-level status.lastUpdated, the controller writes status only on change,
+                        so a replica that keeps reporting identical stats does not advance this —
+                        it marks the last change, not the last observation. (Reporter liveness is
+                        observable via the server's /metrics, not this field.)
                       format: date-time
                       type: string
                     pressure:

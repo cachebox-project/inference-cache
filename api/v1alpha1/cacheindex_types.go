@@ -26,7 +26,11 @@ type ReplicaCacheStatus struct {
 	// string (e.g. "0.65").
 	// +optional
 	Pressure string `json:"pressure,omitempty"`
-	// LastUpdate is when the replica's state was last observed.
+	// LastUpdate is when this replica's reported state last *changed*. Like the
+	// top-level status.lastUpdated, the controller writes status only on change,
+	// so a replica that keeps reporting identical stats does not advance this —
+	// it marks the last change, not the last observation. (Reporter liveness is
+	// observable via the server's /metrics, not this field.)
 	// +optional
 	LastUpdate metav1.Time `json:"lastUpdate,omitempty"`
 }
