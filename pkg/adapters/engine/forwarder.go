@@ -67,7 +67,11 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 		pendTs  int64
 	)
 	defer func() {
-		r.flush(ctx, &stream, &pending, pendTs)
+		// Final flush on shutdown: ctx is already cancelled, so use a short
+		// detached context so the last buffered adds still land.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		r.flush(flushCtx, &stream, &pending, pendTs)
 		r.closeStream(&stream)
 	}()
 
