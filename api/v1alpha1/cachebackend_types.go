@@ -201,6 +201,11 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
+	// ObservedGeneration is the .metadata.generation last reconciled by the controller.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Conditions describe the latest observations of the backend.
 	// +optional
 	// +listType=map
