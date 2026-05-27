@@ -63,6 +63,9 @@ jobs:
     - name: Test (race detector)
       run: make test-race
 
+    - name: Coverage gate
+      run: make cover-check
+
     # Advisory for now: govulncheck currently reports known CVEs in the Go
     # toolchain stdlib + x/net + grpc that require a deliberate Go 1.25 / grpc
     # upgrade (tracked separately). Surfaced here for visibility; flip to

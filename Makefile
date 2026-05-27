@@ -140,6 +140,30 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 	@test -s $(GOVULNCHECK) || GOBIN=$(LOCALBIN) $(GO_CMD) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	$(GOVULNCHECK) ./...
 
+# Coverage gate. We measure the hand-written logic packages only: generated
+# code (proto stubs, deepcopy), entrypoints (cmd/), and test helpers are
+# excluded because their (un)covered statements would swamp the real signal.
+COVER_MIN ?= 65
+COVER_PROFILE ?= cover.out
+COVER_PROFILE_LOGIC ?= cover.logic.out
+COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|pkg/testing/
+
+.PHONY: cover
+cover: ## Run tests with coverage and print the per-function report (logic packages).
+	$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE)
+	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
+	@$(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC)
+
+.PHONY: cover-check
+cover-check: ## Fail if logic-package coverage is below COVER_MIN% (excludes generated/cmd/test-helper code).
+	@$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE) >/dev/null
+	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
+	@total=$$($(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC) | awk '/^total:/ {gsub(/%/,"",$$3); print $$3}'); \
+	if [ -z "$$total" ]; then echo "✗ no coverage data"; exit 1; fi; \
+	awk "BEGIN { exit !($$total >= $(COVER_MIN)) }" \
+		&& echo "✓ logic coverage $$total% (min $(COVER_MIN)%)" \
+		|| { echo "✗ logic coverage $$total% is below the $(COVER_MIN)% gate"; exit 1; }
+
 .PHONY: test-env
 test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
