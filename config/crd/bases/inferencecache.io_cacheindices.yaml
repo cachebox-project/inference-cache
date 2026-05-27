@@ -21,7 +21,7 @@ spec:
       name: Prefixes
       type: integer
     - jsonPath: .status.lastUpdated
-      name: Updated
+      name: Changed
       type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -64,8 +64,11 @@ spec:
               or prompt text.
             properties:
               lastUpdated:
-                description: LastUpdated is when the controller last refreshed this
-                  status.
+                description: |-
+                  LastUpdated is when the observed aggregate last *changed*. The controller
+                  writes the status only on change, so a steady-state poll that finds no
+                  change does not advance this — it marks the last data change, not the last
+                  poll. (Poller liveness is observable via controller health/metrics.)
                 format: date-time
                 type: string
               observedServer:
@@ -82,14 +85,19 @@ spec:
                       hot:
                         description: |-
                           Hot is the number of prefixes with access count above the hot threshold.
-                          Always 0 until per-prefix access counting is implemented.
+                          Always 0 until per-prefix access counting is implemented; rendered
+                          explicitly so an empty index shows hot: 0 rather than omitting it.
                         format: int64
                         type: integer
                       total:
-                        description: Total is the number of distinct prefixes currently
-                          in the index.
+                        description: |-
+                          Total is the number of distinct prefixes currently in the index.
+                          Always rendered (including 0) — it's the core summary, not omitempty.
                         format: int64
                         type: integer
+                    required:
+                    - hot
+                    - total
                     type: object
                 type: object
               replicas:

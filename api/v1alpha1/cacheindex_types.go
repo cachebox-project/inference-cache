@@ -45,12 +45,12 @@ type TenantCacheStatus struct {
 // PrefixSummary summarizes the prefix entries held across the cluster.
 type PrefixSummary struct {
 	// Total is the number of distinct prefixes currently in the index.
-	// +optional
-	Total int64 `json:"total,omitempty"`
+	// Always rendered (including 0) — it's the core summary, not omitempty.
+	Total int64 `json:"total"`
 	// Hot is the number of prefixes with access count above the hot threshold.
-	// Always 0 until per-prefix access counting is implemented.
-	// +optional
-	Hot int64 `json:"hot,omitempty"`
+	// Always 0 until per-prefix access counting is implemented; rendered
+	// explicitly so an empty index shows hot: 0 rather than omitting it.
+	Hot int64 `json:"hot"`
 }
 
 // PrefixStatus holds the prefix summary. The summary is nested (rather than
@@ -82,7 +82,10 @@ type CacheIndexStatus struct {
 	// ObservedServer is the server endpoint the aggregate was scraped from.
 	// +optional
 	ObservedServer string `json:"observedServer,omitempty"`
-	// LastUpdated is when the controller last refreshed this status.
+	// LastUpdated is when the observed aggregate last *changed*. The controller
+	// writes the status only on change, so a steady-state poll that finds no
+	// change does not advance this — it marks the last data change, not the last
+	// poll. (Poller liveness is observable via controller health/metrics.)
 	// +optional
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
 }
@@ -91,7 +94,7 @@ type CacheIndexStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=ci
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.prefixes.summary.total`
-// +kubebuilder:printcolumn:name="Updated",type=date,JSONPath=`.status.lastUpdated`
+// +kubebuilder:printcolumn:name="Changed",type=date,JSONPath=`.status.lastUpdated`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CacheIndex is a cluster-scoped, status-only reflection of the server's

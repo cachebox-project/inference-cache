@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +44,20 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	}
 	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].HitRate != "0.8" {
 		t.Fatalf("tenant = %+v", st.Tenants[0])
+	}
+}
+
+func TestEmptyIndexStatusRendersZeroSummary(t *testing.T) {
+	// An empty index must still render prefixes.summary.{total,hot}=0 explicitly
+	// (not omit them), matching the contract shape.
+	st := buildCacheIndexStatus(index.Snapshot{}, "http://server/snapshot", time.Unix(1, 0))
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	js := string(b)
+	if !strings.Contains(js, `"total":0`) || !strings.Contains(js, `"hot":0`) {
+		t.Fatalf("empty summary should render total:0 and hot:0, got %s", js)
 	}
 }
 
