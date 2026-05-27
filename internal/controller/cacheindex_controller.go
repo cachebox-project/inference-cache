@@ -40,7 +40,10 @@ type CacheIndexPoller struct {
 	Name        string        // singleton CR name; "" → DefaultCacheIndexName
 }
 
-// +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices,verbs=get;list;watch;create;update;patch;delete
+// The poller reads via the manager's cached client (a Get is backed by an
+// informer, hence list+watch) and creates the singleton; it never updates,
+// patches, or deletes the resource itself — only its status subresource.
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices/status,verbs=get;update;patch
 
 // Start runs the refresh loop until ctx is done. Satisfies manager.Runnable.
