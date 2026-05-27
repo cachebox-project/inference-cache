@@ -138,7 +138,7 @@ func (p *CacheIndexPoller) logger(ctx context.Context) logr.Logger {
 func fetchSnapshot(ctx context.Context, hc *http.Client, url string) (index.Snapshot, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return index.Snapshot{}, err
+		return index.Snapshot{}, fmt.Errorf("build snapshot request %q: %w", url, err)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
