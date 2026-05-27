@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
@@ -85,16 +87,19 @@ func TestRenderTemplateFailsOpen(t *testing.T) {
 	}
 }
 
-// TestInferenceCacheServiceOverGRPC exercises the service over a real gRPC
-// connection (in-memory bufconn). Unlike the handler-level tests above, this
-// proves the service is actually registered on the server and that the
-// ReportCacheState client-stream — the one handler with non-trivial control
-// flow — drains updates and returns an Ack over the wire.
-func TestInferenceCacheServiceOverGRPC(t *testing.T) {
+// startInProcessServer starts the service on an in-memory gRPC listener
+// (bufconn) plus a loopback HTTP listener and returns a connected client. The
+// returned stop func tears the server down and fails the test if Serve
+// reported an error. bufSize is the size of bufconn's in-memory pipe buffer —
+// it bounds bytes in flight on the fake socket, unrelated to the size of any
+// individual CacheStateUpdate; 1 MiB is the standard bufconn default and is
+// ample for these metadata-only messages.
+func startInProcessServer(t *testing.T) (icpb.InferenceCacheClient, func()) {
+	t.Helper()
+
 	const bufSize = 1024 * 1024
 	grpcListener := bufconn.Listen(bufSize)
 
-	// HTTP server still needs a real listener; bind an ephemeral local port.
 	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen http: %v", err)
@@ -117,47 +122,83 @@ func TestInferenceCacheServiceOverGRPC(t *testing.T) {
 		cancel()
 		t.Fatalf("dial bufnet: %v", err)
 	}
-	defer conn.Close()
 
-	client := icpb.NewInferenceCacheClient(conn)
-	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer callCancel()
+	stop := func() {
+		_ = conn.Close()
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Errorf("serve shutdown: %v", err)
+		}
+	}
+	return icpb.NewInferenceCacheClient(conn), stop
+}
+
+// TestInferenceCacheServiceOverGRPC exercises the service over a real gRPC
+// connection (in-memory bufconn). Unlike the handler-level tests above, this
+// proves the service is actually registered on the server and that the
+// ReportCacheState client-stream — the one handler with non-trivial control
+// flow — drains updates and returns an Ack over the wire.
+func TestInferenceCacheServiceOverGRPC(t *testing.T) {
+	client, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	// Unary RPC over the wire confirms the service is registered.
-	lookup, err := client.LookupRoute(callCtx, &icpb.LookupRouteRequest{ModelId: "m"})
+	lookup, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{ModelId: "m"})
 	if err != nil {
-		cancel()
 		t.Fatalf("LookupRoute over grpc: %v", err)
 	}
 	if lookup.GetReasonCode() != "NO_HINT" {
-		cancel()
 		t.Fatalf("reason = %q, want NO_HINT", lookup.GetReasonCode())
 	}
 
-	// Client-stream: send a couple of metadata-only updates, expect an Ack.
-	stream, err := client.ReportCacheState(callCtx)
+	// Client-stream happy path: send metadata-only updates, half-close, expect Ack.
+	stream, err := client.ReportCacheState(ctx)
 	if err != nil {
-		cancel()
 		t.Fatalf("open ReportCacheState: %v", err)
 	}
 	for _, replicaID := range []string{"replica-a", "replica-b"} {
 		if err := stream.Send(&icpb.CacheStateUpdate{ReplicaId: replicaID}); err != nil {
-			cancel()
 			t.Fatalf("send update %q: %v", replicaID, err)
 		}
 	}
 	ack, err := stream.CloseAndRecv()
 	if err != nil {
-		cancel()
 		t.Fatalf("CloseAndRecv: %v", err)
 	}
 	if !ack.GetAccepted() {
-		cancel()
 		t.Fatalf("ack.Accepted = false, want true")
 	}
+}
 
+// TestReportCacheStateClientCancel covers the non-EOF error branch of the
+// ReportCacheState handler. When the client cancels mid-stream (e.g. a crashed
+// or disconnected engine adapter) instead of half-closing, the server's Recv
+// returns a cancellation error — not io.EOF — and the handler propagates it
+// rather than acking. The happy-path test only exercises the EOF→Ack branch.
+func TestReportCacheStateClientCancel(t *testing.T) {
+	client, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.ReportCacheState(ctx)
+	if err != nil {
+		cancel()
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{ReplicaId: "replica-a"}); err != nil {
+		cancel()
+		t.Fatalf("send update: %v", err)
+	}
+
+	// Abort mid-stream without half-closing; the server must not return a success Ack.
 	cancel()
-	if err := <-errCh; err != nil {
-		t.Fatalf("serve shutdown: %v", err)
+
+	if ack, err := stream.CloseAndRecv(); err == nil {
+		t.Fatalf("CloseAndRecv after cancel: got ack %+v, want error", ack)
+	} else if status.Code(err) != codes.Canceled {
+		t.Fatalf("error code = %v, want Canceled", status.Code(err))
 	}
 }
