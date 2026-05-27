@@ -142,6 +142,7 @@ func (z *zmqSource) Close() error { return z.sock.Close() }
 func dialZMQ(ctx context.Context, endpoint, topic string) (frameSource, error) {
 	sub := zmq4.NewSub(ctx)
 	if err := sub.Dial(endpoint); err != nil {
+		_ = sub.Close() // Run retries forever; don't leak a socket per backoff cycle
 		return nil, fmt.Errorf("zmq dial %s: %w", endpoint, err)
 	}
 	if err := sub.SetOption(zmq4.OptionSubscribe, topic); err != nil {
