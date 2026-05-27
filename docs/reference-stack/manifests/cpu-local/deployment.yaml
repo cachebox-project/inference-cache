@@ -1,18 +1,19 @@
-# CPU-only prefix-cache demo — runs WITHOUT a GPU and WITHOUT LMCache.
+# CPU-only variant — runs WITHOUT a GPU and WITHOUT LMCache.
 #
-# Scope: demonstrates a prefix-cache hit on a small model using vLLM's CPU build.
-# It does NOT exercise the KV-cache event stream — that path requires the vLLM
-# v1 engine, and v1 does not support CPU execution (it raises NotImplementedError
-# under VLLM_USE_V1=1). So this variant runs on v0 (VLLM_USE_V1=0) and omits the
-# --kv-events-config publisher.
+# Validates the full engine-config path off-GPU: a prefix-cache hit AND the
+# KV-cache event stream (BlockStored/BlockRemoved over ZMQ). vLLM's v1 engine
+# runs on CPU (vLLM >= ~0.21), and the event publisher works there too — so this
+# exercises the same signal a cache-aware router/controller consumes, just slower
+# and without LMCache offload.
 #
-# To validate the event decode/redaction path without a GPU, use the synthetic
-# publisher instead (../../README.md "CPU-only local check"); that is the
-# verified GPU-less check. The real KV-cache event capture happens on the GPU path.
+# VERIFIED (vLLM 0.21.0 CPU image, arm64, via `docker run`): prefix-cache hit
+# (cold ~31s -> warm ~1.4s; vllm:prefix_cache_hits increments) and real
+# BlockStored events captured over ZMQ. Flags below mirror that run.
 #
-# NOTE: this manifest is NOT verified end-to-end (no GPU here, and image pulls are
-# blocked in the authoring environment). Flags follow the vLLM CPU docs; treat it
-# as a starting point and adjust for your host.
+# MEMORY: the vLLM CPU runtime baseline is ~5 GiB before any KV cache. Give the
+# node/VM enough RAM that (baseline + VLLM_CPU_KVCACHE_SPACE + headroom) fits, or
+# the engine aborts with "Available memory ... less than requested memory for kv".
+# ~10+ GiB is comfortable for this 0.5B model with a 4 GiB KV cache.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,27 +33,31 @@ spec:
     spec:
       containers:
         - name: vllm
-          # vLLM's dedicated CPU image (arch-tagged). Use -arm64 on ARM hosts.
-          image: vllm/vllm-openai-cpu:latest-x86_64
+          # vLLM's dedicated CPU image (arch-tagged). Use -x86_64 on x86 hosts.
+          image: vllm/vllm-openai-cpu:latest-arm64
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
           args:
             - "--port=8000"
             - "--dtype=bfloat16"
             - "--max-model-len=8192"
-            - "--enable-prefix-caching"   # prefix caching exists on v0; this is the demo
+            - "--enforce-eager"            # skip torch.compile — faster start, less memory on CPU
+            - "--enable-prefix-caching"
+            # KV-cache event publisher — works on the CPU v1 engine.
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
           env:
-            - name: VLLM_USE_V1            # CPU requires v0; v1 is GPU-only
-              value: "0"
-            - name: VLLM_CPU_KVCACHE_SPACE # GiB of CPU KV cache
+            - name: VLLM_CPU_KVCACHE_SPACE  # GiB (integer) of CPU KV cache; needs node RAM (see header)
               value: "4"
           ports:
             - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
           readinessProbe:
             httpGet: { path: /health, port: http }
-            initialDelaySeconds: 120
-            periodSeconds: 15
-            failureThreshold: 120
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120          # CPU model load + warmup is slow
           volumeMounts:
             - { name: cache-home, mountPath: /root/.cache/huggingface }
             - { name: shm, mountPath: /dev/shm }
@@ -77,3 +82,4 @@ spec:
     app: vllm-cpu-sanity
   ports:
     - { name: http, port: 8000, targetPort: http, nodePort: 30080 }
+    - { name: kv-events, port: 5557, targetPort: kv-events, nodePort: 30557 }
