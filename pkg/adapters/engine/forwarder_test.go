@@ -17,11 +17,14 @@ import (
 )
 
 // recordingServer captures what the Reporter sends, over a real gRPC connection.
+// ops is an ordered receipt log ("add:<hex>" / "evict:<hex>" / "clear") used to
+// assert cross-RPC ordering.
 type recordingServer struct {
 	icpb.UnimplementedInferenceCacheServer
 	mu      sync.Mutex
 	updates []*icpb.CacheStateUpdate
 	events  []*icpb.CacheEvent
+	ops     []string
 }
 
 func (s *recordingServer) ReportCacheState(stream icpb.InferenceCache_ReportCacheStateServer) error {
@@ -35,6 +38,9 @@ func (s *recordingServer) ReportCacheState(stream icpb.InferenceCache_ReportCach
 		}
 		s.mu.Lock()
 		s.updates = append(s.updates, u)
+		for _, p := range u.GetPrefixes() {
+			s.ops = append(s.ops, "add:"+string(p.GetPrefixHash()))
+		}
 		s.mu.Unlock()
 	}
 }
@@ -42,6 +48,12 @@ func (s *recordingServer) ReportCacheState(stream icpb.InferenceCache_ReportCach
 func (s *recordingServer) PublishEvent(_ context.Context, ev *icpb.CacheEvent) (*icpb.Ack, error) {
 	s.mu.Lock()
 	s.events = append(s.events, ev)
+	switch ev.GetType() {
+	case icpb.CacheEvent_PREFIX_EVICTED:
+		s.ops = append(s.ops, "evict:"+string(ev.GetPrefixHash()))
+	case icpb.CacheEvent_ALL_CLEARED:
+		s.ops = append(s.ops, "clear")
+	}
 	s.mu.Unlock()
 	return &icpb.Ack{Accepted: true}, nil
 }
@@ -132,6 +144,35 @@ func TestReporterFlushesPendingOnShutdown(t *testing.T) {
 	}
 	if !found {
 		t.Error("shutdown flush did not deliver the buffered add")
+	}
+}
+
+// Store-then-evict within one debounce window must reach the server in order
+// (add before evict), or the additive add would re-create the evicted prefix.
+func TestReporterFlushesAddsBeforeRemoval(t *testing.T) {
+	h := []byte{0x55}
+	// Large window so only the BlockRemoved-triggered flush (not the ticker) can
+	// deliver the buffered add — exercising the ordering guarantee.
+	rec := runReporterWindow(t, time.Hour,
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{h}}}},
+	)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var addAt, evictAt = -1, -1
+	for i, op := range rec.ops {
+		switch op {
+		case "add:" + string(h):
+			addAt = i
+		case "evict:" + string(h):
+			evictAt = i
+		}
+	}
+	if addAt < 0 || evictAt < 0 {
+		t.Fatalf("missing ops, got %v", rec.ops)
+	}
+	if addAt > evictAt {
+		t.Errorf("add (%d) must precede evict (%d); ops=%v", addAt, evictAt, rec.ops)
 	}
 }
 

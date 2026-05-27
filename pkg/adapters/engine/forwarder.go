@@ -104,6 +104,11 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 						flush()
 					}
 				case BlockRemoved:
+					// Removals are the pruning path and adds are additive, so the
+					// eviction must not be overtaken by a still-buffered add of the
+					// same block (store-then-evict within one window). Flush pending
+					// adds first to preserve store→evict order.
+					flush()
 					for _, cev := range r.cfg.RemovedEvents(e, b.TimestampSeconds) {
 						r.publish(cev)
 					}
