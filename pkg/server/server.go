@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
+	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
@@ -35,25 +36,33 @@ type Service struct {
 	grpcServer *grpc.Server
 	httpServer *http.Server
 	metrics    *serverMetrics
+	index      *index.Index
 }
 
 // New constructs a cache service.
 func New() *Service {
+	metrics := newServerMetrics()
+	idx := index.New(index.WithMetrics(metrics))
+
 	grpcServer := grpc.NewServer()
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService())
-
-	metrics := newServerMetrics()
+	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics))
 
 	mux := http.NewServeMux()
 	// /healthz — liveness: the process is up.
 	mux.HandleFunc("/healthz", writeOK)
-	// /readyz — readiness: the server is ready to take traffic. The stub server
-	// has no external dependencies to gate on yet, so readiness tracks liveness;
-	// real dependency checks (index warm, backends reachable) land with B6.
-	mux.HandleFunc("/readyz", writeOK)
+	// /readyz — readiness: gated on the cache index being started/ingesting.
+	// (Engine-warm gating — waiting for the initial KV-event sync — arrives with
+	// the C1 hook; today the index becomes ready as soon as Serve starts it.)
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !idx.Ready() {
+			http.Error(w, "not ready\n", http.StatusServiceUnavailable)
+			return
+		}
+		writeOK(w, nil)
+	})
 	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
 
@@ -64,6 +73,7 @@ func New() *Service {
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 		metrics: metrics,
+		index:   idx,
 	}
 }
 
@@ -89,6 +99,10 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 
 // Serve starts gRPC and HTTP servers on existing listeners.
 func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.Listener) error {
+	// Start the cache index (marks it ready and runs TTL eviction until ctx is
+	// done) before accepting traffic, so /readyz and lookups reflect a live index.
+	s.index.Start(ctx)
+
 	// Mark the server up before launching the listeners so a scrape can never
 	// observe inferencecache_server_up=0 while Serve is already running.
 	s.metrics.up.Set(1)
