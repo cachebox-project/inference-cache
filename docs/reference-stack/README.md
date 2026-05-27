@@ -108,6 +108,11 @@ has no LMCache offload. Uses a tiny model on vLLM's CPU build.
 > needs enough RAM — see the memory note in
 > [`manifests/cpu-local/deployment.yaml`](manifests/cpu-local/deployment.yaml).
 
+> **Match the image to your host arch.** `manifests/cpu-local/deployment.yaml`
+> defaults to the **`-arm64`** image tag. On x86_64 hosts, change it to
+> `vllm/vllm-openai-cpu:latest-x86_64` first (the tags are arch-specific):
+> `sed -i 's/latest-arm64/latest-x86_64/' manifests/cpu-local/deployment.yaml`.
+
 ```bash
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
 kubectl apply -f manifests/namespace.yaml -f manifests/cpu-local/deployment.yaml
@@ -130,6 +135,10 @@ python scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
 python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
 python scripts/test_kv_events.py        # asserts token_ids never surfaces; token_count kept
 ```
+
+`test_kv_events.py` is the regression check for the decode + token-redaction
+logic. It is run manually (the repo's CI is Go-only and has no Python step), so
+run it after changing the subscriber.
 
 ---
 

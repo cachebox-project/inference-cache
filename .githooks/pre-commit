@@ -59,8 +59,9 @@ ref_violations=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   echo "$f" | grep -qE "$ref_skip" && continue
-  [ -f "$f" ] || continue
-  if hits=$(grep -nIEi 'CAC-[0-9]+|linear\.app' "$f"); then
+  # Check the STAGED blob, not the working tree, so an edited working copy can't
+  # mask a bad staged version.
+  if hits=$(git show ":$f" 2>/dev/null | grep -nIEi 'CAC-[0-9]+|linear\.app'); then
     echo "✗ $f"
     echo "$hits" | sed 's/^/    /'
     ref_violations=1
