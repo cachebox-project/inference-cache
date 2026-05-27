@@ -59,6 +59,7 @@ It intentionally does not expose `containers`; requiring users to provide contai
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
 | `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
+| `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |
 | `conditions` | array | Kubernetes conditions keyed by `type`. |
 
 `kubectl get cachebackend` displays the observed `status.endpoint` so managed backends show the endpoint once reconciliation has created it.

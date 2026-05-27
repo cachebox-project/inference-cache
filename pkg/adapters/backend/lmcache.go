@@ -28,6 +28,12 @@ const (
 	defaultLMCacheMaxLocalCPUSize = "20"
 	defaultHFTokenSecretName      = "hf-token"
 
+	// API-server pod defaults for the two override fields that are server-defaulted.
+	// Baking them into the rendered template keeps the update path churn-free (the
+	// reconciled value matches the live, defaulted object).
+	defaultSchedulerName                 = "default-scheduler"
+	defaultTerminationGracePeriodSeconds = int64(30)
+
 	// backendConfig override keys.
 	cfgKeyImage         = "image"
 	cfgKeyModel         = "model"
@@ -206,8 +212,12 @@ func podTemplateLabels(name string) map[string]string {
 }
 
 // applyPodOverrides copies optional pod-level scheduling/security overrides from
-// the spec onto the rendered pod spec.
+// the spec onto the rendered pod spec. The server-defaulted fields (schedulerName,
+// terminationGracePeriodSeconds) are always set to their defaults when unset so the
+// rendered template matches the API-server-defaulted object and updates don't churn.
 func applyPodOverrides(spec *corev1.PodSpec, override *cachev1alpha1.CacheBackendPodSpecOverride) {
+	spec.SchedulerName = defaultSchedulerName
+	spec.TerminationGracePeriodSeconds = ptrTo(defaultTerminationGracePeriodSeconds)
 	if override == nil {
 		return
 	}
@@ -219,9 +229,13 @@ func applyPodOverrides(spec *corev1.PodSpec, override *cachev1alpha1.CacheBacken
 	spec.ServiceAccountName = override.ServiceAccountName
 	spec.SecurityContext = override.SecurityContext
 	spec.PriorityClassName = override.PriorityClassName
-	spec.SchedulerName = override.SchedulerName
 	spec.RuntimeClassName = override.RuntimeClassName
-	spec.TerminationGracePeriodSeconds = override.TerminationGracePeriodSeconds
+	if override.SchedulerName != "" {
+		spec.SchedulerName = override.SchedulerName
+	}
+	if override.TerminationGracePeriodSeconds != nil {
+		spec.TerminationGracePeriodSeconds = override.TerminationGracePeriodSeconds
+	}
 }
 
 func configOr(cfg map[string]string, key, fallback string) string {

@@ -66,6 +66,13 @@ func getDeployment(t *testing.T, r *CacheBackendReconciler, name, namespace stri
 	return &dep
 }
 
+func getOptionalDeployment(t *testing.T, r *CacheBackendReconciler, name, namespace string) (*appsv1.Deployment, error) {
+	t.Helper()
+	var dep appsv1.Deployment
+	err := r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &dep)
+	return &dep, err
+}
+
 func getBackend(t *testing.T, r *CacheBackendReconciler, name, namespace string) *cachev1alpha1.CacheBackend {
 	t.Helper()
 	var cb cachev1alpha1.CacheBackend
@@ -253,6 +260,68 @@ func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
 	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+}
+
+func TestReconcileLMCacheUpdatesPodOverrides(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.Template = &cachev1alpha1.CacheBackendPodSpecOverride{
+		NodeSelector:       map[string]string{"accelerator": "h100"},
+		ServiceAccountName: "backend-sa",
+	}
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update template overrides: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	spec := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
+	if spec.NodeSelector["accelerator"] != "h100" {
+		t.Fatalf("nodeSelector not reconciled: %v", spec.NodeSelector)
+	}
+	if spec.ServiceAccountName != "backend-sa" {
+		t.Fatalf("serviceAccountName = %q, want backend-sa", spec.ServiceAccountName)
+	}
+}
+
+func TestReconcileTypeSwitchToExternalCleansUpChildren(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// Child workload exists.
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err != nil {
+		t.Fatalf("expected deployment after managed reconcile: %v", err)
+	}
+
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	live.Spec.Endpoint = "external.ns1.svc:8080"
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("switch to external: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 after switch to External", len(deps.Items))
+	}
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 after switch to External", len(svcs.Items))
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "external.ns1.svc:8080" {
+		t.Fatalf("status.endpoint = %q, want mirrored external endpoint", got)
 	}
 }
 

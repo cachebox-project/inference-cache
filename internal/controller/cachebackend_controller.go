@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -53,16 +54,20 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		// A backend switched from a managed type to External must shed its workload.
+		if err := r.cleanupOwnedWorkload(ctx, &backend); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.reconcileExternal(ctx, &backend)
 	}
 
 	builder, ok := backendadapter.For(backend.Spec.Type)
 	if !ok {
 		// Only LMCache is managed in Phase 1 (C2). Other managed types are out of
-		// scope here; leave them untouched until their builders land.
+		// scope here; shed any workload from a previous managed generation.
 		logger.V(1).Info("no managed builder for backend type",
 			"type", backend.Spec.Type, "namespace", req.Namespace, "name", req.Name)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.cleanupOwnedWorkload(ctx, &backend)
 	}
 
 	// StatefulSet-backed (PVC) provisioning + autoscaling is the C3 module. Phase 1
@@ -70,7 +75,7 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
 		logger.V(1).Info("StatefulSet deploymentKind deferred to C3; skipping",
 			"namespace", req.Namespace, "name", req.Name)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.cleanupOwnedWorkload(ctx, &backend)
 	}
 
 	return r.reconcileManaged(ctx, logger, &backend, builder)
@@ -133,7 +138,7 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 			dep.Spec = *desired.Spec.DeepCopy()
 		} else {
 			dep.Spec.Replicas = desired.Spec.Replicas
-			reconcileManagedContainer(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
+			reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 		}
 		return controllerutil.SetControllerReference(backend, dep, r.Scheme)
 	})
@@ -164,6 +169,29 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 	return nil
 }
 
+// reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
+// place: the managed container's image/command/args/env, plus the pod-level
+// override fields. API-server-defaulted fields we don't own (RestartPolicy,
+// DNSPolicy, probe thresholds, port Protocol, ...) are left untouched so the
+// update does not churn. The desired pod spec already carries the canonical
+// defaults for the server-defaulted override fields (schedulerName,
+// terminationGracePeriodSeconds), so copying them is idempotent.
+func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
+	reconcileManagedContainer(live, desired)
+
+	live.NodeSelector = desired.NodeSelector
+	live.Affinity = desired.Affinity
+	live.Tolerations = desired.Tolerations
+	live.TopologySpreadConstraints = desired.TopologySpreadConstraints
+	live.ImagePullSecrets = desired.ImagePullSecrets
+	live.ServiceAccountName = desired.ServiceAccountName
+	live.SecurityContext = desired.SecurityContext
+	live.PriorityClassName = desired.PriorityClassName
+	live.SchedulerName = desired.SchedulerName
+	live.RuntimeClassName = desired.RuntimeClassName
+	live.TerminationGracePeriodSeconds = desired.TerminationGracePeriodSeconds
+}
+
 // reconcileManagedContainer updates the spec-driven fields of the managed backend
 // container in place, leaving API-server-defaulted container fields untouched.
 func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
@@ -182,6 +210,35 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	}
 	// The managed container is missing (e.g. an out-of-band edit) — restore it.
 	live.Containers = append(live.Containers, *want.DeepCopy())
+}
+
+// cleanupOwnedWorkload best-effort deletes the Deployment + Service this CR owns,
+// used when a backend is no longer a managed Deployment (type/kind changed). Normal
+// CR deletion is handled by owner-reference garbage collection; this covers the
+// in-place mutation case where the CR itself still exists.
+func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
+
+	var dep appsv1.Deployment
+	if err := r.deleteIfOwned(ctx, key, &dep, backend); err != nil {
+		return err
+	}
+	var svc corev1.Service
+	return r.deleteIfOwned(ctx, key, &svc, backend)
+}
+
+// deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
+func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.NamespacedName, obj client.Object, backend *cachev1alpha1.CacheBackend) error {
+	if err := r.Get(ctx, key, obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, backend) {
+		return nil
+	}
+	if err := r.Delete(ctx, obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
 }
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
