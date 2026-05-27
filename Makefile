@@ -28,6 +28,7 @@ PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
 SETUP_ENVTEST_VERSION ?= v0.0.0-20241105200929-48ec3b71211f
 KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
+BUF_VERSION ?= v1.69.0
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -35,6 +36,8 @@ PROTOC_GEN_GO := $(LOCALBIN)/protoc-gen-go
 PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
 SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
+LOCAL_BUF := $(LOCALBIN)/buf
+BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 
 .PHONY: all
 all: build test ## Build binaries and run tests.
@@ -72,6 +75,14 @@ kind: $(LOCALBIN) ## Install kind locally when the system kind binary is unavail
 		test -s $(LOCAL_KIND) || GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/kind@$(KIND_VERSION); \
 	fi
 
+.PHONY: buf
+buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailable.
+	@if command -v buf >/dev/null 2>&1; then \
+		true; \
+	else \
+		test -s $(LOCAL_BUF) || GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
+	fi
+
 ##@ Development
 
 .PHONY: fmt
@@ -104,6 +115,10 @@ manifests: controller-gen ## Generate CRD and RBAC manifests.
 .PHONY: proto-gen
 proto-gen: protoc-gen-go ## Generate protobuf Go code.
 	PATH="$(LOCALBIN):$$PATH" protoc -I proto --go_out=. --go_opt=module=$(MODULE) --go-grpc_out=. --go-grpc_opt=module=$(MODULE) $$(find proto -name '*.proto' | sort)
+
+.PHONY: proto-lint
+proto-lint: buf ## Lint the gRPC contract with buf (lint-only; codegen stays on protoc).
+	$(BUF) lint
 
 .PHONY: build
 build: ## Build controller and server binaries.

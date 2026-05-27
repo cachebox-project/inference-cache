@@ -16,12 +16,15 @@ Run the baseline checks before sending a PR:
 
 ```bash
 make proto-gen
+make proto-lint
 make lint
 make test
 make build
 ```
 
-`make ci-lint` runs the golangci-lint configuration used by CI.
+`make ci-lint` runs the golangci-lint configuration used by CI. `make proto-lint`
+lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
+buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 
 ## Development Cluster
 
@@ -46,6 +49,7 @@ After changing protobuf files, run:
 
 ```bash
 make proto-gen
+make proto-lint
 ```
 
 Commit generated artifacts with the source changes.

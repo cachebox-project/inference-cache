@@ -1,0 +1,30 @@
+# buf lint configuration for the InferenceCache gRPC contract.
+#
+# Code generation uses protoc (see `make proto-gen`); buf is used for LINTING
+# ONLY. Run via `make proto-lint` (wired into CI). The full STANDARD ruleset is
+# enabled; the excepted rules below conflict with the deliberate, finalized
+# public contract documented in docs/design/grpc-contract.md — they are carved
+# out intentionally, not because the proto is non-conforming.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # The service is intentionally named `InferenceCache` — the public,
+    # vendor-neutral product identity — not `InferenceCacheService`.
+    - SERVICE_SUFFIX
+    # The contract reuses domain message names across RPCs/streams
+    # (CacheStateUpdate, CacheEvent, Ack, Metric) rather than the
+    # Method{Request,Response} convention. `Ack` is shared by ReportCacheState
+    # and PublishEvent on purpose; `CacheEvent` is both the PublishEvent input
+    # and the StreamCacheEvents output. This keeps the contract readable and is
+    # documented in the design doc.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    # CacheEvent.Type values use the spec's event vocabulary (PREFIX_ADDED,
+    # PREFIX_EVICTED, REPLICA_UPDATED, ALL_CLEARED) instead of a TYPE_ prefix;
+    # the zero value is TYPE_UNSPECIFIED (ENUM_ZERO_VALUE_SUFFIX still enforced).
+    - ENUM_VALUE_PREFIX

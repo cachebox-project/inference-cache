@@ -37,6 +37,15 @@ jobs:
     - name: Verify vendor-neutral naming
       run: make verify-naming
 
+    - name: Set up buf
+      uses: bufbuild/buf-setup-action@v1
+      with:
+        version: 1.69.0
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Lint proto contract
+      run: make proto-lint
+
     - name: Lint
       run: |
         make lint
