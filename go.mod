@@ -4,6 +4,7 @@ go 1.23
 
 require (
 	github.com/go-logr/logr v1.4.2
+	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/prometheus/client_golang v1.19.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.uber.org/zap v1.26.0
@@ -26,6 +27,7 @@ require (
 	github.com/go-openapi/jsonpointer v0.19.6 // indirect
 	github.com/go-openapi/jsonreference v0.20.2 // indirect
 	github.com/go-openapi/swag v0.22.4 // indirect
+	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
@@ -51,6 +53,7 @@ require (
 	golang.org/x/exp v0.0.0-20230515195305-f3d0a9c9a5cc // indirect
 	golang.org/x/net v0.29.0 // indirect
 	golang.org/x/oauth2 v0.23.0 // indirect
+	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.25.0 // indirect
 	golang.org/x/term v0.24.0 // indirect
 	golang.org/x/text v0.18.0 // indirect

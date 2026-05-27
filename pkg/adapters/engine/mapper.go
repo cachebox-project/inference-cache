@@ -31,13 +31,25 @@ func microsFromSeconds(s float64) int64 {
 	return int64(s * 1e6)
 }
 
-// StoredUpdate builds the CacheStateUpdate for a BlockStored event: one
-// PrefixEntry per block hash, each covering BlockSize tokens. Returns nil if the
-// event carries no hashes (nothing to report).
-func (c Config) StoredUpdate(ev BlockStored, tsSeconds float64) *icpb.CacheStateUpdate {
-	if len(ev.BlockHashes) == 0 {
+// Update stamps the replica/model/tenant/hash_scheme identity onto a set of
+// prefixes. Returns nil for an empty prefix set (nothing to report).
+func (c Config) Update(tsUs int64, prefixes []*icpb.PrefixEntry) *icpb.CacheStateUpdate {
+	if len(prefixes) == 0 {
 		return nil
 	}
+	return &icpb.CacheStateUpdate{
+		ReplicaId:   c.ReplicaID,
+		ModelId:     c.ModelID,
+		TenantId:    c.TenantID,
+		HashScheme:  c.HashScheme,
+		TimestampUs: tsUs,
+		Prefixes:    prefixes,
+	}
+}
+
+// StoredPrefixes renders a BlockStored event as PrefixEntry values: one per block
+// hash, each covering BlockSize tokens.
+func StoredPrefixes(ev BlockStored) []*icpb.PrefixEntry {
 	prefixes := make([]*icpb.PrefixEntry, 0, len(ev.BlockHashes))
 	for _, h := range ev.BlockHashes {
 		prefixes = append(prefixes, &icpb.PrefixEntry{
@@ -45,14 +57,13 @@ func (c Config) StoredUpdate(ev BlockStored, tsSeconds float64) *icpb.CacheState
 			TokenCount: ev.BlockSize,
 		})
 	}
-	return &icpb.CacheStateUpdate{
-		ReplicaId:   c.ReplicaID,
-		ModelId:     c.ModelID,
-		TenantId:    c.TenantID,
-		HashScheme:  c.HashScheme,
-		TimestampUs: microsFromSeconds(tsSeconds),
-		Prefixes:    prefixes,
-	}
+	return prefixes
+}
+
+// StoredUpdate builds the CacheStateUpdate for a single BlockStored event.
+// Returns nil if the event carries no hashes (nothing to report).
+func (c Config) StoredUpdate(ev BlockStored, tsSeconds float64) *icpb.CacheStateUpdate {
+	return c.Update(microsFromSeconds(tsSeconds), StoredPrefixes(ev))
 }
 
 // RemovedEvents builds one PREFIX_EVICTED CacheEvent per removed block hash.
