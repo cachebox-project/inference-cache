@@ -39,3 +39,6 @@ go.work.sum
 # Python artifacts
 __pycache__/
 *.pyc
+
+# Serena per-project cache (semantic code navigation)
+.serena/
