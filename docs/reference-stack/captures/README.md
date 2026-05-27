@@ -1,1 +1,1 @@
-# ZMQ event sample + cache-hit screenshot land here from the GPU run (see ../README.md DoD).
+# Save your event-stream sample and cache-hit screenshot here (see ../README.md "What success looks like").

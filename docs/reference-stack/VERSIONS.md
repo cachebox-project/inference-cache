@@ -1,8 +1,7 @@
 # Pinned versions — vLLM + LMCache reference substrate
 
-Everything the reference stack depends on, pinned. The M5 (`CacheBackend`)
-reconciler should generate Deployments that match these pins; bump here first,
-re-validate on the GPU fleet, then update the reconciler defaults.
+Everything the reference stack depends on, pinned. Bump here first, re-validate
+on a GPU host, then propagate to any automation that templates these manifests.
 
 | Component | Pin | Where | Notes |
 |---|---|---|---|
@@ -16,8 +15,9 @@ re-validate on the GPU fleet, then update the reconciler defaults.
 
 ## Re-pin `latest` to a digest before the GPU run
 
-`latest` is fine for local CPU sanity but must not reach the GPU fleet — it is
-not reproducible and is exactly what the M5 reconciler will hard-code. Before
+`latest` is fine for a local CPU check but should not be used for a real GPU
+deployment — it is not reproducible, and it is exactly the value any automation
+templating these manifests would hard-code. Before
 the OCI test/dev run:
 
 ```bash
@@ -30,8 +30,8 @@ docker inspect --format='{{index .RepoDigests 0}}' lmcache/vllm-openai:latest
 
 - The ticket asks for **vLLM + LMCache via their reference manifests**. Upstream
   packages both in `lmcache/vllm-openai`, so a single container runs the engine
-  and the LMCache connector — no sidecar (matches tech-spec §3.4: in-process
-  engine config, not a sidecar).
+  and the LMCache connector in one container — the engine config is in-process,
+  not a sidecar.
 - **vLLM v1 is required**: the KV-event publisher (`BlockStored` / `BlockRemoved`
   / `AllBlocksCleared`) and the `LMCacheConnectorV1` connector both live on the
   v1 engine. The image's `latest` tag assumes v1.

@@ -37,6 +37,9 @@ jobs:
     - name: Verify vendor-neutral naming
       run: make verify-naming
 
+    - name: Verify no internal issue-tracker references
+      run: make verify-no-internal-refs
+
     - name: Set up buf
       uses: bufbuild/buf-setup-action@v1
       with:

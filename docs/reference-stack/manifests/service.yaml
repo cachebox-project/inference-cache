@@ -2,9 +2,8 @@
 # (kind/cluster.yaml) so the host can reach the API on :30080 and subscribe to
 # KV events on :30557 without port-forwarding.
 #
-# On a real cluster (OKE) the M5 reconciler emits a ClusterIP Service; the
-# CacheBackend.status.endpoint then points the gateway/server at it. NodePort
-# here is purely a local-kind convenience.
+# On a real cluster a ClusterIP Service is usually preferable; NodePort here is
+# purely a local-kind convenience so the host can reach the API and event stream.
 apiVersion: v1
 kind: Service
 metadata:

@@ -5,7 +5,7 @@ Local fallback when the real engine can't start (e.g. no GPU / amd64 image under
 emulation). Lets you validate the ZMQ plumbing + the subscriber's decode path
 end-to-end without vLLM. It mirrors vLLM's ZmqEventPublisher framing
 ([topic, seq, msgpack(EventBatch)]); it is NOT a substitute for capturing real
-engine events for the DoD.
+engine events when verifying cache behaviour.
 
     python kv_events_synthetic_publisher.py --bind tcp://*:5557 --topic kv-events
     # in another shell:

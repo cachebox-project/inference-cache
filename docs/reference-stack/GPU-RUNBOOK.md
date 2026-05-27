@@ -5,8 +5,8 @@ available, and how to size it: **GPU memory, card count, tensor-parallelism, and
 host resources**.
 
 The stack is cloud-neutral — it needs an NVIDIA GPU advertising `nvidia.com/gpu`,
-nothing more. §4 gives a concrete OCI-shape mapping as the worked example for the
-test/dev fleet; any equivalent NVIDIA card works.
+nothing more. §4 gives a concrete OCI-shape mapping as one worked example; any
+equivalent NVIDIA card on any cloud or on-prem works the same.
 
 ---
 
@@ -80,33 +80,34 @@ Rules of thumb:
 
 ---
 
-## 4. Worked example — OCI test/dev GPU fleet
+## 4. Worked example — OCI GPU shapes
 
-Concrete shapes for the fleet (any equivalent NVIDIA card elsewhere works the
-same). GPU memory **per card**: A10 = 24 GB, L40S = 48 GB, A100 = 80 GB (also a
-40 GB variant), H100 = 80 GB, H200 = 141 GB.
+One concrete cloud mapping (Oracle Cloud Infrastructure). Any equivalent NVIDIA
+card on another cloud or on-prem works the same. GPU memory **per card**: A10 =
+24 GB, L40S = 48 GB, A100 = 80 GB (also a 40 GB variant), H100 = 80 GB, H200 =
+141 GB.
 
 | Target | OCI shape | Cards × VRAM | Good for |
 |---|---|---|---|
-| **PoC / this reference (recommended)** | `VM.GPU.A10.1` | 1 × 24 GB | 8B, single card, cheapest path to green |
-| PoC with headroom | `BM.GPU.L40S.4` (use 1 GPU) | 4 × 48 GB | 8B–34B comfortably; room for LMCache |
+| **This reference (recommended)** | `VM.GPU.A10.1` | 1 × 24 GB | 8B, single card, cheapest |
+| Single card with headroom | `BM.GPU.L40S.4` (use 1 GPU) | 4 × 48 GB | 8B–34B comfortably; room for LMCache |
 | Single bigger model | `VM.GPU.A100.1` / `VM.GPU.H100.1` | 1 × 80 GB | up to ~34B, or 70B quantized |
 | 70B BF16 (TP) | `BM.GPU4.8` / `BM.GPU.A100-v2.8` | 8 × 40/80 GB (use 4, NVLink) | `--tensor-parallel-size 4` |
 | Largest / fastest | `BM.GPU.H100.8` / `BM.GPU.H200.8` | 8 × 80/141 GB | 70B–100B+, full-node TP |
 
-For the **8B reference**, `VM.GPU.A10.1` is the cheapest way to satisfy the
-CAC-13 DoD. Pick a bare-metal multi-GPU shape only when you need TP ≥ 2.
+For the **8B reference**, a single 24 GB card (e.g. `VM.GPU.A10.1`) is the
+cheapest option. Pick a bare-metal multi-GPU shape only when you need TP ≥ 2.
 
 ---
 
 ## 5. Deploy (once the GPU node is up)
 
-Builds on [`README.md`](README.md) "GPU run". Summary:
+Builds on [`README.md`](README.md) "Deploy and test on a GPU". Summary:
 
 ```bash
 # 0. Prereqs on the GPU host: NVIDIA driver + Container Toolkit, `nvidia` as the
-#    default Docker runtime. Then a cluster (kind per kind/cluster.yaml, or OKE
-#    GPU node pool) and the device plugin:
+#    default Docker runtime. Then a cluster (kind per kind/cluster.yaml, or any
+#    managed GPU node pool) and the device plugin:
 helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
 helm install nvdp nvdp/nvidia-device-plugin -n kube-system
 kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'   # must be >= 1
@@ -132,8 +133,9 @@ tensor-parallelism, edit `manifests/deployment.yaml`:
             nvidia.com/gpu: "4"           # match tensor-parallel-size
 ```
 
-Then run the [§4 verification in README](README.md): subscribe with
-`scripts/kv_events_subscriber.py` and fire `scripts/prefix_cache_hit_test.sh`.
+Then run the verification in [`README.md`](README.md) ("What success looks
+like"): subscribe with `scripts/kv_events_subscriber.py` and fire
+`scripts/prefix_cache_hit_test.sh`.
 
 ## 6. Sizing-related failure cheatsheet
 

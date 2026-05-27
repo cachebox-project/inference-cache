@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Subscribe to a vLLM KV-cache event stream over ZMQ and print/capture events.
 
-This is the by-hand stand-in for what the C1 subscriber will do: connect to the
-engine's ZMQ PUB endpoint, decode the msgpack EventBatch frames, and surface
-BlockStored / BlockRemoved / AllBlocksCleared with their hashes.
+Shows how a cache-aware consumer connects to the engine's ZMQ PUB endpoint,
+decodes the msgpack EventBatch frames, and surfaces BlockStored / BlockRemoved /
+AllBlocksCleared with their hashes.
 
 Usage:
     pip install -r requirements.txt
@@ -13,7 +13,7 @@ Usage:
     #   kubectl -n cache-substrate port-forward svc/vllm-lmcache-llama-8b 5557:5557
     #   python kv_events_subscriber.py --endpoint tcp://localhost:5557 --topic kv-events
 
-Capture a sample (DoD: "captured sample of the ZMQ event stream"):
+Capture a sample of the event stream:
     python kv_events_subscriber.py --endpoint tcp://localhost:30557 \
         --topic kv-events --max 200 --json > ../captures/kv-events-sample.jsonl
 

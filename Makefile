@@ -173,6 +173,19 @@ verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBU
 	fi; \
 	echo "✓ core identity is vendor-neutral"
 
+.PHONY: verify-no-internal-refs
+verify-no-internal-refs: ## Fail if tracked files reference internal issue tracker tickets/URLs (see CONTRIBUTING.md).
+	@bad=$$(git ls-files \
+		| grep -vE '^(Makefile|CONTRIBUTING\.md|\.githooks/pre-commit|\.github/workflows/ci\.yml)$$' \
+		| xargs grep -nIEi 'CAC-[0-9]+|linear\.app' 2>/dev/null || true); \
+	if [ -n "$$bad" ]; then \
+		echo "✗ internal issue-tracker reference in tracked files (banned per CONTRIBUTING.md):"; \
+		echo "$$bad" | sed 's/^/    /'; \
+		echo "  This is a public repo — link GitHub issues (#123); keep internal tracker IDs/URLs out of tracked files."; \
+		exit 1; \
+	fi; \
+	echo "✓ no internal issue-tracker references"
+
 .PHONY: fmt-check
 fmt-check: ## Check Go formatting without modifying files.
 	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './bin/*' -not -path './.cache/*')); \
@@ -180,7 +193,7 @@ fmt-check: ## Check Go formatting without modifying files.
 	echo "✓ gofmt clean"
 
 .PHONY: ci
-ci: verify-naming fmt-check vet test build ## Local CI gate (naming + fmt + vet + test + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet test build ## Local CI gate (naming + internal-refs + fmt + vet + test + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.

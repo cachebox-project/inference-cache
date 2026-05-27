@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Demonstrate a prefix-cache hit: fire the same long (~8K-token) system prefix
-# twice and show the second request is faster (prefill skipped) plus the cache
-# counters move. Satisfies the DoD: "second identical-prefix request shows a
-# cache hit (lower TTFT, prefill skipped)".
+# twice and show the second request is faster (prefill skipped) and the cache
+# counters move (a second identical-prefix request hits the cache).
 #
 #   ./prefix_cache_hit_test.sh                       # defaults to localhost:30080
 #   BASE=http://localhost:8000 MODEL=meta-llama/Llama-3.1-8B-Instruct ./prefix_cache_hit_test.sh

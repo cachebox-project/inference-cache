@@ -5,13 +5,13 @@
 #   2. a prefix-cache hit on a repeated long prefix.
 # It deliberately drops --kv-transfer-config (LMCacheConnectorV1): LMCache's
 # offload tiers are GPU-oriented and are NOT exercised here. This proves the
-# C1-facing signal and the cache behaviour; the real LMCache run is the GPU path.
+# event stream and the cache behaviour; the real LMCache run is the GPU path.
 #
 # CAVEAT (best-effort): the published vLLM images target CUDA + linux/amd64.
 # CPU execution may need a CPU-built image/tag, and on Apple Silicon the amd64
 # image runs under emulation (slow; model load may time out). If the engine
 # won't start, the reliable local check is the synthetic ZMQ publisher — see
-# ../../README.md "CPU-only local sanity". The authoritative cache-hit + real
+# ../../README.md "CPU-only local check". The authoritative cache-hit + real
 # event capture happen on the GPU path regardless.
 apiVersion: apps/v1
 kind: Deployment

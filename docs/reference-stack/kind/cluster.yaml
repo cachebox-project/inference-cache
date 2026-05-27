@@ -23,7 +23,7 @@ nodes:
         hostPort: 30557
         protocol: TCP
 # -----------------------------------------------------------------------------
-# GPU on kind (for the real LMCache + vLLM run on the OCI test/dev GPU fleet).
+# GPU on kind (for the real LMCache + vLLM run on an NVIDIA GPU host).
 # kind has no first-class GPU flag; the supported approaches are:
 #
 #   (A) NVIDIA k8s-device-plugin on a GPU host. Install the NVIDIA Container
@@ -36,5 +36,5 @@ nodes:
 #       ../manifests are identical; only the cluster differs.
 #
 # This file is the CPU-friendly local-dev cluster. GPU node wiring is host- and
-# fleet-specific and lives in the runbook, not here.
+# environment-specific and lives in the runbook, not here.
 # -----------------------------------------------------------------------------

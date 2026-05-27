@@ -5,11 +5,10 @@
 #     --version <pin>  -n cache-substrate --create-namespace \
 #     -f values-reference.yaml
 #
-# This is the ticket's "reference Helm chart" option. It is the upstream-blessed
-# way to deploy vLLM+LMCache and is useful for cross-checking our hand-written
-# manifests (../manifests). The reconciler template is the RAW manifests, not
-# this chart — the chart also ships a router we don't want (the gateway owns
-# routing; we only describe cache state).
+# This is the upstream-supported way to deploy vLLM+LMCache and is useful as an
+# alternative to, or cross-check of, the raw manifests (../manifests). The chart
+# also ships a built-in router, which this reference disables — the goal here is
+# cache state and events, not routing.
 #
 # Requires a GPU node advertising nvidia.com/gpu and an `hf-token` secret with
 # key `token`.
@@ -18,13 +17,13 @@
 # follow the Production-Stack chart schema as of the pinned version — verify
 # against `helm show values vllm/vllm-stack --version <pin>` before relying on
 # them; the chart's schema evolves. The hand-written ../manifests are the
-# canonical M5 template; this chart path is an optional upstream cross-check.
+# primary reference; this chart path is an optional alternative.
 servingEngineSpec:
   runtimeClassName: ""        # set to "nvidia" if your cluster requires it
   modelSpec:
     - name: "llama8b"
       repository: "lmcache/vllm-openai"
-      # PLACEHOLDER — replace with a pinned digest before any GPU/fleet run. Left
+      # PLACEHOLDER — replace with a pinned digest before any GPU deployment. Left
       # non-resolvable on purpose so the values file can't run an unpinned image.
       tag: "REPLACE_WITH_PINNED_DIGEST"   # e.g. set repository to ...@sha256:<digest> per the chart's pinning support; see ../VERSIONS.md
       modelURL: "meta-llama/Llama-3.1-8B-Instruct"

@@ -2,7 +2,8 @@
 #
 # Pre-commit guards (see CONTRIBUTING.md):
 #   1. Vendor-neutral naming — no OCI/Oracle tokens in core-identity files.
-#   2. gRPC contract doc (docs/design/grpc-contract.md) stays in sync with proto changes.
+#   2. No internal issue-tracker references (ticket IDs / tracker URLs) in tracked files.
+#   3. gRPC contract doc (docs/design/grpc-contract.md) stays in sync with proto changes.
 #
 # Install once per clone:   make install-hooks   (sets core.hooksPath=.githooks)
 # Emergency override:       git commit --no-verify   (discouraged)
@@ -50,7 +51,34 @@ MSG
   exit 1
 fi
 
-# 2. Keep the gRPC contract doc in sync with the proto.
+# 2. No internal issue-tracker references in tracked files (public repo).
+#    Skip the files that define/document this rule. Matches ticket IDs (CAC-<n>,
+#    any case) and tracker URLs (linear.app).
+ref_skip='^(Makefile|CONTRIBUTING\.md|\.githooks/pre-commit|\.github/workflows/ci\.yml)$'
+ref_violations=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  echo "$f" | grep -qE "$ref_skip" && continue
+  [ -f "$f" ] || continue
+  if hits=$(grep -nIEi 'CAC-[0-9]+|linear\.app' "$f"); then
+    echo "✗ $f"
+    echo "$hits" | sed 's/^/    /'
+    ref_violations=1
+  fi
+done <<< "$staged"
+
+if [ "$ref_violations" -ne 0 ]; then
+  cat <<'MSG'
+
+Commit blocked: internal issue-tracker reference found (banned per CONTRIBUTING.md).
+  This is a public repo. Link GitHub issues (e.g. "Closes #123") instead, and keep
+  internal tracker IDs/URLs in the tracker (or local-only, untracked files).
+  Emergency override (discouraged): git commit --no-verify
+MSG
+  exit 1
+fi
+
+# 3. Keep the gRPC contract doc in sync with the proto.
 if echo "$staged" | grep -qE '^proto/.*\.proto$' && ! echo "$staged" | grep -qxF 'docs/design/grpc-contract.md'; then
   cat <<'MSG'
 

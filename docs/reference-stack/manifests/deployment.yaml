@@ -1,20 +1,9 @@
 # vLLM + LMCache reference backend (GPU).
 #
-# This is the canonical hand-written template that the M5 (C2) CacheBackend
-# reconciler will learn to generate (Deployment + Service). Keep it minimal and
-# explicit: every flag here maps to a CacheBackend spec field.
-#
-# How this maps to the CacheBackend CRD. NOTE: v1alpha1 currently implements only
-# spec.type and spec.endpoint (api/v1alpha1/cachebackend_types.go). The richer
-# fields below are the TARGET shape from tech-spec §3.1; they land incrementally
-# (B1/B2) and the M5 reconciler will fill them in. Until then this is a structural
-# template, not a 1:1 mapping of today's CRD.
-#   spec.type: LMCache                       -> image + --kv-transfer-config connector
-#   spec.replicas (target)                   -> .spec.replicas
-#   spec.integration.engine: VLLM (target)   -> command `vllm serve`
-#   spec.backendConfig.connector (target)    -> LMCacheConnectorV1
-#   spec.backendConfig.chunk_size:256 (target) -> LMCACHE_CHUNK_SIZE
-#   (KV-event publisher is always on so C1 can subscribe)
+# A minimal, explicit Deployment you can apply directly or use as a template for
+# your own automation. Each flag is annotated below so it is clear what it does
+# and why. The KV-cache event publisher is always enabled so a cache-aware router
+# or controller can subscribe to the engine's cache state.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,9 +28,8 @@ spec:
       containers:
         - name: vllm
           # PLACEHOLDER — intentionally non-applyable. Substitute a real pinned
-          # digest before any GPU run; this all-zero digest will fail to pull, so
-          # the raw manifest cannot accidentally run an unpinned image. That digest
-          # is the single value M5 hard-codes. See VERSIONS.md.
+          # digest before deploying; this all-zero digest will fail to pull, so the
+          # raw manifest cannot accidentally run an unpinned image. See VERSIONS.md.
           image: lmcache/vllm-openai@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"]
@@ -51,14 +39,15 @@ spec:
             # LMCache connector: vLLM reads/writes KV through LMCache (kv_both).
             - "--kv-transfer-config"
             - '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
-            # KV-cache event publisher over ZMQ — the signal C1 subscribes to.
-            # Emits BlockStored / BlockRemoved / AllBlocksCleared (msgpack).
+            # KV-cache event publisher over ZMQ — the stream a cache-aware router
+            # or controller subscribes to. Emits BlockStored / BlockRemoved /
+            # AllBlocksCleared (msgpack).
             - "--kv-events-config"
             - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
           env:
             - name: VLLM_USE_V1                # KV events + LMCacheConnectorV1 require the v1 engine
               value: "1"
-            - name: LMCACHE_CHUNK_SIZE         # spec.backendConfig.chunk_size
+            - name: LMCACHE_CHUNK_SIZE         # LMCache chunk size (tokens)
               value: "256"
             - name: LMCACHE_LOCAL_CPU          # Phase-1 reference: CPU offload tier
               value: "True"
@@ -86,7 +75,7 @@ spec:
             - { name: shm, mountPath: /dev/shm }
       volumes:
         - name: cache-home
-          emptyDir: {}            # swap for a PVC (spec.storage.pvc) on the fleet
+          emptyDir: {}            # swap for a PVC to persist the model/cache across restarts
         - name: shm
           emptyDir:
             medium: Memory

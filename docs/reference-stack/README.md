@@ -1,100 +1,104 @@
-# vLLM + LMCache reference substrate
+# vLLM + LMCache reference stack
 
-Hand-deployed reference for the Phase-1 cache backend: **vLLM** serving a model
-with **LMCache** as the KV-cache backend, emitting **KV-cache events over ZMQ**
-(`BlockStored` / `BlockRemoved` / `AllBlocksCleared`).
+A reproducible reference deployment of **vLLM** serving a model with **LMCache**
+as its KV-cache backend, with **KV-cache events published over ZMQ**. Use it to
+verify cache-aware behaviour end to end:
 
-This is module **A2 / CAC-13**. Two reasons it exists:
+- a **prefix-cache hit** on a repeated long prompt prefix (lower latency, prefill
+  skipped), and
+- a live **KV-cache event stream** (`BlockStored` / `BlockRemoved` /
+  `AllBlocksCleared`) that a cache-aware router or controller can consume.
 
-1. **The manifests here are the template the M5 (`CacheBackend`) reconciler
-   generates** — M5/C2 is automation of [`manifests/`](manifests/), not greenfield
-   design.
-2. The ZMQ event stream is **the signal C1 subscribes to**. The
-   [`scripts/kv_events_subscriber.py`](scripts/kv_events_subscriber.py) here is
-   the by-hand stand-in for that subscriber.
+The manifests here are intentionally minimal and explicit so they can serve as a
+starting template for your own automation (an operator, a Helm release, or plain
+`kubectl apply`).
 
-> **Why two image paths?** Everything real (the cache-hit demo, captured ZMQ
-> events) needs an **NVIDIA GPU** — vLLM loads weights on CUDA and LMCache
-> offloads from GPU memory. The GPU run targets the **OCI test/dev GPU fleet**.
-> A laptop without an NVIDIA GPU can still validate the *config* (ZMQ wiring +
-> prefix-cache behaviour) via the [CPU-only path](#cpu-only-local-sanity).
+> **You need an NVIDIA GPU** for the full stack — vLLM loads weights on CUDA and
+> LMCache offloads KV from GPU memory. See [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) for
+> how to size GPU memory and pick a card. If you only want to validate the event
+> wiring and prefix-cache behaviour without a GPU, use the
+> [CPU-only path](#cpu-only-local-check).
 
 ## Layout
 
 | Path | What |
 |---|---|
 | [`VERSIONS.md`](VERSIONS.md) | Pinned images / models / chart. **Read first.** |
-| [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing (VRAM math), shape/card table, multi-card TP, fleet rollout. |
-| [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for API + ZMQ). |
-| [`manifests/`](manifests/) | **GPU reference** Deployment + Service — the M5 template. |
-| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU-only sanity variant (no LMCache). |
-| [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream Production-Stack Helm path (cross-check). |
-| [`scripts/`](scripts/) | ZMQ subscriber, prefix-cache-hit test, synthetic publisher. |
-| `captures/` | Committed sample of the ZMQ stream + the cache-hit screenshot (DoD). |
+| [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing (VRAM math), shape/card table, multi-card tensor-parallelism. |
+| [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ). |
+| [`manifests/`](manifests/) | GPU reference Deployment + Service. |
+| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU-only variant (no LMCache) for GPU-less validation. |
+| [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream vLLM Production-Stack chart path (alternative to the raw manifests). |
+| [`scripts/`](scripts/) | ZMQ event subscriber, prefix-cache-hit test, synthetic publisher, tests. |
+| `captures/` | Where you save your event-stream sample and a cache-hit screenshot. |
 
 ## Prerequisites
 
 ```bash
-brew install kind            # kubectl + helm assumed present
+brew install kind            # or your platform's installer; kubectl + helm also required
 kind --version               # >= v0.23
 ```
 
-For the GPU path you also need an NVIDIA GPU host (or OKE GPU node pool) and a
-Hugging Face token for the gated Llama model.
+For the GPU path you additionally need an NVIDIA GPU host (or a managed GPU
+cluster), the NVIDIA Container Toolkit / device plugin, and — for gated models —
+a Hugging Face token.
 
 ---
 
-## GPU run (the real DoD — OCI test/dev fleet)
+## Deploy and test on a GPU
 
-> **Sizing first:** see [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) for how much VRAM /
-> how many cards a given model needs and which shape to pick. For the 8B
-> reference, **1× 24 GB card (e.g. OCI `VM.GPU.A10.1`)** is enough.
+> Size the GPU first with [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md). The 8B reference
+> model fits on a single 24 GB card.
 
 ```bash
-# 1. Cluster. On the GPU host, install the NVIDIA Container Toolkit + set the
-#    nvidia Docker runtime as default FIRST, then:
+# 1. Cluster + GPU. On the GPU host, install the NVIDIA Container Toolkit and set
+#    the nvidia runtime as Docker's default FIRST, then create the cluster:
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
-#    Install the device plugin so pods can request nvidia.com/gpu:
 helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
 helm install nvdp nvdp/nvidia-device-plugin -n kube-system
 kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'   # expect "1"
-#    (Or skip kind and use an OKE GPU node pool — the manifests are identical.)
+#    (Or use any managed GPU cluster that advertises nvidia.com/gpu — the manifests
+#     are identical; only the cluster differs.)
 
-# 2. HF token secret (gated model).
+# 2. Pin the image to a real digest (the manifest ships a non-applyable placeholder
+#    on purpose — see VERSIONS.md), then create the HF token secret:
 kubectl create namespace cache-substrate
 kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN"
 
-# 3. Deploy the reference backend.
-kubectl apply -f manifests/namespace.yaml
-kubectl apply -f manifests/deployment.yaml
-kubectl apply -f manifests/service.yaml
+# 3. Deploy.
+kubectl apply -f manifests/namespace.yaml -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
 
-# 4. Subscribe to the ZMQ KV-event stream and capture a sample.
+# 4. Subscribe to the KV-cache event stream and save a sample.
 pip install -r scripts/requirements.txt
 python scripts/kv_events_subscriber.py --endpoint tcp://localhost:30557 \
     --topic kv-events --max 200 --json | tee captures/kv-events-sample.jsonl
 
 # 5. Demonstrate the prefix-cache hit (run while the subscriber is watching).
-./scripts/prefix_cache_hit_test.sh           # screenshot the output -> captures/
+./scripts/prefix_cache_hit_test.sh           # save the output to captures/
 ```
 
-**Expected:** request 2 is faster than request 1, `prefix_cache_hits` delta > 0,
-and the subscriber prints `BlockStored` events with block hashes during request 1.
+### What success looks like
 
-### Upstream Helm cross-check (optional)
+- **Prefix-cache hit:** request 2 (same long prefix) is faster than request 1, and
+  vLLM's `prefix_cache_hits` counter increases.
+- **Event stream:** the subscriber prints `BlockStored` events (with block hashes)
+  during request 1; the saved sample contains metadata only — hashes and counts,
+  never prompt text or token content.
 
-`helm/values-reference.yaml` deploys the same stack via the vLLM Production
-Stack chart — useful to confirm our hand-written manifests match upstream. We
-disable the chart's router (the gateway owns routing; we only describe cache
-state).
+### Alternative: upstream Helm chart
+
+[`helm/values-reference.yaml`](helm/values-reference.yaml) deploys the same stack
+via the vLLM Production-Stack chart, if you prefer Helm over raw manifests. It
+disables the chart's built-in router (this reference is about cache state and
+events, not routing).
 
 ---
 
-## CPU-only local sanity
+## CPU-only local check
 
 Validates the **ZMQ event wiring** and a **prefix-cache hit** without a GPU and
-without LMCache. Uses a tiny ungated model on stock vLLM.
+without LMCache, using a tiny model on stock vLLM.
 
 ```bash
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
@@ -105,27 +109,19 @@ python scripts/kv_events_subscriber.py --endpoint tcp://localhost:30557 --topic 
 MODEL=Qwen/Qwen2.5-0.5B-Instruct ./scripts/prefix_cache_hit_test.sh
 ```
 
-> **Apple Silicon caveat.** Published vLLM images are `linux/amd64`; on an ARM
-> Mac they run under emulation — correct but very slow, and model load can time
-> out. If the engine won't start, validate just the event plumbing + subscriber
-> decode with the synthetic publisher:
+> **No GPU and the engine won't start?** Published vLLM images target CUDA +
+> `linux/amd64`; on other platforms they may run under emulation (slow) or not at
+> all. You can still validate the event framing and the subscriber's decode +
+> redaction path with the synthetic publisher:
 >
 > ```bash
 > python scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
 > python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557
+> # quick self-check of decode + token redaction:
+> python scripts/test_kv_events.py
 > ```
->
-> This proves the ZMQ framing and the C1-facing decode path; it does **not**
-> capture real engine events (do that on the GPU fleet).
 
 ---
-
-## Definition of Done (CAC-13)
-
-- [ ] vLLM+LMCache runs on kind from `manifests/` — **GPU fleet run**.
-- [ ] KV-cache events observed over ZMQ — `captures/kv-events-sample.jsonl`.
-- [ ] Cache hit demonstrated + screenshotted — `captures/`.
-- [ ] Manifests committed here (input for C2/M5). ✅ (this directory)
 
 ## Teardown
 
