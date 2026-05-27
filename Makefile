@@ -29,7 +29,7 @@ SETUP_ENVTEST_VERSION ?= v0.0.0-20241105200929-48ec3b71211f
 KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
-GOVULNCHECK_VERSION ?= v1.1.4
+GOVULNCHECK_VERSION ?= v1.3.0
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -143,7 +143,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 # Coverage gate. We measure the hand-written logic packages only: generated
 # code (proto stubs, deepcopy), entrypoints (cmd/), and test helpers are
 # excluded because their (un)covered statements would swamp the real signal.
-COVER_MIN ?= 65
+COVER_MIN ?= 79
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
 COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|pkg/testing/
