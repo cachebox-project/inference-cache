@@ -1,0 +1,85 @@
+# CPU-only variant — runs WITHOUT a GPU and WITHOUT LMCache.
+#
+# Validates the full engine-config path off-GPU: a prefix-cache hit AND the
+# KV-cache event stream (BlockStored/BlockRemoved over ZMQ). vLLM's v1 engine
+# runs on CPU (vLLM >= ~0.21), and the event publisher works there too — so this
+# exercises the same signal a cache-aware router/controller consumes, just slower
+# and without LMCache offload.
+#
+# VERIFIED (vLLM 0.21.0 CPU image, arm64, via `docker run`): prefix-cache hit
+# (cold ~31s -> warm ~1.4s; vllm:prefix_cache_hits increments) and real
+# BlockStored events captured over ZMQ. Flags below mirror that run.
+#
+# MEMORY: the vLLM CPU runtime baseline is ~5 GiB before any KV cache. Give the
+# node/VM enough RAM that (baseline + VLLM_CPU_KVCACHE_SPACE + headroom) fits, or
+# the engine aborts with "Available memory ... less than requested memory for kv".
+# ~10+ GiB is comfortable for this 0.5B model with a 4 GiB KV cache.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-cpu-sanity
+  namespace: cache-substrate
+  labels:
+    app: vllm-cpu-sanity
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-cpu-sanity
+  template:
+    metadata:
+      labels:
+        app: vllm-cpu-sanity
+    spec:
+      containers:
+        - name: vllm
+          # vLLM's dedicated CPU image (arch-tagged). Use -x86_64 on x86 hosts.
+          image: vllm/vllm-openai-cpu:latest-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"            # skip torch.compile — faster start, less memory on CPU
+            - "--enable-prefix-caching"
+            # KV-cache event publisher — works on the CPU v1 engine.
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE  # GiB (integer) of CPU KV cache; needs node RAM (see header)
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120          # CPU model load + warmup is slow
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-cpu-sanity
+  namespace: cache-substrate
+  labels:
+    app: vllm-cpu-sanity
+spec:
+  type: NodePort
+  selector:
+    app: vllm-cpu-sanity
+  ports:
+    - { name: http, port: 8000, targetPort: http, nodePort: 30080 }
+    - { name: kv-events, port: 5557, targetPort: kv-events, nodePort: 30557 }
