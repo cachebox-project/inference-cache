@@ -114,6 +114,18 @@ func TestDecodeBlockStoredMissingBlockSizeIsError(t *testing.T) {
 	}
 }
 
+// A non-positive block_size is malformed; reject it so a bogus PREFIX_MATCH hint
+// (token_count <= 0) is never produced.
+func TestDecodeBlockStoredNonPositiveBlockSizeIsError(t *testing.T) {
+	for _, bs := range []int32{0, -1} {
+		payload := encodeVLLMBatch(t, 1,
+			[]interface{}{"BlockStored", []uint64{1}, nil, []int64{}, bs, nil})
+		if _, err := DecodeEventBatch(payload); err == nil {
+			t.Errorf("block_size=%d: expected error", bs)
+		}
+	}
+}
+
 func TestDecodeMalformed(t *testing.T) {
 	if _, err := DecodeEventBatch([]byte{0xff, 0x00, 0x01}); err == nil {
 		t.Error("expected error decoding garbage payload")

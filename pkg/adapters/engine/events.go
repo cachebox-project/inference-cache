@@ -123,6 +123,9 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 		if err := msgpack.Unmarshal(fields[4], &bs); err != nil {
 			return nil, fmt.Errorf("BlockStored.block_size: %w", err)
 		}
+		if bs <= 0 {
+			return nil, fmt.Errorf("BlockStored.block_size must be positive, got %d", bs)
+		}
 		return BlockStored{BlockHashes: hashes, BlockSize: bs}, nil
 	case "BlockRemoved":
 		// [tag, block_hashes]
