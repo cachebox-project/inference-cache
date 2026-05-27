@@ -89,6 +89,11 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 
 // Serve starts gRPC and HTTP servers on existing listeners.
 func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.Listener) error {
+	// Mark the server up before launching the listeners so a scrape can never
+	// observe inferencecache_server_up=0 while Serve is already running.
+	s.metrics.up.Set(1)
+	defer s.metrics.up.Set(0)
+
 	errCh := make(chan error, 2)
 	go func() {
 		if err := s.grpcServer.Serve(grpcListener); err != nil {
@@ -100,9 +105,6 @@ func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.List
 			errCh <- fmt.Errorf("serve http: %w", err)
 		}
 	}()
-
-	s.metrics.up.Set(1)
-	defer s.metrics.up.Set(0)
 
 	select {
 	case <-ctx.Done():

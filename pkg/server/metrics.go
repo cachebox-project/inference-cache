@@ -5,8 +5,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
-// metricNamespace prefixes every metric this server emits, per the public
-// schema in the tech spec (§4.3): all names are `inferencecache_*`.
+// metricNamespace is the prefix for this project's own metrics (tech spec
+// §4.3): every inference-cache metric name is `inferencecache_*`. The /metrics
+// registry additionally exposes the standard Go runtime and process collectors
+// (`go_*`, `process_*`) — conventional for Prometheus exporters and useful for
+// ops — which are not part of the §4.3 schema.
 const metricNamespace = "inferencecache"
 
 // serverMetrics holds the Prometheus registry and collectors for one Service.
