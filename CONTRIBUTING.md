@@ -26,6 +26,25 @@ make build
 lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 
+## Optional coding-agent tooling
+
+These are optional and personal — use them with whatever editor or coding agent you prefer. None of it is required to build or contribute, and no agent-specific configuration is committed (keep any such config local and ignored).
+
+### Serena (semantic code navigation)
+
+[Serena](https://github.com/oraios/serena) is a language-server-backed [MCP](https://modelcontextprotocol.io) server that gives a coding agent symbol-level navigation and editing (find symbol, find references, rename) instead of plain-text search. It needs [`uv`](https://github.com/astral-sh/uv) installed; `uvx` then runs it without a separate install:
+
+```bash
+uvx --from git+https://github.com/oraios/serena serena start-mcp-server \
+  --context ide-assistant --project "$(pwd)"
+```
+
+Register that server in your agent's MCP configuration (each agent has its own mechanism and config location). Serena writes a per-project cache under `.serena/`, which is local and git-ignored.
+
+### Superpowers (development-workflow skills)
+
+[Superpowers](https://github.com/obra/superpowers) is a set of composable agent skills (brainstorming, TDD, planning, code review). It installs per user and per harness, so there is no shared or committed install — follow the per-harness instructions in the [Superpowers quickstart](https://github.com/obra/superpowers#quickstart) for your tool.
+
 ## Development Cluster
 
 Create a local kind cluster:
