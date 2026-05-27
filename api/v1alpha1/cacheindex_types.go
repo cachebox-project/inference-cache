@@ -1,6 +1,9 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
 
 // CacheIndexSpec is intentionally empty: CacheIndex is a status-only,
 // controller-maintained reflection of the server's in-memory cache aggregate.
@@ -118,5 +121,8 @@ type CacheIndexList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&CacheIndex{}, &CacheIndexList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &CacheIndex{}, &CacheIndexList{})
+		return nil
+	})
 }
