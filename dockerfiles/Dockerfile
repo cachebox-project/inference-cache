@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.23 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.3 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /workspace

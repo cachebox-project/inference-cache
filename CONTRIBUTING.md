@@ -6,7 +6,7 @@ Thanks for helping build inference-cache. This repository follows kubebuilder-st
 
 Requirements:
 
-- Go 1.23 or newer
+- Go 1.26.3 or newer
 - Make
 - Docker
 - kind
@@ -20,15 +20,13 @@ make proto-lint
 make lint
 make test-race
 make build
-make cover-check # fail if logic-package coverage drops below COVER_MIN (65%)
-make vulncheck   # advisory: vulnerability scan (needs network); currently
-                 # reports known CVEs pending a Go/grpc upgrade, so CI does not
-                 # fail on it yet
+make cover-check # fail if logic-package coverage drops below COVER_MIN (79%)
+make vulncheck   # vulnerability scan (needs network); blocking in CI
 ```
 
 `make test-race` runs the unit tests under the race detector — it's what the
 pre-push gate and CI use; `make test` is the faster, non-race variant for quick
-local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 65%)
+local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 79%)
 over the hand-written logic packages — generated code, `cmd/` entrypoints, and
 test helpers are excluded; `make cover` prints the per-function report. The
 floor is a ratchet: raise it as coverage improves. `make ci-lint` runs the
