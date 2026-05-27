@@ -99,9 +99,15 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 
 // Serve starts gRPC and HTTP servers on existing listeners.
 func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.Listener) error {
-	// Start the cache index (marks it ready and runs TTL eviction until ctx is
-	// done) before accepting traffic, so /readyz and lookups reflect a live index.
-	s.index.Start(ctx)
+	// Derive a context that is cancelled on ANY return from Serve (caller's ctx
+	// done OR the internal error branch), so the index's eviction goroutine and
+	// Ready() state are torn down with the service rather than leaking.
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Start the cache index (marks it ready and runs TTL eviction until serveCtx
+	// is done) before accepting traffic, so /readyz and lookups reflect a live index.
+	s.index.Start(serveCtx)
 
 	// Mark the server up before launching the listeners so a scrape can never
 	// observe inferencecache_server_up=0 while Serve is already running.

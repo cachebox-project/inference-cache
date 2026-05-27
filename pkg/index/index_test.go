@@ -163,6 +163,30 @@ func TestApplyEventEvictAndClear(t *testing.T) {
 	}
 }
 
+func TestPrefixAddedEventDoesNotRefreshAcrossSchemes(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(5_000_000, 0)}
+	idx := New(withClock(clk.now), WithTTL(10*time.Minute))
+
+	// Same opaque prefix bytes under two engine schemes for the same replica.
+	for _, scheme := range []string{"vllm", "sglang"} {
+		idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: scheme,
+			Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}}})
+	}
+
+	clk.add(9 * time.Minute) // both entries are 9m old (TTL 10m)
+	// A PREFIX_ADDED event (no hash_scheme) must NOT refresh either scheme's entry.
+	idx.ApplyEvent(Event{Type: EventPrefixAdded, ReplicaID: "r", Model: "m", Tenant: "t", PrefixHash: hash("p")})
+
+	clk.add(2 * time.Minute) // now 11m old → past TTL since the event did not refresh
+	idx.evictExpired()
+
+	for _, scheme := range []string{"vllm", "sglang"} {
+		if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: scheme, PrefixHash: hash("p")}); len(got) != 0 {
+			t.Fatalf("scheme %q entry should have expired (PREFIX_ADDED must not refresh): got %+v", scheme, got)
+		}
+	}
+}
+
 func TestReadyReflectsStartAndStop(t *testing.T) {
 	idx := New(WithSweepInterval(10 * time.Millisecond))
 	if idx.Ready() {

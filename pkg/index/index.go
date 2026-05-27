@@ -242,9 +242,11 @@ func (i *Index) Ingest(u Update) {
 	i.reportEntries()
 }
 
-// ApplyEvent applies a delta from PublishEvent. PREFIX_ADDED refreshes an
-// already-known entry (events lack hash_scheme/token_count to synthesize a
-// new, matchable one — ReportCacheState is authoritative for additions).
+// ApplyEvent applies a delta from PublishEvent. CacheEvent carries no
+// hash_scheme, and prefix_hash is only meaningful within a scheme, so events
+// never refresh scheme-specific prefix freshness — that is owned by
+// ReportCacheState (authoritative). Events only do scheme-safe work: removals
+// (conservative — at worst a cache miss, soft state) and replica liveness.
 func (i *Index) ApplyEvent(ev Event) {
 	ts := ev.Timestamp
 	if ts.IsZero() {
@@ -254,25 +256,16 @@ func (i *Index) ApplyEvent(ev Event) {
 
 	i.mu.Lock()
 	switch ev.Type {
-	case EventPrefixAdded, EventReplicaUpdated:
-		// Refresh freshness for matching entries already known for this replica.
-		for key, replicas := range i.prefixes {
-			if key.tenant != ev.Tenant || key.model != ev.Model {
-				continue
-			}
-			if ev.Type == EventPrefixAdded && key.prefixHash != hash {
-				continue
-			}
-			if e, ok := replicas[ev.ReplicaID]; ok {
-				e.lastSeen = ts
-				replicas[ev.ReplicaID] = e
-			}
-		}
+	case EventReplicaUpdated:
+		// Replica liveness only: keep its stats entry from expiring. Prefix
+		// freshness is not touched here (no hash_scheme to target it safely).
 		if s, ok := i.stats[statsKey{ev.Tenant, ev.Model, ev.ReplicaID}]; ok {
 			s.lastSeen = ts
 			i.stats[statsKey{ev.Tenant, ev.Model, ev.ReplicaID}] = s
 		}
 	case EventPrefixEvicted:
+		// Remove the replica from the prefix across schemes — removal is
+		// conservative, so matching opaque bytes without a scheme is safe.
 		for key, replicas := range i.prefixes {
 			if key.tenant != ev.Tenant || key.model != ev.Model || key.prefixHash != hash {
 				continue
@@ -288,6 +281,10 @@ func (i *Index) ApplyEvent(ev Event) {
 		}
 		delete(i.stats, statsKey{ev.Tenant, ev.Model, ev.ReplicaID})
 	}
+	// EventPrefixAdded is intentionally a no-op: ReportCacheState is the
+	// authoritative add/refresh path, and the event lacks hash_scheme +
+	// token_count to create or refresh a scheme-specific entry without risking
+	// a cross-scheme false match.
 	i.mu.Unlock()
 
 	i.reportEntries()
