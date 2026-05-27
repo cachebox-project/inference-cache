@@ -77,13 +77,11 @@ func (p *CacheIndexPoller) NeedLeaderElection() bool { return true }
 // status only when the meaningful aggregate changed (timestamps are ignored for
 // change detection to avoid needless writes under steady traffic).
 func (p *CacheIndexPoller) refresh(ctx context.Context) error {
-	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL)
-	if err != nil {
-		return err
-	}
-	desired := buildCacheIndexStatus(snap, p.SnapshotURL, time.Now())
-
 	name := p.name()
+
+	// Ensure the singleton exists FIRST, so `kubectl get cacheindex` shows it
+	// even before — or without — a successful snapshot scrape (e.g. the server
+	// isn't reachable yet). Its status is filled on the next successful tick.
 	var ci cachev1alpha1.CacheIndex
 	switch err := p.Client.Get(ctx, types.NamespacedName{Name: name}, &ci); {
 	case apierrors.IsNotFound(err):
@@ -94,6 +92,12 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 	case err != nil:
 		return fmt.Errorf("get CacheIndex %q: %w", name, err)
 	}
+
+	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL)
+	if err != nil {
+		return err
+	}
+	desired := buildCacheIndexStatus(snap, p.SnapshotURL, time.Now())
 
 	if statusEqual(ci.Status, desired) {
 		return nil

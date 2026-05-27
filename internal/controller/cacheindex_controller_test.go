@@ -159,3 +159,32 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 		t.Fatal("changed snapshot should have written a new status revision")
 	}
 }
+
+func TestRefreshCreatesSingletonEvenWhenServerDown(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheIndex{}).
+		Build()
+
+	// Unreachable snapshot endpoint (connection refused), short timeout.
+	p := &CacheIndexPoller{
+		Client:      cl,
+		SnapshotURL: "http://127.0.0.1:1/snapshot",
+		HTTPClient:  &http.Client{Timeout: time.Second},
+		Name:        "cluster-default",
+	}
+
+	// refresh reports the scrape error...
+	if err := p.refresh(context.Background()); err == nil {
+		t.Fatal("expected an error when the snapshot endpoint is unreachable")
+	}
+	// ...but the singleton CR must still have been created (empty status).
+	var ci cachev1alpha1.CacheIndex
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "cluster-default"}, &ci); err != nil {
+		t.Fatalf("singleton CacheIndex should exist even when the server is down: %v", err)
+	}
+}
