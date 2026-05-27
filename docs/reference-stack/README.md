@@ -27,7 +27,7 @@ starting template for your own automation (an operator, a Helm release, or plain
 | [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing (VRAM math), shape/card table, multi-card tensor-parallelism. |
 | [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ). |
 | [`manifests/`](manifests/) | GPU reference Deployment + Service. |
-| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU-only variant (no LMCache) for GPU-less validation. |
+| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU prefix-cache demo (no LMCache, no events; v0). |
 | [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream vLLM Production-Stack chart path (alternative to the raw manifests). |
 | [`scripts/`](scripts/) | ZMQ event subscriber, prefix-cache-hit test, synthetic publisher, tests. |
 | `captures/` | Where you save your event-stream sample and a cache-hit screenshot. |
@@ -97,29 +97,37 @@ events, not routing).
 
 ## CPU-only local check
 
-Validates the **ZMQ event wiring** and a **prefix-cache hit** without a GPU and
-without LMCache, using a tiny model on stock vLLM.
+You cannot exercise the **KV-cache event stream** without a GPU: the event
+publisher requires the vLLM **v1** engine, and v1 does not run on CPU. So the
+GPU-less checks split in two.
+
+### Verified: event decode + redaction (no GPU, no image)
+
+The reliable way to validate the event-consumer path off-GPU is the synthetic
+publisher — it emits vLLM-shaped frames so you can confirm the subscriber decodes
+them and redacts token content. No container image required:
+
+```bash
+pip install -r scripts/requirements.txt
+python scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
+python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
+python scripts/test_kv_events.py        # asserts token_ids never surfaces; token_count kept
+```
+
+### Optional: prefix-cache demo on CPU (no events)
+
+[`manifests/cpu-local/`](manifests/cpu-local/) runs a small model on vLLM's CPU
+build (v0) to show a prefix-cache hit. It deliberately omits the event publisher
+(v0 can't emit it). This needs vLLM's dedicated `vllm/vllm-openai-cpu` image and
+is **not verified here** (it requires pulling that image, which some networks
+block):
 
 ```bash
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
-kubectl apply -f manifests/namespace.yaml
-kubectl apply -f manifests/cpu-local/deployment.yaml
+kubectl apply -f manifests/namespace.yaml -f manifests/cpu-local/deployment.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-cpu-sanity --timeout=30m
-python scripts/kv_events_subscriber.py --endpoint tcp://localhost:30557 --topic kv-events &
 MODEL=Qwen/Qwen2.5-0.5B-Instruct ./scripts/prefix_cache_hit_test.sh
 ```
-
-> **No GPU and the engine won't start?** Published vLLM images target CUDA +
-> `linux/amd64`; on other platforms they may run under emulation (slow) or not at
-> all. You can still validate the event framing and the subscriber's decode +
-> redaction path with the synthetic publisher:
->
-> ```bash
-> python scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
-> python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557
-> # quick self-check of decode + token redaction:
-> python scripts/test_kv_events.py
-> ```
 
 ---
 
