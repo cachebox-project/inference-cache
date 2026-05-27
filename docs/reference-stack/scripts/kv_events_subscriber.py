@@ -61,20 +61,33 @@ except Exception:  # pragma: no cover - fallback path
     _HAVE_MSGSPEC = False
 
 
+def _redact(fields: dict) -> dict:
+    """Enforce the metadata-only contract: never surface prompt-derived content.
+
+    vLLM's BlockStored carries token_ids (the actual prompt tokens). We keep only
+    the count — hashes/counts/metadata are fine; token content is not (it would
+    otherwise be persisted into the committed capture sample). Mirrors the
+    server-side rule: CacheStateUpdate/PrefixEntry carry metadata only.
+    """
+    if "token_ids" in fields:
+        fields["token_count"] = len(fields.pop("token_ids") or [])
+    return fields
+
+
 def _decode(payload: bytes):
-    """Return a list of (event_type, fields_dict). Falls back to raw msgpack."""
+    """Return (ts, [(event_type, fields_dict)]). Token content is redacted."""
     if _HAVE_MSGSPEC:
         try:
             batch = _DECODER.decode(payload)
             out = []
             for ev in batch.events:
-                out.append((type(ev).__name__, {f: getattr(ev, f) for f in ev.__struct_fields__}))
+                out.append((type(ev).__name__, _redact({f: getattr(ev, f) for f in ev.__struct_fields__})))
             return batch.ts, out
         except Exception:
             pass
-    import msgpack  # type: ignore
-
-    return None, [("RAW", {"msgpack": msgpack.unpackb(payload, raw=False)})]
+    # Typed decode failed: emit shape only, never the raw (potentially
+    # content-bearing) payload, so the metadata-only contract still holds.
+    return None, [("UNDECODED", {"bytes": len(payload)})]
 
 
 def main() -> int:

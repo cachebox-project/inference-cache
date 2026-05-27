@@ -60,8 +60,10 @@ def main() -> int:
             batch = EventBatch(
                 ts=time.time(),
                 events=[
+                    # token_ids intentionally left empty — this is metadata-only test
+                    # data; the subscriber redacts token content regardless.
                     BlockStored(block_hashes=[base, base + 1], parent_block_hash=None,
-                                token_ids=list(range(16)), block_size=16, lora_id=None),
+                                token_ids=[], block_size=16, lora_id=None),
                     BlockRemoved(block_hashes=[base - 4]) if seq else BlockStored(),
                 ],
             )

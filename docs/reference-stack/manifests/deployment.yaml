@@ -4,12 +4,16 @@
 # reconciler will learn to generate (Deployment + Service). Keep it minimal and
 # explicit: every flag here maps to a CacheBackend spec field.
 #
-# CacheBackend → manifest mapping (tech-spec §3.1):
-#   spec.type: LMCache                  -> image + --kv-transfer-config connector
-#   spec.replicas                       -> .spec.replicas
-#   spec.integration.engine: VLLM       -> command `vllm serve`
-#   spec.backendConfig.connector        -> LMCacheConnectorV1
-#   spec.backendConfig.chunk_size: 256  -> LMCACHE_CHUNK_SIZE
+# How this maps to the CacheBackend CRD. NOTE: v1alpha1 currently implements only
+# spec.type and spec.endpoint (api/v1alpha1/cachebackend_types.go). The richer
+# fields below are the TARGET shape from tech-spec §3.1; they land incrementally
+# (B1/B2) and the M5 reconciler will fill them in. Until then this is a structural
+# template, not a 1:1 mapping of today's CRD.
+#   spec.type: LMCache                       -> image + --kv-transfer-config connector
+#   spec.replicas (target)                   -> .spec.replicas
+#   spec.integration.engine: VLLM (target)   -> command `vllm serve`
+#   spec.backendConfig.connector (target)    -> LMCacheConnectorV1
+#   spec.backendConfig.chunk_size:256 (target) -> LMCACHE_CHUNK_SIZE
 #   (KV-event publisher is always on so C1 can subscribe)
 apiVersion: apps/v1
 kind: Deployment
@@ -34,7 +38,10 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: lmcache/vllm-openai:latest   # re-pin to a digest before the GPU run (see VERSIONS.md)
+          # PLACEHOLDER TAG — non-canonical. `latest` is not reproducible and must
+          # NOT reach the GPU fleet. Substitute a digest (lmcache/vllm-openai@sha256:...)
+          # before any GPU run; that digest is the single value M5 hard-codes. See VERSIONS.md.
+          image: lmcache/vllm-openai:latest
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"]
           args:
