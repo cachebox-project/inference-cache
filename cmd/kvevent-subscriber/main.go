@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -66,11 +65,13 @@ func main() {
 
 	out := make(chan *engine.EventBatch, 256)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// The reporter stops by draining a closed channel, not by signal — so on
+	// shutdown the batches already buffered in `out` are flushed rather than
+	// dropped. Its context is background (only the subscriber watches the signal).
+	reporterDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		if err := reporter.Run(ctx, out); err != nil && !errors.Is(err, context.Canceled) {
+		defer close(reporterDone)
+		if err := reporter.Run(context.Background(), out); err != nil {
 			logger.Error("reporter stopped", "err", err)
 		}
 	}()
@@ -82,7 +83,11 @@ func main() {
 		logger.Error("subscriber stopped", "err", err)
 	}
 
-	stop()    // ensure the reporter sees cancellation and flushes
-	wg.Wait() // wait for the final flush before exit
+	close(out) // stop the reporter and let it drain + final-flush
+	select {
+	case <-reporterDone:
+	case <-time.After(5 * time.Second):
+		logger.Warn("reporter drain timed out")
+	}
 	logger.Info("kvevent-subscriber stopped")
 }

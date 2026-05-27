@@ -1,8 +1,6 @@
 package engine
 
 import (
-	"encoding/binary"
-
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
@@ -11,16 +9,8 @@ import (
 //   - BlockStored  -> CacheStateUpdate (additive ingest via ReportCacheState)
 //   - BlockRemoved -> PREFIX_EVICTED CacheEvent(s) (removal via PublishEvent)
 //   - AllBlocksCleared -> ALL_CLEARED CacheEvent
-// Only hashes + counts cross the wire — never tokens or prompt text.
-
-// encodeHash renders a vLLM uint64 block hash as the contract's opaque
-// prefix_hash bytes: 8-byte big-endian. Producer and consumer must agree on this
-// encoding; big-endian keeps the bytes comparable/stable across processes.
-func encodeHash(h uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, h)
-	return b
-}
+// Only hashes + counts cross the wire — never tokens or prompt text. Block hashes
+// are already opaque bytes by the time they reach here (see events.go).
 
 // microsFromSeconds converts vLLM's float-seconds timestamp to the contract's
 // timestamp_us. A non-positive input yields 0 (server treats 0 as "now").
@@ -53,7 +43,7 @@ func StoredPrefixes(ev BlockStored) []*icpb.PrefixEntry {
 	prefixes := make([]*icpb.PrefixEntry, 0, len(ev.BlockHashes))
 	for _, h := range ev.BlockHashes {
 		prefixes = append(prefixes, &icpb.PrefixEntry{
-			PrefixHash: encodeHash(h),
+			PrefixHash: h,
 			TokenCount: ev.BlockSize,
 		})
 	}
@@ -81,7 +71,7 @@ func (c Config) RemovedEvents(ev BlockRemoved, tsSeconds float64) []*icpb.CacheE
 			ReplicaId:   c.ReplicaID,
 			ModelId:     c.ModelID,
 			TenantId:    c.TenantID,
-			PrefixHash:  encodeHash(h),
+			PrefixHash:  h,
 			TimestampUs: us,
 		})
 	}

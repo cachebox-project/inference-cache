@@ -1,8 +1,8 @@
 package engine
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"sync"
@@ -46,9 +46,13 @@ func (s *recordingServer) PublishEvent(_ context.Context, ev *icpb.CacheEvent) (
 	return &icpb.Ack{Accepted: true}, nil
 }
 
-// runReporter starts a recording server + Reporter over bufconn, feeds the
-// batches, closes the input, and returns the server after Run has drained.
 func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
+	return runReporterWindow(t, 20*time.Millisecond, batches...)
+}
+
+// runReporterWindow starts a recording server + Reporter over bufconn, feeds the
+// batches, closes the input, and returns the server after Run has drained.
+func runReporterWindow(t *testing.T, window time.Duration, batches ...*EventBatch) *recordingServer {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
@@ -65,7 +69,7 @@ func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), WithWindow(20*time.Millisecond))
+	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), WithWindow(window))
 	in := make(chan *EventBatch, len(batches))
 	for _, b := range batches {
 		in <- b
@@ -83,14 +87,15 @@ func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
 }
 
 func TestReporterForwardsBlockStored(t *testing.T) {
+	h0, h1 := []byte{0x0a}, []byte{0x0b}
 	rec := runReporter(t, &EventBatch{
 		TimestampSeconds: 2.0,
-		Events:           []Event{BlockStored{BlockHashes: []uint64{10, 11}, BlockSize: 128}},
+		Events:           []Event{BlockStored{BlockHashes: [][]byte{h0, h1}, BlockSize: 128}},
 	})
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	var hashes []uint64
+	var hashes [][]byte
 	for _, u := range rec.updates {
 		if u.GetHashScheme() != "vllm" || u.GetReplicaId() != "vllm-0" {
 			t.Errorf("update identity = %s/%s, want vllm-0/vllm", u.GetReplicaId(), u.GetHashScheme())
@@ -99,17 +104,48 @@ func TestReporterForwardsBlockStored(t *testing.T) {
 			if p.GetTokenCount() != 128 {
 				t.Errorf("token_count = %d, want 128", p.GetTokenCount())
 			}
-			hashes = append(hashes, binary.BigEndian.Uint64(p.GetPrefixHash()))
+			hashes = append(hashes, p.GetPrefixHash())
 		}
 	}
-	if len(hashes) != 2 || hashes[0] != 10 || hashes[1] != 11 {
-		t.Errorf("forwarded hashes = %v, want [10 11]", hashes)
+	if len(hashes) != 2 || !bytes.Equal(hashes[0], h0) || !bytes.Equal(hashes[1], h1) {
+		t.Errorf("forwarded hashes = %x, want [%x %x]", hashes, h0, h1)
+	}
+}
+
+// With a window long enough that the ticker never fires, the only path that can
+// deliver buffered adds is the shutdown flush — which must reopen the stream.
+func TestReporterFlushesPendingOnShutdown(t *testing.T) {
+	h := []byte{0x42}
+	rec := runReporterWindow(t, time.Hour, &EventBatch{
+		TimestampSeconds: 1,
+		Events:           []Event{BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}},
+	})
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var found bool
+	for _, u := range rec.updates {
+		for _, p := range u.GetPrefixes() {
+			if bytes.Equal(p.GetPrefixHash(), h) {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("shutdown flush did not deliver the buffered add")
+	}
+}
+
+// A zero/negative window must not panic time.NewTicker.
+func TestNewReporterClampsWindow(t *testing.T) {
+	r := NewReporter(nil, testConfig(), WithWindow(0))
+	if r.window <= 0 {
+		t.Errorf("window not clamped: %v", r.window)
 	}
 }
 
 func TestReporterForwardsRemovalsAndClear(t *testing.T) {
 	rec := runReporter(t,
-		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockRemoved{BlockHashes: []uint64{7, 8}}}},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{7}, {8}}}}},
 		&EventBatch{TimestampSeconds: 2, Events: []Event{AllBlocksCleared{}}},
 	)
 
@@ -138,7 +174,7 @@ func TestReporterClearSupersedesBufferedAdds(t *testing.T) {
 	rec := runReporter(t, &EventBatch{
 		TimestampSeconds: 1,
 		Events: []Event{
-			BlockStored{BlockHashes: []uint64{1, 2}, BlockSize: 16},
+			BlockStored{BlockHashes: [][]byte{{1}, {2}}, BlockSize: 16},
 			AllBlocksCleared{},
 		},
 	})

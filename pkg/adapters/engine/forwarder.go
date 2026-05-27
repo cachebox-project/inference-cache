@@ -53,6 +53,12 @@ func NewReporter(client icpb.InferenceCacheClient, cfg Config, opts ...ReporterO
 	for _, o := range opts {
 		o(r)
 	}
+	if r.window <= 0 {
+		r.window = 100 * time.Millisecond // guard time.NewTicker
+	}
+	if r.backoff <= 0 {
+		r.backoff = time.Second
+	}
 	return r
 }
 
@@ -67,8 +73,10 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 		pendTs  int64
 	)
 	defer func() {
-		// Final flush on shutdown: ctx is already cancelled, so use a short
+		// Final flush on shutdown. The run ctx may be cancelled (so the open
+		// stream, bound to it, is dead) — drop it and reopen under a short
 		// detached context so the last buffered adds still land.
+		r.closeStream(&stream)
 		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		r.flush(flushCtx, &stream, &pending, pendTs)

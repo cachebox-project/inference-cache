@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"encoding/binary"
 	"fmt"
+	"reflect"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -25,14 +27,19 @@ type Event interface{ isEvent() }
 
 // BlockStored reports KV blocks that became resident. BlockSize is the number of
 // tokens per block; a block covers BlockSize tokens of the prefix.
+//
+// BlockHashes are opaque prefix-hash bytes. vLLM's ExternalBlockHash is a union
+// of bytes and int — integer hashes are normalized to 8-byte big-endian here, so
+// downstream only ever sees opaque bytes (matching the contract's prefix_hash).
 type BlockStored struct {
-	BlockHashes []uint64
+	BlockHashes [][]byte
 	BlockSize   int32
 }
 
-// BlockRemoved reports KV blocks that were evicted.
+// BlockRemoved reports KV blocks that were evicted. BlockHashes are opaque bytes
+// (see BlockStored).
 type BlockRemoved struct {
-	BlockHashes []uint64
+	BlockHashes [][]byte
 }
 
 // AllBlocksCleared reports that the engine flushed its entire KV cache.
@@ -136,12 +143,51 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 	}
 }
 
-// decodeHashes decodes a msgpack array of block hashes. vLLM block hashes are
-// unsigned 64-bit; we read them as uint64 regardless of msgpack int/uint coding.
-func decodeHashes(raw msgpack.RawMessage) ([]uint64, error) {
-	var hashes []uint64
-	if err := msgpack.Unmarshal(raw, &hashes); err != nil {
+// decodeHashes decodes a msgpack array of block hashes into opaque bytes. Each
+// element is either binary (used as-is) or an integer (vLLM's int hash variant,
+// normalized to 8-byte big-endian).
+func decodeHashes(raw msgpack.RawMessage) ([][]byte, error) {
+	var elems []msgpack.RawMessage
+	if err := msgpack.Unmarshal(raw, &elems); err != nil {
 		return nil, err
 	}
-	return hashes, nil
+	out := make([][]byte, 0, len(elems))
+	for _, e := range elems {
+		var v interface{}
+		if err := msgpack.Unmarshal(e, &v); err != nil {
+			return nil, err
+		}
+		b, err := hashToBytes(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// hashToBytes normalizes one decoded block hash to opaque bytes. Binary/string
+// hashes pass through; integer hashes become 8-byte big-endian.
+func hashToBytes(v interface{}) ([]byte, error) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		return []byte(x), nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return uint64BE(rv.Uint()), nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return uint64BE(uint64(rv.Int())), nil
+	default:
+		return nil, fmt.Errorf("unsupported block-hash type %T", v)
+	}
+}
+
+func uint64BE(u uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, u)
+	return b
 }

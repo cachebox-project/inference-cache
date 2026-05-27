@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"encoding/binary"
+	"bytes"
 	"testing"
 
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
@@ -11,25 +11,10 @@ func testConfig() Config {
 	return Config{ReplicaID: "vllm-0", ModelID: "llama", TenantID: "tenant-a", HashScheme: "vllm"}
 }
 
-func TestEncodeHashBigEndian(t *testing.T) {
-	got := encodeHash(0x0102030405060708)
-	want := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	if len(got) != 8 {
-		t.Fatalf("len = %d, want 8", len(got))
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("encodeHash = %v, want %v", got, want)
-		}
-	}
-	if binary.BigEndian.Uint64(got) != 0x0102030405060708 {
-		t.Errorf("round-trip mismatch")
-	}
-}
-
 func TestStoredUpdate(t *testing.T) {
 	c := testConfig()
-	u := c.StoredUpdate(BlockStored{BlockHashes: []uint64{10, 11}, BlockSize: 128}, 2.5)
+	h0, h1 := []byte{0xaa, 0xbb}, []byte{0xcc, 0xdd}
+	u := c.StoredUpdate(BlockStored{BlockHashes: [][]byte{h0, h1}, BlockSize: 128}, 2.5)
 	if u == nil {
 		t.Fatal("StoredUpdate returned nil")
 	}
@@ -45,8 +30,8 @@ func TestStoredUpdate(t *testing.T) {
 	if u.Prefixes[0].TokenCount != 128 {
 		t.Errorf("TokenCount = %d, want 128 (block size)", u.Prefixes[0].TokenCount)
 	}
-	if binary.BigEndian.Uint64(u.Prefixes[0].PrefixHash) != 10 {
-		t.Errorf("PrefixHash[0] decodes to %d, want 10", binary.BigEndian.Uint64(u.Prefixes[0].PrefixHash))
+	if !bytes.Equal(u.Prefixes[0].PrefixHash, h0) || !bytes.Equal(u.Prefixes[1].PrefixHash, h1) {
+		t.Errorf("prefix hashes not passed through opaque: %x %x", u.Prefixes[0].PrefixHash, u.Prefixes[1].PrefixHash)
 	}
 }
 
@@ -58,7 +43,7 @@ func TestStoredUpdateEmptyIsNil(t *testing.T) {
 
 func TestRemovedEvents(t *testing.T) {
 	c := testConfig()
-	evs := c.RemovedEvents(BlockRemoved{BlockHashes: []uint64{1, 2, 3}}, 1.0)
+	evs := c.RemovedEvents(BlockRemoved{BlockHashes: [][]byte{{1}, {2}, {3}}}, 1.0)
 	if len(evs) != 3 {
 		t.Fatalf("got %d events, want 3", len(evs))
 	}

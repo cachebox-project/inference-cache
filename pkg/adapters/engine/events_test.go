@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -47,8 +49,11 @@ func TestDecodeEventBatch(t *testing.T) {
 	if !ok {
 		t.Fatalf("event[0] = %T, want BlockStored", batch.Events[0])
 	}
-	if len(stored.BlockHashes) != 2 || stored.BlockHashes[0] != 10 || stored.BlockHashes[1] != 11 {
-		t.Errorf("BlockHashes = %v, want [10 11]", stored.BlockHashes)
+	// Integer hashes normalize to 8-byte big-endian opaque bytes.
+	if len(stored.BlockHashes) != 2 ||
+		binary.BigEndian.Uint64(stored.BlockHashes[0]) != 10 ||
+		binary.BigEndian.Uint64(stored.BlockHashes[1]) != 11 {
+		t.Errorf("BlockHashes = %v, want big-endian [10 11]", stored.BlockHashes)
 	}
 	if stored.BlockSize != 128 {
 		t.Errorf("BlockSize = %d, want 128", stored.BlockSize)
@@ -62,7 +67,7 @@ func TestDecodeEventBatch(t *testing.T) {
 	}
 }
 
-// vLLM block hashes routinely exceed 2^63; they must survive as uint64.
+// vLLM block hashes routinely exceed 2^63; the uint64 must survive intact.
 func TestDecodeLargeUint64Hash(t *testing.T) {
 	const big = uint64(17927488143086849986) // > math.MaxInt64
 	payload := encodeVLLMBatch(t, 1,
@@ -73,8 +78,30 @@ func TestDecodeLargeUint64Hash(t *testing.T) {
 		t.Fatalf("DecodeEventBatch: %v", err)
 	}
 	stored := batch.Events[0].(BlockStored)
-	if stored.BlockHashes[0] != big {
-		t.Errorf("hash = %d, want %d", stored.BlockHashes[0], big)
+	if binary.BigEndian.Uint64(stored.BlockHashes[0]) != big {
+		t.Errorf("hash = %d, want %d", binary.BigEndian.Uint64(stored.BlockHashes[0]), big)
+	}
+}
+
+// vLLM's ExternalBlockHash can also be raw bytes; those must pass through opaque.
+func TestDecodeByteHashes(t *testing.T) {
+	h0 := []byte{0xde, 0xad, 0xbe, 0xef}
+	h1 := []byte{0x01, 0x02}
+	payload := encodeVLLMBatch(t, 1,
+		[]interface{}{"BlockStored", [][]byte{h0, h1}, nil, []int64{}, int32(16), nil},
+		[]interface{}{"BlockRemoved", [][]byte{h0}},
+	)
+	batch, err := DecodeEventBatch(payload)
+	if err != nil {
+		t.Fatalf("DecodeEventBatch: %v", err)
+	}
+	stored := batch.Events[0].(BlockStored)
+	if len(stored.BlockHashes) != 2 || !bytes.Equal(stored.BlockHashes[0], h0) || !bytes.Equal(stored.BlockHashes[1], h1) {
+		t.Errorf("BlockHashes = %v, want [%x %x] verbatim", stored.BlockHashes, h0, h1)
+	}
+	removed := batch.Events[1].(BlockRemoved)
+	if len(removed.BlockHashes) != 1 || !bytes.Equal(removed.BlockHashes[0], h0) {
+		t.Errorf("removed hashes = %v, want [%x]", removed.BlockHashes, h0)
 	}
 }
 

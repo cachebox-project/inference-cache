@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -62,7 +63,7 @@ func TestSubscriberDecodesAndForwards(t *testing.T) {
 			t.Fatalf("got %d events, want 1", len(b.Events))
 		}
 		stored, ok := b.Events[0].(BlockStored)
-		if !ok || stored.BlockHashes[0] != 99 {
+		if !ok || len(stored.BlockHashes) != 1 || binary.BigEndian.Uint64(stored.BlockHashes[0]) != 99 {
 			t.Fatalf("event = %#v, want BlockStored{99}", b.Events[0])
 		}
 	case <-time.After(3 * time.Second):
