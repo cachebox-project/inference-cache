@@ -67,7 +67,7 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// scope here; shed any workload from a previous managed generation.
 		logger.V(1).Info("no managed builder for backend type",
 			"type", backend.Spec.Type, "namespace", req.Namespace, "name", req.Name)
-		return ctrl.Result{}, r.cleanupOwnedWorkload(ctx, &backend)
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, &backend)
 	}
 
 	// StatefulSet-backed (PVC) provisioning + autoscaling is the C3 module. Phase 1
@@ -75,7 +75,7 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
 		logger.V(1).Info("StatefulSet deploymentKind deferred to C3; skipping",
 			"namespace", req.Namespace, "name", req.Name)
-		return ctrl.Result{}, r.cleanupOwnedWorkload(ctx, &backend)
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, &backend)
 	}
 
 	return r.reconcileManaged(ctx, logger, &backend, builder)
@@ -83,15 +83,26 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	if backend.Status.Endpoint == backend.Spec.Endpoint {
-		return nil
+	return r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = backend.Spec.Endpoint
+		backend.Status.Health = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
+	})
+}
+
+// reconcileUnmanaged sheds any previously owned workload and clears managed status
+// for a backend this module no longer provisions (unsupported type or deferred kind).
+func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+		return err
 	}
-	patch := client.MergeFrom(backend.DeepCopy())
-	backend.Status.Endpoint = backend.Spec.Endpoint
-	if err := r.Status().Patch(ctx, backend, patch); err != nil {
-		return fmt.Errorf("patch CacheBackend status %s/%s: %w", backend.Namespace, backend.Name, err)
-	}
-	return nil
+	return r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = ""
+		backend.Status.Health = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
+	})
 }
 
 // reconcileManaged templates and applies the child workload, then publishes status.
@@ -243,38 +254,49 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
-	wantReplicas := int32(1)
-	if backend.Spec.Replicas != nil {
-		wantReplicas = *backend.Spec.Replicas
-	}
-
-	var health cachev1alpha1.CacheBackendHealth
-	var condStatus metav1.ConditionStatus
-	var reason, message string
-	switch {
-	case dep.Status.ReadyReplicas >= wantReplicas:
-		health, condStatus, reason = cachev1alpha1.CacheBackendHealthReady, metav1.ConditionTrue, "BackendReady"
-		message = fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, wantReplicas)
-	case dep.Status.ReadyReplicas == 0:
-		health, condStatus, reason = cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "WorkloadStarting"
-		message = "waiting for backend pods to become ready"
-	default:
-		health, condStatus, reason = cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "PartiallyReady"
-		message = fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, wantReplicas)
-	}
-
-	before := backend.DeepCopy()
-	backend.Status.Endpoint = endpoint
-	backend.Status.Health = health
-	backend.Status.ObservedGeneration = backend.Generation
-	meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-		Type:               conditionTypeReady,
-		Status:             condStatus,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: backend.Generation,
+	health, condStatus, reason, message := managedHealth(backend, dep)
+	return r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = endpoint
+		backend.Status.Health = health
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             condStatus,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: backend.Generation,
+		})
 	})
+}
 
+// managedHealth maps the Deployment's rollout state to a CacheBackend health.
+// Ready requires the Deployment to have observed its current generation and to
+// have enough updated + available replicas, so a stale rollout (e.g. mid image
+// change) is never reported Ready.
+func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
+	want := int32(1)
+	if backend.Spec.Replicas != nil {
+		want = *backend.Spec.Replicas
+	}
+
+	rolledOut := dep.Status.ObservedGeneration >= dep.Generation
+	switch {
+	case rolledOut && dep.Status.UpdatedReplicas >= want && dep.Status.AvailableReplicas >= want:
+		return cachev1alpha1.CacheBackendHealthReady, metav1.ConditionTrue, "BackendReady",
+			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
+	case !rolledOut || dep.Status.UpdatedReplicas < want:
+		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "RolloutInProgress",
+			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
+	default:
+		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
+			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
+	}
+}
+
+// patchStatus applies mutate to the backend's status and patches it only when it changes.
+func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, mutate func()) error {
+	before := backend.DeepCopy()
+	mutate()
 	if equality.Semantic.DeepEqual(before.Status, backend.Status) {
 		return nil
 	}

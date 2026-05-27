@@ -248,6 +248,10 @@ func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	dep := getDeployment(t, r, "cache", "ns1")
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.AvailableReplicas = 1
 	dep.Status.ReadyReplicas = 1
 	if err := r.Status().Update(context.Background(), dep); err != nil {
 		t.Fatalf("update deployment status: %v", err)
@@ -260,6 +264,55 @@ func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
 	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+}
+
+func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(2)
+
+	cases := []struct {
+		name string
+		dep  appsv1.Deployment
+		want cachev1alpha1.CacheBackendHealth
+	}{
+		{
+			name: "fresh create, nothing ready",
+			dep:  appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Generation: 1}},
+			want: cachev1alpha1.CacheBackendHealthPending,
+		},
+		{
+			name: "stale rollout after image change (old pods still available)",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, UpdatedReplicas: 0, AvailableReplicas: 2, ReadyReplicas: 2},
+			},
+			want: cachev1alpha1.CacheBackendHealthPending,
+		},
+		{
+			name: "rolled out and available",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 2, ReadyReplicas: 2},
+			},
+			want: cachev1alpha1.CacheBackendHealthReady,
+		},
+		{
+			name: "rolled out but replicas unavailable",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 1, ReadyReplicas: 1},
+			},
+			want: cachev1alpha1.CacheBackendHealthDegraded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, _, _ := managedHealth(cb, &tc.dep)
+			if got != tc.want {
+				t.Fatalf("managedHealth = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -339,6 +392,58 @@ func TestReconcileStatefulSetKindDeferred(t *testing.T) {
 	}
 	if len(deps.Items) != 0 {
 		t.Fatalf("deployments = %d, want 0 (StatefulSet kind deferred to C3)", len(deps.Items))
+	}
+}
+
+func TestReconcileSwitchToStatefulSetClearsStaleStatus(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	if ep := getBackend(t, r, "cache", "ns1").Status.Endpoint; ep == "" {
+		t.Fatalf("expected a published endpoint after managed reconcile")
+	}
+
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("switch to StatefulSet kind: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared after no longer managed", updated.Status.Endpoint)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond != nil {
+		t.Fatalf("Ready condition = %+v, want removed", cond)
+	}
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 after switch to StatefulSet kind", len(deps.Items))
+	}
+}
+
+func TestReconcileExternalAdvancesObservedGeneration(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "default", Generation: 7},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "external.default.svc:8080",
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "external.default.svc:8080"},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext", "default")
+
+	// Endpoint is unchanged, but observedGeneration must still advance.
+	if got := getBackend(t, r, "ext", "default").Status.ObservedGeneration; got != 7 {
+		t.Fatalf("status.observedGeneration = %d, want 7", got)
 	}
 }
 
