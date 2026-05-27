@@ -18,12 +18,22 @@ Run the baseline checks before sending a PR:
 make proto-gen
 make proto-lint
 make lint
-make test
+make test-race
 make build
+make cover-check # fail if logic-package coverage drops below COVER_MIN (65%)
+make vulncheck   # advisory: vulnerability scan (needs network); currently
+                 # reports known CVEs pending a Go/grpc upgrade, so CI does not
+                 # fail on it yet
 ```
 
-`make ci-lint` runs the golangci-lint configuration used by CI. `make proto-lint`
-lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
+`make test-race` runs the unit tests under the race detector — it's what the
+pre-push gate and CI use; `make test` is the faster, non-race variant for quick
+local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 65%)
+over the hand-written logic packages — generated code, `cmd/` entrypoints, and
+test helpers are excluded; `make cover` prints the per-function report. The
+floor is a ratchet: raise it as coverage improves. `make ci-lint` runs the
+golangci-lint configuration used by CI.
+`make proto-lint` lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 
 ## Development Cluster
@@ -84,7 +94,7 @@ The pre-commit hook (`.githooks/pre-commit`) blocks any commit that introduces a
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + format + vet + test + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + format + vet + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged). CI runs the full `make ci-lint` (golangci-lint) in addition to the above.
