@@ -32,7 +32,7 @@ jobs:
     outputs:
       final_message: ${{ steps.run_codex.outputs.final-message }}
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v6
       with:
         # Check out the PR's merge commit.
         ref: refs/pull/${{ github.event.pull_request.number }}/merge
@@ -101,7 +101,7 @@ jobs:
       pull-requests: write
     steps:
     - name: Report Codex feedback
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       env:
         CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
       with:
