@@ -206,6 +206,20 @@ func TestMetricsSinkReceivesCounts(t *testing.T) {
 	}
 }
 
+func TestNonPositiveDurationsClampToDefaults(t *testing.T) {
+	// WithSweepInterval(0) must not panic time.NewTicker(0); both clamp to defaults.
+	idx := New(WithTTL(0), WithSweepInterval(0))
+	if idx.ttl != DefaultTTL {
+		t.Fatalf("ttl = %v, want default %v", idx.ttl, DefaultTTL)
+	}
+	if idx.sweepInterval != DefaultSweepInterval {
+		t.Fatalf("sweepInterval = %v, want default %v", idx.sweepInterval, DefaultSweepInterval)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idx.Start(ctx) // would panic if sweepInterval were 0
+}
+
 func TestStatsKeyedByTopLevelReplicaID(t *testing.T) {
 	idx := New()
 	// The nested stats.ReplicaID disagrees with the authoritative top-level one;

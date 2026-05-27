@@ -1,6 +1,6 @@
 # Design: gRPC contract (`InferenceCache` service)
 
-Status: implemented (Phase 1 — proto + fail-open server stubs) · Implements: B4 · Tracks: InferenceCache tech spec §4.2–4.4
+Status: implemented · Implements: B4 (contract + fail-open stubs), B6 (index-backed `LookupRoute` / `ReportCacheState` / `PublishEvent` / `GetCacheState`) · Tracks: InferenceCache tech spec §4.2–4.4
 
 This is the public API gateways and engines integrate against — the load-bearing contract that unblocks the cache index (B6), engine KV-event hook (C1), and gateway clients (E1). Get the signature right early; the bytes behind it are filled in by later modules.
 
@@ -72,4 +72,6 @@ service InferenceCache {
 
 Lands: the proto, generated Go stubs, and the `InferenceCache` service registered on the server with **fail-open stub handlers** (`LookupRoute`→`NO_HINT`; `RenderTemplate`→passthrough; `LookupPDRoute`→empty; `GetCacheState`→empty; `ReportCacheState`/`PublishEvent`→drain + `Ack`; `StreamCacheEvents`/`StreamMetrics`→close immediately). Removes the `Ping` placeholder; keeps `grpc.health.v1`.
 
-Out of scope (later modules): real logic behind the RPCs — index-backed `LookupRoute` (B6), template rendering (D-series), PD routing (Phase 2), real metrics/events (M10). Java stubs are generated when the gateway client (E1) needs them.
+Out of scope (later modules): real logic behind the RPCs — template rendering (D-series), PD routing (Phase 2), real metrics/events (M10). Java stubs are generated when the gateway client (E1) needs them.
+
+**Update — B6 (cache index):** `LookupRoute`, `ReportCacheState`, `PublishEvent`, and `GetCacheState` are now backed by the in-memory `CacheIndex` (`pkg/index`): `ReportCacheState` ingests additive deltas, `PublishEvent` applies `PREFIX_EVICTED` / `ALL_CLEARED` / refresh, `LookupRoute` returns ranked replicas (or `NO_HINT`), and `GetCacheState` returns the `(tenant, model)` aggregate. `RenderTemplate`, `LookupPDRoute`, and the streams remain fail-open stubs. The `CacheIndex` CRD status surface is tracked separately (CAC-50).

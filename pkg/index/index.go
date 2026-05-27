@@ -171,6 +171,14 @@ func New(opts ...Option) *Index {
 	for _, opt := range opts {
 		opt(i)
 	}
+	// Clamp non-positive durations to defaults so misconfigured options can't
+	// produce a divide-by-zero freshness or panic time.NewTicker(0) in Start.
+	if i.ttl <= 0 {
+		i.ttl = DefaultTTL
+	}
+	if i.sweepInterval <= 0 {
+		i.sweepInterval = DefaultSweepInterval
+	}
 	return i
 }
 
