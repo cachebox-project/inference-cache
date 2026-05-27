@@ -5,6 +5,7 @@ go 1.23
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/prometheus/client_golang v1.19.1
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.uber.org/zap v1.26.0
 	google.golang.org/grpc v1.68.1
 	google.golang.org/protobuf v1.36.5
@@ -44,6 +45,7 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20230515195305-f3d0a9c9a5cc // indirect
