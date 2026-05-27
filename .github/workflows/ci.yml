@@ -63,8 +63,19 @@ jobs:
     - name: Generate protobufs
       run: make proto-gen
 
-    - name: Test
-      run: make test
+    - name: Test (race detector)
+      run: make test-race
+
+    - name: Coverage gate
+      run: make cover-check
+
+    # Advisory for now: govulncheck currently reports known CVEs in the Go
+    # toolchain stdlib + x/net + grpc that require a deliberate Go 1.25 / grpc
+    # upgrade (tracked separately). Surfaced here for visibility; flip to
+    # blocking (drop continue-on-error) once the upgrade lands and it's clean.
+    - name: Vulnerability scan (advisory)
+      run: make vulncheck
+      continue-on-error: true
 
     - name: Build binaries
       run: make build

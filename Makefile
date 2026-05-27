@@ -29,6 +29,7 @@ SETUP_ENVTEST_VERSION ?= v0.0.0-20241105200929-48ec3b71211f
 KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
+GOVULNCHECK_VERSION ?= v1.1.4
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -37,6 +38,7 @@ PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
 SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
 LOCAL_BUF := $(LOCALBIN)/buf
+GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 
 .PHONY: all
@@ -129,6 +131,39 @@ build: ## Build controller and server binaries.
 test: ## Run unit tests.
 	$(GO_CMD) test ./...
 
+.PHONY: test-race
+test-race: ## Run unit tests with the race detector (fresh, no cache).
+	$(GO_CMD) test -race -count=1 ./...
+
+.PHONY: vulncheck
+vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulnerabilities. Needs network.
+	@test -s $(GOVULNCHECK) || GOBIN=$(LOCALBIN) $(GO_CMD) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	$(GOVULNCHECK) ./...
+
+# Coverage gate. We measure the hand-written logic packages only: generated
+# code (proto stubs, deepcopy), entrypoints (cmd/), and test helpers are
+# excluded because their (un)covered statements would swamp the real signal.
+COVER_MIN ?= 65
+COVER_PROFILE ?= cover.out
+COVER_PROFILE_LOGIC ?= cover.logic.out
+COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|pkg/testing/
+
+.PHONY: cover
+cover: ## Run tests with coverage and print the per-function report (logic packages).
+	$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE)
+	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
+	@$(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC)
+
+.PHONY: cover-check
+cover-check: ## Fail if logic-package coverage is below COVER_MIN% (excludes generated/cmd/test-helper code).
+	@$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE) >/dev/null
+	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
+	@total=$$($(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC) | awk '/^total:/ {gsub(/%/,"",$$3); print $$3}'); \
+	if [ -z "$$total" ]; then echo "✗ no coverage data"; exit 1; fi; \
+	awk "BEGIN { exit !($$total >= $(COVER_MIN)) }" \
+		&& echo "✓ logic coverage $$total% (min $(COVER_MIN)%)" \
+		|| { echo "✗ logic coverage $$total% is below the $(COVER_MIN)% gate"; exit 1; }
+
 .PHONY: test-env
 test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
@@ -193,7 +228,7 @@ fmt-check: ## Check Go formatting without modifying files.
 	echo "✓ gofmt clean"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet test build ## Local CI gate (naming + internal-refs + fmt + vet + test + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet test-race build ## Local CI gate (naming + internal-refs + fmt + vet + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
