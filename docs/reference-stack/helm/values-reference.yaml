@@ -24,7 +24,9 @@ servingEngineSpec:
   modelSpec:
     - name: "llama8b"
       repository: "lmcache/vllm-openai"
-      tag: "latest"           # PLACEHOLDER — non-canonical; pin to a digest before any GPU/fleet run (see ../VERSIONS.md)
+      # PLACEHOLDER — replace with a pinned digest before any GPU/fleet run. Left
+      # non-resolvable on purpose so the values file can't run an unpinned image.
+      tag: "REPLACE_WITH_PINNED_DIGEST"   # e.g. set repository to ...@sha256:<digest> per the chart's pinning support; see ../VERSIONS.md
       modelURL: "meta-llama/Llama-3.1-8B-Instruct"
       replicaCount: 1
       requestGPU: 1

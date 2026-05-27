@@ -6,7 +6,7 @@ re-validate on the GPU fleet, then update the reconciler defaults.
 
 | Component | Pin | Where | Notes |
 |---|---|---|---|
-| vLLM + LMCache image | `lmcache/vllm-openai:latest` | `manifests/deployment.yaml`, `helm/values-reference.yaml` | Upstream ships LMCache pre-installed in this image. `latest` requires the vLLM **v1** engine (`VLLM_USE_V1=1`). **Re-pin to a digest before the GPU run** — see below. |
+| vLLM + LMCache image | `lmcache/vllm-openai@sha256:<pin>` | `manifests/deployment.yaml`, `helm/values-reference.yaml` | Upstream ships LMCache pre-installed. Requires the vLLM **v1** engine (`VLLM_USE_V1=1`). The manifests ship a **non-applyable placeholder digest** — substitute a real one (below) before the GPU run. |
 | Model | `meta-llama/Llama-3.1-8B-Instruct` | `manifests/deployment.yaml` | Gated on HF; needs `HF_TOKEN`. Small enough for a single A10/L40S-class GPU. Swap freely. |
 | CPU sanity image | `vllm/vllm-openai:latest` (linux/amd64) | `manifests/cpu-local/deployment.yaml` | Stock vLLM, no LMCache. CPU backend only. Used to validate the **ZMQ KV-event wiring + prefix-cache hit**, not LMCache. |
 | CPU sanity model | `Qwen/Qwen2.5-0.5B-Instruct` | `manifests/cpu-local/deployment.yaml` | Ungated, tiny, CPU-runnable. |

@@ -1,4 +1,3 @@
-# For kv_events_subscriber.py / kv_events_synthetic_publisher.py
+# For kv_events_subscriber.py / kv_events_synthetic_publisher.py / test_kv_events.py
 pyzmq>=26
 msgspec>=0.18
-msgpack>=1.0   # fallback decoder only

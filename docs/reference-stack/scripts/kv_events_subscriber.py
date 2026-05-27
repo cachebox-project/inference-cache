@@ -83,11 +83,11 @@ def _decode(payload: bytes):
             for ev in batch.events:
                 out.append((type(ev).__name__, _redact({f: getattr(ev, f) for f in ev.__struct_fields__})))
             return batch.ts, out
-        except Exception:
-            pass
-    # Typed decode failed: emit shape only, never the raw (potentially
-    # content-bearing) payload, so the metadata-only contract still holds.
-    return None, [("UNDECODED", {"bytes": len(payload)})]
+        except Exception as exc:
+            # Surface the error class/message (actionable on schema drift) but
+            # never the raw, potentially content-bearing payload.
+            return None, [("UNDECODED", {"bytes": len(payload), "error": f"{type(exc).__name__}: {exc}"})]
+    return None, [("UNDECODED", {"bytes": len(payload), "error": "msgspec not installed"})]
 
 
 def main() -> int:

@@ -38,10 +38,11 @@ spec:
     spec:
       containers:
         - name: vllm
-          # PLACEHOLDER TAG — non-canonical. `latest` is not reproducible and must
-          # NOT reach the GPU fleet. Substitute a digest (lmcache/vllm-openai@sha256:...)
-          # before any GPU run; that digest is the single value M5 hard-codes. See VERSIONS.md.
-          image: lmcache/vllm-openai:latest
+          # PLACEHOLDER — intentionally non-applyable. Substitute a real pinned
+          # digest before any GPU run; this all-zero digest will fail to pull, so
+          # the raw manifest cannot accidentally run an unpinned image. That digest
+          # is the single value M5 hard-codes. See VERSIONS.md.
+          image: lmcache/vllm-openai@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"]
           args:

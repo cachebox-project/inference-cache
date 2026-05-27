@@ -35,3 +35,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Python artifacts
+__pycache__/
+*.pyc
