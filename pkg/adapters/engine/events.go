@@ -11,7 +11,8 @@ import (
 // This file decodes vLLM's KV-cache event stream. vLLM publishes an EventBatch
 // per step as msgpack over ZMQ, using msgspec array-like tagged structs:
 //
-//	EventBatch  = [ts(float), events([...])]
+//	EventBatch  = [ts(float), events([...]), ...]  // trailing fields (e.g. a
+//	                                                // data-parallel rank) are ignored
 //	event       = [tag(string), ...fields]   // tag is the struct name
 //	  BlockStored      = ["BlockStored", block_hashes, parent_block_hash, token_ids, block_size, lora_id]
 //	  BlockRemoved     = ["BlockRemoved", block_hashes]

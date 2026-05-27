@@ -101,8 +101,8 @@ func TestReporterForwardsBlockStored(t *testing.T) {
 			t.Errorf("update identity = %s/%s, want vllm-0/vllm", u.GetReplicaId(), u.GetHashScheme())
 		}
 		for _, p := range u.GetPrefixes() {
-			if p.GetTokenCount() != 128 {
-				t.Errorf("token_count = %d, want 128", p.GetTokenCount())
+			if p.GetTokenCount() <= 0 {
+				t.Errorf("token_count = %d, want > 0", p.GetTokenCount())
 			}
 			hashes = append(hashes, p.GetPrefixHash())
 		}

@@ -27,8 +27,9 @@ func TestStoredUpdate(t *testing.T) {
 	if len(u.Prefixes) != 2 {
 		t.Fatalf("got %d prefixes, want 2", len(u.Prefixes))
 	}
-	if u.Prefixes[0].TokenCount != 128 {
-		t.Errorf("TokenCount = %d, want 128 (block size)", u.Prefixes[0].TokenCount)
+	// Cumulative token_count: block 0 covers 1×128, block 1 covers 2×128.
+	if u.Prefixes[0].TokenCount != 128 || u.Prefixes[1].TokenCount != 256 {
+		t.Errorf("TokenCount = [%d %d], want [128 256] (cumulative)", u.Prefixes[0].TokenCount, u.Prefixes[1].TokenCount)
 	}
 	if !bytes.Equal(u.Prefixes[0].PrefixHash, h0) || !bytes.Equal(u.Prefixes[1].PrefixHash, h1) {
 		t.Errorf("prefix hashes not passed through opaque: %x %x", u.Prefixes[0].PrefixHash, u.Prefixes[1].PrefixHash)

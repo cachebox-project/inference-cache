@@ -38,13 +38,18 @@ func (c Config) Update(tsUs int64, prefixes []*icpb.PrefixEntry) *icpb.CacheStat
 }
 
 // StoredPrefixes renders a BlockStored event as PrefixEntry values: one per block
-// hash, each covering BlockSize tokens.
+// hash. token_count is cumulative: vLLM block hashes chain their parent, so block
+// i's hash identifies the prefix up to and including block i and therefore covers
+// (i+1) blocks of this event. This keeps the ranking signal (longer prefixes rank
+// higher) instead of a flat per-block count. It counts only within-event tokens —
+// the parent prefix's length isn't in the event — so it's a lower bound, and it
+// never uses token contents.
 func StoredPrefixes(ev BlockStored) []*icpb.PrefixEntry {
 	prefixes := make([]*icpb.PrefixEntry, 0, len(ev.BlockHashes))
-	for _, h := range ev.BlockHashes {
+	for i, h := range ev.BlockHashes {
 		prefixes = append(prefixes, &icpb.PrefixEntry{
 			PrefixHash: h,
-			TokenCount: ev.BlockSize,
+			TokenCount: int32(i+1) * ev.BlockSize,
 		})
 	}
 	return prefixes
