@@ -160,18 +160,17 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 }
 
 // applyService creates or updates the backend Service idempotently, owned by the CR.
-// Ports/type are static in Phase 1, so on update we reconcile only the selector and
-// labels and preserve the API-server-defaulted fields (Protocol, ClusterIP) to avoid
-// write churn through the Owns(Service) watch.
+// Type, selector, and ports are reconciled (so out-of-band drift is corrected); the
+// rendered ports carry Protocol=TCP so they match the API-server-defaulted object,
+// and the allocated fields (clusterIP, nodePort) live in separate fields we never
+// touch — so reconciling ports does not churn through the Owns(Service) watch.
 func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *corev1.Service) error {
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Labels = desired.Labels
+		svc.Spec.Type = desired.Spec.Type
 		svc.Spec.Selector = desired.Spec.Selector
-		if svc.CreationTimestamp.IsZero() {
-			svc.Spec.Type = desired.Spec.Type
-			svc.Spec.Ports = desired.Spec.Ports
-		}
+		svc.Spec.Ports = desired.Spec.Ports
 		return controllerutil.SetControllerReference(backend, svc, r.Scheme)
 	})
 	if err != nil {
@@ -277,6 +276,12 @@ func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) 
 	want := int32(1)
 	if backend.Spec.Replicas != nil {
 		want = *backend.Spec.Replicas
+	}
+
+	// A backend scaled to zero is not serving; never report it Ready.
+	if want == 0 {
+		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "ScaledToZero",
+			"backend scaled to zero replicas"
 	}
 
 	rolledOut := dep.Status.ObservedGeneration >= dep.Generation

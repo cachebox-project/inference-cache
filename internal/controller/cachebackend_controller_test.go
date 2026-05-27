@@ -316,6 +316,44 @@ func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
 	}
 }
 
+func TestManagedHealthZeroReplicasNotReady(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(0)
+	// Even a fully-observed Deployment with 0/0 replicas must not be Ready.
+	dep := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Generation: 1},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+	}
+	if got, status, _, _ := managedHealth(cb, &dep); got == cachev1alpha1.CacheBackendHealthReady || status == metav1.ConditionTrue {
+		t.Fatalf("managedHealth for 0 replicas = %q/%v, want non-Ready", got, status)
+	}
+}
+
+func TestReconcileServicePortDriftCorrected(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+
+	// Drift the owned Service out-of-band: drop two ports.
+	var svc corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	svc.Spec.Ports = svc.Spec.Ports[:1]
+	if err := r.Update(context.Background(), &svc); err != nil {
+		t.Fatalf("drift service: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
+		t.Fatalf("re-get service: %v", err)
+	}
+	if len(svc.Spec.Ports) != 3 {
+		t.Fatalf("service ports = %d, want 3 restored after drift", len(svc.Spec.Ports))
+	}
+}
+
 func TestReconcileLMCacheUpdatesPodOverrides(t *testing.T) {
 	scheme := newScheme(t)
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
