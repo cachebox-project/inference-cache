@@ -15,8 +15,15 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
+
+// newTestService builds a service backed by a fresh, empty index for
+// handler-level unit tests.
+func newTestService() *inferenceCacheService {
+	return newInferenceCacheService(index.New(), newServerMetrics())
+}
 
 func TestHealthAndReadinessReturnOK(t *testing.T) {
 	_, baseURL, stop := startInProcessServer(t)
@@ -50,7 +57,8 @@ func TestMetricsExposesServerUp(t *testing.T) {
 }
 
 func TestLookupRouteFailsOpen(t *testing.T) {
-	resp, err := newInferenceCacheService().LookupRoute(context.Background(), &icpb.LookupRouteRequest{ModelId: "m"})
+	// Empty index → no match → fail open with NO_HINT.
+	resp, err := newTestService().LookupRoute(context.Background(), &icpb.LookupRouteRequest{ModelId: "m"})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
@@ -63,7 +71,7 @@ func TestLookupRouteFailsOpen(t *testing.T) {
 }
 
 func TestRenderTemplateFailsOpen(t *testing.T) {
-	resp, err := newInferenceCacheService().RenderTemplate(context.Background(), &icpb.RenderTemplateRequest{TemplateRef: "t"})
+	resp, err := newTestService().RenderTemplate(context.Background(), &icpb.RenderTemplateRequest{TemplateRef: "t"})
 	if err != nil {
 		t.Fatalf("RenderTemplate: %v", err)
 	}
@@ -206,5 +214,67 @@ func TestReportCacheStateClientCancel(t *testing.T) {
 		t.Fatalf("CloseAndRecv after cancel: got ack %+v, want error", ack)
 	} else if status.Code(err) != codes.Canceled {
 		t.Fatalf("error code = %v, want Canceled", status.Code(err))
+	}
+}
+
+// TestReportThenLookupReturnsPrefixMatch is the B6 end-to-end path: a replica
+// reports a prefix via ReportCacheState, then a LookupRoute for the same
+// (model, tenant, hash_scheme, prefix_hash) returns that replica ranked with a
+// PREFIX_MATCH — proving ingestion populates the index and lookups read it back
+// over the wire.
+func TestReportThenLookupReturnsPrefixMatch(t *testing.T) {
+	client, _, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prefix := []byte("prefix-hash-bytes")
+
+	stream, err := client.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId:  "replica-a",
+		ModelId:    "llama-3-8b",
+		TenantId:   "tenant-a",
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: prefix, TokenCount: 128}},
+	}); err != nil {
+		t.Fatalf("send update: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	resp, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
+		ModelId:    "llama-3-8b",
+		TenantId:   "tenant-a",
+		HashScheme: "vllm",
+		PrefixHash: prefix,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-a" {
+		t.Fatalf("expected single hit for replica-a, got %+v", resp.GetReplicaScores())
+	}
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 128 {
+		t.Fatalf("matched_tokens = %d, want 128", got)
+	}
+
+	// A different hash_scheme must not match the same bytes (engine isolation).
+	other, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
+		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "sglang", PrefixHash: prefix,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute (other scheme): %v", err)
+	}
+	if other.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("cross-scheme reason = %q, want NO_HINT", other.GetReasonCode())
 	}
 }
