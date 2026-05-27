@@ -53,6 +53,15 @@ type PrefixSummary struct {
 	Hot int64 `json:"hot,omitempty"`
 }
 
+// PrefixStatus holds the prefix summary. The summary is nested (rather than
+// flattened onto status.prefixes) to match the contract shape
+// status.prefixes.summary.{total,hot} and leave room for future per-prefix detail.
+type PrefixStatus struct {
+	// Summary aggregates the prefix entries held across the cluster.
+	// +optional
+	Summary PrefixSummary `json:"summary,omitempty"`
+}
+
 // CacheIndexStatus is the observed, cluster-wide cache aggregate the controller
 // reflects from the server's in-memory index. Metadata only — never KV tensors
 // or prompt text.
@@ -69,7 +78,7 @@ type CacheIndexStatus struct {
 	Tenants []TenantCacheStatus `json:"tenants,omitempty"`
 	// Prefixes summarizes prefix entries in the index.
 	// +optional
-	Prefixes PrefixSummary `json:"prefixes,omitempty"`
+	Prefixes PrefixStatus `json:"prefixes,omitempty"`
 	// ObservedServer is the server endpoint the aggregate was scraped from.
 	// +optional
 	ObservedServer string `json:"observedServer,omitempty"`
@@ -81,7 +90,7 @@ type CacheIndexStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=ci
-// +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.prefixes.total`
+// +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.prefixes.summary.total`
 // +kubebuilder:printcolumn:name="Updated",type=date,JSONPath=`.status.lastUpdated`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

@@ -157,7 +157,9 @@ func fetchSnapshot(ctx context.Context, hc *http.Client, url string) (index.Snap
 // buildCacheIndexStatus converts an index snapshot into CacheIndex status.
 func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time) cachev1alpha1.CacheIndexStatus {
 	st := cachev1alpha1.CacheIndexStatus{
-		Prefixes:       cachev1alpha1.PrefixSummary{Total: int64(snap.TotalPrefixes), Hot: int64(snap.HotPrefixes)},
+		Prefixes: cachev1alpha1.PrefixStatus{
+			Summary: cachev1alpha1.PrefixSummary{Total: int64(snap.TotalPrefixes), Hot: int64(snap.HotPrefixes)},
+		},
 		ObservedServer: serverURL,
 		LastUpdated:    metav1.NewTime(now),
 	}

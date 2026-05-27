@@ -17,7 +17,7 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.prefixes.total
+    - jsonPath: .status.prefixes.summary.total
       name: Prefixes
       type: integer
     - jsonPath: .status.lastUpdated
@@ -75,17 +75,22 @@ spec:
               prefixes:
                 description: Prefixes summarizes prefix entries in the index.
                 properties:
-                  hot:
-                    description: |-
-                      Hot is the number of prefixes with access count above the hot threshold.
-                      Always 0 until per-prefix access counting is implemented.
-                    format: int64
-                    type: integer
-                  total:
-                    description: Total is the number of distinct prefixes currently
-                      in the index.
-                    format: int64
-                    type: integer
+                  summary:
+                    description: Summary aggregates the prefix entries held across
+                      the cluster.
+                    properties:
+                      hot:
+                        description: |-
+                          Hot is the number of prefixes with access count above the hot threshold.
+                          Always 0 until per-prefix access counting is implemented.
+                        format: int64
+                        type: integer
+                      total:
+                        description: Total is the number of distinct prefixes currently
+                          in the index.
+                        format: int64
+                        type: integer
+                    type: object
                 type: object
               replicas:
                 description: Replicas is the per-replica cache health.

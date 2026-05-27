@@ -32,7 +32,7 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 
 	st := buildCacheIndexStatus(snap, "http://server/snapshot", now)
 
-	if st.Prefixes.Total != 5 || st.Prefixes.Hot != 0 {
+	if st.Prefixes.Summary.Total != 5 || st.Prefixes.Summary.Hot != 0 {
 		t.Fatalf("prefixes = %+v, want {Total:5 Hot:0}", st.Prefixes)
 	}
 	if st.ObservedServer != "http://server/snapshot" {
@@ -48,7 +48,7 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 
 func TestStatusEqualIgnoresTimestamps(t *testing.T) {
 	base := cachev1alpha1.CacheIndexStatus{
-		Prefixes: cachev1alpha1.PrefixSummary{Total: 3},
+		Prefixes: cachev1alpha1.PrefixStatus{Summary: cachev1alpha1.PrefixSummary{Total: 3}},
 		Replicas: []cachev1alpha1.ReplicaCacheStatus{{ID: "r1", CacheMemoryBytes: 100, HitRate: "0.8"}},
 	}
 	// Same meaningful data, different timestamps → equal.
@@ -131,7 +131,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 		return ci
 	}
 	ci := get()
-	if ci.Status.Prefixes.Total != 3 || len(ci.Status.Replicas) != 1 {
+	if ci.Status.Prefixes.Summary.Total != 3 || len(ci.Status.Replicas) != 1 {
 		t.Fatalf("status after create = %+v", ci.Status)
 	}
 	rvAfterCreate := ci.ResourceVersion
@@ -152,7 +152,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 		t.Fatalf("third refresh: %v", err)
 	}
 	ci = get()
-	if ci.Status.Prefixes.Total != 9 || ci.Status.Replicas[0].CacheMemoryBytes != 500 {
+	if ci.Status.Prefixes.Summary.Total != 9 || ci.Status.Replicas[0].CacheMemoryBytes != 500 {
 		t.Fatalf("status after change = %+v, want total 9 / memory 500", ci.Status)
 	}
 	if ci.ResourceVersion == rvAfterCreate {
