@@ -1,0 +1,177 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: cacheindices.inferencecache.io
+spec:
+  group: inferencecache.io
+  names:
+    kind: CacheIndex
+    listKind: CacheIndexList
+    plural: cacheindices
+    shortNames:
+    - ci
+    singular: cacheindex
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.prefixes.summary.total
+      name: Prefixes
+      type: integer
+    - jsonPath: .status.lastUpdated
+      name: Changed
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          CacheIndex is a cluster-scoped, status-only reflection of the server's
+          in-memory cache aggregate (the CacheIndex). It exists for observability
+          (`kubectl get cacheindex`); it is not a routing-decision substrate.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              CacheIndexSpec is intentionally empty: CacheIndex is a status-only,
+              controller-maintained reflection of the server's in-memory cache aggregate.
+              There is nothing for a user to configure on the spec.
+            type: object
+          status:
+            description: |-
+              CacheIndexStatus is the observed, cluster-wide cache aggregate the controller
+              reflects from the server's in-memory index. Metadata only — never KV tensors
+              or prompt text.
+            properties:
+              lastUpdated:
+                description: |-
+                  LastUpdated is when the observed aggregate last *changed*. The controller
+                  writes the status only on change, so a steady-state poll that finds no
+                  change does not advance this — it marks the last data change, not the last
+                  poll. (Poller liveness is observable via controller health/metrics.)
+                format: date-time
+                type: string
+              observedServer:
+                description: ObservedServer is the server endpoint the aggregate was
+                  scraped from.
+                type: string
+              prefixes:
+                description: Prefixes summarizes prefix entries in the index.
+                properties:
+                  summary:
+                    description: Summary aggregates the prefix entries held across
+                      the cluster.
+                    properties:
+                      hot:
+                        description: |-
+                          Hot is the number of prefixes with access count above the hot threshold.
+                          Always 0 until per-prefix access counting is implemented; rendered
+                          explicitly so an empty index shows hot: 0 rather than omitting it.
+                        format: int64
+                        type: integer
+                      total:
+                        description: |-
+                          Total is the number of distinct prefixes currently in the index.
+                          Always rendered (including 0) — it's the core summary, not omitempty.
+                        format: int64
+                        type: integer
+                    required:
+                    - hot
+                    - total
+                    type: object
+                type: object
+              replicas:
+                description: Replicas is the per-replica cache health.
+                items:
+                  description: ReplicaCacheStatus is the latest reported cache health
+                    for one engine replica.
+                  properties:
+                    cacheMemoryBytes:
+                      description: CacheMemoryBytes is the cache memory the replica
+                        reports using.
+                      format: int64
+                      type: integer
+                    hitRate:
+                      description: |-
+                        HitRate is the replica's rolling cache hit rate in [0,1], as a decimal
+                        string (e.g. "0.78"). A string is used because CRDs avoid floats for
+                        cross-language portability.
+                      type: string
+                    id:
+                      description: ID is the replica identifier (the engine/pod that
+                        reported the state).
+                      type: string
+                    lastUpdate:
+                      description: |-
+                        LastUpdate is when this replica's reported state last *changed*. Like the
+                        top-level status.lastUpdated, the controller writes status only on change,
+                        so a replica that keeps reporting identical stats does not advance this —
+                        it marks the last change, not the last observation. (Reporter liveness is
+                        observable via the server's /metrics, not this field.)
+                      format: date-time
+                      type: string
+                    pressure:
+                      description: |-
+                        Pressure is the replica's memory-pressure heuristic in [0,1], as a decimal
+                        string (e.g. "0.65").
+                      type: string
+                  required:
+                  - id
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              tenants:
+                description: Tenants is the per-tenant cache footprint.
+                items:
+                  description: TenantCacheStatus is the aggregate cache footprint
+                    for one tenant.
+                  properties:
+                    hitRate:
+                      description: |-
+                        HitRate is the tenant's mean replica hit rate in [0,1], as a decimal
+                        string (e.g. "0.82").
+                      type: string
+                    id:
+                      description: ID is the tenant identifier.
+                      type: string
+                    memoryUsed:
+                      description: |-
+                        MemoryUsed is the approximate cache memory attributed to the tenant
+                        (summed over the tenant's distinct replicas).
+                      format: int64
+                      type: integer
+                  required:
+                  - id
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

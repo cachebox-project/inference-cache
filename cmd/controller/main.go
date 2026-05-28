@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	"go.uber.org/zap/zapcore"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,20 +34,24 @@ func init() {
 }
 
 type options struct {
-	metricsAddr          string
-	secureMetrics        bool
-	enableHTTP2          bool
-	enableLeaderElection bool
-	probeAddr            string
-	zapOpts              zap.Options
+	metricsAddr            string
+	secureMetrics          bool
+	enableHTTP2            bool
+	enableLeaderElection   bool
+	probeAddr              string
+	serverSnapshotURL      string
+	cacheIndexRefreshEvery time.Duration
+	zapOpts                zap.Options
 }
 
 func defaultOptions() options {
 	return options{
-		metricsAddr:   ":8080",
-		probeAddr:     ":8081",
-		secureMetrics: false,
-		enableHTTP2:   false,
+		metricsAddr:            ":8080",
+		probeAddr:              ":8081",
+		secureMetrics:          false,
+		enableHTTP2:            false,
+		serverSnapshotURL:      "http://inference-cache-server:8080/snapshot",
+		cacheIndexRefreshEvery: controller.DefaultRefreshInterval,
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
 		},
@@ -60,6 +65,8 @@ func parseOptions() options {
 	flag.BoolVar(&opts.enableHTTP2, "enable-http2", opts.enableHTTP2, "Enable HTTP/2 for metrics.")
 	flag.BoolVar(&opts.enableLeaderElection, "leader-elect", opts.enableLeaderElection, "Enable leader election for controller manager.")
 	flag.StringVar(&opts.probeAddr, "health-probe-bind-address", opts.probeAddr, "The address the probe endpoint binds to.")
+	flag.StringVar(&opts.serverSnapshotURL, "server-snapshot-url", opts.serverSnapshotURL, "URL of the cache server's /snapshot endpoint, scraped to populate the CacheIndex status.")
+	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -100,6 +107,16 @@ func main() {
 		Log:    ctrl.Log.WithName("controllers").WithName("CacheBackend"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
+		os.Exit(1)
+	}
+
+	if err := mgr.Add(&controller.CacheIndexPoller{
+		Client:      mgr.GetClient(),
+		Log:         ctrl.Log.WithName("controllers").WithName("CacheIndex"),
+		SnapshotURL: opts.serverSnapshotURL,
+		Interval:    opts.cacheIndexRefreshEvery,
+	}); err != nil {
+		setupLog.Error(err, "unable to add CacheIndex poller")
 		os.Exit(1)
 	}
 

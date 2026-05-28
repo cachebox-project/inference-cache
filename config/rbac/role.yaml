@@ -56,7 +56,17 @@ rules:
   - inferencecache.io
   resources:
   - cachebackends/status
+  - cacheindices/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - inferencecache.io
+  resources:
+  - cacheindices
+  verbs:
+  - create
+  - get
+  - list
+  - watch
