@@ -104,17 +104,17 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 		t.Fatalf("containers = %d, want 1", len(containers))
 	}
 	c := containers[0]
+	if c.Name != "lmcache-server" {
+		t.Fatalf("container name = %q, want lmcache-server (standalone server, not the all-in-one vLLM)", c.Name)
+	}
 	if c.Image == "" {
 		t.Fatalf("container image is empty")
 	}
-	if !containsStr(c.Args, "--kv-transfer-config") || !containsStr(c.Args, "--kv-events-config") || !containsStr(c.Args, "--enable-prefix-caching") {
-		t.Fatalf("args missing LMCache/KV-event flags: %v", c.Args)
+	if !containsStr(c.Command, "lmcache_server") {
+		t.Fatalf("container command = %v, want to start with lmcache_server", c.Command)
 	}
-	if !hasEnv(c.Env, "VLLM_USE_V1", "1") {
-		t.Fatalf("env missing VLLM_USE_V1=1: %v", c.Env)
-	}
-	if len(c.Ports) != 3 {
-		t.Fatalf("ports = %d, want 3 (http, kv-events, kv-replay)", len(c.Ports))
+	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 {
+		t.Fatalf("ports = %v, want exactly one port on 65432 (lm:// scheme)", c.Ports)
 	}
 
 	svc := &corev1.Service{}
@@ -124,17 +124,27 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
 	}
-	if len(svc.Spec.Ports) != 3 {
-		t.Fatalf("service ports = %d, want 3", len(svc.Spec.Ports))
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
+		t.Fatalf("service ports = %v, want exactly one port on 65432", svc.Spec.Ports)
 	}
 	if so := metav1.GetControllerOf(svc); so == nil || so.Name != "cache" {
 		t.Fatalf("service controller owner = %+v, want CacheBackend/cache", so)
 	}
+	wantSelector := map[string]string{
+		"app.kubernetes.io/name":       "cachebackend",
+		"app.kubernetes.io/instance":   "cache",
+		"app.kubernetes.io/managed-by": "inference-cache-controller",
+	}
+	for k, v := range wantSelector {
+		if svc.Spec.Selector[k] != v {
+			t.Fatalf("service selector[%q] = %q, want %q", k, svc.Spec.Selector[k], v)
+		}
+	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	wantEndpoint := "cache.ns1.svc.cluster.local:8000"
+	wantEndpoint := "cache.ns1.svc.cluster.local:65432"
 	if updated.Status.Endpoint != wantEndpoint {
-		t.Fatalf("status.endpoint = %q, want %q", updated.Status.Endpoint, wantEndpoint)
+		t.Fatalf("status.endpoint = %q, want %q (engine-agnostic host:port; lm:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
 	}
 	if updated.Status.Health != cachev1alpha1.CacheBackendHealthPending {
 		t.Fatalf("status.health = %q, want Pending (no ready replicas yet)", updated.Status.Health)
@@ -150,13 +160,13 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.BackendConfig = map[string]string{"image": "registry.example.com/vllm-lmcache:pinned"}
+	cb.Spec.BackendConfig = map[string]string{"image": "registry.example.com/lmcache-server:pinned"}
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
 
 	dep := getDeployment(t, r, "cache", "ns1")
-	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/vllm-lmcache:pinned" {
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/lmcache-server:pinned" {
 		t.Fatalf("container image = %q, want overridden image", got)
 	}
 }
@@ -207,13 +217,13 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"image": "example.com/vllm-lmcache:v2"}
+	live.Spec.BackendConfig = map[string]string{"image": "example.com/lmcache-server:v2"}
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
 	reconcile(t, r, "cache", "ns1")
 
-	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/vllm-lmcache:v2" {
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v2" {
 		t.Fatalf("deployment image = %q, want updated image", got)
 	}
 }
@@ -340,7 +350,7 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("get service: %v", err)
 	}
-	svc.Spec.Ports = svc.Spec.Ports[:1]
+	svc.Spec.Ports = nil
 	if err := r.Update(context.Background(), &svc); err != nil {
 		t.Fatalf("drift service: %v", err)
 	}
@@ -349,8 +359,8 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("re-get service: %v", err)
 	}
-	if len(svc.Spec.Ports) != 3 {
-		t.Fatalf("service ports = %d, want 3 restored after drift", len(svc.Spec.Ports))
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
+		t.Fatalf("service ports = %v, want lm:// 65432 restored after drift", svc.Spec.Ports)
 	}
 }
 
@@ -549,15 +559,6 @@ func containsStr(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {
 			return true
-		}
-	}
-	return false
-}
-
-func hasEnv(env []corev1.EnvVar, name, value string) bool {
-	for _, e := range env {
-		if e.Name == name {
-			return e.Value == value
 		}
 	}
 	return false
