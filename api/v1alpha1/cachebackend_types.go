@@ -129,6 +129,34 @@ type CacheBackendIntegrationSpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MinimumPrefixTokens *int32 `json:"minimumPrefixTokens,omitempty"`
+
+	// FailOpen controls whether the engine treats cache lookups as a soft
+	// dependency. When true (the default), an unreachable or degraded cache
+	// backend MUST fall back to local prefill and never fail a serving
+	// request — the cache is an optimization, not a serving dependency. When
+	// explicitly set to false the engine fails requests on cache
+	// unreachability ("fail-closed"); the cache becomes a serving
+	// dependency, which is loud and visible via a Warning Event on the
+	// owning CacheBackend.
+	//
+	// The flag is plumbed by the engine adapter; per-request fail-open
+	// behavior at the engine level is owned by vLLM+LMCache (the connector
+	// honors this flag).
+	// +optional
+	// +kubebuilder:default=true
+	FailOpen *bool `json:"failOpen,omitempty"`
+}
+
+// IntegrationFailOpen returns the effective fail-open behavior for a
+// CacheBackend integration spec. Missing spec or nil field defaults to true,
+// matching the API default — the cache is an optimization, never a serving
+// dependency. Engine adapters consult this helper to set the engine connector
+// flags consistently across the spec→adapter path.
+func IntegrationFailOpen(spec *CacheBackendIntegrationSpec) bool {
+	if spec == nil || spec.FailOpen == nil {
+		return true
+	}
+	return *spec.FailOpen
 }
 
 // CacheBackendEngineSelector selects engines by labels.
@@ -200,6 +228,13 @@ type CacheBackendStatus struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
+
+	// FailOpen mirrors the effective spec.integration.failOpen value the
+	// controller most recently observed. Surfaced so operators can confirm
+	// whether the cache is currently a soft optimization (true) or a
+	// serving dependency (false) without re-reading the integration spec.
+	// +optional
+	FailOpen *bool `json:"failOpen,omitempty"`
 
 	// ObservedGeneration is the .metadata.generation last reconciled by the controller.
 	// +optional
