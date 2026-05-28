@@ -271,6 +271,10 @@ func serviceDNSNamespace(endpoint string) (string, bool) {
 	if host == "" {
 		return "", false
 	}
+	// DNS is case-insensitive and a fully-qualified name may carry a
+	// trailing dot ("svc.cluster.local."); normalise both so the suffix
+	// match below is not bypassed by either variant.
+	host = strings.ToLower(host)
 	// Strip a leading URL scheme (http://, https://, grpc://, ...).
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+3:]
@@ -284,6 +288,9 @@ func serviceDNSNamespace(endpoint string) (string, bool) {
 	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i:], ".") {
 		host = host[:i]
 	}
+	// Drop the FQDN trailing dot (e.g. "...svc.cluster.local.") so the
+	// suffix match below isn't bypassed by the absolute-DNS form.
+	host = strings.TrimSuffix(host, ".")
 	// Strip the optional Kubernetes cluster-domain suffix so the two
 	// canonical forms collapse to a single ".svc"-terminated string.
 	host = strings.TrimSuffix(host, "."+k8sClusterDomain)
