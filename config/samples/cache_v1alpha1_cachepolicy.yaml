@@ -1,0 +1,13 @@
+apiVersion: inferencecache.io/v1alpha1
+kind: CachePolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachepolicy-sample
+spec:
+  eviction: LRU
+  evictionTTL: 30m
+  minimumPrefixTokens: 32
+  lookupTimeoutMs: 20
+  failOpen: true
+  tenantScoped: true

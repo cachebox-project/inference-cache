@@ -1,0 +1,6 @@
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheIndex
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cluster-default

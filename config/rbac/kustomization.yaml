@@ -8,3 +8,11 @@ resources:
 - cachebackend_viewer_role.yaml
 - cacheindex_editor_role.yaml
 - cacheindex_viewer_role.yaml
+- cachepolicy_editor_role.yaml
+- cachepolicy_viewer_role.yaml
+- cachetenant_editor_role.yaml
+- cachetenant_viewer_role.yaml
+- pdtopology_editor_role.yaml
+- pdtopology_viewer_role.yaml
+- prompttemplate_editor_role.yaml
+- prompttemplate_viewer_role.yaml

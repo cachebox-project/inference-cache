@@ -1,0 +1,17 @@
+apiVersion: inferencecache.io/v1alpha1
+kind: PromptTemplate
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: prompttemplate-sample
+spec:
+  body: |
+    system: {{.system}}
+    user: {{.user}}
+  slots:
+  - name: system
+    type: Stable
+    required: true
+  - name: user
+    type: Mutable
+    required: true

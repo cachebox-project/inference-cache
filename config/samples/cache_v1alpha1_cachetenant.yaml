@@ -1,0 +1,12 @@
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachetenant-sample
+spec:
+  tenantID: tenant-a
+  isolationMode: Fairness
+  quota:
+    maxMemoryBytes: 1073741824
+    maxIndexEntries: 100000

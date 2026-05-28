@@ -1,3 +1,7 @@
 resources:
 - bases/inferencecache.io_cachebackends.yaml
 - bases/inferencecache.io_cacheindices.yaml
+- bases/inferencecache.io_cachepolicies.yaml
+- bases/inferencecache.io_cachetenants.yaml
+- bases/inferencecache.io_pdtopologies.yaml
+- bases/inferencecache.io_prompttemplates.yaml
