@@ -1,2 +1,3 @@
 resources:
 - bases/inferencecache.io_cachebackends.yaml
+- bases/inferencecache.io_cacheindices.yaml

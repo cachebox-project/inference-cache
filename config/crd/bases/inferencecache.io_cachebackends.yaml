@@ -135,6 +135,22 @@ spec:
                     description: Engine identifies the inference engine integration,
                       such as SGLang or vLLM.
                     type: string
+                  failOpen:
+                    default: true
+                    description: |-
+                      FailOpen controls whether the engine treats cache lookups as a soft
+                      dependency. When true (the default), an unreachable or degraded cache
+                      backend MUST fall back to local prefill and never fail a serving
+                      request — the cache is an optimization, not a serving dependency. When
+                      explicitly set to false the engine fails requests on cache
+                      unreachability ("fail-closed"); the cache becomes a serving
+                      dependency, which is loud and visible via a Warning Event on the
+                      owning CacheBackend.
+
+                      The flag is plumbed by the engine adapter; per-request fail-open
+                      behavior at the engine level is owned by vLLM+LMCache (the connector
+                      honors this flag).
+                    type: boolean
                   lookupTimeoutMs:
                     description: LookupTimeoutMs bounds cache lookup latency in milliseconds.
                     format: int32
@@ -1682,6 +1698,13 @@ spec:
                 description: Endpoint is the observed endpoint clients should use
                   for this backend.
                 type: string
+              failOpen:
+                description: |-
+                  FailOpen mirrors the effective spec.integration.failOpen value the
+                  controller most recently observed. Surfaced so operators can confirm
+                  whether the cache is currently a soft optimization (true) or a
+                  serving dependency (false) without re-reading the integration spec.
+                type: boolean
               health:
                 description: Health summarizes the observed backend health.
                 enum:

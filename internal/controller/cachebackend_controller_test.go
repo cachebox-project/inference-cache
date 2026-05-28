@@ -218,6 +218,44 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	}
 }
 
+func TestReconcileLMCacheProfileSwitchGPUToCPU(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// GPU profile (default): GPU limit set, 8Gi shm.
+	c := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0]
+	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; !ok {
+		t.Fatalf("default profile should request a GPU")
+	}
+
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"profile": "cpu", "image": "vllm/vllm-openai-cpu:latest-arm64"}
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("switch to cpu profile: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	// CPU profile must reach the live Deployment: GPU limit gone, image swapped, shm 4Gi.
+	dep := getDeployment(t, r, "cache", "ns1")
+	c = dep.Spec.Template.Spec.Containers[0]
+	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
+		t.Fatalf("GPU limit should be removed after switching to cpu profile")
+	}
+	if c.Image != "vllm/vllm-openai-cpu:latest-arm64" {
+		t.Fatalf("image = %q, want cpu image after profile switch", c.Image)
+	}
+	var shm *corev1.Volume
+	for i := range dep.Spec.Template.Spec.Volumes {
+		if dep.Spec.Template.Spec.Volumes[i].Name == "shm" {
+			shm = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.SizeLimit == nil || shm.EmptyDir.SizeLimit.String() != "4Gi" {
+		t.Fatalf("shm size = %v, want 4Gi after switching to cpu profile", shm)
+	}
+}
+
 func TestReconcileLMCacheScalesReplicas(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")

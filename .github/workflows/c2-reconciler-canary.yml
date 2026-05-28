@@ -1,0 +1,57 @@
+# On-demand / scheduled CPU canary for the C2 CacheBackend reconciler.
+#
+# Runs docs/reference-stack/scripts/canary_c2_reconcile.sh: brings up a kind
+# cluster, runs the controller, applies a CPU-profile CacheBackend, and asserts
+# the reconciler stands up a healthy serving backend (status.health=Ready,
+# endpoint published), an engine prefix-cache hit, and owner-ref GC on delete.
+# GPU-free.
+#
+# This is NOT a per-PR gate (it pulls a multi-GB image, needs Docker + kind, and
+# ~10 GiB RAM); it runs on a schedule and on manual dispatch.
+name: c2-reconciler-canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (override to target a self-hosted Docker host)"
+        default: ubuntu-latest
+        required: false
+  schedule:
+    - cron: "30 7 * * *" # nightly 07:30 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c2-reconciler-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Run C2 reconciler CPU canary
+        run: docs/reference-stack/scripts/canary_c2_reconcile.sh
+
+      - name: Upload canary logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2-canary-logs
+          path: |
+            /tmp/c2-canary-controller.log
+            /tmp/c2-canary-pf.log
+          if-no-files-found: ignore

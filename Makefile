@@ -123,9 +123,10 @@ proto-lint: buf ## Lint the gRPC contract with buf (lint-only; codegen stays on 
 	$(BUF) lint
 
 .PHONY: build
-build: ## Build controller and server binaries.
+build: ## Build controller, server, and kvevent-subscriber binaries.
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/controller ./cmd/controller
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/server ./cmd/server
+	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/kvevent-subscriber ./cmd/kvevent-subscriber
 
 .PHONY: test
 test: ## Run unit tests.

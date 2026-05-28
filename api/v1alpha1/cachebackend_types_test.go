@@ -36,7 +36,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "conditions"} {
+	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "failOpen", "conditions"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -53,7 +53,13 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"WriteOnly",
 		"ReadWrite",
 	})
-	requireNoProperty(t, integrationSchema, "failOpen")
+	failOpenSchema := mustProperty(t, integrationSchema, "failOpen")
+	if got, ok := failOpenSchema["type"].(string); !ok || got != "boolean" {
+		t.Fatalf("integration.failOpen type = %v, want boolean", failOpenSchema["type"])
+	}
+	if got, ok := failOpenSchema["default"].(bool); !ok || !got {
+		t.Fatalf("integration.failOpen default = %v, want true", failOpenSchema["default"])
+	}
 	requireEnum(t, mustProperty(t, statusSchema, "health"), []string{
 		"Pending",
 		"Ready",
@@ -274,6 +280,27 @@ func TestCacheBackendJSONOmitEmptySpecPointers(t *testing.T) {
 	}
 	if string(data) != "{}" {
 		t.Fatalf("empty spec JSON = %s, want {}", data)
+	}
+}
+
+func TestIntegrationFailOpenDefaultsTrue(t *testing.T) {
+	falseV, trueV := false, true
+	cases := []struct {
+		name string
+		spec *CacheBackendIntegrationSpec
+		want bool
+	}{
+		{name: "nil spec defaults true", spec: nil, want: true},
+		{name: "nil field defaults true", spec: &CacheBackendIntegrationSpec{}, want: true},
+		{name: "explicit true", spec: &CacheBackendIntegrationSpec{FailOpen: &trueV}, want: true},
+		{name: "explicit false honored", spec: &CacheBackendIntegrationSpec{FailOpen: &falseV}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IntegrationFailOpen(tc.spec); got != tc.want {
+				t.Fatalf("IntegrationFailOpen(%+v) = %v, want %v", tc.spec, got, tc.want)
+			}
+		})
 	}
 }
 

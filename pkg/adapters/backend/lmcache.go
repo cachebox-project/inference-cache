@@ -2,6 +2,7 @@ package backend
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,15 @@ const (
 	defaultLMCacheMaxLocalCPUSize = "20"
 	defaultHFTokenSecretName      = "hf-token"
 
+	// CPU profile (backendConfig profile=cpu): a GPU-free vLLM engine for substrate
+	// validation off-GPU. It keeps prefix caching + the KV-event publisher but drops
+	// the LMCache connector — real LMCache offload requires a GPU, so the default
+	// (gpu) profile owns that. Mirrors docs/reference-stack/manifests/cpu-local.
+	// The upstream CPU image is arch-tagged (latest-arm64 / latest-x86_64) with no
+	// safe multi-arch default, so backendConfig.image is REQUIRED for this profile.
+	defaultCPUModel        = "Qwen/Qwen2.5-0.5B-Instruct"
+	defaultCPUKVCacheSpace = "4"
+
 	// API-server pod defaults for the two override fields that are server-defaulted.
 	// Baking them into the rendered template keeps the update path churn-free (the
 	// reconciled value matches the live, defaulted object).
@@ -38,6 +48,11 @@ const (
 	cfgKeyImage         = "image"
 	cfgKeyModel         = "model"
 	cfgKeyHFTokenSecret = "hfTokenSecret"
+	cfgKeyProfile       = "profile"
+
+	// profile values for the profile backendConfig key.
+	profileGPU = "gpu"
+	profileCPU = "cpu"
 
 	portHTTP     = 8000
 	portKVEvents = 5557
@@ -66,8 +81,6 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 	namespace := cb.Namespace
 	cfg := cb.Spec.BackendConfig
 
-	image := configOr(cfg, cfgKeyImage, defaultLMCacheImage)
-	model := configOr(cfg, cfgKeyModel, defaultLMCacheModel)
 	hfSecret := configOr(cfg, cfgKeyHFTokenSecret, defaultHFTokenSecretName)
 
 	replicas := initialReplicas(cb)
@@ -75,69 +88,23 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 	selector := selectorLabels(name)
 	podLabels := podTemplateLabels(name)
 
-	container := corev1.Container{
-		Name:            "vllm",
-		Image:           image,
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"vllm", "serve", model},
-		Args: []string{
-			fmt.Sprintf("--port=%d", portHTTP),
-			"--enable-prefix-caching",
-			"--kv-transfer-config", kvTransferConfig,
-			"--kv-events-config", kvEventsConfig,
-		},
-		Env: []corev1.EnvVar{
-			{Name: "VLLM_USE_V1", Value: "1"},
-			{Name: "LMCACHE_CHUNK_SIZE", Value: defaultLMCacheChunkSize},
-			{Name: "LMCACHE_LOCAL_CPU", Value: defaultLMCacheLocalCPU},
-			{Name: "LMCACHE_MAX_LOCAL_CPU_SIZE", Value: defaultLMCacheMaxLocalCPUSize},
-			{
-				Name: "HF_TOKEN",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: hfSecret},
-						Key:                  "token",
-						// Optional so ungated models run without the secret present;
-						// the A2 reference requires it for the gated default model.
-						Optional: ptrTo(true),
-					},
-				},
-			},
-		},
-		Ports: []corev1.ContainerPort{
-			{Name: "http", ContainerPort: portHTTP, Protocol: corev1.ProtocolTCP},
-			{Name: "kv-events", ContainerPort: portKVEvents, Protocol: corev1.ProtocolTCP},
-			{Name: "kv-replay", ContainerPort: portKVReplay, Protocol: corev1.ProtocolTCP},
-		},
-		Resources: corev1.ResourceRequirements{
-			// CPU and memory requests are needed for HPA CPU utilization to be
-			// computable (Kubernetes computes utilization against the pod's CPU
-			// request). The values are conservative starting points sized for
-			// vLLM's coordination overhead, not its model serving; the GPU does
-			// the heavy lifting via the nvidia.com/gpu limit below.
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("500m"),
-				corev1.ResourceMemory: resource.MustParse("2Gi"),
-			},
-			Limits: corev1.ResourceList{
-				"nvidia.com/gpu": resource.MustParse("1"),
-			},
-		},
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/health",
-					Port: intstr.FromString("http"),
-				},
-			},
-			InitialDelaySeconds: 60,
-			PeriodSeconds:       10,
-			FailureThreshold:    60,
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "cache-home", MountPath: "/root/.cache/huggingface"},
-			{Name: "shm", MountPath: "/dev/shm"},
-		},
+	var container corev1.Container
+	var shmSize resource.Quantity
+	if strings.EqualFold(configOr(cfg, cfgKeyProfile, profileGPU), profileCPU) {
+		// The CPU image is arch-tagged upstream with no safe multi-arch default,
+		// so it must be supplied explicitly (e.g. vllm/vllm-openai-cpu:latest-arm64).
+		image := configOr(cfg, cfgKeyImage, "")
+		if image == "" {
+			return nil, fmt.Errorf("backendConfig.profile=cpu requires backendConfig.image (an arch-tagged CPU image, e.g. vllm/vllm-openai-cpu:latest-arm64)")
+		}
+		model := configOr(cfg, cfgKeyModel, defaultCPUModel)
+		container = cpuEngineContainer(image, model, hfSecret)
+		shmSize = resource.MustParse("4Gi")
+	} else {
+		image := configOr(cfg, cfgKeyImage, defaultLMCacheImage)
+		model := configOr(cfg, cfgKeyModel, defaultLMCacheModel)
+		container = lmCacheEngineContainer(image, model, hfSecret)
+		shmSize = resource.MustParse("8Gi")
 	}
 
 	podSpec := corev1.PodSpec{
@@ -152,7 +119,7 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{
 						Medium:    corev1.StorageMediumMemory,
-						SizeLimit: ptrQuantity(resource.MustParse("8Gi")),
+						SizeLimit: ptrQuantity(shmSize),
 					},
 				},
 			},
@@ -269,6 +236,114 @@ func buildPVC(cb *cachev1alpha1.CacheBackend) *corev1.PersistentVolumeClaim {
 				},
 			},
 			StorageClassName: spec.StorageClassName,
+		},
+	}
+}
+
+// lmCacheEngineContainer renders the GPU vLLM+LMCache container (default profile):
+// vLLM reads/writes KV through the LMCache connector, with prefix caching and the
+// KV-event publisher enabled.
+func lmCacheEngineContainer(image, model, hfSecret string) corev1.Container {
+	c := baseEngineContainer(image, model, hfSecret)
+	c.Args = []string{
+		fmt.Sprintf("--port=%d", portHTTP),
+		"--enable-prefix-caching",
+		"--kv-transfer-config", kvTransferConfig,
+		"--kv-events-config", kvEventsConfig,
+	}
+	c.Env = append([]corev1.EnvVar{
+		{Name: "VLLM_USE_V1", Value: "1"},
+		{Name: "LMCACHE_CHUNK_SIZE", Value: defaultLMCacheChunkSize},
+		{Name: "LMCACHE_LOCAL_CPU", Value: defaultLMCacheLocalCPU},
+		{Name: "LMCACHE_MAX_LOCAL_CPU_SIZE", Value: defaultLMCacheMaxLocalCPUSize},
+	}, hfTokenEnv(hfSecret))
+	// CPU + memory requests size the coordination overhead; the GPU does the
+	// model-serving heavy lifting via the nvidia.com/gpu limit. The CPU request
+	// is also a hard requirement for the HPA: Kubernetes computes
+	// utilization-based scaling against the pod's CPU request, so an HPA on a
+	// container without one never gets usable metrics.
+	c.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}
+	return c
+}
+
+// cpuEngineContainer renders a GPU-free vLLM container (profile=cpu): no GPU limit
+// and no LMCache connector, but prefix caching and the KV-event publisher stay on so
+// the substrate (engine config + KV-event stream) can be validated off-GPU.
+func cpuEngineContainer(image, model, hfSecret string) corev1.Container {
+	c := baseEngineContainer(image, model, hfSecret)
+	c.Args = []string{
+		fmt.Sprintf("--port=%d", portHTTP),
+		"--dtype=bfloat16",
+		"--max-model-len=8192",
+		"--enforce-eager",
+		"--enable-prefix-caching",
+		"--kv-events-config", kvEventsConfig,
+	}
+	c.Env = append([]corev1.EnvVar{
+		{Name: "VLLM_CPU_KVCACHE_SPACE", Value: defaultCPUKVCacheSpace},
+	}, hfTokenEnv(hfSecret))
+	// CPU-profile vLLM does the inference itself on CPU, so its CPU request
+	// must cover the model serving (not just coordination overhead). 2 cores +
+	// 6 GiB is a sensible floor for the tiny default model (Qwen 0.5B); larger
+	// models need a corresponding override. The CPU request is also a hard
+	// requirement for the HPA to compute utilization-based scaling.
+	c.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("2"),
+			corev1.ResourceMemory: resource.MustParse("6Gi"),
+		},
+	}
+	return c
+}
+
+// baseEngineContainer holds the parts shared by every profile (name, image,
+// command, ports, readiness probe, mounts); args/env/resources are profile-specific.
+func baseEngineContainer(image, model, hfSecret string) corev1.Container {
+	return corev1.Container{
+		Name:            "vllm",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"vllm", "serve", model},
+		Ports: []corev1.ContainerPort{
+			{Name: "http", ContainerPort: portHTTP, Protocol: corev1.ProtocolTCP},
+			{Name: "kv-events", ContainerPort: portKVEvents, Protocol: corev1.ProtocolTCP},
+			{Name: "kv-replay", ContainerPort: portKVReplay, Protocol: corev1.ProtocolTCP},
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/health",
+					Port: intstr.FromString("http"),
+				},
+			},
+			InitialDelaySeconds: 60,
+			PeriodSeconds:       10,
+			FailureThreshold:    60,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "cache-home", MountPath: "/root/.cache/huggingface"},
+			{Name: "shm", MountPath: "/dev/shm"},
+		},
+	}
+}
+
+// hfTokenEnv injects the optional HF_TOKEN secret ref so gated models can pull; it
+// is optional so ungated models (e.g. the CPU profile default) run without it.
+func hfTokenEnv(secret string) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: "HF_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secret},
+				Key:                  "token",
+				Optional:             ptrTo(true),
+			},
 		},
 	}
 }
