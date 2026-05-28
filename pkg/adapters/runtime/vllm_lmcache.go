@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -161,6 +162,20 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
+		},
+		// CPU and memory requests are required for a CPU-utilization HPA to
+		// have a baseline to compute utilization against; without a CPU
+		// request the kube-controller-manager's HPA loop never gets a usable
+		// metric and the scaler never moves. The values are conservative
+		// starting points (the standalone server forwards bytes and holds KV
+		// in memory; 1 GiB is a floor sized for a small KV working set).
+		// Memory-bound workloads should grow the request via a future first-
+		// class spec field.
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("250m"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
 		},
 	}
 

@@ -118,6 +118,27 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheResolveCacheServerHasResourceRequests(t *testing.T) {
+	// A CPU-utilization HPA needs the pod's CPU request as the denominator to
+	// compute utilization, so without one the autoscaler never gets a usable
+	// metric and never scales. The adapter must therefore declare modest
+	// CPU + memory requests on the lmcache-server container by default.
+	a := NewVLLMLMCacheAdapter()
+	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	reqs := pod.Containers[0].Resources.Requests
+	cpu, hasCPU := reqs[corev1.ResourceCPU]
+	if !hasCPU || cpu.IsZero() {
+		t.Fatalf("container Resources.Requests missing a CPU request: %v", reqs)
+	}
+	mem, hasMem := reqs[corev1.ResourceMemory]
+	if !hasMem || mem.IsZero() {
+		t.Fatalf("container Resources.Requests missing a memory request: %v", reqs)
+	}
+}
+
 func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})

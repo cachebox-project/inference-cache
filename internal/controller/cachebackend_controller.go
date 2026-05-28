@@ -554,14 +554,19 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 }
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
+//
+// status.capacity is intentionally left empty here: the field is present on
+// the type for forward-compat, but the standalone LMCache server pod has no
+// data volume the controller can attach a PVC to today, so reporting a
+// requested PVC size as "provisioned capacity" would mislead operators.
+// Populating it is left to the follow-up that wires storage end-to-end.
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
 	health, readyStatus, reason, message := managedHealth(backend, dep)
 	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
-	capacity := managedCapacity(backend)
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
 		backend.Status.Health = health
-		backend.Status.Capacity = capacity
+		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
@@ -669,20 +674,6 @@ func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
 		return *backend.Spec.Replicas
 	}
 	return 1
-}
-
-// managedCapacity returns the human-readable capacity surfaced on status.
-// When persistent storage is configured this is the requested PVC size; the
-// PVC itself is currently provisioned by a follow-up module (post-C6 the
-// standalone LMCache server pod has no native data volume to mount), so the
-// capacity field reflects the *requested* size operators can plan against.
-// For ephemeral-storage backends the field is empty (the EmptyDir size isn't
-// a meaningful capacity signal).
-func managedCapacity(backend *cachev1alpha1.CacheBackend) string {
-	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
-		return ""
-	}
-	return backend.Spec.Storage.PVC.Size.String()
 }
 
 // reconcileHPA creates, updates, or deletes the HorizontalPodAutoscaler that

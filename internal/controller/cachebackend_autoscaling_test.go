@@ -7,27 +7,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
-
-// persistentBackend constructs a CacheBackend that carries spec.storage.pvc,
-// used to drive the status.capacity surface (the PVC itself isn't wired to a
-// volume yet post-C6 — that's a follow-up — but the requested size is still
-// surfaced for operators to plan against).
-func persistentBackend(name, namespace, size string, storageClass *string) *cachev1alpha1.CacheBackend {
-	cb := lmcacheBackend(name, namespace)
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{
-			Size:             resource.MustParse(size),
-			StorageClassName: storageClass,
-		},
-	}
-	return cb
-}
 
 // ---- HPA reconciliation -----------------------------------------------------
 
@@ -313,29 +297,19 @@ func TestStatusProgressingFalseWhenDegraded(t *testing.T) {
 	}
 }
 
-func TestStatusCapacityReflectsPVCSize(t *testing.T) {
-	// The PVC isn't wired to a volume yet (deferred to a follow-up post-C6),
-	// but the requested size is still surfaced so operators can plan against
-	// the eventual capacity.
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "20Gi", nil)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "20Gi" {
-		t.Fatalf("status.capacity = %q, want 20Gi", got)
-	}
-}
-
-func TestStatusCapacityEmptyForEphemeralBackend(t *testing.T) {
+func TestStatusCapacityStaysEmpty(t *testing.T) {
+	// The capacity field is present on the type for forward-compat, but the
+	// controller does not populate it: there is no data volume on the
+	// adapter-rendered pod today to attach a PVC to, so reporting a
+	// requested PVC size as "provisioned capacity" would mislead operators.
+	// Populating it is left to the follow-up that wires storage end-to-end.
 	scheme := newScheme(t)
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
 
 	reconcile(t, r, "cache", "ns1")
 
 	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "" {
-		t.Fatalf("status.capacity = %q, want empty for ephemeral backend", got)
+		t.Fatalf("status.capacity = %q, want empty (storage wire-up deferred)", got)
 	}
 }
 
@@ -386,16 +360,6 @@ func TestProgressingFromHealthExhaustive(t *testing.T) {
 				t.Fatalf("reason = %q, want %q", reason, tc.wantReason)
 			}
 		})
-	}
-}
-
-func TestManagedCapacity(t *testing.T) {
-	if got := managedCapacity(lmcacheBackend("cache", "ns1")); got != "" {
-		t.Fatalf("ephemeral capacity = %q, want empty", got)
-	}
-	persistent := persistentBackend("cache", "ns1", "50Gi", nil)
-	if got := managedCapacity(persistent); got != "50Gi" {
-		t.Fatalf("persistent capacity = %q, want 50Gi", got)
 	}
 }
 
