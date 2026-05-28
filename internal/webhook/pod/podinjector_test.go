@@ -480,15 +480,15 @@ func TestSkipAnnotationOptsOut(t *testing.T) {
 		val  string
 		want bool
 	}{
-		{"", false},          // empty annotation = no opt-out
-		{"true", true},       // canonical truthy
-		{"1", true},          // numeric truthy
-		{"yes", true},        // free-form truthy
+		{"", false},           // empty annotation = no opt-out
+		{"true", true},        // canonical truthy
+		{"1", true},           // numeric truthy
+		{"yes", true},         // free-form truthy
 		{"please skip", true}, // free-form note treated as opt-out
-		{"false", false},     // explicit falsey
-		{"0", false},         // numeric falsey
-		{"no", false},        // explicit falsey synonym
-		{"OFF", false},       // case-insensitive falsey synonym
+		{"false", false},      // explicit falsey
+		{"0", false},          // numeric falsey
+		{"no", false},         // explicit falsey synonym
+		{"OFF", false},        // case-insensitive falsey synonym
 	}
 	for _, tc := range cases {
 		t.Run(tc.val, func(t *testing.T) {
