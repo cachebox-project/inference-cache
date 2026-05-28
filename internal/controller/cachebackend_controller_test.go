@@ -959,6 +959,50 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	}
 }
 
+// TestReconcileLMCacheDeploymentVanishedAfterApply pins the behavior when the
+// managed Deployment disappears between a successful apply and the post-apply
+// Get (out-of-band delete, GC). Reconcile must NOT silently report success —
+// there is no observed state to publish, so the controller must requeue.
+func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var swallowDeploymentGet atomic.Bool
+	funcs := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && swallowDeploymentGet.Load() {
+				return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile creates everything and publishes initial status.
+	reconcile(t, r, "cache", "ns1")
+
+	// Simulate the Deployment vanishing between the (successful) apply and
+	// the post-apply Get inside the same reconcile pass. Apply itself uses
+	// Get-then-Create when the live object is missing, so swallowing Get
+	// indiscriminately would make apply re-Create the Deployment. We only
+	// need the post-apply Get to fail, so toggle the flag right before the
+	// next reconcile and back off mid-reconcile is impossible here — instead,
+	// we run a no-op reconcile (apply does nothing because nothing changed
+	// in the desired state) and have the post-apply Get see the absence.
+	if err := r.Delete(context.Background(), getDeployment(t, r, "cache", "ns1")); err != nil {
+		t.Fatalf("delete deployment: %v", err)
+	}
+	swallowDeploymentGet.Store(true)
+	defer swallowDeploymentGet.Store(false)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment vanished after apply)")
+	}
+}
+
 func containsStr(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {

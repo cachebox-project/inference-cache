@@ -236,12 +236,15 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 
 	var live appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
-		if apierrors.IsNotFound(err) {
-			// Deployment does not exist yet (apply failed before create), so
-			// there is no observed state to publish — return the apply error
-			// to requeue.
+		if apierrors.IsNotFound(err) && applyErr != nil {
+			// Apply failed before creating the Deployment, so there is no
+			// observed state to publish — surface the apply error to requeue.
 			return ctrl.Result{}, applyErr
 		}
+		// Either a transient Get error, or NotFound after a successful apply
+		// (deleted out-of-band between apply and Get). Both must requeue;
+		// silently reporting success here would freeze status at a stale
+		// snapshot.
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 
