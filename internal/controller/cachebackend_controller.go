@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -88,11 +89,13 @@ type CacheBackendReconciler struct {
 // owns, optionally reconcile an HPA from spec.autoscaling, and publish the
 // resolved endpoint.
 //
-// On every successful reconcile, transitions in the observed backend health
-// (entering/leaving Degraded) and in the effective spec.integration.failOpen
-// are emitted as Kubernetes Events. Events fire only on transitions — never on
-// steady state — so operators see backend outages and fail-closed opt-ins in
-// `kubectl describe` without event-stream noise.
+// On every reconcile — including ones that return an apply error — transitions
+// in the observed backend health (entering/leaving Degraded) and in the
+// effective spec.integration.failOpen are emitted as Kubernetes Events. Events
+// fire only on transitions that were actually persisted to the apiserver
+// (patchStatus rolls back the in-memory mutation on patch failure), and never
+// on steady state — so operators see backend outages and fail-closed opt-ins
+// in `kubectl describe` without phantom or duplicate events.
 func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := r.Log
 	if logger.GetSink() == nil {
@@ -106,9 +109,15 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	before := snapshotState(&backend)
 
 	result, err := r.dispatch(ctx, logger, &backend)
-	if err == nil {
-		r.emitTransitionEvents(&backend, before)
-	}
+	// Emit transitions whenever dispatch published a status change, even on
+	// an apply-error reconcile: the status path runs independently of apply
+	// success (so apply churn doesn't freeze user-visible health), and the
+	// next reconcile's snapshot is taken from the *post-patch* CR. Gating
+	// emission on err==nil would mean a Degraded transition observed during
+	// an apply-error pass is permanently lost. emitTransitionEvents only
+	// fires when before != after, so an error path that didn't change status
+	// (e.g. early return before the status patch) emits nothing.
+	r.emitTransitionEvents(&backend, before)
 	return result, err
 }
 
@@ -201,6 +210,13 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 // reconcileManaged renders the cache-server PodSpec + Service via the runtime
 // adapter, wraps them into a Deployment + Service owned by the CR, and
 // publishes the resolved endpoint to status.
+//
+// Apply drives desired state; status reflects observed state. The two must not
+// block each other: if a desired-state write fails (e.g. a transient API-server
+// conflict or a webhook rejection), we still publish status from whatever the
+// live Deployment reports, so the user-visible CR field is never held hostage
+// to apply churn. Any apply error is surfaced after the status pass so
+// controller-runtime requeues.
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
 	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
 	if err != nil {
@@ -218,24 +234,71 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
 
-	if err := r.applyDeployment(ctx, backend, dep); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.applyService(ctx, backend, svc); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.reconcileHPA(ctx, backend, dep); err != nil {
-		return ctrl.Result{}, err
+	// Skip Service + HPA when applyDeployment failed. The HPA targets the
+	// Deployment by name, so running it after a foreign-ownership failure
+	// could scale another controller's workload; the Service is independent
+	// but pointless to expose alongside a Deployment we don't own. Status
+	// observation still runs below (it has its own ownership guards) so the
+	// CR isn't held hostage to apply churn.
+	applyErr := r.applyDeployment(ctx, backend, dep)
+	if applyErr == nil {
+		if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
+			applyErr = svcErr
+		}
+		if hpaErr := r.reconcileHPA(ctx, backend, dep); hpaErr != nil && applyErr == nil {
+			applyErr = hpaErr
+		}
 	}
 
 	var live appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
+		if apierrors.IsNotFound(err) && applyErr != nil {
+			// Apply failed before creating the Deployment, so there is no
+			// observed state to publish — surface the apply error to requeue.
+			return ctrl.Result{}, applyErr
+		}
+		// Either a transient Get error, or NotFound after a successful apply
+		// (deleted out-of-band between apply and Get). Both must requeue;
+		// silently reporting success here would freeze status at a stale
+		// snapshot.
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
+	// Never publish status derived from a foreign workload. The common case
+	// is an AlreadyOwned collision during apply (applyErr is set; surface
+	// it). The race case is that apply succeeded but the live Deployment's
+	// controller ref was changed out-of-band between Update and this Get —
+	// applyErr is nil, but we no longer own the object. Returning nil there
+	// would silently mark the reconcile successful AND lose the owned-object
+	// watch (no future event would re-trigger), so synthesize an explicit
+	// error to requeue.
+	if !metav1.IsControlledBy(&live, backend) {
+		if applyErr != nil {
+			return ctrl.Result{}, applyErr
+		}
+		return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
+	}
 
-	endpoint := serviceEndpoint(svc)
-	if err := r.updateManagedStatus(ctx, backend, endpoint, &live); err != nil {
+	// Endpoint is derived from the *live* Service, not the desired one: if
+	// applyService failed (Forbidden, conflict-budget exhausted, foreign
+	// ownership, ...) we must not advertise an endpoint that doesn't exist,
+	// has stale ports, or points at a Service we don't own. Empty endpoint
+	// when the Service hasn't materialized or is owned by someone else.
+	var liveSvc corev1.Service
+	endpoint := ""
+	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+		}
+	} else if metav1.IsControlledBy(&liveSvc, backend) {
+		endpoint = serviceEndpoint(&liveSvc)
+	}
+
+	if err := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if applyErr != nil {
+		return ctrl.Result{}, applyErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
@@ -365,32 +428,40 @@ func serviceEndpoint(svc *corev1.Service) string {
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
 // HPA's replica count rather than overwriting it — re-asserting replicas on
 // every reconcile would fight the HPA and churn the rollout.
+//
+// Wrapped in RetryOnConflict because the kube Deployment controller writes
+// Deployment.Status often during rollout; without retry, the Get/Update inside
+// CreateOrUpdate races those writes and surfaces a 409 that aborts the
+// reconcile pass and freezes CR status.
 func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.Deployment) error {
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
-		// Snapshot the HPA-owned field BEFORE we mutate the live spec. When an
-		// HPA is configured the controller must never re-assert replicas; doing
-		// so would fight the HPA on every reconcile and churn the rollout.
-		liveReplicas := dep.Spec.Replicas
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
+			// Snapshot the HPA-owned field BEFORE we mutate the live spec. When an
+			// HPA is configured the controller must never re-assert replicas; doing
+			// so would fight the HPA on every reconcile and churn the rollout.
+			liveReplicas := dep.Spec.Replicas
 
-		dep.Labels = desired.Labels
-		if dep.CreationTimestamp.IsZero() {
-			dep.Spec = *desired.Spec.DeepCopy()
-		} else {
-			dep.Spec.Replicas = desired.Spec.Replicas
-			reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
-		}
-		if backend.Spec.Autoscaling != nil && liveReplicas != nil {
-			// Preserve the HPA's writes — but clamp to the configured floor so
-			// raising autoscaling.minReplicas doesn't briefly publish Ready
-			// against the old smaller live count before the HPA catches up.
-			preserved := *liveReplicas
-			if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
-				preserved = floor
+			dep.Labels = desired.Labels
+			if dep.CreationTimestamp.IsZero() {
+				dep.Spec = *desired.Spec.DeepCopy()
+			} else {
+				dep.Spec.Replicas = desired.Spec.Replicas
+				reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 			}
-			dep.Spec.Replicas = &preserved
-		}
-		return controllerutil.SetControllerReference(backend, dep, r.Scheme)
+			if backend.Spec.Autoscaling != nil && liveReplicas != nil {
+				// Preserve the HPA's writes — but clamp to the configured floor so
+				// raising autoscaling.minReplicas doesn't briefly publish Ready
+				// against the old smaller live count before the HPA catches up.
+				preserved := *liveReplicas
+				if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
+					preserved = floor
+				}
+				dep.Spec.Replicas = &preserved
+			}
+			return controllerutil.SetControllerReference(backend, dep, r.Scheme)
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("apply deployment %s/%s: %w", desired.Namespace, desired.Name, err)
@@ -417,13 +488,16 @@ func autoscalingFloor(spec *cachev1alpha1.CacheBackendAutoscalingSpec) int32 {
 // and the allocated fields (clusterIP, nodePort) live in separate fields we never
 // touch — so reconciling ports does not churn through the Owns(Service) watch.
 func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *corev1.Service) error {
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
-		svc.Labels = desired.Labels
-		svc.Spec.Type = desired.Spec.Type
-		svc.Spec.Selector = desired.Spec.Selector
-		svc.Spec.Ports = desired.Spec.Ports
-		return controllerutil.SetControllerReference(backend, svc, r.Scheme)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+			svc.Labels = desired.Labels
+			svc.Spec.Type = desired.Spec.Type
+			svc.Spec.Selector = desired.Spec.Selector
+			svc.Spec.Ports = desired.Spec.Ports
+			return controllerutil.SetControllerReference(backend, svc, r.Scheme)
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("apply service %s/%s: %w", desired.Namespace, desired.Name, err)
@@ -574,32 +648,44 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
 //
+// applyOK is the convergence signal from reconcileManaged: when apply failed,
+// the live Deployment we read may still reflect a *prior* CR generation, so
+// advancing Status.ObservedGeneration to the current CR generation would tell
+// clients the controller has caught up when it hasn't. The published
+// observedGeneration therefore stays at its prior value until apply succeeds
+// for the current generation; the Ready and Progressing conditions carry the
+// same generation so callers can tell which spec the observation belongs to.
+//
 // status.capacity is intentionally left empty here: the field is present on
 // the type for forward-compat, but the standalone LMCache server pod has no
 // data volume the controller can attach a PVC to today, so reporting a
 // requested PVC size as "provisioned capacity" would mislead operators.
 // Populating it is left to the follow-up that wires storage end-to-end.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) error {
 	health, readyStatus, reason, message := managedHealth(backend, dep)
 	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
+	publishedGen := backend.Status.ObservedGeneration
+	if applyOK {
+		publishedGen = backend.Generation
+	}
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
 		backend.Status.Health = health
 		backend.Status.Capacity = ""
-		backend.Status.ObservedGeneration = backend.Generation
+		backend.Status.ObservedGeneration = publishedGen
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
 			Status:             readyStatus,
 			Reason:             reason,
 			Message:            message,
-			ObservedGeneration: backend.Generation,
+			ObservedGeneration: publishedGen,
 		})
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeProgressing,
 			Status:             progressingStatus,
 			Reason:             progressingReason,
 			Message:            progressingMessage,
-			ObservedGeneration: backend.Generation,
+			ObservedGeneration: publishedGen,
 		})
 	})
 }
@@ -800,6 +886,14 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 		return nil
 	}
 	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
+		// Roll back the in-memory mutation. emitTransitionEvents is called on
+		// every Reconcile return and compares the pre-reconcile snapshot to
+		// backend.Status; leaving the un-persisted mutation in place would
+		// fire a Warning/Normal event for a transition the apiserver never
+		// observed, and the same transition would fire again on the next
+		// reconcile (when the patch retries) — producing duplicate / phantom
+		// events under status-subresource conflict / RBAC / API failures.
+		backend.Status = before.Status
 		return fmt.Errorf("patch CacheBackend status %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	return nil

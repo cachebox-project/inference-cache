@@ -2,18 +2,23 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -157,6 +162,174 @@ func TestReconcileEmitsBackendDegradedOnTransition(t *testing.T) {
 	events := drainEvents(rec)
 	expectEvent(t, events, "Warning "+eventReasonBackendDegraded)
 	expectEvent(t, events, "0/2 replicas available")
+}
+
+// TestReconcileEmitsTransitionEventEvenWhenApplyErrors guards the
+// event-emission ↔ status-decoupling interaction: status can now be patched
+// from the live Deployment even when reconcile returns an apply error, so
+// emitting events only on the happy path would lose any Degraded transition
+// observed during an apply-error reconcile (the next reconcile's snapshot is
+// taken from the already-updated status). Events must therefore be emitted on
+// every observed transition regardless of dispatch error.
+func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(2)
+
+	// Block Deployment Updates after the first reconcile so the second pass
+	// returns an apply error while the live Deployment status drives a
+	// Ready → Degraded transition.
+	var blockUpdate atomic.Bool
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && blockUpdate.Load() {
+				return apierrors.NewForbidden(
+					schema.GroupResource{Group: "apps", Resource: "deployments"},
+					obj.GetName(),
+					errors.New("denied by admission webhook"),
+				)
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb).
+		WithInterceptorFuncs(funcs).
+		Build()
+	rec := events.NewFakeRecorder(16)
+	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+
+	// First pass establishes the Deployment + drives Ready (no events; only
+	// Degraded transitions are loud by design).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 2)
+	reconcile(t, r, "cache", "ns1")
+	_ = drainEvents(rec)
+
+	// Now drive a Ready → Degraded transition while apply errors. Mutating
+	// the CR forces applyDeployment to issue an Update; degrading the live
+	// Deployment status (AvailableReplicas=0) drives the health transition.
+	blockUpdate.Store(true)
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Generation = 2
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+	markDeploymentDegraded(t, r, "cache", "ns1", 2)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (apply was blocked)")
+	}
+
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
+		t.Fatalf("status.health = %q, want Degraded (status path runs independently of apply error)", got)
+	}
+	events := drainEvents(rec)
+	expectEvent(t, events, "Warning "+eventReasonBackendDegraded)
+}
+
+// TestReconcileNoPhantomEventOnStatusPatchFailure pins the rollback semantics
+// of patchStatus: if the status sub-resource Patch fails, the in-memory
+// mutation must be rolled back so emitTransitionEvents does not see a
+// transition the apiserver never observed. Otherwise an apiserver hiccup
+// would surface as a Warning/Normal event for a transition that didn't
+// persist, and would fire again on the next reconcile that retries the patch
+// — duplicate events that look real but reflect nothing in cluster state.
+func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(2)
+
+	var blockStatusPatch atomic.Bool
+	funcs := interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" && blockStatusPatch.Load() {
+				if _, ok := obj.(*cachev1alpha1.CacheBackend); ok {
+					return apierrors.NewInternalError(errors.New("simulated apiserver hiccup on status patch"))
+				}
+			}
+			return c.Status().Patch(ctx, obj, patch, opts...)
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb).
+		WithInterceptorFuncs(funcs).
+		Build()
+	rec := events.NewFakeRecorder(16)
+	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+
+	// Drive to Ready first. Pending → Ready emits no event by design (only
+	// Degraded entry/exit are loud).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 2)
+	reconcile(t, r, "cache", "ns1")
+	_ = drainEvents(rec)
+
+	// Block the status patch, then degrade the live Deployment. Reconcile
+	// computes Degraded internally, fails to patch status, returns the
+	// error — and must emit NO event, because the apiserver never saw the
+	// transition.
+	blockStatusPatch.Store(true)
+	markDeploymentDegraded(t, r, "cache", "ns1", 2)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (status patch was blocked)")
+	}
+	if got := drainEvents(rec); len(got) != 0 {
+		t.Fatalf("emitted events for un-persisted transition: %v (want none)", got)
+	}
+	// The live CR status must still report the pre-transition Ready, since
+	// the patch was rejected.
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want Ready (the failed patch must not be visible)", got)
+	}
+
+	// Unblock and reconcile again. The same transition now lands cleanly and
+	// fires the BackendDegraded warning exactly once (no carry-over from
+	// the blocked pass).
+	blockStatusPatch.Store(false)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err != nil {
+		t.Fatalf("reconcile after unblock: %v", err)
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
+		t.Fatalf("status.health = %q, want Degraded after unblock", got)
+	}
+	got := drainEvents(rec)
+	expectEvent(t, got, "Warning "+eventReasonBackendDegraded)
+	count := 0
+	for _, e := range got {
+		if strings.Contains(e, eventReasonBackendDegraded) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("BackendDegraded event count = %d, want exactly 1: %v", count, got)
+	}
 }
 
 func TestReconcileEmitsBackendRecoveredOnReadyTransition(t *testing.T) {
