@@ -548,6 +548,74 @@ func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	}
 }
 
+func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
+	// Common user spellings ("vLLM", "VLLM") must route to the canonical
+	// RuntimeVLLM, not silently drop the CR into the unmanaged path.
+	for _, engine := range []string{"vLLM", "VLLM", "vllm"} {
+		t.Run(engine, func(t *testing.T) {
+			scheme := newScheme(t)
+			cb := lmcacheBackend("cache", "ns1")
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+			r := newReconciler(scheme, cb)
+
+			reconcile(t, r, "cache", "ns1")
+
+			dep, err := getOptionalDeployment(t, r, "cache", "ns1")
+			if err != nil {
+				t.Fatalf("expected a managed Deployment for engine=%q, got error: %v", engine, err)
+			}
+			if got := dep.Spec.Template.Spec.Containers[0].Name; got != "lmcache-server" {
+				t.Fatalf("container = %q, want lmcache-server (engine=%q must resolve to RuntimeVLLM)", got, engine)
+			}
+		})
+	}
+}
+
+func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
+	// Upgrading an existing Deployment that the retired C2 builder created
+	// (single container named "vllm") to the C6 standalone shape (single
+	// container named "lmcache-server") must REPLACE the container — leaving
+	// both would run the engine and the cache side-by-side with stale
+	// resources/probes/volumes.
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	r := newReconciler(scheme, cb)
+
+	// Seed the live Deployment with the old colocated container shape so the
+	// reconciler's update path (not the create path) is exercised.
+	reconcile(t, r, "cache", "ns1")
+	live := getDeployment(t, r, "cache", "ns1")
+	live.Spec.Template.Spec.Containers = []corev1.Container{
+		{
+			Name:    "vllm",
+			Image:   "lmcache/vllm-openai:latest",
+			Command: []string{"vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"},
+			Args:    []string{"--enable-prefix-caching"},
+		},
+	}
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("seed pre-upgrade deployment: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	containers := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers
+	if len(containers) != 1 {
+		t.Fatalf("containers = %d (%v), want exactly 1 lmcache-server after upgrade", len(containers), containerNames(containers))
+	}
+	if containers[0].Name != "lmcache-server" {
+		t.Fatalf("container = %q, want lmcache-server (old vllm container must be dropped)", containers[0].Name)
+	}
+}
+
+func containerNames(cs []corev1.Container) []string {
+	names := make([]string, len(cs))
+	for i := range cs {
+		names[i] = cs[i].Name
+	}
+	return names
+}
+
 func TestReconcileIgnoresMissingObject(t *testing.T) {
 	scheme := newScheme(t)
 	r := newReconciler(scheme)

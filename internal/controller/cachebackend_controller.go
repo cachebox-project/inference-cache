@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -97,9 +98,15 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // the registry to match. The CacheBackend carries the engine name in
 // Spec.Integration.Engine; when unset, vLLM is the Phase-1 default (the only
 // engine the shipping adapters target).
+//
+// Engine values are normalised to lower-case so common spellings ("vLLM",
+// "VLLM", "SGLang") route to the canonical RuntimeID constants
+// ([adapterruntime.RuntimeVLLM] etc.); a free-form string in the CR should
+// never silently drop a CacheBackend into the unmanaged path just because of
+// case.
 func resolveRuntimeID(backend *cachev1alpha1.CacheBackend) adapterruntime.RuntimeID {
 	if backend.Spec.Integration != nil && backend.Spec.Integration.Engine != "" {
-		return adapterruntime.RuntimeID(backend.Spec.Integration.Engine)
+		return adapterruntime.RuntimeID(strings.ToLower(backend.Spec.Integration.Engine))
 	}
 	return adapterruntime.RuntimeVLLM
 }
@@ -355,22 +362,53 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend
 // container in place, leaving API-server-defaulted container fields untouched.
+//
+// Containers in live whose names are not in desired are dropped — this is the
+// upgrade path from the C2 colocated all-in-one (container name "vllm") to
+// the C6 standalone topology (container name "lmcache-server"): an in-place
+// upgrade must replace the old managed container, not stack the new one
+// alongside it. We never drop containers that match a desired name (we only
+// update their managed fields), so a Deployment carrying sidecars in addition
+// to the managed container loses the sidecars — sidecars were not a supported
+// path in C2 and remain unsupported here.
 func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	if len(desired.Containers) == 0 {
 		return
 	}
-	want := desired.Containers[0]
+	desiredNames := make(map[string]int, len(desired.Containers))
+	for i := range desired.Containers {
+		desiredNames[desired.Containers[i].Name] = i
+	}
+
+	// First pass: drop any live container whose name isn't desired (the
+	// upgrade-from-previous-managed-shape case).
+	kept := live.Containers[:0]
 	for i := range live.Containers {
-		if live.Containers[i].Name == want.Name {
-			live.Containers[i].Image = want.Image
-			live.Containers[i].Command = want.Command
-			live.Containers[i].Args = want.Args
-			live.Containers[i].Env = want.Env
-			return
+		if _, ok := desiredNames[live.Containers[i].Name]; ok {
+			kept = append(kept, live.Containers[i])
 		}
 	}
-	// The managed container is missing (e.g. an out-of-band edit) — restore it.
-	live.Containers = append(live.Containers, *want.DeepCopy())
+	live.Containers = kept
+
+	// Second pass: for each desired container, update the matching live one
+	// in place (preserving API-server-defaulted fields) or append it.
+	for i := range desired.Containers {
+		want := desired.Containers[i]
+		matched := false
+		for j := range live.Containers {
+			if live.Containers[j].Name == want.Name {
+				live.Containers[j].Image = want.Image
+				live.Containers[j].Command = want.Command
+				live.Containers[j].Args = want.Args
+				live.Containers[j].Env = want.Env
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			live.Containers = append(live.Containers, *want.DeepCopy())
+		}
+	}
 }
 
 // cleanupOwnedWorkload best-effort deletes the Deployment + Service this CR owns,
