@@ -70,7 +70,8 @@ type CachePolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CachePolicySpec   `json:"spec,omitempty"`
+	// +kubebuilder:validation:Required
+	Spec   CachePolicySpec   `json:"spec"`
 	Status CachePolicyStatus `json:"status,omitempty"`
 }
 

@@ -7,12 +7,19 @@ import (
 	"testing"
 	"time"
 
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	structuralpruning "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/yaml"
 )
 
 func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
+	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
 	requireEnum(t, mustProperty(t, policySpec, "eviction"), []string{"LRU", "LFU"})
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
@@ -59,7 +66,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireMinLength(t, mustProperty(t, acceleratorType, "name"), 1)
 
 	indexSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cacheindices.yaml")
-	requireStatusOnlySpecValidation(t, indexSchema)
+	requireStatusOnlyEmptySpecSchema(t, mustProperty(t, indexSchema, "spec"))
 }
 
 func TestRemainingCRDDeepCopies(t *testing.T) {
@@ -197,6 +204,54 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	}
 }
 
+func TestGeneratedCRDAdmissionValidationHandlesCacheIndexStatusOnlySpec(t *testing.T) {
+	schema := loadCRDInternalOpenAPISchema(t, "config/crd/bases/inferencecache.io_cacheindices.yaml")
+
+	validCases := []struct {
+		name string
+		obj  map[string]any
+	}{
+		{
+			name: "omitted legacy spec",
+			obj: map[string]any{
+				"apiVersion": "inferencecache.io/v1alpha1",
+				"kind":       "CacheIndex",
+			},
+		},
+		{
+			name: "empty legacy spec",
+			obj: map[string]any{
+				"apiVersion": "inferencecache.io/v1alpha1",
+				"kind":       "CacheIndex",
+				"spec":       map[string]any{},
+			},
+		},
+	}
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if errs := validateGeneratedCustomResource(t, schema, tc.obj); len(errs) != 0 {
+				t.Fatalf("valid CacheIndex produced admission validation errors: %v", errs)
+			}
+		})
+	}
+
+	invalid := map[string]any{
+		"apiVersion": "inferencecache.io/v1alpha1",
+		"kind":       "CacheIndex",
+		"spec": map[string]any{
+			"foo": "bar",
+		},
+	}
+	pruned := pruneGeneratedCustomResource(t, schema, invalid)
+	spec, ok := pruned["spec"].(map[string]any)
+	if !ok || spec["foo"] != "bar" {
+		t.Fatalf("CacheIndex spec was pruned before validation: %#v", pruned["spec"])
+	}
+	if errs := validateGeneratedCustomResource(t, schema, invalid); len(errs) == 0 {
+		t.Fatal("CacheIndex with non-empty spec passed generated CRD admission validation")
+	}
+}
+
 func TestCacheIndexJSONUsesLegacyEmptySpecByDefault(t *testing.T) {
 	data, err := json.Marshal(CacheIndex{})
 	if err != nil {
@@ -205,6 +260,67 @@ func TestCacheIndexJSONUsesLegacyEmptySpecByDefault(t *testing.T) {
 	if !strings.Contains(string(data), `"spec":{}`) {
 		t.Fatalf("empty CacheIndex JSON = %s, want legacy empty spec", data)
 	}
+}
+
+func loadCRDInternalOpenAPISchema(t *testing.T, relativePath string) *apiextensions.JSONSchemaProps {
+	t.Helper()
+
+	data, err := os.ReadFile("../../" + relativePath)
+	if err != nil {
+		t.Fatalf("read generated CRD %s: %v", relativePath, err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("unmarshal generated CRD %s: %v", relativePath, err)
+	}
+	for _, version := range crd.Spec.Versions {
+		if version.Name != "v1alpha1" {
+			continue
+		}
+		if version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			t.Fatalf("CRD %s version v1alpha1 has no OpenAPI schema", relativePath)
+		}
+		internalSchema := &apiextensions.JSONSchemaProps{}
+		if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(
+			version.Schema.OpenAPIV3Schema,
+			internalSchema,
+			nil,
+		); err != nil {
+			t.Fatalf("convert generated CRD %s schema: %v", relativePath, err)
+		}
+		return internalSchema
+	}
+	t.Fatalf("CRD %s does not contain version v1alpha1", relativePath)
+	return nil
+}
+
+func validateGeneratedCustomResource(t *testing.T, schema *apiextensions.JSONSchemaProps, obj map[string]any) []string {
+	t.Helper()
+
+	candidate := pruneGeneratedCustomResource(t, schema, obj)
+
+	validator, _, err := apiservervalidation.NewSchemaValidator(schema)
+	if err != nil {
+		t.Fatalf("build schema validator: %v", err)
+	}
+	errs := apiservervalidation.ValidateCustomResource(nil, candidate, validator)
+	messages := make([]string, 0, len(errs))
+	for _, err := range errs {
+		messages = append(messages, err.Error())
+	}
+	return messages
+}
+
+func pruneGeneratedCustomResource(t *testing.T, schema *apiextensions.JSONSchemaProps, obj map[string]any) map[string]any {
+	t.Helper()
+
+	structural, err := structuralschema.NewStructural(schema)
+	if err != nil {
+		t.Fatalf("build structural schema: %v", err)
+	}
+	candidate := runtime.DeepCopyJSONValue(obj).(map[string]any)
+	structuralpruning.Prune(candidate, structural, true)
+	return candidate
 }
 
 func loadCRDOpenAPISchema(t *testing.T, relativePath string) map[string]any {
@@ -292,17 +408,16 @@ func requireBooleanLike(t *testing.T, schema map[string]any) {
 	}
 }
 
-func requireStatusOnlySpecValidation(t *testing.T, schema map[string]any) {
+func requireStatusOnlyEmptySpecSchema(t *testing.T, schema map[string]any) {
 	t.Helper()
-	validations := mustPath[[]any](t, schema, "x-kubernetes-validations")
-	for _, validation := range validations {
-		validationSchema, ok := validation.(map[string]any)
-		if !ok {
-			t.Fatalf("x-kubernetes-validations entry has type %T, want object", validation)
-		}
-		if validationSchema["rule"] == "!has(self.spec) || self.spec == {}" {
-			return
-		}
+	if got := mustPath[string](t, schema, "type"); got != "object" {
+		t.Fatalf("type = %q, want object", got)
 	}
-	t.Fatalf("x-kubernetes-validations = %v, want legacy-empty-spec-compatible status-only validation", validations)
+	maxProperties := mustPath[float64](t, schema, "maxProperties")
+	if maxProperties != 0 {
+		t.Fatalf("maxProperties = %v, want 0", maxProperties)
+	}
+	if schema["x-kubernetes-preserve-unknown-fields"] != true {
+		t.Fatalf("x-kubernetes-preserve-unknown-fields = %v, want true", schema["x-kubernetes-preserve-unknown-fields"])
+	}
 }
