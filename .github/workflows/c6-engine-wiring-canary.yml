@@ -1,0 +1,68 @@
+# On-demand / scheduled CPU canary for the C6 vLLM+LMCache engine-pod
+# wiring webhook + cross-pod cache reuse.
+#
+# Runs docs/reference-stack/scripts/canary_c6_engine_wiring.sh: brings up
+# a kind cluster, installs cert-manager + this repo's config/default
+# (controller + mutating Pod webhook + lmcache wiring), applies a
+# CacheBackend, then creates two vLLM CPU engine pods labeled to match the
+# CacheBackend.Spec.EngineSelector. Asserts the webhook injects the
+# LMCache wiring on both pods at admission and (when traffic is enabled)
+# that engine-b reports a vllm:prefix_cache_hits increment populated by a
+# prompt prefix engine-a previously serviced via the shared lmcache-server.
+#
+# This is NOT a per-PR gate (multi-GB image pull, ~12 GiB RAM for two CPU
+# engines + lmcache-server + cert-manager); it runs on a schedule and on
+# manual dispatch. Time-offset 1h after the C2 reconciler canary so two
+# kind clusters never share a runner.
+name: c6-engine-wiring-canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (override to target a self-hosted Docker host)"
+        default: ubuntu-latest
+        required: false
+      skip_traffic:
+        description: "Skip the traffic-driving step (still asserts webhook wiring)"
+        default: "0"
+        required: false
+  schedule:
+    - cron: "30 8 * * *" # nightly 08:30 UTC, offset from C2 canary at 07:30
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c6-engine-wiring-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Run C6 engine-wiring CPU canary
+        env:
+          SKIP_TRAFFIC: ${{ github.event.inputs.skip_traffic || '0' }}
+        run: docs/reference-stack/scripts/canary_c6_engine_wiring.sh
+
+      - name: Upload canary logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c6-canary-logs
+          path: |
+            /tmp/c6-canary-*.log
+          if-no-files-found: ignore

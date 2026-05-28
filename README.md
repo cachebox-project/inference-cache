@@ -44,8 +44,10 @@ curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
 
 ## Cluster Prerequisites
 
-The controller serves admission webhooks (defaulting + validation for
-`CacheBackend`) over TLS, so deploying it requires [cert-manager][cm]
+The controller serves admission webhooks — defaulting + validation for
+`CacheBackend`, plus a mutating Pod webhook that auto-injects the LMCache
+engine configuration into pods labeled to match a `CacheBackend`'s
+`spec.engineSelector` — over TLS, so deploying it requires [cert-manager][cm]
 v1.0+ in the target cluster. The default install (`config/default`)
 provisions a self-signed `Issuer` plus a `Certificate` for the webhook
 serving cert, and relies on cert-manager's `cert-manager.io/inject-ca-from`

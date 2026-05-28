@@ -10,6 +10,25 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /mutate--v1-pod
+  failurePolicy: Ignore
+  name: mpod.inferencecache.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /mutate-inferencecache-io-v1alpha1-cachebackend
   failurePolicy: Fail
   name: mcachebackend.inferencecache.io
