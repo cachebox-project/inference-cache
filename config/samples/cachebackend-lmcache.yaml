@@ -1,13 +1,14 @@
 # A managed LMCache backend the controller reconciles into a standalone
 # lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
-# spec.engineSelector identifies the pods a future mutating webhook will
-# wire to the resolved cache endpoint published in status.endpoint (as an
-# engine-agnostic host:port — the adapter adds the lm:// scheme on the
-# engine env). Until
-# that webhook lands, the engine-side env vars + `--kv-transfer-config`
-# arg must be set manually (see the runtime adapter for the exact set:
-# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
-# VLLM_USE_V1).
+# spec.engineSelector identifies the pods the controller's mutating Pod
+# admission webhook auto-wires to the resolved cache endpoint published
+# in status.endpoint (as an engine-agnostic host:port — the adapter adds
+# the lm:// scheme on the engine env). Pods labeled to match are
+# auto-injected at admission with LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/
+# LOCAL_CPU/MAX_LOCAL_CPU_SIZE + VLLM_USE_V1 + the LMCache
+# `--kv-transfer-config` arg; user-set env/args on the pod template
+# survive injection (the adapter merges, never clobbers). A pod can opt
+# out per-instance with the annotation `inferencecache.io/skip-inject`.
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
 # canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler

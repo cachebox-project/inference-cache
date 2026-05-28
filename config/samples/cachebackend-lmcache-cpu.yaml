@@ -6,12 +6,14 @@
 # user-owned vLLM Deployment, not on the CacheBackend.
 #
 # Apply this alongside a vLLM Deployment whose labels match
-# `spec.engineSelector`; a future mutating webhook will wire the engine
-# pods to the resolved cache endpoint published in `status.endpoint` (an
-# engine-agnostic host:port — the adapter adds the `lm://` scheme on the
-# engine env). Until that webhook lands, set the engine-side env vars +
-# `--kv-transfer-config` arg manually (see docs/design/cachebackend-api.md
-# §backendConfig keys for the full set).
+# `spec.engineSelector`; the controller's mutating Pod admission webhook
+# auto-wires the engine pods to the resolved cache endpoint published in
+# `status.endpoint` (an engine-agnostic host:port — the adapter adds the
+# `lm://` scheme on the engine env). The webhook injects the engine-side
+# env vars + `--kv-transfer-config` arg at pod admission (see
+# docs/design/cachebackend-api.md §"Mutating Pod webhook (engine wiring)"
+# for the full behavior, including the
+# `inferencecache.io/skip-inject` per-pod opt-out).
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
