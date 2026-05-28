@@ -20,6 +20,28 @@ images:
 patches:
 - path: manager_webhook_patch.yaml
 - path: webhookcainjection_patch.yaml
+# Rename the cluster-scoped webhook configurations so two kubebuilder
+# operators that ship the generic controller-gen defaults (mutating-
+# webhook-configuration / validating-webhook-configuration) do not
+# collide when installed into the same cluster.
+- target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: MutatingWebhookConfiguration
+    name: mutating-webhook-configuration
+  patch: |
+    - op: replace
+      path: /metadata/name
+      value: inference-cache-mutating-webhook-configuration
+- target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: ValidatingWebhookConfiguration
+    name: validating-webhook-configuration
+  patch: |
+    - op: replace
+      path: /metadata/name
+      value: inference-cache-validating-webhook-configuration
 
 # Wire the webhook Service and cert-manager Certificate into the generated
 # webhook configurations and the Certificate's dnsNames. The four

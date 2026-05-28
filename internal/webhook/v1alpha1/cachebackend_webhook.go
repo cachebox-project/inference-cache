@@ -236,17 +236,26 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 }
 
 // serviceDNSNamespace returns the namespace segment of an in-cluster
-// Service DNS endpoint, or false if the endpoint is not recognisable as
-// Service DNS. Recognised forms (after stripping scheme + port):
+// Service-scoped or Pod-scoped DNS endpoint, or false if the endpoint is
+// not recognisable as in-cluster DNS. Recognised forms (after stripping
+// scheme + path + port):
 //
-//	<svc>.<ns>.svc
-//	<svc>.<ns>.svc.cluster.local
-//	<svc>.<ns>.svc.<any.cluster.suffix>
+//	Service-scoped:
+//	  <svc>.<ns>.svc
+//	  <svc>.<ns>.svc.cluster.local
+//	  <svc>.<ns>.svc.<any.cluster.suffix>
+//	Pod-scoped (StatefulSet pod-FQDN / headless-service pod-DNS):
+//	  <pod>.<svc>.<ns>.svc
+//	  <pod>.<svc>.<ns>.svc.cluster.local
 //
-// Bare hostnames (e.g. "cache.example.com"), IP addresses, and unqualified
-// names are not in-cluster Service DNS and pass through as ok=false — we
-// have no namespace to compare against and rejecting them would block
-// legitimate external-backend addresses.
+// Both forms namespace the connection — pod-FQDNs are how StatefulSet
+// pods are addressed individually and must be treated as the same
+// tenancy boundary as the equivalent Service DNS.
+//
+// Bare hostnames (e.g. "cache.example.com"), IP addresses, and
+// unqualified names are not in-cluster DNS and pass through as
+// ok=false — we have no namespace to compare against and rejecting
+// them would block legitimate external-backend addresses.
 func serviceDNSNamespace(endpoint string) (string, bool) {
 	host := strings.TrimSpace(endpoint)
 	if host == "" {
@@ -266,11 +275,21 @@ func serviceDNSNamespace(endpoint string) (string, bool) {
 		host = host[:i]
 	}
 	parts := strings.Split(host, ".")
-	// Must be at least <svc>.<ns>.svc — three labels, third is "svc".
-	if len(parts) < 3 || parts[2] != "svc" {
+	// Find the "svc" marker that anchors in-cluster DNS. The label
+	// immediately before it is the namespace; the labels before that are
+	// the Service name (and optionally the pod prefix). This unifies the
+	// 3-label Service form and the 4-label Pod-FQDN form.
+	svcIdx := -1
+	for i, p := range parts {
+		if p == "svc" {
+			svcIdx = i
+			break
+		}
+	}
+	if svcIdx < 2 {
 		return "", false
 	}
-	ns := parts[1]
+	ns := parts[svcIdx-1]
 	if ns == "" {
 		return "", false
 	}
