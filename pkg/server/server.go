@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -65,6 +66,15 @@ func New() *Service {
 	})
 	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
+	// /snapshot — internal JSON of the cluster-wide cache aggregate, scraped by
+	// the controller to populate the CacheIndex CR status (B6 status surface).
+	// Metadata only (replica/tenant stats + prefix counts), never KV/prompt data.
+	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(idx.Snapshot()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
 
 	return &Service{
 		grpcServer: grpcServer,

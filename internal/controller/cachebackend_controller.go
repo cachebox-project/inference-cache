@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -25,11 +26,27 @@ import (
 // conditionTypeReady reports whether the managed backend workload is serving.
 const conditionTypeReady = "Ready"
 
+// Event reasons emitted on a CacheBackend.
+//
+// The cache is an optimization, never a serving dependency: BackendDegraded
+// and BackendRecovered narrate transitions of the managed workload's health
+// so operators see backend health changes in `kubectl describe`. The
+// FailClosedEnabled / FailOpenRestored pair narrates transitions of the
+// spec.integration.failOpen toggle — explicitly fail-closed is loud because
+// the cache then becomes a serving dependency.
+const (
+	eventReasonBackendDegraded   = "BackendDegraded"
+	eventReasonBackendRecovered  = "BackendRecovered"
+	eventReasonFailClosedEnabled = "FailClosedEnabled"
+	eventReasonFailOpenRestored  = "FailOpenRestored"
+)
+
 // CacheBackendReconciler reconciles a CacheBackend object.
 type CacheBackendReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	Scheme   *runtime.Scheme
+	Log      logr.Logger
+	Recorder events.EventRecorder
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
 	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
 	// that need a custom adapter set.
@@ -42,12 +59,20 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives a CacheBackend toward its desired state. External backends
 // only mirror their configured endpoint to status; managed backends (LMCache
 // in Phase 1) ask the registered runtime adapter for the cache-server pod
 // spec + service spec, wrap them into a Deployment + Service the controller
 // owns, and publish the resolved endpoint.
+//
+// On every successful reconcile, transitions in the observed backend health
+// (entering/leaving Degraded) and in the effective spec.integration.failOpen
+// are emitted as Kubernetes Events. Events fire only on transitions — never on
+// steady state — so operators see backend outages and fail-closed opt-ins in
+// `kubectl describe` without event-stream noise.
 func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := r.Log
 	if logger.GetSink() == nil {
@@ -58,40 +83,53 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &backend); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	before := snapshotState(&backend)
 
+	result, err := r.dispatch(ctx, logger, &backend)
+	if err == nil {
+		r.emitTransitionEvents(&backend, before)
+	}
+	return result, err
+}
+
+// dispatch routes a CacheBackend to the right reconcile path. External backends
+// only mirror their configured endpoint to status; unsupported / deferred kinds
+// shed any previously managed workload; LMCache (Phase 1) templates a
+// Deployment + Service.
+func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		// A backend switched from a managed type to External must shed its workload.
-		if err := r.cleanupOwnedWorkload(ctx, &backend); err != nil {
+		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, r.reconcileExternal(ctx, &backend)
+		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
 	// StatefulSet-backed (PVC) provisioning + autoscaling is the C3 module. Phase 1
 	// manages a Deployment only.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
 		logger.V(1).Info("StatefulSet deploymentKind deferred to C3; skipping",
-			"namespace", req.Namespace, "name", req.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, &backend)
+			"namespace", backend.Namespace, "name", backend.Name)
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
 	registry := r.Registry
 	if registry == nil {
 		registry = adapterruntime.DefaultRegistry()
 	}
-	runtimeID := resolveRuntimeID(&backend)
-	adapter, err := registry.Select(runtimeID, &backend)
+	runtimeID := resolveRuntimeID(backend)
+	adapter, err := registry.Select(runtimeID, backend)
 	if err != nil {
 		// No adapter knows how to wire this (runtime, backend) pair. Shed any
 		// previously managed workload and log; the C7 admission validator
 		// surfaces the same condition as a user-visible rejection.
 		logger.V(1).Info("no runtime adapter for backend",
 			"runtime", runtimeID, "type", backend.Spec.Type,
-			"namespace", req.Namespace, "name", req.Name, "error", err.Error())
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, &backend)
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	return r.reconcileManaged(ctx, logger, &backend, adapter)
+	return r.reconcileManaged(ctx, logger, backend, adapter)
 }
 
 // resolveRuntimeID picks the [adapterruntime.RuntimeID] the reconciler asks
@@ -439,7 +477,10 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 				// the rendering), so copying them is idempotent and doesn't
 				// churn the Owns watch. Leaving Ports/Probes/VolumeMounts
 				// untouched would let port drift break the Service's
-				// TargetPort lookup or hide a probe regression.
+				// TargetPort lookup or hide a probe regression. Resources
+				// likewise differ by profile (e.g. GPU vs CPU canary) and
+				// aren't API-server-defaulted, so reconciling them is
+				// churn-free.
 				live.Containers[j].Image = want.Image
 				live.Containers[j].ImagePullPolicy = want.ImagePullPolicy
 				live.Containers[j].Command = want.Command
@@ -537,10 +578,16 @@ func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) 
 	}
 }
 
-// patchStatus applies mutate to the backend's status and patches it only when it changes.
+// patchStatus applies mutate to the backend's status and patches it only when
+// it changes. The effective spec.integration.failOpen is always echoed to
+// status.failOpen so operators can read the current mode from status alone,
+// and so transition detection in [CacheBackendReconciler.emitTransitionEvents]
+// has a stable previous-value baseline to compare against.
 func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, mutate func()) error {
 	before := backend.DeepCopy()
 	mutate()
+	failOpen := cachev1alpha1.IntegrationFailOpen(backend.Spec.Integration)
+	backend.Status.FailOpen = &failOpen
 	if equality.Semantic.DeepEqual(before.Status, backend.Status) {
 		return nil
 	}
@@ -550,8 +597,92 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 	return nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// stateSnapshot captures the prior-status fields that drive transition events.
+// Health is the observed phase enum and failOpen is the previously-echoed
+// integration.failOpen (nil ⇒ never observed ⇒ treated as the API default of
+// true, so an initial apply with failOpen=false correctly fires the warning).
+type stateSnapshot struct {
+	health   cachev1alpha1.CacheBackendHealth
+	failOpen bool
+}
+
+// snapshotState captures the prior status values that drive transition events.
+// Called at the top of Reconcile before any mutation so emitTransitionEvents
+// has a stable baseline to compare the post-reconcile state against.
+func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
+	return stateSnapshot{
+		health:   cb.Status.Health,
+		failOpen: statusFailOpen(cb.Status.FailOpen),
+	}
+}
+
+// statusFailOpen treats a missing status.failOpen as the API default (true).
+// A first-time reconcile with spec.integration.failOpen=false is then correctly
+// observed as a transition true→false and fires the FailClosedEnabled Warning.
+func statusFailOpen(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
+}
+
+// emitTransitionEvents emits Kubernetes Events on transitions of the observed
+// backend health or the effective failOpen toggle. By design events fire only
+// on transitions — never on steady state — so a Ready backend reconciling
+// every few seconds does not flood the event stream.
+//
+//   - Entering Degraded → Warning BackendDegraded.
+//   - Leaving Degraded for Ready → Normal BackendRecovered.
+//   - failOpen flipped true → false → Warning FailClosedEnabled (the cache
+//     becomes a serving dependency; advanced opt-in).
+//   - failOpen flipped false → true → Normal FailOpenRestored.
+func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBackend, before stateSnapshot) {
+	if r.Recorder == nil {
+		return
+	}
+	after := stateSnapshot{
+		health:   cb.Status.Health,
+		failOpen: statusFailOpen(cb.Status.FailOpen),
+	}
+
+	if before.health != cachev1alpha1.CacheBackendHealthDegraded &&
+		after.health == cachev1alpha1.CacheBackendHealthDegraded {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonBackendDegraded, eventReasonBackendDegraded,
+			"cache backend is degraded: %s", degradedMessage(cb))
+	}
+	if before.health == cachev1alpha1.CacheBackendHealthDegraded &&
+		after.health == cachev1alpha1.CacheBackendHealthReady {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonBackendRecovered, eventReasonBackendRecovered,
+			"cache backend recovered to Ready")
+	}
+
+	if before.failOpen && !after.failOpen {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonFailClosedEnabled, eventReasonFailClosedEnabled,
+			"fail-closed mode enabled — cache is now a serving dependency; engine requests will fail when the cache is unreachable")
+	}
+	if !before.failOpen && after.failOpen {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonFailOpenRestored, eventReasonFailOpenRestored,
+			"fail-open mode restored — cache is again an optimization, not a serving dependency")
+	}
+}
+
+// degradedMessage surfaces the Ready=False condition's message (set by
+// managedHealth) so the BackendDegraded event names the failure mode (e.g.
+// "1/3 replicas available") instead of just announcing the phase change.
+func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
+	if c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady); c != nil && c.Message != "" {
+		return c.Message
+	}
+	return "backend workload not available"
+}
+
+// SetupWithManager sets up the controller with the Manager. Owns(Deployment)
+// guarantees that a child's status flipping (e.g. AvailableReplicas dropping
+// to zero) re-triggers a Reconcile so emitTransitionEvents observes the change.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).

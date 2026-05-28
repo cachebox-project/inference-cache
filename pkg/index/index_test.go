@@ -2,7 +2,9 @@ package index
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -210,6 +212,47 @@ func TestPrefixAddedEventDoesNotRefreshAcrossSchemes(t *testing.T) {
 	}
 }
 
+func TestSnapshotAggregates(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m1", Tenant: "tenant-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
+	// Same replica reports again under a different model for the same tenant: the
+	// tenant footprint must count the replica once (dedup), not double its memory.
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m2", Tenant: "tenant-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p2"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
+	idx.Ingest(Update{ReplicaID: "replica-b", Model: "m1", Tenant: "tenant-b", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p3"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 200, HitRate: 0.6, Pressure: 0.3}})
+
+	snap := idx.Snapshot()
+
+	if snap.TotalPrefixes != 3 {
+		t.Fatalf("total prefixes = %d, want 3", snap.TotalPrefixes)
+	}
+	if snap.HotPrefixes != 0 {
+		t.Fatalf("hot prefixes = %d, want 0 (not tracked yet)", snap.HotPrefixes)
+	}
+	// Replicas sorted by id, deduped cluster-wide.
+	if len(snap.Replicas) != 2 || snap.Replicas[0].ReplicaID != "replica-a" || snap.Replicas[1].ReplicaID != "replica-b" {
+		t.Fatalf("replicas = %+v, want [replica-a replica-b]", snap.Replicas)
+	}
+	if snap.Replicas[0].CacheMemoryBytes != 100 || snap.Replicas[0].HitRate != 0.8 {
+		t.Fatalf("replica-a stats = %+v", snap.Replicas[0])
+	}
+	// Tenants sorted by id; tenant-a counts replica-a once despite two reports.
+	if len(snap.Tenants) != 2 {
+		t.Fatalf("tenants = %+v, want 2", snap.Tenants)
+	}
+	if snap.Tenants[0].TenantID != "tenant-a" || snap.Tenants[0].MemoryUsed != 100 {
+		t.Fatalf("tenant-a = %+v, want memoryUsed 100 (deduped)", snap.Tenants[0])
+	}
+	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].MemoryUsed != 200 {
+		t.Fatalf("tenant-b = %+v, want memoryUsed 200", snap.Tenants[1])
+	}
+}
+
 func TestReadyReflectsStartAndStop(t *testing.T) {
 	idx := New(WithSweepInterval(10 * time.Millisecond))
 	if idx.Ready() {
@@ -329,5 +372,47 @@ func TestMetricsZeroedWhenModelDrains(t *testing.T) {
 	// The drained model's gauge must be reset to 0, not left stale at 1.
 	if m.last["m"] != 0 {
 		t.Fatalf("drained model gauge = %d, want 0", m.last["m"])
+	}
+}
+
+func TestIngestSanitizesNonFiniteStats(t *testing.T) {
+	idx := New()
+	// NaN / +Inf / -Inf would later make /snapshot's JSON encode fail
+	// (and 500 the endpoint) — Ingest must clamp them to 0 at the boundary.
+	idx.Ingest(Update{
+		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}},
+		Stats: &ReplicaStats{
+			HitRate:  float32(math.NaN()),
+			Pressure: float32(math.Inf(1)),
+		},
+	})
+	replicas, _ := idx.CacheState("t", "m")
+	if len(replicas) != 1 {
+		t.Fatalf("expected 1 replica, got %d", len(replicas))
+	}
+	r := replicas[0]
+	if x := float64(r.HitRate); math.IsNaN(x) || math.IsInf(x, 0) {
+		t.Fatalf("HitRate not sanitized: %v", r.HitRate)
+	}
+	if x := float64(r.Pressure); math.IsNaN(x) || math.IsInf(x, 0) {
+		t.Fatalf("Pressure not sanitized: %v", r.Pressure)
+	}
+	// The whole snapshot must JSON-encode cleanly — that's the failure mode
+	// this guards: encoding/json rejects non-finite floats.
+	if _, err := json.Marshal(idx.Snapshot()); err != nil {
+		t.Fatalf("snapshot encode after sanitization: %v", err)
+	}
+}
+
+func TestIngestSanitizesNegativeInfinity(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{HitRate: float32(math.Inf(-1))},
+	})
+	replicas, _ := idx.CacheState("t", "m")
+	if len(replicas) != 1 || replicas[0].HitRate != 0 {
+		t.Fatalf("-Inf HitRate should be clamped to 0, got %+v", replicas)
 	}
 }

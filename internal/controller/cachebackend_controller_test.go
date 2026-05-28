@@ -229,6 +229,15 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	}
 }
 
+// TestReconcileLMCacheProfileSwitchGPUToCPU was retired with C6: the
+// "profile" backendConfig key + the all-in-one vLLM+LMCache container shape
+// it switched between are gone. Post-C6 the CacheBackend renders a
+// CPU-only standalone lmcache-server regardless of the engine the user
+// runs alongside it — engine choice (GPU vs CPU image) is the user's, not a
+// CacheBackend toggle. The substrate's CPU canary now exercises the engine
+// pod wiring (via the PR2 mutating webhook), not a CacheBackend profile
+// switch.
+
 func TestReconcileLMCacheScalesReplicas(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")

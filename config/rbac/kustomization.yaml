@@ -6,3 +6,5 @@ resources:
 - leader_election_role_binding.yaml
 - cachebackend_editor_role.yaml
 - cachebackend_viewer_role.yaml
+- cacheindex_editor_role.yaml
+- cacheindex_viewer_role.yaml

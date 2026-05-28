@@ -17,6 +17,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -56,7 +64,17 @@ rules:
   - inferencecache.io
   resources:
   - cachebackends/status
+  - cacheindices/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - inferencecache.io
+  resources:
+  - cacheindices
+  verbs:
+  - create
+  - get
+  - list
+  - watch
