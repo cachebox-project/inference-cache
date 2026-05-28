@@ -2,7 +2,9 @@ package index
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -370,5 +372,47 @@ func TestMetricsZeroedWhenModelDrains(t *testing.T) {
 	// The drained model's gauge must be reset to 0, not left stale at 1.
 	if m.last["m"] != 0 {
 		t.Fatalf("drained model gauge = %d, want 0", m.last["m"])
+	}
+}
+
+func TestIngestSanitizesNonFiniteStats(t *testing.T) {
+	idx := New()
+	// NaN / +Inf / -Inf would later make /snapshot's JSON encode fail
+	// (and 500 the endpoint) — Ingest must clamp them to 0 at the boundary.
+	idx.Ingest(Update{
+		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}},
+		Stats: &ReplicaStats{
+			HitRate:  float32(math.NaN()),
+			Pressure: float32(math.Inf(1)),
+		},
+	})
+	replicas, _ := idx.CacheState("t", "m")
+	if len(replicas) != 1 {
+		t.Fatalf("expected 1 replica, got %d", len(replicas))
+	}
+	r := replicas[0]
+	if x := float64(r.HitRate); math.IsNaN(x) || math.IsInf(x, 0) {
+		t.Fatalf("HitRate not sanitized: %v", r.HitRate)
+	}
+	if x := float64(r.Pressure); math.IsNaN(x) || math.IsInf(x, 0) {
+		t.Fatalf("Pressure not sanitized: %v", r.Pressure)
+	}
+	// The whole snapshot must JSON-encode cleanly — that's the failure mode
+	// this guards: encoding/json rejects non-finite floats.
+	if _, err := json.Marshal(idx.Snapshot()); err != nil {
+		t.Fatalf("snapshot encode after sanitization: %v", err)
+	}
+}
+
+func TestIngestSanitizesNegativeInfinity(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{HitRate: float32(math.Inf(-1))},
+	})
+	replicas, _ := idx.CacheState("t", "m")
+	if len(replicas) != 1 || replicas[0].HitRate != 0 {
+		t.Fatalf("-Inf HitRate should be clamped to 0, got %+v", replicas)
 	}
 }

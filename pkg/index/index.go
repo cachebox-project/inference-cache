@@ -9,6 +9,7 @@ package index
 
 import (
 	"context"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -239,6 +240,11 @@ func (i *Index) Ingest(u Update) {
 	if u.Stats != nil {
 		st := *u.Stats
 		st.ReplicaID = u.ReplicaID // top-level replica id is authoritative — it is the index key
+		// Clamp non-finite rates to 0 so a bad engine stat can't poison /snapshot:
+		// encoding/json rejects NaN/±Inf and would 500 the endpoint until the
+		// stat expires (TTL), stalling the CacheIndex poller.
+		st.HitRate = sanitizeRate(st.HitRate)
+		st.Pressure = sanitizeRate(st.Pressure)
 		i.stats[statsKey{u.Tenant, u.Model, u.ReplicaID}] = statEntry{stats: st, lastSeen: ts}
 	}
 	i.enforceCapLocked()
@@ -553,4 +559,15 @@ func (i *Index) reportEntries() {
 		i.metrics.SetIndexEntries(model, n)
 		i.reportedModels[model] = struct{}{}
 	}
+}
+
+// sanitizeRate clamps non-finite values (NaN, ±Inf) to 0. Engine adapters can
+// produce these (e.g. hit_rate = hits/(hits+misses) with 0 total). encoding/json
+// rejects them, so letting them into the index would later break /snapshot.
+func sanitizeRate(f float32) float32 {
+	x := float64(f)
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0
+	}
+	return f
 }
