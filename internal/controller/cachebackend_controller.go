@@ -125,9 +125,8 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
-	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later module.
-	// Phase 1 manages a Deployment only — a single shared PVC mounted by a
-	// single-replica Deployment covers the LMCache common shape.
+	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
+	// module. Phase 1 manages a Deployment only.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
 		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)

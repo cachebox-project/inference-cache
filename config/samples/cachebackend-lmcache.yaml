@@ -11,10 +11,10 @@
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
 # canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler
-# from spec.autoscaling. spec.storage.pvc is accepted for forward-compat —
-# the requested size is mirrored to status.capacity — but mounting the PVC
-# into the standalone lmcache-server's data directory is deferred to a
-# follow-up module.
+# from spec.autoscaling. spec.storage.pvc is accepted on the CRD for
+# forward-compat but is inert today — no PVC is provisioned and no volume
+# is mounted; wiring it through to the lmcache-server's data directory is
+# a follow-up.
 #
 # Override the lmcache-server image (defaults to lmcache/standalone:latest)
 # or the server command via backendConfig until first-class spec fields land.

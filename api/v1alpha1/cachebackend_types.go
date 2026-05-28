@@ -57,10 +57,9 @@ const (
 // Persistent storage (spec.storage.pvc) and the autoscaling spec
 // (spec.autoscaling) are both surfaced here for v1alpha1 forward-compat. The
 // autoscaling spec is reconciled into a HorizontalPodAutoscaler today;
-// wiring spec.storage.pvc into the standalone LMCache server's data
-// directory is deferred to a follow-up module — until then status.capacity
-// reflects the requested size so operators can plan against the eventual
-// capacity, and the PVC field is otherwise inert.
+// spec.storage.pvc is accepted but inert until a follow-up wires it through
+// to the runtime adapter's rendered pod (there is no PVC provisioning, no
+// volume injection, and no status.capacity reporting until then).
 type CacheBackendSpec struct {
 	// Type identifies the backing cache implementation.
 	// +optional
