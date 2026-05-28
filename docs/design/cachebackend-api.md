@@ -59,7 +59,7 @@ It intentionally does not expose `containers`; requiring users to provide contai
 
 ### backendConfig keys (managed LMCache)
 
-`spec.backendConfig` is a free-form string map; the managed LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) recognizes overrides for the **standalone lmcache-server** workload it renders, and for the **engine-side env** a future mutating admission webhook will inject into vLLM pods. Defaults are overridable until they are promoted to first-class spec fields.
+`spec.backendConfig` is a free-form string map; the managed LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) recognizes overrides for the **standalone lmcache-server** workload it renders, and for the **engine-side env** that the [mutating Pod admission webhook](#mutating-pod-webhook-engine-wiring) injects into vLLM pods. Defaults are overridable until they are promoted to first-class spec fields.
 
 Server-side (consumed by `ResolveCacheServer` when rendering the cache-server pod):
 
@@ -153,3 +153,16 @@ The validating rules tighten what `v1alpha1` accepts, so they ship together with
 - Existing stored CacheBackends that were applied before the webhook is installed remain in etcd and are unaffected until they are next created or mutated.
 - An operator with a now-invalid CR can read it (`kubectl get`), but a write (create or update) fails until the spec satisfies the new rules.
 - The cluster-wide rollout knob is the webhook's `failurePolicy`; future tightenings that need a softer rollout can switch to `Ignore` for one release before flipping to `Fail`.
+
+### Mutating Pod webhook (engine wiring)
+
+A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencecache.io`) auto-wires user-supplied inference engine pods to the matching managed `CacheBackend` — operators never have to hand-edit `LMCACHE_*` env vars or the LMCache connector arg onto their pod templates. The handler lives in `internal/webhook/pod` and runs on every Pod CREATE.
+
+| Aspect | Behavior |
+|---|---|
+| Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. The first matching `CacheBackend` wins; one with a nil or empty `EngineSelector` is skipped (a "match-everything" selector would silently claim every pod in the namespace). |
+| Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)` and calls `adapter.InjectEngineConfig(pod.Spec, cache.Status.Endpoint, cache)`. The adapter merges: existing args/env on the engine container are preserved; repeat injections are idempotent. |
+| Annotations | Stamps `inferencecache.io/injected-by: <namespace>/<name>` on every mutated pod for observability (`kubectl describe pod`). Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out — the handler returns Allowed without mutation when set. |
+| Idempotency short-circuit | A pod that already carries `LMCACHE_REMOTE_URL` on any container is left alone, so re-admissions don't churn JSON patches at the apiserver. The adapter itself is idempotent at the merge level. |
+| Fail-open | Every error path (decode failure, list error, no matching backend, missing `status.endpoint`, no registered adapter, adapter rejection, re-encode failure) returns `admission.Allowed(...)` with a reason — webhook errors MUST NOT block engine admission. `MutatingWebhookConfiguration.failurePolicy` is also pinned to `Ignore` as a belt-and-suspenders second layer. |
+| Verbs | `CREATE` only. UPDATE re-admissions to a running pod don't re-inject (and the engine container can't pick up env changes without a restart anyway); UPDATEs to engine pods are rare in this fleet. |

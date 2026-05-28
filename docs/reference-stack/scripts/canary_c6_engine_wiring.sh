@@ -17,9 +17,10 @@
 #
 # Heavy: two CPU vLLM pods + the lmcache-server + cert-manager + the
 # controller image all run on one kind node. The vLLM CPU runtime baseline
-# is ~5 GiB per pod, so the Docker VM needs ~12 GiB RAM (PROJECT_CONTEXT.md
-# section 6b documents the memory floor). Pulls the multi-GB vLLM image.
-# This is NOT a per-PR gate; it runs on a schedule and on manual dispatch.
+# is ~5 GiB per pod, so the Docker VM needs ~12 GiB RAM (see
+# docs/reference-stack/VERSIONS.md for the documented memory floor).
+# Pulls the multi-GB vLLM image. This is NOT a per-PR gate; it runs on a
+# schedule and on manual dispatch.
 #
 # Usage:    docs/reference-stack/scripts/canary_c6_engine_wiring.sh
 # Tunables: IMAGE, MODEL, KIND_CLUSTER, NAMESPACE, READY_TIMEOUT,

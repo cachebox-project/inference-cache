@@ -46,11 +46,19 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Skip("KUBEBUILDER_ASSETS unset; skipping webhook envtest")
 	}
 
+	// Install only the Pod MutatingWebhookConfiguration. The shipped
+	// config/webhook/manifests.yaml also carries the CacheBackend
+	// defaulting/validating webhooks (B3) whose handlers this test does
+	// not register; installing them would route every test CacheBackend
+	// CREATE to a non-existent path. Splice in a temp file with just the
+	// pod webhook configuration.
+	podOnlyWebhook := writePodOnlyWebhookManifest(t)
+
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
-			Paths: []string{filepath.Join("..", "..", "..", "config", "webhook", "manifests.yaml")},
+			Paths: []string{podOnlyWebhook},
 		},
 	}
 
@@ -82,7 +90,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
-		Handler: &EngineInjector{Client: mgr.GetClient()},
+		Handler: &EngineInjector{Reader: mgr.GetAPIReader()},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,7 +155,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	}
 
 	var got corev1.Pod
-	if err := mgr.GetClient().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod.Name}, &got); err != nil {
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod.Name}, &got); err != nil {
 		t.Fatalf("get pod after create: %v", err)
 	}
 
@@ -171,7 +179,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("create second Pod: %v", err)
 	}
 	var got2 corev1.Pod
-	if err := mgr.GetClient().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod2.Name}, &got2); err != nil {
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod2.Name}, &got2); err != nil {
 		t.Fatalf("get second pod: %v", err)
 	}
 	mustHaveContainerEnv(t, &got2, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
@@ -244,4 +252,47 @@ func waitForWebhookReady(t *testing.T, host string, port int) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("webhook never became ready at %s", addr)
+}
+
+// writePodOnlyWebhookManifest emits a temporary MutatingWebhookConfiguration
+// containing only the Pod webhook, so envtest doesn't install the
+// CacheBackend defaulting/validating webhooks alongside it (those would
+// route every test CacheBackend CREATE to a path we don't serve in this
+// test). The content mirrors the generated config/webhook/manifests.yaml
+// for the Pod webhook — kept narrow on purpose so an unrelated webhook
+// rename in the generated manifest doesn't silently de-install this one.
+func writePodOnlyWebhookManifest(t *testing.T) string {
+	t.Helper()
+	manifest := `---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: mutating-webhook-configuration-pod-only
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: ` + WebhookPath + `
+  failurePolicy: Ignore
+  name: mpod.inferencecache.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pod-webhook.yaml")
+	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write temp webhook manifest: %v", err)
+	}
+	return path
 }
