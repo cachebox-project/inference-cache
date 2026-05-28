@@ -248,8 +248,21 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 
-	endpoint := serviceEndpoint(svc)
-	if err := r.updateManagedStatus(ctx, backend, endpoint, &live); err != nil {
+	// Endpoint is derived from the *live* Service, not the desired one: if
+	// applyService failed (Forbidden, conflict-budget exhausted, ...) we must
+	// not advertise an endpoint that doesn't exist or whose ports/selectors
+	// haven't landed yet. Empty endpoint when the Service hasn't materialized.
+	var liveSvc corev1.Service
+	endpoint := ""
+	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+		}
+	} else {
+		endpoint = serviceEndpoint(&liveSvc)
+	}
+
+	if err := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -604,32 +617,44 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
 //
+// applyOK is the convergence signal from reconcileManaged: when apply failed,
+// the live Deployment we read may still reflect a *prior* CR generation, so
+// advancing Status.ObservedGeneration to the current CR generation would tell
+// clients the controller has caught up when it hasn't. The published
+// observedGeneration therefore stays at its prior value until apply succeeds
+// for the current generation; the Ready and Progressing conditions carry the
+// same generation so callers can tell which spec the observation belongs to.
+//
 // status.capacity is intentionally left empty here: the field is present on
 // the type for forward-compat, but the standalone LMCache server pod has no
 // data volume the controller can attach a PVC to today, so reporting a
 // requested PVC size as "provisioned capacity" would mislead operators.
 // Populating it is left to the follow-up that wires storage end-to-end.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) error {
 	health, readyStatus, reason, message := managedHealth(backend, dep)
 	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
+	publishedGen := backend.Status.ObservedGeneration
+	if applyOK {
+		publishedGen = backend.Generation
+	}
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
 		backend.Status.Health = health
 		backend.Status.Capacity = ""
-		backend.Status.ObservedGeneration = backend.Generation
+		backend.Status.ObservedGeneration = publishedGen
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
 			Status:             readyStatus,
 			Reason:             reason,
 			Message:            message,
-			ObservedGeneration: backend.Generation,
+			ObservedGeneration: publishedGen,
 		})
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeProgressing,
 			Status:             progressingStatus,
 			Reason:             progressingReason,
 			Message:            progressingMessage,
-			ObservedGeneration: backend.Generation,
+			ObservedGeneration: publishedGen,
 		})
 	})
 }

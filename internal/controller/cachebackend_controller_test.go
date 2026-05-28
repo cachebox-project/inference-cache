@@ -909,6 +909,10 @@ func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 // Even when apply fails (here, a Forbidden as if an admission webhook rejected
 // the write), the CR must still publish what the Deployment reports instead
 // of remaining frozen at a stale snapshot.
+//
+// At the same time, Status.ObservedGeneration must NOT advance to the new CR
+// generation when apply for that generation failed — otherwise clients can't
+// tell from the status whether the controller has caught up.
 func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
@@ -928,6 +932,11 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 
 	reconcile(t, r, "cache", "ns1")
 	markDeploymentReady(t, r, "cache", "ns1", 1)
+	// Sanity: after a successful first reconcile, observedGeneration tracks
+	// the CR generation (1).
+	if got := getBackend(t, r, "cache", "ns1").Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration after successful first reconcile = %d, want 1", got)
+	}
 
 	// Now flip the gate so the next applyDeployment Update is rejected. Force
 	// an Update to happen by changing the image in the CR.
@@ -954,8 +963,57 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("Ready condition = %+v, want True", cond)
 	}
+	// Apply for generation 2 failed, so observedGeneration must NOT have
+	// advanced to 2 — it should still report 1 (the last generation we
+	// successfully drove the live state toward). Same for the Ready
+	// condition's ObservedGeneration, so the (status, condition) pair stays
+	// internally consistent.
+	if got := updated.Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 (apply failed; must not advance to current CR gen)", got)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.ObservedGeneration != 1 {
+		t.Fatalf("Ready condition ObservedGeneration = %d, want 1", cond.ObservedGeneration)
+	}
 	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got == "example.com/lmcache-server:v9" {
 		t.Fatalf("deployment image was updated despite Forbidden — interceptor was not exercised")
+	}
+}
+
+// TestReconcileLMCacheEndpointHeldUntilServiceExists pins the endpoint
+// invariant: Status.Endpoint must only advertise an address that corresponds
+// to a *live* Service. When applyService is rejected on the first reconcile
+// (so the Service was never created), the CR must not publish the desired
+// endpoint — clients/gateways would route to a non-existent target.
+func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	gr := schema.GroupResource{Group: "", Resource: "services"}
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Service); ok {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Service create was blocked)")
+	}
+
+	// Deployment is created (only Service apply was blocked), so the status
+	// pass runs and publishes Health. But Status.Endpoint must stay empty
+	// until a live Service backs it.
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err != nil {
+		t.Fatalf("expected deployment to be created (only Service was blocked): %v", err)
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
+		t.Fatalf("status.endpoint = %q, want \"\" (no live Service exists yet)", got)
 	}
 }
 
@@ -963,16 +1021,25 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 // managed Deployment disappears between a successful apply and the post-apply
 // Get (out-of-band delete, GC). Reconcile must NOT silently report success —
 // there is no observed state to publish, so the controller must requeue.
+//
+// The interceptor counts Deployment Get calls in the reconcile pass under
+// test: the 1st Get is inside applyDeployment's CreateOrUpdate (Get-then-
+// Update — must pass through so apply itself succeeds); the 2nd Get is the
+// post-apply read in reconcileManaged, which we swallow as NotFound to
+// simulate the live object being deleted between those two steps.
 func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)
 
-	var swallowDeploymentGet atomic.Bool
+	var depGetCount atomic.Int32
+	var armed atomic.Bool
 	funcs := interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && swallowDeploymentGet.Load() {
-				return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, key.Name)
+			if _, ok := obj.(*appsv1.Deployment); ok && armed.Load() {
+				if depGetCount.Add(1) == 2 {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, key.Name)
+				}
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -981,25 +1048,23 @@ func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 
 	// First reconcile creates everything and publishes initial status.
 	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
 
-	// Simulate the Deployment vanishing between the (successful) apply and
-	// the post-apply Get inside the same reconcile pass. Apply itself uses
-	// Get-then-Create when the live object is missing, so swallowing Get
-	// indiscriminately would make apply re-Create the Deployment. We only
-	// need the post-apply Get to fail, so toggle the flag right before the
-	// next reconcile and back off mid-reconcile is impossible here — instead,
-	// we run a no-op reconcile (apply does nothing because nothing changed
-	// in the desired state) and have the post-apply Get see the absence.
-	if err := r.Delete(context.Background(), getDeployment(t, r, "cache", "ns1")); err != nil {
-		t.Fatalf("delete deployment: %v", err)
-	}
-	swallowDeploymentGet.Store(true)
-	defer swallowDeploymentGet.Store(false)
+	// Arm the interceptor for the next reconcile. The 1st Deployment Get
+	// (inside applyDeployment's CreateOrUpdate) passes through so apply
+	// converges as normal; the 2nd Get (the post-apply read in
+	// reconcileManaged) returns NotFound, simulating the live Deployment
+	// being deleted between apply and Get within the same reconcile pass.
+	armed.Store(true)
+	defer armed.Store(false)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
 	}); err == nil {
 		t.Fatalf("reconcile returned nil, want error (Deployment vanished after apply)")
+	}
+	if got := depGetCount.Load(); got < 2 {
+		t.Fatalf("expected at least 2 Deployment Gets in the armed reconcile; got %d", got)
 	}
 }
 
