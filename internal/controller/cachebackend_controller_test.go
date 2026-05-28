@@ -1069,6 +1069,61 @@ func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 	}
 }
 
+// TestReconcileLMCacheDeploymentLosesOwnershipAfterApply pins the foreign-
+// ownership race on the no-apply-error path: applyDeployment succeeded (we
+// own the live Deployment after Update), but between Update and the post-
+// apply Get, the live Deployment's controller ref was changed out-of-band.
+// Returning nil there would silently report success AND, since we no longer
+// own the object, the Owns() watch would stop delivering events — so the
+// CacheBackend would never re-reconcile. Reconcile must therefore synthesize
+// an error to requeue.
+func TestReconcileLMCacheDeploymentLosesOwnershipAfterApply(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	// The interceptor strips Deployment owner refs on the 2nd Get per
+	// reconcile (the post-apply read). The 1st Get (inside applyDeployment's
+	// CreateOrUpdate) passes through unchanged so apply itself succeeds —
+	// the bug we're guarding is only visible *after* a successful apply.
+	var depGetCount atomic.Int32
+	var armed atomic.Bool
+	otherCtrl := true
+	foreignOwner := metav1.OwnerReference{
+		APIVersion: "example.com/v1", Kind: "OtherKind",
+		Name: "other", UID: "other-uid",
+		Controller: &otherCtrl, BlockOwnerDeletion: &otherCtrl,
+	}
+	funcs := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if dep, ok := obj.(*appsv1.Deployment); ok && armed.Load() {
+				if depGetCount.Add(1) == 2 {
+					dep.OwnerReferences = []metav1.OwnerReference{foreignOwner}
+				}
+			}
+			return nil
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile lands the Deployment with us as controller (no event
+	// from the interceptor yet — armed is still false).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	armed.Store(true)
+	defer armed.Store(false)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment lost controller ref between apply and Get)")
+	}
+}
+
 // TestReconcileLMCacheForeignDeploymentNoStatusLeak pins the foreign-ownership
 // guard on the Deployment status path: if a Deployment with the matching name
 // already exists but is owned by another controller, applyDeployment fails

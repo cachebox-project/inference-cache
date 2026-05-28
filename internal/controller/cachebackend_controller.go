@@ -263,13 +263,19 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		// snapshot.
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
-	// Never publish status derived from a foreign workload: if apply collided
-	// with an existing Deployment owned by some other controller,
-	// SetControllerReference returned an AlreadyOwned error and applyErr is
-	// set. Reading that foreign object's status here could mark the
-	// CacheBackend Ready based on another controller's pods.
+	// Never publish status derived from a foreign workload. The common case
+	// is an AlreadyOwned collision during apply (applyErr is set; surface
+	// it). The race case is that apply succeeded but the live Deployment's
+	// controller ref was changed out-of-band between Update and this Get —
+	// applyErr is nil, but we no longer own the object. Returning nil there
+	// would silently mark the reconcile successful AND lose the owned-object
+	// watch (no future event would re-trigger), so synthesize an explicit
+	// error to requeue.
 	if !metav1.IsControlledBy(&live, backend) {
-		return ctrl.Result{}, applyErr
+		if applyErr != nil {
+			return ctrl.Result{}, applyErr
+		}
+		return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
 	}
 
 	// Endpoint is derived from the *live* Service, not the desired one: if
