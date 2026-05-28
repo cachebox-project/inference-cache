@@ -132,8 +132,11 @@ jobs:
         format: sarif
         output: trivy-controller.sarif
 
+    # Skip on forked PRs: GITHUB_TOKEN is read-only for forks regardless of
+    # requested permissions, so upload-sarif would fail and break public CI for
+    # outside contributors. The scan + aggregation gate still runs.
     - name: Upload Trivy SARIF (controller)
-      if: always()
+      if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
       with:
         sarif_file: trivy-controller.sarif
@@ -151,7 +154,7 @@ jobs:
         output: trivy-server.sarif
 
     - name: Upload Trivy SARIF (server)
-      if: always()
+      if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
       with:
         sarif_file: trivy-server.sarif
