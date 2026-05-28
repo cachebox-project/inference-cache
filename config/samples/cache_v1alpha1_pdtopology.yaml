@@ -1,0 +1,25 @@
+apiVersion: inferencecache.io/v1alpha1
+kind: PDTopology
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: pdtopology-sample
+spec:
+  acceleratorTypes:
+  - name: a100
+    vendor: nvidia
+    model: A100
+    matchLabels:
+      accelerator: a100
+  prefillPools:
+  - name: prefill-a
+    acceleratorType: a100
+    replicas: 2
+    matchLabels:
+      inferencecache.io/pool: prefill-a
+  decodePools:
+  - name: decode-a
+    acceleratorType: a100
+    replicas: 4
+    matchLabels:
+      inferencecache.io/pool: decode-a

@@ -100,6 +100,7 @@ type CacheIndexStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=ci
+// +kubebuilder:validation:XValidation:rule="!has(self.spec)",message="CacheIndex is status-only; spec is not user-writable"
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.prefixes.summary.total`
 // +kubebuilder:printcolumn:name="Changed",type=date,JSONPath=`.status.lastUpdated`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
@@ -111,7 +112,7 @@ type CacheIndex struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CacheIndexSpec   `json:"spec,omitempty"`
+	Spec   *CacheIndexSpec  `json:"spec,omitempty"`
 	Status CacheIndexStatus `json:"status,omitempty"`
 }
 

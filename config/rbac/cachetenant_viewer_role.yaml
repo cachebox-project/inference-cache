@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cachetenant-viewer-role
+rules:
+- apiGroups:
+  - inferencecache.io
+  resources:
+  - cachetenants
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - inferencecache.io
+  resources:
+  - cachetenants/status
+  verbs:
+  - get

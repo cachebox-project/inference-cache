@@ -87,7 +87,9 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 
 Design docs live under [`docs/`](docs/):
 
+- [`docs/design/cachebackend-api.md`](docs/design/cachebackend-api.md) — the `CacheBackend` CRD contract
 - [`docs/design/grpc-contract.md`](docs/design/grpc-contract.md) — the `InferenceCache` gRPC service contract (B4)
+- [`docs/design/policy-crds.md`](docs/design/policy-crds.md) — policy CRDs (`CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex`)
 
 Contributor guide: [`CONTRIBUTING.md`](CONTRIBUTING.md) (layout, naming rule, push/PR gates).
 
