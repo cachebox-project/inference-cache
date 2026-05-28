@@ -49,6 +49,8 @@ type CacheTenantQuotaSpec struct {
 }
 
 // CacheTenantCryptoSpec is reserved for future cryptographic isolation.
+// +kubebuilder:pruning:PreserveUnknownFields
+// +kubebuilder:validation:MaxProperties=0
 type CacheTenantCryptoSpec struct{}
 
 // CacheTenantStatus defines observed tenant state.

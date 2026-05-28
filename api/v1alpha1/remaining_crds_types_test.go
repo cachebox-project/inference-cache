@@ -38,6 +38,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	tenantQuota := mustProperty(t, tenantSpec, "quota")
 	requireMinimum(t, mustProperty(t, tenantQuota, "maxMemoryBytes"), 0)
 	requireMinimum(t, mustProperty(t, tenantQuota, "maxIndexEntries"), 0)
+	requireReservedEmptyObject(t, mustProperty(t, tenantSpec, "crypto"))
 
 	templateSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_prompttemplates.yaml")
 	requireRequired(t, templateSchema, "spec")
@@ -66,7 +67,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireMinLength(t, mustProperty(t, acceleratorType, "name"), 1)
 
 	indexSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cacheindices.yaml")
-	requireStatusOnlyEmptySpecSchema(t, mustProperty(t, indexSchema, "spec"))
+	requireLegacyStatusOnlySpecSchema(t, mustProperty(t, indexSchema, "spec"))
 }
 
 func TestRemainingCRDDeepCopies(t *testing.T) {
@@ -226,6 +227,16 @@ func TestGeneratedCRDAdmissionValidationHandlesCacheIndexStatusOnlySpec(t *testi
 				"spec":       map[string]any{},
 			},
 		},
+		{
+			name: "non-empty legacy spec pruned",
+			obj: map[string]any{
+				"apiVersion": "inferencecache.io/v1alpha1",
+				"kind":       "CacheIndex",
+				"spec": map[string]any{
+					"foo": "bar",
+				},
+			},
+		},
 	}
 	for _, tc := range validCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,20 +246,55 @@ func TestGeneratedCRDAdmissionValidationHandlesCacheIndexStatusOnlySpec(t *testi
 		})
 	}
 
-	invalid := map[string]any{
+	legacyNonEmpty := map[string]any{
 		"apiVersion": "inferencecache.io/v1alpha1",
 		"kind":       "CacheIndex",
 		"spec": map[string]any{
 			"foo": "bar",
 		},
 	}
-	pruned := pruneGeneratedCustomResource(t, schema, invalid)
+	pruned := pruneGeneratedCustomResource(t, schema, legacyNonEmpty)
 	spec, ok := pruned["spec"].(map[string]any)
-	if !ok || spec["foo"] != "bar" {
-		t.Fatalf("CacheIndex spec was pruned before validation: %#v", pruned["spec"])
+	if !ok {
+		t.Fatalf("CacheIndex spec was pruned entirely, want legacy empty object: %#v", pruned["spec"])
+	}
+	if _, ok := spec["foo"]; ok {
+		t.Fatalf("CacheIndex legacy spec field survived pruning: %#v", spec)
+	}
+}
+
+func TestGeneratedCRDAdmissionValidationRejectsReservedCacheTenantCryptoConfig(t *testing.T) {
+	schema := loadCRDInternalOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
+
+	valid := map[string]any{
+		"apiVersion": "inferencecache.io/v1alpha1",
+		"kind":       "CacheTenant",
+		"spec": map[string]any{
+			"tenantID": "tenant-a",
+			"crypto":   map[string]any{},
+		},
+	}
+	if errs := validateGeneratedCustomResource(t, schema, valid); len(errs) != 0 {
+		t.Fatalf("valid CacheTenant produced admission validation errors: %v", errs)
+	}
+
+	invalid := map[string]any{
+		"apiVersion": "inferencecache.io/v1alpha1",
+		"kind":       "CacheTenant",
+		"spec": map[string]any{
+			"tenantID": "tenant-a",
+			"crypto": map[string]any{
+				"keyRef": "secret-name",
+			},
+		},
+	}
+	pruned := pruneGeneratedCustomResource(t, schema, invalid)
+	crypto := mustPath[map[string]any](t, pruned, "spec", "crypto")
+	if _, ok := crypto["keyRef"]; !ok {
+		t.Fatalf("reserved CacheTenant crypto config was pruned before validation: %#v", crypto)
 	}
 	if errs := validateGeneratedCustomResource(t, schema, invalid); len(errs) == 0 {
-		t.Fatal("CacheIndex with non-empty spec passed generated CRD admission validation")
+		t.Fatal("CacheTenant with non-empty reserved crypto config passed generated CRD admission validation")
 	}
 }
 
@@ -408,7 +454,20 @@ func requireBooleanLike(t *testing.T, schema map[string]any) {
 	}
 }
 
-func requireStatusOnlyEmptySpecSchema(t *testing.T, schema map[string]any) {
+func requireLegacyStatusOnlySpecSchema(t *testing.T, schema map[string]any) {
+	t.Helper()
+	if got := mustPath[string](t, schema, "type"); got != "object" {
+		t.Fatalf("type = %q, want object", got)
+	}
+	if _, ok := schema["maxProperties"]; ok {
+		t.Fatalf("maxProperties = %v, want omitted for v1alpha1 compatibility", schema["maxProperties"])
+	}
+	if _, ok := schema["x-kubernetes-preserve-unknown-fields"]; ok {
+		t.Fatalf("x-kubernetes-preserve-unknown-fields = %v, want omitted for v1alpha1 pruning compatibility", schema["x-kubernetes-preserve-unknown-fields"])
+	}
+}
+
+func requireReservedEmptyObject(t *testing.T, schema map[string]any) {
 	t.Helper()
 	if got := mustPath[string](t, schema, "type"); got != "object" {
 		t.Fatalf("type = %q, want object", got)

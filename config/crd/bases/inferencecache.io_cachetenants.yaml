@@ -53,7 +53,9 @@ spec:
             properties:
               crypto:
                 description: Crypto is reserved for future tenant encryption settings.
+                maxProperties: 0
                 type: object
+                x-kubernetes-preserve-unknown-fields: true
               isolationMode:
                 default: Fairness
                 description: IsolationMode controls how this tenant shares cache resources.

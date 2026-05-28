@@ -56,9 +56,7 @@ spec:
               CacheIndexSpec is intentionally empty: CacheIndex is a status-only,
               controller-maintained reflection of the server's in-memory cache aggregate.
               There is nothing for a user to configure on the spec.
-            maxProperties: 0
             type: object
-            x-kubernetes-preserve-unknown-fields: true
           status:
             description: |-
               CacheIndexStatus is the observed, cluster-wide cache aggregate the controller

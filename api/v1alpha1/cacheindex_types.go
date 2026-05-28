@@ -8,8 +8,6 @@ import (
 // CacheIndexSpec is intentionally empty: CacheIndex is a status-only,
 // controller-maintained reflection of the server's in-memory cache aggregate.
 // There is nothing for a user to configure on the spec.
-// +kubebuilder:pruning:PreserveUnknownFields
-// +kubebuilder:validation:MaxProperties=0
 type CacheIndexSpec struct{}
 
 // ReplicaCacheStatus is the latest reported cache health for one engine replica.
