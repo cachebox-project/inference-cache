@@ -37,6 +37,7 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `backendConfig` | map | Backend-specific string settings. |
 | `template` | object | Optional pod-level overrides for managed backend pods. This is a narrow override surface, not a full `PodSpec`; backend containers come from controller defaults. |
 | `endpoint` | string | Optional endpoint for an existing external backend. The controller mirrors this into `status.endpoint`. |
+| `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
 
 ### Template Overrides
 
@@ -116,5 +117,39 @@ When the desired replica count is owned by an HPA (`spec.autoscaling` set) the c
 
 - Lookup paths fail open by default. `spec.integration.failOpen` defaults to `true` and the engine adapter MUST fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Operators may opt into fail-closed serving by setting `failOpen: false`, which is loud and visible: the controller emits a Warning `FailClosedEnabled` Event on the `CacheBackend` to make it explicit that the cache has been promoted to a serving dependency.
 - The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded`, `BackendRecovered` (Normal) on returning to `Ready` from `Degraded`, plus the `FailClosedEnabled` / `FailOpenRestored` pair above. Steady-state reconciles do not emit events.
-- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects.
+- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook is the exception: it materialises `spec.integration` with the Phase-1 defaults (`lookupTimeoutMs`, `minimumPrefixTokens`) so downstream code does not need to nil-check them. The fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
 - `status.indexEntries` is a pointer in Go so `0` is distinguishable from unset.
+
+## Admission
+
+The controller serves two webhooks for CacheBackend, both registered as `failurePolicy: Fail` with `sideEffects: None` on CREATE and UPDATE. Webhook serving requires cert-manager (see README "Cluster Prerequisites").
+
+### Defaulting (mutating)
+
+Stamps Phase-1 defaults onto every admitted CacheBackend, only where the operator has not specified a value. Operator-set values are never clobbered.
+
+| Field | Default |
+|---|---|
+| `spec.replicas` | `1` |
+| `spec.integration.lookupTimeoutMs` | `50` |
+| `spec.integration.minimumPrefixTokens` | `256` |
+
+### Validating
+
+Rejects structurally-broken specs that the reconciler cannot do anything useful with, with field-scoped error messages. Multiple violations on a single spec are aggregated into one `Invalid` status so kubectl prints them together.
+
+| Rule | Rejects |
+|---|---|
+| `External` requires `spec.endpoint` | `spec.type=External` with no endpoint — the external backend has no address to mirror to `status.endpoint`. |
+| Memory-only backends cannot declare PVC storage | `spec.storage.pvc` set when `spec.type` is in the Phase-1 memory-only set (`AIBrix`, `NIXL`). These backends have no persistent tier; a PVC would never mount. |
+| Cross-namespace endpoint requires opt-in | `spec.endpoint` resolves to a Service in a namespace other than the CacheBackend's, and `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator should acknowledge. Bare hostnames, IPs, and unqualified names pass through (no namespace to compare against). |
+
+Rules are an ordered, pluggable list (`CacheBackendValidator.Rules`); admission rules planned in later modules (e.g. the runtime/backend compatibility check from M6) plug in as a one-line append.
+
+### Migration
+
+The validating rules tighten what `v1alpha1` accepts, so they ship together with the admission webhook itself (a previously-uninstalled webhook). Tightening applies at write time only:
+
+- Existing stored CacheBackends that were applied before the webhook is installed remain in etcd and are unaffected until they are next created or mutated.
+- An operator with a now-invalid CR can read it (`kubectl get`), but a write (create or update) fails until the spec satisfies the new rules.
+- The cluster-wide rollout knob is the webhook's `failurePolicy`; future tightenings that need a softer rollout can switch to `Ignore` for one release before flipping to `Fail`.

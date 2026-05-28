@@ -111,8 +111,8 @@ generate: controller-gen ## Generate Kubernetes deepcopy code.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
 
 .PHONY: manifests
-manifests: controller-gen ## Generate CRD and RBAC manifests.
-	$(CONTROLLER_GEN) rbac:roleName=inference-cache-manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac
+manifests: controller-gen ## Generate CRD, RBAC, and webhook manifests.
+	$(CONTROLLER_GEN) rbac:roleName=inference-cache-manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac output:webhook:artifacts:config=config/webhook
 
 .PHONY: proto-gen
 proto-gen: protoc-gen-go ## Generate protobuf Go code.
@@ -201,7 +201,7 @@ install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooks
 .PHONY: verify-naming
 verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
 	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
-		api proto pkg/server/proto config/crd config/rbac internal PROJECT go.mod 2>/dev/null || true); \
+		api proto pkg/server/proto config/crd config/rbac config/default config/webhook config/certmanager internal PROJECT go.mod 2>/dev/null || true); \
 	if [ -n "$$bad" ]; then \
 		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
 		echo "$$bad" | sed 's/^/    /'; \
@@ -234,7 +234,7 @@ ci: verify-naming verify-no-internal-refs fmt-check vet test-race build ## Local
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
-	@gen='config/crd config/rbac/role.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
+	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
 	if ! git diff --quiet -- $$gen; then \
 		echo "✗ generated-code drift — regenerate and commit these files:"; \
 		git --no-pager diff --name-only -- $$gen; \
