@@ -126,10 +126,10 @@ The check (Makefile + `.githooks/pre-commit` + CI) scans every tracked file exce
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + golangci-lint + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. The same set of checks runs in CI.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then prints the review checklist. Review the diff against the tech spec before submitting.
 
-Emergency override for the push gate: `git push --no-verify` (discouraged). CI runs the full `make ci-lint` (golangci-lint) in addition to the above.
+Emergency override for the push gate: `git push --no-verify` (discouraged).
 
 ## Repository layout — where new code goes
 

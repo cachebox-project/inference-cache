@@ -229,7 +229,7 @@ fmt-check: ## Check Go formatting without modifying files.
 	echo "✓ gofmt clean"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet test-race build ## Local CI gate (naming + internal-refs + fmt + vet + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.

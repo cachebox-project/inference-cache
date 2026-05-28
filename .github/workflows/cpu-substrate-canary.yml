@@ -1,0 +1,52 @@
+# On-demand / scheduled full-chain CPU canary for the cache substrate.
+#
+# Runs docs/reference-stack/scripts/canary_e2e.sh: brings up a CPU vLLM engine +
+# policy server + kvevent-subscriber, drives prefix traffic, and asserts a
+# prefix-cache hit and that the index populated end-to-end. GPU-free.
+#
+# This is NOT a per-PR gate (it pulls a multi-GB image and needs ~10 GiB RAM); it
+# runs on a schedule and on manual dispatch. It depends on the kvevent-subscriber
+# (cmd/kvevent-subscriber), so it only works once that has landed on the default
+# branch.
+name: cpu-substrate-canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (override to target a self-hosted Docker host)"
+        default: ubuntu-latest
+        required: false
+  schedule:
+    - cron: "0 7 * * *" # nightly 07:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-substrate-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run full-chain CPU canary
+        run: docs/reference-stack/scripts/canary_e2e.sh
+
+      - name: Upload canary logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-logs
+          path: |
+            /tmp/canary-server.log
+            /tmp/canary-subscriber.log
+          if-no-files-found: ignore

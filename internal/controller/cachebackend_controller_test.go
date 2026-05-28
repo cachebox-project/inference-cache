@@ -2,19 +2,25 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -820,6 +826,420 @@ func TestReconcileIgnoresMissingObject(t *testing.T) {
 	r := newReconciler(scheme)
 
 	reconcile(t, r, "missing", "default")
+}
+
+// newReconcilerWithInterceptor wires a fake client whose write methods are
+// wrapped by funcs, so a test can inject 409 Conflict / 403 Forbidden errors
+// for specific resources and exercise the reconciler's retry + status paths.
+func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Funcs, objs ...client.Object) *CacheBackendReconciler {
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
+		Build()
+	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+}
+
+// TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded
+// regression: a Deployment Update inside applyDeployment races the kube
+// Deployment controller's status writes and returns 409. Without retry, the
+// reconcile aborts and the CR's Health is frozen at whatever the last
+// successful pass observed — typically "pod not yet Ready". With
+// RetryOnConflict in place, apply converges within a reconcile pass and the
+// CR reports Ready once the underlying Deployment is healthy.
+func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var conflictsRemaining int32 = 3 // first 3 Deployment Updates → 409
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				if atomic.LoadInt32(&conflictsRemaining) > 0 {
+					atomic.AddInt32(&conflictsRemaining, -1)
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: "apps", Resource: "deployments"},
+						obj.GetName(),
+						errors.New("the object has been modified; please apply your changes to the latest version and try again"),
+					)
+				}
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile creates the Deployment + Service (Create, not Update —
+	// no conflict possible at this step).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	// Force the next reconcile to issue a real Update against the Deployment.
+	// (Image override mutates the managed container in-place; a no-op reconcile
+	// would not call Update at all.)
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Generation = 2
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	// Second reconcile: applyDeployment hits 3 conflicts, retries through them,
+	// eventually succeeds; the status step then publishes Ready.
+	reconcile(t, r, "cache", "ns1")
+
+	if remaining := atomic.LoadInt32(&conflictsRemaining); remaining != 0 {
+		t.Fatalf("conflictsRemaining = %d, want 0 (RetryOnConflict should consume them)", remaining)
+	}
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v9" {
+		t.Fatalf("deployment image = %q, want %q (apply did not converge under conflict)", got, "example.com/lmcache-server:v9")
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want Ready (CR is stuck despite Deployment being ready)", updated.Status.Health)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+}
+
+// TestReconcileLMCacheStatusIndependentOfApplyError pins the other half of the
+// fix: status is derived from the live Deployment, not gated on apply success.
+// Even when apply fails (here, a Forbidden as if an admission webhook rejected
+// the write), the CR must still publish what the Deployment reports instead
+// of remaining frozen at a stale snapshot.
+//
+// At the same time, Status.ObservedGeneration must NOT advance to the new CR
+// generation when apply for that generation failed — otherwise clients can't
+// tell from the status whether the controller has caught up.
+func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var blockDeploymentUpdate atomic.Bool
+	gr := schema.GroupResource{Group: "apps", Resource: "deployments"}
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && blockDeploymentUpdate.Load() {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	// Sanity: after a successful first reconcile, observedGeneration tracks
+	// the CR generation (1).
+	if got := getBackend(t, r, "cache", "ns1").Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration after successful first reconcile = %d, want 1", got)
+	}
+
+	// Now flip the gate so the next applyDeployment Update is rejected. Force
+	// an Update to happen by changing the image in the CR.
+	blockDeploymentUpdate.Store(true)
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Generation = 2
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	// Reconcile must surface an error (so controller-runtime requeues) but the
+	// status pass must still publish observed state from the live Deployment.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (apply was blocked)")
+	}
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want Ready (status must reflect live Deployment regardless of apply error)", updated.Status.Health)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+	// Apply for generation 2 failed, so observedGeneration must NOT have
+	// advanced to 2 — it should still report 1 (the last generation we
+	// successfully drove the live state toward). Same for the Ready
+	// condition's ObservedGeneration, so the (status, condition) pair stays
+	// internally consistent.
+	if got := updated.Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 (apply failed; must not advance to current CR gen)", got)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.ObservedGeneration != 1 {
+		t.Fatalf("Ready condition ObservedGeneration = %d, want 1", cond.ObservedGeneration)
+	}
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got == "example.com/lmcache-server:v9" {
+		t.Fatalf("deployment image was updated despite Forbidden — interceptor was not exercised")
+	}
+}
+
+// TestReconcileLMCacheEndpointHeldUntilServiceExists pins the endpoint
+// invariant: Status.Endpoint must only advertise an address that corresponds
+// to a *live* Service. When applyService is rejected on the first reconcile
+// (so the Service was never created), the CR must not publish the desired
+// endpoint — clients/gateways would route to a non-existent target.
+func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	gr := schema.GroupResource{Group: "", Resource: "services"}
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Service); ok {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Service create was blocked)")
+	}
+
+	// Deployment is created (only Service apply was blocked), so the status
+	// pass runs and publishes Health. But Status.Endpoint must stay empty
+	// until a live Service backs it.
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err != nil {
+		t.Fatalf("expected deployment to be created (only Service was blocked): %v", err)
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
+		t.Fatalf("status.endpoint = %q, want \"\" (no live Service exists yet)", got)
+	}
+}
+
+// TestReconcileLMCacheDeploymentVanishedAfterApply pins the behavior when the
+// managed Deployment disappears between a successful apply and the post-apply
+// Get (out-of-band delete, GC). Reconcile must NOT silently report success —
+// there is no observed state to publish, so the controller must requeue.
+//
+// The interceptor counts Deployment Get calls in the reconcile pass under
+// test: the 1st Get is inside applyDeployment's CreateOrUpdate (Get-then-
+// Update — must pass through so apply itself succeeds); the 2nd Get is the
+// post-apply read in reconcileManaged, which we swallow as NotFound to
+// simulate the live object being deleted between those two steps.
+func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var depGetCount atomic.Int32
+	var armed atomic.Bool
+	funcs := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && armed.Load() {
+				if depGetCount.Add(1) == 2 {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, key.Name)
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile creates everything and publishes initial status.
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	// Arm the interceptor for the next reconcile. The 1st Deployment Get
+	// (inside applyDeployment's CreateOrUpdate) passes through so apply
+	// converges as normal; the 2nd Get (the post-apply read in
+	// reconcileManaged) returns NotFound, simulating the live Deployment
+	// being deleted between apply and Get within the same reconcile pass.
+	armed.Store(true)
+	defer armed.Store(false)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment vanished after apply)")
+	}
+	if got := depGetCount.Load(); got < 2 {
+		t.Fatalf("expected at least 2 Deployment Gets in the armed reconcile; got %d", got)
+	}
+}
+
+// TestReconcileLMCacheDeploymentLosesOwnershipAfterApply pins the foreign-
+// ownership race on the no-apply-error path: applyDeployment succeeded (we
+// own the live Deployment after Update), but between Update and the post-
+// apply Get, the live Deployment's controller ref was changed out-of-band.
+// Returning nil there would silently report success AND, since we no longer
+// own the object, the Owns() watch would stop delivering events — so the
+// CacheBackend would never re-reconcile. Reconcile must therefore synthesize
+// an error to requeue.
+func TestReconcileLMCacheDeploymentLosesOwnershipAfterApply(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	// The interceptor strips Deployment owner refs on the 2nd Get per
+	// reconcile (the post-apply read). The 1st Get (inside applyDeployment's
+	// CreateOrUpdate) passes through unchanged so apply itself succeeds —
+	// the bug we're guarding is only visible *after* a successful apply.
+	var depGetCount atomic.Int32
+	var armed atomic.Bool
+	otherCtrl := true
+	foreignOwner := metav1.OwnerReference{
+		APIVersion: "example.com/v1", Kind: "OtherKind",
+		Name: "other", UID: "other-uid",
+		Controller: &otherCtrl, BlockOwnerDeletion: &otherCtrl,
+	}
+	funcs := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if dep, ok := obj.(*appsv1.Deployment); ok && armed.Load() {
+				if depGetCount.Add(1) == 2 {
+					dep.OwnerReferences = []metav1.OwnerReference{foreignOwner}
+				}
+			}
+			return nil
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile lands the Deployment with us as controller (no event
+	// from the interceptor yet — armed is still false).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	armed.Store(true)
+	defer armed.Store(false)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment lost controller ref between apply and Get)")
+	}
+}
+
+// TestReconcileLMCacheForeignDeploymentNoStatusLeak pins the foreign-ownership
+// guard on the Deployment status path: if a Deployment with the matching name
+// already exists but is owned by another controller, applyDeployment fails
+// (SetControllerReference returns AlreadyOwned). The reconciler must NOT
+// derive Health from that foreign workload — that would mark the CacheBackend
+// Ready based on someone else's pods.
+func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
+	scheme := newScheme(t)
+
+	// A foreign Deployment with the same name as the CacheBackend, owned by
+	// some unrelated CR. Populate status as Ready so a leaky status read
+	// would mark the CacheBackend Ready.
+	foreignOwner := true
+	foreign := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cache", Namespace: "ns1", Generation: 1,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "example.com/v1", Kind: "OtherKind",
+				Name: "other", UID: "other-uid",
+				Controller: &foreignOwner, BlockOwnerDeletion: &foreignOwner,
+			}},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "other"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "x:1"}}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1, Replicas: 1,
+			UpdatedReplicas: 1, AvailableReplicas: 1, ReadyReplicas: 1,
+		},
+	}
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	// Wire autoscaling so reconcileHPA would otherwise create an HPA targeting
+	// the same-named (foreign) Deployment. The fix must skip both Service and
+	// HPA applies when applyDeployment fails — running them after a
+	// foreign-ownership failure could scale another controller's workload or
+	// expose its pods through our Service.
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	r := newReconciler(scheme, cb, foreign)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment already owned by another controller)")
+	}
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health == cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = Ready, must not be derived from foreign Deployment")
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond != nil && cond.Status == metav1.ConditionTrue {
+		t.Fatalf("Ready condition True, must not be derived from foreign Deployment")
+	}
+	// No Service should have been created either — applying a Service that
+	// selects pods of a foreign Deployment is just as wrong as adopting it.
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 (dependent applies must be skipped when applyDeployment fails)", len(svcs.Items))
+	}
+	// And no HPA, despite spec.autoscaling being set — otherwise the HPA
+	// would scale the foreign Deployment by name.
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(hpas.Items) != 0 {
+		t.Fatalf("HPAs = %d, want 0 (HPA must not target a foreign Deployment)", len(hpas.Items))
+	}
+}
+
+// TestReconcileLMCacheForeignServiceNoEndpointLeak pins the foreign-ownership
+// guard on the Service endpoint path: if a Service with the matching name
+// already exists but is owned by another controller, applyService fails
+// (AlreadyOwned). Status.Endpoint must NOT advertise that foreign Service's
+// address; clients/gateways would route to the wrong workload.
+func TestReconcileLMCacheForeignServiceNoEndpointLeak(t *testing.T) {
+	scheme := newScheme(t)
+
+	foreignOwner := true
+	foreign := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cache", Namespace: "ns1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "example.com/v1", Kind: "OtherKind",
+				Name: "other", UID: "other-uid",
+				Controller: &foreignOwner, BlockOwnerDeletion: &foreignOwner,
+			}},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": "other"},
+			Ports: []corev1.ServicePort{{
+				Name: "http", Port: 7777, TargetPort: intstr.FromInt(7777),
+			}},
+		},
+	}
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	r := newReconciler(scheme, cb, foreign)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Service already owned by another controller)")
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
+		t.Fatalf("status.endpoint = %q, want empty (foreign Service must not leak into status)", got)
+	}
 }
 
 func containsStr(s []string, want string) bool {
