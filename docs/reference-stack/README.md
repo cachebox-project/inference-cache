@@ -161,6 +161,22 @@ Docker + kind, pulls the vLLM CPU image, and wants ~10+ GiB of Docker VM RAM. Th
 `cpu` profile runs a GPU-free vLLM engine (prefix caching + KV events, no LMCache
 offload); real LMCache offload still needs a GPU (the default `gpu` profile).
 
+## Full-chain canary
+
+[`scripts/canary_e2e.sh`](scripts/canary_e2e.sh) is a complementary GPU-free
+canary that exercises the **data path** the reconciler canary doesn't: CPU vLLM
+engine → `kvevent-subscriber` → policy server → index. It drives prefix traffic
+and asserts both an engine prefix-cache hit and that the server index populated
+(`inferencecache_index_entries > 0`). Builds the binaries, manages the engine
+container, cleans up after itself, exits non-zero on failure.
+
+```bash
+docs/reference-stack/scripts/canary_e2e.sh
+```
+
+Same on-demand profile as the reconciler canary (Docker, vLLM CPU image, ~10+ GiB
+Docker VM RAM). Run locally or wire into a scheduled/dispatch job.
+
 ---
 
 ## Teardown
