@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -162,6 +163,13 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
+		// CPU + memory requests are added ONLY when autoscaling is configured
+		// — a CPU-utilization HPA needs the CPU request as the utilization
+		// denominator, so the scaler can't move without one. Non-autoscaled
+		// backends keep main's pre-existing "no requests" rendering so this
+		// change doesn't alter scheduling for users not opting into HPA. A
+		// future first-class spec field can promote these from defaults.
+		Resources: defaultServerResources(cache),
 	}
 
 	pod := &corev1.PodSpec{
@@ -182,6 +190,25 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 		},
 	}
 	return pod, svc, nil
+}
+
+// defaultServerResources returns the requests baked into the lmcache-server
+// container. The defaults are a conservative floor sized for a small KV
+// working set + an HPA-usable CPU baseline (a CPU-utilization HPA can't
+// compute a denominator without a CPU request). They are applied ONLY when
+// the CacheBackend opts into autoscaling, so backends that don't use an HPA
+// keep the previous "no requests" rendering and don't see scheduling
+// behaviour change on upgrade. A future first-class spec field can override.
+func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRequirements {
+	if cache == nil || cache.Spec.Autoscaling == nil {
+		return corev1.ResourceRequirements{}
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+	}
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
