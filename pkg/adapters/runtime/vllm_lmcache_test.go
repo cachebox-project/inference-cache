@@ -94,6 +94,29 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
+	// Without a readiness probe on the lm:// port, AvailableReplicas (and
+	// therefore the CacheBackend's Ready condition) can flip True before
+	// the server is actually serving — making status optimistic. The
+	// adapter must render a TCP probe targeting the named lmcache port so
+	// Ready waits on the real accept loop.
+	a := NewVLLMLMCacheAdapter()
+	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	probe := pod.Containers[0].ReadinessProbe
+	if probe == nil {
+		t.Fatalf("ReadinessProbe is nil; want a TCP probe so Ready waits on the actual accept loop")
+	}
+	if probe.TCPSocket == nil {
+		t.Fatalf("ReadinessProbe.TCPSocket is nil; want a TCP-socket probe")
+	}
+	if probe.TCPSocket.Port.StrVal != "lmcache" {
+		t.Fatalf("probe targets %q, want named port \"lmcache\"", probe.TCPSocket.Port.StrVal)
+	}
+}
+
 func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"image": "registry.example.com/lmcache:pinned"})
@@ -338,7 +361,11 @@ func TestVLLMLMCacheInjectRouterConfigIsNoop(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheInjectRouterConfigStillValidatesInputs(t *testing.T) {
+func TestVLLMLMCacheInjectRouterConfigTruelyNoopsOnBadInput(t *testing.T) {
+	// The KVCacheRuntimeAdapter contract says backends without a router
+	// component should return nil without touching pod. The LMCache adapter
+	// must honour that even for nil/empty inputs so callers can blindly
+	// invoke InjectRouterConfig on every adapter without branching.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	good := &corev1.PodSpec{Containers: []corev1.Container{{Name: "router"}}}
@@ -353,8 +380,8 @@ func TestVLLMLMCacheInjectRouterConfigStillValidatesInputs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.fn(); err == nil {
-				t.Fatalf("expected error for %s, got nil", tc.name)
+			if err := tc.fn(); err != nil {
+				t.Fatalf("InjectRouterConfig %s returned %v, want nil (router-less backend is a no-op)", tc.name, err)
 			}
 		})
 	}

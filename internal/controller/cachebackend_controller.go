@@ -432,10 +432,25 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 		matched := false
 		for j := range live.Containers {
 			if live.Containers[j].Name == want.Name {
+				// Adapter-owned fields the reconciler propagates from desired:
+				// the cache-server's serving port, probes, resource shape, and
+				// the connector args/env. Adapters render these explicitly
+				// (with API-server-defaulted fields like Port Protocol set in
+				// the rendering), so copying them is idempotent and doesn't
+				// churn the Owns watch. Leaving Ports/Probes/VolumeMounts
+				// untouched would let port drift break the Service's
+				// TargetPort lookup or hide a probe regression.
 				live.Containers[j].Image = want.Image
+				live.Containers[j].ImagePullPolicy = want.ImagePullPolicy
 				live.Containers[j].Command = want.Command
 				live.Containers[j].Args = want.Args
 				live.Containers[j].Env = want.Env
+				live.Containers[j].Ports = want.Ports
+				live.Containers[j].Resources = want.Resources
+				live.Containers[j].VolumeMounts = want.VolumeMounts
+				live.Containers[j].ReadinessProbe = want.ReadinessProbe
+				live.Containers[j].LivenessProbe = want.LivenessProbe
+				live.Containers[j].StartupProbe = want.StartupProbe
 				matched = true
 				break
 			}

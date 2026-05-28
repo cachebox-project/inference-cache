@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -740,8 +741,11 @@ func TestReconcileManagedPodSpecCopiesOverrideFields(t *testing.T) {
 }
 
 func TestReconcileManagedContainerUpdatesInPlace(t *testing.T) {
-	// Same-name container update: only Image/Command/Args/Env are written
-	// from desired, leaving API-server-defaulted fields untouched.
+	// Same-name container update: adapter-owned fields propagate from
+	// desired — including Ports and probes, since the Service targets the
+	// container's named port and Ready is gated on the probe. The adapter
+	// renders Port.Protocol explicitly (ProtocolTCP), so the copy doesn't
+	// churn against API-server defaulting.
 	live := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
@@ -750,18 +754,25 @@ func TestReconcileManagedContainerUpdatesInPlace(t *testing.T) {
 				Command: []string{"old"},
 				Args:    []string{"--old"},
 				Env:     []corev1.EnvVar{{Name: "OLD", Value: "x"}},
-				Ports:   []corev1.ContainerPort{{Name: "lmcache", ContainerPort: 65432, Protocol: corev1.ProtocolTCP}},
+				Ports:   []corev1.ContainerPort{{Name: "stale", ContainerPort: 1234, Protocol: corev1.ProtocolTCP}},
 			},
+		},
+	}
+	newProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("lmcache")},
 		},
 	}
 	desired := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name:    "lmcache-server",
-				Image:   "lmcache/standalone:v2",
-				Command: []string{"new"},
-				Args:    []string{"--new"},
-				Env:     []corev1.EnvVar{{Name: "NEW", Value: "y"}},
+				Name:           "lmcache-server",
+				Image:          "lmcache/standalone:v2",
+				Command:        []string{"new"},
+				Args:           []string{"--new"},
+				Env:            []corev1.EnvVar{{Name: "NEW", Value: "y"}},
+				Ports:          []corev1.ContainerPort{{Name: "lmcache", ContainerPort: 65432, Protocol: corev1.ProtocolTCP}},
+				ReadinessProbe: newProbe,
 			},
 		},
 	}
@@ -775,10 +786,11 @@ func TestReconcileManagedContainerUpdatesInPlace(t *testing.T) {
 	if len(c.Env) != 1 || c.Env[0].Name != "NEW" {
 		t.Fatalf("Env = %v, want [NEW=y]", c.Env)
 	}
-	// Ports were not in desired's spec-driven set; live ports stay intact so
-	// API-server-defaulted Protocol doesn't churn under the Owns watch.
-	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 {
-		t.Fatalf("Ports = %v, want preserved 65432 (defensive of API-server defaulting)", c.Ports)
+	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 || c.Ports[0].Name != "lmcache" {
+		t.Fatalf("Ports = %v, want desired [lmcache:65432] (Service TargetPort lookups depend on this)", c.Ports)
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.TCPSocket == nil {
+		t.Fatalf("ReadinessProbe = %v, want desired TCP probe propagated", c.ReadinessProbe)
 	}
 }
 

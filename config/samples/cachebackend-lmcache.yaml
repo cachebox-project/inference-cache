@@ -4,7 +4,8 @@
 # wire to the resolved lm:// endpoint published in status.endpoint. Until
 # that webhook lands, the engine-side env vars + `--kv-transfer-config`
 # arg must be set manually (see the runtime adapter for the exact set:
-# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU + VLLM_USE_V1).
+# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
+# VLLM_USE_V1).
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
 # canonical LMCache lm:// port). Storage/PVC + autoscaling (C3) and richer

@@ -126,6 +126,18 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 		Ports: []corev1.ContainerPort{
 			{Name: defaultLMCacheServerPortName, ContainerPort: defaultLMCacheServerPort, Protocol: corev1.ProtocolTCP},
 		},
+		// A TCP-socket readiness probe on the lm:// port gates AvailableReplicas
+		// (and therefore the CacheBackend's Ready condition, via managedHealth)
+		// on the LMCache server actually accepting connections — otherwise
+		// status could flip Ready before the server is reachable.
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(defaultLMCacheServerPortName)},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+			FailureThreshold:    6,
+		},
 	}
 
 	pod := &corev1.PodSpec{
@@ -183,11 +195,15 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint strin
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no
 // router component the controller needs to wire. Returning nil keeps the
 // interface contract satisfied so a Registry caller can blindly invoke both
-// Inject* paths on a per-pod basis without branching on backend type.
+// Inject* paths on a per-pod basis without branching on backend type — per
+// [KVCacheRuntimeAdapter.InjectRouterConfig]: "backends without a router
+// component should return nil without touching pod." Input validation is
+// intentionally skipped so a router-less backend never forces callers to
+// special-case it.
 func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	if err := validateInjectInputs(pod, endpoint, cache, "router"); err != nil {
-		return err
-	}
+	_ = pod
+	_ = endpoint
+	_ = cache
 	return nil
 }
 
