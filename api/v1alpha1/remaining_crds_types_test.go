@@ -15,14 +15,11 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
 	requireEnum(t, mustProperty(t, policySpec, "eviction"), []string{"LRU", "LFU"})
+	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireDefault(t, mustProperty(t, policySpec, "failOpen"), true)
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
-	requireEnum(t, mustPath[map[string]any](t, policySpec, "properties", "tenantScope", "properties", "type"), []string{
-		"All",
-		"Tenant",
-		"Namespace",
-	})
+	requireBooleanLike(t, mustProperty(t, policySpec, "tenantScoped"))
 
 	tenantSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
 	requireRequired(t, tenantSchema, "spec")
@@ -73,25 +70,21 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	policy := &CachePolicy{
 		Spec: CachePolicySpec{
 			Eviction:            CachePolicyEvictionAlgorithmLRU,
-			TTL:                 &ttl,
+			EvictionTTL:         &ttl,
 			MinimumPrefixTokens: &minimumPrefixTokens,
 			LookupTimeoutMs:     &lookupTimeoutMs,
 			FailOpen:            &failOpen,
-			TenantScope: &CachePolicyTenantScopeSpec{
-				Type:        CachePolicyTenantScopeTenant,
-				TenantRef:   "gold",
-				MatchLabels: map[string]string{"tier": "gold"},
-			},
+			TenantScoped:        &failOpen,
 		},
 		Status: CachePolicyStatus{Conditions: []metav1.Condition{{Type: "Ready", Message: "ok"}}},
 	}
 	policyCopy := policy.DeepCopy()
-	policy.Spec.TTL.Duration = 2 * time.Minute
+	policy.Spec.EvictionTTL.Duration = 2 * time.Minute
 	*policy.Spec.FailOpen = false
-	policy.Spec.TenantScope.MatchLabels["tier"] = "silver"
+	*policy.Spec.TenantScoped = false
 	policy.Status.Conditions[0].Message = "changed"
-	if policyCopy.Spec.TTL.Duration != time.Minute || !*policyCopy.Spec.FailOpen ||
-		policyCopy.Spec.TenantScope.MatchLabels["tier"] != "gold" ||
+	if policyCopy.Spec.EvictionTTL.Duration != time.Minute || !*policyCopy.Spec.FailOpen ||
+		!*policyCopy.Spec.TenantScoped ||
 		policyCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}
@@ -279,6 +272,23 @@ func requireMinLength(t *testing.T, schema map[string]any, expected int64) {
 	minLength := mustPath[float64](t, schema, "minLength")
 	if int64(minLength) != expected {
 		t.Fatalf("minLength = %v, want %d", minLength, expected)
+	}
+}
+
+func requireDurationLike(t *testing.T, schema map[string]any) {
+	t.Helper()
+	if got := mustPath[string](t, schema, "type"); got != "string" {
+		t.Fatalf("type = %q, want string", got)
+	}
+	if _, ok := schema["format"]; ok {
+		t.Fatalf("format = %v, want plain string duration schema", schema["format"])
+	}
+}
+
+func requireBooleanLike(t *testing.T, schema map[string]any) {
+	t.Helper()
+	if got := mustPath[string](t, schema, "type"); got != "boolean" {
+		t.Fatalf("type = %q, want boolean", got)
 	}
 }
 

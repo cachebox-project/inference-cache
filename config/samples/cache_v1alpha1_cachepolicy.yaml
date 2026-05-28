@@ -6,10 +6,8 @@ metadata:
   name: cachepolicy-sample
 spec:
   eviction: LRU
-  ttl: 30m
+  evictionTTL: 30m
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
   failOpen: true
-  tenantScope:
-    type: Tenant
-    tenantRef: cachetenant-sample
+  tenantScoped: true

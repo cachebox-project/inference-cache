@@ -57,6 +57,10 @@ spec:
                 - LRU
                 - LFU
                 type: string
+              evictionTTL:
+                description: EvictionTTL is the maximum time a cache entry should
+                  remain usable.
+                type: string
               failOpen:
                 default: true
                 description: FailOpen keeps inference serving when the cache is unreachable.
@@ -72,31 +76,9 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
-              tenantScope:
-                description: TenantScope restricts where this policy applies.
-                properties:
-                  matchLabels:
-                    additionalProperties:
-                      type: string
-                    description: MatchLabels selects CacheTenant resources by label.
-                    type: object
-                  tenantID:
-                    description: TenantID matches an external tenant identifier.
-                    type: string
-                  tenantRef:
-                    description: TenantRef names a CacheTenant in the same namespace.
-                    type: string
-                  type:
-                    description: Type is the scope strategy.
-                    enum:
-                    - All
-                    - Tenant
-                    - Namespace
-                    type: string
-                type: object
-              ttl:
-                description: TTL is the maximum time a cache entry should remain usable.
-                type: string
+              tenantScoped:
+                description: TenantScoped restricts the policy to tenant-local lookups.
+                type: boolean
             type: object
           status:
             description: CachePolicyStatus defines observed policy state.

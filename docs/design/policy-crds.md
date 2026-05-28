@@ -11,13 +11,15 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 | Field | Type | Purpose |
 |---|---|---|
 | `spec.eviction` | enum | `LRU` or `LFU`. |
-| `spec.ttl` | duration | Maximum usable lifetime for cache entries. |
+| `spec.evictionTTL` | duration | Maximum usable lifetime for cache entries. |
 | `spec.minimumPrefixTokens` | integer | Minimum prefix token count before lookup. Minimum `0`. |
 | `spec.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. |
 | `spec.failOpen` | boolean | Defaults to `true`; keeps inference serving when cache lookup is unavailable. |
-| `spec.tenantScope` | object | Selects the tenants affected by the policy. Supports `type`, `tenantRef`, `tenantID`, and `matchLabels`. |
+| `spec.tenantScoped` | boolean | When `true`, the policy is constrained to tenant-local lookups. |
 
 `status.conditions` and `status.observedGeneration` are reserved for controller observations.
+
+This PR ships the declarative `CachePolicy` contract only. Runtime propagation into the in-memory index and lookup path remains follow-up work in the server/controller layer.
 
 ## CacheTenant
 

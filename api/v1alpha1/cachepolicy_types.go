@@ -15,26 +15,15 @@ const (
 	CachePolicyEvictionAlgorithmLFU CachePolicyEvictionAlgorithm = "LFU"
 )
 
-// +kubebuilder:validation:Enum=All;Tenant;Namespace
-
-// CachePolicyTenantScopeType identifies the tenant scope a policy applies to.
-type CachePolicyTenantScopeType string
-
-const (
-	CachePolicyTenantScopeAll       CachePolicyTenantScopeType = "All"
-	CachePolicyTenantScopeTenant    CachePolicyTenantScopeType = "Tenant"
-	CachePolicyTenantScopeNamespace CachePolicyTenantScopeType = "Namespace"
-)
-
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
 	// Eviction is the cache eviction algorithm.
 	// +optional
 	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
 
-	// TTL is the maximum time a cache entry should remain usable.
+	// EvictionTTL is the maximum time a cache entry should remain usable.
 	// +optional
-	TTL *metav1.Duration `json:"ttl,omitempty"`
+	EvictionTTL *metav1.Duration `json:"evictionTTL,omitempty"`
 
 	// MinimumPrefixTokens is the minimum prefix length required before lookup.
 	// +optional
@@ -51,28 +40,9 @@ type CachePolicySpec struct {
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`
 
-	// TenantScope restricts where this policy applies.
+	// TenantScoped restricts the policy to tenant-local lookups.
 	// +optional
-	TenantScope *CachePolicyTenantScopeSpec `json:"tenantScope,omitempty"`
-}
-
-// CachePolicyTenantScopeSpec selects the tenants affected by a policy.
-type CachePolicyTenantScopeSpec struct {
-	// Type is the scope strategy.
-	// +optional
-	Type CachePolicyTenantScopeType `json:"type,omitempty"`
-
-	// TenantRef names a CacheTenant in the same namespace.
-	// +optional
-	TenantRef string `json:"tenantRef,omitempty"`
-
-	// TenantID matches an external tenant identifier.
-	// +optional
-	TenantID string `json:"tenantID,omitempty"`
-
-	// MatchLabels selects CacheTenant resources by label.
-	// +optional
-	MatchLabels map[string]string `json:"matchLabels,omitempty"`
+	TenantScoped *bool `json:"tenantScoped,omitempty"`
 }
 
 // CachePolicyStatus defines observed policy state.
