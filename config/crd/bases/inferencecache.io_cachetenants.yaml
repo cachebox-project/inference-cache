@@ -79,6 +79,7 @@ spec:
               tenantID:
                 description: TenantID is the external tenant identifier used by gateway
                   and engine traffic.
+                minLength: 1
                 type: string
             required:
             - tenantID

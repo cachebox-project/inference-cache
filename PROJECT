@@ -22,4 +22,40 @@ resources:
   kind: CacheIndex
   path: github.com/cachebox-project/inference-cache/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: false
+  domain: inferencecache.io
+  group: ""
+  kind: CachePolicy
+  path: github.com/cachebox-project/inference-cache/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: false
+  domain: inferencecache.io
+  group: ""
+  kind: CacheTenant
+  path: github.com/cachebox-project/inference-cache/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: false
+  domain: inferencecache.io
+  group: ""
+  kind: PromptTemplate
+  path: github.com/cachebox-project/inference-cache/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: false
+  domain: inferencecache.io
+  group: ""
+  kind: PDTopology
+  path: github.com/cachebox-project/inference-cache/api/v1alpha1
+  version: v1alpha1
 version: "3"

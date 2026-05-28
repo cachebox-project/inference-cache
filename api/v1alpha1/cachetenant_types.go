@@ -18,6 +18,7 @@ const (
 type CacheTenantSpec struct {
 	// TenantID is the external tenant identifier used by gateway and engine traffic.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	TenantID string `json:"tenantID"`
 
 	// Quota bounds this tenant's cache footprint.

@@ -100,7 +100,7 @@ type CacheIndexStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=ci
-// +kubebuilder:validation:XValidation:rule="!has(self.spec)",message="CacheIndex is status-only; spec is not user-writable"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || self.spec == {}",message="CacheIndex is status-only; only an empty legacy spec is accepted"
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.prefixes.summary.total`
 // +kubebuilder:printcolumn:name="Changed",type=date,JSONPath=`.status.lastUpdated`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

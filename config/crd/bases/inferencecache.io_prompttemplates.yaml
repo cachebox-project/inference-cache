@@ -51,6 +51,7 @@ spec:
             properties:
               body:
                 description: Body is the template text consumed by the rendering engine.
+                minLength: 1
                 type: string
               slots:
                 description: Slots declares the stable and mutable slots used by the
@@ -64,6 +65,7 @@ spec:
                     name:
                       description: Name is the slot identifier used by the template
                         body.
+                      minLength: 1
                       type: string
                     required:
                       description: Required marks whether callers must provide a value

@@ -25,7 +25,7 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.tenantID` | string | Required external tenant identifier used by gateway and engine traffic. |
+| `spec.tenantID` | string | Required non-empty external tenant identifier used by gateway and engine traffic. |
 | `spec.quota.maxMemoryBytes` | integer | Maximum cache memory attributed to the tenant. Minimum `0`. |
 | `spec.quota.maxIndexEntries` | integer | Maximum index entries attributed to the tenant. Minimum `0`. |
 | `spec.isolationMode` | enum | `Fairness` in the current phase. |
@@ -39,9 +39,9 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.body` | string | Required template text. |
+| `spec.body` | string | Required non-empty template text. |
 | `spec.slots[]` | list | Slot declarations keyed by `name`. |
-| `spec.slots[].name` | string | Required slot identifier used by the template body. |
+| `spec.slots[].name` | string | Required non-empty slot identifier used by the template body. |
 | `spec.slots[].type` | enum | Required `Stable` or `Mutable`. Stable slots participate in prefix stability; mutable slots do not. |
 | `spec.slots[].required` | boolean | Whether callers must provide the slot. |
 | `spec.slots[].description` | string | Human-readable slot notes. |
@@ -57,7 +57,7 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 | `spec.prefillPools[]` | list | Prefill pools keyed by `name`. |
 | `spec.decodePools[]` | list | Decode pools keyed by `name`. |
 | `spec.acceleratorTypes[]` | list | Accelerator classes keyed by `name`. |
-| `*.name` | string | Required identifier for each pool or accelerator type. |
+| `*.name` | string | Required non-empty identifier for each pool or accelerator type. |
 | `prefillPools[].matchLabels`, `decodePools[].matchLabels` | map | Selects pods or nodes for the pool. |
 | `prefillPools[].replicas`, `decodePools[].replicas` | integer | Desired pool size. Minimum `0`. |
 | `prefillPools[].acceleratorType`, `decodePools[].acceleratorType` | string | References `spec.acceleratorTypes[].name`. |
@@ -70,6 +70,6 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 `CacheIndex` is cluster-scoped and status-only. It reflects the server's in-memory cache aggregate for observability (`kubectl get cacheindex`); it is not a routing substrate.
 
-- The CRD rejects any user-supplied `spec`.
+- The CRD has no user-configurable spec. For v1alpha1 compatibility, it accepts an omitted spec or the legacy empty `spec: {}` shape, but it does not define writable spec fields.
 - The controller owns the singleton object and writes only the status subresource.
 - Status carries replica, tenant, and prefix summaries. It never stores KV tensors or prompt text.

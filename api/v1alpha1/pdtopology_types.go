@@ -30,6 +30,7 @@ type PDTopologySpec struct {
 type PDPoolSpec struct {
 	// Name is the pool identifier.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// MatchLabels selects pods or nodes belonging to this pool.
@@ -50,6 +51,7 @@ type PDPoolSpec struct {
 type PDAcceleratorTypeSpec struct {
 	// Name is the accelerator type identifier.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// Vendor is the accelerator vendor or runtime family.

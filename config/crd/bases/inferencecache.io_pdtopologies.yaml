@@ -70,6 +70,7 @@ spec:
                       type: string
                     name:
                       description: Name is the accelerator type identifier.
+                      minLength: 1
                       type: string
                     vendor:
                       description: Vendor is the accelerator vendor or runtime family.
@@ -98,6 +99,7 @@ spec:
                       type: object
                     name:
                       description: Name is the pool identifier.
+                      minLength: 1
                       type: string
                     replicas:
                       description: Replicas is the desired pool size.
@@ -128,6 +130,7 @@ spec:
                       type: object
                     name:
                       description: Name is the pool identifier.
+                      minLength: 1
                       type: string
                     replicas:
                       description: Replicas is the desired pool size.

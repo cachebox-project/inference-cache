@@ -172,8 +172,8 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: CacheIndex is status-only; spec is not user-writable
-          rule: '!has(self.spec)'
+        - message: CacheIndex is status-only; only an empty legacy spec is accepted
+          rule: '!has(self.spec) || self.spec == {}'
     served: true
     storage: true
     subresources:

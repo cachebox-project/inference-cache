@@ -19,6 +19,7 @@ const (
 type PromptTemplateSpec struct {
 	// Body is the template text consumed by the rendering engine.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	Body string `json:"body"`
 
 	// Slots declares the stable and mutable slots used by the template body.
@@ -32,6 +33,7 @@ type PromptTemplateSpec struct {
 type PromptTemplateSlot struct {
 	// Name is the slot identifier used by the template body.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// Type identifies whether the slot belongs to the stable prefix or mutable suffix.

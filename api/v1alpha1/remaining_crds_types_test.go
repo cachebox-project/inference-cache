@@ -27,6 +27,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	tenantSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
 	tenantSpec := mustPath[map[string]any](t, tenantSchema, "properties", "spec")
 	requireRequired(t, tenantSpec, "tenantID")
+	requireMinLength(t, mustProperty(t, tenantSpec, "tenantID"), 1)
 	requireEnum(t, mustProperty(t, tenantSpec, "isolationMode"), []string{"Fairness"})
 	requireDefault(t, mustProperty(t, tenantSpec, "isolationMode"), "Fairness")
 	tenantQuota := mustProperty(t, tenantSpec, "quota")
@@ -36,10 +37,12 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	templateSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_prompttemplates.yaml")
 	templateSpec := mustPath[map[string]any](t, templateSchema, "properties", "spec")
 	requireRequired(t, templateSpec, "body")
+	requireMinLength(t, mustProperty(t, templateSpec, "body"), 1)
 	slotsSchema := mustProperty(t, templateSpec, "slots")
 	requireListMapKey(t, slotsSchema, "name")
 	slotSchema := mustPath[map[string]any](t, slotsSchema, "items")
 	requireRequired(t, slotSchema, "name")
+	requireMinLength(t, mustProperty(t, slotSchema, "name"), 1)
 	requireRequired(t, slotSchema, "type")
 	requireEnum(t, mustProperty(t, slotSchema, "type"), []string{"Stable", "Mutable"})
 
@@ -50,9 +53,11 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	}
 	prefillPool := mustPath[map[string]any](t, topologySpec, "properties", "prefillPools", "items")
 	requireRequired(t, prefillPool, "name")
+	requireMinLength(t, mustProperty(t, prefillPool, "name"), 1)
 	requireMinimum(t, mustProperty(t, prefillPool, "replicas"), 0)
 	acceleratorType := mustPath[map[string]any](t, topologySpec, "properties", "acceleratorTypes", "items")
 	requireRequired(t, acceleratorType, "name")
+	requireMinLength(t, mustProperty(t, acceleratorType, "name"), 1)
 
 	indexSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cacheindices.yaml")
 	requireStatusOnlySpecValidation(t, indexSchema)
@@ -268,6 +273,15 @@ func requireListMapKey(t *testing.T, schema map[string]any, key string) {
 	t.Fatalf("x-kubernetes-list-map-keys = %v, want %q", keys, key)
 }
 
+func requireMinLength(t *testing.T, schema map[string]any, expected int64) {
+	t.Helper()
+
+	minLength := mustPath[float64](t, schema, "minLength")
+	if int64(minLength) != expected {
+		t.Fatalf("minLength = %v, want %d", minLength, expected)
+	}
+}
+
 func requireStatusOnlySpecValidation(t *testing.T, schema map[string]any) {
 	t.Helper()
 	validations := mustPath[[]any](t, schema, "x-kubernetes-validations")
@@ -276,9 +290,9 @@ func requireStatusOnlySpecValidation(t *testing.T, schema map[string]any) {
 		if !ok {
 			t.Fatalf("x-kubernetes-validations entry has type %T, want object", validation)
 		}
-		if validationSchema["rule"] == "!has(self.spec)" {
+		if validationSchema["rule"] == "!has(self.spec) || self.spec == {}" {
 			return
 		}
 	}
-	t.Fatalf("x-kubernetes-validations = %v, want !has(self.spec)", validations)
+	t.Fatalf("x-kubernetes-validations = %v, want legacy-empty-spec-compatible status-only validation", validations)
 }
