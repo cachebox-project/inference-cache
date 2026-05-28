@@ -2,19 +2,24 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -820,6 +825,138 @@ func TestReconcileIgnoresMissingObject(t *testing.T) {
 	r := newReconciler(scheme)
 
 	reconcile(t, r, "missing", "default")
+}
+
+// newReconcilerWithInterceptor wires a fake client whose write methods are
+// wrapped by funcs, so a test can inject 409 Conflict / 403 Forbidden errors
+// for specific resources and exercise the reconciler's retry + status paths.
+func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Funcs, objs ...client.Object) *CacheBackendReconciler {
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
+		Build()
+	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+}
+
+// TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded
+// regression: a Deployment Update inside applyDeployment races the kube
+// Deployment controller's status writes and returns 409. Without retry, the
+// reconcile aborts and the CR's Health is frozen at whatever the last
+// successful pass observed — typically "pod not yet Ready". With
+// RetryOnConflict in place, apply converges within a reconcile pass and the
+// CR reports Ready once the underlying Deployment is healthy.
+func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var conflictsRemaining int32 = 3 // first 3 Deployment Updates → 409
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				if atomic.LoadInt32(&conflictsRemaining) > 0 {
+					atomic.AddInt32(&conflictsRemaining, -1)
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: "apps", Resource: "deployments"},
+						obj.GetName(),
+						errors.New("the object has been modified; please apply your changes to the latest version and try again"),
+					)
+				}
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	// First reconcile creates the Deployment + Service (Create, not Update —
+	// no conflict possible at this step).
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	// Force the next reconcile to issue a real Update against the Deployment.
+	// (Image override mutates the managed container in-place; a no-op reconcile
+	// would not call Update at all.)
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Generation = 2
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	// Second reconcile: applyDeployment hits 3 conflicts, retries through them,
+	// eventually succeeds; the status step then publishes Ready.
+	reconcile(t, r, "cache", "ns1")
+
+	if remaining := atomic.LoadInt32(&conflictsRemaining); remaining != 0 {
+		t.Fatalf("conflictsRemaining = %d, want 0 (RetryOnConflict should consume them)", remaining)
+	}
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v9" {
+		t.Fatalf("deployment image = %q, want %q (apply did not converge under conflict)", got, "example.com/lmcache-server:v9")
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want Ready (CR is stuck despite Deployment being ready)", updated.Status.Health)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+}
+
+// TestReconcileLMCacheStatusIndependentOfApplyError pins the other half of the
+// fix: status is derived from the live Deployment, not gated on apply success.
+// Even when apply fails (here, a Forbidden as if an admission webhook rejected
+// the write), the CR must still publish what the Deployment reports instead
+// of remaining frozen at a stale snapshot.
+func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	var blockDeploymentUpdate atomic.Bool
+	gr := schema.GroupResource{Group: "apps", Resource: "deployments"}
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && blockDeploymentUpdate.Load() {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	// Now flip the gate so the next applyDeployment Update is rejected. Force
+	// an Update to happen by changing the image in the CR.
+	blockDeploymentUpdate.Store(true)
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Generation = 2
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	// Reconcile must surface an error (so controller-runtime requeues) but the
+	// status pass must still publish observed state from the live Deployment.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (apply was blocked)")
+	}
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want Ready (status must reflect live Deployment regardless of apply error)", updated.Status.Health)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got == "example.com/lmcache-server:v9" {
+		t.Fatalf("deployment image was updated despite Forbidden — interceptor was not exercised")
+	}
 }
 
 func containsStr(s []string, want string) bool {

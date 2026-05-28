@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -201,6 +202,13 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 // reconcileManaged renders the cache-server PodSpec + Service via the runtime
 // adapter, wraps them into a Deployment + Service owned by the CR, and
 // publishes the resolved endpoint to status.
+//
+// Apply drives desired state; status reflects observed state. The two must not
+// block each other: if a desired-state write fails (e.g. a transient API-server
+// conflict or a webhook rejection), we still publish status from whatever the
+// live Deployment reports, so the user-visible CR field is never held hostage
+// to apply churn. Any apply error is surfaced after the status pass so
+// controller-runtime requeues.
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
 	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
 	if err != nil {
@@ -218,24 +226,32 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
 
-	if err := r.applyDeployment(ctx, backend, dep); err != nil {
-		return ctrl.Result{}, err
+	applyErr := r.applyDeployment(ctx, backend, dep)
+	if svcErr := r.applyService(ctx, backend, svc); applyErr == nil {
+		applyErr = svcErr
 	}
-	if err := r.applyService(ctx, backend, svc); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.reconcileHPA(ctx, backend, dep); err != nil {
-		return ctrl.Result{}, err
+	if hpaErr := r.reconcileHPA(ctx, backend, dep); applyErr == nil {
+		applyErr = hpaErr
 	}
 
 	var live appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Deployment does not exist yet (apply failed before create), so
+			// there is no observed state to publish — return the apply error
+			// to requeue.
+			return ctrl.Result{}, applyErr
+		}
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 
 	endpoint := serviceEndpoint(svc)
 	if err := r.updateManagedStatus(ctx, backend, endpoint, &live); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if applyErr != nil {
+		return ctrl.Result{}, applyErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
@@ -365,32 +381,40 @@ func serviceEndpoint(svc *corev1.Service) string {
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
 // HPA's replica count rather than overwriting it — re-asserting replicas on
 // every reconcile would fight the HPA and churn the rollout.
+//
+// Wrapped in RetryOnConflict because the kube Deployment controller writes
+// Deployment.Status often during rollout; without retry, the Get/Update inside
+// CreateOrUpdate races those writes and surfaces a 409 that aborts the
+// reconcile pass and freezes CR status.
 func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.Deployment) error {
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
-		// Snapshot the HPA-owned field BEFORE we mutate the live spec. When an
-		// HPA is configured the controller must never re-assert replicas; doing
-		// so would fight the HPA on every reconcile and churn the rollout.
-		liveReplicas := dep.Spec.Replicas
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
+			// Snapshot the HPA-owned field BEFORE we mutate the live spec. When an
+			// HPA is configured the controller must never re-assert replicas; doing
+			// so would fight the HPA on every reconcile and churn the rollout.
+			liveReplicas := dep.Spec.Replicas
 
-		dep.Labels = desired.Labels
-		if dep.CreationTimestamp.IsZero() {
-			dep.Spec = *desired.Spec.DeepCopy()
-		} else {
-			dep.Spec.Replicas = desired.Spec.Replicas
-			reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
-		}
-		if backend.Spec.Autoscaling != nil && liveReplicas != nil {
-			// Preserve the HPA's writes — but clamp to the configured floor so
-			// raising autoscaling.minReplicas doesn't briefly publish Ready
-			// against the old smaller live count before the HPA catches up.
-			preserved := *liveReplicas
-			if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
-				preserved = floor
+			dep.Labels = desired.Labels
+			if dep.CreationTimestamp.IsZero() {
+				dep.Spec = *desired.Spec.DeepCopy()
+			} else {
+				dep.Spec.Replicas = desired.Spec.Replicas
+				reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 			}
-			dep.Spec.Replicas = &preserved
-		}
-		return controllerutil.SetControllerReference(backend, dep, r.Scheme)
+			if backend.Spec.Autoscaling != nil && liveReplicas != nil {
+				// Preserve the HPA's writes — but clamp to the configured floor so
+				// raising autoscaling.minReplicas doesn't briefly publish Ready
+				// against the old smaller live count before the HPA catches up.
+				preserved := *liveReplicas
+				if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
+					preserved = floor
+				}
+				dep.Spec.Replicas = &preserved
+			}
+			return controllerutil.SetControllerReference(backend, dep, r.Scheme)
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("apply deployment %s/%s: %w", desired.Namespace, desired.Name, err)
@@ -417,13 +441,16 @@ func autoscalingFloor(spec *cachev1alpha1.CacheBackendAutoscalingSpec) int32 {
 // and the allocated fields (clusterIP, nodePort) live in separate fields we never
 // touch — so reconciling ports does not churn through the Owns(Service) watch.
 func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *corev1.Service) error {
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
-		svc.Labels = desired.Labels
-		svc.Spec.Type = desired.Spec.Type
-		svc.Spec.Selector = desired.Spec.Selector
-		svc.Spec.Ports = desired.Spec.Ports
-		return controllerutil.SetControllerReference(backend, svc, r.Scheme)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+			svc.Labels = desired.Labels
+			svc.Spec.Type = desired.Spec.Type
+			svc.Spec.Selector = desired.Spec.Selector
+			svc.Spec.Ports = desired.Spec.Ports
+			return controllerutil.SetControllerReference(backend, svc, r.Scheme)
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("apply service %s/%s: %w", desired.Namespace, desired.Name, err)
