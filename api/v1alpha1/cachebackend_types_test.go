@@ -25,6 +25,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"deploymentKind",
 		"replicas",
 		"storage",
+		"autoscaling",
 		"integration",
 		"engineSelector",
 		"backendConfig",
@@ -35,7 +36,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "indexEntries", "conditions"} {
+	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "conditions"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -75,6 +76,14 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 	requireMinimum(t, mustProperty(t, statusSchema, "indexEntries"), 0)
+
+	// Autoscaling validation surface.
+	autoscalingSchema := mustProperty(t, specSchema, "autoscaling")
+	requireRequired(t, autoscalingSchema, "maxReplicas")
+	requireMinimum(t, mustProperty(t, autoscalingSchema, "minReplicas"), 1)
+	requireMinimum(t, mustProperty(t, autoscalingSchema, "maxReplicas"), 1)
+	requireMinimum(t, mustProperty(t, autoscalingSchema, "targetCPUUtilizationPercent"), 1)
+	requireMaximum(t, mustProperty(t, autoscalingSchema, "targetCPUUtilizationPercent"), 100)
 }
 
 func TestCacheBackendCRDPrintColumns(t *testing.T) {
@@ -107,6 +116,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	runAsNonRoot := true
 	runtimeClassName := "runc"
 	terminationGracePeriodSeconds := int64(30)
+	autoscalingMin := int32(2)
+	autoscalingTargetCPU := int32(70)
 	backend := &CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: CacheBackendSpec{
@@ -118,6 +129,11 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 					Size:             resource.MustParse("10Gi"),
 					StorageClassName: &storageClassName,
 				},
+			},
+			Autoscaling: &CacheBackendAutoscalingSpec{
+				MinReplicas:                 &autoscalingMin,
+				MaxReplicas:                 5,
+				TargetCPUUtilizationPercent: &autoscalingTargetCPU,
 			},
 			Integration: &CacheBackendIntegrationSpec{
 				Engine:              "SGLang",
@@ -146,6 +162,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 		Status: CacheBackendStatus{
 			Endpoint:     "cache.default.svc:8080",
 			Health:       CacheBackendHealthReady,
+			Capacity:     "10Gi",
 			IndexEntries: &indexEntries,
 			Conditions: []metav1.Condition{{
 				Type:               "Ready",
@@ -161,6 +178,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Replicas = 3
 	backend.Spec.Storage.PVC.Size.Add(resource.MustParse("1Gi"))
 	*backend.Spec.Storage.PVC.StorageClassName = "slow"
+	*backend.Spec.Autoscaling.MinReplicas = 4
+	backend.Spec.Autoscaling.MaxReplicas = 9
+	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
 	*backend.Spec.Integration.LookupTimeoutMs = 50
 	*backend.Spec.Integration.MinimumPrefixTokens = 128
 	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
@@ -184,6 +204,21 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Spec.Storage.PVC.StorageClassName == nil || *copied.Spec.Storage.PVC.StorageClassName != "fast" {
 		t.Fatalf("storage.pvc.storageClassName was not deep-copied")
+	}
+	if copied.Spec.Autoscaling == nil {
+		t.Fatalf("autoscaling was not deep-copied")
+	}
+	if copied.Spec.Autoscaling.MinReplicas == nil || *copied.Spec.Autoscaling.MinReplicas != 2 {
+		t.Fatalf("autoscaling.minReplicas was not deep-copied")
+	}
+	if copied.Spec.Autoscaling.MaxReplicas != 5 {
+		t.Fatalf("autoscaling.maxReplicas was not deep-copied")
+	}
+	if copied.Spec.Autoscaling.TargetCPUUtilizationPercent == nil || *copied.Spec.Autoscaling.TargetCPUUtilizationPercent != 70 {
+		t.Fatalf("autoscaling.targetCPUUtilizationPercent was not deep-copied")
+	}
+	if copied.Status.Capacity != "10Gi" {
+		t.Fatalf("status.capacity = %q, want 10Gi (independent copy)", copied.Status.Capacity)
 	}
 	if copied.Spec.Integration == nil {
 		t.Fatalf("integration was not deep-copied")
@@ -389,6 +424,15 @@ func requireMinimum(t *testing.T, schema map[string]any, expected int64) {
 	minimum := mustPath[float64](t, schema, "minimum")
 	if int64(minimum) != expected {
 		t.Fatalf("minimum = %v, want %d", minimum, expected)
+	}
+}
+
+func requireMaximum(t *testing.T, schema map[string]any, expected int64) {
+	t.Helper()
+
+	maximum := mustPath[float64](t, schema, "maximum")
+	if int64(maximum) != expected {
+		t.Fatalf("maximum = %v, want %d", maximum, expected)
 	}
 }
 

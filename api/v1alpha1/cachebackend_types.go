@@ -53,6 +53,14 @@ const (
 )
 
 // CacheBackendSpec defines the desired state of a cache backend.
+//
+// Phase-1 LMCache renders persistent storage as a single ReadWriteOnce PVC
+// mounted by a Deployment, so combining it with multi-replica scaling would
+// hit multi-attach conflicts. Per-replica PVCs (StatefulSet
+// volumeClaimTemplates or RWX storage classes) are a follow-up — until then,
+// admission rejects spec.storage.pvc + (replicas > 1 OR autoscaling.maxReplicas > 1).
+//
+// +kubebuilder:validation:XValidation:rule="!(has(self.storage) && has(self.storage.pvc)) || ((!has(self.replicas) || self.replicas <= 1) && (!has(self.autoscaling) || self.autoscaling.maxReplicas <= 1))",message="spec.storage.pvc currently requires single-replica backends (spec.replicas <= 1 and spec.autoscaling.maxReplicas <= 1); per-replica PVC support is deferred"
 type CacheBackendSpec struct {
 	// Type identifies the backing cache implementation.
 	// +optional

@@ -52,7 +52,14 @@ spec:
           metadata:
             type: object
           spec:
-            description: CacheBackendSpec defines the desired state of a cache backend.
+            description: |-
+              CacheBackendSpec defines the desired state of a cache backend.
+
+              Phase-1 LMCache renders persistent storage as a single ReadWriteOnce PVC
+              mounted by a Deployment, so combining it with multi-replica scaling would
+              hit multi-attach conflicts. Per-replica PVCs (StatefulSet
+              volumeClaimTemplates or RWX storage classes) are a follow-up — until then,
+              admission rejects spec.storage.pvc + (replicas > 1 OR autoscaling.maxReplicas > 1).
             properties:
               autoscaling:
                 description: |-
@@ -1596,6 +1603,13 @@ spec:
                 description: Type identifies the backing cache implementation.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: spec.storage.pvc currently requires single-replica backends
+                (spec.replicas <= 1 and spec.autoscaling.maxReplicas <= 1); per-replica
+                PVC support is deferred
+              rule: '!(has(self.storage) && has(self.storage.pvc)) || ((!has(self.replicas)
+                || self.replicas <= 1) && (!has(self.autoscaling) || self.autoscaling.maxReplicas
+                <= 1))'
           status:
             description: CacheBackendStatus defines the observed state of a cache
               backend.
