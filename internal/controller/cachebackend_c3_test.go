@@ -287,6 +287,41 @@ func TestReconcileHPADeletedWhenAutoscalingCleared(t *testing.T) {
 	}
 }
 
+func TestReconcileInitialReplicasFromAutoscalingMin(t *testing.T) {
+	// With autoscaling configured, the Deployment must come up at the HPA's
+	// minReplicas — otherwise it briefly runs below the HPA floor on first
+	// apply (and may publish ScaledToZero status if spec.replicas defaults to
+	// zero on a different shape).
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 3, 6, nil)
+	// Even with spec.replicas explicitly set, the HPA's floor wins on init.
+	cb.Spec.Replicas = ptrInt32(1)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	dep := getDeployment(t, r, "cache", "ns1")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 3 {
+		t.Fatalf("initial deployment replicas = %v, want 3 (autoscaling.minReplicas)", dep.Spec.Replicas)
+	}
+}
+
+func TestReconcileInitialReplicasDefaultsToOneWithAutoscaling(t *testing.T) {
+	// Autoscaling without minReplicas → default 1 (matching the HPA default
+	// the controller renders).
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 5}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	dep := getDeployment(t, r, "cache", "ns1")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 {
+		t.Fatalf("initial deployment replicas = %v, want 1 (default autoscaling floor)", dep.Spec.Replicas)
+	}
+}
+
 func TestReconcileDeploymentRespectsHPAReplicas(t *testing.T) {
 	// When an HPA owns the replica count, the reconciler must not overwrite
 	// dep.Spec.Replicas back to spec.Replicas — that would let the controller

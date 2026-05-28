@@ -70,10 +70,7 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 	model := configOr(cfg, cfgKeyModel, defaultLMCacheModel)
 	hfSecret := configOr(cfg, cfgKeyHFTokenSecret, defaultHFTokenSecretName)
 
-	replicas := int32(1)
-	if cb.Spec.Replicas != nil {
-		replicas = *cb.Spec.Replicas
-	}
+	replicas := initialReplicas(cb)
 
 	selector := selectorLabels(name)
 	podLabels := podTemplateLabels(name)
@@ -205,6 +202,24 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 		workload.PVC = pvc
 	}
 	return workload, nil
+}
+
+// initialReplicas picks the Deployment's initial replica count. With
+// autoscaling configured, spec.autoscaling.minReplicas is the source of truth
+// (defaulting to 1 when unset), so the workload comes up at or above the HPA
+// floor on first apply instead of starting at 1 and waiting for the HPA to
+// patch it. Without autoscaling, spec.replicas wins (default 1).
+func initialReplicas(cb *cachev1alpha1.CacheBackend) int32 {
+	if cb.Spec.Autoscaling != nil {
+		if cb.Spec.Autoscaling.MinReplicas != nil {
+			return *cb.Spec.Autoscaling.MinReplicas
+		}
+		return 1
+	}
+	if cb.Spec.Replicas != nil {
+		return *cb.Spec.Replicas
+	}
+	return 1
 }
 
 // PVCName is the deterministic PVC name the LMCache backend mounts at
