@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -210,8 +211,9 @@ func TestVLLMLMCacheInjectEngineConfig(t *testing.T) {
 	if !containsArg(engine.Args, "--enable-prefix-caching") {
 		t.Fatalf("--enable-prefix-caching was dropped: %v", engine.Args)
 	}
-	if !containsArgPair(engine.Args, defaultEngineKVTransferConfigArg, defaultEngineKVTransferConfig) {
-		t.Fatalf("connector args missing: %v", engine.Args)
+	wantTransfer := kvTransferConfig(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)
+	if !containsArgPair(engine.Args, defaultEngineKVTransferConfigArg, wantTransfer) {
+		t.Fatalf("connector args missing %s %s: %v", defaultEngineKVTransferConfigArg, wantTransfer, engine.Args)
 	}
 
 	// Sidecar is not the engine container, so it should be untouched.
@@ -268,18 +270,80 @@ func TestVLLMLMCacheInjectEngineConfigIdempotent(t *testing.T) {
 	}
 
 	// Args: the connector arg pair must appear exactly once.
+	wantTransfer := kvTransferConfig(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)
 	flagCount := 0
 	valueCount := 0
 	for _, a := range pod.Containers[0].Args {
 		if a == defaultEngineKVTransferConfigArg {
 			flagCount++
 		}
-		if a == defaultEngineKVTransferConfig {
+		if a == wantTransfer {
 			valueCount++
 		}
 	}
 	if flagCount != 1 || valueCount != 1 {
 		t.Fatalf("connector arg pair count = (flag %d, value %d), want (1, 1)", flagCount, valueCount)
+	}
+}
+
+func TestVLLMLMCacheInjectEngineConfigFailOpen(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name     string
+		failOpen *bool
+		want     string
+	}{
+		{"default (unset → true)", nil, "true"},
+		{"explicit true", &trueVal, "true"},
+		{"explicit false", &falseVal, "false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newLMCacheBackend(nil)
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine:   "vllm",
+				FailOpen: tc.failOpen,
+			}
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+				t.Fatalf("InjectEngineConfig: %v", err)
+			}
+			if v, _ := lookupEnv(pod.Containers[0].Env, EnvInferenceCacheFailOpen); v != tc.want {
+				t.Fatalf("%s = %q, want %q", EnvInferenceCacheFailOpen, v, tc.want)
+			}
+		})
+	}
+}
+
+func TestVLLMLMCacheInjectEngineConfigRoleMapping(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	cases := []struct {
+		role        cachev1alpha1.CacheBackendIntegrationRole
+		wantKVRole  string
+		description string
+	}{
+		{cachev1alpha1.CacheBackendIntegrationRoleReadOnly, "kv_consumer", "ReadOnly → kv_consumer"},
+		{cachev1alpha1.CacheBackendIntegrationRoleWriteOnly, "kv_producer", "WriteOnly → kv_producer"},
+		{cachev1alpha1.CacheBackendIntegrationRoleReadWrite, "kv_both", "ReadWrite → kv_both"},
+		{"", "kv_both", "unset → kv_both (default)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			cb := newLMCacheBackend(nil)
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   tc.role,
+			}
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+				t.Fatalf("InjectEngineConfig: %v", err)
+			}
+			wantValue := fmt.Sprintf(`{"kv_connector":"LMCacheConnectorV1","kv_role":%q}`, tc.wantKVRole)
+			if !containsArgPair(pod.Containers[0].Args, defaultEngineKVTransferConfigArg, wantValue) {
+				t.Fatalf("Args = %v, want pair (%s, %s)", pod.Containers[0].Args, defaultEngineKVTransferConfigArg, wantValue)
+			}
+		})
 	}
 }
 

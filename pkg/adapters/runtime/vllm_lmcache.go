@@ -43,9 +43,17 @@ const (
 	defaultEngineLMCacheRemoteSerde  = "naive"
 	defaultEngineLMCacheLocalCPU     = "False"
 	defaultEngineLMCacheMaxLocalCPU  = "20"
-	defaultEngineKVTransferConfig    = `{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}`
 	defaultEngineKVTransferConfigArg = "--kv-transfer-config"
 	defaultEngineVLLMUseV1           = "1"
+
+	// kvRole values map the CacheBackend integration role onto LMCache's
+	// kv_role semantics carried in the --kv-transfer-config JSON: kv_consumer
+	// reads from the cache only, kv_producer writes only, kv_both reads and
+	// writes. The default (when integration is unset) is kv_both, matching
+	// the ReadWrite role's behaviour.
+	kvRoleConsumer = "kv_consumer"
+	kvRoleProducer = "kv_producer"
+	kvRoleBoth     = "kv_both"
 
 	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
 	// since they round-trip through CacheBackend.Spec.BackendConfig (a
@@ -70,10 +78,19 @@ const (
 const (
 	EnvLMCacheRemoteURL   = "LMCACHE_REMOTE_URL"
 	EnvLMCacheRemoteSerde = "LMCACHE_REMOTE_SERDE"
-	EnvLMCacheChunkSize   = "LMCACHE_CHUNK_SIZE"
-	EnvLMCacheLocalCPU    = "LMCACHE_LOCAL_CPU"
-	EnvLMCacheMaxLocalCPU = "LMCACHE_MAX_LOCAL_CPU_SIZE"
-	EnvVLLMUseV1          = "VLLM_USE_V1"
+	// EnvInferenceCacheFailOpen mirrors spec.integration.failOpen onto the
+	// engine pod so a future engine-side hook can decide whether to fall
+	// back to local prefill on cache unreachability (true) or treat the
+	// cache as a hard serving dependency (false). The LMCache connector
+	// today is fail-open by default at runtime regardless of this value;
+	// surfacing the bit lets the engine layer enforce fail-closed
+	// semantics when that work lands, and matches the API/design contract
+	// that this flag is plumbed by the engine adapter.
+	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
+	EnvLMCacheChunkSize       = "LMCACHE_CHUNK_SIZE"
+	EnvLMCacheLocalCPU        = "LMCACHE_LOCAL_CPU"
+	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
+	EnvVLLMUseV1              = "VLLM_USE_V1"
 	// EngineContainerName is the conventional name for the vLLM container in
 	// an engine pod the adapter mutates. When no container with this name is
 	// present, the adapter injects into every container — the same defensive
@@ -186,8 +203,12 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint strin
 		{Name: EnvLMCacheLocalCPU, Value: configOr(cfg, cfgKeyLocalCPU, defaultEngineLMCacheLocalCPU)},
 		{Name: EnvLMCacheMaxLocalCPU, Value: configOr(cfg, cfgKeyMaxLocalCPU, defaultEngineLMCacheMaxLocalCPU)},
 		{Name: EnvVLLMUseV1, Value: defaultEngineVLLMUseV1},
+		{Name: EnvInferenceCacheFailOpen, Value: failOpenString(cache)},
 	}
-	args := []string{defaultEngineKVTransferConfigArg, defaultEngineKVTransferConfig}
+	// spec.integration.role maps onto LMCache's kv_role in the connector
+	// config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
+	// (and unset / unknown) → kv_both.
+	args := []string{defaultEngineKVTransferConfigArg, kvTransferConfig(integrationRole(cache))}
 
 	targets := engineContainerIndices(pod)
 	for _, i := range targets {
@@ -291,6 +312,44 @@ func lmcacheRemoteURL(endpoint string) string {
 		return endpoint
 	}
 	return "lm://" + endpoint
+}
+
+// failOpenString returns the bool form of the effective fail-open mode for
+// the engine env. The CRD defaults to fail-open via the defaulting webhook;
+// the helper handles nil Integration / nil failOpen too — pre-defaulting
+// code paths shouldn't crash. The rendered string is "true" / "false" so the
+// engine-side hook can parse it without LMCache-specific knowledge.
+func failOpenString(cache *cachev1alpha1.CacheBackend) string {
+	if cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration) {
+		return "true"
+	}
+	return "false"
+}
+
+// integrationRole returns the engine's participation role from cache.Spec.
+// Integration, defaulting to ReadWrite (matching the CRD's documented
+// behaviour when integration is unset).
+func integrationRole(cache *cachev1alpha1.CacheBackend) cachev1alpha1.CacheBackendIntegrationRole {
+	if cache.Spec.Integration == nil || cache.Spec.Integration.Role == "" {
+		return cachev1alpha1.CacheBackendIntegrationRoleReadWrite
+	}
+	return cache.Spec.Integration.Role
+}
+
+// kvTransferConfig renders the --kv-transfer-config JSON for the given role.
+// An unrecognised role falls back to kv_both so a future CRD value (added
+// after this adapter ships) is not silently dropped from the kv path.
+func kvTransferConfig(role cachev1alpha1.CacheBackendIntegrationRole) string {
+	kvRole := kvRoleBoth
+	switch role {
+	case cachev1alpha1.CacheBackendIntegrationRoleReadOnly:
+		kvRole = kvRoleConsumer
+	case cachev1alpha1.CacheBackendIntegrationRoleWriteOnly:
+		kvRole = kvRoleProducer
+	case cachev1alpha1.CacheBackendIntegrationRoleReadWrite:
+		kvRole = kvRoleBoth
+	}
+	return fmt.Sprintf(`{"kv_connector":"LMCacheConnectorV1","kv_role":%q}`, kvRole)
 }
 
 // serverCommand returns the LMCache server command + args, with a single
