@@ -142,7 +142,7 @@ See the README's "Repository layout" for the full map. In short:
 | gRPC handlers, server wiring | `pkg/server/` |
 | Cache-state index logic | `pkg/index/` |
 | Mutable-slot rendering (the wedge) | `pkg/render/` |
-| Engine / runtime / backend adapters | `pkg/adapters/{engine,runtime,backend}/` |
+| Engine / runtime adapters | `pkg/adapters/{engine,runtime}/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
 Each package's `doc.go` states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to.
