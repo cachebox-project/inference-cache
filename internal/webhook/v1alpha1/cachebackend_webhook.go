@@ -6,12 +6,10 @@ import (
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -42,14 +40,14 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 
 // CacheBackendDefaulter applies Phase-1 defaults to a CacheBackend at
 // admission time so downstream code never has to nil-check the defaulted
-// fields. It implements [webhook.CustomDefaulter].
+// fields. It implements [admission.Defaulter] over CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
 // broken — External without an endpoint, persistent storage on a
 // memory-only backend, cross-namespace endpoints without explicit opt-in —
 // before the reconciler ever sees them. It implements
-// [webhook.CustomValidator].
+// [admission.Validator] over CacheBackend.
 //
 // The rule set is ordered and pluggable: new admission-time guards (the
 // next one will be the M6 runtime-adapter compatibility check) plug in by
@@ -85,24 +83,18 @@ var DefaultValidationRules = []ValidationRule{
 // configurations; do not hand-edit config/webhook/manifests.yaml.
 func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
-		WithCustomDefaulter(&CacheBackendDefaulter{}).
-		WithCustomValidator(&CacheBackendValidator{}).
+		WithDefaulter(&CacheBackendDefaulter{}).
+		WithValidator(&CacheBackendValidator{}).
 		Complete()
 }
 
 // +kubebuilder:webhook:path=/mutate-inferencecache-io-v1alpha1-cachebackend,mutating=true,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachebackends,verbs=create;update,versions=v1alpha1,name=mcachebackend.inferencecache.io,admissionReviewVersions=v1
 
-// Default implements [webhook.CustomDefaulter]. It stamps the Phase-1
+// Default implements [admission.Defaulter]. It stamps the Phase-1
 // defaults onto cb only where the operator did not specify a value: a
 // non-nil pointer or a non-zero scalar is treated as an explicit choice
-// and left alone. Defaulting is best-effort — a misregistration that
-// hands the handler a non-CacheBackend object surfaces as apierrors,
-// never a panic.
-func (d *CacheBackendDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	cb, err := asCacheBackend(obj)
-	if err != nil {
-		return err
-	}
+// and left alone.
+func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.CacheBackend) error {
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)
 
@@ -132,37 +124,29 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, obj runtime.Object)
 
 // +kubebuilder:webhook:path=/validate-inferencecache-io-v1alpha1-cachebackend,mutating=false,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachebackends,verbs=create;update,versions=v1alpha1,name=vcachebackend.inferencecache.io,admissionReviewVersions=v1
 
-// ValidateCreate implements [webhook.CustomValidator]. Every admitted
+// ValidateCreate implements [admission.Validator]. Every admitted
 // CacheBackend runs the full rule set; aggregated violations come back as
 // one Invalid status so kubectl prints them all in a single rejection.
-func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	cb, err := asCacheBackend(obj)
-	if err != nil {
-		return nil, err
-	}
+func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend create",
 		"namespace", cb.Namespace, "name", cb.Name, "type", cb.Spec.Type)
 	return nil, v.validate(cb)
 }
 
-// ValidateUpdate implements [webhook.CustomValidator]. Updates are
-// validated against the *new* object only: admission rules are functions
-// of the desired spec, and re-checking each admit catches a kubectl edit
-// that flips a previously-valid field just as it would on create.
-func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	cb, err := asCacheBackend(newObj)
-	if err != nil {
-		return nil, err
-	}
+// ValidateUpdate implements [admission.Validator]. Updates are validated
+// against the *new* object only: admission rules are functions of the
+// desired spec, and re-checking each admit catches a kubectl edit that
+// flips a previously-valid field just as it would on create.
+func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, _, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
-		"namespace", cb.Namespace, "name", cb.Name, "type", cb.Spec.Type)
-	return nil, v.validate(cb)
+		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
+	return nil, v.validate(newCB)
 }
 
-// ValidateDelete implements [webhook.CustomValidator]. Deletion is always
+// ValidateDelete implements [admission.Validator]. Deletion is always
 // allowed: removing a CacheBackend that was previously admitted under a
 // stricter rule must still succeed so operators can clear bad state.
-func (v *CacheBackendValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (v *CacheBackendValidator) ValidateDelete(_ context.Context, _ *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	return nil, nil
 }
 
@@ -295,25 +279,10 @@ func serviceDNSNamespace(endpoint string) (string, bool) {
 	return ns, true
 }
 
-// asCacheBackend coerces an admission runtime.Object into the typed CR.
-// The webhook framework wires the right concrete type via
-// [SetupCacheBackendWebhookWithManager]'s builder.For; a different type
-// here means the webhook was misregistered, which is a controller bug —
-// return apierrors.NewBadRequest so the apiserver surfaces it as a 4xx
-// with a useful message rather than panicking.
-func asCacheBackend(obj runtime.Object) (*cachev1alpha1.CacheBackend, error) {
-	cb, ok := obj.(*cachev1alpha1.CacheBackend)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf(
-			"expected *v1alpha1.CacheBackend, got %T (webhook misregistered)", obj))
-	}
-	return cb, nil
-}
-
 // Compile-time assertions: the handlers implement the controller-runtime
 // webhook interfaces. A breaking change in those interfaces fails the
 // build here instead of at manager start-up.
 var (
-	_ webhook.CustomDefaulter = (*CacheBackendDefaulter)(nil)
-	_ webhook.CustomValidator = (*CacheBackendValidator)(nil)
+	_ admission.Defaulter[*cachev1alpha1.CacheBackend] = (*CacheBackendDefaulter)(nil)
+	_ admission.Validator[*cachev1alpha1.CacheBackend] = (*CacheBackendValidator)(nil)
 )

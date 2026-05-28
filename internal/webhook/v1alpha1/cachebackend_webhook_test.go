@@ -106,16 +106,6 @@ func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
 	}
 }
 
-func TestDefaulter_RejectsWrongType(t *testing.T) {
-	// A misregistered webhook would hand the handler a different runtime.Object;
-	// it should surface as a typed BadRequest, not a panic.
-	d := &CacheBackendDefaulter{}
-	err := d.Default(context.Background(), &cachev1alpha1.CacheBackendList{})
-	if !apierrors.IsBadRequest(err) {
-		t.Fatalf("expected BadRequest, got %v", err)
-	}
-}
-
 // requireInvalidWithCause runs v against cb and asserts the response is an
 // aggregated Invalid status whose causes contain the substring wantMsg on
 // field wantField. Centralising the assertion keeps the per-rule tests one
@@ -292,18 +282,6 @@ func TestValidator_Delete_AlwaysAllowed(t *testing.T) {
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal // no endpoint
 	if _, err := v.ValidateDelete(context.Background(), cb); err != nil {
 		t.Fatalf("ValidateDelete rejected: %v", err)
-	}
-}
-
-func TestValidator_RejectsWrongType(t *testing.T) {
-	v := &CacheBackendValidator{}
-	_, err := v.ValidateCreate(context.Background(), &cachev1alpha1.CacheBackendList{})
-	if !apierrors.IsBadRequest(err) {
-		t.Fatalf("expected BadRequest, got %v", err)
-	}
-	_, err = v.ValidateUpdate(context.Background(), nil, &cachev1alpha1.CacheBackendList{})
-	if !apierrors.IsBadRequest(err) {
-		t.Fatalf("expected BadRequest, got %v", err)
 	}
 }
 
