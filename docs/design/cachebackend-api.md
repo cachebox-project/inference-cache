@@ -55,14 +55,27 @@ It intentionally does not expose `containers`; requiring users to provide contai
 
 ### backendConfig keys (managed LMCache)
 
-`spec.backendConfig` is a free-form string map; the managed LMCache builder recognizes a few keys as overrides until they are promoted to first-class spec fields:
+`spec.backendConfig` is a free-form string map; the managed LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) recognizes overrides for the **standalone lmcache-server** workload it renders, and for the **engine-side env** a future mutating admission webhook will inject into vLLM pods. Defaults are overridable until they are promoted to first-class spec fields.
+
+Server-side (consumed by `ResolveCacheServer` when rendering the cache-server pod):
 
 | Key | Default | Purpose |
 |---|---|---|
-| `image` | gpu: lmcache reference image; cpu: **required** | Container image for the backend engine. The CPU image is arch-tagged upstream with no safe multi-arch default, so `profile=cpu` requires an explicit image. |
-| `model` | profile-dependent | Model the engine serves (`vllm serve <model>`). |
-| `hfTokenSecret` | `hf-token` | Name of the Secret (key `token`) injected as `HF_TOKEN` for gated model pulls. The reference is optional, so ungated models run without it. |
-| `profile` | `gpu` | Rendering profile. `gpu` (default): the full vLLM + LMCache connector with prefix caching, KV events, and an `nvidia.com/gpu` limit. `cpu`: a GPU-free vLLM engine (no GPU limit, no LMCache connector) that keeps prefix caching + the KV-event publisher, for validating the substrate off-GPU. Real LMCache offload requires a GPU, so it stays on the `gpu` profile. |
+| `image` | `lmcache/standalone:latest` | Container image for the standalone lmcache-server. Pin to a digest for non-local runs. |
+| `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
+
+Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod to the cache):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `chunkSize` | `256` | `LMCACHE_CHUNK_SIZE` on the engine container. |
+| `remoteSerde` | `naive` | `LMCACHE_REMOTE_SERDE` on the engine container. CPU-safe default; `cachegen` is faster but pulls in CUDA-only codepaths and should be opted into via this key on GPU. |
+| `localCPU` | `False` | `LMCACHE_LOCAL_CPU` on the engine container. Defaults to `False` (remote-only); `True` enables a hybrid local+remote mode. |
+| `maxLocalCPU` | `20` | `LMCACHE_MAX_LOCAL_CPU_SIZE` (GiB) on the engine container; only meaningful when `localCPU=True`. |
+
+The webhook also injects the constant flags every vLLM+LMCache engine needs: `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'`, `VLLM_USE_V1=1`, and `LMCACHE_REMOTE_URL=lm://<status.endpoint>`. These are not user-overridable.
+
+The retired all-in-one C2 keys (`profile`, `model`, `hfTokenSecret`) were specific to the colocated vLLM+LMCache workload C2 templated. The new architecture splits the cache server from the engine: the engine is user-owned (its image/model/HF token live on the engine's own Deployment), the cache-server is engine-agnostic.
 
 ## Status
 

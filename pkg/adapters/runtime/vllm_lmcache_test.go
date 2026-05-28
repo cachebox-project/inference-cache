@@ -361,7 +361,7 @@ func TestVLLMLMCacheInjectRouterConfigIsNoop(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheInjectRouterConfigTruelyNoopsOnBadInput(t *testing.T) {
+func TestVLLMLMCacheInjectRouterConfigTrulyNoopsOnBadInput(t *testing.T) {
 	// The KVCacheRuntimeAdapter contract says backends without a router
 	// component should return nil without touching pod. The LMCache adapter
 	// must honour that even for nil/empty inputs so callers can blindly

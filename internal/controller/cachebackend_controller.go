@@ -383,20 +383,21 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 // defaults for the server-defaulted override fields (schedulerName,
 // terminationGracePeriodSeconds), so copying them is idempotent.
 //
-// When the container set changes (e.g. an in-place upgrade from C2's "vllm"
-// to the C6 "lmcache-server" container), [reconcileManagedContainer] prunes
-// the old containers — and the adapter-owned pod-level Volumes the old
-// containers referenced (e.g. C2's cache-home + shm) must be pruned too, or
-// the live pod template carries dangling volumes from the previous shape.
-// The volume reset is gated on a container-set change so a steady-state
-// reconcile never overwrites Volumes (avoiding churn under the Owns watch).
+// Volumes are adapter-owned (per [adapterruntime.KVCacheRuntimeAdapter] — the
+// adapter fills PodSpec.Containers + PodSpec.Volumes) and are not
+// API-server-defaulted in a Deployment template, so the reconciler always
+// propagates them from desired. That corrects two cases the previous
+// gated-on-container-set-change behaviour missed:
+//   - Out-of-band volume drift on a steady-state Deployment.
+//   - An adapter update that adds/changes pod-level volumes without changing
+//     the container set.
+//
+// For C6 the LMCache adapter renders no pod-level volumes, so this is a no-op
+// for the steady-state path; for the upgrade-from-C2 path it still prunes the
+// stale cache-home + shm volumes.
 func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
-	before := containerNameSet(live.Containers)
 	reconcileManagedContainer(live, desired)
-	after := containerNameSet(live.Containers)
-	if !stringSetEqual(before, after) {
-		live.Volumes = desired.Volumes
-	}
+	live.Volumes = desired.Volumes
 
 	live.NodeSelector = desired.NodeSelector
 	live.Affinity = desired.Affinity
@@ -409,28 +410,6 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	live.SchedulerName = desired.SchedulerName
 	live.RuntimeClassName = desired.RuntimeClassName
 	live.TerminationGracePeriodSeconds = desired.TerminationGracePeriodSeconds
-}
-
-// containerNameSet returns the set of container names in cs.
-func containerNameSet(cs []corev1.Container) map[string]struct{} {
-	out := make(map[string]struct{}, len(cs))
-	for i := range cs {
-		out[cs[i].Name] = struct{}{}
-	}
-	return out
-}
-
-// stringSetEqual reports whether two name sets contain the same keys.
-func stringSetEqual(a, b map[string]struct{}) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k := range a {
-		if _, ok := b[k]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend

@@ -687,21 +687,23 @@ func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *test
 	}
 }
 
-func TestReconcileManagedPodSpecPreservesVolumesOnSteadyStateUpdate(t *testing.T) {
-	// When the container set is unchanged (e.g. user just bumps the image
-	// override), Volumes must NOT be rewritten — overwriting them on every
-	// reconcile would churn the Owns(Deployment) watch.
-	original := []corev1.Volume{
-		{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-	}
+func TestReconcileManagedPodSpecAdoptsAdapterVolumesOnSteadyStateUpdate(t *testing.T) {
+	// Volumes are adapter-owned (per the KVCacheRuntimeAdapter contract), so
+	// the reconciler always propagates them from desired — even on a
+	// same-container reconcile. This corrects out-of-band drift and lets an
+	// adapter add/change pod-level volumes without simultaneously changing
+	// the container set.
 	live := &corev1.PodSpec{
 		Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache/standalone:v1"}},
-		Volumes:    original,
+		Volumes: []corev1.Volume{
+			{Name: "drift", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		},
 	}
 	desired := &corev1.PodSpec{
 		Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache/standalone:v2"}},
-		// desired carries no Volumes — a steady-state reconcile must not
-		// drop the live ones just because desired declines to specify any.
+		Volumes: []corev1.Volume{
+			{Name: "intended", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		},
 	}
 
 	reconcileManagedPodSpec(live, desired)
@@ -709,8 +711,8 @@ func TestReconcileManagedPodSpecPreservesVolumesOnSteadyStateUpdate(t *testing.T
 	if got := live.Containers[0].Image; got != "lmcache/standalone:v2" {
 		t.Fatalf("container image = %q, want updated to v2", got)
 	}
-	if len(live.Volumes) != 1 || live.Volumes[0].Name != "data" {
-		t.Fatalf("Volumes = %v, want original [data] preserved on steady-state update", volumeNames(live.Volumes))
+	if len(live.Volumes) != 1 || live.Volumes[0].Name != "intended" {
+		t.Fatalf("Volumes = %v, want adapter-owned [intended] (drift corrected)", volumeNames(live.Volumes))
 	}
 }
 
@@ -808,26 +810,6 @@ func TestReconcileManagedContainerEmptyDesiredIsNoop(t *testing.T) {
 	reconcileManagedContainer(live, &corev1.PodSpec{})
 	if len(live.Containers) != 1 || live.Containers[0].Name != "lmcache-server" {
 		t.Fatalf("empty desired must not touch live; got %v", containerNames(live.Containers))
-	}
-}
-
-func TestStringSetEqual(t *testing.T) {
-	cases := []struct {
-		name string
-		a, b map[string]struct{}
-		want bool
-	}{
-		{"both empty", map[string]struct{}{}, map[string]struct{}{}, true},
-		{"same keys", map[string]struct{}{"x": {}, "y": {}}, map[string]struct{}{"y": {}, "x": {}}, true},
-		{"different sizes", map[string]struct{}{"x": {}}, map[string]struct{}{"x": {}, "y": {}}, false},
-		{"same size, different keys", map[string]struct{}{"x": {}}, map[string]struct{}{"y": {}}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := stringSetEqual(tc.a, tc.b); got != tc.want {
-				t.Fatalf("stringSetEqual = %v, want %v", got, tc.want)
-			}
-		})
 	}
 }
 
