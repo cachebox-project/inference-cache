@@ -476,11 +476,15 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 // Ready requires the Deployment to have observed its current generation and to
 // have enough updated + available replicas, so a stale rollout (e.g. mid image
 // change) is never reported Ready.
+//
+// When the CacheBackend is autoscaled the HPA owns the desired replica count,
+// so the comparison target is the live Deployment's spec.replicas (which the
+// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
+// in that mode). This keeps Ready accurate when an HPA decides to run more
+// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
+// happens to be 0 with autoscaling configured.
 func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
-	want := int32(1)
-	if backend.Spec.Replicas != nil {
-		want = *backend.Spec.Replicas
-	}
+	want := desiredReplicas(backend, dep)
 
 	// A backend scaled to zero is not serving; never report it Ready.
 	if want == 0 {
@@ -518,6 +522,26 @@ func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, mess
 	default:
 		return metav1.ConditionFalse, reason, message
 	}
+}
+
+// desiredReplicas is the per-reconcile source of truth for "how many replicas
+// should this backend be running". With autoscaling enabled the HPA writes
+// spec.replicas on the Deployment, so the live value is authoritative; without
+// it, the user's spec.replicas (default 1) wins.
+func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	if backend.Spec.Autoscaling != nil {
+		// First reconcile after an HPA spec is added may briefly see
+		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
+		// it within one cycle. Until then, fall back to the controller value.
+		if dep.Spec.Replicas != nil {
+			return *dep.Spec.Replicas
+		}
+		// Fall through to the floor.
+	}
+	if backend.Spec.Replicas != nil {
+		return *backend.Spec.Replicas
+	}
+	return 1
 }
 
 // managedCapacity returns the human-readable capacity surfaced on status.

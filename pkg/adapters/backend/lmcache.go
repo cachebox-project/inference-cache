@@ -113,6 +113,15 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 			{Name: "kv-replay", ContainerPort: portKVReplay, Protocol: corev1.ProtocolTCP},
 		},
 		Resources: corev1.ResourceRequirements{
+			// CPU and memory requests are needed for HPA CPU utilization to be
+			// computable (Kubernetes computes utilization against the pod's CPU
+			// request). The values are conservative starting points sized for
+			// vLLM's coordination overhead, not its model serving; the GPU does
+			// the heavy lifting via the nvidia.com/gpu limit below.
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("2Gi"),
+			},
 			Limits: corev1.ResourceList{
 				"nvidia.com/gpu": resource.MustParse("1"),
 			},

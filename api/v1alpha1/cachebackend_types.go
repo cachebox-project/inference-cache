@@ -121,6 +121,8 @@ type CacheBackendPVCSpec struct {
 // backend workload via a HorizontalPodAutoscaler. Cache-aware (custom-metric)
 // autoscaling is deferred to a later module; Phase 1 supports a CPU-utilization
 // target, which is sufficient to demonstrate scale-up under load.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
 type CacheBackendAutoscalingSpec struct {
 	// MinReplicas is the lower bound for the HPA replica count. Defaults to 1
 	// when unset.

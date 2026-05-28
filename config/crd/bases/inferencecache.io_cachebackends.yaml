@@ -85,6 +85,9 @@ spec:
                 required:
                 - maxReplicas
                 type: object
+                x-kubernetes-validations:
+                - message: minReplicas must not exceed maxReplicas
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
               backendConfig:
                 additionalProperties:
                   type: string

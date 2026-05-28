@@ -4,13 +4,14 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 )
 
 // ---- PVC reconciliation -----------------------------------------------------
@@ -466,5 +467,73 @@ func TestManagedCapacity(t *testing.T) {
 	persistent := persistentBackend("cache", "ns1", "50Gi", nil)
 	if got := managedCapacity(persistent); got != "50Gi" {
 		t.Fatalf("persistent capacity = %q, want 50Gi", got)
+	}
+}
+
+// ---- HPA-aware health -------------------------------------------------------
+
+func TestDesiredReplicasPrefersHPAWhenAutoscalingSet(t *testing.T) {
+	cb := autoscalingBackend("cache", "ns1", 1, 5, nil)
+	// User-set spec.replicas should be ignored once autoscaling is in charge —
+	// the HPA's writes to dep.spec.replicas are authoritative.
+	cb.Spec.Replicas = ptrInt32(1)
+	dep := newDep(4)
+	if got := desiredReplicas(cb, dep); got != 4 {
+		t.Fatalf("desiredReplicas = %d, want 4 (HPA-driven)", got)
+	}
+}
+
+func TestDesiredReplicasFallbackToSpecWhenNoAutoscaling(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(3)
+	dep := newDep(7) // out-of-band edit; not HPA-managed.
+	if got := desiredReplicas(cb, dep); got != 3 {
+		t.Fatalf("desiredReplicas = %d, want 3 (spec.replicas wins without autoscaling)", got)
+	}
+}
+
+func TestManagedHealthIgnoresSpecReplicasUnderHPA(t *testing.T) {
+	// spec.replicas=0 with autoscaling set must NOT trip the ScaledToZero
+	// guard — the HPA owns the count, and minReplicas>=1 is enforced by the
+	// kubebuilder validation on autoscaling.minReplicas.
+	cb := autoscalingBackend("cache", "ns1", 1, 3, nil)
+	cb.Spec.Replicas = ptrInt32(0)
+	dep := newDep(2)
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.UpdatedReplicas = 2
+	dep.Status.AvailableReplicas = 2
+
+	health, status, _, _ := managedHealth(cb, dep)
+	if health != cachev1alpha1.CacheBackendHealthReady || status != metav1.ConditionTrue {
+		t.Fatalf("managedHealth = %q/%v, want Ready/True under HPA with 2/2 replicas", health, status)
+	}
+}
+
+func newDep(replicas int32) *appsv1.Deployment {
+	r := replicas
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Replicas: &r},
+	}
+}
+
+// ---- Resource requests for HPA-friendly scaling -----------------------------
+
+func TestLMCacheContainerHasCPURequest(t *testing.T) {
+	// HPA CPU utilization is computed against the pod's CPU request; without
+	// it, the HPA never gets usable metrics and never scales. Regression test
+	// for a Codex review finding.
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+	reconcile(t, r, "cache", "ns1")
+
+	dep := getDeployment(t, r, "cache", "ns1")
+	c := dep.Spec.Template.Spec.Containers[0]
+	cpu, ok := c.Resources.Requests[corev1.ResourceCPU]
+	if !ok || cpu.IsZero() {
+		t.Fatalf("container should declare a CPU request for HPA, got requests=%v", c.Resources.Requests)
+	}
+	if _, ok := c.Resources.Requests[corev1.ResourceMemory]; !ok {
+		t.Fatalf("container should declare a memory request, got requests=%v", c.Resources.Requests)
 	}
 }
