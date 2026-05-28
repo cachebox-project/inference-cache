@@ -132,6 +132,15 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 
 // reconcileManaged templates and applies the child workload, then publishes status.
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, builder backendadapter.Builder) (ctrl.Result, error) {
+	if reason, msg, ok := validateManagedSpec(backend); !ok {
+		// Don't tear down whatever's already running — keep the in-flight
+		// workload visible to the user while they fix the spec. We just refuse
+		// to propagate the unsafe combination further.
+		logger.V(1).Info("CacheBackend spec is invalid; not applying children",
+			"namespace", backend.Namespace, "name", backend.Name, "reason", reason)
+		return ctrl.Result{}, r.markInvalidSpec(ctx, backend, reason, msg)
+	}
+
 	workload, err := builder.Build(backend)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("build workload for %s/%s: %w", backend.Namespace, backend.Name, err)
@@ -372,6 +381,8 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend
 // container in place, leaving API-server-defaulted container fields untouched.
+// Resources are reconciled so upgrades from older controller versions adopt the
+// new CPU/memory requests (the HPA needs a CPU request to compute utilization).
 func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	if len(desired.Containers) == 0 {
 		return
@@ -383,6 +394,7 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 			live.Containers[i].Command = want.Command
 			live.Containers[i].Args = want.Args
 			live.Containers[i].Env = want.Env
+			live.Containers[i].Resources = *want.Resources.DeepCopy()
 			return
 		}
 	}
@@ -407,11 +419,13 @@ func reconcileVolumeSources(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	}
 }
 
-// cleanupOwnedWorkload best-effort deletes all child resources this CR owns,
-// used when a backend is no longer a managed Deployment (type/kind changed).
-// Normal CR deletion is handled by owner-reference garbage collection; this
-// covers the in-place mutation case where the CR itself still exists. The PVC
-// is included so a managed→External flip doesn't strand persistent storage.
+// cleanupOwnedWorkload best-effort deletes the stateless children this CR
+// owns, used when a backend is no longer a managed Deployment (type/kind
+// changed). The PVC is intentionally NOT deleted here — destroying persistent
+// storage in response to an in-place spec edit risks silent data loss, the
+// same reasoning that makes reconcilePVC adopt-and-keep when spec.storage is
+// removed. The owner reference still ensures the PVC is GC'd when the
+// CacheBackend itself is deleted.
 func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
 
@@ -424,11 +438,7 @@ func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backe
 		return err
 	}
 	var hpa autoscalingv2.HorizontalPodAutoscaler
-	if err := r.deleteIfOwned(ctx, key, &hpa, backend); err != nil {
-		return err
-	}
-	var pvc corev1.PersistentVolumeClaim
-	return r.deleteIfOwned(ctx, key, &pvc, backend)
+	return r.deleteIfOwned(ctx, key, &hpa, backend)
 }
 
 // deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
@@ -443,6 +453,51 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 		return client.IgnoreNotFound(err)
 	}
 	return nil
+}
+
+// validateManagedSpec catches spec combinations the Phase-1 reconciler cannot
+// safely satisfy. It returns false (reason, message) when the spec is unsafe.
+// The check is deliberately controller-side rather than CRD-level so it does
+// not tighten v1alpha1 schema validation for existing fields.
+func validateManagedSpec(backend *cachev1alpha1.CacheBackend) (string, string, bool) {
+	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
+		return "", "", true
+	}
+	if backend.Spec.Replicas != nil && *backend.Spec.Replicas > 1 {
+		return "InvalidStorageConfiguration",
+			"spec.storage.pvc currently requires spec.replicas <= 1 (per-replica PVC support deferred)",
+			false
+	}
+	if backend.Spec.Autoscaling != nil && backend.Spec.Autoscaling.MaxReplicas > 1 {
+		return "InvalidStorageConfiguration",
+			"spec.storage.pvc currently requires spec.autoscaling.maxReplicas <= 1 (per-replica PVC support deferred)",
+			false
+	}
+	return "", "", true
+}
+
+// markInvalidSpec records an InvalidStorageConfiguration outcome on status:
+// Health=Failed, Ready=False, Progressing=False, both conditions carrying the
+// reason/message so kubectl describe shows the user exactly what's wrong.
+func (r *CacheBackendReconciler) markInvalidSpec(ctx context.Context, backend *cachev1alpha1.CacheBackend, reason, message string) error {
+	return r.patchStatus(ctx, backend, func() {
+		backend.Status.Health = cachev1alpha1.CacheBackendHealthFailed
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: backend.Generation,
+		})
+	})
 }
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.

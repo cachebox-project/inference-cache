@@ -146,18 +146,16 @@ func TestReconcilePVCSizePatchedOnUpdate(t *testing.T) {
 	}
 }
 
-func TestReconcilePVCSwitchToExternalDeletesPVC(t *testing.T) {
-	// When the user converts a managed backend to External the entire managed
-	// workload is shed — Deployment, Service, HPA, and PVC. The PVC owner ref
-	// would catch it on CR deletion anyway, but an in-place type flip wouldn't.
+func TestReconcilePVCKeptOnSwitchToExternal(t *testing.T) {
+	// Switching a managed backend to External is a spec edit. Like the
+	// storage-drop path, the PVC is preserved to avoid silent data loss on a
+	// mistaken edit. Owner-ref GC still cleans it up when the CR is deleted.
 	scheme := newScheme(t)
 	cb := persistentBackend("cache", "ns1", "10Gi", nil)
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &corev1.PersistentVolumeClaim{}); err != nil {
-		t.Fatalf("expected PVC to exist after managed reconcile: %v", err)
-	}
+	pvcUID := getPVC(t, r, "cache", "ns1").UID
 
 	live := getBackend(t, r, "cache", "ns1")
 	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
@@ -167,12 +165,9 @@ func TestReconcilePVCSwitchToExternalDeletesPVC(t *testing.T) {
 	}
 	reconcile(t, r, "cache", "ns1")
 
-	var pvcs corev1.PersistentVolumeClaimList
-	if err := r.List(context.Background(), &pvcs); err != nil {
-		t.Fatalf("list PVCs: %v", err)
-	}
-	if len(pvcs.Items) != 0 {
-		t.Fatalf("PVCs = %d, want 0 after switch to External", len(pvcs.Items))
+	pvc := getPVC(t, r, "cache", "ns1")
+	if pvc.UID != pvcUID {
+		t.Fatalf("PVC UID changed after switch to External: %q -> %q", pvcUID, pvc.UID)
 	}
 }
 
@@ -518,6 +513,76 @@ func newDep(replicas int32) *appsv1.Deployment {
 }
 
 // ---- Resource requests for HPA-friendly scaling -----------------------------
+
+// ---- Invalid-spec handling (PVC + multi-replica) ----------------------------
+
+func TestReconcilePersistentMultiReplicaMarksFailed(t *testing.T) {
+	// PVC + replicas > 1 is unsafe with a single ReadWriteOnce PVC. The
+	// controller refuses to apply children and surfaces the error via status.
+	scheme := newScheme(t)
+	cb := persistentBackend("cache", "ns1", "10Gi", nil)
+	cb.Spec.Replicas = ptrInt32(3)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	// No children applied for the invalid spec.
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err == nil {
+		t.Fatalf("expected no Deployment for invalid spec")
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthFailed {
+		t.Fatalf("status.health = %q, want Failed", updated.Status.Health)
+	}
+	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidStorageConfiguration" {
+		t.Fatalf("Ready condition = %+v, want False/InvalidStorageConfiguration", cond)
+	}
+}
+
+func TestReconcilePersistentAutoscalingMaxRepliasMarksFailed(t *testing.T) {
+	scheme := newScheme(t)
+	cb := persistentBackend("cache", "ns1", "10Gi", nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 4}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health != cachev1alpha1.CacheBackendHealthFailed {
+		t.Fatalf("status.health = %q, want Failed", updated.Status.Health)
+	}
+}
+
+// ---- Resources upgrade path -------------------------------------------------
+
+func TestReconcileAdoptsResourcesOnUpgrade(t *testing.T) {
+	// Pre-existing C2-era Deployments lack CPU/memory requests. The new HPA
+	// depends on a CPU request being present, so the update path must
+	// reconcile Resources onto the live container, not just image/args/env.
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	r := newReconciler(scheme, cb)
+	reconcile(t, r, "cache", "ns1")
+
+	// Simulate an older Deployment in the cluster: empty Resources.
+	dep := getDeployment(t, r, "cache", "ns1")
+	dep.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
+	if err := r.Update(context.Background(), dep); err != nil {
+		t.Fatalf("blank container resources: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	dep = getDeployment(t, r, "cache", "ns1")
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Requests
+	if got == nil {
+		t.Fatalf("expected requests to be reconciled onto upgraded container")
+	}
+	cpu, ok := got[corev1.ResourceCPU]
+	if !ok || cpu.IsZero() {
+		t.Fatalf("container CPU request after reconcile = %v, want non-zero", got)
+	}
+}
 
 func TestLMCacheContainerHasCPURequest(t *testing.T) {
 	// HPA CPU utilization is computed against the pod's CPU request; without
