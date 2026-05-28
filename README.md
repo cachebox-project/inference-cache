@@ -42,6 +42,22 @@ curl -i http://localhost:8080/readyz    # readiness
 curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
 ```
 
+## Cluster Prerequisites
+
+The controller serves admission webhooks (defaulting + validation for
+`CacheBackend`) over TLS, so deploying it requires [cert-manager][cm]
+v1.0+ in the target cluster. The default install (`config/default`)
+provisions a self-signed `Issuer` plus a `Certificate` for the webhook
+serving cert, and relies on cert-manager's `cert-manager.io/inject-ca-from`
+annotation to inject the CA bundle into the generated
+`MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration`.
+
+```bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+```
+
+[cm]: https://cert-manager.io/
+
 ## Local Development Cluster
 
 Create a kind cluster for controller development:
@@ -64,7 +80,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make ci-lint`: run golangci-lint
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code
-- `make manifests`: regenerate CRD and RBAC manifests
+- `make manifests`: regenerate CRD, RBAC, and webhook manifests
 - `make image-build`: build controller and server images
 
 ## Documentation

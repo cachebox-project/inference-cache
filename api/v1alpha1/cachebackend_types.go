@@ -104,6 +104,15 @@ type CacheBackendSpec struct {
 	// Endpoint is the optional network address for an existing backend.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// AllowCrossNamespace opts the CacheBackend into referencing an Endpoint
+	// that resolves into a Kubernetes Service in a different namespace from
+	// this object. Without this opt-in admission rejects such Endpoints,
+	// because a cross-namespace reference crosses a tenancy/RBAC boundary that
+	// the cluster operator should explicitly acknowledge. Endpoints that are
+	// not in-cluster Service DNS (external hostnames, IPs) are unaffected.
+	// +optional
+	AllowCrossNamespace bool `json:"allowCrossNamespace,omitempty"`
 }
 
 // CacheBackendStorageSpec defines storage settings for a cache backend.

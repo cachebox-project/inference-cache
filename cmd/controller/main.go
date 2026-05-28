@@ -18,6 +18,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	"github.com/cachebox-project/inference-cache/internal/controller"
+	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -118,6 +119,11 @@ func main() {
 		Interval:    opts.cacheIndexRefreshEvery,
 	}); err != nil {
 		setupLog.Error(err, "unable to add CacheIndex poller")
+		os.Exit(1)
+	}
+
+	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to register webhook", "webhook", "CacheBackend")
 		os.Exit(1)
 	}
 

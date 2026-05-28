@@ -1,0 +1,35 @@
+# Self-signed Issuer used to mint the webhook serving certificate. Using a
+# self-signed Issuer keeps the install dependency minimal — cert-manager
+# itself is required, but no external CA — and matches the kubebuilder-default
+# webhook pattern.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: selfsigned-issuer
+  namespace: system
+spec:
+  selfSigned: {}
+---
+# Certificate for the webhook's serving HTTPS endpoint. The DNS names point
+# at the webhook-service in the controller namespace; the kustomize
+# `replacements` block in config/default rewrites them to the real
+# Service name + namespace at apply time. The CA bundle in the generated
+# Secret is injected into the Mutating/Validating webhook configurations
+# via the cert-manager.io/inject-ca-from annotation.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: serving-cert
+  namespace: system
+spec:
+  dnsNames:
+    - SERVICE_NAME.SERVICE_NAMESPACE.svc
+    - SERVICE_NAME.SERVICE_NAMESPACE.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: webhook-server-cert

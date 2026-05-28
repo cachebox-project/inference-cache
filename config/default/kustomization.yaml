@@ -4,6 +4,8 @@ resources:
 - ../crd
 - ../rbac
 - ../manager
+- ../webhook
+- ../certmanager
 
 labels:
 - includeSelectors: true
@@ -14,3 +16,97 @@ images:
 - name: controller
   newName: ghcr.io/cachebox-project/inference-cache-controller
   newTag: dev
+
+patches:
+- path: manager_webhook_patch.yaml
+- path: webhookcainjection_patch.yaml
+
+# Wire the webhook Service and cert-manager Certificate into the generated
+# webhook configurations and the Certificate's dnsNames. The four
+# replacements below rewrite, in order: (1) SERVICE_NAME and (2)
+# SERVICE_NAMESPACE in the Certificate's dnsNames; (3) CERTIFICATE_NAMESPACE
+# and (4) CERTIFICATE_NAME in the cert-manager.io/inject-ca-from annotation
+# on both webhook configurations.
+replacements:
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - .spec.dnsNames.0
+    - .spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 0
+      create: true
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: .metadata.namespace
+  targets:
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - .spec.dnsNames.0
+    - .spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 1
+      create: true
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: .metadata.namespace
+  targets:
+  - select:
+      kind: MutatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 0
+      create: true
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 0
+      create: true
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: MutatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 1
+      create: true
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 1
+      create: true

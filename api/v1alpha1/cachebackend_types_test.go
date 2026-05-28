@@ -30,6 +30,8 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"engineSelector",
 		"backendConfig",
 		"template",
+		"endpoint",
+		"allowCrossNamespace",
 	} {
 		if !hasProperty(specSchema, field) {
 			t.Fatalf("spec.%s is missing from CRD schema", field)

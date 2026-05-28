@@ -62,6 +62,15 @@ spec:
               to the runtime adapter's rendered pod (there is no PVC provisioning, no
               volume injection, and no status.capacity reporting until then).
             properties:
+              allowCrossNamespace:
+                description: |-
+                  AllowCrossNamespace opts the CacheBackend into referencing an Endpoint
+                  that resolves into a Kubernetes Service in a different namespace from
+                  this object. Without this opt-in admission rejects such Endpoints,
+                  because a cross-namespace reference crosses a tenancy/RBAC boundary that
+                  the cluster operator should explicitly acknowledge. Endpoints that are
+                  not in-cluster Service DNS (external hostnames, IPs) are unaffected.
+                type: boolean
               autoscaling:
                 description: |-
                   Autoscaling configures horizontal autoscaling for the managed backend
