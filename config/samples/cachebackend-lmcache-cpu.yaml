@@ -1,15 +1,17 @@
-# GPU-free LMCache backend for substrate validation (backendConfig profile=cpu).
+# Standalone lmcache-server backend for substrate validation on a GPU-free
+# cluster (e.g. kind). The lmcache-server itself is always CPU-only (its
+# storage device is `cpu` in-memory) regardless of what engine attaches to
+# it — there is no separate CPU/GPU "profile" anymore: the cache server is
+# engine-agnostic and the engine choice (CPU vs GPU image) lives on the
+# user-owned vLLM Deployment, not on the CacheBackend.
 #
-# Renders a vLLM CPU engine with prefix caching + the KV-cache event publisher,
-# but WITHOUT the LMCache connector and WITHOUT a GPU resource request — real
-# LMCache offload needs a GPU (use the default gpu profile for that). This lets
-# the reconciler stand up a healthy, serving backend on a CPU-only cluster (e.g.
-# kind) to validate the engine-config + KV-event path end to end.
-#
-# IMPORTANT: the CPU image is arch-tagged upstream with no multi-arch tag, so the
-# `image` below is a deliberate non-applyable PLACEHOLDER — substitute the tag for
-# your host before applying: `latest-arm64` (arm64) or `latest-x86_64` (x86_64).
-# Applying as-is fails fast (bad tag) rather than silently running the wrong arch.
+# Apply this alongside a vLLM Deployment whose labels match
+# `spec.engineSelector`; a future mutating webhook will wire the engine
+# pods to the resolved cache endpoint published in `status.endpoint` (an
+# engine-agnostic host:port — the adapter adds the `lm://` scheme on the
+# engine env). Until that webhook lands, set the engine-side env vars +
+# `--kv-transfer-config` arg manually (see docs/design/cachebackend-api.md
+# §backendConfig keys for the full set).
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -21,10 +23,12 @@ spec:
   deploymentKind: Deployment
   replicas: 1
   integration:
-    engine: vLLM
+    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
+    engine: vllm
     role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
   backendConfig:
-    profile: cpu
-    # PLACEHOLDER — replace <arch> with arm64 or x86_64 for your host before applying.
-    image: vllm/vllm-openai-cpu:latest-<arch>
-    model: Qwen/Qwen2.5-0.5B-Instruct
+    # Pin to a real digest for non-local runs.
+    serverImage: lmcache/standalone:latest

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -19,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // conditionTypeReady reports whether the managed backend workload is serving.
@@ -46,6 +47,10 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
+	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
+	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
+	// that need a custom adapter set.
+	Registry *adapterruntime.Registry
 }
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
@@ -57,10 +62,11 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile drives a CacheBackend toward its desired state. External backends only
-// mirror their configured endpoint to status; managed backends (LMCache in Phase 1)
-// template a Deployment + Service from the reference stack and own them via owner
-// references so they are garbage-collected with the CR.
+// Reconcile drives a CacheBackend toward its desired state. External backends
+// only mirror their configured endpoint to status; managed backends (LMCache
+// in Phase 1) ask the registered runtime adapter for the cache-server pod
+// spec + service spec, wrap them into a Deployment + Service the controller
+// owns, and publish the resolved endpoint.
 //
 // On every successful reconcile, transitions in the observed backend health
 // (entering/leaving Degraded) and in the effective spec.integration.failOpen
@@ -99,15 +105,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
-	builder, ok := backendadapter.For(backend.Spec.Type)
-	if !ok {
-		// Only LMCache is managed in Phase 1 (C2). Other managed types are out of
-		// scope here; shed any workload from a previous managed generation.
-		logger.V(1).Info("no managed builder for backend type",
-			"type", backend.Spec.Type, "namespace", backend.Namespace, "name", backend.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
-	}
-
 	// StatefulSet-backed (PVC) provisioning + autoscaling is the C3 module. Phase 1
 	// manages a Deployment only.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
@@ -116,7 +113,40 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	return r.reconcileManaged(ctx, logger, backend, builder)
+	registry := r.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := resolveRuntimeID(backend)
+	adapter, err := registry.Select(runtimeID, backend)
+	if err != nil {
+		// No adapter knows how to wire this (runtime, backend) pair. Shed any
+		// previously managed workload and log; a future admission validator
+		// will surface the same condition as a user-visible rejection.
+		logger.V(1).Info("no runtime adapter for backend",
+			"runtime", runtimeID, "type", backend.Spec.Type,
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+
+	return r.reconcileManaged(ctx, logger, backend, adapter)
+}
+
+// resolveRuntimeID picks the [adapterruntime.RuntimeID] the reconciler asks
+// the registry to match. The CacheBackend carries the engine name in
+// Spec.Integration.Engine; when unset, vLLM is the Phase-1 default (the only
+// engine the shipping adapters target).
+//
+// Engine values are normalised to lower-case so common spellings ("vLLM",
+// "VLLM", "SGLang") route to the canonical RuntimeID constants
+// ([adapterruntime.RuntimeVLLM] etc.); a free-form string in the CR should
+// never silently drop a CacheBackend into the unmanaged path just because of
+// case.
+func resolveRuntimeID(backend *cachev1alpha1.CacheBackend) adapterruntime.RuntimeID {
+	if backend.Spec.Integration != nil && backend.Spec.Integration.Engine != "" {
+		return adapterruntime.RuntimeID(strings.ToLower(backend.Spec.Integration.Engine))
+	}
+	return adapterruntime.RuntimeVLLM
 }
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
@@ -130,7 +160,8 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 }
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
-// for a backend this module no longer provisions (unsupported type or deferred kind).
+// for a backend this module no longer provisions (unsupported runtime/backend or
+// deferred kind).
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -143,32 +174,159 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	})
 }
 
-// reconcileManaged templates and applies the child workload, then publishes status.
-func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, builder backendadapter.Builder) (ctrl.Result, error) {
-	workload, err := builder.Build(backend)
+// reconcileManaged renders the cache-server PodSpec + Service via the runtime
+// adapter, wraps them into a Deployment + Service owned by the CR, and
+// publishes the resolved endpoint to status.
+func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
+	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("build workload for %s/%s: %w", backend.Namespace, backend.Name, err)
+		return ctrl.Result{}, fmt.Errorf("resolve cache server for %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	if podSpec == nil || svcSpec == nil {
+		// An adapter that genuinely needs no cache-server (e.g. an
+		// engine-colocated backend) is a valid future case. For Phase 1 it
+		// shouldn't happen for managed types — surface as unmanaged.
+		logger.V(1).Info("adapter rendered no cache-server; treating as unmanaged",
+			"namespace", backend.Namespace, "name", backend.Name)
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	if err := r.applyDeployment(ctx, backend, workload.Deployment); err != nil {
+	dep := r.buildDeployment(backend, podSpec)
+	svc := r.buildService(backend, svcSpec)
+
+	if err := r.applyDeployment(ctx, backend, dep); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.applyService(ctx, backend, workload.Service); err != nil {
+	if err := r.applyService(ctx, backend, svc); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	var dep appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workload.Deployment), &dep); err != nil {
-		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", workload.Deployment.Namespace, workload.Deployment.Name, err)
+	var live appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
+		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 
-	if err := r.updateManagedStatus(ctx, backend, workload.Endpoint, &dep); err != nil {
+	endpoint := serviceEndpoint(svc)
+	if err := r.updateManagedStatus(ctx, backend, endpoint, &live); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
-		"namespace", backend.Namespace, "name", backend.Name, "endpoint", workload.Endpoint)
+		"namespace", backend.Namespace, "name", backend.Name, "endpoint", endpoint)
 	return ctrl.Result{}, nil
+}
+
+// buildDeployment wraps the adapter-rendered PodSpec into a Deployment the
+// controller owns: ObjectMeta + labels + replicas + selector come from the
+// CacheBackend identity, not the adapter.
+func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBackend, podSpec *corev1.PodSpec) *appsv1.Deployment {
+	replicas := int32(1)
+	if backend.Spec.Replicas != nil {
+		replicas = *backend.Spec.Replicas
+	}
+	selector := selectorLabels(backend.Name)
+	podLabels := podTemplateLabels(backend)
+
+	pod := podSpec.DeepCopy()
+	applyPodOverrides(pod, backend.Spec.Template)
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backend.Name,
+			Namespace: backend.Namespace,
+			Labels:    podLabels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec:       *pod,
+			},
+		},
+	}
+}
+
+// buildService wraps the adapter-rendered Service spec into a Service the
+// controller owns: ObjectMeta + Selector come from the CacheBackend identity.
+// Adapter-provided fields (Spec.Type, Spec.Ports) are preserved as-is.
+func (r *CacheBackendReconciler) buildService(backend *cachev1alpha1.CacheBackend, src *corev1.Service) *corev1.Service {
+	selector := selectorLabels(backend.Name)
+	labels := podTemplateLabels(backend)
+	out := src.DeepCopy()
+	out.ObjectMeta = metav1.ObjectMeta{
+		Name:      backend.Name,
+		Namespace: backend.Namespace,
+		Labels:    labels,
+	}
+	out.Spec.Selector = selector
+	if out.Spec.Type == "" {
+		out.Spec.Type = corev1.ServiceTypeClusterIP
+	}
+	return out
+}
+
+// selectorLabels are the immutable identity labels for a backend's child objects.
+func selectorLabels(name string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":       "cachebackend",
+		"app.kubernetes.io/instance":   name,
+		"app.kubernetes.io/managed-by": "inference-cache-controller",
+	}
+}
+
+// podTemplateLabels add backend-type identity on top of the selector labels.
+// The backend-type label is informational (kubectl filtering); the controller
+// only relies on the selector labels.
+func podTemplateLabels(backend *cachev1alpha1.CacheBackend) map[string]string {
+	labels := selectorLabels(backend.Name)
+	if t := string(backend.Spec.Type); t != "" {
+		labels["inferencecache.io/backend-type"] = t
+	}
+	return labels
+}
+
+// applyPodOverrides copies optional pod-level scheduling/security overrides
+// from the spec onto the rendered pod spec. Server-defaulted fields
+// (schedulerName, terminationGracePeriodSeconds) are always set to their
+// defaults when unset so the rendered template matches the API-server-
+// defaulted object and updates don't churn.
+func applyPodOverrides(spec *corev1.PodSpec, override *cachev1alpha1.CacheBackendPodSpecOverride) {
+	if spec.SchedulerName == "" {
+		spec.SchedulerName = "default-scheduler"
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		defaultGrace := int64(30)
+		spec.TerminationGracePeriodSeconds = &defaultGrace
+	}
+	if override == nil {
+		return
+	}
+	spec.NodeSelector = override.NodeSelector
+	spec.Affinity = override.Affinity
+	spec.Tolerations = override.Tolerations
+	spec.TopologySpreadConstraints = override.TopologySpreadConstraints
+	spec.ImagePullSecrets = override.ImagePullSecrets
+	spec.ServiceAccountName = override.ServiceAccountName
+	spec.SecurityContext = override.SecurityContext
+	spec.PriorityClassName = override.PriorityClassName
+	spec.RuntimeClassName = override.RuntimeClassName
+	if override.SchedulerName != "" {
+		spec.SchedulerName = override.SchedulerName
+	}
+	if override.TerminationGracePeriodSeconds != nil {
+		spec.TerminationGracePeriodSeconds = override.TerminationGracePeriodSeconds
+	}
+}
+
+// serviceEndpoint formats the published cache endpoint as host:port using the
+// service's first port. Engine-protocol prefixes (e.g. lm:// for LMCache) are
+// the adapter's responsibility — status.endpoint stays engine-agnostic.
+func serviceEndpoint(svc *corev1.Service) string {
+	if len(svc.Spec.Ports) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s.%s.svc.cluster.local:%d", svc.Name, svc.Namespace, svc.Spec.Ports[0].Port)
 }
 
 // applyDeployment creates or updates the backend Deployment idempotently, owned by the CR.
@@ -224,11 +382,22 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 // update does not churn. The desired pod spec already carries the canonical
 // defaults for the server-defaulted override fields (schedulerName,
 // terminationGracePeriodSeconds), so copying them is idempotent.
+//
+// Volumes are adapter-owned (per [adapterruntime.KVCacheRuntimeAdapter] — the
+// adapter fills PodSpec.Containers + PodSpec.Volumes) and are not
+// API-server-defaulted in a Deployment template, so the reconciler always
+// propagates them from desired. That corrects two cases the previous
+// gated-on-container-set-change behaviour missed:
+//   - Out-of-band volume drift on a steady-state Deployment.
+//   - An adapter update that adds/changes pod-level volumes without changing
+//     the container set.
+//
+// The current LMCache adapter renders no pod-level volumes, so this is a
+// no-op for the steady-state path; on an in-place upgrade from the previous
+// colocated all-in-one rendering it still prunes the stale cache-home + shm
+// volumes that container left behind.
 func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	reconcileManagedContainer(live, desired)
-
-	// Volumes are builder-owned (e.g. the shm size differs by profile) and are not
-	// API-server-defaulted in a Deployment template, so copying them is churn-free.
 	live.Volumes = desired.Volumes
 
 	live.NodeSelector = desired.NodeSelector
@@ -246,25 +415,71 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend
 // container in place, leaving API-server-defaulted container fields untouched.
+//
+// Containers in live whose names are not in desired are dropped — this is the
+// upgrade path from a previous colocated all-in-one rendering (container
+// name "vllm") to the standalone topology (container name "lmcache-server"):
+// an in-place upgrade must replace the old managed container, not stack the
+// new one alongside it. We never drop containers that match a desired name
+// (we only update their managed fields), so a Deployment carrying sidecars
+// in addition to the managed container loses the sidecars — sidecars were
+// not supported in the previous rendering and remain unsupported here.
 func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	if len(desired.Containers) == 0 {
 		return
 	}
-	want := desired.Containers[0]
+	desiredNames := make(map[string]int, len(desired.Containers))
+	for i := range desired.Containers {
+		desiredNames[desired.Containers[i].Name] = i
+	}
+
+	// First pass: drop any live container whose name isn't desired (the
+	// upgrade-from-previous-managed-shape case).
+	kept := live.Containers[:0]
 	for i := range live.Containers {
-		if live.Containers[i].Name == want.Name {
-			live.Containers[i].Image = want.Image
-			live.Containers[i].Command = want.Command
-			live.Containers[i].Args = want.Args
-			live.Containers[i].Env = want.Env
-			// Resources are builder-owned (the GPU limit differs by profile) and not
-			// API-server-defaulted, so reconciling them is churn-free.
-			live.Containers[i].Resources = want.Resources
-			return
+		if _, ok := desiredNames[live.Containers[i].Name]; ok {
+			kept = append(kept, live.Containers[i])
 		}
 	}
-	// The managed container is missing (e.g. an out-of-band edit) — restore it.
-	live.Containers = append(live.Containers, *want.DeepCopy())
+	live.Containers = kept
+
+	// Second pass: for each desired container, update the matching live one
+	// in place (preserving API-server-defaulted fields) or append it.
+	for i := range desired.Containers {
+		want := desired.Containers[i]
+		matched := false
+		for j := range live.Containers {
+			if live.Containers[j].Name == want.Name {
+				// Adapter-owned fields the reconciler propagates from desired:
+				// the cache-server's serving port, probes, resource shape, and
+				// the connector args/env. Adapters render these explicitly
+				// (with API-server-defaulted fields like Port Protocol set in
+				// the rendering), so copying them is idempotent and doesn't
+				// churn the Owns watch. Leaving Ports/Probes/VolumeMounts
+				// untouched would let port drift break the Service's
+				// TargetPort lookup or hide a probe regression. Resources
+				// likewise differ by profile (e.g. GPU vs CPU canary) and
+				// aren't API-server-defaulted, so reconciling them is
+				// churn-free.
+				live.Containers[j].Image = want.Image
+				live.Containers[j].ImagePullPolicy = want.ImagePullPolicy
+				live.Containers[j].Command = want.Command
+				live.Containers[j].Args = want.Args
+				live.Containers[j].Env = want.Env
+				live.Containers[j].Ports = want.Ports
+				live.Containers[j].Resources = want.Resources
+				live.Containers[j].VolumeMounts = want.VolumeMounts
+				live.Containers[j].ReadinessProbe = want.ReadinessProbe
+				live.Containers[j].LivenessProbe = want.LivenessProbe
+				live.Containers[j].StartupProbe = want.StartupProbe
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			live.Containers = append(live.Containers, *want.DeepCopy())
+		}
+	}
 }
 
 // cleanupOwnedWorkload best-effort deletes the Deployment + Service this CR owns,
