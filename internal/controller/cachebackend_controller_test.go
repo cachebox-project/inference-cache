@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1105,6 +1106,12 @@ func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 	}
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)
+	// Wire autoscaling so reconcileHPA would otherwise create an HPA targeting
+	// the same-named (foreign) Deployment. The fix must skip both Service and
+	// HPA applies when applyDeployment fails — running them after a
+	// foreign-ownership failure could scale another controller's workload or
+	// expose its pods through our Service.
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
 	r := newReconciler(scheme, cb, foreign)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1119,6 +1126,24 @@ func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond != nil && cond.Status == metav1.ConditionTrue {
 		t.Fatalf("Ready condition True, must not be derived from foreign Deployment")
+	}
+	// No Service should have been created either — applying a Service that
+	// selects pods of a foreign Deployment is just as wrong as adopting it.
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 (dependent applies must be skipped when applyDeployment fails)", len(svcs.Items))
+	}
+	// And no HPA, despite spec.autoscaling being set — otherwise the HPA
+	// would scale the foreign Deployment by name.
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(hpas.Items) != 0 {
+		t.Fatalf("HPAs = %d, want 0 (HPA must not target a foreign Deployment)", len(hpas.Items))
 	}
 }
 

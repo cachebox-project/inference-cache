@@ -107,9 +107,15 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	before := snapshotState(&backend)
 
 	result, err := r.dispatch(ctx, logger, &backend)
-	if err == nil {
-		r.emitTransitionEvents(&backend, before)
-	}
+	// Emit transitions whenever dispatch published a status change, even on
+	// an apply-error reconcile: the status path runs independently of apply
+	// success (so apply churn doesn't freeze user-visible health), and the
+	// next reconcile's snapshot is taken from the *post-patch* CR. Gating
+	// emission on err==nil would mean a Degraded transition observed during
+	// an apply-error pass is permanently lost. emitTransitionEvents only
+	// fires when before != after, so an error path that didn't change status
+	// (e.g. early return before the status patch) emits nothing.
+	r.emitTransitionEvents(&backend, before)
 	return result, err
 }
 
@@ -226,12 +232,20 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
 
+	// Skip Service + HPA when applyDeployment failed. The HPA targets the
+	// Deployment by name, so running it after a foreign-ownership failure
+	// could scale another controller's workload; the Service is independent
+	// but pointless to expose alongside a Deployment we don't own. Status
+	// observation still runs below (it has its own ownership guards) so the
+	// CR isn't held hostage to apply churn.
 	applyErr := r.applyDeployment(ctx, backend, dep)
-	if svcErr := r.applyService(ctx, backend, svc); applyErr == nil {
-		applyErr = svcErr
-	}
-	if hpaErr := r.reconcileHPA(ctx, backend, dep); applyErr == nil {
-		applyErr = hpaErr
+	if applyErr == nil {
+		if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
+			applyErr = svcErr
+		}
+		if hpaErr := r.reconcileHPA(ctx, backend, dep); hpaErr != nil && applyErr == nil {
+			applyErr = hpaErr
+		}
 	}
 
 	var live appsv1.Deployment
