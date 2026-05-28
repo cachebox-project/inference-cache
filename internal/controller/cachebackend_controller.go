@@ -89,11 +89,13 @@ type CacheBackendReconciler struct {
 // owns, optionally reconcile an HPA from spec.autoscaling, and publish the
 // resolved endpoint.
 //
-// On every successful reconcile, transitions in the observed backend health
-// (entering/leaving Degraded) and in the effective spec.integration.failOpen
-// are emitted as Kubernetes Events. Events fire only on transitions — never on
-// steady state — so operators see backend outages and fail-closed opt-ins in
-// `kubectl describe` without event-stream noise.
+// On every reconcile — including ones that return an apply error — transitions
+// in the observed backend health (entering/leaving Degraded) and in the
+// effective spec.integration.failOpen are emitted as Kubernetes Events. Events
+// fire only on transitions that were actually persisted to the apiserver
+// (patchStatus rolls back the in-memory mutation on patch failure), and never
+// on steady state — so operators see backend outages and fail-closed opt-ins
+// in `kubectl describe` without phantom or duplicate events.
 func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := r.Log
 	if logger.GetSink() == nil {
@@ -878,6 +880,14 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 		return nil
 	}
 	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
+		// Roll back the in-memory mutation. emitTransitionEvents is called on
+		// every Reconcile return and compares the pre-reconcile snapshot to
+		// backend.Status; leaving the un-persisted mutation in place would
+		// fire a Warning/Normal event for a transition the apiserver never
+		// observed, and the same transition would fire again on the next
+		// reconcile (when the patch retries) — producing duplicate / phantom
+		// events under status-subresource conflict / RBAC / API failures.
+		backend.Status = before.Status
 		return fmt.Errorf("patch CacheBackend status %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	return nil
