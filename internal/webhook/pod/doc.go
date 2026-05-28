@@ -12,7 +12,12 @@
 // The webhook fails open: any error (no matching CacheBackend, no published
 // endpoint yet, adapter rejection, API list error) returns Allowed without
 // mutation, matching the project's hot-path semantics (a webhook fault must
-// never block engine admission). The adapter's InjectEngineConfig is itself
-// idempotent, but already-injected pods are short-circuited at the handler
-// so the apiserver doesn't churn JSON patches on every re-admit.
+// never block engine admission). The adapter's InjectEngineConfig is the
+// source of truth for the full injected contract (env + arg) and is itself
+// idempotent at the merge level, so re-admission of an already-injected
+// pod produces an empty JSON-patch set and the handler does not need a
+// separate env-presence short-circuit. Trusting the adapter — rather than a
+// lenient env-only check at the handler — avoids the trap where a
+// partially-wired pod (e.g. only LMCACHE_REMOTE_URL set by hand) is
+// admitted permanently missing the rest of the wiring.
 package pod
