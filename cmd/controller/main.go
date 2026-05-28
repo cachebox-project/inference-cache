@@ -15,9 +15,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	"github.com/cachebox-project/inference-cache/internal/controller"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
@@ -126,6 +128,19 @@ func main() {
 		setupLog.Error(err, "unable to register webhook", "webhook", "CacheBackend")
 		os.Exit(1)
 	}
+
+	// The Pod admission handler uses the manager's APIReader (uncached
+	// live client) instead of the cached client: pod CREATE is a
+	// one-shot opportunity to inject, so a stale informer view of the
+	// owning CacheBackend (in particular a status.endpoint that lags
+	// reality) would leave the pod permanently unwired. Live reads also
+	// avoid a cold-cache window on controller startup.
+	mgr.GetWebhookServer().Register(podwebhook.WebhookPath, &webhook.Admission{
+		Handler: &podwebhook.EngineInjector{
+			Reader: mgr.GetAPIReader(),
+			Log:    ctrl.Log.WithName("webhooks").WithName("pod-injector"),
+		},
+	})
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
