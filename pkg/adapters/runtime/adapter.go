@@ -42,8 +42,17 @@ type KVCacheRuntimeAdapter interface {
 	// ResolveCacheServer renders the desired cache-server pod and service for
 	// this backend, when one is required. Returning (nil, nil, nil) is valid
 	// for backends that colocate with the engine (e.g. an in-process
-	// connector) and need no separate cache-server. The reconciler wraps the
-	// returned PodSpec into the appropriate workload kind and applies it.
+	// connector) and need no separate cache-server.
+	//
+	// The split between adapter and reconciler is deliberate:
+	//   - The adapter fills PodSpec.Containers / PodSpec.Volumes and
+	//     Service.Spec.Ports / Service.Spec.Type — the backend-specific
+	//     details that don't depend on the CacheBackend's identity.
+	//   - The reconciler fills ObjectMeta (name, namespace, labels, owner
+	//     refs), Service.Spec.Selector, replicas, and the workload kind
+	//     (Deployment vs StatefulSet) — the identity-dependent fields.
+	// An adapter rendering the same containers for two CacheBackends in
+	// different namespaces should not have to learn about names.
 	ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
 
 	// InjectEngineConfig mutates pod so the engine talks to the cache at
@@ -60,8 +69,8 @@ type KVCacheRuntimeAdapter interface {
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
-// supports a given (runtime, CacheBackend) pair. Admission (cf. C7) translates
-// this into a user-visible rejection; the reconciler logs and skips.
+// supports a given (runtime, CacheBackend) pair. An admission validator can
+// translate this into a user-visible rejection; the reconciler logs and skips.
 var ErrNoAdapter = errors.New("no runtime adapter supports the runtime/backend pair")
 
 // Registry holds the set of known [KVCacheRuntimeAdapter] implementations and
@@ -106,3 +115,14 @@ func (r *Registry) Select(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) 
 
 // Len reports the number of registered adapters. Mostly useful in tests.
 func (r *Registry) Len() int { return len(r.adapters) }
+
+// DefaultRegistry returns a Registry pre-populated with the runtime adapters
+// the controller ships with — currently the vLLM+LMCache adapter. The
+// reconciler builds one of these at startup; tests that need a specific
+// adapter set should construct their own [Registry] via [NewRegistry] +
+// [Registry.Register].
+func DefaultRegistry() *Registry {
+	r := NewRegistry()
+	r.Register(NewVLLMLMCacheAdapter())
+	return r
+}

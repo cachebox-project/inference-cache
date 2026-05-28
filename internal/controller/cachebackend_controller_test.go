@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -104,17 +105,17 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 		t.Fatalf("containers = %d, want 1", len(containers))
 	}
 	c := containers[0]
+	if c.Name != "lmcache-server" {
+		t.Fatalf("container name = %q, want lmcache-server (standalone server, not the all-in-one vLLM)", c.Name)
+	}
 	if c.Image == "" {
 		t.Fatalf("container image is empty")
 	}
-	if !containsStr(c.Args, "--kv-transfer-config") || !containsStr(c.Args, "--kv-events-config") || !containsStr(c.Args, "--enable-prefix-caching") {
-		t.Fatalf("args missing LMCache/KV-event flags: %v", c.Args)
+	if !containsStr(c.Command, "lmcache_server") {
+		t.Fatalf("container command = %v, want to start with lmcache_server", c.Command)
 	}
-	if !hasEnv(c.Env, "VLLM_USE_V1", "1") {
-		t.Fatalf("env missing VLLM_USE_V1=1: %v", c.Env)
-	}
-	if len(c.Ports) != 3 {
-		t.Fatalf("ports = %d, want 3 (http, kv-events, kv-replay)", len(c.Ports))
+	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 {
+		t.Fatalf("ports = %v, want exactly one port on 65432 (lm:// scheme)", c.Ports)
 	}
 
 	svc := &corev1.Service{}
@@ -124,17 +125,27 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
 	}
-	if len(svc.Spec.Ports) != 3 {
-		t.Fatalf("service ports = %d, want 3", len(svc.Spec.Ports))
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
+		t.Fatalf("service ports = %v, want exactly one port on 65432", svc.Spec.Ports)
 	}
 	if so := metav1.GetControllerOf(svc); so == nil || so.Name != "cache" {
 		t.Fatalf("service controller owner = %+v, want CacheBackend/cache", so)
 	}
+	wantSelector := map[string]string{
+		"app.kubernetes.io/name":       "cachebackend",
+		"app.kubernetes.io/instance":   "cache",
+		"app.kubernetes.io/managed-by": "inference-cache-controller",
+	}
+	for k, v := range wantSelector {
+		if svc.Spec.Selector[k] != v {
+			t.Fatalf("service selector[%q] = %q, want %q", k, svc.Spec.Selector[k], v)
+		}
+	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	wantEndpoint := "cache.ns1.svc.cluster.local:8000"
+	wantEndpoint := "cache.ns1.svc.cluster.local:65432"
 	if updated.Status.Endpoint != wantEndpoint {
-		t.Fatalf("status.endpoint = %q, want %q", updated.Status.Endpoint, wantEndpoint)
+		t.Fatalf("status.endpoint = %q, want %q (engine-agnostic host:port; lm:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
 	}
 	if updated.Status.Health != cachev1alpha1.CacheBackendHealthPending {
 		t.Fatalf("status.health = %q, want Pending (no ready replicas yet)", updated.Status.Health)
@@ -150,13 +161,13 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.BackendConfig = map[string]string{"image": "registry.example.com/vllm-lmcache:pinned"}
+	cb.Spec.BackendConfig = map[string]string{"serverImage": "registry.example.com/lmcache-server:pinned"}
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
 
 	dep := getDeployment(t, r, "cache", "ns1")
-	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/vllm-lmcache:pinned" {
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/lmcache-server:pinned" {
 		t.Fatalf("container image = %q, want overridden image", got)
 	}
 }
@@ -207,54 +218,25 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"image": "example.com/vllm-lmcache:v2"}
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v2"}
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
 	reconcile(t, r, "cache", "ns1")
 
-	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/vllm-lmcache:v2" {
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v2" {
 		t.Fatalf("deployment image = %q, want updated image", got)
 	}
 }
 
-func TestReconcileLMCacheProfileSwitchGPUToCPU(t *testing.T) {
-	scheme := newScheme(t)
-	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
-
-	reconcile(t, r, "cache", "ns1")
-	// GPU profile (default): GPU limit set, 8Gi shm.
-	c := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0]
-	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; !ok {
-		t.Fatalf("default profile should request a GPU")
-	}
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"profile": "cpu", "image": "vllm/vllm-openai-cpu:latest-arm64"}
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("switch to cpu profile: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	// CPU profile must reach the live Deployment: GPU limit gone, image swapped, shm 4Gi.
-	dep := getDeployment(t, r, "cache", "ns1")
-	c = dep.Spec.Template.Spec.Containers[0]
-	if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
-		t.Fatalf("GPU limit should be removed after switching to cpu profile")
-	}
-	if c.Image != "vllm/vllm-openai-cpu:latest-arm64" {
-		t.Fatalf("image = %q, want cpu image after profile switch", c.Image)
-	}
-	var shm *corev1.Volume
-	for i := range dep.Spec.Template.Spec.Volumes {
-		if dep.Spec.Template.Spec.Volumes[i].Name == "shm" {
-			shm = &dep.Spec.Template.Spec.Volumes[i]
-		}
-	}
-	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.SizeLimit == nil || shm.EmptyDir.SizeLimit.String() != "4Gi" {
-		t.Fatalf("shm size = %v, want 4Gi after switching to cpu profile", shm)
-	}
-}
+// TestReconcileLMCacheProfileSwitchGPUToCPU is retired: the "profile"
+// backendConfig key and the all-in-one vLLM+LMCache container shape it
+// switched between are gone. The CacheBackend now renders a CPU-only
+// standalone lmcache-server regardless of the engine the user runs
+// alongside it — engine choice (GPU vs CPU image) is the user's, not a
+// CacheBackend toggle. The substrate's CPU canary now exercises the engine
+// pod wiring (via the future mutating webhook), not a CacheBackend profile
+// switch.
 
 func TestReconcileLMCacheScalesReplicas(t *testing.T) {
 	scheme := newScheme(t)
@@ -378,7 +360,7 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("get service: %v", err)
 	}
-	svc.Spec.Ports = svc.Spec.Ports[:1]
+	svc.Spec.Ports = nil
 	if err := r.Update(context.Background(), &svc); err != nil {
 		t.Fatalf("drift service: %v", err)
 	}
@@ -387,8 +369,8 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("re-get service: %v", err)
 	}
-	if len(svc.Spec.Ports) != 3 {
-		t.Fatalf("service ports = %d, want 3 restored after drift", len(svc.Spec.Ports))
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
+		t.Fatalf("service ports = %v, want lm:// 65432 restored after drift", svc.Spec.Ports)
 	}
 }
 
@@ -467,7 +449,7 @@ func TestReconcileStatefulSetKindDeferred(t *testing.T) {
 		t.Fatalf("list deployments: %v", err)
 	}
 	if len(deps.Items) != 0 {
-		t.Fatalf("deployments = %d, want 0 (StatefulSet kind deferred to C3)", len(deps.Items))
+		t.Fatalf("deployments = %d, want 0 (StatefulSet kind deferred — managed Deployments only for now)", len(deps.Items))
 	}
 }
 
@@ -576,6 +558,263 @@ func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	}
 }
 
+func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
+	// Common user spellings ("vLLM", "VLLM") must route to the canonical
+	// RuntimeVLLM, not silently drop the CR into the unmanaged path.
+	for _, engine := range []string{"vLLM", "VLLM", "vllm"} {
+		t.Run(engine, func(t *testing.T) {
+			scheme := newScheme(t)
+			cb := lmcacheBackend("cache", "ns1")
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+			r := newReconciler(scheme, cb)
+
+			reconcile(t, r, "cache", "ns1")
+
+			dep, err := getOptionalDeployment(t, r, "cache", "ns1")
+			if err != nil {
+				t.Fatalf("expected a managed Deployment for engine=%q, got error: %v", engine, err)
+			}
+			if got := dep.Spec.Template.Spec.Containers[0].Name; got != "lmcache-server" {
+				t.Fatalf("container = %q, want lmcache-server (engine=%q must resolve to RuntimeVLLM)", got, engine)
+			}
+		})
+	}
+}
+
+func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
+	// Upgrading an existing Deployment that the retired colocated all-in-one
+	// builder created (single container named "vllm" referencing pod-level
+	// volumes "cache-home" + "shm") to the standalone shape (single
+	// container named "lmcache-server", no pod-level volumes) must REPLACE
+	// both the container set AND the dangling adapter-owned volumes. Leaving
+	// the old volumes would carry stale config from the previous shape
+	// forever.
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	r := newReconciler(scheme, cb)
+
+	// Seed the live Deployment with the old colocated container + volume
+	// shape so the reconciler's update path (not the create path) is exercised.
+	reconcile(t, r, "cache", "ns1")
+	live := getDeployment(t, r, "cache", "ns1")
+	live.Spec.Template.Spec.Containers = []corev1.Container{
+		{
+			Name:    "vllm",
+			Image:   "lmcache/vllm-openai:latest",
+			Command: []string{"vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"},
+			Args:    []string{"--enable-prefix-caching"},
+		},
+	}
+	live.Spec.Template.Spec.Volumes = []corev1.Volume{
+		{Name: "cache-home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+	}
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("seed pre-upgrade deployment: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	pod := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != "lmcache-server" {
+		t.Fatalf("containers = %v, want exactly 1 lmcache-server after upgrade", containerNames(pod.Containers))
+	}
+	for _, v := range pod.Volumes {
+		if v.Name == "cache-home" || v.Name == "shm" {
+			t.Fatalf("stale colocated-rendering volume %q survived the upgrade: %v", v.Name, volumeNames(pod.Volumes))
+		}
+	}
+}
+
+func volumeNames(vs []corev1.Volume) []string {
+	names := make([]string, len(vs))
+	for i := range vs {
+		names[i] = vs[i].Name
+	}
+	return names
+}
+
+func containerNames(cs []corev1.Container) []string {
+	names := make([]string, len(cs))
+	for i := range cs {
+		names[i] = cs[i].Name
+	}
+	return names
+}
+
+// The pod-spec reconcile helpers are tested as pure functions because the
+// fake client doesn't set CreationTimestamp on Update, which means the
+// CreateOrUpdate mutate path in applyDeployment always takes the "create"
+// branch (wholesale Spec copy). Testing the in-place update branch the way
+// real-apiserver reconciles take requires direct calls; an envtest covering
+// the same lives behind KUBEBUILDER_ASSETS.
+
+func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *testing.T) {
+	// Simulates a live Deployment from the previous colocated all-in-one
+	// rendering: a "vllm" container referencing pod-level cache-home + shm
+	// volumes.
+	live := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:    "vllm",
+				Image:   "lmcache/vllm-openai:latest",
+				Command: []string{"vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct"},
+			},
+		},
+		Volumes: []corev1.Volume{
+			{Name: "cache-home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		},
+	}
+	// The standalone desired shape: a "lmcache-server" container, no
+	// pod-level volumes.
+	desired := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:    "lmcache-server",
+				Image:   "lmcache/standalone:latest",
+				Command: []string{"lmcache_server"},
+				Args:    []string{"0.0.0.0", "65432", "cpu"},
+			},
+		},
+	}
+
+	reconcileManagedPodSpec(live, desired)
+
+	if len(live.Containers) != 1 || live.Containers[0].Name != "lmcache-server" {
+		t.Fatalf("containers = %v, want exactly [lmcache-server] after upgrade", containerNames(live.Containers))
+	}
+	if len(live.Volumes) != 0 {
+		t.Fatalf("Volumes = %v, want empty after upgrade (stale colocated-rendering volumes must be pruned)", volumeNames(live.Volumes))
+	}
+}
+
+func TestReconcileManagedPodSpecAdoptsAdapterVolumesOnSteadyStateUpdate(t *testing.T) {
+	// Volumes are adapter-owned (per the KVCacheRuntimeAdapter contract), so
+	// the reconciler always propagates them from desired — even on a
+	// same-container reconcile. This corrects out-of-band drift and lets an
+	// adapter add/change pod-level volumes without simultaneously changing
+	// the container set.
+	live := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache/standalone:v1"}},
+		Volumes: []corev1.Volume{
+			{Name: "drift", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		},
+	}
+	desired := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache/standalone:v2"}},
+		Volumes: []corev1.Volume{
+			{Name: "intended", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		},
+	}
+
+	reconcileManagedPodSpec(live, desired)
+
+	if got := live.Containers[0].Image; got != "lmcache/standalone:v2" {
+		t.Fatalf("container image = %q, want updated to v2", got)
+	}
+	if len(live.Volumes) != 1 || live.Volumes[0].Name != "intended" {
+		t.Fatalf("Volumes = %v, want adapter-owned [intended] (drift corrected)", volumeNames(live.Volumes))
+	}
+}
+
+func TestReconcileManagedPodSpecCopiesOverrideFields(t *testing.T) {
+	// The pod-level override fields the controller owns must be reconciled
+	// from desired even on the in-place update path.
+	live := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "lmcache-server"}},
+	}
+	gracePeriod := int64(45)
+	desired := &corev1.PodSpec{
+		Containers:                    []corev1.Container{{Name: "lmcache-server"}},
+		NodeSelector:                  map[string]string{"accelerator": "h100"},
+		ServiceAccountName:            "backend-sa",
+		SchedulerName:                 "custom-scheduler",
+		PriorityClassName:             "high",
+		TerminationGracePeriodSeconds: &gracePeriod,
+	}
+
+	reconcileManagedPodSpec(live, desired)
+
+	if live.NodeSelector["accelerator"] != "h100" {
+		t.Fatalf("NodeSelector not reconciled: %v", live.NodeSelector)
+	}
+	if live.ServiceAccountName != "backend-sa" {
+		t.Fatalf("ServiceAccountName = %q, want backend-sa", live.ServiceAccountName)
+	}
+	if live.SchedulerName != "custom-scheduler" {
+		t.Fatalf("SchedulerName = %q, want custom-scheduler", live.SchedulerName)
+	}
+	if live.PriorityClassName != "high" {
+		t.Fatalf("PriorityClassName = %q, want high", live.PriorityClassName)
+	}
+	if live.TerminationGracePeriodSeconds == nil || *live.TerminationGracePeriodSeconds != 45 {
+		t.Fatalf("TerminationGracePeriodSeconds = %v, want 45", live.TerminationGracePeriodSeconds)
+	}
+}
+
+func TestReconcileManagedContainerUpdatesInPlace(t *testing.T) {
+	// Same-name container update: adapter-owned fields propagate from
+	// desired — including Ports and probes, since the Service targets the
+	// container's named port and Ready is gated on the probe. The adapter
+	// renders Port.Protocol explicitly (ProtocolTCP), so the copy doesn't
+	// churn against API-server defaulting.
+	live := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:    "lmcache-server",
+				Image:   "lmcache/standalone:v1",
+				Command: []string{"old"},
+				Args:    []string{"--old"},
+				Env:     []corev1.EnvVar{{Name: "OLD", Value: "x"}},
+				Ports:   []corev1.ContainerPort{{Name: "stale", ContainerPort: 1234, Protocol: corev1.ProtocolTCP}},
+			},
+		},
+	}
+	newProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("lmcache")},
+		},
+	}
+	desired := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:           "lmcache-server",
+				Image:          "lmcache/standalone:v2",
+				Command:        []string{"new"},
+				Args:           []string{"--new"},
+				Env:            []corev1.EnvVar{{Name: "NEW", Value: "y"}},
+				Ports:          []corev1.ContainerPort{{Name: "lmcache", ContainerPort: 65432, Protocol: corev1.ProtocolTCP}},
+				ReadinessProbe: newProbe,
+			},
+		},
+	}
+
+	reconcileManagedContainer(live, desired)
+
+	c := live.Containers[0]
+	if c.Image != "lmcache/standalone:v2" || c.Command[0] != "new" || c.Args[0] != "--new" {
+		t.Fatalf("spec-driven fields not updated: image=%q command=%v args=%v", c.Image, c.Command, c.Args)
+	}
+	if len(c.Env) != 1 || c.Env[0].Name != "NEW" {
+		t.Fatalf("Env = %v, want [NEW=y]", c.Env)
+	}
+	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 || c.Ports[0].Name != "lmcache" {
+		t.Fatalf("Ports = %v, want desired [lmcache:65432] (Service TargetPort lookups depend on this)", c.Ports)
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.TCPSocket == nil {
+		t.Fatalf("ReadinessProbe = %v, want desired TCP probe propagated", c.ReadinessProbe)
+	}
+}
+
+func TestReconcileManagedContainerEmptyDesiredIsNoop(t *testing.T) {
+	live := &corev1.PodSpec{Containers: []corev1.Container{{Name: "lmcache-server"}}}
+	reconcileManagedContainer(live, &corev1.PodSpec{})
+	if len(live.Containers) != 1 || live.Containers[0].Name != "lmcache-server" {
+		t.Fatalf("empty desired must not touch live; got %v", containerNames(live.Containers))
+	}
+}
+
 func TestReconcileIgnoresMissingObject(t *testing.T) {
 	scheme := newScheme(t)
 	r := newReconciler(scheme)
@@ -587,15 +826,6 @@ func containsStr(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {
 			return true
-		}
-	}
-	return false
-}
-
-func hasEnv(env []corev1.EnvVar, name, value string) bool {
-	for _, e := range env {
-		if e.Name == name {
-			return e.Value == value
 		}
 	}
 	return false

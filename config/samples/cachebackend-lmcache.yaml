@@ -1,15 +1,23 @@
-# A managed LMCache backend the controller reconciles into a Deployment +
-# Service (and optionally a PVC + HPA). The Deployment is templated from the
-# vLLM + LMCache reference stack (docs/reference-stack/manifests/deployment.yaml).
+# A managed LMCache backend the controller reconciles into a standalone
+# lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
+# spec.engineSelector identifies the pods a future mutating webhook will
+# wire to the resolved cache endpoint published in status.endpoint (as an
+# engine-agnostic host:port — the adapter adds the lm:// scheme on the
+# engine env). Until
+# that webhook lands, the engine-side env vars + `--kv-transfer-config`
+# arg must be set manually (see the runtime adapter for the exact set:
+# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
+# VLLM_USE_V1).
 #
-# This sample is ephemeral and single-replica. Add spec.storage.pvc for
-# persistent cache state, or spec.autoscaling for CPU-driven HPA scaling.
-# Persistent storage currently requires a single replica (per-replica PVCs are
-# a follow-up); the controller marks spec.storage.pvc + multi-replica as Failed
-# via status (Reason=InvalidStorageConfiguration) and refuses to apply.
+# Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
+# canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler
+# from spec.autoscaling. spec.storage.pvc is accepted for forward-compat —
+# the requested size is mirrored to status.capacity — but mounting the PVC
+# into the standalone lmcache-server's data directory is deferred to a
+# follow-up module.
 #
-# image/model default to the reference stack's vLLM+LMCache image and gated
-# model; override them via backendConfig until first-class spec fields land.
+# Override the lmcache-server image (defaults to lmcache/standalone:latest)
+# or the server command via backendConfig until first-class spec fields land.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -21,11 +29,17 @@ spec:
   deploymentKind: Deployment
   replicas: 1
   integration:
-    engine: vLLM
+    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
+    engine: vllm
     role: ReadWrite
     lookupTimeoutMs: 20
     minimumPrefixTokens: 32
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
   backendConfig:
-    # Pin to a real digest for non-local runs (see docs/reference-stack/VERSIONS.md).
-    image: lmcache/vllm-openai:latest
-    model: meta-llama/Llama-3.1-8B-Instruct
+    # Pin to a real digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+    # LMCache server storage device; "cpu" (in-memory) is the supported default.
+    # Override `serverCommand` to switch to the newer
+    # `python3 -m lmcache.v1.multiprocess.server` form once stabilised.

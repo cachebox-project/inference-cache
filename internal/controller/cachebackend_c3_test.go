@@ -14,8 +14,10 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// ---- PVC reconciliation -----------------------------------------------------
-
+// persistentBackend constructs a CacheBackend that carries spec.storage.pvc,
+// used to drive the status.capacity surface (the PVC itself isn't wired to a
+// volume yet post-C6 — that's a follow-up — but the requested size is still
+// surfaced for operators to plan against).
 func persistentBackend(name, namespace, size string, storageClass *string) *cachev1alpha1.CacheBackend {
 	cb := lmcacheBackend(name, namespace)
 	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
@@ -25,150 +27,6 @@ func persistentBackend(name, namespace, size string, storageClass *string) *cach
 		},
 	}
 	return cb
-}
-
-func getPVC(t *testing.T, r *CacheBackendReconciler, name, namespace string) *corev1.PersistentVolumeClaim {
-	t.Helper()
-	var pvc corev1.PersistentVolumeClaim
-	if err := r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &pvc); err != nil {
-		t.Fatalf("get PVC %s/%s: %v", namespace, name, err)
-	}
-	return &pvc
-}
-
-func TestReconcilePVCCreatedWhenPersistent(t *testing.T) {
-	scheme := newScheme(t)
-	sc := "fast"
-	cb := persistentBackend("cache", "ns1", "20Gi", &sc)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	pvc := getPVC(t, r, "cache", "ns1")
-	if got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "20Gi" {
-		t.Fatalf("PVC size = %q, want 20Gi", got.String())
-	}
-	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "fast" {
-		t.Fatalf("PVC storageClassName = %v, want fast", pvc.Spec.StorageClassName)
-	}
-	owner := metav1.GetControllerOf(pvc)
-	if owner == nil || owner.Kind != "CacheBackend" || owner.Name != "cache" {
-		t.Fatalf("PVC controller owner = %+v, want CacheBackend/cache", owner)
-	}
-
-	// Pod template mounts the PVC at cache-home.
-	dep := getDeployment(t, r, "cache", "ns1")
-	var cacheHome *corev1.Volume
-	for i := range dep.Spec.Template.Spec.Volumes {
-		v := dep.Spec.Template.Spec.Volumes[i]
-		if v.Name == "cache-home" {
-			cacheHome = &v
-			break
-		}
-	}
-	if cacheHome == nil || cacheHome.PersistentVolumeClaim == nil || cacheHome.PersistentVolumeClaim.ClaimName != "cache" {
-		t.Fatalf("cache-home volume should reference PVC 'cache', got %+v", cacheHome)
-	}
-	if cacheHome.EmptyDir != nil {
-		t.Fatalf("cache-home volume should not also be EmptyDir when persistent: %+v", cacheHome.EmptyDir)
-	}
-}
-
-func TestReconcileNoPVCWhenEphemeral(t *testing.T) {
-	scheme := newScheme(t)
-	cb := lmcacheBackend("cache", "ns1")
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	var pvcs corev1.PersistentVolumeClaimList
-	if err := r.List(context.Background(), &pvcs); err != nil {
-		t.Fatalf("list PVCs: %v", err)
-	}
-	if len(pvcs.Items) != 0 {
-		t.Fatalf("PVCs = %d, want 0 when storage is not requested", len(pvcs.Items))
-	}
-	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "" {
-		t.Fatalf("status.capacity = %q, want empty for ephemeral backend", got)
-	}
-}
-
-func TestReconcilePVCKeptWhenStorageRemoved(t *testing.T) {
-	// Removing spec.storage from a persistent backend must NOT auto-delete the
-	// PVC — silent data loss in response to a spec edit is a serious footgun.
-	// The PVC stays owner-referenced so it is GC'd when the CR is deleted.
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "10Gi", nil)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-	pvcUID := getPVC(t, r, "cache", "ns1").UID
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Storage = nil
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("update backend: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	// PVC must still exist, with the same identity.
-	pvc := getPVC(t, r, "cache", "ns1")
-	if pvc.UID != pvcUID {
-		t.Fatalf("PVC UID changed after spec.storage removed: %q -> %q (PVC was recreated)", pvcUID, pvc.UID)
-	}
-	// Pod volume source should have reverted to EmptyDir so the pod still starts.
-	dep := getDeployment(t, r, "cache", "ns1")
-	for i := range dep.Spec.Template.Spec.Volumes {
-		v := dep.Spec.Template.Spec.Volumes[i]
-		if v.Name == "cache-home" && v.EmptyDir == nil {
-			t.Fatalf("cache-home volume should revert to EmptyDir after spec.storage removed, got %+v", v.VolumeSource)
-		}
-	}
-}
-
-func TestReconcilePVCSizePatchedOnUpdate(t *testing.T) {
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "10Gi", nil)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Storage.PVC.Size = resource.MustParse("25Gi")
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("update size: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	pvc := getPVC(t, r, "cache", "ns1")
-	if got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "25Gi" {
-		t.Fatalf("PVC size after update = %q, want 25Gi", got.String())
-	}
-}
-
-func TestReconcilePVCKeptOnSwitchToExternal(t *testing.T) {
-	// Switching a managed backend to External is a spec edit. Like the
-	// storage-drop path, the PVC is preserved to avoid silent data loss on a
-	// mistaken edit. Owner-ref GC still cleans it up when the CR is deleted.
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "10Gi", nil)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-	pvcUID := getPVC(t, r, "cache", "ns1").UID
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	live.Spec.Endpoint = "external.ns1.svc:8080"
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("switch to external: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	pvc := getPVC(t, r, "cache", "ns1")
-	if pvc.UID != pvcUID {
-		t.Fatalf("PVC UID changed after switch to External: %q -> %q", pvcUID, pvc.UID)
-	}
 }
 
 // ---- HPA reconciliation -----------------------------------------------------
@@ -284,6 +142,33 @@ func TestReconcileHPADeletedWhenAutoscalingCleared(t *testing.T) {
 	}
 	if len(hpas.Items) != 0 {
 		t.Fatalf("HPAs = %d, want 0 after autoscaling cleared", len(hpas.Items))
+	}
+}
+
+func TestReconcileHPACleanedUpOnSwitchToExternal(t *testing.T) {
+	// Switching to an External backend sheds all managed children, including
+	// the HPA.
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 1, 3, nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	_ = getHPA(t, r, "cache", "ns1")
+
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	live.Spec.Endpoint = "external.ns1.svc:8080"
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("switch to external: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(hpas.Items) != 0 {
+		t.Fatalf("HPAs = %d, want 0 after switch to External", len(hpas.Items))
 	}
 }
 
@@ -429,6 +314,9 @@ func TestStatusProgressingFalseWhenDegraded(t *testing.T) {
 }
 
 func TestStatusCapacityReflectsPVCSize(t *testing.T) {
+	// The PVC isn't wired to a volume yet (deferred to a follow-up post-C6),
+	// but the requested size is still surfaced so operators can plan against
+	// the eventual capacity.
 	scheme := newScheme(t)
 	cb := persistentBackend("cache", "ns1", "20Gi", nil)
 	r := newReconciler(scheme, cb)
@@ -437,6 +325,17 @@ func TestStatusCapacityReflectsPVCSize(t *testing.T) {
 
 	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "20Gi" {
 		t.Fatalf("status.capacity = %q, want 20Gi", got)
+	}
+}
+
+func TestStatusCapacityEmptyForEphemeralBackend(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+
+	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "" {
+		t.Fatalf("status.capacity = %q, want empty for ephemeral backend", got)
 	}
 }
 
@@ -464,7 +363,7 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 	}
 }
 
-// ---- progressingFromHealth pure-function coverage ---------------------------
+// ---- Pure-function coverage -------------------------------------------------
 
 func TestProgressingFromHealthExhaustive(t *testing.T) {
 	cases := []struct {
@@ -499,8 +398,6 @@ func TestManagedCapacity(t *testing.T) {
 		t.Fatalf("persistent capacity = %q, want 50Gi", got)
 	}
 }
-
-// ---- HPA-aware health -------------------------------------------------------
 
 func TestDesiredReplicasPrefersHPAWhenAutoscalingSet(t *testing.T) {
 	cb := autoscalingBackend("cache", "ns1", 1, 5, nil)
@@ -544,96 +441,5 @@ func newDep(replicas int32) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Generation: 1},
 		Spec:       appsv1.DeploymentSpec{Replicas: &r},
-	}
-}
-
-// ---- Resource requests for HPA-friendly scaling -----------------------------
-
-// ---- Invalid-spec handling (PVC + multi-replica) ----------------------------
-
-func TestReconcilePersistentMultiReplicaMarksFailed(t *testing.T) {
-	// PVC + replicas > 1 is unsafe with a single ReadWriteOnce PVC. The
-	// controller refuses to apply children and surfaces the error via status.
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "10Gi", nil)
-	cb.Spec.Replicas = ptrInt32(3)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	// No children applied for the invalid spec.
-	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err == nil {
-		t.Fatalf("expected no Deployment for invalid spec")
-	}
-	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthFailed {
-		t.Fatalf("status.health = %q, want Failed", updated.Status.Health)
-	}
-	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidStorageConfiguration" {
-		t.Fatalf("Ready condition = %+v, want False/InvalidStorageConfiguration", cond)
-	}
-}
-
-func TestReconcilePersistentAutoscalingMaxRepliasMarksFailed(t *testing.T) {
-	scheme := newScheme(t)
-	cb := persistentBackend("cache", "ns1", "10Gi", nil)
-	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 4}
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthFailed {
-		t.Fatalf("status.health = %q, want Failed", updated.Status.Health)
-	}
-}
-
-// ---- Resources upgrade path -------------------------------------------------
-
-func TestReconcileAdoptsResourcesOnUpgrade(t *testing.T) {
-	// Pre-existing C2-era Deployments lack CPU/memory requests. The new HPA
-	// depends on a CPU request being present, so the update path must
-	// reconcile Resources onto the live container, not just image/args/env.
-	scheme := newScheme(t)
-	cb := lmcacheBackend("cache", "ns1")
-	r := newReconciler(scheme, cb)
-	reconcile(t, r, "cache", "ns1")
-
-	// Simulate an older Deployment in the cluster: empty Resources.
-	dep := getDeployment(t, r, "cache", "ns1")
-	dep.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
-	if err := r.Update(context.Background(), dep); err != nil {
-		t.Fatalf("blank container resources: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	dep = getDeployment(t, r, "cache", "ns1")
-	got := dep.Spec.Template.Spec.Containers[0].Resources.Requests
-	if got == nil {
-		t.Fatalf("expected requests to be reconciled onto upgraded container")
-	}
-	cpu, ok := got[corev1.ResourceCPU]
-	if !ok || cpu.IsZero() {
-		t.Fatalf("container CPU request after reconcile = %v, want non-zero", got)
-	}
-}
-
-func TestLMCacheContainerHasCPURequest(t *testing.T) {
-	// HPA CPU utilization is computed against the pod's CPU request; without
-	// it, the HPA never gets usable metrics and never scales. Regression test
-	// for a Codex review finding.
-	scheme := newScheme(t)
-	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
-	reconcile(t, r, "cache", "ns1")
-
-	dep := getDeployment(t, r, "cache", "ns1")
-	c := dep.Spec.Template.Spec.Containers[0]
-	cpu, ok := c.Resources.Requests[corev1.ResourceCPU]
-	if !ok || cpu.IsZero() {
-		t.Fatalf("container should declare a CPU request for HPA, got requests=%v", c.Resources.Requests)
-	}
-	if _, ok := c.Resources.Requests[corev1.ResourceMemory]; !ok {
-		t.Fatalf("container should declare a memory request, got requests=%v", c.Resources.Requests)
 	}
 }

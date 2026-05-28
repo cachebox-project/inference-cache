@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,7 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // Status condition types published on a managed CacheBackend.
@@ -64,6 +65,10 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
+	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
+	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
+	// that need a custom adapter set.
+	Registry *adapterruntime.Registry
 }
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
@@ -72,15 +77,16 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile drives a CacheBackend toward its desired state. External backends only
-// mirror their configured endpoint to status; managed backends (LMCache in Phase 1)
-// template a Deployment + Service (+ optional PVC + HPA) from the reference stack
-// and own them via owner references so they are garbage-collected with the CR.
+// Reconcile drives a CacheBackend toward its desired state. External backends
+// only mirror their configured endpoint to status; managed backends (LMCache
+// in Phase 1) ask the registered runtime adapter for the cache-server pod
+// spec + service spec, wrap them into a Deployment + Service the controller
+// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
+// resolved endpoint.
 //
 // On every successful reconcile, transitions in the observed backend health
 // (entering/leaving Degraded) and in the effective spec.integration.failOpen
@@ -119,25 +125,49 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
-	builder, ok := backendadapter.For(backend.Spec.Type)
-	if !ok {
-		// Only LMCache is managed in Phase 1 (C2). Other managed types are out of
-		// scope here; shed any workload from a previous managed generation.
-		logger.V(1).Info("no managed builder for backend type",
-			"type", backend.Spec.Type, "namespace", backend.Namespace, "name", backend.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
-	}
-
-	// C3 ships Deployment + optional PVC + optional HPA. StatefulSet (per-replica
-	// PVCs via volumeClaimTemplates) is a later module — the LMCache single-pod
-	// shape Phase 1 targets is covered by a Deployment + a single shared PVC.
+	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later module.
+	// Phase 1 manages a Deployment only — a single shared PVC mounted by a
+	// single-replica Deployment covers the LMCache common shape.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
 		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	return r.reconcileManaged(ctx, logger, backend, builder)
+	registry := r.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := resolveRuntimeID(backend)
+	adapter, err := registry.Select(runtimeID, backend)
+	if err != nil {
+		// No adapter knows how to wire this (runtime, backend) pair. Shed any
+		// previously managed workload and log; a future admission validator
+		// will surface the same condition as a user-visible rejection.
+		logger.V(1).Info("no runtime adapter for backend",
+			"runtime", runtimeID, "type", backend.Spec.Type,
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+
+	return r.reconcileManaged(ctx, logger, backend, adapter)
+}
+
+// resolveRuntimeID picks the [adapterruntime.RuntimeID] the reconciler asks
+// the registry to match. The CacheBackend carries the engine name in
+// Spec.Integration.Engine; when unset, vLLM is the Phase-1 default (the only
+// engine the shipping adapters target).
+//
+// Engine values are normalised to lower-case so common spellings ("vLLM",
+// "VLLM", "SGLang") route to the canonical RuntimeID constants
+// ([adapterruntime.RuntimeVLLM] etc.); a free-form string in the CR should
+// never silently drop a CacheBackend into the unmanaged path just because of
+// case.
+func resolveRuntimeID(backend *cachev1alpha1.CacheBackend) adapterruntime.RuntimeID {
+	if backend.Spec.Integration != nil && backend.Spec.Integration.Engine != "" {
+		return adapterruntime.RuntimeID(strings.ToLower(backend.Spec.Integration.Engine))
+	}
+	return adapterruntime.RuntimeVLLM
 }
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
@@ -153,7 +183,8 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 }
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
-// for a backend this module no longer provisions (unsupported type or deferred kind).
+// for a backend this module no longer provisions (unsupported runtime/backend or
+// deferred kind).
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -168,65 +199,173 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	})
 }
 
-// reconcileManaged templates and applies the child workload, then publishes status.
-func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, builder backendadapter.Builder) (ctrl.Result, error) {
-	if reason, msg, ok := validateManagedSpec(backend); !ok {
-		// Don't tear down whatever's already running — keep the in-flight
-		// workload visible to the user while they fix the spec. We just refuse
-		// to propagate the unsafe combination further.
-		logger.V(1).Info("CacheBackend spec is invalid; not applying children",
-			"namespace", backend.Namespace, "name", backend.Name, "reason", reason)
-		return ctrl.Result{}, r.markInvalidSpec(ctx, backend, reason, msg)
-	}
-
-	workload, err := builder.Build(backend)
+// reconcileManaged renders the cache-server PodSpec + Service via the runtime
+// adapter, wraps them into a Deployment + Service owned by the CR, and
+// publishes the resolved endpoint to status.
+func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
+	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("build workload for %s/%s: %w", backend.Namespace, backend.Name, err)
+		return ctrl.Result{}, fmt.Errorf("resolve cache server for %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	if podSpec == nil || svcSpec == nil {
+		// An adapter that genuinely needs no cache-server (e.g. an
+		// engine-colocated backend) is a valid future case. For Phase 1 it
+		// shouldn't happen for managed types — surface as unmanaged.
+		logger.V(1).Info("adapter rendered no cache-server; treating as unmanaged",
+			"namespace", backend.Namespace, "name", backend.Name)
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	// PVC first: the Deployment references the PVC by name, so the claim should
-	// exist before the workload pod schedules. Apply order doesn't gate
-	// reconciliation correctness (k8s tolerates missing PVCs while a pod is
-	// pending), but it keeps the time-to-Ready window minimal on first apply.
-	if err := r.reconcilePVC(ctx, backend, workload.PVC); err != nil {
+	dep := r.buildDeployment(backend, podSpec)
+	svc := r.buildService(backend, svcSpec)
+
+	if err := r.applyDeployment(ctx, backend, dep); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.applyDeployment(ctx, backend, workload.Deployment); err != nil {
+	if err := r.applyService(ctx, backend, svc); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.applyService(ctx, backend, workload.Service); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.reconcileHPA(ctx, backend, workload.Deployment); err != nil {
+	if err := r.reconcileHPA(ctx, backend, dep); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	var dep appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workload.Deployment), &dep); err != nil {
-		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", workload.Deployment.Namespace, workload.Deployment.Name, err)
+	var live appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
+		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
 
-	if err := r.updateManagedStatus(ctx, backend, workload.Endpoint, &dep); err != nil {
+	endpoint := serviceEndpoint(svc)
+	if err := r.updateManagedStatus(ctx, backend, endpoint, &live); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
-		"namespace", backend.Namespace, "name", backend.Name, "endpoint", workload.Endpoint)
+		"namespace", backend.Namespace, "name", backend.Name, "endpoint", endpoint)
 	return ctrl.Result{}, nil
+}
+
+// buildDeployment wraps the adapter-rendered PodSpec into a Deployment the
+// controller owns: ObjectMeta + labels + replicas + selector come from the
+// CacheBackend identity, not the adapter.
+func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBackend, podSpec *corev1.PodSpec) *appsv1.Deployment {
+	replicas := initialReplicas(backend)
+	selector := selectorLabels(backend.Name)
+	podLabels := podTemplateLabels(backend)
+
+	pod := podSpec.DeepCopy()
+	applyPodOverrides(pod, backend.Spec.Template)
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backend.Name,
+			Namespace: backend.Namespace,
+			Labels:    podLabels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec:       *pod,
+			},
+		},
+	}
+}
+
+// buildService wraps the adapter-rendered Service spec into a Service the
+// controller owns: ObjectMeta + Selector come from the CacheBackend identity.
+// Adapter-provided fields (Spec.Type, Spec.Ports) are preserved as-is.
+func (r *CacheBackendReconciler) buildService(backend *cachev1alpha1.CacheBackend, src *corev1.Service) *corev1.Service {
+	selector := selectorLabels(backend.Name)
+	labels := podTemplateLabels(backend)
+	out := src.DeepCopy()
+	out.ObjectMeta = metav1.ObjectMeta{
+		Name:      backend.Name,
+		Namespace: backend.Namespace,
+		Labels:    labels,
+	}
+	out.Spec.Selector = selector
+	if out.Spec.Type == "" {
+		out.Spec.Type = corev1.ServiceTypeClusterIP
+	}
+	return out
+}
+
+// selectorLabels are the immutable identity labels for a backend's child objects.
+func selectorLabels(name string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":       "cachebackend",
+		"app.kubernetes.io/instance":   name,
+		"app.kubernetes.io/managed-by": "inference-cache-controller",
+	}
+}
+
+// podTemplateLabels add backend-type identity on top of the selector labels.
+// The backend-type label is informational (kubectl filtering); the controller
+// only relies on the selector labels.
+func podTemplateLabels(backend *cachev1alpha1.CacheBackend) map[string]string {
+	labels := selectorLabels(backend.Name)
+	if t := string(backend.Spec.Type); t != "" {
+		labels["inferencecache.io/backend-type"] = t
+	}
+	return labels
+}
+
+// applyPodOverrides copies optional pod-level scheduling/security overrides
+// from the spec onto the rendered pod spec. Server-defaulted fields
+// (schedulerName, terminationGracePeriodSeconds) are always set to their
+// defaults when unset so the rendered template matches the API-server-
+// defaulted object and updates don't churn.
+func applyPodOverrides(spec *corev1.PodSpec, override *cachev1alpha1.CacheBackendPodSpecOverride) {
+	if spec.SchedulerName == "" {
+		spec.SchedulerName = "default-scheduler"
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		defaultGrace := int64(30)
+		spec.TerminationGracePeriodSeconds = &defaultGrace
+	}
+	if override == nil {
+		return
+	}
+	spec.NodeSelector = override.NodeSelector
+	spec.Affinity = override.Affinity
+	spec.Tolerations = override.Tolerations
+	spec.TopologySpreadConstraints = override.TopologySpreadConstraints
+	spec.ImagePullSecrets = override.ImagePullSecrets
+	spec.ServiceAccountName = override.ServiceAccountName
+	spec.SecurityContext = override.SecurityContext
+	spec.PriorityClassName = override.PriorityClassName
+	spec.RuntimeClassName = override.RuntimeClassName
+	if override.SchedulerName != "" {
+		spec.SchedulerName = override.SchedulerName
+	}
+	if override.TerminationGracePeriodSeconds != nil {
+		spec.TerminationGracePeriodSeconds = override.TerminationGracePeriodSeconds
+	}
+}
+
+// serviceEndpoint formats the published cache endpoint as host:port using the
+// service's first port. Engine-protocol prefixes (e.g. lm:// for LMCache) are
+// the adapter's responsibility — status.endpoint stays engine-agnostic.
+func serviceEndpoint(svc *corev1.Service) string {
+	if len(svc.Spec.Ports) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s.%s.svc.cluster.local:%d", svc.Name, svc.Namespace, svc.Spec.Ports[0].Port)
 }
 
 // applyDeployment creates or updates the backend Deployment idempotently, owned by the CR.
 //
 // On create we establish the full templated spec. On update we touch only the
 // fields this module owns (replicas + the managed container's image/command/
-// args/env, plus volume sources for cache-home switching between EmptyDir and
-// a PVC) and leave everything else intact — overwriting the whole PodTemplate
+// args/env) and leave everything else intact — overwriting the whole PodTemplate
 // would strip API-server-defaulted fields (port Protocol, RestartPolicy, probe
 // thresholds, ...), and since those are re-defaulted on every write it would spin
 // a perpetual update loop via the Owns(Deployment) watch.
 //
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
-// HPA's replica count rather than overwriting it.
+// HPA's replica count rather than overwriting it — re-asserting replicas on
+// every reconcile would fight the HPA and churn the rollout.
 func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.Deployment) error {
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
@@ -273,38 +412,277 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 	return nil
 }
 
-// reconcilePVC creates or updates the PVC backing the cache-home volume when the
-// spec requests persistent storage. When the spec drops persistence the existing
-// PVC is intentionally NOT deleted — destroying persistent storage in response to
-// a spec edit risks silent data loss. The orphaned PVC carries an owner reference,
-// so it is still GC'd when the CacheBackend itself is deleted.
+// reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
+// place: the managed container's image/command/args/env, plus the pod-level
+// override fields. API-server-defaulted fields we don't own (RestartPolicy,
+// DNSPolicy, probe thresholds, port Protocol, ...) are left untouched so the
+// update does not churn. The desired pod spec already carries the canonical
+// defaults for the server-defaulted override fields (schedulerName,
+// terminationGracePeriodSeconds), so copying them is idempotent.
 //
-// On update the requested size is the only mutable spec field we patch
-// (StorageClassName is immutable in k8s; access modes are stable for ROW PVCs).
-// PVC size shrinks aren't allowed by k8s, so the user must size up over time.
-func (r *CacheBackendReconciler) reconcilePVC(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *corev1.PersistentVolumeClaim) error {
-	if desired == nil {
+// Volumes are adapter-owned (per [adapterruntime.KVCacheRuntimeAdapter] — the
+// adapter fills PodSpec.Containers + PodSpec.Volumes) and are not
+// API-server-defaulted in a Deployment template, so the reconciler always
+// propagates them from desired. That corrects two cases the previous
+// gated-on-container-set-change behaviour missed:
+//   - Out-of-band volume drift on a steady-state Deployment.
+//   - An adapter update that adds/changes pod-level volumes without changing
+//     the container set.
+//
+// The current LMCache adapter renders no pod-level volumes, so this is a
+// no-op for the steady-state path; on an in-place upgrade from the previous
+// colocated all-in-one rendering it still prunes the stale cache-home + shm
+// volumes that container left behind.
+func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
+	reconcileManagedContainer(live, desired)
+	live.Volumes = desired.Volumes
+
+	live.NodeSelector = desired.NodeSelector
+	live.Affinity = desired.Affinity
+	live.Tolerations = desired.Tolerations
+	live.TopologySpreadConstraints = desired.TopologySpreadConstraints
+	live.ImagePullSecrets = desired.ImagePullSecrets
+	live.ServiceAccountName = desired.ServiceAccountName
+	live.SecurityContext = desired.SecurityContext
+	live.PriorityClassName = desired.PriorityClassName
+	live.SchedulerName = desired.SchedulerName
+	live.RuntimeClassName = desired.RuntimeClassName
+	live.TerminationGracePeriodSeconds = desired.TerminationGracePeriodSeconds
+}
+
+// reconcileManagedContainer updates the spec-driven fields of the managed backend
+// container in place, leaving API-server-defaulted container fields untouched.
+//
+// Containers in live whose names are not in desired are dropped — this is the
+// upgrade path from a previous colocated all-in-one rendering (container
+// name "vllm") to the standalone topology (container name "lmcache-server"):
+// an in-place upgrade must replace the old managed container, not stack the
+// new one alongside it. We never drop containers that match a desired name
+// (we only update their managed fields), so a Deployment carrying sidecars
+// in addition to the managed container loses the sidecars — sidecars were
+// not supported in the previous rendering and remain unsupported here.
+func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
+	if len(desired.Containers) == 0 {
+		return
+	}
+	desiredNames := make(map[string]int, len(desired.Containers))
+	for i := range desired.Containers {
+		desiredNames[desired.Containers[i].Name] = i
+	}
+
+	// First pass: drop any live container whose name isn't desired (the
+	// upgrade-from-previous-managed-shape case).
+	kept := live.Containers[:0]
+	for i := range live.Containers {
+		if _, ok := desiredNames[live.Containers[i].Name]; ok {
+			kept = append(kept, live.Containers[i])
+		}
+	}
+	live.Containers = kept
+
+	// Second pass: for each desired container, update the matching live one
+	// in place (preserving API-server-defaulted fields) or append it.
+	for i := range desired.Containers {
+		want := desired.Containers[i]
+		matched := false
+		for j := range live.Containers {
+			if live.Containers[j].Name == want.Name {
+				// Adapter-owned fields the reconciler propagates from desired:
+				// the cache-server's serving port, probes, resource shape, and
+				// the connector args/env. Adapters render these explicitly
+				// (with API-server-defaulted fields like Port Protocol set in
+				// the rendering), so copying them is idempotent and doesn't
+				// churn the Owns watch. Leaving Ports/Probes/VolumeMounts
+				// untouched would let port drift break the Service's
+				// TargetPort lookup or hide a probe regression. Resources
+				// likewise differ by profile (e.g. GPU vs CPU canary) and
+				// aren't API-server-defaulted, so reconciling them is
+				// churn-free.
+				live.Containers[j].Image = want.Image
+				live.Containers[j].ImagePullPolicy = want.ImagePullPolicy
+				live.Containers[j].Command = want.Command
+				live.Containers[j].Args = want.Args
+				live.Containers[j].Env = want.Env
+				live.Containers[j].Ports = want.Ports
+				live.Containers[j].Resources = want.Resources
+				live.Containers[j].VolumeMounts = want.VolumeMounts
+				live.Containers[j].ReadinessProbe = want.ReadinessProbe
+				live.Containers[j].LivenessProbe = want.LivenessProbe
+				live.Containers[j].StartupProbe = want.StartupProbe
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			live.Containers = append(live.Containers, *want.DeepCopy())
+		}
+	}
+}
+
+// cleanupOwnedWorkload best-effort deletes the Deployment + Service + HPA this
+// CR owns, used when a backend is no longer a managed Deployment (type/kind
+// changed). Normal CR deletion is handled by owner-reference garbage
+// collection; this covers the in-place mutation case where the CR itself
+// still exists.
+func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
+
+	var dep appsv1.Deployment
+	if err := r.deleteIfOwned(ctx, key, &dep, backend); err != nil {
+		return err
+	}
+	var svc corev1.Service
+	if err := r.deleteIfOwned(ctx, key, &svc, backend); err != nil {
+		return err
+	}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	return r.deleteIfOwned(ctx, key, &hpa, backend)
+}
+
+// deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
+func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.NamespacedName, obj client.Object, backend *cachev1alpha1.CacheBackend) error {
+	if err := r.Get(ctx, key, obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, backend) {
 		return nil
 	}
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pvc, func() error {
-		pvc.Labels = desired.Labels
-		if pvc.CreationTimestamp.IsZero() {
-			// First-time provisioning: write the full desired spec.
-			pvc.Spec = *desired.Spec.DeepCopy()
-		} else {
-			// In-place updates: only the requested storage size is mutable.
-			if pvc.Spec.Resources.Requests == nil {
-				pvc.Spec.Resources.Requests = corev1.ResourceList{}
-			}
-			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desired.Spec.Resources.Requests[corev1.ResourceStorage]
-		}
-		return controllerutil.SetControllerReference(backend, pvc, r.Scheme)
-	})
-	if err != nil {
-		return fmt.Errorf("apply PVC %s/%s: %w", desired.Namespace, desired.Name, err)
+	if err := r.Delete(ctx, obj); err != nil {
+		return client.IgnoreNotFound(err)
 	}
 	return nil
+}
+
+// updateManagedStatus derives health from the Deployment and patches status only when it changes.
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
+	health, readyStatus, reason, message := managedHealth(backend, dep)
+	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
+	capacity := managedCapacity(backend)
+	return r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = endpoint
+		backend.Status.Health = health
+		backend.Status.Capacity = capacity
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             readyStatus,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             progressingStatus,
+			Reason:             progressingReason,
+			Message:            progressingMessage,
+			ObservedGeneration: backend.Generation,
+		})
+	})
+}
+
+// managedHealth maps the Deployment's rollout state to a CacheBackend health.
+// Ready requires the Deployment to have observed its current generation and to
+// have enough updated + available replicas, so a stale rollout (e.g. mid image
+// change) is never reported Ready.
+//
+// When the CacheBackend is autoscaled the HPA owns the desired replica count,
+// so the comparison target is the live Deployment's spec.replicas (which the
+// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
+// in that mode). This keeps Ready accurate when an HPA decides to run more
+// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
+// happens to be 0 with autoscaling configured.
+func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
+	want := desiredReplicas(backend, dep)
+
+	// A backend scaled to zero is not serving; never report it Ready.
+	if want == 0 {
+		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "ScaledToZero",
+			"backend scaled to zero replicas"
+	}
+
+	rolledOut := dep.Status.ObservedGeneration >= dep.Generation
+	switch {
+	case rolledOut && dep.Status.UpdatedReplicas >= want && dep.Status.AvailableReplicas >= want:
+		return cachev1alpha1.CacheBackendHealthReady, metav1.ConditionTrue, "BackendReady",
+			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
+	case !rolledOut || dep.Status.UpdatedReplicas < want:
+		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "RolloutInProgress",
+			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
+	default:
+		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
+			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
+	}
+}
+
+// progressingFromHealth derives the Progressing condition from the Ready
+// condition's outcome. A Pending backend is still actively converging
+// (Progressing=True); a Ready backend has converged (Progressing=False,
+// Reason=Synced); a Degraded backend has finished a rollout but lost replicas
+// (Progressing=False, Reason=Degraded — Ready=False already signals the
+// problem, and the rollout isn't in motion).
+func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, message string) (metav1.ConditionStatus, string, string) {
+	switch health {
+	case cachev1alpha1.CacheBackendHealthReady:
+		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
+	case cachev1alpha1.CacheBackendHealthPending:
+		return metav1.ConditionTrue, reason, message
+	case cachev1alpha1.CacheBackendHealthDegraded:
+		return metav1.ConditionFalse, "Degraded", message
+	default:
+		return metav1.ConditionFalse, reason, message
+	}
+}
+
+// desiredReplicas is the per-reconcile source of truth for "how many replicas
+// should this backend be running". With autoscaling enabled the HPA writes
+// spec.replicas on the Deployment, so the live value is authoritative; without
+// it, the user's spec.replicas (default 1) wins.
+func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	if backend.Spec.Autoscaling != nil {
+		// First reconcile after an HPA spec is added may briefly see
+		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
+		// it within one cycle. Until then, fall back to the controller value.
+		if dep.Spec.Replicas != nil {
+			return *dep.Spec.Replicas
+		}
+		// Fall through to the floor.
+	}
+	if backend.Spec.Replicas != nil {
+		return *backend.Spec.Replicas
+	}
+	return 1
+}
+
+// initialReplicas picks the Deployment's initial replica count. With
+// autoscaling configured, spec.autoscaling.minReplicas is the source of truth
+// (defaulting to 1 when unset), so the workload comes up at or above the HPA
+// floor on first apply instead of starting at 1 and waiting for the HPA to
+// patch it. Without autoscaling, spec.replicas wins (default 1).
+func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
+	if backend.Spec.Autoscaling != nil {
+		if backend.Spec.Autoscaling.MinReplicas != nil {
+			return *backend.Spec.Autoscaling.MinReplicas
+		}
+		return 1
+	}
+	if backend.Spec.Replicas != nil {
+		return *backend.Spec.Replicas
+	}
+	return 1
+}
+
+// managedCapacity returns the human-readable capacity surfaced on status.
+// When persistent storage is configured this is the requested PVC size; the
+// PVC itself is currently provisioned by a follow-up module (post-C6 the
+// standalone LMCache server pod has no native data volume to mount), so the
+// capacity field reflects the *requested* size operators can plan against.
+// For ephemeral-storage backends the field is empty (the EmptyDir size isn't
+// a meaningful capacity signal).
+func managedCapacity(backend *cachev1alpha1.CacheBackend) string {
+	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
+		return ""
+	}
+	return backend.Spec.Storage.PVC.Size.String()
 }
 
 // reconcileHPA creates, updates, or deletes the HorizontalPodAutoscaler that
@@ -390,271 +768,6 @@ func (r *CacheBackendReconciler) deleteOwnedHPA(ctx context.Context, backend *ca
 		return client.IgnoreNotFound(err)
 	}
 	return nil
-}
-
-// reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
-// place: the managed container's image/command/args/env, plus the pod-level
-// override fields and the cache-home volume source (which switches between
-// EmptyDir and a PVC based on spec.storage). API-server-defaulted fields we
-// don't own (RestartPolicy, DNSPolicy, probe thresholds, port Protocol, ...) are
-// left untouched so the update does not churn. The desired pod spec already
-// carries the canonical defaults for the server-defaulted override fields
-// (schedulerName, terminationGracePeriodSeconds), so copying them is idempotent.
-func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
-	reconcileManagedContainer(live, desired)
-	reconcileVolumeSources(live, desired)
-
-	// Volumes are builder-owned (e.g. the shm size differs by profile) and are not
-	// API-server-defaulted in a Deployment template, so copying them is churn-free.
-	live.Volumes = desired.Volumes
-
-	live.NodeSelector = desired.NodeSelector
-	live.Affinity = desired.Affinity
-	live.Tolerations = desired.Tolerations
-	live.TopologySpreadConstraints = desired.TopologySpreadConstraints
-	live.ImagePullSecrets = desired.ImagePullSecrets
-	live.ServiceAccountName = desired.ServiceAccountName
-	live.SecurityContext = desired.SecurityContext
-	live.PriorityClassName = desired.PriorityClassName
-	live.SchedulerName = desired.SchedulerName
-	live.RuntimeClassName = desired.RuntimeClassName
-	live.TerminationGracePeriodSeconds = desired.TerminationGracePeriodSeconds
-}
-
-// reconcileManagedContainer updates the spec-driven fields of the managed backend
-// container in place, leaving API-server-defaulted container fields untouched.
-// Resources are reconciled so upgrades from older controller versions adopt the
-// new CPU/memory requests (the HPA needs a CPU request to compute utilization).
-func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
-	if len(desired.Containers) == 0 {
-		return
-	}
-	want := desired.Containers[0]
-	for i := range live.Containers {
-		if live.Containers[i].Name == want.Name {
-			live.Containers[i].Image = want.Image
-			live.Containers[i].Command = want.Command
-			live.Containers[i].Args = want.Args
-			live.Containers[i].Env = want.Env
-			// Resources are builder-owned (the GPU limit + CPU/memory requests
-			// differ by profile, and HPA CPU utilization depends on the CPU
-			// request being present), and not API-server-defaulted, so
-			// reconciling them is churn-free. The DeepCopy guards callers that
-			// later mutate the desired struct against a shared-pointer surprise.
-			live.Containers[i].Resources = *want.Resources.DeepCopy()
-			return
-		}
-	}
-	// The managed container is missing (e.g. an out-of-band edit) — restore it.
-	live.Containers = append(live.Containers, *want.DeepCopy())
-}
-
-// reconcileVolumeSources reconciles the source (EmptyDir vs PVC) of volumes
-// the controller owns. It only updates volumes that exist on both live and
-// desired by name, which keeps it from clobbering volumes the user added.
-// In particular this lets cache-home swap between EmptyDir and a PVC when
-// the spec gains or loses persistent storage.
-func reconcileVolumeSources(live *corev1.PodSpec, desired *corev1.PodSpec) {
-	for di := range desired.Volumes {
-		want := desired.Volumes[di]
-		for li := range live.Volumes {
-			if live.Volumes[li].Name == want.Name {
-				live.Volumes[li].VolumeSource = want.VolumeSource
-				break
-			}
-		}
-	}
-}
-
-// cleanupOwnedWorkload best-effort deletes the stateless children this CR
-// owns, used when a backend is no longer a managed Deployment (type/kind
-// changed). The PVC is intentionally NOT deleted here — destroying persistent
-// storage in response to an in-place spec edit risks silent data loss, the
-// same reasoning that makes reconcilePVC adopt-and-keep when spec.storage is
-// removed. The owner reference still ensures the PVC is GC'd when the
-// CacheBackend itself is deleted.
-func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
-
-	var dep appsv1.Deployment
-	if err := r.deleteIfOwned(ctx, key, &dep, backend); err != nil {
-		return err
-	}
-	var svc corev1.Service
-	if err := r.deleteIfOwned(ctx, key, &svc, backend); err != nil {
-		return err
-	}
-	var hpa autoscalingv2.HorizontalPodAutoscaler
-	return r.deleteIfOwned(ctx, key, &hpa, backend)
-}
-
-// deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
-func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.NamespacedName, obj client.Object, backend *cachev1alpha1.CacheBackend) error {
-	if err := r.Get(ctx, key, obj); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(obj, backend) {
-		return nil
-	}
-	if err := r.Delete(ctx, obj); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	return nil
-}
-
-// validateManagedSpec catches spec combinations the Phase-1 reconciler cannot
-// safely satisfy. It returns false (reason, message) when the spec is unsafe.
-// The check is deliberately controller-side rather than CRD-level so it does
-// not tighten v1alpha1 schema validation for existing fields.
-func validateManagedSpec(backend *cachev1alpha1.CacheBackend) (string, string, bool) {
-	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
-		return "", "", true
-	}
-	if backend.Spec.Replicas != nil && *backend.Spec.Replicas > 1 {
-		return "InvalidStorageConfiguration",
-			"spec.storage.pvc currently requires spec.replicas <= 1 (per-replica PVC support deferred)",
-			false
-	}
-	if backend.Spec.Autoscaling != nil && backend.Spec.Autoscaling.MaxReplicas > 1 {
-		return "InvalidStorageConfiguration",
-			"spec.storage.pvc currently requires spec.autoscaling.maxReplicas <= 1 (per-replica PVC support deferred)",
-			false
-	}
-	return "", "", true
-}
-
-// markInvalidSpec records an InvalidStorageConfiguration outcome on status:
-// Health=Failed, Ready=False, Progressing=False, both conditions carrying the
-// reason/message so kubectl describe shows the user exactly what's wrong.
-func (r *CacheBackendReconciler) markInvalidSpec(ctx context.Context, backend *cachev1alpha1.CacheBackend, reason, message string) error {
-	return r.patchStatus(ctx, backend, func() {
-		backend.Status.Health = cachev1alpha1.CacheBackendHealthFailed
-		backend.Status.ObservedGeneration = backend.Generation
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             reason,
-			Message:            message,
-			ObservedGeneration: backend.Generation,
-		})
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeProgressing,
-			Status:             metav1.ConditionFalse,
-			Reason:             reason,
-			Message:            message,
-			ObservedGeneration: backend.Generation,
-		})
-	})
-}
-
-// updateManagedStatus derives health from the Deployment and patches status only when it changes.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
-	health, readyStatus, reason, message := managedHealth(backend, dep)
-	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
-	capacity := managedCapacity(backend)
-	return r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = endpoint
-		backend.Status.Health = health
-		backend.Status.Capacity = capacity
-		backend.Status.ObservedGeneration = backend.Generation
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             readyStatus,
-			Reason:             reason,
-			Message:            message,
-			ObservedGeneration: backend.Generation,
-		})
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeProgressing,
-			Status:             progressingStatus,
-			Reason:             progressingReason,
-			Message:            progressingMessage,
-			ObservedGeneration: backend.Generation,
-		})
-	})
-}
-
-// managedHealth maps the Deployment's rollout state to a CacheBackend health.
-// Ready requires the Deployment to have observed its current generation and to
-// have enough updated + available replicas, so a stale rollout (e.g. mid image
-// change) is never reported Ready.
-//
-// When the CacheBackend is autoscaled the HPA owns the desired replica count,
-// so the comparison target is the live Deployment's spec.replicas (which the
-// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
-// in that mode). This keeps Ready accurate when an HPA decides to run more
-// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
-// happens to be 0 with autoscaling configured.
-func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
-	want := desiredReplicas(backend, dep)
-
-	// A backend scaled to zero is not serving; never report it Ready.
-	if want == 0 {
-		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "ScaledToZero",
-			"backend scaled to zero replicas"
-	}
-
-	rolledOut := dep.Status.ObservedGeneration >= dep.Generation
-	switch {
-	case rolledOut && dep.Status.UpdatedReplicas >= want && dep.Status.AvailableReplicas >= want:
-		return cachev1alpha1.CacheBackendHealthReady, metav1.ConditionTrue, "BackendReady",
-			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
-	case !rolledOut || dep.Status.UpdatedReplicas < want:
-		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "RolloutInProgress",
-			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
-	default:
-		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
-			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
-	}
-}
-
-// progressingFromHealth derives the Progressing condition from the Ready
-// condition's outcome. A Pending backend is still actively converging
-// (Progressing=True); a Ready backend has converged (Progressing=False); a
-// Degraded backend has finished a rollout but lost replicas (Progressing=False,
-// because no rollout is in motion — Ready=False already signals the problem).
-func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, message string) (metav1.ConditionStatus, string, string) {
-	switch health {
-	case cachev1alpha1.CacheBackendHealthReady:
-		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
-	case cachev1alpha1.CacheBackendHealthPending:
-		return metav1.ConditionTrue, reason, message
-	case cachev1alpha1.CacheBackendHealthDegraded:
-		return metav1.ConditionFalse, "Degraded", message
-	default:
-		return metav1.ConditionFalse, reason, message
-	}
-}
-
-// desiredReplicas is the per-reconcile source of truth for "how many replicas
-// should this backend be running". With autoscaling enabled the HPA writes
-// spec.replicas on the Deployment, so the live value is authoritative; without
-// it, the user's spec.replicas (default 1) wins.
-func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
-	if backend.Spec.Autoscaling != nil {
-		// First reconcile after an HPA spec is added may briefly see
-		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
-		// it within one cycle. Until then, fall back to the controller value.
-		if dep.Spec.Replicas != nil {
-			return *dep.Spec.Replicas
-		}
-		// Fall through to the floor.
-	}
-	if backend.Spec.Replicas != nil {
-		return *backend.Spec.Replicas
-	}
-	return 1
-}
-
-// managedCapacity returns the human-readable capacity surfaced on status.
-// When persistent storage is configured this is the requested PVC size; for
-// ephemeral-storage backends the field is empty (the EmptyDir size isn't a
-// meaningful capacity signal).
-func managedCapacity(backend *cachev1alpha1.CacheBackend) string {
-	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
-		return ""
-	}
-	return backend.Spec.Storage.PVC.Size.String()
 }
 
 // patchStatus applies mutate to the backend's status and patches it only when
@@ -757,7 +870,9 @@ func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 
 // SetupWithManager sets up the controller with the Manager. Owns(Deployment)
 // guarantees that a child's status flipping (e.g. AvailableReplicas dropping
-// to zero) re-triggers a Reconcile so emitTransitionEvents observes the change.
+// to zero) re-triggers a Reconcile so emitTransitionEvents observes the
+// change; the HPA is owned so the controller re-reconciles when the
+// autoscaler updates spec.replicas or its own status.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
@@ -766,7 +881,6 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Complete(r)
 }

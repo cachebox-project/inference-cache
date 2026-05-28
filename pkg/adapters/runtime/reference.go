@@ -10,15 +10,15 @@ import (
 
 // RuntimeReference is the [RuntimeID] the in-tree reference adapter matches.
 // It is deliberately not "vllm" or "sglang" — those names are reserved for
-// the real C6/C7 adapters, so unit tests for the registry can register the
-// reference without colliding with production adapter names.
+// the real production adapters, so unit tests for the registry can register
+// the reference without colliding with production adapter names.
 const RuntimeReference RuntimeID = "reference"
 
 // EnvCacheEndpoint is the environment variable the reference adapter writes
 // to every container in an engine pod, set to the endpoint argument of
 // InjectEngineConfig. It is exported so tests in this package and downstream
-// (C7 admission validation, future adapter authors taking the reference as a
-// template) can assert on it.
+// callers (admission validation, future adapter authors taking the reference
+// as a template) can assert on it.
 const EnvCacheEndpoint = "INFERENCECACHE_CACHE_ENDPOINT"
 
 // EnvRouterEndpoint is the env var the reference adapter writes to router
@@ -30,7 +30,7 @@ const EnvRouterEndpoint = "INFERENCECACHE_ROUTER_ENDPOINT"
 // [KVCacheRuntimeAdapter] contract end to end without binding to any real
 // engine. It accepts every CacheBackend type for runtime [RuntimeReference],
 // renders no cache-server (the wiring is endpoint-only), and demonstrates the
-// idempotent merge contract that real adapters (C6 vLLM+LMCache, future
+// idempotent merge contract that real adapters (vLLM+LMCache today, future
 // SGLang HiCache) must honour.
 type referenceAdapter struct{}
 
