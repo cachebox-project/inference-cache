@@ -190,7 +190,42 @@ func TestHandle_NoMatch_Passthrough(t *testing.T) {
 	}
 }
 
-func TestHandle_AlreadyInjected_Skip(t *testing.T) {
+func TestHandle_FullyInjected_NoOpPatch(t *testing.T) {
+	// When a pod is admitted twice (e.g. via re-admission) the second pass
+	// produces an empty patch set: the adapter's upsertEnv/upsertArgPair
+	// merges are idempotent, so the second InjectEngineConfig call leaves
+	// the spec unchanged. Confirms the handler does NOT depend on an
+	// env-presence short-circuit for idempotency — the adapter is the
+	// source of truth for the full injected contract.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+
+	// First admission produces patches.
+	first := h.Handle(context.Background(), newRequest(t, pod, ns))
+	if !first.Allowed || len(first.Patches) == 0 {
+		t.Fatalf("first admission: Allowed=%v patches=%d", first.Allowed, len(first.Patches))
+	}
+	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, first)
+
+	// Second admission of the already-injected pod is a no-op patch set.
+	second := h.Handle(context.Background(), newRequest(t, injected, ns))
+	if !second.Allowed {
+		t.Fatalf("second admission rejected: %+v", second.Result)
+	}
+	if len(second.Patches) != 0 {
+		t.Fatalf("re-admission of fully-injected pod should emit no patches, got %d: %+v", len(second.Patches), second.Patches)
+	}
+}
+
+func TestHandle_PartialEnvOnly_StillConverges(t *testing.T) {
+	// Regression for the round-5 Codex finding: a pod that already carries
+	// LMCACHE_REMOTE_URL but is missing the rest of the contract (no
+	// VLLM_USE_V1, no --kv-transfer-config arg) MUST still get the
+	// remaining wiring filled in. A lenient env-presence short-circuit
+	// would leave the pod permanently misconfigured; the adapter is the
+	// source of truth and we always call it.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
@@ -202,12 +237,15 @@ func TestHandle_AlreadyInjected_Skip(t *testing.T) {
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("partial-wired pod must still get the missing fields; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
-	if len(resp.Patches) != 0 {
-		t.Fatalf("expected no patches when already injected, got %d", len(resp.Patches))
-	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	// The stale URL is overwritten with the canonical one for the matched
+	// backend, and the missing pieces are added.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
 func TestHandle_EndpointNotPublished_FailOpen(t *testing.T) {
@@ -386,93 +424,6 @@ func TestHandle_PodNamespaceDefaultedFromRequest(t *testing.T) {
 	if !resp.Allowed || len(resp.Patches) == 0 {
 		t.Fatalf("expected match via req.Namespace; got Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
-}
-
-func TestAlreadyInjected(t *testing.T) {
-	if alreadyInjected(&corev1.PodSpec{
-		Containers: []corev1.Container{{Name: "vllm"}},
-	}) {
-		t.Fatalf("clean pod should not look injected")
-	}
-	if !alreadyInjected(&corev1.PodSpec{
-		Containers: []corev1.Container{{
-			Name: "vllm",
-			Env:  []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}},
-		}},
-	}) {
-		t.Fatalf("pod with LMCACHE_REMOTE_URL on the engine should look injected")
-	}
-	// Sidecar carrying the env on a multi-container pod where the engine
-	// is unwired must NOT short-circuit injection. The engine container is
-	// identified by name; the sidecar's env is irrelevant to the
-	// idempotency check.
-	if alreadyInjected(&corev1.PodSpec{
-		Containers: []corev1.Container{
-			{Name: "vllm"},
-			{Name: "debugger", Env: []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}}},
-		},
-	}) {
-		t.Fatalf("sidecar env must not look like engine is injected; engine container is empty")
-	}
-	// In a single-container pod the lone container is the engine, so its
-	// env still counts.
-	if !alreadyInjected(&corev1.PodSpec{
-		Containers: []corev1.Container{{
-			Name: "other-name",
-			Env:  []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}},
-		}},
-	}) {
-		t.Fatalf("single-container pod is treated as the engine; env should be honored")
-	}
-	// When the pod is multi-container with no engine-named container, the
-	// adapter would reject it anyway — the check stays conservative and
-	// scans every container so we don't double-mutate something that
-	// already looks injected.
-	if !alreadyInjected(&corev1.PodSpec{
-		Containers: []corev1.Container{
-			{Name: "a", Env: []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}}},
-			{Name: "b"},
-		},
-	}) {
-		t.Fatalf("multi-container with no engine should scan all containers")
-	}
-}
-
-func TestHandle_SidecarCarriesEnv_StillInjectsEngine(t *testing.T) {
-	// Regression: a multi-container pod where a sidecar (not the engine)
-	// happens to carry LMCACHE_REMOTE_URL must still get the engine
-	// container wired. Two containers, the engine is named `vllm` (the
-	// adapter's canonical target), and the sidecar carries a stale env.
-	const ns = "engines"
-	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	h := newHandler(t, cb)
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "engine-sidecar", Labels: map[string]string{"app": "vllm"}},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  adapterruntime.EngineContainerName,
-					Image: "vllm/vllm-openai-cpu:latest",
-					Args:  []string{"--model", "Qwen/Qwen2.5-0.5B-Instruct"},
-				},
-				{
-					Name:  "sidecar",
-					Image: "busybox",
-					Env: []corev1.EnvVar{
-						{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://stale:65432"},
-					},
-				},
-			},
-		},
-	}
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed || len(resp.Patches) == 0 {
-		t.Fatalf("expected the engine container to be wired despite sidecar env; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 }
 
 func TestSkipAnnotationOptsOut(t *testing.T) {

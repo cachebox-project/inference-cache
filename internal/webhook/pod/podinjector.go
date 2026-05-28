@@ -131,14 +131,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed("CacheBackend status.endpoint not yet published (fail-open)")
 	}
 
-	if alreadyInjected(&pod.Spec) {
-		// Idempotency short-circuit: the adapter's InjectEngineConfig is
-		// itself idempotent, but skipping a re-injection saves the
-		// apiserver an unnecessary JSON-patch round-trip on each update.
-		log.V(1).Info("already injected; skipping")
-		return admission.Allowed("already injected")
-	}
-
+	// No env-presence short-circuit here: the adapter is the source of truth
+	// for the full injected contract (env + arg), and lenient short-circuits
+	// risk admitting a pod that carries only a subset of the wiring (e.g. a
+	// pre-set LMCACHE_REMOTE_URL but no --kv-transfer-config / VLLM_USE_V1)
+	// permanently un-converged. Call the adapter unconditionally; it merges
+	// idempotently (upsertEnv / upsertArgPair) and a no-op merge produces an
+	// empty patch set, so re-admissions on an already-injected pod are
+	// free at the apiserver.
 	runtimeID := resolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
@@ -205,60 +205,6 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 		}
 	}
 	return nil, nil
-}
-
-// alreadyInjected reports whether the engine container already carries the
-// LMCache wiring this handler would write. Used as the idempotency
-// short-circuit; the check is conservative (a single env var name is
-// enough — adapters set it as a unit) so a pod a user pre-wired by hand is
-// also recognised and left alone.
-//
-// Only the engine container is consulted: a sidecar that happens to carry
-// LMCACHE_REMOTE_URL (e.g. a debugging container reading from the same
-// remote cache) must not prevent the actual engine from being wired. The
-// engine container is identified by the same name-or-single-container rule
-// the vLLM adapter uses ([adapterruntime.EngineContainerName] or the lone
-// container in a single-container pod). When neither rule selects a
-// container, the check is conservative — every container is scanned — so
-// the adapter still has the final say (it will reject the pod with a
-// multi-container error that the handler then fails open on).
-func alreadyInjected(spec *corev1.PodSpec) bool {
-	if idx := engineContainerIndex(spec); idx >= 0 {
-		return containerHasEnv(&spec.Containers[idx], adapterruntime.EnvLMCacheRemoteURL)
-	}
-	for i := range spec.Containers {
-		if containerHasEnv(&spec.Containers[i], adapterruntime.EnvLMCacheRemoteURL) {
-			return true
-		}
-	}
-	return false
-}
-
-// engineContainerIndex returns the index of the engine container in spec,
-// or -1 when no clear target is identifiable. Mirrors the adapter's
-// internal engineContainerIndex so the handler's idempotency check looks at
-// the same container the adapter would mutate.
-func engineContainerIndex(spec *corev1.PodSpec) int {
-	for i := range spec.Containers {
-		if spec.Containers[i].Name == adapterruntime.EngineContainerName {
-			return i
-		}
-	}
-	if len(spec.Containers) == 1 {
-		return 0
-	}
-	return -1
-}
-
-// containerHasEnv reports whether container's env array carries an entry
-// named name. Used by alreadyInjected to avoid duplicating the loop.
-func containerHasEnv(container *corev1.Container, name string) bool {
-	for _, e := range container.Env {
-		if e.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 // skipAnnotationOptsOut returns true when the value of [AnnotationSkip]
