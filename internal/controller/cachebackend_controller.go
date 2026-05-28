@@ -247,18 +247,27 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		// snapshot.
 		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
+	// Never publish status derived from a foreign workload: if apply collided
+	// with an existing Deployment owned by some other controller,
+	// SetControllerReference returned an AlreadyOwned error and applyErr is
+	// set. Reading that foreign object's status here could mark the
+	// CacheBackend Ready based on another controller's pods.
+	if !metav1.IsControlledBy(&live, backend) {
+		return ctrl.Result{}, applyErr
+	}
 
 	// Endpoint is derived from the *live* Service, not the desired one: if
-	// applyService failed (Forbidden, conflict-budget exhausted, ...) we must
-	// not advertise an endpoint that doesn't exist or whose ports/selectors
-	// haven't landed yet. Empty endpoint when the Service hasn't materialized.
+	// applyService failed (Forbidden, conflict-budget exhausted, foreign
+	// ownership, ...) we must not advertise an endpoint that doesn't exist,
+	// has stale ports, or points at a Service we don't own. Empty endpoint
+	// when the Service hasn't materialized or is owned by someone else.
 	var liveSvc corev1.Service
 	endpoint := ""
 	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
 		}
-	} else {
+	} else if metav1.IsControlledBy(&liveSvc, backend) {
 		endpoint = serviceEndpoint(&liveSvc)
 	}
 

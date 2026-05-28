@@ -1068,6 +1068,100 @@ func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 	}
 }
 
+// TestReconcileLMCacheForeignDeploymentNoStatusLeak pins the foreign-ownership
+// guard on the Deployment status path: if a Deployment with the matching name
+// already exists but is owned by another controller, applyDeployment fails
+// (SetControllerReference returns AlreadyOwned). The reconciler must NOT
+// derive Health from that foreign workload — that would mark the CacheBackend
+// Ready based on someone else's pods.
+func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
+	scheme := newScheme(t)
+
+	// A foreign Deployment with the same name as the CacheBackend, owned by
+	// some unrelated CR. Populate status as Ready so a leaky status read
+	// would mark the CacheBackend Ready.
+	foreignOwner := true
+	foreign := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cache", Namespace: "ns1", Generation: 1,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "example.com/v1", Kind: "OtherKind",
+				Name: "other", UID: "other-uid",
+				Controller: &foreignOwner, BlockOwnerDeletion: &foreignOwner,
+			}},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "other"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "x:1"}}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1, Replicas: 1,
+			UpdatedReplicas: 1, AvailableReplicas: 1, ReadyReplicas: 1,
+		},
+	}
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	r := newReconciler(scheme, cb, foreign)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment already owned by another controller)")
+	}
+
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Health == cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = Ready, must not be derived from foreign Deployment")
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond != nil && cond.Status == metav1.ConditionTrue {
+		t.Fatalf("Ready condition True, must not be derived from foreign Deployment")
+	}
+}
+
+// TestReconcileLMCacheForeignServiceNoEndpointLeak pins the foreign-ownership
+// guard on the Service endpoint path: if a Service with the matching name
+// already exists but is owned by another controller, applyService fails
+// (AlreadyOwned). Status.Endpoint must NOT advertise that foreign Service's
+// address; clients/gateways would route to the wrong workload.
+func TestReconcileLMCacheForeignServiceNoEndpointLeak(t *testing.T) {
+	scheme := newScheme(t)
+
+	foreignOwner := true
+	foreign := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cache", Namespace: "ns1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "example.com/v1", Kind: "OtherKind",
+				Name: "other", UID: "other-uid",
+				Controller: &foreignOwner, BlockOwnerDeletion: &foreignOwner,
+			}},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": "other"},
+			Ports: []corev1.ServicePort{{
+				Name: "http", Port: 7777, TargetPort: intstr.FromInt(7777),
+			}},
+		},
+	}
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	r := newReconciler(scheme, cb, foreign)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Service already owned by another controller)")
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
+		t.Fatalf("status.endpoint = %q, want empty (foreign Service must not leak into status)", got)
+	}
+}
+
 func containsStr(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {
