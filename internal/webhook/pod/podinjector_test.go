@@ -400,7 +400,116 @@ func TestAlreadyInjected(t *testing.T) {
 			Env:  []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}},
 		}},
 	}) {
-		t.Fatalf("pod with LMCACHE_REMOTE_URL should look injected")
+		t.Fatalf("pod with LMCACHE_REMOTE_URL on the engine should look injected")
+	}
+	// Sidecar carrying the env on a multi-container pod where the engine
+	// is unwired must NOT short-circuit injection. The engine container is
+	// identified by name; the sidecar's env is irrelevant to the
+	// idempotency check.
+	if alreadyInjected(&corev1.PodSpec{
+		Containers: []corev1.Container{
+			{Name: "vllm"},
+			{Name: "debugger", Env: []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}}},
+		},
+	}) {
+		t.Fatalf("sidecar env must not look like engine is injected; engine container is empty")
+	}
+	// In a single-container pod the lone container is the engine, so its
+	// env still counts.
+	if !alreadyInjected(&corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name: "other-name",
+			Env:  []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}},
+		}},
+	}) {
+		t.Fatalf("single-container pod is treated as the engine; env should be honored")
+	}
+	// When the pod is multi-container with no engine-named container, the
+	// adapter would reject it anyway — the check stays conservative and
+	// scans every container so we don't double-mutate something that
+	// already looks injected.
+	if !alreadyInjected(&corev1.PodSpec{
+		Containers: []corev1.Container{
+			{Name: "a", Env: []corev1.EnvVar{{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://x:65432"}}},
+			{Name: "b"},
+		},
+	}) {
+		t.Fatalf("multi-container with no engine should scan all containers")
+	}
+}
+
+func TestHandle_SidecarCarriesEnv_StillInjectsEngine(t *testing.T) {
+	// Regression: a multi-container pod where a sidecar (not the engine)
+	// happens to carry LMCACHE_REMOTE_URL must still get the engine
+	// container wired. Two containers, the engine is named `vllm` (the
+	// adapter's canonical target), and the sidecar carries a stale env.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine-sidecar", Labels: map[string]string{"app": "vllm"}},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  adapterruntime.EngineContainerName,
+					Image: "vllm/vllm-openai-cpu:latest",
+					Args:  []string{"--model", "Qwen/Qwen2.5-0.5B-Instruct"},
+				},
+				{
+					Name:  "sidecar",
+					Image: "busybox",
+					Env: []corev1.EnvVar{
+						{Name: adapterruntime.EnvLMCacheRemoteURL, Value: "lm://stale:65432"},
+					},
+				},
+			},
+		},
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("expected the engine container to be wired despite sidecar env; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
+func TestSkipAnnotationOptsOut(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"", false},          // empty annotation = no opt-out
+		{"true", true},       // canonical truthy
+		{"1", true},          // numeric truthy
+		{"yes", true},        // free-form truthy
+		{"please skip", true}, // free-form note treated as opt-out
+		{"false", false},     // explicit falsey
+		{"0", false},         // numeric falsey
+		{"no", false},        // explicit falsey synonym
+		{"OFF", false},       // case-insensitive falsey synonym
+	}
+	for _, tc := range cases {
+		t.Run(tc.val, func(t *testing.T) {
+			if got := skipAnnotationOptsOut(tc.val); got != tc.want {
+				t.Fatalf("skipAnnotationOptsOut(%q): got %v want %v", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHandle_SkipAnnotationFalse_StillInjects(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Annotations = map[string]string{AnnotationSkip: "false"}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("explicit skip-inject=false must still inject; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
 }
 

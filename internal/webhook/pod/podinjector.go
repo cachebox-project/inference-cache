@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -100,7 +101,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		pod.Namespace = req.Namespace
 	}
 
-	if skip, ok := pod.Annotations[AnnotationSkip]; ok && skip != "" {
+	if skipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 
@@ -211,15 +212,77 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 // short-circuit; the check is conservative (a single env var name is
 // enough — adapters set it as a unit) so a pod a user pre-wired by hand is
 // also recognised and left alone.
+//
+// Only the engine container is consulted: a sidecar that happens to carry
+// LMCACHE_REMOTE_URL (e.g. a debugging container reading from the same
+// remote cache) must not prevent the actual engine from being wired. The
+// engine container is identified by the same name-or-single-container rule
+// the vLLM adapter uses ([adapterruntime.EngineContainerName] or the lone
+// container in a single-container pod). When neither rule selects a
+// container, the check is conservative — every container is scanned — so
+// the adapter still has the final say (it will reject the pod with a
+// multi-container error that the handler then fails open on).
 func alreadyInjected(spec *corev1.PodSpec) bool {
+	if idx := engineContainerIndex(spec); idx >= 0 {
+		return containerHasEnv(&spec.Containers[idx], adapterruntime.EnvLMCacheRemoteURL)
+	}
 	for i := range spec.Containers {
-		for _, e := range spec.Containers[i].Env {
-			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
-				return true
-			}
+		if containerHasEnv(&spec.Containers[i], adapterruntime.EnvLMCacheRemoteURL) {
+			return true
 		}
 	}
 	return false
+}
+
+// engineContainerIndex returns the index of the engine container in spec,
+// or -1 when no clear target is identifiable. Mirrors the adapter's
+// internal engineContainerIndex so the handler's idempotency check looks at
+// the same container the adapter would mutate.
+func engineContainerIndex(spec *corev1.PodSpec) int {
+	for i := range spec.Containers {
+		if spec.Containers[i].Name == adapterruntime.EngineContainerName {
+			return i
+		}
+	}
+	if len(spec.Containers) == 1 {
+		return 0
+	}
+	return -1
+}
+
+// containerHasEnv reports whether container's env array carries an entry
+// named name. Used by alreadyInjected to avoid duplicating the loop.
+func containerHasEnv(container *corev1.Container, name string) bool {
+	for _, e := range container.Env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// skipAnnotationOptsOut returns true when the value of [AnnotationSkip]
+// should be treated as an opt-out. Truthy values (anything strconv.ParseBool
+// accepts as true) opt out; non-empty values that ParseBool can't interpret
+// (e.g. "yes", "skip", an operator's free-form note) also opt out — making
+// the annotation "set with any meaningful value disables injection."
+// Explicitly falsey values ("false", "0", "f", "no") leave injection
+// enabled, so `inferencecache.io/skip-inject: "false"` does NOT disable.
+func skipAnnotationOptsOut(value string) bool {
+	if value == "" {
+		return false
+	}
+	if b, err := strconv.ParseBool(value); err == nil {
+		return b
+	}
+	// strconv.ParseBool accepts a small set ("1","t","T","true","TRUE",
+	// "True","0","f","F","false","FALSE","False"). Treat other free-form
+	// values as opt-out unless the user explicitly typed a false synonym.
+	switch strings.ToLower(value) {
+	case "no", "off", "disable", "disabled":
+		return false
+	}
+	return true
 }
 
 // resolveRuntimeID picks the [adapterruntime.RuntimeID] the handler asks the
