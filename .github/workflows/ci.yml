@@ -118,13 +118,17 @@ jobs:
     - name: Build images
       run: make image-build TAG=${IMAGE_TAG}
 
+    # Both image scans run with exit-code: 0 (and both SARIF uploads run with
+    # if: always()) so a failing controller scan can't short-circuit the server
+    # scan/upload. A final aggregation step parses both SARIFs and fails the
+    # job if either image had HIGH/CRITICAL findings.
     - name: Scan controller image with Trivy
       uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
       with:
         image-ref: ghcr.io/cachebox-project/inference-cache-controller:${{ env.IMAGE_TAG }}
         severity: CRITICAL,HIGH
         vuln-type: os,library
-        exit-code: '1'
+        exit-code: '0'
         format: sarif
         output: trivy-controller.sarif
 
@@ -136,12 +140,13 @@ jobs:
         category: trivy-controller
 
     - name: Scan server image with Trivy
+      if: always()
       uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
       with:
         image-ref: ghcr.io/cachebox-project/inference-cache-server:${{ env.IMAGE_TAG }}
         severity: CRITICAL,HIGH
         vuln-type: os,library
-        exit-code: '1'
+        exit-code: '0'
         format: sarif
         output: trivy-server.sarif
 
@@ -151,3 +156,24 @@ jobs:
       with:
         sarif_file: trivy-server.sarif
         category: trivy-server
+
+    - name: Fail if any Trivy scan found HIGH/CRITICAL
+      if: always()
+      shell: bash
+      run: |
+        fail=0
+        for f in trivy-controller.sarif trivy-server.sarif; do
+          if [ ! -f "$f" ]; then
+            echo "✗ $f: missing (scan step did not run or failed)"
+            fail=1
+            continue
+          fi
+          n=$(jq '[.runs[]?.results[]?] | length' "$f")
+          if [ "$n" -gt 0 ]; then
+            echo "✗ $f: $n HIGH/CRITICAL finding(s)"
+            fail=1
+          else
+            echo "✓ $f: clean"
+          fi
+        done
+        exit "$fail"
