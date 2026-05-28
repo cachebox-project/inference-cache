@@ -27,7 +27,6 @@ func newBackend() *cachev1alpha1.CacheBackend {
 }
 
 func i32p(v int32) *int32 { return &v }
-func bp(v bool) *bool     { return &v }
 
 func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
 	d := &CacheBackendDefaulter{}
@@ -43,9 +42,6 @@ func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
 	if cb.Spec.Integration == nil {
 		t.Fatal("integration block not created")
 	}
-	if cb.Spec.Integration.FailOpen == nil || *cb.Spec.Integration.FailOpen != defaultFailOpen {
-		t.Errorf("failOpen = %v, want %v", cb.Spec.Integration.FailOpen, defaultFailOpen)
-	}
 	if cb.Spec.Integration.LookupTimeoutMs == nil || *cb.Spec.Integration.LookupTimeoutMs != defaultLookupTimeoutMs {
 		t.Errorf("lookupTimeoutMs = %v, want %d", cb.Spec.Integration.LookupTimeoutMs, defaultLookupTimeoutMs)
 	}
@@ -59,7 +55,6 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(7)
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		FailOpen:            bp(false),
 		LookupTimeoutMs:     i32p(123),
 		MinimumPrefixTokens: i32p(999),
 	}
@@ -71,9 +66,6 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	if *cb.Spec.Replicas != 7 {
 		t.Errorf("replicas clobbered: got %d, want 7", *cb.Spec.Replicas)
 	}
-	if *cb.Spec.Integration.FailOpen {
-		t.Errorf("failOpen clobbered: got true, want false")
-	}
 	if *cb.Spec.Integration.LookupTimeoutMs != 123 {
 		t.Errorf("lookupTimeoutMs clobbered: got %d, want 123", *cb.Spec.Integration.LookupTimeoutMs)
 	}
@@ -83,8 +75,8 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 }
 
 func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
-	// Operator pinned the timeout but left failOpen and minimumPrefixTokens
-	// unset — defaulter should fill in only the holes.
+	// Operator pinned the timeout but left minimumPrefixTokens unset —
+	// defaulter should fill in only the holes.
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
@@ -97,9 +89,6 @@ func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
 
 	if *cb.Spec.Integration.LookupTimeoutMs != 25 {
 		t.Errorf("operator timeout clobbered: %d", *cb.Spec.Integration.LookupTimeoutMs)
-	}
-	if cb.Spec.Integration.FailOpen == nil || *cb.Spec.Integration.FailOpen != defaultFailOpen {
-		t.Errorf("failOpen not defaulted")
 	}
 	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
 		t.Errorf("minimumPrefixTokens not defaulted")
@@ -238,17 +227,16 @@ func TestValidator_ExternalHostnamePassesThrough(t *testing.T) {
 }
 
 func TestValidator_AggregatesMultipleViolations(t *testing.T) {
-	// External backend with no endpoint AND a PVC on a memory-only-by-spec
-	// type — both rules should fire and both causes should land in the same
-	// rejection. (We use NIXL here so the storage rule applies; the missing
-	// endpoint rule fires regardless because spec.type=External.)
+	// Two independent violations on a single CR must both appear in the
+	// rejection's status.details.causes, so kubectl prints them together.
+	// Here: PVC on a memory-only backend (NIXL) plus a cross-namespace
+	// endpoint without opt-in. Both rules should fire on the same spec.
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeNIXL
 	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
 		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("1Gi")},
 	}
-	// Add a second violation: cross-namespace endpoint without opt-in.
 	cb.Spec.Endpoint = "x.other-ns.svc"
 
 	_, err := v.ValidateCreate(context.Background(), cb)
