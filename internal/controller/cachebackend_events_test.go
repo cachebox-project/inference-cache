@@ -10,7 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -22,7 +22,7 @@ import (
 // recorder. The buffer is intentionally generous so a test never blocks on
 // emit; assertions read from rec.Events with a select+default to avoid hanging
 // when an expected event is missing.
-func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBackendReconciler, *record.FakeRecorder) {
+func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBackendReconciler, *events.FakeRecorder) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -36,14 +36,14 @@ func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBacke
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
 		WithObjects(objs...).
 		Build()
-	rec := record.NewFakeRecorder(16)
+	rec := events.NewFakeRecorder(16)
 	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}, rec
 }
 
 // drainEvents pulls every event currently on the recorder channel. The channel
 // is non-blocking; absence of an expected event is detected by length, not by
 // blocking, so tests fail fast instead of timing out.
-func drainEvents(rec *record.FakeRecorder) []string {
+func drainEvents(rec *events.FakeRecorder) []string {
 	var out []string
 	for {
 		select {

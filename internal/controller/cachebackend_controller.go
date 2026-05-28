@@ -12,7 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -45,7 +45,7 @@ type CacheBackendReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
@@ -404,21 +404,21 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 
 	if before.health != cachev1alpha1.CacheBackendHealthDegraded &&
 		after.health == cachev1alpha1.CacheBackendHealthDegraded {
-		r.Recorder.Eventf(cb, corev1.EventTypeWarning, eventReasonBackendDegraded,
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonBackendDegraded, eventReasonBackendDegraded,
 			"cache backend is degraded: %s", degradedMessage(cb))
 	}
 	if before.health == cachev1alpha1.CacheBackendHealthDegraded &&
 		after.health == cachev1alpha1.CacheBackendHealthReady {
-		r.Recorder.Eventf(cb, corev1.EventTypeNormal, eventReasonBackendRecovered,
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonBackendRecovered, eventReasonBackendRecovered,
 			"cache backend recovered to Ready")
 	}
 
 	if before.failOpen && !after.failOpen {
-		r.Recorder.Eventf(cb, corev1.EventTypeWarning, eventReasonFailClosedEnabled,
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonFailClosedEnabled, eventReasonFailClosedEnabled,
 			"fail-closed mode enabled — cache is now a serving dependency; engine requests will fail when the cache is unreachable")
 	}
 	if !before.failOpen && after.failOpen {
-		r.Recorder.Eventf(cb, corev1.EventTypeNormal, eventReasonFailOpenRestored,
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonFailOpenRestored, eventReasonFailOpenRestored,
 			"fail-open mode restored — cache is again an optimization, not a serving dependency")
 	}
 }
@@ -438,7 +438,7 @@ func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 // to zero) re-triggers a Reconcile so emitTransitionEvents observes the change.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("cachebackend-controller")
+		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.CacheBackend{}).
