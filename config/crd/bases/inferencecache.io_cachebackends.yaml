@@ -54,6 +54,37 @@ spec:
           spec:
             description: CacheBackendSpec defines the desired state of a cache backend.
             properties:
+              autoscaling:
+                description: |-
+                  Autoscaling configures horizontal autoscaling for the managed backend
+                  workload. When set, the controller reconciles a HorizontalPodAutoscaler
+                  owned by this CacheBackend; the HPA then drives the underlying workload's
+                  replica count, overriding spec.replicas.
+                properties:
+                  maxReplicas:
+                    description: MaxReplicas is the upper bound for the HPA replica
+                      count.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    description: |-
+                      MinReplicas is the lower bound for the HPA replica count. Defaults to 1
+                      when unset.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  targetCPUUtilizationPercent:
+                    description: |-
+                      TargetCPUUtilizationPercent is the average per-pod CPU utilization the
+                      HPA targets. Defaults to 80 when unset.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                required:
+                - maxReplicas
+                type: object
               backendConfig:
                 additionalProperties:
                   type: string
@@ -1566,6 +1597,12 @@ spec:
             description: CacheBackendStatus defines the observed state of a cache
               backend.
             properties:
+              capacity:
+                description: |-
+                  Capacity is a human-readable summary of the backend's provisioned
+                  capacity (e.g. the requested PVC size when persistent storage is
+                  configured). It is informational; clients must not parse it.
+                type: string
               conditions:
                 description: Conditions describe the latest observations of the backend.
                 items:

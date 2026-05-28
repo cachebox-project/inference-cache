@@ -13,6 +13,10 @@ import (
 type Workload struct {
 	Deployment *appsv1.Deployment
 	Service    *corev1.Service
+	// PVC is the optional PersistentVolumeClaim mounted into the backend pod
+	// when the CacheBackend spec requests persistent storage. It is nil when
+	// storage is ephemeral (cache-home backed by EmptyDir).
+	PVC *corev1.PersistentVolumeClaim
 	// Endpoint is the in-cluster address engines should use for this backend
 	// (published to status for C6 to inject).
 	Endpoint string

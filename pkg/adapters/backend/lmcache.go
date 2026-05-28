@@ -139,7 +139,7 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 		Volumes: []corev1.Volume{
 			{
 				Name:         "cache-home",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				VolumeSource: cacheHomeVolumeSource(cb),
 			},
 			{
 				Name: "shm",
@@ -187,11 +187,66 @@ func (lmCacheBuilder) Build(cb *cachev1alpha1.CacheBackend) (*Workload, error) {
 		},
 	}
 
-	return &Workload{
+	workload := &Workload{
 		Deployment: deployment,
 		Service:    service,
 		Endpoint:   fmt.Sprintf("%s.%s.svc.cluster.local:%d", name, namespace, portHTTP),
-	}, nil
+	}
+	if pvc := buildPVC(cb); pvc != nil {
+		workload.PVC = pvc
+	}
+	return workload, nil
+}
+
+// PVCName is the deterministic PVC name the LMCache backend mounts at
+// /root/.cache/huggingface when persistent storage is requested. Sharing the
+// CacheBackend's name keeps the child-object identity uniform (Deployment,
+// Service, PVC all named after the CR).
+func PVCName(cb *cachev1alpha1.CacheBackend) string {
+	return cb.Name
+}
+
+// cacheHomeVolumeSource returns the volume source for the cache-home volume:
+// a PVC reference when persistent storage is requested, an EmptyDir otherwise.
+// The A2 reference manifest's comment ("swap for a PVC to persist the
+// model/cache across restarts") is exactly this swap.
+func cacheHomeVolumeSource(cb *cachev1alpha1.CacheBackend) corev1.VolumeSource {
+	if cb.Spec.Storage != nil && cb.Spec.Storage.PVC != nil {
+		return corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: PVCName(cb),
+			},
+		}
+	}
+	return corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+}
+
+// buildPVC renders the desired PVC for a CacheBackend, or nil when persistent
+// storage is not requested. Phase-1 LMCache uses a single ReadWriteOnce PVC —
+// the pod is single-replica by default, and multi-replica persistence is a
+// later module's concern (per-replica PVCs via StatefulSet volumeClaimTemplates,
+// or a ReadWriteMany class).
+func buildPVC(cb *cachev1alpha1.CacheBackend) *corev1.PersistentVolumeClaim {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	spec := cb.Spec.Storage.PVC
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      PVCName(cb),
+			Namespace: cb.Namespace,
+			Labels:    selectorLabels(cb.Name),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: spec.Size,
+				},
+			},
+			StorageClassName: spec.StorageClassName,
+		},
+	}
 }
 
 // selectorLabels are the immutable identity labels for a backend's child objects.
