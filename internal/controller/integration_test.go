@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -105,6 +107,23 @@ func getRV(t *testing.T, r *CacheBackendReconciler, name, namespace string, obj 
 		t.Fatalf("get %T for resourceVersion: %v", obj, err)
 	}
 	return obj.GetResourceVersion()
+}
+
+func ptrBool(v bool) *bool { return &v }
+
+// pollDeployment waits for a Deployment to exist at key, returning its UID.
+func pollDeployment(t *testing.T, k8s client.Client, key types.NamespacedName, what string) string {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var dep appsv1.Deployment
+		if err := k8s.Get(context.Background(), key, &dep); err == nil {
+			return string(dep.UID)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for deployment to %s", what)
+	return ""
 }
 
 func setDeploymentStatus(t *testing.T, r *CacheBackendReconciler, name, ns string, mutate func(*appsv1.Deployment)) {
@@ -571,6 +590,53 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
+	t.Run("FailOpenStatusMirrorsSpec", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		// Default (no integration spec): status.failOpen mirrors the API default (true).
+		if err := k8s.Create(ctx, lmcacheBackend("def", ns)); err != nil {
+			t.Fatalf("create default: %v", err)
+		}
+		reconcile(t, r, "def", ns)
+		if got := getBackend(t, r, "def", ns).Status.FailOpen; got == nil || !*got {
+			t.Fatalf("default status.failOpen = %v, want true", got)
+		}
+		// Explicit fail-closed: status.failOpen reflects it.
+		strict := lmcacheBackend("strict", ns)
+		strict.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: ptrBool(false)}
+		if err := k8s.Create(ctx, strict); err != nil {
+			t.Fatalf("create strict: %v", err)
+		}
+		reconcile(t, r, "strict", ns)
+		if got := getBackend(t, r, "strict", ns).Status.FailOpen; got == nil || *got {
+			t.Fatalf("strict status.failOpen = %v, want false", got)
+		}
+	})
+
+	t.Run("EngineNameCaseInsensitiveRouting", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		// Upper-case engine name still routes to the vllm adapter.
+		up := lmcacheBackend("up", ns)
+		up.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "VLLM"}
+		if err := k8s.Create(ctx, up); err != nil {
+			t.Fatalf("create VLLM: %v", err)
+		}
+		reconcile(t, r, "up", ns)
+		if _, err := getOptionalDeployment(t, r, "up", ns); err != nil {
+			t.Fatalf("VLLM (uppercase) should match the vllm adapter and produce a Deployment: %v", err)
+		}
+
+		// An engine with no registered Phase-1 adapter falls into the unmanaged path.
+		sg := lmcacheBackend("sg", ns)
+		sg.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		if err := k8s.Create(ctx, sg); err != nil {
+			t.Fatalf("create sglang: %v", err)
+		}
+		reconcile(t, r, "sg", ns)
+		if _, err := getOptionalDeployment(t, r, "sg", ns); err == nil {
+			t.Fatalf("sglang has no Phase-1 adapter; expected no Deployment (unmanaged path)")
+		}
+	})
+
 	t.Run("MissingObjectIsNoError", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		reconcile(t, r, "does-not-exist", ns)
@@ -584,9 +650,12 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, cfg := startEnv(t)
 
+	// SkipNameValidation: multiple manager-based subtests in the same test binary
+	// would otherwise collide on the global controller-name registry.
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: "0"},
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
 	})
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -647,4 +716,107 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("deployment was not recreated after deletion (Owns watch did not re-trigger)")
+}
+
+// TestIntegrationCacheBackendEvents runs a real manager (so the Recorder is
+// auto-wired) and asserts the two transition Events the controller emits on
+// status changes — FailClosedEnabled (spec.integration.failOpen flipped to
+// false) and BackendDegraded (rolled out, but no available replicas) — actually
+// reach the apiserver, end to end.
+func TestIntegrationCacheBackendEvents(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	// SkipNameValidation: multiple manager-based subtests in the same test binary
+	// would otherwise collide on the global controller-name registry.
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := (&CacheBackendReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    logr.Discard(),
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	// A fresh CR with spec.integration.failOpen=false: the first reconcile
+	// observes a true→false transition (status.failOpen defaults to true when
+	// unset) and emits FailClosedEnabled.
+	ns := freshNS(t, k8s)
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.Replicas = ptrInt32(1)
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: ptrBool(false)}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	key := types.NamespacedName{Name: "cache", Namespace: ns}
+	pollDeployment(t, k8s, key, "be created by the manager")
+
+	// Drive a Pending→Degraded transition by patching the Deployment status to
+	// rolled-out but with no available replicas.
+	var dep appsv1.Deployment
+	if err := k8s.Get(context.Background(), key, &dep); err != nil {
+		t.Fatalf("get dep: %v", err)
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.AvailableReplicas = 0
+	dep.Status.ReadyReplicas = 0
+	if err := k8s.Status().Update(context.Background(), &dep); err != nil {
+		t.Fatalf("patch dep status: %v", err)
+	}
+
+	wantReasons := map[string]bool{
+		eventReasonFailClosedEnabled: false,
+		eventReasonBackendDegraded:   false,
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var list eventsv1.EventList
+		if err := k8s.List(context.Background(), &list, client.InNamespace(ns)); err == nil {
+			for _, ev := range list.Items {
+				if ev.Regarding.Name != "cache" || ev.Regarding.Kind != "CacheBackend" {
+					continue
+				}
+				if _, ok := wantReasons[ev.Reason]; ok {
+					wantReasons[ev.Reason] = true
+				}
+			}
+		}
+		allSeen := true
+		for _, seen := range wantReasons {
+			if !seen {
+				allSeen = false
+				break
+			}
+		}
+		if allSeen {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for reason, seen := range wantReasons {
+		if !seen {
+			t.Errorf("did not observe Event reason=%s on CacheBackend cache/%s within timeout", reason, ns)
+		}
+	}
 }

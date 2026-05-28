@@ -63,6 +63,13 @@ jobs:
     - name: Generate protobufs
       run: make proto-gen
 
+    # Fetch envtest binaries (apiserver + etcd) so the controller integration
+    # tests (internal/controller/integration_test.go) run against a real
+    # apiserver instead of skipping. The test skip guard checks $KUBEBUILDER_ASSETS,
+    # so exporting it via $GITHUB_ENV is enough to flip them on.
+    - name: Install envtest binaries
+      run: echo "KUBEBUILDER_ASSETS=$(make test-env | tail -1)" >> $GITHUB_ENV
+
     - name: Test (race detector)
       run: make test-race
 
