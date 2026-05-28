@@ -93,7 +93,7 @@ The retired colocated-rendering keys (`image`, `profile`, `model`, `hfTokenSecre
 |---|---|---|
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
 | `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
-| `capacity` | string | Human-readable summary of the backend's provisioned capacity (e.g. the requested PVC size when persistent storage is configured). Informational; clients must not parse it. |
+| `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
 | `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |

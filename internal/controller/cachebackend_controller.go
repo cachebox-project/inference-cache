@@ -382,7 +382,14 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 			reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 		}
 		if backend.Spec.Autoscaling != nil && liveReplicas != nil {
-			dep.Spec.Replicas = liveReplicas
+			// Preserve the HPA's writes — but clamp to the configured floor so
+			// raising autoscaling.minReplicas doesn't briefly publish Ready
+			// against the old smaller live count before the HPA catches up.
+			preserved := *liveReplicas
+			if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
+				preserved = floor
+			}
+			dep.Spec.Replicas = &preserved
 		}
 		return controllerutil.SetControllerReference(backend, dep, r.Scheme)
 	})
@@ -390,6 +397,19 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 		return fmt.Errorf("apply deployment %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
 	return nil
+}
+
+// autoscalingFloor is the effective minReplicas value for the HPA — the
+// user's setting, or the default floor when unset. Mirrors the resolution
+// buildHPA does so the reconciler and the HPA agree on the lower bound.
+func autoscalingFloor(spec *cachev1alpha1.CacheBackendAutoscalingSpec) int32 {
+	if spec == nil {
+		return defaultHPAMinReplicas
+	}
+	if spec.MinReplicas != nil {
+		return *spec.MinReplicas
+	}
+	return defaultHPAMinReplicas
 }
 
 // applyService creates or updates the backend Service idempotently, owned by the CR.

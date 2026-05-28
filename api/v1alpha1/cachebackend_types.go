@@ -267,7 +267,11 @@ type CacheBackendStatus struct {
 
 	// Capacity is a human-readable summary of the backend's provisioned
 	// capacity (e.g. the requested PVC size when persistent storage is
-	// configured). It is informational; clients must not parse it.
+	// actually wired through to the cache server). It is informational;
+	// clients must not parse it. The field is intentionally left empty
+	// until the storage wire-up follow-up lands — the rendered cache-server
+	// pod has no data volume to attach a PVC to today, so reporting a
+	// requested size as "provisioned" would mislead operators.
 	// +optional
 	Capacity string `json:"capacity,omitempty"`
 

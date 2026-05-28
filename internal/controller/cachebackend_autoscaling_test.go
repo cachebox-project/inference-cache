@@ -191,6 +191,36 @@ func TestReconcileInitialReplicasDefaultsToOneWithAutoscaling(t *testing.T) {
 	}
 }
 
+func TestReconcileDeploymentClampsToRaisedHPAFloor(t *testing.T) {
+	// When the user raises autoscaling.minReplicas above the current live
+	// replica count, the reconciler must NOT preserve the stale lower value —
+	// otherwise managedHealth would report Ready against the old count before
+	// the HPA controller catches up, briefly publishing a Ready that does not
+	// satisfy the new minimum.
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 1, 5, nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	dep := getDeployment(t, r, "cache", "ns1")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 {
+		t.Fatalf("initial deployment replicas = %v, want 1", dep.Spec.Replicas)
+	}
+
+	// Raise the HPA floor; live replicas (set by us above) lags behind.
+	live := getBackend(t, r, "cache", "ns1")
+	*live.Spec.Autoscaling.MinReplicas = 4
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("raise minReplicas: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	dep = getDeployment(t, r, "cache", "ns1")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas < 4 {
+		t.Fatalf("deployment replicas = %v, want >= 4 (clamped to raised HPA floor)", dep.Spec.Replicas)
+	}
+}
+
 func TestReconcileDeploymentRespectsHPAReplicas(t *testing.T) {
 	// When an HPA owns the replica count, the reconciler must not overwrite
 	// dep.Spec.Replicas back to spec.Replicas — that would let the controller
