@@ -226,19 +226,40 @@ func TestVLLMLMCacheInjectEngineConfig(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheInjectEngineConfigFallbackToAllContainersWhenNoEngineName(t *testing.T) {
+func TestVLLMLMCacheInjectEngineConfigSingleContainerPodAcceptsAnyName(t *testing.T) {
+	// A pod with exactly one container is accepted as the engine even when
+	// the container is not named "vllm" — there's no sidecar to crash.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
-	// No container named "vllm" — adapter falls back to mutating every container
-	// so a non-standard pod template still gets wired (documented contract).
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}, {Name: "sidecar"}}}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
 
 	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
+	if _, ok := lookupEnv(pod.Containers[0].Env, EnvLMCacheRemoteURL); !ok {
+		t.Fatalf("single-container pod missing %s; should have been treated as the engine", EnvLMCacheRemoteURL)
+	}
+}
+
+func TestVLLMLMCacheInjectEngineConfigMultiContainerWithoutVLLMNameErrors(t *testing.T) {
+	// A multi-container pod with no container named "vllm" must be
+	// rejected: blindly mutating every container would inject vLLM-only
+	// flags onto sidecars and crash them.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	pod := &corev1.PodSpec{Containers: []corev1.Container{
+		{Name: "engine", Env: []corev1.EnvVar{{Name: "EXISTING", Value: "x"}}},
+		{Name: "sidecar", Env: []corev1.EnvVar{{Name: "SIDECAR_VAR", Value: "untouched"}}},
+	}}
+
+	err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb)
+	if err == nil {
+		t.Fatalf("expected an error for multi-container pod without a vllm-named container")
+	}
+	// Containers must come back untouched — no partial-mutation footprint.
 	for _, c := range pod.Containers {
-		if _, ok := lookupEnv(c.Env, EnvLMCacheRemoteURL); !ok {
-			t.Fatalf("container %q missing %s; fallback should target every container", c.Name, EnvLMCacheRemoteURL)
+		if _, ok := lookupEnv(c.Env, EnvLMCacheRemoteURL); ok {
+			t.Fatalf("container %q got %s injected before the error: %v", c.Name, EnvLMCacheRemoteURL, c.Env)
 		}
 	}
 }

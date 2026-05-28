@@ -187,10 +187,11 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
 // vLLM container in pod. It merges: existing args/env on the vLLM container
 // are preserved, repeat injections are idempotent, sidecars are left alone.
-// If no container is named [EngineContainerName] the adapter targets every
-// container in the pod — pod templates that name vLLM differently still get
-// wired, at the cost of duplicating env on innocent sidecars. Adapter users
-// who care should name the engine container `vllm`.
+// The engine container is identified by the canonical name
+// [EngineContainerName]; a single-container pod is also accepted (the lone
+// container is treated as the engine). A multi-container pod whose
+// containers are not named `vllm` is rejected — silently mutating every
+// container would inject vLLM-only flags onto sidecars and crash them.
 func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	if err := validateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
 		return err
@@ -210,13 +211,14 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint strin
 	// (and unset / unknown) → kv_both.
 	args := []string{defaultEngineKVTransferConfigArg, kvTransferConfig(integrationRole(cache))}
 
-	targets := engineContainerIndices(pod)
-	for _, i := range targets {
-		for _, e := range env {
-			pod.Containers[i].Env = upsertEnv(pod.Containers[i].Env, e)
-		}
-		pod.Containers[i].Args = upsertArgPair(pod.Containers[i].Args, args[0], args[1])
+	i, err := engineContainerIndex(pod)
+	if err != nil {
+		return err
 	}
+	for _, e := range env {
+		pod.Containers[i].Env = upsertEnv(pod.Containers[i].Env, e)
+	}
+	pod.Containers[i].Args = upsertArgPair(pod.Containers[i].Args, args[0], args[1])
 	return nil
 }
 
@@ -235,23 +237,29 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint strin
 	return nil
 }
 
-// engineContainerIndices returns the indices of containers the adapter should
-// mutate: only the container named [EngineContainerName] when present, or all
-// containers otherwise. The fallback exists so a pod template that names the
-// engine container differently still gets wired in PR1's webhook-less
-// reconcile-only path; the documented convention is to use the canonical
-// name.
-func engineContainerIndices(pod *corev1.PodSpec) []int {
+// engineContainerIndex returns the index of the engine container the adapter
+// should mutate. The engine container is identified by the canonical name
+// [EngineContainerName]; a single-container pod is also accepted (the lone
+// container is assumed to be the engine). Multi-container pods that don't
+// name a container `vllm` are rejected — blindly mutating every container
+// would inject vLLM-only flags (e.g. `--kv-transfer-config`) onto sidecars,
+// which would crash them on startup. The pod-template owner should name the
+// engine container `vllm` so the adapter has a stable target.
+func engineContainerIndex(pod *corev1.PodSpec) (int, error) {
 	for i := range pod.Containers {
 		if pod.Containers[i].Name == EngineContainerName {
-			return []int{i}
+			return i, nil
 		}
 	}
-	all := make([]int, len(pod.Containers))
-	for i := range pod.Containers {
-		all[i] = i
+	if len(pod.Containers) == 1 {
+		return 0, nil
 	}
-	return all
+	names := make([]string, len(pod.Containers))
+	for i := range pod.Containers {
+		names[i] = pod.Containers[i].Name
+	}
+	return -1, fmt.Errorf("inject engine config: pod has %d containers %v but none is named %q; injecting vLLM flags into unrelated sidecars would crash them — name the engine container %q",
+		len(pod.Containers), names, EngineContainerName, EngineContainerName)
 }
 
 // upsertArgPair inserts or updates the flag/value pair `flag value` in args,
