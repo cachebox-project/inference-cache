@@ -8,6 +8,7 @@ on:
     branches:
     - main
 
+# Workflow-level default; each job re-declares its minimal scope.
 permissions:
   contents: read
 
@@ -19,12 +20,14 @@ jobs:
   lint-test-proto:
     name: Lint, Test, Proto
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
     - name: Setup Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -41,13 +44,29 @@ jobs:
       run: make verify-no-internal-refs
 
     - name: Set up buf
-      uses: bufbuild/buf-setup-action@v1
+      uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99  # v1
       with:
         version: 1.69.0
         github_token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Lint proto contract
       run: make proto-lint
+
+    # Guards v1alpha1 wire compatibility: renumbered or removed fields, RPC
+    # removals, and incompatible type changes fail the PR. Skipped on push to
+    # main (no base ref to compare against).
+    - name: Fetch base ref for buf breaking
+      if: github.event_name == 'pull_request'
+      env:
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: |
+        git fetch --no-tags origin "+refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+
+    - name: Check for breaking proto changes
+      if: github.event_name == 'pull_request'
+      env:
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: buf breaking --against ".git#ref=origin/${PR_BASE_REF}"
 
     - name: Lint
       run: |
@@ -81,12 +100,83 @@ jobs:
     name: Image Build
     runs-on: ubuntu-latest
     needs: lint-test-proto
+    permissions:
+      contents: read
+      # Required for Trivy SARIF upload to the Security tab.
+      security-events: write
+    env:
+      # Deterministic tag the Trivy steps address. `git describe` would
+      # otherwise produce per-commit refs the scan steps can't pin.
+      IMAGE_TAG: ci-${{ github.sha }}
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4
 
     - name: Build images
-      run: make image-build
+      run: make image-build TAG=${IMAGE_TAG}
+
+    # Both image scans run with exit-code: 0 (and both SARIF uploads run with
+    # if: always()) so a failing controller scan can't short-circuit the server
+    # scan/upload. A final aggregation step parses both SARIFs and fails the
+    # job if either image had HIGH/CRITICAL findings.
+    - name: Scan controller image with Trivy
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+      with:
+        image-ref: ghcr.io/cachebox-project/inference-cache-controller:${{ env.IMAGE_TAG }}
+        severity: CRITICAL,HIGH
+        vuln-type: os,library
+        exit-code: '0'
+        format: sarif
+        output: trivy-controller.sarif
+
+    # Skip on forked PRs: GITHUB_TOKEN is read-only for forks regardless of
+    # requested permissions, so upload-sarif would fail and break public CI for
+    # outside contributors. The scan + aggregation gate still runs.
+    - name: Upload Trivy SARIF (controller)
+      if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+      with:
+        sarif_file: trivy-controller.sarif
+        category: trivy-controller
+
+    - name: Scan server image with Trivy
+      if: always()
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+      with:
+        image-ref: ghcr.io/cachebox-project/inference-cache-server:${{ env.IMAGE_TAG }}
+        severity: CRITICAL,HIGH
+        vuln-type: os,library
+        exit-code: '0'
+        format: sarif
+        output: trivy-server.sarif
+
+    - name: Upload Trivy SARIF (server)
+      if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+      with:
+        sarif_file: trivy-server.sarif
+        category: trivy-server
+
+    - name: Fail if any Trivy scan found HIGH/CRITICAL
+      if: always()
+      shell: bash
+      run: |
+        fail=0
+        for f in trivy-controller.sarif trivy-server.sarif; do
+          if [ ! -f "$f" ]; then
+            echo "✗ $f: missing (scan step did not run or failed)"
+            fail=1
+            continue
+          fi
+          n=$(jq '[.runs[]?.results[]?] | length' "$f")
+          if [ "$n" -gt 0 ]; then
+            echo "✗ $f: $n HIGH/CRITICAL finding(s)"
+            fail=1
+          else
+            echo "✓ $f: clean"
+          fi
+        done
+        exit "$fail"
