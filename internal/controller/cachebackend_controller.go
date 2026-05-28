@@ -55,6 +55,7 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives a CacheBackend toward its desired state. External backends only
 // mirror their configured endpoint to status; managed backends (LMCache in Phase 1)
