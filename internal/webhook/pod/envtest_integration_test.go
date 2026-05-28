@@ -36,7 +36,8 @@ import (
 //
 // Skips when KUBEBUILDER_ASSETS is unset so default CI stays green.
 // Run locally via:
-//   KUBEBUILDER_ASSETS=$(make test-env | tail -1) go test ./internal/webhook/pod/...
+//
+//	KUBEBUILDER_ASSETS=$(make test-env | tail -1) go test ./internal/webhook/pod/...
 func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping envtest in short mode")
