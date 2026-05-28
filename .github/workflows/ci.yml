@@ -67,8 +67,17 @@ jobs:
     # tests (internal/controller/integration_test.go) run against a real
     # apiserver instead of skipping. The test skip guard checks $KUBEBUILDER_ASSETS,
     # so exporting it via $GITHUB_ENV is enough to flip them on.
+    # The script fails fast if the path is empty or missing, so a `make test-env`
+    # failure can't silently skip the integration suite and let CI go green.
     - name: Install envtest binaries
-      run: echo "KUBEBUILDER_ASSETS=$(make test-env | tail -1)" >> $GITHUB_ENV
+      run: |
+        set -euo pipefail
+        path="$(make test-env | tail -1)"
+        if [ -z "$path" ] || [ ! -d "$path" ]; then
+          echo "make test-env did not produce a valid envtest path: '$path'" >&2
+          exit 1
+        fi
+        echo "KUBEBUILDER_ASSETS=$path" >> "$GITHUB_ENV"
 
     - name: Test (race detector)
       run: make test-race

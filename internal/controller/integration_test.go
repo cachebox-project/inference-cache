@@ -38,8 +38,9 @@ import (
 // HPA reconciliation, and — in TestIntegrationCacheBackendWatch — the Owns()
 // watch re-trigger via a real manager.
 //
-// Skipped unless KUBEBUILDER_ASSETS is set (e.g. `make test-env`) so the default
-// `go test ./...` in CI does not require envtest binaries.
+// Skipped unless KUBEBUILDER_ASSETS is set. CI installs envtest in
+// .github/workflows/ci.yml before `make test-race`, so the suite runs there;
+// locally run `KUBEBUILDER_ASSETS=$(make test-env | tail -1) go test ./...`.
 
 func skipWithoutEnvtest(t *testing.T) {
 	t.Helper()
