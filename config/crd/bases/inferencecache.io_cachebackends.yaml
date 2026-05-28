@@ -52,8 +52,50 @@ spec:
           metadata:
             type: object
           spec:
-            description: CacheBackendSpec defines the desired state of a cache backend.
+            description: |-
+              CacheBackendSpec defines the desired state of a cache backend.
+
+              Persistent storage (spec.storage.pvc) and the autoscaling spec
+              (spec.autoscaling) are both surfaced here for v1alpha1 forward-compat. The
+              autoscaling spec is reconciled into a HorizontalPodAutoscaler today;
+              spec.storage.pvc is accepted but inert until a follow-up wires it through
+              to the runtime adapter's rendered pod (there is no PVC provisioning, no
+              volume injection, and no status.capacity reporting until then).
             properties:
+              autoscaling:
+                description: |-
+                  Autoscaling configures horizontal autoscaling for the managed backend
+                  workload. When set, the controller reconciles a HorizontalPodAutoscaler
+                  owned by this CacheBackend; the HPA then drives the underlying workload's
+                  replica count, overriding spec.replicas.
+                properties:
+                  maxReplicas:
+                    description: MaxReplicas is the upper bound for the HPA replica
+                      count.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    description: |-
+                      MinReplicas is the lower bound for the HPA replica count. Defaults to 1
+                      when unset.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  targetCPUUtilizationPercent:
+                    description: |-
+                      TargetCPUUtilizationPercent is the average per-pod CPU utilization the
+                      HPA targets. Defaults to 80 when unset.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                required:
+                - maxReplicas
+                type: object
+                x-kubernetes-validations:
+                - message: minReplicas must not exceed maxReplicas
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
               backendConfig:
                 additionalProperties:
                   type: string
@@ -1582,6 +1624,16 @@ spec:
             description: CacheBackendStatus defines the observed state of a cache
               backend.
             properties:
+              capacity:
+                description: |-
+                  Capacity is a human-readable summary of the backend's provisioned
+                  capacity (e.g. the requested PVC size when persistent storage is
+                  actually wired through to the cache server). It is informational;
+                  clients must not parse it. The field is intentionally left empty
+                  until the storage wire-up follow-up lands — the rendered cache-server
+                  pod has no data volume to attach a PVC to today, so reporting a
+                  requested size as "provisioned" would mislead operators.
+                type: string
               conditions:
                 description: Conditions describe the latest observations of the backend.
                 items:

@@ -7,8 +7,10 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,8 +25,24 @@ import (
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
-// conditionTypeReady reports whether the managed backend workload is serving.
-const conditionTypeReady = "Ready"
+// Status condition types published on a managed CacheBackend.
+//
+// Ready reports whether the managed backend workload is currently serving.
+// Progressing reports whether the controller is still driving the live state
+// toward the desired state (template render, child apply, rollout in flight).
+// The two conditions together let consumers tell a still-converging backend
+// (Ready=False, Progressing=True) apart from a stuck/degraded one
+// (Ready=False, Progressing=False).
+const (
+	conditionTypeReady       = "Ready"
+	conditionTypeProgressing = "Progressing"
+)
+
+// Default HPA tuning when the autoscaling spec leaves them unset.
+const (
+	defaultHPAMinReplicas                 = int32(1)
+	defaultHPATargetCPUUtilizationPercent = int32(80)
+)
 
 // Event reasons emitted on a CacheBackend.
 //
@@ -59,6 +77,7 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -66,7 +85,8 @@ type CacheBackendReconciler struct {
 // only mirror their configured endpoint to status; managed backends (LMCache
 // in Phase 1) ask the registered runtime adapter for the cache-server pod
 // spec + service spec, wrap them into a Deployment + Service the controller
-// owns, and publish the resolved endpoint.
+// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
+// resolved endpoint.
 //
 // On every successful reconcile, transitions in the observed backend health
 // (entering/leaving Degraded) and in the effective spec.integration.failOpen
@@ -105,10 +125,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
-	// StatefulSet-backed (PVC) provisioning + autoscaling is the C3 module. Phase 1
-	// manages a Deployment only.
+	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
+	// module. Phase 1 manages a Deployment only.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
-		logger.V(1).Info("StatefulSet deploymentKind deferred to C3; skipping",
+		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
@@ -154,8 +174,10 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = backend.Spec.Endpoint
 		backend.Status.Health = ""
+		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 	})
 }
 
@@ -169,8 +191,10 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Health = ""
+		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 	})
 }
 
@@ -200,6 +224,9 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	if err := r.applyService(ctx, backend, svc); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileHPA(ctx, backend, dep); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	var live appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
@@ -220,10 +247,7 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 // controller owns: ObjectMeta + labels + replicas + selector come from the
 // CacheBackend identity, not the adapter.
 func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBackend, podSpec *corev1.PodSpec) *appsv1.Deployment {
-	replicas := int32(1)
-	if backend.Spec.Replicas != nil {
-		replicas = *backend.Spec.Replicas
-	}
+	replicas := initialReplicas(backend)
 	selector := selectorLabels(backend.Name)
 	podLabels := podTemplateLabels(backend)
 
@@ -337,9 +361,18 @@ func serviceEndpoint(svc *corev1.Service) string {
 // would strip API-server-defaulted fields (port Protocol, RestartPolicy, probe
 // thresholds, ...), and since those are re-defaulted on every write it would spin
 // a perpetual update loop via the Owns(Deployment) watch.
+//
+// When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
+// HPA's replica count rather than overwriting it — re-asserting replicas on
+// every reconcile would fight the HPA and churn the rollout.
 func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.Deployment) error {
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
+		// Snapshot the HPA-owned field BEFORE we mutate the live spec. When an
+		// HPA is configured the controller must never re-assert replicas; doing
+		// so would fight the HPA on every reconcile and churn the rollout.
+		liveReplicas := dep.Spec.Replicas
+
 		dep.Labels = desired.Labels
 		if dep.CreationTimestamp.IsZero() {
 			dep.Spec = *desired.Spec.DeepCopy()
@@ -347,12 +380,35 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 			dep.Spec.Replicas = desired.Spec.Replicas
 			reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 		}
+		if backend.Spec.Autoscaling != nil && liveReplicas != nil {
+			// Preserve the HPA's writes — but clamp to the configured floor so
+			// raising autoscaling.minReplicas doesn't briefly publish Ready
+			// against the old smaller live count before the HPA catches up.
+			preserved := *liveReplicas
+			if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
+				preserved = floor
+			}
+			dep.Spec.Replicas = &preserved
+		}
 		return controllerutil.SetControllerReference(backend, dep, r.Scheme)
 	})
 	if err != nil {
 		return fmt.Errorf("apply deployment %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
 	return nil
+}
+
+// autoscalingFloor is the effective minReplicas value for the HPA — the
+// user's setting, or the default floor when unset. Mirrors the resolution
+// buildHPA does so the reconciler and the HPA agree on the lower bound.
+func autoscalingFloor(spec *cachev1alpha1.CacheBackendAutoscalingSpec) int32 {
+	if spec == nil {
+		return defaultHPAMinReplicas
+	}
+	if spec.MinReplicas != nil {
+		return *spec.MinReplicas
+	}
+	return defaultHPAMinReplicas
 }
 
 // applyService creates or updates the backend Service idempotently, owned by the CR.
@@ -482,10 +538,11 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	}
 }
 
-// cleanupOwnedWorkload best-effort deletes the Deployment + Service this CR owns,
-// used when a backend is no longer a managed Deployment (type/kind changed). Normal
-// CR deletion is handled by owner-reference garbage collection; this covers the
-// in-place mutation case where the CR itself still exists.
+// cleanupOwnedWorkload best-effort deletes the Deployment + Service + HPA this
+// CR owns, used when a backend is no longer a managed Deployment (type/kind
+// changed). Normal CR deletion is handled by owner-reference garbage
+// collection; this covers the in-place mutation case where the CR itself
+// still exists.
 func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
 
@@ -494,7 +551,11 @@ func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backe
 		return err
 	}
 	var svc corev1.Service
-	return r.deleteIfOwned(ctx, key, &svc, backend)
+	if err := r.deleteIfOwned(ctx, key, &svc, backend); err != nil {
+		return err
+	}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	return r.deleteIfOwned(ctx, key, &hpa, backend)
 }
 
 // deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
@@ -512,17 +573,32 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 }
 
 // updateManagedStatus derives health from the Deployment and patches status only when it changes.
+//
+// status.capacity is intentionally left empty here: the field is present on
+// the type for forward-compat, but the standalone LMCache server pod has no
+// data volume the controller can attach a PVC to today, so reporting a
+// requested PVC size as "provisioned capacity" would mislead operators.
+// Populating it is left to the follow-up that wires storage end-to-end.
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment) error {
-	health, condStatus, reason, message := managedHealth(backend, dep)
+	health, readyStatus, reason, message := managedHealth(backend, dep)
+	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
 		backend.Status.Health = health
+		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
-			Status:             condStatus,
+			Status:             readyStatus,
 			Reason:             reason,
 			Message:            message,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             progressingStatus,
+			Reason:             progressingReason,
+			Message:            progressingMessage,
 			ObservedGeneration: backend.Generation,
 		})
 	})
@@ -532,11 +608,15 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 // Ready requires the Deployment to have observed its current generation and to
 // have enough updated + available replicas, so a stale rollout (e.g. mid image
 // change) is never reported Ready.
+//
+// When the CacheBackend is autoscaled the HPA owns the desired replica count,
+// so the comparison target is the live Deployment's spec.replicas (which the
+// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
+// in that mode). This keeps Ready accurate when an HPA decides to run more
+// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
+// happens to be 0 with autoscaling configured.
 func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
-	want := int32(1)
-	if backend.Spec.Replicas != nil {
-		want = *backend.Spec.Replicas
-	}
+	want := desiredReplicas(backend, dep)
 
 	// A backend scaled to zero is not serving; never report it Ready.
 	if want == 0 {
@@ -556,6 +636,154 @@ func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) 
 		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
 			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
 	}
+}
+
+// progressingFromHealth derives the Progressing condition from the Ready
+// condition's outcome. A Pending backend that's actively converging
+// (RolloutInProgress) flips Progressing=True; a Pending backend that's
+// reached a stable user-chosen state (ScaledToZero) is NOT progressing — no
+// rollout is in motion. A Ready backend has converged (Progressing=False,
+// Reason=Synced); a Degraded backend has finished a rollout but lost
+// replicas (Progressing=False, Reason=Degraded — Ready=False already
+// signals the problem, and the rollout isn't in motion).
+func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, message string) (metav1.ConditionStatus, string, string) {
+	switch health {
+	case cachev1alpha1.CacheBackendHealthReady:
+		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
+	case cachev1alpha1.CacheBackendHealthPending:
+		// ScaledToZero is a stable terminal state, not a rollout in progress.
+		if reason == "ScaledToZero" {
+			return metav1.ConditionFalse, reason, message
+		}
+		return metav1.ConditionTrue, reason, message
+	case cachev1alpha1.CacheBackendHealthDegraded:
+		return metav1.ConditionFalse, "Degraded", message
+	default:
+		return metav1.ConditionFalse, reason, message
+	}
+}
+
+// desiredReplicas is the per-reconcile source of truth for "how many replicas
+// should this backend be running". With autoscaling enabled the HPA writes
+// spec.replicas on the Deployment, so the live value is authoritative; without
+// it, the user's spec.replicas (default 1) wins.
+func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	if backend.Spec.Autoscaling != nil {
+		// First reconcile after an HPA spec is added may briefly see
+		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
+		// it within one cycle. Until then, fall back to the controller value.
+		if dep.Spec.Replicas != nil {
+			return *dep.Spec.Replicas
+		}
+		// Fall through to the floor.
+	}
+	if backend.Spec.Replicas != nil {
+		return *backend.Spec.Replicas
+	}
+	return 1
+}
+
+// initialReplicas picks the Deployment's initial replica count. With
+// autoscaling configured, spec.autoscaling.minReplicas is the source of truth
+// (defaulting to 1 when unset), so the workload comes up at or above the HPA
+// floor on first apply instead of starting at 1 and waiting for the HPA to
+// patch it. Without autoscaling, spec.replicas wins (default 1).
+func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
+	if backend.Spec.Autoscaling != nil {
+		if backend.Spec.Autoscaling.MinReplicas != nil {
+			return *backend.Spec.Autoscaling.MinReplicas
+		}
+		return 1
+	}
+	if backend.Spec.Replicas != nil {
+		return *backend.Spec.Replicas
+	}
+	return 1
+}
+
+// reconcileHPA creates, updates, or deletes the HorizontalPodAutoscaler that
+// drives the backend Deployment's replica count. The HPA exists iff
+// spec.autoscaling is set; otherwise any controller-owned HPA is removed.
+func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) error {
+	if backend.Spec.Autoscaling == nil {
+		// Autoscaling disabled — clean up any HPA we previously owned.
+		return r.deleteOwnedHPA(ctx, backend, deployment.Name)
+	}
+
+	desired := buildHPA(backend, deployment)
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
+		hpa.Labels = desired.Labels
+		hpa.Spec = desired.Spec
+		return controllerutil.SetControllerReference(backend, hpa, r.Scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("apply HPA %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+	return nil
+}
+
+// buildHPA renders the desired HorizontalPodAutoscaler for a CacheBackend whose
+// spec.autoscaling is set. Targets the managed Deployment by name. Phase 1 ships
+// a CPU-utilization target; cache-aware (custom-metric) HPAs come later.
+func buildHPA(backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) *autoscalingv2.HorizontalPodAutoscaler {
+	spec := backend.Spec.Autoscaling
+	minReplicas := defaultHPAMinReplicas
+	if spec.MinReplicas != nil {
+		minReplicas = *spec.MinReplicas
+	}
+	target := defaultHPATargetCPUUtilizationPercent
+	if spec.TargetCPUUtilizationPercent != nil {
+		target = *spec.TargetCPUUtilizationPercent
+	}
+	return &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deployment.Name,
+			Namespace: deployment.Namespace,
+			Labels:    deployment.Labels,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       deployment.Name,
+			},
+			MinReplicas: &minReplicas,
+			MaxReplicas: spec.MaxReplicas,
+			Metrics: []autoscalingv2.MetricSpec{
+				{
+					Type: autoscalingv2.ResourceMetricSourceType,
+					Resource: &autoscalingv2.ResourceMetricSource{
+						Name: corev1.ResourceCPU,
+						Target: autoscalingv2.MetricTarget{
+							Type:               autoscalingv2.UtilizationMetricType,
+							AverageUtilization: &target,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// deleteOwnedHPA removes a previously-owned HPA (e.g. spec.autoscaling cleared).
+// Missing HPA is a no-op.
+func (r *CacheBackendReconciler) deleteOwnedHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, name string) error {
+	key := types.NamespacedName{Name: name, Namespace: backend.Namespace}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	if err := r.Get(ctx, key, &hpa); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get HPA %s/%s: %w", backend.Namespace, name, err)
+	}
+	if !metav1.IsControlledBy(&hpa, backend) {
+		return nil
+	}
+	if err := r.Delete(ctx, &hpa); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
 }
 
 // patchStatus applies mutate to the backend's status and patches it only when
@@ -658,7 +886,9 @@ func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 
 // SetupWithManager sets up the controller with the Manager. Owns(Deployment)
 // guarantees that a child's status flipping (e.g. AvailableReplicas dropping
-// to zero) re-triggers a Reconcile so emitTransitionEvents observes the change.
+// to zero) re-triggers a Reconcile so emitTransitionEvents observes the
+// change; the HPA is owned so the controller re-reconciles when the
+// autoscaler updates spec.replicas or its own status.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
@@ -667,5 +897,6 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Complete(r)
 }

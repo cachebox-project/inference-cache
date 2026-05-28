@@ -53,6 +53,13 @@ const (
 )
 
 // CacheBackendSpec defines the desired state of a cache backend.
+//
+// Persistent storage (spec.storage.pvc) and the autoscaling spec
+// (spec.autoscaling) are both surfaced here for v1alpha1 forward-compat. The
+// autoscaling spec is reconciled into a HorizontalPodAutoscaler today;
+// spec.storage.pvc is accepted but inert until a follow-up wires it through
+// to the runtime adapter's rendered pod (there is no PVC provisioning, no
+// volume injection, and no status.capacity reporting until then).
 type CacheBackendSpec struct {
 	// Type identifies the backing cache implementation.
 	// +optional
@@ -70,6 +77,13 @@ type CacheBackendSpec struct {
 	// Storage describes persistent storage requested by the backend.
 	// +optional
 	Storage *CacheBackendStorageSpec `json:"storage,omitempty"`
+
+	// Autoscaling configures horizontal autoscaling for the managed backend
+	// workload. When set, the controller reconciles a HorizontalPodAutoscaler
+	// owned by this CacheBackend; the HPA then drives the underlying workload's
+	// replica count, overriding spec.replicas.
+	// +optional
+	Autoscaling *CacheBackendAutoscalingSpec `json:"autoscaling,omitempty"`
 
 	// Integration describes how inference engines should use the cache backend.
 	// +optional
@@ -108,6 +122,32 @@ type CacheBackendPVCSpec struct {
 	// StorageClassName is the optional StorageClass for the PVC.
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
+}
+
+// CacheBackendAutoscalingSpec configures horizontal autoscaling of the managed
+// backend workload via a HorizontalPodAutoscaler. Cache-aware (custom-metric)
+// autoscaling is deferred to a later module; Phase 1 supports a CPU-utilization
+// target, which is sufficient to demonstrate scale-up under load.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
+type CacheBackendAutoscalingSpec struct {
+	// MinReplicas is the lower bound for the HPA replica count. Defaults to 1
+	// when unset.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+
+	// MaxReplicas is the upper bound for the HPA replica count.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas int32 `json:"maxReplicas"`
+
+	// TargetCPUUtilizationPercent is the average per-pod CPU utilization the
+	// HPA targets. Defaults to 80 when unset.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	TargetCPUUtilizationPercent *int32 `json:"targetCPUUtilizationPercent,omitempty"`
 }
 
 // CacheBackendIntegrationSpec describes engine integration behavior.
@@ -223,6 +263,16 @@ type CacheBackendStatus struct {
 	// Health summarizes the observed backend health.
 	// +optional
 	Health CacheBackendHealth `json:"health,omitempty"`
+
+	// Capacity is a human-readable summary of the backend's provisioned
+	// capacity (e.g. the requested PVC size when persistent storage is
+	// actually wired through to the cache server). It is informational;
+	// clients must not parse it. The field is intentionally left empty
+	// until the storage wire-up follow-up lands — the rendered cache-server
+	// pod has no data volume to attach a PVC to today, so reporting a
+	// requested size as "provisioned" would mislead operators.
+	// +optional
+	Capacity string `json:"capacity,omitempty"`
 
 	// IndexEntries is the observed number of cache index entries for this backend.
 	// +optional

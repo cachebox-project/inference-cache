@@ -23,8 +23,11 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `type` | string | Backend implementation identifier. Known constants are `LMCache`, `SGLangHiCache`, `AIBrix`, `Mooncake`, `NIXL`, and `External`; validation intentionally stays open for v1alpha1 compatibility. |
 | `deploymentKind` | enum | Managed workload kind: `Deployment` or `StatefulSet`. |
 | `replicas` | integer | Desired managed backend replicas. Minimum `0`. |
-| `storage.pvc.size` | quantity | Requested PVC capacity when persistent storage is used. Required only when `storage.pvc` is present. |
-| `storage.pvc.storageClassName` | string | Optional StorageClass for PVC-backed cache storage. |
+| `storage.pvc.size` | quantity | Requested PVC capacity when persistent storage is used. Required only when `storage.pvc` is present. Accepted for forward-compat; wiring the PVC into the standalone LMCache server's data directory is deferred to a follow-up — the runtime-adapter interface doesn't yet declare a data-volume contract, so the controller has no place to attach it. Until then this field is inert. |
+| `storage.pvc.storageClassName` | string | Optional StorageClass for PVC-backed cache storage. See `storage.pvc.size` for the wire-up status. |
+| `autoscaling.minReplicas` | integer | Lower bound for HPA replica count. Defaults to `1` when unset. Minimum `1`. |
+| `autoscaling.maxReplicas` | integer | Upper bound for HPA replica count. Required when `autoscaling` is set. Minimum `1`. Cross-field validation: `minReplicas <= maxReplicas`. |
+| `autoscaling.targetCPUUtilizationPercent` | integer | Target average per-pod CPU utilization for the HPA. Defaults to `80` when unset. Range `[1, 100]`. |
 | `integration.engine` | string | Engine integration target, such as SGLang or vLLM. |
 | `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. |
 | `integration.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. Lookup callers must still fail open. |
@@ -90,10 +93,22 @@ The retired colocated-rendering keys (`image`, `profile`, `model`, `hfTokenSecre
 |---|---|---|
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
 | `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
+| `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
 | `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |
-| `conditions` | array | Kubernetes conditions keyed by `type`. |
+| `conditions` | array | Kubernetes conditions keyed by `type`. See [Conditions](#conditions). |
+
+### Conditions
+
+Two condition types are published on managed backends:
+
+| Type | Meaning |
+|---|---|
+| `Ready` | True once the backend Deployment has rolled out its current generation and has enough updated + available replicas to serve traffic. |
+| `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply). Transitions to False once the Deployment converges (`Synced`) or stalls (`Degraded`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded". |
+
+When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
 `kubectl get cachebackend` displays the observed `status.endpoint` so managed backends show the endpoint once reconciliation has created it.
 
