@@ -52,6 +52,17 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 
 It intentionally does not expose `containers`; requiring users to provide containers would conflict with managed backend defaults and would make simple scheduling overrides unnecessarily large.
 
+### backendConfig keys (managed LMCache)
+
+`spec.backendConfig` is a free-form string map; the managed LMCache builder recognizes a few keys as overrides until they are promoted to first-class spec fields:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `image` | gpu: lmcache reference image; cpu: **required** | Container image for the backend engine. The CPU image is arch-tagged upstream with no safe multi-arch default, so `profile=cpu` requires an explicit image. |
+| `model` | profile-dependent | Model the engine serves (`vllm serve <model>`). |
+| `hfTokenSecret` | `hf-token` | Name of the Secret (key `token`) injected as `HF_TOKEN` for gated model pulls. The reference is optional, so ungated models run without it. |
+| `profile` | `gpu` | Rendering profile. `gpu` (default): the full vLLM + LMCache connector with prefix caching, KV events, and an `nvidia.com/gpu` limit. `cpu`: a GPU-free vLLM engine (no GPU limit, no LMCache connector) that keeps prefix caching + the KV-event publisher, for validating the substrate off-GPU. Real LMCache offload requires a GPU, so it stays on the `gpu` profile. |
+
 ## Status
 
 | Field | Type | Purpose |
