@@ -50,7 +50,14 @@ const (
 	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
 	// since they round-trip through CacheBackend.Spec.BackendConfig (a
 	// map[string]string).
-	cfgKeyServerImage   = "image"
+	// cfgKeyServerImage is the BackendConfig key that overrides the
+	// lmcache-server container image. The name is deliberately distinct from
+	// the legacy "image" key (which addressed the all-in-one vLLM container
+	// the previous reconciler rendered) so an existing CR carrying
+	// `backendConfig.image: vllm/vllm-openai:...` does not silently render an
+	// lmcache-server pod with the wrong image — the legacy key is now
+	// ignored and the lmcache-server falls back to its default image.
+	cfgKeyServerImage   = "serverImage"
 	cfgKeyServerCommand = "serverCommand"
 	cfgKeyChunkSize     = "chunkSize"
 	cfgKeyRemoteSerde   = "remoteSerde"
@@ -58,7 +65,7 @@ const (
 	cfgKeyMaxLocalCPU   = "maxLocalCPU"
 )
 
-// Engine env var names. Exported so the C6 mutating webhook (PR2) and tests in
+// Engine env var names. Exported so a future mutating webhook and tests in
 // other packages can assert on them without re-stringifying the contract.
 const (
 	EnvLMCacheRemoteURL   = "LMCACHE_REMOTE_URL"
@@ -92,7 +99,7 @@ func NewVLLMLMCacheAdapter() KVCacheRuntimeAdapter {
 }
 
 // Supports matches vLLM runtimes against an LMCache CacheBackend. Any other
-// (runtime, backend) combination is left for another adapter — the C7
+// (runtime, backend) combination is left for another adapter — a future
 // admission validator surfaces unsupported pairs as ErrNoAdapter.
 func (vllmLMCacheAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
 	if cache == nil {
@@ -227,17 +234,31 @@ func engineContainerIndices(pod *corev1.PodSpec) []int {
 }
 
 // upsertArgPair inserts or updates the flag/value pair `flag value` in args,
-// preserving every other arg. If flag is already present its immediately
-// following value is replaced; otherwise the pair is appended. A trailing
-// flag with no value is treated as missing.
+// preserving every other arg. Both the two-arg form (`--flag`, `value`) and
+// the equals form (`--flag=value`) are recognised: an existing entry in
+// either form is updated in place (to the two-arg form), no duplicate is
+// appended. A trailing two-arg `--flag` with no value is treated as missing.
+// Normalising on the two-arg form keeps the rendered args stable across
+// repeat injections so an idempotent reconcile doesn't churn.
 func upsertArgPair(args []string, flag, value string) []string {
+	prefix := flag + "="
 	for i, a := range args {
-		if a == flag {
+		switch {
+		case a == flag:
 			if i+1 < len(args) {
 				args[i+1] = value
 				return args
 			}
 			return append(args, value)
+		case strings.HasPrefix(a, prefix):
+			// Replace the single equals-form entry with the two-arg form.
+			// Splice in `flag, value` at position i.
+			args[i] = flag
+			out := make([]string, 0, len(args)+1)
+			out = append(out, args[:i+1]...)
+			out = append(out, value)
+			out = append(out, args[i+1:]...)
+			return out
 		}
 	}
 	return append(args, flag, value)

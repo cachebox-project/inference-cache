@@ -69,8 +69,8 @@ type KVCacheRuntimeAdapter interface {
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
-// supports a given (runtime, CacheBackend) pair. Admission (cf. C7) translates
-// this into a user-visible rejection; the reconciler logs and skips.
+// supports a given (runtime, CacheBackend) pair. An admission validator can
+// translate this into a user-visible rejection; the reconciler logs and skips.
 var ErrNoAdapter = errors.New("no runtime adapter supports the runtime/backend pair")
 
 // Registry holds the set of known [KVCacheRuntimeAdapter] implementations and

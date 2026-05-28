@@ -30,4 +30,4 @@ spec:
       app.kubernetes.io/name: vllm
   backendConfig:
     # Pin to a real digest for non-local runs.
-    image: lmcache/standalone:latest
+    serverImage: lmcache/standalone:latest

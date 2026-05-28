@@ -119,7 +119,7 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 
 func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	cb := newLMCacheBackend(map[string]string{"image": "registry.example.com/lmcache:pinned"})
+	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
 
 	pod, _, err := a.ResolveCacheServer(cb)
 	if err != nil {
@@ -408,7 +408,7 @@ func TestUpsertArgPairAppendsAndReplaces(t *testing.T) {
 	if !equalStrSlice(got, want) {
 		t.Fatalf("upsertArgPair append = %v, want %v", got, want)
 	}
-	// Replace value when flag already present.
+	// Replace value when flag already present (two-arg form).
 	got = upsertArgPair([]string{"--flag", "old", "--other"}, "--flag", "new")
 	want = []string{"--flag", "new", "--other"}
 	if !equalStrSlice(got, want) {
@@ -419,6 +419,21 @@ func TestUpsertArgPairAppendsAndReplaces(t *testing.T) {
 	want = []string{"--flag", "v"}
 	if !equalStrSlice(got, want) {
 		t.Fatalf("upsertArgPair trailing-flag = %v, want %v", got, want)
+	}
+	// Equals form: a single `--flag=old` entry must be replaced in place
+	// with the two-arg form, not have a second `--flag new` appended.
+	got = upsertArgPair([]string{"--flag=old", "--other"}, "--flag", "new")
+	want = []string{"--flag", "new", "--other"}
+	if !equalStrSlice(got, want) {
+		t.Fatalf("upsertArgPair equals-form replace = %v, want %v", got, want)
+	}
+	// Idempotence across forms: the equals form gets normalised to the
+	// two-arg form, and a second upsert collapses to a single entry.
+	got = upsertArgPair([]string{"--flag=v1"}, "--flag", "v1")
+	got = upsertArgPair(got, "--flag", "v2")
+	want = []string{"--flag", "v2"}
+	if !equalStrSlice(got, want) {
+		t.Fatalf("upsertArgPair equals-then-two-arg idempotence = %v, want %v", got, want)
 	}
 }
 

@@ -161,7 +161,7 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.BackendConfig = map[string]string{"image": "registry.example.com/lmcache-server:pinned"}
+	cb.Spec.BackendConfig = map[string]string{"serverImage": "registry.example.com/lmcache-server:pinned"}
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
@@ -218,7 +218,7 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"image": "example.com/lmcache-server:v2"}
+	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v2"}
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
@@ -229,13 +229,13 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	}
 }
 
-// TestReconcileLMCacheProfileSwitchGPUToCPU was retired with C6: the
-// "profile" backendConfig key + the all-in-one vLLM+LMCache container shape
-// it switched between are gone. Post-C6 the CacheBackend renders a
-// CPU-only standalone lmcache-server regardless of the engine the user
-// runs alongside it — engine choice (GPU vs CPU image) is the user's, not a
+// TestReconcileLMCacheProfileSwitchGPUToCPU is retired: the "profile"
+// backendConfig key and the all-in-one vLLM+LMCache container shape it
+// switched between are gone. The CacheBackend now renders a CPU-only
+// standalone lmcache-server regardless of the engine the user runs
+// alongside it — engine choice (GPU vs CPU image) is the user's, not a
 // CacheBackend toggle. The substrate's CPU canary now exercises the engine
-// pod wiring (via the PR2 mutating webhook), not a CacheBackend profile
+// pod wiring (via the future mutating webhook), not a CacheBackend profile
 // switch.
 
 func TestReconcileLMCacheScalesReplicas(t *testing.T) {
@@ -449,7 +449,7 @@ func TestReconcileStatefulSetKindDeferred(t *testing.T) {
 		t.Fatalf("list deployments: %v", err)
 	}
 	if len(deps.Items) != 0 {
-		t.Fatalf("deployments = %d, want 0 (StatefulSet kind deferred to C3)", len(deps.Items))
+		t.Fatalf("deployments = %d, want 0 (StatefulSet kind deferred — managed Deployments only for now)", len(deps.Items))
 	}
 }
 
@@ -582,12 +582,13 @@ func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
 }
 
 func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
-	// Upgrading an existing Deployment that the retired C2 builder created
-	// (single container named "vllm" referencing pod-level volumes
-	// "cache-home" + "shm") to the C6 standalone shape (single container
-	// named "lmcache-server", no pod-level volumes) must REPLACE both the
-	// container set AND the dangling adapter-owned volumes. Leaving the old
-	// volumes would carry stale config from the previous shape forever.
+	// Upgrading an existing Deployment that the retired colocated all-in-one
+	// builder created (single container named "vllm" referencing pod-level
+	// volumes "cache-home" + "shm") to the standalone shape (single
+	// container named "lmcache-server", no pod-level volumes) must REPLACE
+	// both the container set AND the dangling adapter-owned volumes. Leaving
+	// the old volumes would carry stale config from the previous shape
+	// forever.
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
 	r := newReconciler(scheme, cb)
@@ -620,7 +621,7 @@ func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
 	}
 	for _, v := range pod.Volumes {
 		if v.Name == "cache-home" || v.Name == "shm" {
-			t.Fatalf("stale C2 volume %q survived the upgrade: %v", v.Name, volumeNames(pod.Volumes))
+			t.Fatalf("stale colocated-rendering volume %q survived the upgrade: %v", v.Name, volumeNames(pod.Volumes))
 		}
 	}
 }
@@ -649,8 +650,9 @@ func containerNames(cs []corev1.Container) []string {
 // the same lives behind KUBEBUILDER_ASSETS.
 
 func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *testing.T) {
-	// Simulates a live Deployment from C2's colocated all-in-one: a "vllm"
-	// container referencing pod-level cache-home + shm volumes.
+	// Simulates a live Deployment from the previous colocated all-in-one
+	// rendering: a "vllm" container referencing pod-level cache-home + shm
+	// volumes.
 	live := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
@@ -664,7 +666,7 @@ func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *test
 			{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
 		},
 	}
-	// The C6 standalone desired shape: a "lmcache-server" container, no
+	// The standalone desired shape: a "lmcache-server" container, no
 	// pod-level volumes.
 	desired := &corev1.PodSpec{
 		Containers: []corev1.Container{
@@ -683,7 +685,7 @@ func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *test
 		t.Fatalf("containers = %v, want exactly [lmcache-server] after upgrade", containerNames(live.Containers))
 	}
 	if len(live.Volumes) != 0 {
-		t.Fatalf("Volumes = %v, want empty after upgrade (stale C2 volumes must be pruned)", volumeNames(live.Volumes))
+		t.Fatalf("Volumes = %v, want empty after upgrade (stale colocated-rendering volumes must be pruned)", volumeNames(live.Volumes))
 	}
 }
 

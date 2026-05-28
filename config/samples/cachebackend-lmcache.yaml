@@ -8,8 +8,8 @@
 # VLLM_USE_V1).
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
-# canonical LMCache lm:// port). Storage/PVC + autoscaling (C3) and richer
-# fail-open serving semantics (C4) are tracked separately.
+# canonical LMCache lm:// port). Storage/PVC + autoscaling and richer
+# fail-open serving semantics are tracked separately.
 #
 # Override the lmcache-server image (defaults to lmcache/standalone:latest)
 # or the server command via backendConfig until first-class spec fields land.
@@ -34,7 +34,7 @@ spec:
       app.kubernetes.io/name: vllm
   backendConfig:
     # Pin to a real digest for non-local runs.
-    image: lmcache/standalone:latest
+    serverImage: lmcache/standalone:latest
     # LMCache server storage device; "cpu" (in-memory) is the supported default.
     # Override `serverCommand` to switch to the newer
     # `python3 -m lmcache.v1.multiprocess.server` form once stabilised.

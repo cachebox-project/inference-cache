@@ -61,7 +61,7 @@ Server-side (consumed by `ResolveCacheServer` when rendering the cache-server po
 
 | Key | Default | Purpose |
 |---|---|---|
-| `image` | `lmcache/standalone:latest` | Container image for the standalone lmcache-server. Pin to a digest for non-local runs. |
+| `serverImage` | `lmcache/standalone:latest` | Container image for the standalone lmcache-server. Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
 
 Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod to the cache):
@@ -75,7 +75,7 @@ Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod 
 
 The webhook also injects the constant flags every vLLM+LMCache engine needs: `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'`, `VLLM_USE_V1=1`, and `LMCACHE_REMOTE_URL=lm://<status.endpoint>`. These are not user-overridable.
 
-The retired all-in-one C2 keys (`profile`, `model`, `hfTokenSecret`) were specific to the colocated vLLM+LMCache workload C2 templated. The new architecture splits the cache server from the engine: the engine is user-owned (its image/model/HF token live on the engine's own Deployment), the cache-server is engine-agnostic.
+The retired colocated-rendering keys (`image`, `profile`, `model`, `hfTokenSecret`) were specific to a previous all-in-one vLLM+LMCache workload the reconciler templated. The new architecture splits the cache server from the engine: the engine is user-owned (its image/model/HF-token Secret live on the engine's own Deployment), the cache-server is engine-agnostic. CRs carrying any of those legacy keys keep validating against the unchanged CRD schema (`backendConfig` is a free-form string map) but the values are silently ignored — operators upgrading from the colocated rendering should drop them, or move them to the engine Deployment they own.
 
 ## Status
 

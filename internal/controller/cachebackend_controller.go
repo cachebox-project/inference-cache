@@ -121,8 +121,8 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	adapter, err := registry.Select(runtimeID, backend)
 	if err != nil {
 		// No adapter knows how to wire this (runtime, backend) pair. Shed any
-		// previously managed workload and log; the C7 admission validator
-		// surfaces the same condition as a user-visible rejection.
+		// previously managed workload and log; a future admission validator
+		// will surface the same condition as a user-visible rejection.
 		logger.V(1).Info("no runtime adapter for backend",
 			"runtime", runtimeID, "type", backend.Spec.Type,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
@@ -392,9 +392,10 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 //   - An adapter update that adds/changes pod-level volumes without changing
 //     the container set.
 //
-// For C6 the LMCache adapter renders no pod-level volumes, so this is a no-op
-// for the steady-state path; for the upgrade-from-C2 path it still prunes the
-// stale cache-home + shm volumes.
+// The current LMCache adapter renders no pod-level volumes, so this is a
+// no-op for the steady-state path; on an in-place upgrade from the previous
+// colocated all-in-one rendering it still prunes the stale cache-home + shm
+// volumes that container left behind.
 func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	reconcileManagedContainer(live, desired)
 	live.Volumes = desired.Volumes
@@ -416,13 +417,13 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 // container in place, leaving API-server-defaulted container fields untouched.
 //
 // Containers in live whose names are not in desired are dropped — this is the
-// upgrade path from the C2 colocated all-in-one (container name "vllm") to
-// the C6 standalone topology (container name "lmcache-server"): an in-place
-// upgrade must replace the old managed container, not stack the new one
-// alongside it. We never drop containers that match a desired name (we only
-// update their managed fields), so a Deployment carrying sidecars in addition
-// to the managed container loses the sidecars — sidecars were not a supported
-// path in C2 and remain unsupported here.
+// upgrade path from a previous colocated all-in-one rendering (container
+// name "vllm") to the standalone topology (container name "lmcache-server"):
+// an in-place upgrade must replace the old managed container, not stack the
+// new one alongside it. We never drop containers that match a desired name
+// (we only update their managed fields), so a Deployment carrying sidecars
+// in addition to the managed container loses the sidecars — sidecars were
+// not supported in the previous rendering and remain unsupported here.
 func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	if len(desired.Containers) == 0 {
 		return
