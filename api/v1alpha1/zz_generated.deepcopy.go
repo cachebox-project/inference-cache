@@ -353,11 +353,7 @@ func (in *CacheIndex) DeepCopyInto(out *CacheIndex) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
 	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
-	if in.Spec != nil {
-		in, out := &in.Spec, &out.Spec
-		*out = new(CacheIndexSpec)
-		**out = **in
-	}
+	out.Spec = in.Spec
 	in.Status.DeepCopyInto(&out.Status)
 }
 

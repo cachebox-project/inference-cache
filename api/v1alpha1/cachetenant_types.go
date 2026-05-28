@@ -84,7 +84,8 @@ type CacheTenant struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CacheTenantSpec   `json:"spec,omitempty"`
+	// +kubebuilder:validation:Required
+	Spec   CacheTenantSpec   `json:"spec"`
 	Status CacheTenantStatus `json:"status,omitempty"`
 }
 

@@ -77,7 +77,8 @@ type PromptTemplate struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   PromptTemplateSpec   `json:"spec,omitempty"`
+	// +kubebuilder:validation:Required
+	Spec   PromptTemplateSpec   `json:"spec"`
 	Status PromptTemplateStatus `json:"status,omitempty"`
 }
 

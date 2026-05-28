@@ -112,7 +112,7 @@ type CacheIndex struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   *CacheIndexSpec  `json:"spec,omitempty"`
+	Spec   CacheIndexSpec   `json:"spec,omitempty"`
 	Status CacheIndexStatus `json:"status,omitempty"`
 }
 

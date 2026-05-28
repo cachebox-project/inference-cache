@@ -25,6 +25,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	})
 
 	tenantSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
+	requireRequired(t, tenantSchema, "spec")
 	tenantSpec := mustPath[map[string]any](t, tenantSchema, "properties", "spec")
 	requireRequired(t, tenantSpec, "tenantID")
 	requireMinLength(t, mustProperty(t, tenantSpec, "tenantID"), 1)
@@ -35,6 +36,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireMinimum(t, mustProperty(t, tenantQuota, "maxIndexEntries"), 0)
 
 	templateSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_prompttemplates.yaml")
+	requireRequired(t, templateSchema, "spec")
 	templateSpec := mustPath[map[string]any](t, templateSchema, "properties", "spec")
 	requireRequired(t, templateSpec, "body")
 	requireMinLength(t, mustProperty(t, templateSpec, "body"), 1)
@@ -182,7 +184,6 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	}
 
 	index := &CacheIndex{
-		Spec: &CacheIndexSpec{},
 		Status: CacheIndexStatus{
 			Replicas: []ReplicaCacheStatus{{ID: "r1", CacheMemoryBytes: 100}},
 			Tenants:  []TenantCacheStatus{{ID: "tenant-a", MemoryUsed: 50}},
@@ -196,21 +197,20 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	index.Status.Replicas[0].CacheMemoryBytes = 200
 	index.Status.Tenants[0].MemoryUsed = 75
 	index.Status.Prefixes.Summary.Total = 2
-	if indexCopy.Spec == nil ||
-		indexCopy.Status.Replicas[0].CacheMemoryBytes != 100 ||
+	if indexCopy.Status.Replicas[0].CacheMemoryBytes != 100 ||
 		indexCopy.Status.Tenants[0].MemoryUsed != 50 ||
 		indexCopy.Status.Prefixes.Summary.Total != 1 {
 		t.Fatalf("CacheIndex was not deep-copied")
 	}
 }
 
-func TestCacheIndexJSONOmitsSpecByDefault(t *testing.T) {
+func TestCacheIndexJSONUsesLegacyEmptySpecByDefault(t *testing.T) {
 	data, err := json.Marshal(CacheIndex{})
 	if err != nil {
 		t.Fatalf("marshal CacheIndex: %v", err)
 	}
-	if strings.Contains(string(data), `"spec"`) {
-		t.Fatalf("empty CacheIndex JSON = %s, did not want spec", data)
+	if !strings.Contains(string(data), `"spec":{}`) {
+		t.Fatalf("empty CacheIndex JSON = %s, want legacy empty spec", data)
 	}
 }
 
