@@ -47,16 +47,17 @@ log() { echo "[canary] $*"; }
 fail() { echo "[canary] FAIL: $*" >&2; exit 1; }
 
 cleanup() {
-  [ -n "$sub_pid" ] && kill "$sub_pid" 2>/dev/null || true
-  [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+  if [ -n "$sub_pid" ]; then kill "$sub_pid" 2>/dev/null || true; fi
+  if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 # --- build the binaries from source ----------------------------------------
+# Use `make build` so the bin/ dir + ldflags are handled consistently with the
+# rest of the repo (a fresh checkout doesn't have bin/, which is git-ignored).
 log "building server + kvevent-subscriber"
-go build -o bin/server ./cmd/server
-go build -o bin/kvevent-subscriber ./cmd/kvevent-subscriber
+make build
 
 # --- start the CPU engine ---------------------------------------------------
 log "starting vLLM CPU engine ($IMAGE)"
