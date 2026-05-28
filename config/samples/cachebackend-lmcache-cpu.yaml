@@ -3,13 +3,14 @@
 # storage device is `cpu` in-memory) regardless of what engine attaches to
 # it — there is no separate CPU/GPU "profile" anymore: the cache server is
 # engine-agnostic and the engine choice (CPU vs GPU image) lives on the
-# operator-owned vLLM Deployment, not on the CacheBackend.
+# user-owned vLLM Deployment, not on the CacheBackend.
 #
 # Apply this alongside a vLLM Deployment whose labels match
 # `spec.engineSelector`; a future mutating webhook will wire the engine
-# pods to the resolved `lm://<svc>:65432` endpoint published in
-# `status.endpoint`. Until that webhook lands, set the engine-side env vars
-# + `--kv-transfer-config` arg manually (see docs/design/cachebackend-api.md
+# pods to the resolved cache endpoint published in `status.endpoint` (an
+# engine-agnostic host:port — the adapter adds the `lm://` scheme on the
+# engine env). Until that webhook lands, set the engine-side env vars +
+# `--kv-transfer-config` arg manually (see docs/design/cachebackend-api.md
 # §backendConfig keys for the full set).
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend

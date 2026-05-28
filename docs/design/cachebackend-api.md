@@ -73,7 +73,14 @@ Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod 
 | `localCPU` | `False` | `LMCACHE_LOCAL_CPU` on the engine container. Defaults to `False` (remote-only); `True` enables a hybrid local+remote mode. |
 | `maxLocalCPU` | `20` | `LMCACHE_MAX_LOCAL_CPU_SIZE` (GiB) on the engine container; only meaningful when `localCPU=True`. |
 
-The webhook also injects the constant flags every vLLM+LMCache engine needs: `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'`, `VLLM_USE_V1=1`, and `LMCACHE_REMOTE_URL=lm://<status.endpoint>`. These are not user-overridable.
+The webhook also injects the flags every vLLM+LMCache engine needs:
+
+- `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"<role>"}'` — `<role>` is derived from `spec.integration.role`: `ReadOnly → kv_consumer`, `WriteOnly → kv_producer`, `ReadWrite → kv_both` (also the default when `integration` is unset).
+- `LMCACHE_REMOTE_URL=lm://<status.endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter (`status.endpoint` itself stays an engine-agnostic `host:port`).
+- `VLLM_USE_V1=1`.
+- `INFERENCECACHE_FAIL_OPEN=<true|false>` — mirrors `spec.integration.failOpen` onto the engine pod (defaults to `true` when the field is unset). The LMCache connector is fail-open by default at runtime regardless of this value; surfacing the bit lets the engine layer enforce fail-closed semantics when that work lands, and keeps the adapter aligned with the contract that this flag is plumbed by the engine adapter.
+
+These are not user-overridable via `backendConfig`.
 
 The retired colocated-rendering keys (`image`, `profile`, `model`, `hfTokenSecret`) were specific to a previous all-in-one vLLM+LMCache workload the reconciler templated. The new architecture splits the cache server from the engine: the engine is user-owned (its image/model/HF-token Secret live on the engine's own Deployment), the cache-server is engine-agnostic. CRs carrying any of those legacy keys keep validating against the unchanged CRD schema (`backendConfig` is a free-form string map) but the values are silently ignored — operators upgrading from the colocated rendering should drop them, or move them to the engine Deployment they own.
 

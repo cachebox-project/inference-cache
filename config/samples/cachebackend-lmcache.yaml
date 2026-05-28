@@ -1,7 +1,9 @@
 # A managed LMCache backend the controller reconciles into a standalone
 # lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
 # spec.engineSelector identifies the pods a future mutating webhook will
-# wire to the resolved lm:// endpoint published in status.endpoint. Until
+# wire to the resolved cache endpoint published in status.endpoint (as an
+# engine-agnostic host:port — the adapter adds the lm:// scheme on the
+# engine env). Until
 # that webhook lands, the engine-side env vars + `--kv-transfer-config`
 # arg must be set manually (see the runtime adapter for the exact set:
 # LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
