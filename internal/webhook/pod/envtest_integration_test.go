@@ -94,10 +94,16 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	mgrErr := make(chan error, 1)
 	go func() { mgrErr <- mgr.Start(ctx) }()
+	// Single combined cleanup: cancel the context FIRST, then wait for the
+	// manager goroutine to exit. Two separate t.Cleanups would fire in
+	// reverse registration order (LIFO), so registering cancel and then
+	// the wait would mean the wait runs first against a still-live
+	// context — the 5s deadline would fire on every test instead of the
+	// manager exiting promptly on cancellation.
 	t.Cleanup(func() {
+		cancel()
 		select {
 		case err := <-mgrErr:
 			if err != nil && !isContextCanceledErr(err) {
