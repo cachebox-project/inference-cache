@@ -295,7 +295,6 @@ func TestServiceDNSNamespace(t *testing.T) {
 	}{
 		{"bare svc DNS", "cache.team-a.svc", "team-a", true},
 		{"cluster.local svc DNS", "cache.team-b.svc.cluster.local", "team-b", true},
-		{"alt cluster suffix", "cache.team-c.svc.private", "team-c", true},
 		{"svc DNS with port", "cache.team-d.svc.cluster.local:9000", "team-d", true},
 		{"https scheme + path", "https://cache.team-e.svc.cluster.local/api", "team-e", true},
 		{"grpc scheme", "grpc://cache.team-f.svc:9090", "team-f", true},
@@ -304,6 +303,9 @@ func TestServiceDNSNamespace(t *testing.T) {
 		{"pod FQDN with port", "cache-1.cache.team-i.svc.cluster.local:9000", "team-i", true},
 		{"external hostname", "cache.example.com", "", false},
 		{"external hostname with port", "cache.example.com:443", "", false},
+		{"external with svc-shaped label", "cache.team-b.svc.example.com", "", false},
+		{"external svc-shaped label with port", "cache.team-b.svc.example.com:443", "", false},
+		{"non-default cluster domain", "cache.team-c.svc.private", "", false},
 		{"bare hostname", "cache", "", false},
 		{"two-label hostname", "cache.team-a", "", false},
 		{"third label not svc", "cache.team-a.cluster", "", false},

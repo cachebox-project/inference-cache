@@ -235,27 +235,37 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 	}
 }
 
+// k8sClusterDomain is the standard Kubernetes cluster DNS suffix. Most
+// clusters use the default; the rare cluster with a custom cluster
+// domain can opt past the cross-namespace rule with
+// spec.allowCrossNamespace=true rather than have the parser
+// conservatively widen to anything that contains a "svc" label.
+const k8sClusterDomain = "cluster.local"
+
 // serviceDNSNamespace returns the namespace segment of an in-cluster
-// Service-scoped or Pod-scoped DNS endpoint, or false if the endpoint is
-// not recognisable as in-cluster DNS. Recognised forms (after stripping
-// scheme + path + port):
+// Service-scoped or Pod-scoped Kubernetes DNS endpoint, or false if the
+// endpoint is not recognisable as in-cluster DNS. To avoid misparsing
+// external hostnames that happen to contain a "svc" label (e.g.
+// "cache.team-b.svc.example.com"), the parser only matches hostnames
+// that end with ".svc" or ".svc.cluster.local" — the two canonical
+// Kubernetes forms. Recognised shapes (after stripping scheme + path +
+// port + optional cluster-domain suffix):
 //
 //	Service-scoped:
 //	  <svc>.<ns>.svc
 //	  <svc>.<ns>.svc.cluster.local
-//	  <svc>.<ns>.svc.<any.cluster.suffix>
 //	Pod-scoped (StatefulSet pod-FQDN / headless-service pod-DNS):
 //	  <pod>.<svc>.<ns>.svc
 //	  <pod>.<svc>.<ns>.svc.cluster.local
 //
-// Both forms namespace the connection — pod-FQDNs are how StatefulSet
-// pods are addressed individually and must be treated as the same
-// tenancy boundary as the equivalent Service DNS.
+// Both forms cross the same tenancy boundary — pod-FQDNs are how
+// StatefulSet pods are addressed individually and must be treated as
+// equivalent to the Service DNS that backs them.
 //
-// Bare hostnames (e.g. "cache.example.com"), IP addresses, and
-// unqualified names are not in-cluster DNS and pass through as
-// ok=false — we have no namespace to compare against and rejecting
-// them would block legitimate external-backend addresses.
+// External hostnames (e.g. "cache.example.com"), IP addresses, and
+// unqualified names pass through as ok=false — we have no namespace to
+// compare against and rejecting them would block legitimate
+// external-backend addresses.
 func serviceDNSNamespace(endpoint string) (string, bool) {
 	host := strings.TrimSpace(endpoint)
 	if host == "" {
@@ -274,22 +284,23 @@ func serviceDNSNamespace(endpoint string) (string, bool) {
 	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i:], ".") {
 		host = host[:i]
 	}
-	parts := strings.Split(host, ".")
-	// Find the "svc" marker that anchors in-cluster DNS. The label
-	// immediately before it is the namespace; the labels before that are
-	// the Service name (and optionally the pod prefix). This unifies the
-	// 3-label Service form and the 4-label Pod-FQDN form.
-	svcIdx := -1
-	for i, p := range parts {
-		if p == "svc" {
-			svcIdx = i
-			break
-		}
-	}
-	if svcIdx < 2 {
+	// Strip the optional Kubernetes cluster-domain suffix so the two
+	// canonical forms collapse to a single ".svc"-terminated string.
+	host = strings.TrimSuffix(host, "."+k8sClusterDomain)
+	// Anchored match: in-cluster DNS terminates at ".svc". Anything else
+	// (external hostnames, IPs, unqualified names) is not in-cluster.
+	if !strings.HasSuffix(host, ".svc") {
 		return "", false
 	}
-	ns := parts[svcIdx-1]
+	host = strings.TrimSuffix(host, ".svc")
+	parts := strings.Split(host, ".")
+	// After trimming ".svc", we need at least <svc>.<ns> (Service form)
+	// or <pod>.<svc>.<ns> (Pod-FQDN form). The namespace is the
+	// rightmost label in both cases.
+	if len(parts) < 2 {
+		return "", false
+	}
+	ns := parts[len(parts)-1]
 	if ns == "" {
 		return "", false
 	}
