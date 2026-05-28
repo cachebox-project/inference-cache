@@ -118,24 +118,39 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerHasResourceRequests(t *testing.T) {
-	// A CPU-utilization HPA needs the pod's CPU request as the denominator to
-	// compute utilization, so without one the autoscaler never gets a usable
-	// metric and never scales. The adapter must therefore declare modest
-	// CPU + memory requests on the lmcache-server container by default.
+func TestVLLMLMCacheResolveCacheServerNoRequestsWithoutAutoscaling(t *testing.T) {
+	// Non-autoscaled backends keep the previous "no requests" rendering so
+	// upgrades don't change scheduling for users who don't opt into an HPA.
 	a := NewVLLMLMCacheAdapter()
 	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if len(pod.Containers[0].Resources.Requests) != 0 {
+		t.Fatalf("container Requests = %v, want empty when autoscaling is unset", pod.Containers[0].Resources.Requests)
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerHasResourceRequestsWhenAutoscaled(t *testing.T) {
+	// A CPU-utilization HPA needs the pod's CPU request as the denominator
+	// to compute utilization, so without one the autoscaler never gets a
+	// usable metric. The adapter must therefore declare CPU + memory
+	// requests on the lmcache-server container when spec.autoscaling is set.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	pod, _, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
 	reqs := pod.Containers[0].Resources.Requests
 	cpu, hasCPU := reqs[corev1.ResourceCPU]
 	if !hasCPU || cpu.IsZero() {
-		t.Fatalf("container Resources.Requests missing a CPU request: %v", reqs)
+		t.Fatalf("container Resources.Requests missing a CPU request under autoscaling: %v", reqs)
 	}
 	mem, hasMem := reqs[corev1.ResourceMemory]
 	if !hasMem || mem.IsZero() {
-		t.Fatalf("container Resources.Requests missing a memory request: %v", reqs)
+		t.Fatalf("container Resources.Requests missing a memory request under autoscaling: %v", reqs)
 	}
 }
 

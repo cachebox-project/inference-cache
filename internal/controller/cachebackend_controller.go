@@ -639,16 +639,22 @@ func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) 
 }
 
 // progressingFromHealth derives the Progressing condition from the Ready
-// condition's outcome. A Pending backend is still actively converging
-// (Progressing=True); a Ready backend has converged (Progressing=False,
-// Reason=Synced); a Degraded backend has finished a rollout but lost replicas
-// (Progressing=False, Reason=Degraded — Ready=False already signals the
-// problem, and the rollout isn't in motion).
+// condition's outcome. A Pending backend that's actively converging
+// (RolloutInProgress) flips Progressing=True; a Pending backend that's
+// reached a stable user-chosen state (ScaledToZero) is NOT progressing — no
+// rollout is in motion. A Ready backend has converged (Progressing=False,
+// Reason=Synced); a Degraded backend has finished a rollout but lost
+// replicas (Progressing=False, Reason=Degraded — Ready=False already
+// signals the problem, and the rollout isn't in motion).
 func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, message string) (metav1.ConditionStatus, string, string) {
 	switch health {
 	case cachev1alpha1.CacheBackendHealthReady:
 		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
 	case cachev1alpha1.CacheBackendHealthPending:
+		// ScaledToZero is a stable terminal state, not a rollout in progress.
+		if reason == "ScaledToZero" {
+			return metav1.ConditionFalse, reason, message
+		}
 		return metav1.ConditionTrue, reason, message
 	case cachev1alpha1.CacheBackendHealthDegraded:
 		return metav1.ConditionFalse, "Degraded", message

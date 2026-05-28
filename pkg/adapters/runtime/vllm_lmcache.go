@@ -163,20 +163,13 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// CPU and memory requests are required for a CPU-utilization HPA to
-		// have a baseline to compute utilization against; without a CPU
-		// request the kube-controller-manager's HPA loop never gets a usable
-		// metric and the scaler never moves. The values are conservative
-		// starting points (the standalone server forwards bytes and holds KV
-		// in memory; 1 GiB is a floor sized for a small KV working set).
-		// Memory-bound workloads should grow the request via a future first-
-		// class spec field.
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("250m"),
-				corev1.ResourceMemory: resource.MustParse("1Gi"),
-			},
-		},
+		// CPU + memory requests are added ONLY when autoscaling is configured
+		// — a CPU-utilization HPA needs the CPU request as the utilization
+		// denominator, so the scaler can't move without one. Non-autoscaled
+		// backends keep main's pre-existing "no requests" rendering so this
+		// change doesn't alter scheduling for users not opting into HPA. A
+		// future first-class spec field can promote these from defaults.
+		Resources: defaultServerResources(cache),
 	}
 
 	pod := &corev1.PodSpec{
@@ -197,6 +190,25 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 		},
 	}
 	return pod, svc, nil
+}
+
+// defaultServerResources returns the requests baked into the lmcache-server
+// container. The defaults are a conservative floor sized for a small KV
+// working set + an HPA-usable CPU baseline (a CPU-utilization HPA can't
+// compute a denominator without a CPU request). They are applied ONLY when
+// the CacheBackend opts into autoscaling, so backends that don't use an HPA
+// keep the previous "no requests" rendering and don't see scheduling
+// behaviour change on upgrade. A future first-class spec field can override.
+func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRequirements {
+	if cache == nil || cache.Spec.Autoscaling == nil {
+		return corev1.ResourceRequirements{}
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+	}
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the

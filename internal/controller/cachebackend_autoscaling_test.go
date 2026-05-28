@@ -327,6 +327,24 @@ func TestStatusProgressingFalseWhenDegraded(t *testing.T) {
 	}
 }
 
+func TestStatusProgressingFalseAtScaledToZero(t *testing.T) {
+	// A backend with spec.replicas: 0 is in a stable terminal state — no
+	// rollout is in motion. Progressing must be False (Reason=ScaledToZero),
+	// not True, so consumers don't see "still converging" forever.
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(0)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	updated := getBackend(t, r, "cache", "ns1")
+	prog := findCondition(updated.Status.Conditions, conditionTypeProgressing)
+	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "ScaledToZero" {
+		t.Fatalf("Progressing condition = %+v, want False/ScaledToZero at zero replicas", prog)
+	}
+}
+
 func TestStatusCapacityStaysEmpty(t *testing.T) {
 	// The capacity field is present on the type for forward-compat, but the
 	// controller does not populate it: there is no data volume on the
@@ -371,18 +389,21 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 
 func TestProgressingFromHealthExhaustive(t *testing.T) {
 	cases := []struct {
+		name       string
 		health     cachev1alpha1.CacheBackendHealth
+		reason     string
 		wantStatus metav1.ConditionStatus
 		wantReason string
 	}{
-		{cachev1alpha1.CacheBackendHealthReady, metav1.ConditionFalse, "Synced"},
-		{cachev1alpha1.CacheBackendHealthPending, metav1.ConditionTrue, "RolloutInProgress"},
-		{cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "Degraded"},
-		{cachev1alpha1.CacheBackendHealthFailed, metav1.ConditionFalse, "RolloutInProgress"},
+		{"Ready", cachev1alpha1.CacheBackendHealthReady, "BackendReady", metav1.ConditionFalse, "Synced"},
+		{"Pending-rollout", cachev1alpha1.CacheBackendHealthPending, "RolloutInProgress", metav1.ConditionTrue, "RolloutInProgress"},
+		{"Pending-scaled-to-zero", cachev1alpha1.CacheBackendHealthPending, "ScaledToZero", metav1.ConditionFalse, "ScaledToZero"},
+		{"Degraded", cachev1alpha1.CacheBackendHealthDegraded, "ReplicasUnavailable", metav1.ConditionFalse, "Degraded"},
+		{"Failed-passthrough", cachev1alpha1.CacheBackendHealthFailed, "RolloutInProgress", metav1.ConditionFalse, "RolloutInProgress"},
 	}
 	for _, tc := range cases {
-		t.Run(string(tc.health), func(t *testing.T) {
-			status, reason, _ := progressingFromHealth(tc.health, "RolloutInProgress", "msg")
+		t.Run(tc.name, func(t *testing.T) {
+			status, reason, _ := progressingFromHealth(tc.health, tc.reason, "msg")
 			if status != tc.wantStatus {
 				t.Fatalf("status = %v, want %v", status, tc.wantStatus)
 			}
