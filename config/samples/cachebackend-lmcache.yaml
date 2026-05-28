@@ -1,7 +1,10 @@
 # A managed LMCache backend the controller reconciles into a standalone
 # lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
-# pods labeled to match spec.engineSelector are mutated at admission to
-# point at the resolved lm:// endpoint published in status.endpoint.
+# spec.engineSelector identifies the pods a future mutating webhook will
+# wire to the resolved lm:// endpoint published in status.endpoint. Until
+# that webhook lands, the engine-side env vars + `--kv-transfer-config`
+# arg must be set manually (see the runtime adapter for the exact set:
+# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU + VLLM_USE_V1).
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
 # canonical LMCache lm:// port). Storage/PVC + autoscaling (C3) and richer

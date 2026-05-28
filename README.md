@@ -13,8 +13,7 @@ One operator, split across two binaries plus the CRDs.
 **`inferencecache-controller`** (`cmd/controller`) — watches CRDs and provisions cache backends
 - `cmd/controller/` — controller-runtime manager entrypoint
 - `internal/controller/` — reconcilers
-- `pkg/adapters/runtime/` — runtime adapter library: inject backend config into engine pods
-- `pkg/adapters/backend/` — cache-backend provisioning helpers
+- `pkg/adapters/runtime/` — `KVCacheRuntimeAdapter`s render the cache-server pod/service and inject engine/router pod config; the reconciler drives them through the in-package `Registry`
 
 **`inferencecache-server`** (`cmd/server`) — gRPC policy server + cache-state index + metrics
 - `cmd/server/` — gRPC + HTTP server entrypoint

@@ -573,16 +573,17 @@ func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
 
 func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
 	// Upgrading an existing Deployment that the retired C2 builder created
-	// (single container named "vllm") to the C6 standalone shape (single
-	// container named "lmcache-server") must REPLACE the container — leaving
-	// both would run the engine and the cache side-by-side with stale
-	// resources/probes/volumes.
+	// (single container named "vllm" referencing pod-level volumes
+	// "cache-home" + "shm") to the C6 standalone shape (single container
+	// named "lmcache-server", no pod-level volumes) must REPLACE both the
+	// container set AND the dangling adapter-owned volumes. Leaving the old
+	// volumes would carry stale config from the previous shape forever.
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
 	r := newReconciler(scheme, cb)
 
-	// Seed the live Deployment with the old colocated container shape so the
-	// reconciler's update path (not the create path) is exercised.
+	// Seed the live Deployment with the old colocated container + volume
+	// shape so the reconciler's update path (not the create path) is exercised.
 	reconcile(t, r, "cache", "ns1")
 	live := getDeployment(t, r, "cache", "ns1")
 	live.Spec.Template.Spec.Containers = []corev1.Container{
@@ -593,19 +594,33 @@ func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
 			Args:    []string{"--enable-prefix-caching"},
 		},
 	}
+	live.Spec.Template.Spec.Volumes = []corev1.Volume{
+		{Name: "cache-home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+	}
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("seed pre-upgrade deployment: %v", err)
 	}
 
 	reconcile(t, r, "cache", "ns1")
 
-	containers := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers
-	if len(containers) != 1 {
-		t.Fatalf("containers = %d (%v), want exactly 1 lmcache-server after upgrade", len(containers), containerNames(containers))
+	pod := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != "lmcache-server" {
+		t.Fatalf("containers = %v, want exactly 1 lmcache-server after upgrade", containerNames(pod.Containers))
 	}
-	if containers[0].Name != "lmcache-server" {
-		t.Fatalf("container = %q, want lmcache-server (old vllm container must be dropped)", containers[0].Name)
+	for _, v := range pod.Volumes {
+		if v.Name == "cache-home" || v.Name == "shm" {
+			t.Fatalf("stale C2 volume %q survived the upgrade: %v", v.Name, volumeNames(pod.Volumes))
+		}
 	}
+}
+
+func volumeNames(vs []corev1.Volume) []string {
+	names := make([]string, len(vs))
+	for i := range vs {
+		names[i] = vs[i].Name
+	}
+	return names
 }
 
 func containerNames(cs []corev1.Container) []string {
