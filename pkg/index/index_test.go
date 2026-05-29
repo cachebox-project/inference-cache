@@ -813,6 +813,39 @@ func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 	}
 }
 
+// TestTenantHotRequiresFreshServingPrefixEntry guards the freshness rule on
+// the engine-domain check: a prefix entry that is past the index TTL (not
+// yet swept) does NOT count as proof the replica is currently serving the
+// requested scheme. Lookup filters stale prefix entries via freshness <= 0;
+// tenantHotCandidates mirrors that rule so the two strategies treat staleness
+// identically. The replica below is recently warm by stats but its prefix
+// entry has aged past the TTL — TENANT_HOT must NOT promote it.
+func TestTenantHotRequiresFreshServingPrefixEntry(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(11_500_000, 0)}
+	cfg := DefaultRankerConfig()
+	cfg.TenantHotMaxAge = time.Hour // warm window much wider than the TTL
+	idx := New(withClock(clk.now), WithTTL(10*time.Minute), WithRanker(cfg))
+
+	// Ingest the prefix entry first (it will go stale).
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}}})
+
+	// Advance past the TTL so the prefix entry is stale, but NOT past the
+	// TenantHotMaxAge — so the stats refresh below is still "recent".
+	clk.add(15 * time.Minute)
+
+	// Refresh stats only (no new prefix entry, so the existing one stays stale).
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{HitRate: 0.9}})
+
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("novel")})
+	if res.Strategy != StrategyNone {
+		t.Fatalf("stale serving prefix must NOT enable TENANT_HOT; got %v (%+v)",
+			res.Strategy, res.Scores)
+	}
+}
+
 // TestTenantHotIgnoresStatsOnlyReplicas guards the same engine-domain check
 // for a more subtle case: an update that carries stats but NO prefix entry
 // (regardless of HashScheme) cannot become a TENANT_HOT candidate, because

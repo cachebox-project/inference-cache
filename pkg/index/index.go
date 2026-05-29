@@ -515,51 +515,81 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	i.mu.RLock()
-	// Build the set of replicas that have at least one prefix entry for the
-	// requested (tenant, model, hash_scheme). Only these are proven to serve
-	// the engine domain the caller asked about.
-	serving := make(map[string]struct{})
-	for key, replicas := range i.prefixes {
-		if key.tenant != req.Tenant || key.model != req.Model || key.hashScheme != req.HashScheme {
-			continue
-		}
-		for id := range replicas {
-			serving[id] = struct{}{}
-		}
-	}
+	defer i.mu.RUnlock()
 
-	var scores []ReplicaScore
+	// Pass 1 (cheap): collect the warm replicas for (tenant, model). Bounded
+	// by the number of stats entries for this scope — typically tens, not
+	// millions. If none qualify, short-circuit BEFORE the (potentially
+	// expensive) prefixes scan — the realistic common case for a tenant
+	// with no recent activity has zero warm replicas.
+	type warmReplica struct {
+		hitRate, pressure float32
+		lastSeen          time.Time
+	}
+	warm := make(map[string]warmReplica)
 	for sk, s := range i.stats {
 		if sk.tenant != req.Tenant || sk.model != req.Model {
 			continue
 		}
-		if _, ok := serving[sk.replicaID]; !ok {
-			continue // stats exist but replica doesn't serve this hash_scheme
-		}
-		age := now.Sub(s.lastSeen)
-		if age >= maxAge {
+		if now.Sub(s.lastSeen) >= maxAge {
 			continue
 		}
 		if s.stats.HitRate < minHitRate {
 			continue
 		}
-		// Recency decays from 1 (just seen) to 0 (>= maxAge old). Same shape
-		// as freshness in the prefix-match path so the same SLO/pressure
-		// factors compose cleanly.
+		warm[sk.replicaID] = warmReplica{
+			hitRate:  s.stats.HitRate,
+			pressure: s.stats.Pressure,
+			lastSeen: s.lastSeen,
+		}
+	}
+	if len(warm) == 0 {
+		return nil
+	}
+
+	// Pass 2: only now scan i.prefixes to confirm each warm replica actually
+	// serves the requested (tenant, model, hash_scheme) engine domain with a
+	// FRESH prefix entry. A stale prefix entry (past TTL but not yet swept)
+	// is not proof of current serving — Lookup applies the same freshness
+	// filter to score replicas, so the TENANT_HOT path mirrors that rule.
+	serving := make(map[string]struct{})
+	for key, replicas := range i.prefixes {
+		if key.tenant != req.Tenant || key.model != req.Model || key.hashScheme != req.HashScheme {
+			continue
+		}
+		for id, e := range replicas {
+			if _, ok := warm[id]; !ok {
+				continue // not warm anyway — skip the freshness compute
+			}
+			if i.freshness(now, e.lastSeen) <= 0 {
+				continue // stale prefix entry — not proof of current serving
+			}
+			serving[id] = struct{}{}
+		}
+	}
+
+	scores := make([]ReplicaScore, 0, len(serving))
+	for id, w := range warm {
+		if _, ok := serving[id]; !ok {
+			continue
+		}
+		age := now.Sub(w.lastSeen)
+		// Recency decays from 1 (just seen) to 0 (>= maxAge old). Same
+		// shape as freshness in the prefix-match path so the same SLO and
+		// pressure factors compose cleanly.
 		recency := 1 - float32(age)/float32(maxAge)
-		pressureFactor := pressureFactorAt(s.stats.Pressure, i.ranker.PressureWeight)
+		pressureFactor := pressureFactorAt(w.pressure, i.ranker.PressureWeight)
 		sloBias := 1 + recency*sloBiasFactor
 		scores = append(scores, ReplicaScore{
-			ReplicaID: sk.replicaID,
-			Score:     s.stats.HitRate * recency * pressureFactor * sloBias,
+			ReplicaID: id,
+			Score:     w.hitRate * recency * pressureFactor * sloBias,
 			// No prefix matched in this strategy — leave MatchedTokens at 0
 			// so a downstream "best prefix hit" guard never mistakes a hot
 			// tenant signal for a prefix overlap.
 			MatchedTokens:         0,
-			EstimatedCacheHitProb: s.stats.HitRate,
+			EstimatedCacheHitProb: w.hitRate,
 		})
 	}
-	i.mu.RUnlock()
 
 	sort.Slice(scores, func(a, b int) bool {
 		if scores[a].Score != scores[b].Score {
