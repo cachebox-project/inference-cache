@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -38,18 +39,23 @@ type Service struct {
 	httpServer *http.Server
 	metrics    *serverMetrics
 	index      *index.Index
+	policies   *PolicyStore
 }
 
 // New constructs a cache service.
 func New() *Service {
 	metrics := newServerMetrics()
-	idx := index.New(index.WithMetrics(metrics))
+	policies := NewPolicyStore()
+	idx := index.New(
+		index.WithMetrics(metrics),
+		index.WithTTLResolver(policies),
+	)
 
 	grpcServer := grpc.NewServer()
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics))
+	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics, policies))
 
 	mux := http.NewServeMux()
 	// /healthz — liveness: the process is up.
@@ -75,6 +81,10 @@ func New() *Service {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
+	// /policy — internal endpoint the controller PUSHES resolved CachePolicy
+	// snapshots to. Replace-on-write; the controller owns the source of truth
+	// and re-pushes on its tick, so a server restart self-heals.
+	mux.HandleFunc("/policy", policyHandler(policies))
 
 	return &Service{
 		grpcServer: grpcServer,
@@ -82,8 +92,9 @@ func New() *Service {
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
-		metrics: metrics,
-		index:   idx,
+		metrics:  metrics,
+		index:    idx,
+		policies: policies,
 	}
 }
 
@@ -138,12 +149,18 @@ func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.List
 
 	select {
 	case <-ctx.Done():
+		slog.InfoContext(ctx, "graceful_shutdown_started")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(shutdownCtx)
+		slog.InfoContext(ctx, "graceful_shutdown_done")
 		return nil
 	case err := <-errCh:
+		// One terminal error per Serve return: cmd/server logs serve_error
+		// on the non-nil return. The second listener's flap (if both fail)
+		// stays in the buffered channel and is discarded by design, so this
+		// branch produces no log line itself.
 		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(context.Background())
 		return err

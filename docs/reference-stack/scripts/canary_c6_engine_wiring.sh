@@ -42,6 +42,7 @@ READY_TIMEOUT="${READY_TIMEOUT:-900}"
 SKIP_TRAFFIC="${SKIP_TRAFFIC:-0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
 CONTROLLER_IMG="${CONTROLLER_IMG:-localhost/inference-cache-controller:canary}"
+SERVER_IMG="${SERVER_IMG:-localhost/inference-cache-server:canary}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
@@ -72,19 +73,47 @@ kubectl "${KCTX[@]}" apply -f \
   "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml"
 kubectl "${KCTX[@]}" -n cert-manager wait --for=condition=Available deployment --all --timeout=180s
 
-# --- controller image + install --------------------------------------------
+# --- controller + server images + install ----------------------------------
 log "building controller image $CONTROLLER_IMG"
 docker build -f dockerfiles/Dockerfile --target controller -t "$CONTROLLER_IMG" .
 "$KIND" load docker-image "$CONTROLLER_IMG" --name "$KIND_CLUSTER"
 
-log "rendering + applying config/default (controller + webhook + cert-manager wiring)"
-# kustomize edit: point the controller Deployment at our canary image.
+log "building server image $SERVER_IMG"
+docker build -f dockerfiles/Dockerfile --target server -t "$SERVER_IMG" .
+"$KIND" load docker-image "$SERVER_IMG" --name "$KIND_CLUSTER"
+
+log "rendering + applying config/default (controller + server + webhook + cert-manager wiring)"
+# Point both the controller and server Deployments at our canary images.
+# The default overlay now ships an inference-cache-server Deployment too;
+# without rewriting its image the canary would resolve to the published
+# :dev tag, not the image built from this commit. Prefer `kustomize edit`
+# when available; otherwise fall back to a sed that scopes the rewrite to
+# each `- name: ...` block (both blocks share `newTag: dev`, so an
+# unscoped substitute would collapse them onto the same value).
 tmpdir="$(mktemp -d)"
 trap "rm -rf $tmpdir; cleanup" EXIT
 cp -r config "$tmpdir/config"
-( cd "$tmpdir/config/default" && \
-  (command -v kustomize >/dev/null 2>&1 && kustomize edit set image controller="$CONTROLLER_IMG" \
-    || sed -i.bak "s|newName: ghcr.io/cachebox-project/inference-cache-controller|newName: ${CONTROLLER_IMG%%:*}|;s|newTag: dev|newTag: ${CONTROLLER_IMG##*:}|" kustomization.yaml) )
+(
+  cd "$tmpdir/config/default"
+  if command -v kustomize >/dev/null 2>&1; then
+    kustomize edit set image controller="$CONTROLLER_IMG" server="$SERVER_IMG"
+  else
+    # Split on the LAST `:` so refs that include a registry port
+    # (e.g. localhost:5001/inference-cache-server:canary) keep their
+    # full registry/repo path. `${X%:*}` strips the shortest suffix
+    # from the last `:`, leaving everything before the tag.
+    sed -i.bak \
+      -e "/^- name: controller$/,/^- name: server$/ {
+            s|^  newName: .*|  newName: ${CONTROLLER_IMG%:*}|
+            s|^  newTag: .*|  newTag: ${CONTROLLER_IMG##*:}|
+          }" \
+      -e "/^- name: server$/,\$ {
+            s|^  newName: .*|  newName: ${SERVER_IMG%:*}|
+            s|^  newTag: .*|  newTag: ${SERVER_IMG##*:}|
+          }" \
+      kustomization.yaml
+  fi
+)
 kubectl "${KCTX[@]}" apply -k "$tmpdir/config/default"
 kubectl "${KCTX[@]}" -n inference-cache-system wait --for=condition=Available deployment --all --timeout=180s
 
