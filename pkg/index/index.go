@@ -246,10 +246,14 @@ func (i *Index) Ingest(u Update) {
 			// Chain form: expand into one per-block entry per hash, keyed by
 			// the block hash with cumulative tokenCount so a legacy exact-match
 			// against any single block hash still works. The parallel arrays
-			// must agree in length; a chain with mismatched lengths is dropped
-			// silently (fail-soft — a stale hint is OK, a wrong one isn't) and
-			// is NOT downgraded to the legacy single-blob path.
-			if len(p.BlockHashes) > 0 {
+			// must agree in length AND both be non-empty for the chain path
+			// to engage; a chain whose two arrays disagree (including the
+			// one-sided cases — hashes set with no counts, or counts set with
+			// no hashes) is dropped silently (fail-soft — a stale hint is OK,
+			// a wrong one isn't) and is NOT downgraded to the legacy single-
+			// blob path. Only an entry that sets neither chain field falls
+			// through to the legacy PrefixHash path.
+			if len(p.BlockHashes) > 0 || len(p.BlockTokenCounts) > 0 {
 				if len(p.BlockHashes) != len(p.BlockTokenCounts) {
 					continue
 				}
@@ -347,7 +351,7 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	if req.HashScheme == "" {
 		return nil
 	}
-	if len(req.BlockHashes) > 0 {
+	if len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0 {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return nil
 		}

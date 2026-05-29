@@ -607,3 +607,51 @@ func TestChainLookupMismatchedLengthsFailOpen(t *testing.T) {
 		t.Fatalf("malformed chain must fail open (NO_HINT), got %+v — would have leaked legacy hit", got)
 	}
 }
+
+// TestChainIngestOneSidedHashesOnlyDropped covers the asymmetric malformed
+// shape (BlockHashes set but BlockTokenCounts empty). Symmetric to the
+// existing mismatched-length test; both paths must drop fail-soft.
+func TestChainIngestOneSidedHashesOnlyDropped(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+			BlockTokenCounts: nil,
+		}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("hashes-only chain should drop, got %d entries", n)
+	}
+}
+
+// TestChainIngestOneSidedCountsOnlyDropped covers the inverse asymmetric
+// shape (counts set but hashes empty). Without this guard the entry would
+// silently fall through to the legacy single-blob path with an empty
+// PrefixHash key — a wrong-hint surface area.
+func TestChainIngestOneSidedCountsOnlyDropped(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			PrefixHash:       []byte("legacy-p"),
+			TokenCount:       64,
+			BlockHashes:      nil,
+			BlockTokenCounts: []int32{16, 16},
+		}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("counts-only chain should drop (must not downgrade to legacy), got %d entries", n)
+	}
+}
+
+// TestChainLookupOneSidedCountsOnlyFailsOpen guards the lookup side of the
+// same shape: a request with BlockTokenCounts set but no BlockHashes is
+// malformed and must return NO_HINT, not fall back to legacy exact-match.
+func TestChainLookupOneSidedCountsOnlyFailsOpen(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("legacy-p"), TokenCount: 128}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash:       hash("legacy-p"),
+		BlockTokenCounts: []int32{16, 16},
+	}); len(got) != 0 {
+		t.Fatalf("counts-only chain lookup must fail open, got %+v", got)
+	}
+}
