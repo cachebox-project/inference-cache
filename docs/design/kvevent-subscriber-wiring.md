@@ -47,13 +47,18 @@ Concretely:
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* Sidecar identity flags are derived from the CR + pod: `--replica-id` ← `pod.Name`,
-  `--model-id` ← `spec.backendConfig.model` (with a documented fallback chain),
-  `--hash-scheme` ← the adapter's runtime convention, `--tenant-id` ← `pod.Namespace`,
-  `--server` ← the policy-server in-cluster Service DNS,
-  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`,
-  `--engine-metrics-url` ← `http://127.0.0.1:<engine HTTP port>/metrics`. No operator-
-  supplied `--replica-id`/`--model-id` on the demo path.
+* Sidecar identity flags are derived from the CR + pod: `--replica-id` ← `pod.Name`
+  (via the downward API so `generateName` pods work), `--tenant-id` ← `pod.Namespace`
+  (downward API likewise), `--model-id` ← `spec.backendConfig.model` (single source;
+  when unset, the adapter returns no sidecar — the binary requires the flag, the next
+  admission picks it up once the operator sets the key), `--hash-scheme` ← the
+  adapter's runtime convention (`"vllm"` here), `--server` ← the policy-server
+  in-cluster Service DNS (operator-configurable via a controller flag),
+  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags
+  (`--engine-metrics-url`, `--stats-interval`, etc.) are added by the adapter when the
+  shipped subscriber binary learns to scrape and emit `ReplicaStats`; passing flags the
+  binary doesn't recognise would crash the sidecar at startup. No operator-supplied
+  `--replica-id` / `--model-id` on the demo path.
 
 ### Why this combination
 
