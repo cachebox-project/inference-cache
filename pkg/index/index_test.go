@@ -960,3 +960,57 @@ func TestTenantHotIsolatedByModel(t *testing.T) {
 		t.Fatalf("model-b lookup leaked model-a's warm replica: %+v", res)
 	}
 }
+
+// TestReplicaUpdatedEventDoesNotKeepStaleStatsFresh guards a subtle
+// interaction between liveness events and the ranker's stats freshness
+// check: REPLICA_UPDATED refreshes the index's liveness timestamp without
+// supplying new stat values. The ranker uses a separate statsReported
+// timestamp so a stale high-pressure / high-hit_rate payload kept "alive"
+// by liveness events can't keep demoting prefix scores or qualifying for
+// TENANT_HOT indefinitely.
+//
+// Two assertions in one test, with the same setup, so the bug is easy to
+// recognise if either path regresses.
+func TestReplicaUpdatedEventDoesNotKeepStaleStatsFresh(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(13_000_000, 0)}
+	cfg := DefaultRankerConfig()
+	cfg.TenantHotMaxAge = 5 * time.Minute
+	idx := New(withClock(clk.now), WithTTL(10*time.Minute), WithRanker(cfg))
+
+	// Replica reports an initial state with high pressure and high hit_rate.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}},
+		Stats:    &ReplicaStats{Pressure: 0.9, HitRate: 0.9}})
+
+	// Advance past both freshness windows so the stats payload is stale.
+	clk.add(20 * time.Minute)
+
+	// Now a stream of REPLICA_UPDATED liveness events keeps refreshing
+	// the in-index lastSeen — but NOT the stats payload.
+	for k := 0; k < 5; k++ {
+		idx.ApplyEvent(Event{Type: EventReplicaUpdated,
+			ReplicaID: "r", Model: "m", Tenant: "t"})
+		clk.add(time.Minute)
+	}
+
+	// Refresh the prefix so the prefix-match path has a candidate to score.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}})
+
+	// Prefix-match path: stale Pressure must NOT be applied. The score
+	// should equal the unpenalized baseline (50 × 1.0 × 1.0 × 1.0 = 50).
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("p")})
+	if len(got) != 1 || got[0].Score != 50 {
+		t.Fatalf("liveness-refreshed stale pressure leaked into score: got %+v, want score 50", got)
+	}
+
+	// TENANT_HOT path: the stale HitRate must NOT qualify the replica for
+	// the fallback either. Look up a novel prefix to force the miss.
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("novel")})
+	if res.Strategy != StrategyNone {
+		t.Fatalf("liveness-refreshed stale hit_rate leaked into TENANT_HOT: got %v (%+v)",
+			res.Strategy, res.Scores)
+	}
+}

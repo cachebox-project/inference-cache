@@ -210,8 +210,15 @@ type replicaEntry struct {
 }
 
 type statEntry struct {
-	stats    ReplicaStats
+	stats ReplicaStats
+	// lastSeen tracks replica LIVENESS — refreshed by Ingest AND by
+	// REPLICA_UPDATED events. Used for eviction and observability.
 	lastSeen time.Time
+	// statsReported tracks when these stat values themselves were last
+	// reported (Ingest only). The ranker uses this for the pressure /
+	// TENANT_HOT freshness check so a stale stats payload kept artificially
+	// alive by liveness events does not keep demoting or hinting.
+	statsReported time.Time
 }
 
 // Index is the in-memory, concurrent-safe, soft-state cache-state aggregator.
@@ -362,7 +369,11 @@ func (i *Index) Ingest(u Update) {
 		// stat expires (TTL), stalling the CacheIndex poller.
 		st.HitRate = sanitizeRate(st.HitRate)
 		st.Pressure = sanitizeRate(st.Pressure)
-		i.stats[statsKey{u.Tenant, u.Model, u.ReplicaID}] = statEntry{stats: st, lastSeen: ts}
+		i.stats[statsKey{u.Tenant, u.Model, u.ReplicaID}] = statEntry{
+			stats:         st,
+			lastSeen:      ts,
+			statsReported: ts,
+		}
 	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
@@ -447,15 +458,16 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
-		// Only fold in pressure when the replica's stats are themselves
-		// still fresh under the global TTL. Stats expire only on the sweep,
-		// so a refresh of the prefix entry can race with a stale stats
-		// record and otherwise demote (or zero) a perfectly fresh replica
-		// for no good reason. Mirror Lookup's prefix freshness rule on
-		// the stats side so the two stay symmetric.
+		// Only fold in pressure when the replica's stats *payload* is still
+		// fresh under the global TTL. statsReported reflects when the stat
+		// values themselves were ingested — distinct from lastSeen, which a
+		// REPLICA_UPDATED liveness event refreshes without supplying new
+		// stat values. Without that distinction a stale high-pressure
+		// reading kept "alive" by liveness events could keep demoting a
+		// perfectly fresh prefix score indefinitely.
 		pressure := float32(0)
 		if s, ok := i.stats[statsKey{req.Tenant, req.Model, id}]; ok &&
-			i.freshness(now, s.lastSeen) > 0 {
+			i.freshness(now, s.statsReported) > 0 {
 			pressure = s.stats.Pressure
 		}
 		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
@@ -560,7 +572,10 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		if sk.tenant != req.Tenant || sk.model != req.Model {
 			continue
 		}
-		if now.Sub(s.lastSeen) >= maxAge {
+		// Use statsReported, not lastSeen: TENANT_HOT must hint based on
+		// recently reported stat payloads, not on liveness events that
+		// only refresh lastSeen without supplying new values.
+		if now.Sub(s.statsReported) >= maxAge {
 			continue
 		}
 		if s.stats.HitRate < minHitRate {
@@ -569,7 +584,7 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		warm[sk.replicaID] = warmReplica{
 			hitRate:  s.stats.HitRate,
 			pressure: s.stats.Pressure,
-			lastSeen: s.lastSeen,
+			lastSeen: s.statsReported,
 		}
 	}
 	if len(warm) == 0 {
