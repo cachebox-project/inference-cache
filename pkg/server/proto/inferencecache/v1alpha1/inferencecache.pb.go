@@ -277,7 +277,11 @@ type LookupRouteRequest struct {
 	// replica's longest common leading run; matched_tokens reflects that run's
 	// token count. block_token_counts is parallel to block_hashes (same length,
 	// same order) — the per-block token count is used to compute matched_tokens.
-	// Empty (or length-mismatched) falls back to exact-match on prefix_hash.
+	// An empty chain falls back to exact-match on prefix_hash. A non-empty
+	// chain whose block_token_counts length disagrees with block_hashes is
+	// malformed: the server returns NO_HINT rather than downgrading to the
+	// legacy single-blob path (symmetric with chain ingest, which drops the
+	// entry — a wrong hint is worse than a stale one).
 	BlockHashes      [][]byte `protobuf:"bytes,7,rep,name=block_hashes,json=blockHashes,proto3" json:"block_hashes,omitempty"`
 	BlockTokenCounts []int32  `protobuf:"varint,8,rep,packed,name=block_token_counts,json=blockTokenCounts,proto3" json:"block_token_counts,omitempty"`
 	unknownFields    protoimpl.UnknownFields
