@@ -219,6 +219,60 @@ func TestPushSnapshotPropagatesNon2xxAsError(t *testing.T) {
 	}
 }
 
+// TestPushSnapshotSerializesConcurrentPushes proves that two concurrent
+// reconciles never overlap inside pushSnapshot, so an older List + POST
+// pair can't sandwich and overwrite a newer one. The handler asserts
+// no in-flight push at entry; if pushMu were missing the handler would
+// observe a concurrent call and fail the test.
+func TestPushSnapshotSerializesConcurrentPushes(t *testing.T) {
+	var (
+		inflight   sync.Mutex
+		concurrent bool
+	)
+	handler := func(w http.ResponseWriter, _ *http.Request) {
+		// TryLock approximates "is another push currently inside the
+		// handler?" without blocking. A false here means another push
+		// holds the mutex, which means the two pushes were interleaved.
+		if !inflight.TryLock() {
+			concurrent = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// Hold the handler "open" long enough that a concurrent push,
+		// were one possible, would land while we're inside.
+		time.Sleep(20 * time.Millisecond)
+		inflight.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(&cachev1alpha1.CachePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		}).
+		Build()
+	r := &CachePolicyReconciler{
+		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
+	}
+
+	const n = 4
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = r.Reconcile(context.Background(), ctrl.Request{})
+		}()
+	}
+	wg.Wait()
+
+	if concurrent {
+		t.Fatal("two pushSnapshot calls overlapped — pushMu is not serializing them")
+	}
+}
+
 func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	// Stand up the real /policy handler and assert the body the reconciler
 	// sends successfully Replace()s the store — this guards against a

@@ -112,8 +112,18 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	)
 	select {
 	case res := <-resCh:
+		// When both resCh AND ctx.Done() are ready, Go's select picks
+		// pseudorandomly — so a lookup that overran the deadline could
+		// still win and we'd surface stale scores as PREFIX_MATCH.
+		// Re-check the deadline before honoring the result.
+		if ctx.Err() != nil {
+			return s.timeoutResponse(model, time.Since(start)), nil
+		}
 		scores = res.scores
 		elapsed = res.elapsed
+		if budget > 0 && elapsed > budget {
+			return s.timeoutResponse(model, elapsed), nil
+		}
 	case <-ctx.Done():
 		// Deadline (or upstream cancellation) hit while waiting for the
 		// lookup. The goroutine will land eventually with its result

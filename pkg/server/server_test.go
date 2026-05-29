@@ -495,6 +495,36 @@ func TestLookupRouteReturnsTimeoutWhenCallerDeadlineBreached(t *testing.T) {
 	}
 }
 
+// TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline injects a
+// lookup that returns immediately but waits until *after* the deadline
+// has elapsed so the select arms with both channels ready. Re-checking
+// ctx.Err() after resCh wins is what catches this — without it, Go's
+// select pseudorandom choice could leak stale scores as PREFIX_MATCH.
+func TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", LookupTimeoutMs: 5},
+	})
+	// Lookup deliberately exceeds the budget before returning a hit.
+	svc.lookupFn = func(index.LookupRequest) []index.ReplicaScore {
+		time.Sleep(50 * time.Millisecond)
+		return []index.ReplicaScore{{ReplicaID: "would-have-been-stale", MatchedTokens: 100}}
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "TIMEOUT" {
+		t.Fatalf("reason = %q, want TIMEOUT — lookup overran the budget", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("TIMEOUT must not leak stale scores; got %+v", resp.GetReplicaScores())
+	}
+}
+
 // TestLookupRouteBoundsWallTimeWhenLookupBlocks injects a lookup that
 // blocks indefinitely; the handler must still return promptly under the
 // policy budget rather than wait for the lookup. This is the case

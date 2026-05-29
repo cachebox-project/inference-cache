@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -50,6 +51,14 @@ type CachePolicyReconciler struct {
 	HTTPClient *http.Client
 	// PushInterval is the self-healing tick cadence. <=0 → DefaultPolicyPushInterval.
 	PushInterval time.Duration
+
+	// pushMu serializes pushSnapshot calls. Without it the watch-driven
+	// reconciler and the periodic ticker can race: tick T1 lists the world
+	// then a delete reconcile R1 lists+POSTs the new (empty) snapshot, then
+	// T1 POSTs its now-stale list — re-introducing the deleted policy on
+	// the server until the next tick. Both list AND POST are inside the
+	// critical section so the ordering between snapshots is total.
+	pushMu sync.Mutex
 }
 
 // The reconciler only READS CachePolicy resources — propagation is a
@@ -124,7 +133,13 @@ func (r *CachePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // pushSnapshot lists every CachePolicy in the cluster, resolves it into the
 // shape the server consumes, and PUTs the full snapshot. Always pushes a
 // full snapshot (replace-on-write) so deletions propagate naturally.
+//
+// Serialized via pushMu so two concurrent pushes can't reorder list-then-POST
+// pairs and let an older snapshot land after a newer one.
 func (r *CachePolicyReconciler) pushSnapshot(ctx context.Context) error {
+	r.pushMu.Lock()
+	defer r.pushMu.Unlock()
+
 	var list cachev1alpha1.CachePolicyList
 	if err := r.Client.List(ctx, &list); err != nil {
 		if apierrors.IsNotFound(err) {
