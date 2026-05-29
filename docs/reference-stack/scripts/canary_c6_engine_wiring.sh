@@ -98,13 +98,17 @@ cp -r config "$tmpdir/config"
   if command -v kustomize >/dev/null 2>&1; then
     kustomize edit set image controller="$CONTROLLER_IMG" server="$SERVER_IMG"
   else
+    # Split on the LAST `:` so refs that include a registry port
+    # (e.g. localhost:5001/inference-cache-server:canary) keep their
+    # full registry/repo path. `${X%:*}` strips the shortest suffix
+    # from the last `:`, leaving everything before the tag.
     sed -i.bak \
       -e "/^- name: controller$/,/^- name: server$/ {
-            s|^  newName: .*|  newName: ${CONTROLLER_IMG%%:*}|
+            s|^  newName: .*|  newName: ${CONTROLLER_IMG%:*}|
             s|^  newTag: .*|  newTag: ${CONTROLLER_IMG##*:}|
           }" \
       -e "/^- name: server$/,\$ {
-            s|^  newName: .*|  newName: ${SERVER_IMG%%:*}|
+            s|^  newName: .*|  newName: ${SERVER_IMG%:*}|
             s|^  newTag: .*|  newTag: ${SERVER_IMG##*:}|
           }" \
       kustomization.yaml
