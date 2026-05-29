@@ -625,11 +625,22 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		if serving[id] == 0 {
 			continue
 		}
-		age := now.Sub(w.lastSeen)
 		// Recency decays from 1 (just seen) to 0 (>= maxAge old). Same
 		// shape as freshness in the prefix-match path so the same SLO and
-		// pressure factors compose cleanly.
-		recency := 1 - float32(age)/float32(maxAge)
+		// pressure factors compose cleanly. Clamp to [0, 1] to defend
+		// against clock skew (a future statsReported timestamp would
+		// otherwise produce recency > 1 and amplify both score and SLO
+		// bias). Mirrors freshnessAt's `age <= 0 → 1` clamp.
+		age := now.Sub(w.lastSeen)
+		var recency float32
+		switch {
+		case age <= 0:
+			recency = 1
+		case age >= maxAge:
+			recency = 0
+		default:
+			recency = 1 - float32(age)/float32(maxAge)
+		}
 		pressureFactor := pressureFactorAt(w.pressure, i.ranker.PressureWeight)
 		sloBias := 1 + recency*sloBiasFactor
 		scores = append(scores, ReplicaScore{

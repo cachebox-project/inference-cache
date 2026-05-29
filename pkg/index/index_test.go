@@ -704,6 +704,41 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 	}
 }
 
+// TestTenantHotRecencyClampedAgainstClockSkew guards that a future
+// statsReported timestamp (e.g. from clock skew between the replica and the
+// server) is clamped to recency=1 rather than producing recency>1, which
+// would otherwise amplify both the score and the SLO bias factor and let a
+// stale-but-future-stamped replica outrank everyone else. Mirrors
+// freshnessAt's `age <= 0 → 1` clamp on the prefix-match path.
+func TestTenantHotRecencyClampedAgainstClockSkew(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(13_500_000, 0)}
+	cfg := DefaultRankerConfig()
+	idx := New(withClock(clk.now), WithTTL(time.Hour), WithRanker(cfg))
+
+	// Ingest serving prefix + stats normally so the replica qualifies.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.5, Pressure: 0}})
+
+	// Now move the clock BACKWARDS so the previously-stored statsReported
+	// is in the "future" relative to now — i.e. simulate a server-side clock
+	// step backwards while a replica's report is in flight.
+	clk.t = clk.t.Add(-2 * time.Minute)
+
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("novel")})
+	if res.Strategy != StrategyTenantHot || len(res.Scores) != 1 {
+		t.Fatalf("expected TENANT_HOT candidate, got %v (%+v)", res.Strategy, res.Scores)
+	}
+	// With recency clamped to 1, and PressureWeight default 1 × pressure 0
+	// → pressureFactor 1, and no SLO budget set → sloBias 1:
+	//   score = hit_rate × 1 × 1 × 1 = 0.5.
+	// Without the clamp, recency could exceed 1 and amplify the score.
+	if got := res.Scores[0].Score; got > 0.5 {
+		t.Fatalf("recency not clamped against clock skew: score = %v, want <= 0.5", got)
+	}
+}
+
 // TestTenantHotMatchedTokensIsZero pins a contract detail: a TENANT_HOT
 // candidate carries MatchedTokens=0 because there is no prefix overlap. A
 // gateway client that filters or weights by MatchedTokens must therefore

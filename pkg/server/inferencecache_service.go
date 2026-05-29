@@ -59,8 +59,9 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 	return &icpb.RenderTemplateResponse{ReasonCode: reasonOK}, nil
 }
 
-// returns them ranked. The handler honors the tenant's CachePolicy and runs
-// the ranking-v2 orchestrator (index.LookupRoute) which:
+// LookupRoute consults the index for replicas holding the request's prefix
+// and returns them ranked. The handler honors the tenant's CachePolicy and
+// runs the ranking-v2 orchestrator (index.LookupRoute) which:
 //
 //   - minimumPrefixTokens: a pre-lookup gate on the request's prefix token
 //     count. If the request's prefix is shorter than the threshold the index
