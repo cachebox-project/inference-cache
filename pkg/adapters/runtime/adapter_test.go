@@ -37,6 +37,10 @@ func (stubAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.Ca
 	return nil
 }
 
+func (stubAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, nil
+}
+
 func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1alpha1.CacheBackend {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},

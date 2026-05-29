@@ -311,6 +311,9 @@ func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cache
 func (stubVLLMLMCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
+func (stubVLLMLMCacheAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, nil
+}
 func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 	return []adapterruntime.SupportedPair{{
 		Runtime: adapterruntime.RuntimeVLLM,

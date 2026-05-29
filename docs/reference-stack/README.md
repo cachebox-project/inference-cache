@@ -161,14 +161,51 @@ Docker + kind, pulls the vLLM CPU image, and wants ~10+ GiB of Docker VM RAM. Th
 `cpu` profile runs a GPU-free vLLM engine (prefix caching + KV events, no LMCache
 offload); real LMCache offload still needs a GPU (the default `gpu` profile).
 
-## Full-chain canary
+## In-cluster auto-attach (production path)
+
+When the controller is installed in a cluster **and the operator passes
+`--kvevent-subscriber-image=<ref>` on the controller** (the
+`subscriber-image` make target emits the well-known dev tag; pin to a
+digest in production), the pod-mutating webhook auto-attaches the
+`kvevent-subscriber` as a sidecar to every engine pod whose labels match a
+`CacheBackend.spec.engineSelector` and whose backend sets
+`backendConfig.model`. The subscriber's identity flags (`--replica-id`,
+`--tenant-id`, `--model-id`, `--hash-scheme`) are derived from the CR + pod
+— no operator-supplied flags, no out-of-band `kubectl port-forward` + manual
+binary launch on the demo path.
+
+The default install ships with the flag unset and therefore does not
+auto-attach: a nonexistent image would put the sidecar container into
+`ImagePullBackOff`, which would keep the engine pod from going Ready and
+turn the cache into a serving dependency. Operators opt in by passing the
+image once they have one ready to ship.
+
+The shape decision and rationale are in
+[`docs/design/kvevent-subscriber-wiring.md`](../design/kvevent-subscriber-wiring.md);
+the end-to-end auto-attach behaviour is gated by the webhook envtest
+(`internal/webhook/pod/envtest_integration_test.go`), which boots a real
+apiserver, installs the webhook, applies a `CacheBackend`, creates a labeled
+engine pod, and asserts the persisted pod carries the `kvevent-subscriber`
+container with flags derived from the CR. Run it locally with:
+
+```bash
+KUBEBUILDER_ASSETS=$(make test-env | tail -1) go test ./internal/webhook/pod/...
+```
+
+## Full-chain binary canary
 
 [`scripts/canary_e2e.sh`](scripts/canary_e2e.sh) is a complementary GPU-free
-canary that exercises the **data path** the reconciler canary doesn't: CPU vLLM
-engine → `kvevent-subscriber` → policy server → index. It drives prefix traffic
-and asserts both an engine prefix-cache hit and that the server index populated
+canary that exercises the **subscriber binary's data path** end-to-end on the
+host (no Kubernetes admission in the loop): CPU vLLM engine → `kvevent-
+subscriber` → policy server → index. It drives prefix traffic and asserts
+both an engine prefix-cache hit and that the server index populated
 (`inferencecache_index_entries > 0`). Builds the binaries, manages the engine
 container, cleans up after itself, exits non-zero on failure.
+
+Because this canary launches the engine in plain Docker (no K8s admission),
+the subscriber is hand-launched on purpose — the binary's wire protocol is
+what the test exercises. The in-cluster auto-attach path is covered by the
+envtest gate above.
 
 The subscriber additionally scrapes the engine's Prometheus `/metrics` and emits
 a per-replica `ReplicaStats` (`cacheMemoryBytes`, `hitRate`, `pressure`) on a

@@ -158,6 +158,24 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			"runtime", string(runtimeID), "error", err.Error())
 		return admission.Allowed(fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
+
+	// Auto-attach the observation sidecar. The adapter owns the
+	// shape decision: vLLM/LMCache returns a kvevent-subscriber container,
+	// the reference adapter (and any future External-type adapter) returns
+	// (nil, nil). A side-channel failure here MUST NOT block admission —
+	// the engine config above already converged, the cache is still an
+	// optimisation, and the next admission will retry. Idempotent: skip
+	// the append if a container by the same name is already on the pod
+	// (re-admission, manual sidecar in the pod template, etc.).
+	if sidecar, sErr := adapter.ObservationSidecar(cache, mutated); sErr != nil {
+		log.V(1).Info("fail-open: adapter rejected observation sidecar",
+			"runtime", string(runtimeID), "error", sErr.Error())
+	} else if sidecar != nil && !hasContainer(mutated.Spec.Containers, sidecar.Name) {
+		mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
+		log.V(1).Info("observation sidecar appended",
+			"runtime", string(runtimeID), "container", sidecar.Name)
+	}
+
 	if mutated.Annotations == nil {
 		mutated.Annotations = map[string]string{}
 	}
@@ -239,4 +257,16 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 		return h.Log
 	}
 	return logf.FromContext(ctx)
+}
+
+// hasContainer reports whether containers already includes one named name.
+// Used to keep the observation-sidecar append idempotent across re-admissions
+// and against pod templates that pre-baked the sidecar.
+func hasContainer(containers []corev1.Container, name string) bool {
+	for i := range containers {
+		if containers[i].Name == name {
+			return true
+		}
+	}
+	return false
 }

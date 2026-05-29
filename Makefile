@@ -12,6 +12,7 @@ REGISTRY ?= ghcr.io/cachebox-project
 TAG ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 IMG ?= $(REGISTRY)/inference-cache-controller:$(TAG)
 SERVER_IMG ?= $(REGISTRY)/inference-cache-server:$(TAG)
+SUBSCRIBER_IMG ?= $(REGISTRY)/inference-cache-subscriber:$(TAG)
 DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
@@ -170,7 +171,7 @@ test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
 
 .PHONY: image-build
-image-build: controller-image server-image ## Build controller and server images.
+image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
 
 .PHONY: controller-image
 controller-image: ## Build the controller container image.
@@ -179,6 +180,10 @@ controller-image: ## Build the controller container image.
 .PHONY: server-image
 server-image: ## Build the server container image.
 	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target server -t $(SERVER_IMG) .
+
+.PHONY: subscriber-image
+subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t $(SUBSCRIBER_IMG) .
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.

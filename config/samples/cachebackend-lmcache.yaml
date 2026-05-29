@@ -39,6 +39,11 @@ spec:
     matchLabels:
       app.kubernetes.io/name: vllm
   backendConfig:
+    # Served model identifier the matched engine pods are loaded with.
+    # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
+    # so the index keys per-replica entries by model. Omit (or set empty)
+    # to skip the subscriber sidecar (engine wiring still happens).
+    model: meta-llama/Meta-Llama-3-8B-Instruct
     # Pin to a real digest for non-local runs.
     serverImage: lmcache/standalone:latest
     # LMCache server storage device; "cpu" (in-memory) is the supported default.

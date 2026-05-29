@@ -67,6 +67,18 @@ type KVCacheRuntimeAdapter interface {
 	// Backends without a router component should return nil without
 	// touching pod.
 	InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error
+
+	// ObservationSidecar returns the container that observes the engine pod
+	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
+	// (nil, nil) when no sidecar is needed for this (engine, backend) pair
+	// — for example, an External backend whose lifecycle the controller
+	// does not manage, or a future backend that exports observation data
+	// some other way. Returning a container does not by itself mutate pod;
+	// the Pod webhook appends it after [InjectEngineConfig] (idempotent: if
+	// a container with the same Name is already present, the caller skips
+	// the append). Identity flags MUST be derived from cache + pod so the
+	// CR is the single source of truth — no operator-supplied flags.
+	ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error)
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
@@ -188,13 +200,56 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	return RuntimeID(strings.ToLower(cache.Spec.Integration.Engine))
 }
 
+// Options configures the runtime adapters [DefaultRegistry] constructs.
+// Zero values are valid: empty PolicyServerGRPCAddress falls back to the
+// package default, and empty SubscriberImage disables sidecar auto-attach
+// (see the field doc for why).
+type Options struct {
+	// SubscriberImage is the image reference the vLLM/LMCache adapter
+	// uses for the kvevent-subscriber sidecar. Empty (the zero value)
+	// **disables** sidecar auto-attach — the adapter returns no sidecar
+	// at all. Auto-attach is opt-in by design: a nonexistent default
+	// image would put the sidecar container into ImagePullBackOff and
+	// keep the engine pod from going Ready. See [DefaultSubscriberImage]
+	// for the build-tag operators pin to (or a digest-pinned production
+	// image), passed through the controller's --kvevent-subscriber-image
+	// flag.
+	SubscriberImage string
+
+	// PolicyServerGRPCAddress overrides the host:port the kvevent-
+	// subscriber sidecar dials to ReportCacheState. Empty selects the
+	// package default ([DefaultPolicyServerGRPCAddress]), which assumes the
+	// in-cluster Service produced by config/server installed into the
+	// inference-cache-system namespace.
+	PolicyServerGRPCAddress string
+}
+
+// Option mutates [Options] for callers that prefer the functional-option
+// style. Either Options{...} or a chain of Option helpers work.
+type Option func(*Options)
+
+// WithSubscriberImage sets [Options.SubscriberImage].
+func WithSubscriberImage(image string) Option {
+	return func(o *Options) { o.SubscriberImage = image }
+}
+
+// WithPolicyServerGRPCAddress sets [Options.PolicyServerGRPCAddress].
+func WithPolicyServerGRPCAddress(addr string) Option {
+	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
+}
+
 // DefaultRegistry returns a Registry pre-populated with the runtime adapters
 // the controller ships with — currently the vLLM+LMCache adapter. The
 // reconciler builds one of these at startup; tests that need a specific
 // adapter set should construct their own [Registry] via [NewRegistry] +
 // [Registry.Register].
-func DefaultRegistry() *Registry {
+//
+// Options the controller cares about (subscriber sidecar image, policy-server
+// address) are passed in via the variadic [Option] helpers; the no-arg form
+// preserves the original Phase-1 behaviour and is still used by the
+// reconciler/webhook nil-Registry fallback paths.
+func DefaultRegistry(opts ...Option) *Registry {
 	r := NewRegistry()
-	r.Register(NewVLLMLMCacheAdapter())
+	r.Register(NewVLLMLMCacheAdapter(opts...))
 	return r
 }

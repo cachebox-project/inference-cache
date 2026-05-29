@@ -97,6 +97,58 @@ const (
 	// present, the adapter injects into every container — the same defensive
 	// merge other adapters use.
 	EngineContainerName = "vllm"
+	// SubscriberContainerName is the well-known name for the kvevent-
+	// subscriber sidecar the adapter renders. Webhook callers use it to
+	// short-circuit re-admission (skip the append if a container by this
+	// name is already present), and operators can `kubectl logs <pod> -c
+	// kvevent-subscriber` without guessing.
+	SubscriberContainerName = "kvevent-subscriber"
+)
+
+// Defaults the kvevent-subscriber sidecar carries when the operator does
+// not pin them via controller flags. Vendor-neutral; production should set
+// SubscriberImage to a digest-pinned image and PolicyServerGRPCAddress to
+// the in-cluster Service DNS the operator's policy server actually exposes.
+const (
+	// DefaultSubscriberImage is the well-known dev-tag the Makefile's
+	// subscriber-image target emits; operators pass it (or a
+	// production-pinned digest) to the controller's
+	// --kvevent-subscriber-image flag to enable auto-attach.
+	//
+	// Auto-attach is opt-in by design: when no image is configured the
+	// adapter returns no sidecar at all. A pulled-but-unavailable image
+	// would put the sidecar container into ImagePullBackOff, which keeps
+	// the engine pod from going Ready and would violate the "cache is an
+	// optimisation, never a serving dependency" posture. Defaulting off
+	// keeps the default install safe — operators turn auto-attach on
+	// when they're ready to ship a subscriber image alongside the
+	// controller.
+	DefaultSubscriberImage = "ghcr.io/cachebox-project/inference-cache-subscriber:dev"
+	// DefaultPolicyServerGRPCAddress is the in-cluster Service DNS the
+	// kvevent-subscriber sidecar dials by default. Mirrors the assumption
+	// the controller's HTTP poller already makes about the policy server's
+	// Deployment landing in the inference-cache-system namespace.
+	DefaultPolicyServerGRPCAddress = "inference-cache-server.inference-cache-system.svc.cluster.local:9090"
+
+	// vLLM engine convention: the KV-event ZMQ PUB endpoint binds on :5557
+	// by default (the reference stack's --kv-events-config sets
+	// endpoint=tcp://*:5557). Parameterising via the adapter (not
+	// hardcoding in the webhook) lets SGLang or another engine adapter
+	// pick a different port without touching the webhook.
+	defaultEngineZMQPortStr = "5557"
+
+	// subscriberHashScheme is the canonical hash-scheme tag the vLLM
+	// subscriber carries. Hard-coded for this adapter (vLLM's block-hash
+	// scheme is distinct from SGLang's, and the cache plane keys on the
+	// scheme to keep them from collapsing).
+	subscriberHashScheme = "vllm"
+
+	// modelBackendConfigKey is the BackendConfig key the adapter reads the
+	// served model id from when rendering the subscriber sidecar. Mirrors
+	// the key the reconciler canary already writes (`backendConfig.model:
+	// <served model>`); kept as a constant so a future rename ripples
+	// through one place.
+	modelBackendConfigKey = "model"
 )
 
 // vllmLMCacheAdapter wires vLLM engine pods to the LMCache backend that
@@ -104,16 +156,38 @@ const (
 // standalone lmcache-server pod + Service (the engine connects to it via
 // LMCACHE_REMOTE_URL=lm://<svc>:65432); InjectEngineConfig adds the
 // --kv-transfer-config arg and the LMCACHE_* env vars to the vLLM container,
-// merging with what the pod template already carries.
+// merging with what the pod template already carries; ObservationSidecar
+// returns the kvevent-subscriber container the webhook appends so the engine
+// pod auto-attaches to the policy server with no out-of-band steps.
 //
 // Phase 1 only wires vLLM. SGLang HiCache and Mooncake adapters will live in
 // their own files when those backends are picked up.
-type vllmLMCacheAdapter struct{}
+type vllmLMCacheAdapter struct {
+	// subscriberImage is the image the kvevent-subscriber sidecar runs.
+	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
+	// returns nil — so an unconfigured controller install doesn't push
+	// engine pods into ImagePullBackOff on a nonexistent default image.
+	subscriberImage string
+	// policyServerGRPCAddress overrides the default in-cluster Service DNS
+	// the sidecar dials to ReportCacheState. Empty falls back to
+	// [DefaultPolicyServerGRPCAddress].
+	policyServerGRPCAddress string
+}
 
 // NewVLLMLMCacheAdapter returns the adapter that wires vLLM engine pods to an
-// LMCache CacheBackend. It is registered by [DefaultRegistry].
-func NewVLLMLMCacheAdapter() KVCacheRuntimeAdapter {
-	return vllmLMCacheAdapter{}
+// LMCache CacheBackend. The optional [Option] helpers let the controller pin
+// the subscriber sidecar's image + policy-server target; the no-arg form
+// reproduces the package defaults and keeps tests + the nil-Registry
+// fallback paths working.
+func NewVLLMLMCacheAdapter(opts ...Option) KVCacheRuntimeAdapter {
+	var cfg Options
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return vllmLMCacheAdapter{
+		subscriberImage:         cfg.SubscriberImage,
+		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
+	}
 }
 
 // Supports matches vLLM runtimes against an LMCache CacheBackend. Any other
@@ -269,6 +343,110 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint strin
 	_ = endpoint
 	_ = cache
 	return nil
+}
+
+// ObservationSidecar returns the kvevent-subscriber container the Pod
+// webhook appends to a vLLM engine pod so its KV-cache events flow to the
+// policy server with no out-of-band bring-up. The container shares the
+// engine pod's network namespace, so the subscriber dials the engine over
+// 127.0.0.1 (the vLLM ZMQ PUB endpoint defaults to :5557); identity flags
+// are derived from cache + pod (--replica-id from pod.Name via the
+// downward API, --tenant-id from pod.Namespace ditto, --model-id from
+// cache.Spec.BackendConfig["model"], --hash-scheme fixed to "vllm") so
+// the CR is the single source of truth.
+//
+// The flag surface here is deliberately the intersection of what the
+// shipped kvevent-subscriber binary accepts: passing flags the binary
+// doesn't know would crash the sidecar on startup (Go's flag package
+// rejects unknown flags). Stats-path flags (--engine-metrics-url,
+// --stats-interval, etc.) are added when the binary itself learns to
+// scrape and emit ReplicaStats.
+//
+// Returns (nil, nil) when the served model id is not derivable from the CR
+// — the subscriber's --model-id flag is required, so emitting a container
+// that would CrashLoopBackOff is worse than skipping. The webhook logs the
+// skip; once the operator sets spec.backendConfig.model the next pod
+// admission picks it up.
+func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+	if cache == nil {
+		return nil, fmt.Errorf("observation sidecar: cache is nil")
+	}
+	if pod == nil {
+		return nil, fmt.Errorf("observation sidecar: pod is nil")
+	}
+	// Auto-attach is opt-in: when the operator hasn't configured a
+	// subscriber image via the controller flag, skip the sidecar
+	// entirely. A nonexistent image would put the sidecar container into
+	// ImagePullBackOff, which keeps the engine pod from going Ready —
+	// that turns the cache into a serving dependency, the exact failure
+	// mode the fail-open posture exists to avoid. See
+	// [DefaultSubscriberImage] for the build-tag operators pin to.
+	if a.subscriberImage == "" {
+		return nil, nil
+	}
+	modelID := configOr(cache.Spec.BackendConfig, modelBackendConfigKey, "")
+	if modelID == "" {
+		// No --model-id ⇒ subscriber binary would refuse to start; skip
+		// the append and let the next admission pick it up once the
+		// operator sets spec.backendConfig.model.
+		return nil, nil
+	}
+	serverAddr := a.policyServerGRPCAddress
+	if serverAddr == "" {
+		serverAddr = DefaultPolicyServerGRPCAddress
+	}
+	image := a.subscriberImage
+
+	nonRoot := true
+	noPrivEsc := false
+	readOnlyRoot := true
+	uid := int64(65532)
+	return &corev1.Container{
+		Name:            SubscriberContainerName,
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		// pod.Name is empty at admission for generateName pods; resolve
+		// via the downward API so the value is filled in at container
+		// start. K8s expands $(VAR) references in args from the
+		// container's own env, which lets the literal CR-derived fields
+		// (model id, hash scheme) live next to the dynamically resolved
+		// ones in one place.
+		Env: []corev1.EnvVar{
+			{
+				Name:      "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+			},
+			{
+				Name:      "POD_NAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
+			},
+		},
+		Args: []string{
+			"--engine-endpoint=tcp://127.0.0.1:" + defaultEngineZMQPortStr,
+			"--server=" + serverAddr,
+			"--replica-id=$(POD_NAME)",
+			"--tenant-id=$(POD_NAMESPACE)",
+			"--model-id=" + modelID,
+			"--hash-scheme=" + subscriberHashScheme,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             &nonRoot,
+			RunAsUser:                &uid,
+			AllowPrivilegeEscalation: &noPrivEsc,
+			ReadOnlyRootFilesystem:   &readOnlyRoot,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
+	}, nil
 }
 
 // engineContainerIndex returns the index of the engine container the adapter

@@ -38,28 +38,32 @@ func init() {
 }
 
 type options struct {
-	metricsAddr            string
-	secureMetrics          bool
-	enableHTTP2            bool
-	enableLeaderElection   bool
-	probeAddr              string
-	serverSnapshotURL      string
-	serverPolicyURL        string
-	cacheIndexRefreshEvery time.Duration
-	policyPushEvery        time.Duration
-	zapOpts                zap.Options
+	metricsAddr             string
+	secureMetrics           bool
+	enableHTTP2             bool
+	enableLeaderElection    bool
+	probeAddr               string
+	serverSnapshotURL       string
+	serverPolicyURL         string
+	cacheIndexRefreshEvery  time.Duration
+	policyPushEvery         time.Duration
+	subscriberImage         string
+	policyServerGRPCAddress string
+	zapOpts                 zap.Options
 }
 
 func defaultOptions() options {
 	return options{
-		metricsAddr:            ":8080",
-		probeAddr:              ":8081",
-		secureMetrics:          false,
-		enableHTTP2:            false,
-		serverSnapshotURL:      "http://inference-cache-server:8080/snapshot",
-		serverPolicyURL:        "http://inference-cache-server:8080/policy",
-		cacheIndexRefreshEvery: controller.DefaultRefreshInterval,
-		policyPushEvery:        controller.DefaultPolicyPushInterval,
+		metricsAddr:             ":8080",
+		probeAddr:               ":8081",
+		secureMetrics:           false,
+		enableHTTP2:             false,
+		serverSnapshotURL:       "http://inference-cache-server:8080/snapshot",
+		serverPolicyURL:         "http://inference-cache-server:8080/policy",
+		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
+		policyPushEvery:         controller.DefaultPolicyPushInterval,
+		subscriberImage:         "",
+		policyServerGRPCAddress: adapterruntime.DefaultPolicyServerGRPCAddress,
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
 		},
@@ -77,6 +81,8 @@ func parseOptions() options {
 	flag.StringVar(&opts.serverPolicyURL, "server-policy-url", opts.serverPolicyURL, "URL of the cache server's /policy endpoint, the controller PUSHES resolved CachePolicy snapshots to.")
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
+	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to vLLM engine pods. Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
+	flag.StringVar(&opts.policyServerGRPCAddress, "policy-server-grpc-address", opts.policyServerGRPCAddress, "host:port the kvevent-subscriber sidecar dials to ReportCacheState. Defaults to the in-cluster Service DNS in the inference-cache-system namespace.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -117,7 +123,15 @@ func main() {
 	// the reconciler will be able to render and the pod webhook will be
 	// able to inject. Adding a new adapter is a one-line registry
 	// change, not three.
-	adapterRegistry := adapterruntime.DefaultRegistry()
+	//
+	// The kvevent-subscriber sidecar image + policy-server gRPC
+	// address are operator-supplied: pinning the image to a digest in
+	// production and pointing the sidecar at the right Service DNS are
+	// deployment concerns, not CR-level knobs.
+	adapterRegistry := adapterruntime.DefaultRegistry(
+		adapterruntime.WithSubscriberImage(opts.subscriberImage),
+		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
+	)
 
 	if err := (&controller.CacheBackendReconciler{
 		Client:   mgr.GetClient(),
