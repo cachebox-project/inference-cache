@@ -21,6 +21,7 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/controller"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -110,11 +111,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One Registry shared by the reconciler, the pod-mutating webhook,
+	// and the CacheBackend validating webhook. Building it here keeps the
+	// three call sites in agreement: whatever pair the validator admits,
+	// the reconciler will be able to render and the pod webhook will be
+	// able to inject. Adding a new adapter is a one-line registry
+	// change, not three.
+	adapterRegistry := adapterruntime.DefaultRegistry()
+
 	if err := (&controller.CacheBackendReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Log:      ctrl.Log.WithName("controllers").WithName("CacheBackend"),
 		Recorder: mgr.GetEventRecorder("cachebackend-controller"),
+		Registry: adapterRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -140,7 +150,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr); err != nil {
+	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, adapterRegistry); err != nil {
 		setupLog.Error(err, "unable to register webhook", "webhook", "CacheBackend")
 		os.Exit(1)
 	}
@@ -153,8 +163,9 @@ func main() {
 	// avoid a cold-cache window on controller startup.
 	mgr.GetWebhookServer().Register(podwebhook.WebhookPath, &webhook.Admission{
 		Handler: &podwebhook.EngineInjector{
-			Reader: mgr.GetAPIReader(),
-			Log:    ctrl.Log.WithName("webhooks").WithName("pod-injector"),
+			Reader:   mgr.GetAPIReader(),
+			Registry: adapterRegistry,
+			Log:      ctrl.Log.WithName("webhooks").WithName("pod-injector"),
 		},
 	})
 

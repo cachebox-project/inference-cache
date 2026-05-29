@@ -2,7 +2,9 @@ package v1alpha1
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -13,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
@@ -47,19 +50,28 @@ type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
 // broken — External without an endpoint, persistent storage on a
-// memory-only backend, cross-namespace endpoints without explicit opt-in —
-// before the reconciler ever sees them. It implements
-// [admission.Validator] over CacheBackend.
+// memory-only backend, cross-namespace endpoints without explicit opt-in,
+// runtime/backend pairs no installed adapter supports — before the
+// reconciler ever sees them. It implements [admission.Validator] over
+// CacheBackend.
 //
-// The rule set is ordered and pluggable: new admission-time guards (the
-// next one will be the M6 runtime-adapter compatibility check) plug in by
-// appending to [CacheBackendValidator.Rules], not by editing this type.
-// A nil/empty Rules slice falls back to [DefaultValidationRules].
+// The structural rule set is ordered and pluggable; the runtime-adapter
+// compatibility check runs separately because it needs to consult the
+// shared [adapterruntime.Registry] rather than just the spec.
 type CacheBackendValidator struct {
-	// Rules is the ordered list of admission-time checks the validator
-	// applies to every admitted CacheBackend. When nil/empty,
+	// Rules is the ordered list of structural admission-time checks the
+	// validator applies to every admitted CacheBackend. When nil/empty,
 	// [DefaultValidationRules] is used.
 	Rules []ValidationRule
+
+	// Registry resolves the runtime adapter for a (runtime, backend) pair
+	// at admission time. A nil Registry falls back to
+	// [adapterruntime.DefaultRegistry] so unit tests and the bare zero
+	// value still validate against the controller's shipping adapter set;
+	// production wiring in cmd/controller passes the same registry
+	// instance the reconciler + pod webhook consume so all three agree on
+	// what's supported.
+	Registry *adapterruntime.Registry
 }
 
 // ValidationRule is the seam plugged-in admission rules implement. It
@@ -83,10 +95,16 @@ var DefaultValidationRules = []ValidationRule{
 // validating webhooks for CacheBackend with mgr. The kubebuilder markers
 // below are the single source of truth for the generated webhook
 // configurations; do not hand-edit config/webhook/manifests.yaml.
-func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager) error {
+//
+// registry is the runtime-adapter [adapterruntime.Registry] the validator
+// consults for the (engine, backend) compatibility check; passing nil falls
+// back to [adapterruntime.DefaultRegistry]. cmd/controller threads the same
+// instance the reconciler + pod webhook receive so all three layers agree on
+// what's supported.
+func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterruntime.Registry) error {
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).
-		WithValidator(&CacheBackendValidator{}).
+		WithValidator(&CacheBackendValidator{Registry: registry}).
 		Complete()
 }
 
@@ -150,7 +168,10 @@ func (v *CacheBackendValidator) ValidateDelete(_ context.Context, _ *cachev1alph
 
 // validate runs the configured rule set against cb and returns a single
 // aggregated Invalid status, or nil when every rule accepts. Centralised
-// here so create + update share one code path.
+// here so create + update share one code path. The runtime-adapter
+// compatibility check runs after the structural rules so a missing
+// required field surfaces as a single field-level error instead of
+// stacking an unsupported-pair complaint on top of it.
 func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 	rules := v.Rules
 	if len(rules) == 0 {
@@ -160,6 +181,7 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 	for _, rule := range rules {
 		errs = append(errs, rule(cb)...)
 	}
+	errs = append(errs, v.checkRuntimeAdapter(cb)...)
 	if len(errs) == 0 {
 		return nil
 	}
@@ -167,6 +189,72 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
 		cb.Name,
 		errs,
+	)
+}
+
+// checkRuntimeAdapter rejects a CacheBackend whose (engine, type) pair no
+// installed runtime adapter supports. The check skips when either side of
+// the pair is unset so the underlying "engine/type is required" surfaces
+// from CRD-level (or future field-level) validation instead of doubling up
+// with a redundant unsupported-pair complaint. cb.Spec.Type is the
+// canonical CacheBackendType enum; the engine string is normalised to
+// lower case so a CR that spells the engine "VLLM" matches the same
+// adapter the reconciler will pick.
+func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	engine := ""
+	if cb.Spec.Integration != nil {
+		engine = strings.TrimSpace(cb.Spec.Integration.Engine)
+	}
+	if engine == "" || strings.TrimSpace(string(cb.Spec.Type)) == "" {
+		return nil
+	}
+	registry := v.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := adapterruntime.RuntimeID(strings.ToLower(engine))
+	if _, err := registry.Select(runtimeID, cb); err != nil {
+		if !errors.Is(err, adapterruntime.ErrNoAdapter) {
+			// Registry currently only returns ErrNoAdapter from Select; a
+			// future error class should surface as-is rather than be
+			// rewritten as an unsupported-pair message.
+			return field.ErrorList{
+				field.InternalError(field.NewPath("spec", "integration", "engine"), err),
+			}
+		}
+		return field.ErrorList{
+			field.Invalid(
+				field.NewPath("spec", "integration", "engine"),
+				cb.Spec.Integration.Engine,
+				unsupportedPairMessage(engine, cb.Spec.Type, registry),
+			),
+		}
+	}
+	return nil
+}
+
+// unsupportedPairMessage formats the admission rejection a user sees when
+// their CacheBackend asks for a runtime/backend pair no installed adapter
+// supports. The message names both sides of the offending pair and lists
+// the supported pairs the controller's registered adapters expose so the
+// user has an actionable list of alternatives. When the registry can
+// enumerate no pairs (e.g. only the permissive reference adapter is
+// installed) we surface that as "(none)" rather than printing a
+// misleading empty list.
+func unsupportedPairMessage(engine string, backend cachev1alpha1.CacheBackendType, registry *adapterruntime.Registry) string {
+	pairs := registry.SupportedPairs()
+	pretty := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		pretty = append(pretty, p.String())
+	}
+	sort.Strings(pretty)
+	list := "(none)"
+	if len(pretty) > 0 {
+		list = strings.Join(pretty, ", ")
+	}
+	return fmt.Sprintf(
+		"no runtime adapter supports the (engine=%q, backend=%q) pair; supported pairs in this build: %s",
+		engine, backend, list,
 	)
 }
 

@@ -116,6 +116,56 @@ func (r *Registry) Select(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) 
 // Len reports the number of registered adapters. Mostly useful in tests.
 func (r *Registry) Len() int { return len(r.adapters) }
 
+// SupportedPair names an (engine runtime, cache backend type) combination that
+// at least one registered adapter accepts. It is returned by
+// [Registry.SupportedPairs] so admission validators can list the user's
+// options when they ask for an unsupported pair.
+type SupportedPair struct {
+	Runtime RuntimeID
+	Backend cachev1alpha1.CacheBackendType
+}
+
+// String renders a SupportedPair in the "<runtime>/<backend>" form used in
+// user-facing admission messages.
+func (p SupportedPair) String() string {
+	return fmt.Sprintf("%s/%s", p.Runtime, p.Backend)
+}
+
+// PairLister is the optional interface a [KVCacheRuntimeAdapter] implements
+// when it can enumerate the concrete (runtime, backend) pairs it accepts.
+// Adapters that match a single canonical pair (the vLLM+LMCache adapter, the
+// future SGLang HiCache adapter) implement it; permissive adapters that
+// accept arbitrary backends (e.g. the in-tree reference adapter) leave it
+// off and simply do not contribute to [Registry.SupportedPairs].
+type PairLister interface {
+	SupportedPairs() []SupportedPair
+}
+
+// SupportedPairs returns the union of pairs reported by every registered
+// adapter that implements [PairLister], in registration order, deduplicated.
+// Adapters without the optional method are skipped (they do not contribute to
+// the user-facing list). The result is intended for admission error messages,
+// not for routing decisions — callers that need to test a specific pair must
+// still go through [Registry.Select].
+func (r *Registry) SupportedPairs() []SupportedPair {
+	seen := map[SupportedPair]struct{}{}
+	var out []SupportedPair
+	for _, a := range r.adapters {
+		lister, ok := a.(PairLister)
+		if !ok {
+			continue
+		}
+		for _, p := range lister.SupportedPairs() {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // DefaultRegistry returns a Registry pre-populated with the runtime adapters
 // the controller ships with — currently the vLLM+LMCache adapter. The
 // reconciler builds one of these at startup; tests that need a specific

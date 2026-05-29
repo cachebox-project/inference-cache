@@ -126,6 +126,13 @@ func (vllmLMCacheAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.Cache
 	return runtime == RuntimeVLLM && cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
 }
 
+// SupportedPairs lets the registry expose this adapter's canonical pair to
+// admission error messages so a user who asked for an unsupported pair can
+// see what they could have asked for instead.
+func (vllmLMCacheAdapter) SupportedPairs() []SupportedPair {
+	return []SupportedPair{{Runtime: RuntimeVLLM, Backend: cachev1alpha1.CacheBackendTypeLMCache}}
+}
+
 // ResolveCacheServer renders the standalone LMCache server's container set
 // and the Service's port set. The reconciler owns ObjectMeta, the Service
 // Selector, the workload kind (Deployment vs StatefulSet), and owner
