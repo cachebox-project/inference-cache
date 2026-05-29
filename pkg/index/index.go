@@ -277,6 +277,14 @@ func (i *Index) Ingest(u Update) {
 					cumulative += p.BlockTokenCounts[j]
 					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(h)}, u.ReplicaID, cumulative, ts)
 				}
+				// Preserve the legacy single-blob key too when the producer
+				// set both representations on the same entry — so legacy
+				// LookupRoute callers (no chain in the request) still hit
+				// via exact-match on PrefixHash. The chain path otherwise
+				// silently breaks backward-compat for unmigrated clients.
+				if len(p.PrefixHash) > 0 {
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, ts)
+				}
 				continue
 			}
 			// Legacy single-blob exact-match entry.

@@ -75,8 +75,11 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	model := req.GetModelId()
 
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
-	// request that can't clear it — no index lock, no goroutine.
-	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && req.GetPrefixTokenCount() < minTokens {
+	// request that can't clear it — no index lock, no goroutine. A chain
+	// request reports its token budget via block_token_counts (the legacy
+	// prefix_token_count may be 0); fall back to that sum so chain callers
+	// aren't gated out by a zero legacy field.
+	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && effectivePrefixTokens(req) < minTokens {
 		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
@@ -332,4 +335,22 @@ func microsToTime(us int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMicro(us)
+}
+
+// effectivePrefixTokens returns the token count the request asserts its
+// prefix covers, picking the right field based on whether the request is in
+// chain or legacy form. A chain-only request (no prefix_token_count, but
+// block_token_counts populated) reports its budget as the sum of per-block
+// counts — otherwise the legacy prefix_token_count would zero-out the
+// CachePolicy.minimumPrefixTokens gate. Mismatched-length chains are still
+// dropped downstream by the index; here we fall back to whichever is set.
+func effectivePrefixTokens(req *icpb.LookupRouteRequest) int32 {
+	if c := req.GetPrefixTokenCount(); c > 0 {
+		return c
+	}
+	var sum int32
+	for _, v := range req.GetBlockTokenCounts() {
+		sum += v
+	}
+	return sum
 }

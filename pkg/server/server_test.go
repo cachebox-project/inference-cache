@@ -660,3 +660,57 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 		t.Fatalf("matched_tokens = %d, want 48 (3 blocks × 16 — the partial run, not the full request chain)", got)
 	}
 }
+
+// TestLookupRouteAboveMinimumPrefixTokensViaChainCounts verifies the
+// minimumPrefixTokens gate uses the sum of block_token_counts when a chain
+// request omits the legacy prefix_token_count (a chain-only caller). Without
+// this fallback the policy threshold would erroneously short-circuit every
+// chain request to NO_HINT regardless of its actual token budget.
+func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 32},
+	})
+	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
+	counts := []int32{16, 16, 16}
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts, // sum=48, clears 32
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH — chain budget (48) clears threshold (32)", resp.GetReasonCode())
+	}
+}
+
+// TestLookupRouteBelowMinimumPrefixTokensViaChainCounts confirms the gate
+// still fires when the chain's summed token budget is below the threshold.
+func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 200},
+	})
+	svc.lookupFn = func(index.LookupRequest) []index.ReplicaScore {
+		t.Fatal("index lookup should not run when chain budget is below the threshold")
+		return nil
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16, 16}, // sum=32, below 200
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT when chain budget is below the threshold", resp.GetReasonCode())
+	}
+}

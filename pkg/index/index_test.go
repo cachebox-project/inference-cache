@@ -759,3 +759,35 @@ func TestChainLookupOneSidedCountsOnlyFailsOpen(t *testing.T) {
 		t.Fatalf("counts-only chain lookup must fail open, got %+v", got)
 	}
 }
+
+// TestChainIngestWithCoSetLegacyPrefixHashPreservesBoth covers v1alpha1
+// backward-compat: a producer that sets BOTH the new chain (block_hashes)
+// and the legacy single-blob (PrefixHash) on the same PrefixEntry must
+// have BOTH representations indexed. The chain enables longest-prefix
+// matching for new clients; the legacy key keeps unmigrated callers
+// (legacy LookupRoute on prefix_hash) hitting.
+func TestChainIngestWithCoSetLegacyPrefixHashPreservesBoth(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			PrefixHash:       []byte("legacy-full"),
+			TokenCount:       128,
+			BlockHashes:      hashes,
+			BlockTokenCounts: counts,
+		}}})
+
+	// Chain lookup hits the per-block entries.
+	gotChain := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(gotChain) != 1 || gotChain[0].ReplicaID != "r" || gotChain[0].MatchedTokens != 48 {
+		t.Fatalf("chain lookup against co-set entry should hit all 3 blocks: got %+v", gotChain)
+	}
+
+	// Legacy lookup on the co-set PrefixHash MUST still hit (backward-compat).
+	gotLegacy := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: []byte("legacy-full")})
+	if len(gotLegacy) != 1 || gotLegacy[0].ReplicaID != "r" || gotLegacy[0].MatchedTokens != 128 {
+		t.Fatalf("legacy lookup against co-set entry must still hit prefix_hash with TokenCount=128: got %+v", gotLegacy)
+	}
+}
