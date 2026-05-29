@@ -60,6 +60,25 @@ kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/do
 
 [cm]: https://cert-manager.io/
 
+## Install
+
+The default Kustomize overlay brings up both control-plane components:
+
+- `inference-cache-controller-manager` — the reconciler + admission webhooks.
+- `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
+  HTTP `/healthz`, `/readyz`, `/metrics`, `/snapshot` surface, fronted by a
+  `ClusterIP` Service `inference-cache-server` in the
+  `inference-cache-system` namespace with named ports `grpc:9090` and
+  `http:8080`. The controller's CacheIndex poller scrapes `http://inference-cache-server:8080/snapshot`
+  by default, so once both pods are Ready `kubectl get cacheindex` reports
+  live cluster-wide cache state.
+
+```bash
+kubectl apply -k config/default
+kubectl -n inference-cache-system wait --for=condition=Available deployment --all --timeout=180s
+kubectl get cacheindex cluster-default -o yaml
+```
+
 ## Local Development Cluster
 
 Create a kind cluster for controller development:
