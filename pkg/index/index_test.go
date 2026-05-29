@@ -241,6 +241,22 @@ func TestSnapshotAggregates(t *testing.T) {
 	if snap.Replicas[0].CacheMemoryBytes != 100 || snap.Replicas[0].HitRate != 0.8 {
 		t.Fatalf("replica-a stats = %+v", snap.Replicas[0])
 	}
+	// Per-replica prefix counts are aggregated cluster-wide across models /
+	// hash_schemes: replica-a holds two distinct prefixes (one per model),
+	// replica-b holds one.
+	if snap.Replicas[0].PrefixCount != 2 {
+		t.Fatalf("replica-a prefixCount = %d, want 2", snap.Replicas[0].PrefixCount)
+	}
+	if snap.Replicas[1].PrefixCount != 1 {
+		t.Fatalf("replica-b prefixCount = %d, want 1", snap.Replicas[1].PrefixCount)
+	}
+	// LastEventAt is the max replica-entry lastSeen across the replica's
+	// prefixes; here both Ingest calls happened in the same test, so the
+	// field must at least be non-zero.
+	if snap.Replicas[0].LastEventAt.IsZero() || snap.Replicas[1].LastEventAt.IsZero() {
+		t.Fatalf("lastEventAt should be set after Ingest: %+v / %+v",
+			snap.Replicas[0].LastEventAt, snap.Replicas[1].LastEventAt)
+	}
 	// Tenants sorted by id; tenant-a counts replica-a once despite two reports.
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)

@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,8 +47,12 @@ type CacheIndexPoller struct {
 // The poller reads via the manager's cached client (a Get is backed by an
 // informer, hence list+watch) and creates the singleton; it never updates,
 // patches, or deletes the resource itself — only its status subresource.
+// It also lists CacheBackends across all namespaces and patches each
+// backend's status.indexParticipation projection from the same /snapshot
+// scrape (see [refreshCacheBackendParticipation]).
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
 
 // Start runs the refresh loop until ctx is done. Satisfies manager.Runnable.
 func (p *CacheIndexPoller) Start(ctx context.Context) error {
@@ -99,9 +106,21 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 
 	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL)
 	if err != nil {
+		// Soft-state: a single failed scrape must NOT clear the cluster-wide
+		// CacheIndex status nor the per-backend indexParticipation projection.
+		// The caller logs the error.
 		return err
 	}
 	desired := buildCacheIndexStatus(snap, p.SnapshotURL, time.Now())
+
+	// Project the same snapshot into each CacheBackend's status.indexParticipation
+	// BEFORE we touch the cluster-wide CacheIndex, so the projection runs even
+	// if the CacheIndex update itself errors (e.g. transient conflict). Errors
+	// during projection are non-fatal — log and continue — to keep parity with
+	// the single failing-replica → single backend-skipped fail-soft model.
+	if perr := p.refreshCacheBackendParticipation(ctx, snap); perr != nil {
+		p.logger(ctx).Error(perr, "project per-backend index participation")
+	}
 
 	if statusEqual(ci.Status, desired) {
 		return nil
@@ -111,6 +130,119 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 		return fmt.Errorf("update CacheIndex %q status: %w", name, err)
 	}
 	return nil
+}
+
+// refreshCacheBackendParticipation projects the cluster-wide snapshot into each
+// CacheBackend's status.indexParticipation. Matching: a replica belongs to
+// CacheBackend X when its `replica_id` has the prefix `X.metadata.name + "-"`.
+//
+// The "Deployment-name prefix" rule is set by the kvevent-subscriber sidecar
+// injected via the pod webhook (`replica_id = <pod-name>`, where the pod's
+// owning Deployment name equals the CacheBackend name). If a future change
+// shifts replica identity to a label-selector model, this matcher and the
+// subscriber-sidecar identity convention must move together.
+//
+// Per-replica HitRate stays nil until the stats reporter starts emitting
+// per-replica hit_rate into the index — surfacing a fabricated 0 here would
+// mislead operators into thinking the backend served traffic with 0% hit rate.
+func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap index.Snapshot) error {
+	var backends cachev1alpha1.CacheBackendList
+	if err := p.Client.List(ctx, &backends); err != nil {
+		return fmt.Errorf("list CacheBackends: %w", err)
+	}
+	if len(backends.Items) == 0 {
+		return nil
+	}
+
+	// Sort backend names by descending length so longest-prefix-first matching
+	// disambiguates names that are prefixes of each other (e.g. "cb" vs "cb-a"):
+	// without this, replica id "cb-a-0" would be claimed by "cb" instead of
+	// "cb-a". Unowned replicas (no backend name is a prefix) are silently
+	// dropped — they will be reflected only on the cluster-wide CacheIndex.
+	names := make([]string, 0, len(backends.Items))
+	byName := make(map[string]int, len(backends.Items))
+	for i := range backends.Items {
+		n := backends.Items[i].Name
+		names = append(names, n)
+		byName[n] = i
+	}
+	sort.Slice(names, func(a, b int) bool { return len(names[a]) > len(names[b]) })
+
+	type agg struct {
+		prefixCount int64
+		lastEventAt time.Time
+		hitNumer    float64 // weighted sum: hitRate × prefixCount per replica
+		hitDenom    int64   // sum of replica prefix counts that contributed a hit value
+		anyHit      bool
+	}
+	perBackend := make(map[string]*agg)
+	for _, r := range snap.Replicas {
+		owner := ""
+		for _, n := range names {
+			if strings.HasPrefix(r.ReplicaID, n+"-") {
+				owner = n
+				break
+			}
+		}
+		if owner == "" {
+			continue
+		}
+		a := perBackend[owner]
+		if a == nil {
+			a = &agg{}
+			perBackend[owner] = a
+		}
+		a.prefixCount += int64(r.PrefixCount)
+		if r.LastEventAt.After(a.lastEventAt) {
+			a.lastEventAt = r.LastEventAt
+		}
+		// HitRate aggregation: weight by per-replica prefix count, and only
+		// count replicas that actually carry a value AND hold prefixes. The
+		// snapshot's HitRate is a float32 today and never reported nil (the
+		// stats reporter is the source that will toggle "no value reported"
+		// semantics). For now, treat a non-zero HitRate as "value reported";
+		// this will tighten once the stats-reporter follow-up lands.
+		if r.HitRate != 0 && r.PrefixCount > 0 {
+			a.hitNumer += float64(r.HitRate) * float64(r.PrefixCount)
+			a.hitDenom += int64(r.PrefixCount)
+			a.anyHit = true
+		}
+	}
+
+	now := metav1.NewTime(time.Now())
+	for name, a := range perBackend {
+		cb := &backends.Items[byName[name]]
+		desired := &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: a.prefixCount}
+		if !a.lastEventAt.IsZero() {
+			t := metav1.NewTime(a.lastEventAt)
+			desired.LastEventAt = &t
+		}
+		if a.anyHit && a.hitDenom > 0 {
+			s := strconv.FormatFloat(a.hitNumer/float64(a.hitDenom), 'f', -1, 32)
+			desired.HitRate = &s
+		}
+		if participationEqual(cb.Status.IndexParticipation, desired) {
+			continue
+		}
+		_ = now // reserved for future "LastObserved" field; written today only via the projected fields
+		before := cb.DeepCopy()
+		cb.Status.IndexParticipation = desired
+		if err := p.Client.Status().Patch(ctx, cb, client.MergeFrom(before)); err != nil {
+			// Single-backend failure must not block the rest of the projection.
+			p.logger(ctx).Error(err, "patch CacheBackend indexParticipation",
+				"cacheBackend", cb.Namespace+"/"+cb.Name)
+			cb.Status.IndexParticipation = before.Status.IndexParticipation
+			continue
+		}
+	}
+	return nil
+}
+
+// participationEqual is the no-churn guard: skip the Status().Patch when the
+// projected fields are identical to what's already published. Uses semantic
+// equality so a *string pointer with the same value is treated as equal.
+func participationEqual(a, b *cachev1alpha1.CacheBackendIndexParticipation) bool {
+	return equality.Semantic.DeepEqual(a, b)
 }
 
 func (p *CacheIndexPoller) name() string {

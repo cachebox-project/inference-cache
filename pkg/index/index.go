@@ -924,12 +924,20 @@ type Snapshot struct {
 }
 
 // ReplicaSnapshot is the latest reported state for one replica, cluster-wide.
+//
+// PrefixCount and LastEventAt are derived from the prefix map and are the
+// per-replica view consumed by the CacheBackend status projection (see
+// internal/controller/cacheindex_controller.go). LastEventAt is the zero
+// time when the replica holds no prefix entries — interpret a zero value as
+// "no KV event observed yet" rather than "epoch."
 type ReplicaSnapshot struct {
 	ReplicaID        string    `json:"replicaId"`
 	CacheMemoryBytes int64     `json:"cacheMemoryBytes"`
 	HitRate          float32   `json:"hitRate"`
 	Pressure         float32   `json:"pressure"`
 	LastUpdate       time.Time `json:"lastUpdate"`
+	PrefixCount      int       `json:"prefixCount"`
+	LastEventAt      time.Time `json:"lastEventAt,omitempty"`
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
@@ -959,16 +967,56 @@ func (i *Index) Snapshot() Snapshot {
 		}
 	}
 
+	// Per-replica prefix counts + last KV-event timestamps. Derived from the
+	// prefix map (not the stats map) so the projection reflects what the
+	// replica actually holds, not just whether its stats are alive. A replica
+	// that only ever reported stats but no prefixes will show PrefixCount=0
+	// and LastEventAt=zero.
+	type replicaPrefixAgg struct {
+		count       int
+		lastEventAt time.Time
+	}
+	prefixByReplica := make(map[string]*replicaPrefixAgg)
+	for _, replicas := range i.prefixes {
+		for id, e := range replicas {
+			a := prefixByReplica[id]
+			if a == nil {
+				a = &replicaPrefixAgg{}
+				prefixByReplica[id] = a
+			}
+			a.count++
+			if e.lastSeen.After(a.lastEventAt) {
+				a.lastEventAt = e.lastSeen
+			}
+		}
+	}
+
 	snap := Snapshot{TotalPrefixes: len(i.prefixes)}
 
-	for id, s := range latestByReplica {
-		snap.Replicas = append(snap.Replicas, ReplicaSnapshot{
-			ReplicaID:        id,
-			CacheMemoryBytes: s.stats.CacheMemoryBytes,
-			HitRate:          s.stats.HitRate,
-			Pressure:         s.stats.Pressure,
-			LastUpdate:       s.lastSeen,
-		})
+	// Union of replicas seen in stats AND in prefixes — a replica may have
+	// reported prefixes via Ingest but had its stats entry evicted, or vice
+	// versa; the snapshot surfaces both so per-backend projection is robust.
+	seen := make(map[string]struct{}, len(latestByReplica)+len(prefixByReplica))
+	for id := range latestByReplica {
+		seen[id] = struct{}{}
+	}
+	for id := range prefixByReplica {
+		seen[id] = struct{}{}
+	}
+	for id := range seen {
+		var r ReplicaSnapshot
+		r.ReplicaID = id
+		if s, ok := latestByReplica[id]; ok {
+			r.CacheMemoryBytes = s.stats.CacheMemoryBytes
+			r.HitRate = s.stats.HitRate
+			r.Pressure = s.stats.Pressure
+			r.LastUpdate = s.lastSeen
+		}
+		if a, ok := prefixByReplica[id]; ok {
+			r.PrefixCount = a.count
+			r.LastEventAt = a.lastEventAt
+		}
+		snap.Replicas = append(snap.Replicas, r)
 	}
 
 	type tenantAgg struct {

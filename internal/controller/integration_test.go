@@ -2,10 +2,14 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,6 +33,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 // These tests run the reconciler against a real kube-apiserver (envtest), so they
@@ -717,6 +722,71 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("deployment was not recreated after deletion (Owns watch did not re-trigger)")
+}
+
+// TestIntegrationCacheIndexPollerProjectsParticipation exercises the poller
+// against a real apiserver to confirm that Status().Patch on CacheBackend
+// applies the indexParticipation projection, and that a steady snapshot does
+// not churn the backend's resourceVersion (the no-churn invariant under real
+// apiserver defaulting). Catches the class of bug a fake client misses — the
+// fake client skips apiserver defaulting that can flip semantic equality on
+// round-trip and cause spurious writes.
+func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, _ := startEnv(t)
+	ctx := context.Background()
+	ns := freshNS(t, k8s)
+
+	// Seed two CacheBackends that the projection will own. We deliberately use
+	// plain (External-typed) fixtures so the CacheBackend reconciler is NOT
+	// running and we are testing the poller's Status().Patch in isolation.
+	for _, name := range []string{"backend-a", "backend-b"} {
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:     cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint: "external.example:6379",
+			},
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create CacheBackend %s: %v", name, err)
+		}
+	}
+
+	tEvent := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "backend-a-0", PrefixCount: 4, LastEventAt: tEvent},
+			{ReplicaID: "backend-b-0", PrefixCount: 1, LastEventAt: tEvent},
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(served)
+	}))
+	defer srv.Close()
+
+	p := &CacheIndexPoller{Client: k8s, SnapshotURL: srv.URL, HTTPClient: srv.Client(), Name: "cluster-default"}
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+
+	a := getBackendDirect(t, k8s, "backend-a", ns)
+	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 4 {
+		t.Fatalf("backend-a participation = %+v, want prefixCount 4", a.Status.IndexParticipation)
+	}
+	rvA := a.ResourceVersion
+
+	// Second refresh on identical snapshot → no churn (apiserver-side).
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	a2 := getBackendDirect(t, k8s, "backend-a", ns)
+	if a2.ResourceVersion != rvA {
+		t.Fatalf("steady snapshot churned resourceVersion (%s → %s)", rvA, a2.ResourceVersion)
+	}
 }
 
 // TestIntegrationCacheBackendEvents runs a real manager (so the Recorder is
