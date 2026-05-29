@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
@@ -50,6 +51,10 @@ func New() *Service {
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics))
+	// Register gRPC server reflection so operators can use grpcurl,
+	// grpc_health_probe, and similar debug tooling without shipping the .proto.
+	// Reflection exposes only the service schema, never KV or prompt data.
+	reflection.Register(grpcServer)
 
 	mux := http.NewServeMux()
 	// /healthz — liveness: the process is up.
