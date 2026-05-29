@@ -94,7 +94,7 @@ resolver step before pushing, without any schema change.
 | Field | Where it lands |
 |---|---|
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
-| `minimumPrefixTokens` | `LookupRoute` drops candidates below the threshold; if none survive, response is `NO_HINT`. |
+| `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 
 `failOpen` and `tenantScoped` are part of the CRD but not enforced by

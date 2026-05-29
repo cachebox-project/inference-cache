@@ -413,59 +413,60 @@ func TestMicrosToTime(t *testing.T) {
 	}
 }
 
-// TestLookupRouteRespectsMinimumPrefixTokens seeds two replicas with different
-// matched-token counts under one tenant's CachePolicy threshold; only the one
-// at or above the threshold should be returned, and the response shape stays
-// fail-open when none clear the bar.
-func TestLookupRouteRespectsMinimumPrefixTokens(t *testing.T) {
+// TestLookupRouteAboveMinimumPrefixTokensProceedsToLookup verifies that a
+// request whose prefix_token_count meets the policy threshold proceeds to
+// the index lookup and returns the normal PREFIX_MATCH response.
+func TestLookupRouteAboveMinimumPrefixTokensProceedsToLookup(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 50},
 	})
-
-	// replica-low has 10 tokens; replica-high has 100. Threshold is 50.
-	for r, tok := range map[string]int32{"replica-low": 10, "replica-high": 100} {
-		svc.index.Ingest(index.Update{
-			ReplicaID: r, Model: "m", Tenant: "team-a", HashScheme: "vllm",
-			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: tok}},
-		})
-	}
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 100}},
+	})
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
-		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		PrefixHash: []byte("p"), PrefixTokenCount: 100, // clears the 50 threshold
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
-		t.Fatalf("reason = %q, want PREFIX_MATCH (replica-high clears the threshold)", resp.GetReasonCode())
+		t.Fatalf("reason = %q, want PREFIX_MATCH (request clears the threshold)", resp.GetReasonCode())
 	}
-	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-high" {
-		t.Fatalf("expected only replica-high after filter, got %+v", resp.GetReplicaScores())
+	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "r" {
+		t.Fatalf("expected hit on replica r, got %+v", resp.GetReplicaScores())
 	}
 }
 
-func TestLookupRouteReturnsNoHintWhenAllBelowThreshold(t *testing.T) {
+// TestLookupRouteBelowMinimumPrefixTokensReturnsNoHintWithoutTouchingIndex
+// pins the documented semantics: the threshold gates the request BEFORE
+// the lookup. To prove the index is not touched even when a match exists,
+// we inject a lookupFn that fails the test if ever called.
+func TestLookupRouteBelowMinimumPrefixTokensReturnsNoHintWithoutTouchingIndex(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200},
 	})
-	svc.index.Ingest(index.Update{
-		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
-	})
+	svc.lookupFn = func(index.LookupRequest) []index.ReplicaScore {
+		t.Fatal("index lookup should not run when the request is below the policy threshold")
+		return nil
+	}
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
-		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		PrefixHash: []byte("p"), PrefixTokenCount: 10, // below the 200 threshold
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() != "NO_HINT" {
-		t.Fatalf("reason = %q, want NO_HINT when nothing clears the threshold", resp.GetReasonCode())
+		t.Fatalf("reason = %q, want NO_HINT when request is below the threshold", resp.GetReasonCode())
 	}
 	if len(resp.GetReplicaScores()) != 0 {
-		t.Fatalf("expected empty scores when filtered out, got %+v", resp.GetReplicaScores())
+		t.Fatalf("expected empty scores below the threshold, got %+v", resp.GetReplicaScores())
 	}
 }
 

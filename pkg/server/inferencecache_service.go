@@ -57,8 +57,12 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 // LookupRoute consults the index for replicas holding the request's prefix and
 // returns them ranked. The handler honors the tenant's CachePolicy:
 //
-//   - minimumPrefixTokens: candidates whose matched-token count is below the
-//     threshold are dropped; if none survive, the response is NO_HINT.
+//   - minimumPrefixTokens: a pre-lookup gate on the request's prefix token
+//     count. If the request's prefix is shorter than the threshold the index
+//     is never touched and the response is NO_HINT. Matches the CRD doc
+//     ("minimum prefix token count before lookup", docs/design/policy-crds.md)
+//     and avoids spending lock/lookup budget on requests that wouldn't yield
+//     a useful hint anyway.
 //   - lookupTimeoutMs: a deadline is applied around the lookup. If the caller's
 //     ctx is already past its deadline, or if the in-memory lookup exceeds the
 //     policy budget, the response is TIMEOUT (still fail-open: empty scores).
@@ -67,6 +71,14 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
 	tenant := req.GetTenantId()
 	model := req.GetModelId()
+
+	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
+	// request that can't clear it — no index lock, no goroutine.
+	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && req.GetPrefixTokenCount() < minTokens {
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
+	}
 
 	// Apply the per-tenant lookup budget as a derived context deadline so we
 	// honor whichever is tighter — the caller's deadline or the policy budget.
@@ -129,21 +141,6 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		// lookup. The goroutine will land eventually with its result
 		// discarded; the RPC returns immediately.
 		return s.timeoutResponse(model, time.Since(start)), nil
-	}
-
-	// Drop candidates below the per-tenant minimum-prefix-tokens threshold
-	// (a coarse "is this match worth a routing hint" filter). Keep them
-	// pre-filter so we can still report PREFIX_MATCH semantics correctly
-	// when at least one candidate clears the bar.
-	minTokens := s.policyMinimumPrefixTokens(tenant)
-	if minTokens > 0 {
-		filtered := scores[:0]
-		for _, sc := range scores {
-			if sc.MatchedTokens >= minTokens {
-				filtered = append(filtered, sc)
-			}
-		}
-		scores = filtered
 	}
 
 	resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
