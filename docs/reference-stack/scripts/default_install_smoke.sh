@@ -42,7 +42,7 @@ KIND_CLUSTER="${KIND_CLUSTER:-ic-install-smoke}"
 NAMESPACE="${NAMESPACE:-inference-cache-system}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
 READY_TIMEOUT="${READY_TIMEOUT:-120s}"
-CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-60}" # seconds
+CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
 GRPC_LOCAL_PORT="${GRPC_LOCAL_PORT:-19090}"
 LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 
@@ -94,7 +94,21 @@ cleanup() {
     "$KIND" delete cluster --name "$KIND_CLUSTER" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+
+# Catch ANY non-zero exit, not just the ones routed through fail(), and dump
+# diagnostics BEFORE cleanup deletes the cluster. Without this, a `set -e`
+# abort from an unwrapped command (kubectl apply -k, make image-build, kind
+# load, the cert-manager apply) tears the cluster down with no artifact left
+# behind -- which is exactly the case (e.g. a missing Namespace resource in
+# config/default) this gate is meant to surface.
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    collect_diagnostics || true
+  fi
+  cleanup
+}
+trap on_exit EXIT
 
 # --- prereq checks ----------------------------------------------------------
 for bin in docker kubectl grpcurl "$KIND"; do
