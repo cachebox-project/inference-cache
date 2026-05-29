@@ -38,7 +38,7 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
 
    where `freshness = max(0, 1 − age / TTL)` — a linear decay from 1 (just
    reported) to 0 (older than the TTL).
-3. Return them ranked, top-K, ties broken by replica ID. `reason_code: PREFIX_MATCH`.
+3. Return them ranked best-first, ties broken by replica ID. `reason_code: PREFIX_MATCH`. (The handler currently returns every qualifying candidate — there is no top-K limit today; the gateway typically uses the top entry.)
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the

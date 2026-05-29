@@ -204,6 +204,16 @@ type statsKey struct {
 	replicaID string
 }
 
+// modelKey identifies a (tenant, model) — the granularity at which stats are
+// keyed in the index (stats are scheme-independent: one ReplicaStats applies
+// across engine domains). Used by the TENANT_HOT fallback to look up the
+// (tenant, model) stats subset in O(replicas-in-this-(tenant, model)) rather
+// than O(total stats in the index).
+type modelKey struct {
+	tenant string
+	model  string
+}
+
 // scopeKey identifies a (tenant, model, hash_scheme) — the engine domain
 // granularity TENANT_HOT needs for its serving-membership check.
 type scopeKey struct {
@@ -254,6 +264,13 @@ type Index struct {
 	// removeReplicaLocked, and the entry is dropped when the count hits 0.
 	servingByScope map[scopeKey]map[string]int
 
+	// replicasByModel is the (tenant, model) → set of replicas with stats
+	// reported in that scope. It exists purely so TENANT_HOT's warmth scan
+	// touches only the stats for the requested (tenant, model) instead of
+	// iterating the full i.stats map. Updated in lockstep with i.stats on
+	// ingest, replica-clear events, and stats eviction.
+	replicasByModel map[modelKey]map[string]struct{}
+
 	// reportMu guards reportedModels, the set of models last pushed to the
 	// metrics sink — used to zero a model's gauge when it drains to empty.
 	reportMu       sync.Mutex
@@ -293,15 +310,16 @@ func withClock(now func() time.Time) Option { return func(i *Index) { i.now = no
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
 	i := &Index{
-		ttl:            DefaultTTL,
-		sweepInterval:  DefaultSweepInterval,
-		maxEntries:     DefaultMaxEntries,
-		now:            time.Now,
-		ranker:         DefaultRankerConfig(),
-		prefixes:       make(map[prefixKey]map[string]replicaEntry),
-		stats:          make(map[statsKey]statEntry),
-		servingByScope: make(map[scopeKey]map[string]int),
-		reportedModels: make(map[string]struct{}),
+		ttl:             DefaultTTL,
+		sweepInterval:   DefaultSweepInterval,
+		maxEntries:      DefaultMaxEntries,
+		now:             time.Now,
+		ranker:          DefaultRankerConfig(),
+		prefixes:        make(map[prefixKey]map[string]replicaEntry),
+		stats:           make(map[statsKey]statEntry),
+		servingByScope:  make(map[scopeKey]map[string]int),
+		replicasByModel: make(map[modelKey]map[string]struct{}),
+		reportedModels:  make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -389,6 +407,7 @@ func (i *Index) Ingest(u Update) {
 			lastSeen:      ts,
 			statsReported: ts,
 		}
+		i.statsScopeAddLocked(modelKey{u.Tenant, u.Model}, u.ReplicaID)
 	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
@@ -434,6 +453,7 @@ func (i *Index) ApplyEvent(ev Event) {
 			i.removeReplicaLocked(key, replicas, ev.ReplicaID)
 		}
 		delete(i.stats, statsKey{ev.Tenant, ev.Model, ev.ReplicaID})
+		i.statsScopeRemoveLocked(modelKey{ev.Tenant, ev.Model}, ev.ReplicaID)
 	}
 	// EventPrefixAdded is intentionally a no-op: ReportCacheState is the
 	// authoritative add/refresh path, and the event lacks hash_scheme +
@@ -540,8 +560,9 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 //
 //  1. The replica has reported at least one prefix entry for
 //     (tenant, model, req.HashScheme). Stats in the index are deliberately
-//     scheme-independent (PROJECT_CONTEXT §5), so without this check a
-//     stats-only update with an empty/unrelated hash_scheme could leak into
+//     scheme-independent (the (tenant, model, replicaID) statsKey carries no
+//     hash_scheme), so without this check a stats-only update — or an update
+//     with an empty/unrelated hash_scheme — could leak into
 //     a TENANT_HOT hint for the wrong engine domain. Proving the replica
 //     has SOME prefix in the requested scheme is the cheapest way to assert
 //     "this replica actually serves this engine".
@@ -576,18 +597,25 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 	defer i.mu.RUnlock()
 
 	// Pass 1 (cheap): collect the warm replicas for (tenant, model). Bounded
-	// by the number of stats entries for this scope — typically tens, not
-	// millions. If none qualify, short-circuit BEFORE the (potentially
-	// expensive) prefixes scan — the realistic common case for a tenant
-	// with no recent activity has zero warm replicas.
+	// by the size of the (tenant, model) scope — typically tens of replicas —
+	// thanks to the replicasByModel secondary index. Without it this would
+	// scan the whole i.stats map on every prefix miss, an O(total stats)
+	// hot-path cost. Short-circuit BEFORE the prefixes-scope check if no
+	// replica qualifies: the common-case prefix miss for a tenant with no
+	// recent activity has zero warm replicas.
 	type warmReplica struct {
 		hitRate, pressure float32
 		lastSeen          time.Time
 	}
-	warm := make(map[string]warmReplica)
-	for sk, s := range i.stats {
-		if sk.tenant != req.Tenant || sk.model != req.Model {
-			continue
+	scoped := i.replicasByModel[modelKey{req.Tenant, req.Model}]
+	if len(scoped) == 0 {
+		return nil
+	}
+	warm := make(map[string]warmReplica, len(scoped))
+	for replicaID := range scoped {
+		s, ok := i.stats[statsKey{req.Tenant, req.Model, replicaID}]
+		if !ok {
+			continue // defensive: scoped membership and i.stats should be in lockstep
 		}
 		// Use statsReported, not lastSeen: TENANT_HOT must hint based on
 		// recently reported stat payloads, not on liveness events that
@@ -598,7 +626,7 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		if s.stats.HitRate < minHitRate {
 			continue
 		}
-		warm[sk.replicaID] = warmReplica{
+		warm[replicaID] = warmReplica{
 			hitRate:  s.stats.HitRate,
 			pressure: s.stats.Pressure,
 			lastSeen: s.statsReported,
@@ -886,6 +914,32 @@ func (i *Index) scopeDecLocked(scope scopeKey, replicaID string) {
 	m[replicaID] = n
 }
 
+// statsScopeAddLocked records replicaID as having stats reported in (tenant,
+// model) so tenantHotCandidates can scan only the relevant subset rather
+// than the whole i.stats map. Caller holds the write lock.
+func (i *Index) statsScopeAddLocked(mk modelKey, replicaID string) {
+	m := i.replicasByModel[mk]
+	if m == nil {
+		m = make(map[string]struct{})
+		i.replicasByModel[mk] = m
+	}
+	m[replicaID] = struct{}{}
+}
+
+// statsScopeRemoveLocked drops replicaID from the (tenant, model) set when
+// its stats entry has been deleted (event-driven clear or TTL sweep).
+// Caller holds the write lock.
+func (i *Index) statsScopeRemoveLocked(mk modelKey, replicaID string) {
+	m := i.replicasByModel[mk]
+	if m == nil {
+		return
+	}
+	delete(m, replicaID)
+	if len(m) == 0 {
+		delete(i.replicasByModel, mk)
+	}
+}
+
 // evictExpired removes entries older than each tenant's TTL. Runs on the
 // sweep loop. Per-tenant TTLs let two namespaces with very different
 // CachePolicy TTLs evict on independent schedules (the sweep itself
@@ -920,6 +974,7 @@ func (i *Index) evictExpired() {
 		ttl := ttlOf(sk.tenant)
 		if ttl > 0 && now.Sub(s.lastSeen) >= ttl {
 			delete(i.stats, sk)
+			i.statsScopeRemoveLocked(modelKey{sk.tenant, sk.model}, sk.replicaID)
 		}
 	}
 	i.mu.Unlock()
