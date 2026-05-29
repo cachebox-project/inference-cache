@@ -97,6 +97,7 @@ The retired colocated-rendering keys (`image`, `profile`, `model`, `hfTokenSecre
 | `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
+| `indexParticipation` | object | Per-backend slice of the cluster-wide cache index, projected from the server's `/snapshot` by grouping replicas by owning `CacheBackend`. Populated by the CacheIndex poller (status-only). Object is unset until the poller has observed a successful scrape that names the backend's replicas (see [Index Participation](#index-participation)). |
 | `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |
 | `conditions` | array | Kubernetes conditions keyed by `type`. See [Conditions](#conditions). |
 
@@ -111,7 +112,17 @@ Two condition types are published on managed backends:
 
 When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
-`kubectl get cachebackend` displays the observed `status.endpoint` so managed backends show the endpoint once reconciliation has created it.
+`kubectl get cachebackend` displays the observed `status.endpoint`, `status.indexParticipation.prefixCount` (as `PREFIXES`), and `status.indexParticipation.lastEventAt` (as `LASTEVENT`) so managed backends show endpoint + live participation once reconciliation has created them and the poller has observed a `/snapshot` tick.
+
+### Index Participation
+
+| Field | Type | Purpose |
+|---|---|---|
+| `indexParticipation.prefixCount` | integer | Sum of distinct prefix entries currently attributed to this backend's replicas. `0` is a valid observed value (the backend is up but holds no warm prefixes yet); always serialized. |
+| `indexParticipation.lastEventAt` | time | Most recent KV-event timestamp observed for any of this backend's replicas. Unset until the first event arrives; readiness gates must treat the absent value as "not yet observed" rather than epoch. |
+| `indexParticipation.hitRate` | string | Prefix-count-weighted cache hit rate across this backend's replicas, formatted as a decimal in `[0,1]`. Unset until the snapshot carries an explicit per-replica presence bit (planned with the stats-reporter follow-up); a missing value MUST NOT be interpreted as `0`. |
+
+The poller projects per-replica entries from `/snapshot.replicas[]` into the matching `CacheBackend` by checking whether `replica_id` is prefixed by `metadata.name + "-"`. The match relies on the sidecar's identity convention (replica id = pod name; pod name's owning Deployment name = CacheBackend name). When two CacheBackends share a `metadata.name` across namespaces the matcher cannot disambiguate, so those backends keep `indexParticipation` unset until the conflict is resolved. A failing scrape preserves existing state (soft-state); a successful scrape that finds no matching replicas resets `prefixCount` to `0` so stale positive values do not survive a drain.
 
 ## Contract Notes
 

@@ -267,11 +267,12 @@ func TestRefreshProjectsParticipationPerBackend(t *testing.T) {
 	}
 }
 
-// TestRefreshNoEventsForBackendKeepsZeroParticipation: a CacheBackend with no
-// matching replicas must NOT have indexParticipation written (no error and no
-// fabricated zero state — the field stays nil so the printer column shows the
-// CRD default until a real signal arrives).
-func TestRefreshNoEventsForBackendKeepsZeroParticipation(t *testing.T) {
+// TestRefreshNoEventsForBackendPublishesZeroParticipation: a CacheBackend with
+// no matching replicas in a SUCCESSFUL snapshot must have indexParticipation
+// published as {prefixCount: 0, lastEventAt: nil} — semantically "I'm visible
+// but holding no warm prefixes right now." A scrape-failure scenario keeps
+// existing state (see TestRefreshScrapeFailureDoesNotClearParticipation).
+func TestRefreshNoEventsForBackendPublishesZeroParticipation(t *testing.T) {
 	cbA := cbFixture("backend-a", "default")
 	cbQuiet := cbFixture("backend-quiet", "default")
 	var mu sync.Mutex
@@ -288,12 +289,94 @@ func TestRefreshNoEventsForBackendKeepsZeroParticipation(t *testing.T) {
 	}
 
 	q := getBackendDirect(t, cl, "backend-quiet", "default")
-	if q.Status.IndexParticipation != nil {
-		t.Fatalf("backend-quiet should have no indexParticipation, got %+v", q.Status.IndexParticipation)
+	if q.Status.IndexParticipation == nil {
+		t.Fatal("backend-quiet should have indexParticipation published (prefixCount 0)")
+	}
+	if q.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("backend-quiet prefixCount = %d, want 0", q.Status.IndexParticipation.PrefixCount)
+	}
+	if q.Status.IndexParticipation.LastEventAt != nil {
+		t.Fatalf("backend-quiet lastEventAt = %v, want nil", q.Status.IndexParticipation.LastEventAt)
 	}
 	a := getBackendDirect(t, cl, "backend-a", "default")
 	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 1 {
 		t.Fatalf("backend-a participation = %+v, want prefixCount 1", a.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshClearsStaleParticipationOnReplicaDrain: once a backend has
+// published a positive prefixCount, a later successful snapshot with no
+// matching replicas must reset prefixCount to 0 (and clear lastEventAt).
+// Otherwise the operator sees stale "still contributing" state forever.
+func TestRefreshClearsStaleParticipationOnReplicaDrain(t *testing.T) {
+	cbA := cbFixture("backend-a", "default")
+	var mu sync.Mutex
+	tEvent := time.Unix(1_700_000_000, 0).UTC()
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "backend-a-0", PrefixCount: 5, LastEventAt: tEvent},
+		},
+	}
+	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	defer srv.Close()
+	ctx := context.Background()
+
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	a := getBackendDirect(t, cl, "backend-a", "default")
+	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 5 {
+		t.Fatalf("seed participation = %+v, want prefixCount 5", a.Status.IndexParticipation)
+	}
+
+	// Drain: a successful scrape with zero matching replicas.
+	mu.Lock()
+	served = index.Snapshot{Replicas: nil}
+	mu.Unlock()
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	a = getBackendDirect(t, cl, "backend-a", "default")
+	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("drained participation = %+v, want prefixCount 0", a.Status.IndexParticipation)
+	}
+	if a.Status.IndexParticipation.LastEventAt != nil {
+		t.Fatalf("drained lastEventAt = %v, want nil", a.Status.IndexParticipation.LastEventAt)
+	}
+}
+
+// TestRefreshAmbiguousBackendNameSkipsProjection: two CacheBackends share a
+// metadata.name across namespaces, so neither can be safely attributed via
+// the replica-id prefix matcher. Both must keep status.indexParticipation
+// nil (the controller logs the ambiguity and bails). A non-conflicting third
+// backend still gets projected normally.
+func TestRefreshAmbiguousBackendNameSkipsProjection(t *testing.T) {
+	cbDup1 := cbFixture("backend-a", "ns-1")
+	cbDup2 := cbFixture("backend-a", "ns-2")
+	cbUnique := cbFixture("backend-b", "ns-1")
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "backend-a-0", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "backend-b-0", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbDup1, cbDup2, cbUnique}, &served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	for _, ns := range []string{"ns-1", "ns-2"} {
+		got := getBackendDirect(t, cl, "backend-a", ns)
+		if got.Status.IndexParticipation != nil {
+			t.Fatalf("backend-a/%s should be skipped due to name collision, got %+v", ns, got.Status.IndexParticipation)
+		}
+	}
+	gotB := getBackendDirect(t, cl, "backend-b", "ns-1")
+	if gotB.Status.IndexParticipation == nil || gotB.Status.IndexParticipation.PrefixCount != 3 {
+		t.Fatalf("backend-b should still be projected, got %+v", gotB.Status.IndexParticipation)
 	}
 }
 
@@ -349,16 +432,18 @@ func TestRefreshNoChurnOnIdenticalSnapshot(t *testing.T) {
 	}
 }
 
-// TestRefreshHitRateNilPassthrough: snapshot replicas all report HitRate=0
-// (the "no value yet" signal until the stats reporter ships) →
-// indexParticipation.HitRate stays nil. Don't fabricate a 0.
-func TestRefreshHitRateNilPassthrough(t *testing.T) {
+// TestRefreshHitRateStaysNil: HitRate aggregation is intentionally deferred
+// because the snapshot's per-replica HitRate has no presence bit — a real 0%
+// hit rate is indistinguishable from "not reported". Until the stats-reporter
+// follow-up adds a presence signal to the snapshot, status.indexParticipation
+// .hitRate stays nil regardless of replica values.
+func TestRefreshHitRateStaysNil(t *testing.T) {
 	cbA := cbFixture("backend-a", "default")
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 2, HitRate: 0, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-			{ReplicaID: "backend-a-1", PrefixCount: 3, HitRate: 0, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "backend-a-0", PrefixCount: 2, HitRate: 0.75, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "backend-a-1", PrefixCount: 3, HitRate: 0.85, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
 	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
@@ -372,7 +457,7 @@ func TestRefreshHitRateNilPassthrough(t *testing.T) {
 		t.Fatal("backend-a participation should be populated (prefixCount + lastEventAt)")
 	}
 	if a.Status.IndexParticipation.HitRate != nil {
-		t.Fatalf("HitRate should be nil while the stats reporter is unshipped, got %q", *a.Status.IndexParticipation.HitRate)
+		t.Fatalf("HitRate should be nil while the snapshot lacks a presence bit, got %q", *a.Status.IndexParticipation.HitRate)
 	}
 }
 
@@ -428,8 +513,11 @@ func TestRefreshLongestPrefixWinsOnAmbiguousNames(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 	short := getBackendDirect(t, cl, "cb", "default")
-	if short.Status.IndexParticipation != nil {
-		t.Fatalf("short-name backend should not steal replica from cb-a, got %+v", short.Status.IndexParticipation)
+	if short.Status.IndexParticipation == nil {
+		t.Fatal("short-name backend should still get an empty zero-state participation written")
+	}
+	if short.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("short-name backend should not steal replica from cb-a, got prefixCount %d", short.Status.IndexParticipation.PrefixCount)
 	}
 	long := getBackendDirect(t, cl, "cb-a", "default")
 	if long.Status.IndexParticipation == nil || long.Status.IndexParticipation.PrefixCount != 3 {

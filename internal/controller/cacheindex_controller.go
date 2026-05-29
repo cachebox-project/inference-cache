@@ -154,28 +154,62 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		return nil
 	}
 
+	// CacheBackends are namespaced; replica_id is just the pod name (no
+	// namespace, by the sidecar identity convention), so two CacheBackends
+	// with the same metadata.name in different namespaces would each match
+	// the same replicas — we can't disambiguate. Detect this and skip those
+	// names entirely (preserve any existing status — fail-soft). Once the
+	// replica-identity scheme encodes namespace, this guard can drop.
+	type backendRef struct {
+		idx       int
+		ambiguous bool
+	}
+	byName := make(map[string]*backendRef, len(backends.Items))
+	for i := range backends.Items {
+		n := backends.Items[i].Name
+		if ref, ok := byName[n]; ok {
+			ref.ambiguous = true
+			continue
+		}
+		byName[n] = &backendRef{idx: i}
+	}
+	for n, ref := range byName {
+		if ref.ambiguous {
+			p.logger(ctx).Info("ambiguous CacheBackend name across namespaces; skipping indexParticipation projection",
+				"name", n)
+		}
+	}
+
 	// Sort backend names by descending length so longest-prefix-first matching
 	// disambiguates names that are prefixes of each other (e.g. "cb" vs "cb-a"):
 	// without this, replica id "cb-a-0" would be claimed by "cb" instead of
-	// "cb-a". Unowned replicas (no backend name is a prefix) are silently
-	// dropped — they will be reflected only on the cluster-wide CacheIndex.
-	names := make([]string, 0, len(backends.Items))
-	byName := make(map[string]int, len(backends.Items))
-	for i := range backends.Items {
-		n := backends.Items[i].Name
+	// "cb-a". Unambiguous names only — ambiguous ones are excluded so they
+	// neither steal replicas nor get projected. Unowned replicas (no backend
+	// name is a prefix) are silently dropped — they only show up in the
+	// cluster-wide CacheIndex.
+	names := make([]string, 0, len(byName))
+	for n, ref := range byName {
+		if ref.ambiguous {
+			continue
+		}
 		names = append(names, n)
-		byName[n] = i
 	}
 	sort.Slice(names, func(a, b int) bool { return len(names[a]) > len(names[b]) })
 
 	type agg struct {
 		prefixCount int64
 		lastEventAt time.Time
-		hitNumer    float64 // weighted sum: hitRate × prefixCount per replica
-		hitDenom    int64   // sum of replica prefix counts that contributed a hit value
-		anyHit      bool
 	}
-	perBackend := make(map[string]*agg)
+	// Seed perBackend with every unambiguous backend (including ones with no
+	// matching replicas) so a successful snapshot that drains a backend's
+	// replicas publishes prefixCount=0 instead of leaving stale positive
+	// state behind. Backends with no observed replicas this tick land in
+	// the "zero participation" bucket — semantically "no warm prefixes
+	// right now", consistent with the printer column showing 0.
+	perBackend := make(map[string]*agg, len(names))
+	for _, n := range names {
+		perBackend[n] = &agg{}
+	}
 	for _, r := range snap.Replicas {
 		owner := ""
 		for _, n := range names {
@@ -188,43 +222,29 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 			continue
 		}
 		a := perBackend[owner]
-		if a == nil {
-			a = &agg{}
-			perBackend[owner] = a
-		}
 		a.prefixCount += int64(r.PrefixCount)
 		if r.LastEventAt.After(a.lastEventAt) {
 			a.lastEventAt = r.LastEventAt
 		}
-		// HitRate aggregation: weight by per-replica prefix count, and only
-		// count replicas that actually carry a value AND hold prefixes. The
-		// snapshot's HitRate is a float32 today and never reported nil (the
-		// stats reporter is the source that will toggle "no value reported"
-		// semantics). For now, treat a non-zero HitRate as "value reported";
-		// this will tighten once the stats-reporter follow-up lands.
-		if r.HitRate != 0 && r.PrefixCount > 0 {
-			a.hitNumer += float64(r.HitRate) * float64(r.PrefixCount)
-			a.hitDenom += int64(r.PrefixCount)
-			a.anyHit = true
-		}
+		// HitRate is intentionally NOT aggregated yet. The snapshot's
+		// per-replica hitRate is a float32 with no presence bit, so a real
+		// "served traffic with 0% hit rate" is indistinguishable from "no
+		// value reported." Surfacing a value would bias the aggregate
+		// upward as soon as a single non-zero replica appears. The status
+		// field stays nil until the snapshot carries an explicit presence
+		// signal (planned for the stats-reporter follow-up).
 	}
 
-	now := metav1.NewTime(time.Now())
 	for name, a := range perBackend {
-		cb := &backends.Items[byName[name]]
+		cb := &backends.Items[byName[name].idx]
 		desired := &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: a.prefixCount}
 		if !a.lastEventAt.IsZero() {
 			t := metav1.NewTime(a.lastEventAt)
 			desired.LastEventAt = &t
 		}
-		if a.anyHit && a.hitDenom > 0 {
-			s := strconv.FormatFloat(a.hitNumer/float64(a.hitDenom), 'f', -1, 32)
-			desired.HitRate = &s
-		}
 		if participationEqual(cb.Status.IndexParticipation, desired) {
 			continue
 		}
-		_ = now // reserved for future "LastObserved" field; written today only via the projected fields
 		before := cb.DeepCopy()
 		cb.Status.IndexParticipation = desired
 		if err := p.Client.Status().Patch(ctx, cb, client.MergeFrom(before)); err != nil {
