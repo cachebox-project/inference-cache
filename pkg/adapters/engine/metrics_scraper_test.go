@@ -303,7 +303,7 @@ vllm:kv_cache_usage_perc 0.42
 }
 
 func TestCacheTierIsValid(t *testing.T) {
-	for _, ok := range ValidCacheTiers {
+	for _, ok := range ValidCacheTierNames() {
 		if !ok.IsValid() {
 			t.Errorf("%q reported invalid", ok)
 		}
@@ -312,6 +312,55 @@ func TestCacheTierIsValid(t *testing.T) {
 		if bad.IsValid() {
 			t.Errorf("%q reported valid", bad)
 		}
+	}
+	// ValidCacheTierNames must hand out a fresh slice each call so callers
+	// can't clobber the canonical set.
+	got := ValidCacheTierNames()
+	if len(got) == 0 {
+		t.Fatal("ValidCacheTierNames returned empty")
+	}
+	got[0] = CacheTier("clobber")
+	if fresh := ValidCacheTierNames(); fresh[0] == "clobber" {
+		t.Error("ValidCacheTierNames returned a shared mutable slice")
+	}
+}
+
+func TestScraperPartialCounterDoesNotPoisonDelta(t *testing.T) {
+	// Tick 1: hits+queries present (good baseline).
+	// Tick 2: hits family absent — a transient partial scrape. Hit-rate must
+	// be 0 and the baseline must NOT advance to 0; otherwise tick 3 (counters
+	// restored at much larger values) would compute against `0`, producing a
+	// huge lifetime-ish hit-rate spike.
+	srv := fixtureServer(t,
+		"vllm_metrics_cpu.txt",       // tick 1: hits=25, queries=100
+		"vllm_metrics_partial.txt",   // tick 2: hits/queries absent
+		"vllm_metrics_cpu_tick2.txt", // tick 3: hits=95, queries=200
+	)
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{
+		URL: srv.URL, Tier: CacheTierAuto, MaxConcurrencyCeiling: 256,
+	}, nil)
+	if _, err := s.Scrape(context.Background()); err != nil { // prime
+		t.Fatalf("tick 1: %v", err)
+	}
+	partial, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if partial.GetHitRate() != 0 {
+		t.Errorf("partial-scrape hit_rate = %v, want 0", partial.GetHitRate())
+	}
+	restored, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	// Should produce the same delta tick 1→tick 3 produces directly:
+	// dHits = 95-25 = 70; dQueries = 200-100 = 100 → 0.7. Anything close to a
+	// lifetime ratio (95/200 = 0.475) would mean the baseline was rebased to
+	// 0 during tick 2 and the bug Codex flagged is still live.
+	if got, want := restored.GetHitRate(), float32(0.7); got < want-1e-3 || got > want+1e-3 {
+		t.Errorf("post-partial hit_rate = %v, want %v (baseline poisoned by tick 2 absence)", got, want)
 	}
 }
 

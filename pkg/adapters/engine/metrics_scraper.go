@@ -30,20 +30,29 @@ const (
 	CacheTierCPU  CacheTier = "cpu" // legacy: vllm:cpu_cache_usage_perc
 )
 
-// ValidCacheTiers enumerates the accepted --cache-tier values, in fallback
-// order. Callers (e.g. the kvevent-subscriber main) use this to validate user
-// input at startup so a typo is rejected loudly rather than silently treated
-// as "auto".
-var ValidCacheTiers = []CacheTier{CacheTierAuto, CacheTierKV, CacheTierGPU, CacheTierCPU}
+// validCacheTiers is the canonical set of accepted --cache-tier values. Kept
+// unexported (an exported mutable slice would let callers reorder/clobber the
+// shared list); use CacheTier.IsValid() to check membership and
+// ValidCacheTierNames() to render the set for help text or error messages.
+var validCacheTiers = [...]CacheTier{CacheTierAuto, CacheTierKV, CacheTierGPU, CacheTierCPU}
 
 // IsValid reports whether t is one of the documented tiers.
 func (t CacheTier) IsValid() bool {
-	for _, v := range ValidCacheTiers {
+	for _, v := range validCacheTiers {
 		if t == v {
 			return true
 		}
 	}
 	return false
+}
+
+// ValidCacheTierNames returns the accepted --cache-tier values in fallback
+// order. Returns a fresh slice each call so callers cannot mutate the
+// canonical set.
+func ValidCacheTierNames() []CacheTier {
+	out := make([]CacheTier, len(validCacheTiers))
+	copy(out, validCacheTiers[:])
+	return out
 }
 
 const (
@@ -158,9 +167,9 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 
 	usage, _ := selectUsage(s.cfg.Tier, families, s.cfg.ModelLabel)
 
-	hits := sumCounter(families, metricHits, s.cfg.ModelLabel)
-	queries := sumCounter(families, metricQueries, s.cfg.ModelLabel)
-	hitRate := s.consumeHitRate(hits, queries)
+	hits, haveHits := sumCounter(families, metricHits, s.cfg.ModelLabel)
+	queries, haveQueries := sumCounter(families, metricQueries, s.cfg.ModelLabel)
+	hitRate := s.consumeHitRate(hits, queries, haveHits && haveQueries)
 
 	running, _ := singleGaugeValue(families, metricRunning, s.cfg.ModelLabel)
 	waiting, _ := singleGaugeValue(families, metricWaiting, s.cfg.ModelLabel)
@@ -181,9 +190,19 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 // consumeHitRate computes Δhits/Δqueries against the previous scrape and
 // updates the cached counters. First scrape returns 0 (no delta). A counter
 // reset (current < previous) also returns 0 and rebases the deltas.
-func (s *MetricsScraper) consumeHitRate(hits, queries float64) float64 {
+//
+// `present` is false when either counter was missing from this scrape — the
+// engine has not exposed it yet, or a partial scrape lost it. In that case
+// the previous baseline is preserved (NOT rebased to 0) so when the counter
+// reappears we don't manufacture a lifetime-ish hit-rate spike from the
+// `current − 0` delta.
+func (s *MetricsScraper) consumeHitRate(hits, queries float64, present bool) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !present {
+		// Don't touch prev_*; resume the delta when both counters reappear.
+		return 0
+	}
 	if !s.havePrev {
 		s.prevHits, s.prevQueries, s.havePrev = hits, queries, true
 		return 0
@@ -256,30 +275,37 @@ func singleGaugeValue(families map[string]*dto.MetricFamily, name, modelLabel st
 }
 
 // sumCounter returns the sum of counter values for a metric whose `model_name`
-// label matches modelLabel (modelLabel == "" disables the filter). The Python
+// label matches modelLabel (modelLabel == "" disables the filter), plus a
+// presence flag. ok=false means the family was absent (or no series matched
+// the filter) — caller distinguishes a real 0 from "we didn't see it" so a
+// partial scrape can't poison the hit-rate delta baseline. The Python
 // prometheus_client exposes Counter("foo") under the family name "foo_total"
 // in the text format, but other Prometheus clients use the unsuffixed form —
 // we check both so the scraper is portable across them. One vLLM replica
 // generally exposes one series per metric, but summing is the safe thing to
 // do under unexpected label cardinality.
-func sumCounter(families map[string]*dto.MetricFamily, name, modelLabel string) float64 {
+func sumCounter(families map[string]*dto.MetricFamily, name, modelLabel string) (float64, bool) {
 	mf := families[name+"_total"]
 	if mf == nil {
 		mf = families[name]
 	}
 	if mf == nil {
-		return 0
+		return 0, false
 	}
-	var v float64
+	var (
+		v       float64
+		matched bool
+	)
 	for _, m := range mf.Metric {
 		if !modelLabelMatches(m, modelLabel) {
 			continue
 		}
 		if c := m.GetCounter(); c != nil {
 			v += c.GetValue()
+			matched = true
 		}
 	}
-	return v
+	return v, matched
 }
 
 // modelLabelMatches reports whether m's `model_name` label equals want.

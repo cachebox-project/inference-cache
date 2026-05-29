@@ -65,7 +65,7 @@ func main() {
 	}
 	tier := engine.CacheTier(*cacheTier)
 	if !tier.IsValid() {
-		logger.Error("invalid --cache-tier", "value", *cacheTier, "valid", engine.ValidCacheTiers)
+		logger.Error("invalid --cache-tier", "value", *cacheTier, "valid", engine.ValidCacheTierNames())
 		os.Exit(2)
 	}
 
