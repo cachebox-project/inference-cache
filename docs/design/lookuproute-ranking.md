@@ -138,11 +138,45 @@ A few subtleties worth knowing:
 
 ## 5. SLO-aware bias — freshness matters more when latency is tight
 
-The request's `SLO.ttft_ms` carries the gateway's target time-to-first-
-token in milliseconds. Under a tight TTFT budget, the cost of routing to
-a stale replica (it still has to rebuild context) is higher relative to
-the cost of slightly less prefix overlap. So when TTFT is tight, freshness
-should weigh more than matched-token count.
+### SLO is a field on `LookupRouteRequest`, not a separate RPC
+
+Worth pinning before the formulas: **there is no "SLO" RPC.** `SLO` is a
+nested message tucked into the existing `LookupRouteRequest`:
+
+```
+LookupRouteRequest {
+  string model_id;
+  string tenant_id;
+  bytes  prefix_hash;
+  int32  prefix_token_count;
+  string hash_scheme;
+  SLO    slo;            // ← TTFT / TBT budget the gateway is targeting
+}
+
+SLO {
+  int32 ttft_ms;         // target time-to-first-token (ms)
+  int32 tbt_ms;          // target time-between-tokens (ms)
+}
+```
+
+It has been on the wire since the contract was first defined; what changes
+in this layer is that the server now **reads** the field instead of
+ignoring it. There is still one RPC, one response envelope, and the same
+reason-code vocabulary. SLO is a knob that reshapes the existing
+`PREFIX_MATCH` and `TENANT_HOT` ranking — not a new strategy.
+
+It is also **not enforcement**: the cache plane does not refuse to answer
+when SLO is tight, does not time the response out against `ttft_ms`, and
+does not promise to meet the SLO. It uses the budget purely as a hint
+about what the gateway cares about. "We hint, the gateway decides" still
+holds.
+
+### The bias
+
+Under a tight TTFT budget, the cost of routing to a stale replica (it
+still has to rebuild context) is higher relative to the cost of slightly
+less prefix overlap. So when TTFT is tight, freshness should weigh more
+than matched-token count.
 
 The bias is a single multiplicative factor on top of everything else:
 
@@ -156,9 +190,24 @@ For example with `SLOTightBias = 1`, a perfectly fresh candidate
 1.1×. Effect: under tight SLO, fresher candidates pull ahead of
 token-richer-but-staler ones more aggressively.
 
+The same factor composes into both shipped strategies — it multiplies
+into the `PREFIX_MATCH` score and into the `TENANT_HOT` fallback score
+identically. There is no "SLO strategy" or "SLO reason code"; a tight-SLO
+response still comes back as `PREFIX_MATCH` (or `TENANT_HOT`, or
+`NO_HINT`), just with a different internal ranking.
+
 `SLOTightBias = 0` disables the bias; an unset (zero) TTFT budget skips
 it; a TTFT budget above the threshold skips it. So baseline behavior is
 preserved when no SLO is supplied.
+
+### `tbt_ms` — plumbed but not yet used
+
+`SLO.tbt_ms` (time-between-tokens budget) is threaded all the way through
+from the proto request into the index's `LookupRequest.TBTBudgetMs`, but
+the current scoring formula does not reference it. It is a placeholder
+for a future tuning hook — e.g. a tight TBT budget might bias toward
+replicas with low pressure so the decode loop isn't queued behind other
+work. Wiring is in place; the factor is currently a no-op.
 
 ## 6. Putting the factors together
 
