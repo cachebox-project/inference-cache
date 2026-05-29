@@ -31,10 +31,21 @@ type inferenceCacheService struct {
 	index    *index.Index
 	metrics  *serverMetrics
 	policies *PolicyStore
+
+	// lookupFn is the index lookup function the handler runs through the
+	// goroutine+select wall-time bound. Defaults to s.index.Lookup; tests
+	// override it to inject slow lookups that prove the deadline path
+	// actually fires.
+	lookupFn func(index.LookupRequest) []index.ReplicaScore
 }
 
 func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
-	return &inferenceCacheService{index: idx, metrics: metrics, policies: policies}
+	return &inferenceCacheService{
+		index:    idx,
+		metrics:  metrics,
+		policies: policies,
+		lookupFn: idx.Lookup,
+	}
 }
 
 // RenderTemplate: no rendering yet (M7). An empty stable_prefix_hash signals the
@@ -73,21 +84,41 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, 0), nil
 	}
 
+	// Bound the lookup at wall-clock time. The in-memory lookup is normally
+	// sub-millisecond, but it takes the index's read lock, which a sweep or
+	// large writer can hold — without the goroutine+select the RPC could
+	// block past the policy budget and surface a client-side deadline
+	// instead of a clean fail-open TIMEOUT.
 	start := time.Now()
-	scores := s.index.Lookup(index.LookupRequest{
-		Model:      model,
-		Tenant:     tenant,
-		HashScheme: req.GetHashScheme(),
-		PrefixHash: req.GetPrefixHash(),
-		TokenCount: req.GetPrefixTokenCount(),
-	})
-	elapsed := time.Since(start)
+	type lookupResult struct {
+		scores  []index.ReplicaScore
+		elapsed time.Duration
+	}
+	resCh := make(chan lookupResult, 1)
+	go func() {
+		sc := s.lookupFn(index.LookupRequest{
+			Model:      model,
+			Tenant:     tenant,
+			HashScheme: req.GetHashScheme(),
+			PrefixHash: req.GetPrefixHash(),
+			TokenCount: req.GetPrefixTokenCount(),
+		})
+		resCh <- lookupResult{scores: sc, elapsed: time.Since(start)}
+	}()
 
-	// If the budget was breached during the (in-memory, normally sub-ms)
-	// lookup, surface that as TIMEOUT — the caller's policy was that this
-	// lookup was not worth waiting longer for.
-	if budget > 0 && elapsed > budget {
-		return s.timeoutResponse(model, elapsed), nil
+	var (
+		scores  []index.ReplicaScore
+		elapsed time.Duration
+	)
+	select {
+	case res := <-resCh:
+		scores = res.scores
+		elapsed = res.elapsed
+	case <-ctx.Done():
+		// Deadline (or upstream cancellation) hit while waiting for the
+		// lookup. The goroutine will land eventually with its result
+		// discarded; the RPC returns immediately.
+		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
 	// Drop candidates below the per-tenant minimum-prefix-tokens threshold

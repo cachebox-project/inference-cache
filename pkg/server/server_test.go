@@ -495,6 +495,48 @@ func TestLookupRouteReturnsTimeoutWhenCallerDeadlineBreached(t *testing.T) {
 	}
 }
 
+// TestLookupRouteBoundsWallTimeWhenLookupBlocks injects a lookup that
+// blocks indefinitely; the handler must still return promptly under the
+// policy budget rather than wait for the lookup. This is the case
+// Codex's review flagged: a writer holding the index lock past the
+// budget would otherwise let the gRPC RPC exceed its deadline instead
+// of fail-opening with reason_code:TIMEOUT.
+func TestLookupRouteBoundsWallTimeWhenLookupBlocks(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", LookupTimeoutMs: 20},
+	})
+
+	// Replace the lookup with one that blocks until the test ends.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	svc.lookupFn = func(index.LookupRequest) []index.ReplicaScore {
+		<-release
+		return nil
+	}
+
+	start := time.Now()
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "TIMEOUT" {
+		t.Fatalf("reason = %q, want TIMEOUT when the lookup hangs past the policy budget", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("expected empty scores on TIMEOUT, got %+v", resp.GetReplicaScores())
+	}
+	// Allow generous slack to keep the test non-flaky on a loaded CI host,
+	// but assert we returned in well under a second — the point is that the
+	// handler didn't wait for the blocking lookup.
+	if elapsed > time.Second {
+		t.Fatalf("handler should have returned promptly under the budget; elapsed = %v", elapsed)
+	}
+}
+
 func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
 	svc := newTestService()
 	// Tiny budget; lookup itself is sub-µs on an empty index but the

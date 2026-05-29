@@ -519,14 +519,16 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 }
 
 // evictExpired removes entries older than each tenant's TTL. Runs on the
-// sweep loop. The TTL is resolved per-tenant outside the lock so two
-// namespaces with very different CachePolicy TTLs evict on independent
-// schedules (the sweep itself remains shared).
+// sweep loop. Per-tenant TTLs let two namespaces with very different
+// CachePolicy TTLs evict on independent schedules (the sweep itself
+// remains shared).
 func (i *Index) evictExpired() {
 	now := i.now()
 
-	// Cache per-tenant TTL across the sweep so a slow resolver isn't called
-	// once per entry. Built lazily — populated only as we encounter a tenant.
+	// Cache per-tenant TTL across one sweep so a slow resolver isn't called
+	// once per entry. The cache lives only for this sweep — built lazily on
+	// first sight of a tenant. Lookups still go through i.ttlFor (which may
+	// call the resolver), but at most once per tenant per sweep.
 	ttlCache := make(map[string]time.Duration)
 	ttlOf := func(tenant string) time.Duration {
 		if d, ok := ttlCache[tenant]; ok {
