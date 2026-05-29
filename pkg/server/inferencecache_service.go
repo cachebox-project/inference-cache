@@ -11,9 +11,11 @@ import (
 )
 
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
-// String, not enum — forward-compat per the gRPC contract decision.
+// String, not enum — forward-compat per the gRPC contract decision (a new
+// code is a server-only addition; old clients degrade to NO_HINT).
 const (
 	reasonPrefixMatch = "PREFIX_MATCH"
+	reasonTenantHot   = "TENANT_HOT"
 	reasonNoHint      = "NO_HINT"
 	reasonTimeout     = "TIMEOUT"
 	reasonOK          = "OK"
@@ -34,11 +36,12 @@ type inferenceCacheService struct {
 	metrics  *serverMetrics
 	policies *PolicyStore
 
-	// lookupFn is the index lookup function the handler runs through the
-	// goroutine+select wall-time bound. Defaults to s.index.Lookup; tests
-	// override it to inject slow lookups that prove the deadline path
-	// actually fires.
-	lookupFn func(index.LookupRequest) []index.ReplicaScore
+	// lookupFn is the index lookup orchestrator the handler runs through the
+	// goroutine+select wall-time bound. Defaults to s.index.LookupRoute (which
+	// runs the ranking-v2 strategies and emits a Strategy → reason_code); tests
+	// override it to inject slow lookups that prove the deadline path actually
+	// fires.
+	lookupFn func(index.LookupRequest) index.LookupResult
 }
 
 func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
@@ -46,7 +49,7 @@ func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies
 		index:    idx,
 		metrics:  metrics,
 		policies: policies,
-		lookupFn: idx.Lookup,
+		lookupFn: idx.LookupRoute,
 	}
 }
 
@@ -56,8 +59,9 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 	return &icpb.RenderTemplateResponse{ReasonCode: reasonOK}, nil
 }
 
-// LookupRoute consults the index for replicas holding the request's prefix and
-// returns them ranked. The handler honors the tenant's CachePolicy:
+// LookupRoute consults the index for replicas holding the request's prefix
+// and returns them ranked. The handler honors the tenant's CachePolicy and
+// runs the ranking-v2 orchestrator (index.LookupRoute) which:
 //
 //   - minimumPrefixTokens: a pre-lookup gate on the request's prefix token
 //     count. If the request's prefix is shorter than the threshold the index
@@ -68,6 +72,12 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 //   - lookupTimeoutMs: a deadline is applied around the lookup. If the caller's
 //     ctx is already past its deadline, or if the in-memory lookup exceeds the
 //     policy budget, the response is TIMEOUT (still fail-open: empty scores).
+//   - Ranking-v2 strategies: the index returns StrategyPrefixMatch (exact
+//     prefix hit, scored with the pressure- and SLO-aware formula),
+//     StrategyTenantHot (no prefix match but the tenant has recently warm
+//     replicas in the requested engine domain — a softer locality hint), or
+//     StrategyNone (fail-open default). The handler maps Strategy →
+//     reason_code (PREFIX_MATCH / TENANT_HOT / NO_HINT) via reasonForStrategy.
 //
 // A no-match still returns NO_HINT (fail open) — never an error on the hot path.
 func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
@@ -98,12 +108,15 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, 0), nil
 	}
 
+	slo := req.GetSlo()
 	lookupReq := index.LookupRequest{
-		Model:      model,
-		Tenant:     tenant,
-		HashScheme: req.GetHashScheme(),
-		PrefixHash: req.GetPrefixHash(),
-		TokenCount: req.GetPrefixTokenCount(),
+		Model:        model,
+		Tenant:       tenant,
+		HashScheme:   req.GetHashScheme(),
+		PrefixHash:   req.GetPrefixHash(),
+		TokenCount:   req.GetPrefixTokenCount(),
+		TTFTBudgetMs: slo.GetTtftMs(),
+		TBTBudgetMs:  slo.GetTbtMs(),
 	}
 
 	// Default (and dominant) path: no policy budget AND no caller deadline.
@@ -114,8 +127,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	_, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
 		start := time.Now()
-		scores := s.lookupFn(lookupReq)
-		return s.buildLookupResponse(model, scores, time.Since(start)), nil
+		result := s.lookupFn(lookupReq)
+		return s.buildLookupResponse(model, result, time.Since(start)), nil
 	}
 
 	// Bounded path: a deadline is active, so bound the lookup at wall-clock
@@ -124,22 +137,22 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// block past the policy budget and surface a client-side deadline
 	// instead of a clean fail-open TIMEOUT.
 	start := time.Now()
-	type lookupResult struct {
-		scores  []index.ReplicaScore
+	type boundedResult struct {
+		result  index.LookupResult
 		elapsed time.Duration
 	}
-	resCh := make(chan lookupResult, 1)
+	resCh := make(chan boundedResult, 1)
 	go func() {
-		sc := s.lookupFn(lookupReq)
-		resCh <- lookupResult{scores: sc, elapsed: time.Since(start)}
+		r := s.lookupFn(lookupReq)
+		resCh <- boundedResult{result: r, elapsed: time.Since(start)}
 	}()
 
 	var (
-		scores  []index.ReplicaScore
+		result  index.LookupResult
 		elapsed time.Duration
 	)
 	select {
-	case res := <-resCh:
+	case b := <-resCh:
 		// When both resCh AND ctx.Done() are ready, Go's select picks
 		// pseudorandomly — so a lookup that overran the deadline could
 		// still win and we'd surface stale scores as PREFIX_MATCH.
@@ -147,8 +160,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		if ctx.Err() != nil {
 			return s.timeoutResponse(model, time.Since(start)), nil
 		}
-		scores = res.scores
-		elapsed = res.elapsed
+		result = b.result
+		elapsed = b.elapsed
 		if budget > 0 && elapsed > budget {
 			return s.timeoutResponse(model, elapsed), nil
 		}
@@ -159,19 +172,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
-	return s.buildLookupResponse(model, scores, elapsed), nil
+	return s.buildLookupResponse(model, result, elapsed), nil
 }
 
-// buildLookupResponse turns a ranked score set into the proto envelope and
-// records the matching metric observation. Shared by the synchronous
-// fast-path and the bounded path so the proto shape stays identical across
-// both.
-func (s *inferenceCacheService) buildLookupResponse(model string, scores []index.ReplicaScore, elapsed time.Duration) *icpb.LookupRouteResponse {
-	resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
-	if len(scores) > 0 {
-		resp.ReasonCode = reasonPrefixMatch
-		resp.ReplicaScores = make([]*icpb.ReplicaScore, 0, len(scores))
-		for _, sc := range scores {
+// buildLookupResponse turns a LookupResult into the proto envelope and records
+// the matching metric observation. Shared by the synchronous fast-path and
+// the bounded path so the proto shape stays identical across both. The
+// reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
+// TENANT_HOT / NO_HINT).
+func (s *inferenceCacheService) buildLookupResponse(model string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+	resp := &icpb.LookupRouteResponse{ReasonCode: reasonForStrategy(result.Strategy)}
+	if len(result.Scores) > 0 {
+		resp.ReplicaScores = make([]*icpb.ReplicaScore, 0, len(result.Scores))
+		for _, sc := range result.Scores {
 			resp.ReplicaScores = append(resp.ReplicaScores, &icpb.ReplicaScore{
 				ReplicaId:             sc.ReplicaID,
 				Score:                 sc.Score,
@@ -181,7 +194,7 @@ func (s *inferenceCacheService) buildLookupResponse(model string, scores []index
 		}
 	}
 	resp.LookupLatencyUs = elapsed.Microseconds()
-	s.metrics.observeLookup(model, resp.ReasonCode, len(scores) > 0, elapsed)
+	s.metrics.observeLookup(model, resp.ReasonCode, len(result.Scores) > 0, elapsed)
 	return resp
 }
 
@@ -211,6 +224,22 @@ func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
 		return 0
 	}
 	return s.policies.MinimumPrefixTokens(tenant)
+}
+
+// reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's
+// reason_code vocabulary. StrategyNone collapses to NO_HINT — the fail-open
+// default; an unknown strategy is treated the same so a future Strategy
+// addition (e.g. block-level matching) won't surface as a junk reason code
+// before its mapping ships.
+func reasonForStrategy(s index.Strategy) string {
+	switch s {
+	case index.StrategyPrefixMatch:
+		return reasonPrefixMatch
+	case index.StrategyTenantHot:
+		return reasonTenantHot
+	default:
+		return reasonNoHint
+	}
 }
 
 // LookupPDRoute: prefill/decode routing is Phase 2 — fail open.
