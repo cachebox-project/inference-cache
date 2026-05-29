@@ -1,7 +1,6 @@
 namespace: inference-cache-system
 
 resources:
-- namespace.yaml
 - ../crd
 - ../rbac
 - ../manager
