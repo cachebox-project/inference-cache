@@ -90,3 +90,11 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - inferencecache.io
+  resources:
+  - cachepolicies
+  verbs:
+  - get
+  - list
+  - watch

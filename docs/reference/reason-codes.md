@@ -31,9 +31,9 @@ and for ops dashboards.
 | `PREFIX_MATCH` | **shipped** | The index has at least one replica holding `(tenant, model, hash_scheme, prefix_hash)` and the ranker returned a non-empty set. | `replica_scores` non-empty, ranked by `matched_tokens × freshness` (top-K). | Route to the top-ranked replica → prefix-cache hit; lower TTFT. |
 | `NO_HINT` | **shipped** | Anything that yields no useful hint: prefix not in index, `hash_scheme` empty or unknown, the ranker returned empty, an index-disabled state. **This is the fail-open default.** | `replica_scores` **empty**. Not an error. | Route per the gateway's default policy (round-robin, least-loaded, …). The cache plane is invisible to this request. |
 | `TENANT_HOT` | spec'd, not emitted | Planned for the future ranking-v2 work: no exact prefix match, but the index knows this tenant has hot replicas worth biasing toward. | `replica_scores` non-empty (tenant-hot ranked); shape unchanged. | Treat as a softer hint than `PREFIX_MATCH`; gateway free to use or ignore. |
-| `TIMEOUT` | spec'd, not emitted server-side today | The server's lookup deadline expired before it could rank. Gateway clients also synthesize this locally when *they* cancel a slow `LookupRoute` RPC. | Server: empty `replica_scores`. Client-side synth: same. | Treat as `NO_HINT`. |
+| `TIMEOUT` | **shipped** | The lookup deadline expired before the index could rank — either the caller's context was already past its deadline on arrival or the per-tenant `CachePolicy.spec.lookupTimeoutMs` budget elapsed during the lookup. Gateway clients also synthesize this locally when *they* cancel a slow `LookupRoute` RPC. | Server: empty `replica_scores`. Client-side synth: same. | Treat as `NO_HINT`. |
 
-**Constants in code:** `reasonPrefixMatch`, `reasonNoHint` in
+**Constants in code:** `reasonPrefixMatch`, `reasonNoHint`, `reasonTimeout` in
 `pkg/server/inferencecache_service.go`.
 
 ---
