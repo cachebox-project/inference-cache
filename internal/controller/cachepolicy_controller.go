@@ -162,16 +162,36 @@ func (r *CachePolicyReconciler) pushSnapshot(ctx context.Context) error {
 	return nil
 }
 
-// resolvePolicies flattens CachePolicy CRs into the server-side shape, with
-// deterministic ordering (sorted by namespace) so equivalent cluster state
-// always produces an identical request body. This also keeps the test golden
-// path stable.
+// resolvePolicies flattens CachePolicy CRs into the server-side shape with a
+// deterministic outcome even when multiple CachePolicies share a namespace.
+//
+// The CRD does not enforce a singleton per namespace, so the controller may
+// see multiple CRs in the same namespace. The server's PolicyStore is keyed
+// by namespace, so something has to pick. We sort by (namespace, name) and
+// emit the FIRST entry per namespace — i.e. the alphabetically smallest
+// name wins, deterministically, regardless of Kubernetes list order. This
+// avoids "the effective policy depends on the apiserver's list ordering"
+// without bolting on a singleton constraint (admission webhook scope).
 func resolvePolicies(items []cachev1alpha1.CachePolicy) []cacheserver.ResolvedPolicy {
-	out := make([]cacheserver.ResolvedPolicy, 0, len(items))
-	for i := range items {
-		out = append(out, resolveOnePolicy(&items[i]))
+	if len(items) == 0 {
+		return []cacheserver.ResolvedPolicy{}
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Namespace < out[b].Namespace })
+	sorted := make([]cachev1alpha1.CachePolicy, len(items))
+	copy(sorted, items)
+	sort.Slice(sorted, func(a, b int) bool {
+		if sorted[a].Namespace != sorted[b].Namespace {
+			return sorted[a].Namespace < sorted[b].Namespace
+		}
+		return sorted[a].Name < sorted[b].Name
+	})
+	out := make([]cacheserver.ResolvedPolicy, 0, len(sorted))
+	for i := range sorted {
+		// First entry per namespace wins; skip the rest of the namespace's run.
+		if i > 0 && sorted[i].Namespace == sorted[i-1].Namespace {
+			continue
+		}
+		out = append(out, resolveOnePolicy(&sorted[i]))
+	}
 	return out
 }
 

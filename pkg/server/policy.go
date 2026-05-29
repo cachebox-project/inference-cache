@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -94,6 +95,7 @@ func (s *PolicyStore) Snapshot() []ResolvedPolicy {
 		out = append(out, p)
 	}
 	s.mu.RUnlock()
+	sort.Slice(out, func(a, b int) bool { return out[a].Namespace < out[b].Namespace })
 	return out
 }
 

@@ -163,6 +163,46 @@ func TestPushSnapshotReflectsDeletions(t *testing.T) {
 	}
 }
 
+// TestPushSnapshotDeduplicatesByFirstNameWhenMultiplePoliciesShareNamespace
+// pins the conflict-resolution rule: when several CachePolicies share a
+// namespace, the entry with the alphabetically smallest name wins. The CRD
+// does not enforce a singleton per namespace, so a deterministic tiebreak
+// here keeps the effective policy independent of apiserver list ordering.
+func TestPushSnapshotDeduplicatesByFirstNameWhenMultiplePoliciesShareNamespace(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(
+			// "z-pol" sorts last alphabetically — should LOSE.
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "z-pol", Namespace: "team-a"},
+				Spec:       cachev1alpha1.CachePolicySpec{MinimumPrefixTokens: i32Ptr(999)},
+			},
+			// "a-pol" sorts first — should WIN.
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "a-pol", Namespace: "team-a"},
+				Spec:       cachev1alpha1.CachePolicySpec{MinimumPrefixTokens: i32Ptr(16)},
+			},
+		).
+		Build()
+	r := &CachePolicyReconciler{
+		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	snap, _ := rec.latest()
+	if len(snap.Policies) != 1 {
+		t.Fatalf("expected exactly 1 deduped entry for team-a, got %d (%+v)", len(snap.Policies), snap.Policies)
+	}
+	if snap.Policies[0].MinimumPrefixTokens != 16 {
+		t.Fatalf("dedup picked the wrong CR: %+v (expected the a-pol value 16)", snap.Policies[0])
+	}
+}
+
 func TestPushSnapshotPropagatesNon2xxAsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
