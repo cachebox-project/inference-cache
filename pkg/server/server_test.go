@@ -528,10 +528,10 @@ func TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline(t *testing.T) {
 
 // TestLookupRouteBoundsWallTimeWhenLookupBlocks injects a lookup that
 // blocks indefinitely; the handler must still return promptly under the
-// policy budget rather than wait for the lookup. This is the case
-// Codex's review flagged: a writer holding the index lock past the
-// budget would otherwise let the gRPC RPC exceed its deadline instead
-// of fail-opening with reason_code:TIMEOUT.
+// policy budget rather than wait for the lookup. This guards the case
+// where a writer holding the index lock past the budget would otherwise
+// let the gRPC RPC exceed its deadline instead of fail-opening with
+// reason_code:TIMEOUT.
 func TestLookupRouteBoundsWallTimeWhenLookupBlocks(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{

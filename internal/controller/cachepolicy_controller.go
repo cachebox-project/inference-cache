@@ -132,7 +132,7 @@ func (r *CachePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // pushSnapshot lists every CachePolicy in the cluster, resolves it into the
-// shape the server consumes, and PUTs the full snapshot. Always pushes a
+// shape the server consumes, and POSTs the full snapshot. Always pushes a
 // full snapshot (replace-on-write) so deletions propagate naturally.
 //
 // Serialized via pushMu so two concurrent pushes can't reorder list-then-POST
