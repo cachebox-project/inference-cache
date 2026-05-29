@@ -41,8 +41,8 @@ const (
 //     side-effect-free apart from emitting metrics.
 //   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
 //     treat it as a no-op and route as they normally would.
-//   - prefix_hash bytes are engine-defined and only matched within a matching
-//     hash_scheme; the server never interprets them.
+//   - prefix_hash and block_hashes bytes are engine-defined and only matched
+//     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
 //     (template_ref, variables, template_revision).
 //   - CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or
@@ -182,8 +182,8 @@ type InferenceCache_StreamMetricsClient = grpc.ServerStreamingClient[Metric]
 //     side-effect-free apart from emitting metrics.
 //   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
 //     treat it as a no-op and route as they normally would.
-//   - prefix_hash bytes are engine-defined and only matched within a matching
-//     hash_scheme; the server never interprets them.
+//   - prefix_hash and block_hashes bytes are engine-defined and only matched
+//     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
 //     (template_ref, variables, template_revision).
 //   - CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or

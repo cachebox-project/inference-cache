@@ -796,3 +796,208 @@ func TestLookupRouteUnaffectedByPolicyForUnknownTenant(t *testing.T) {
 		t.Fatalf("team-b has no policy; lookup should pass through unfiltered. Got %+v", resp)
 	}
 }
+
+// TestLookupRouteChainReturnsPartialPrefixMatch is the longest-prefix e2e: a replica
+// reports a chain via ReportCacheState, then a LookupRoute carrying a longer
+// chain that shares the first K blocks returns PREFIX_MATCH with
+// matched_tokens reflecting the partial run (not the full request chain).
+func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
+	client, _, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ingestHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
+	ingestCounts := []int32{16, 16, 16}
+
+	stream, err := client.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId: "replica-a", ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
+		Prefixes: []*icpb.PrefixEntry{{BlockHashes: ingestHashes, BlockTokenCounts: ingestCounts}},
+	}); err != nil {
+		t.Fatalf("send update: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	lookupHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3"), []byte("x4"), []byte("x5")}
+	lookupCounts := []int32{16, 16, 16, 16, 16}
+	resp, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
+		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
+		BlockHashes: lookupHashes, BlockTokenCounts: lookupCounts,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH (partial chain still counts)", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-a" {
+		t.Fatalf("expected single hit for replica-a, got %+v", resp.GetReplicaScores())
+	}
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 48 {
+		t.Fatalf("matched_tokens = %d, want 48 (3 blocks × 16 — the partial run, not the full request chain)", got)
+	}
+}
+
+// TestLookupRouteAboveMinimumPrefixTokensViaChainCounts verifies the
+// minimumPrefixTokens gate uses the sum of block_token_counts when a chain
+// request omits the legacy prefix_token_count (a chain-only caller). Without
+// this fallback the policy threshold would erroneously short-circuit every
+// chain request to NO_HINT regardless of its actual token budget.
+func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 32},
+	})
+	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
+	counts := []int32{16, 16, 16}
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts, // sum=48, clears 32
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH — chain budget (48) clears threshold (32)", resp.GetReasonCode())
+	}
+}
+
+// TestLookupRouteBelowMinimumPrefixTokensViaChainCounts confirms the gate
+// still fires when the chain's summed token budget is below the threshold.
+func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 200},
+	})
+	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
+		t.Fatal("index lookup should not run when chain budget is below the threshold")
+		return index.LookupResult{}
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16, 16}, // sum=32, below 200
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT when chain budget is below the threshold", resp.GetReasonCode())
+	}
+}
+
+// TestLookupRouteMalformedChainNeverFallsThroughToTenantHot guards the
+// orchestrator: a chain-bearing request with mismatched parallel-array
+// lengths must hard-fail to NO_HINT, NOT fall through to TENANT_HOT — a
+// soft locality hint against an unrelated warm replica would surface a
+// wrong answer for what the producer asserted as a chain.
+func TestLookupRouteMalformedChainNeverFallsThroughToTenantHot(t *testing.T) {
+	svc := newTestService()
+	// Seed a TENANT_HOT-eligible replica: warm stats AND a prefix entry in
+	// the requested engine domain (the engine-domain guard requires that).
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16}, // mismatched: 2 hashes, 1 count
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — malformed chain must not be downgraded to TENANT_HOT (would surface %d unrelated warm-tenant hint(s))", resp.GetReasonCode(), len(resp.GetReplicaScores()))
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("malformed chain must not return any scores, got %+v", resp.GetReplicaScores())
+	}
+}
+
+// TestEffectivePrefixTokensChainTakesPrecedence verifies the precedence
+// rule the doc claims: when both the chain and the legacy
+// prefix_token_count are set, the chain's sum wins so the
+// CachePolicy.minimumPrefixTokens gate uses what the chain producer
+// actually reported, not whatever stale legacy count was tagged along.
+func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *icpb.LookupRouteRequest
+		want int32
+	}{
+		{
+			name: "chain wins over legacy",
+			req: &icpb.LookupRouteRequest{
+				PrefixTokenCount: 999,
+				BlockTokenCounts: []int32{16, 16, 16}, // sum = 48
+			},
+			want: 48,
+		},
+		{
+			name: "legacy used when chain empty",
+			req:  &icpb.LookupRouteRequest{PrefixTokenCount: 128},
+			want: 128,
+		},
+		{
+			name: "chain-only request reports chain sum",
+			req: &icpb.LookupRouteRequest{
+				BlockTokenCounts: []int32{32, 32, 32},
+			},
+			want: 96,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectivePrefixTokens(tc.req); got != tc.want {
+				t.Fatalf("effectivePrefixTokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot is the symmetric
+// guard to TestLookupRouteMalformedChainNeverFallsThroughToTenantHot: a
+// chain-bearing request with no first-block match must hard-stop at NO_HINT,
+// not surface a TENANT_HOT hint against an unrelated warm replica. The
+// chain caller asked specifically for longest-prefix matching; a soft
+// locality nudge is not what they requested and "no overlap → NO_HINT" is
+// the documented contract.
+func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("q1"), []byte("q2")},
+		BlockTokenCounts: []int32{16, 16}, // well-formed, but nobody holds q1
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — chain miss must not be downgraded to TENANT_HOT (got %d unrelated warm-tenant hint(s))", resp.GetReasonCode(), len(resp.GetReplicaScores()))
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("chain miss must not return any scores, got %+v", resp.GetReplicaScores())
+	}
+}

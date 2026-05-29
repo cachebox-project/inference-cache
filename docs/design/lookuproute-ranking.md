@@ -9,10 +9,11 @@ when each one fires. This is the *design* explanation; the
 ## 1. What `LookupRoute` is for
 
 `LookupRoute` is the single gRPC the gateway calls on the hot path of every
-inference request. It carries the prompt's prefix hash, the tenant/model the
-request is for, the engine `hash_scheme`, and an optional `SLO` (TTFT / TBT
-budget). The response is a list of ranked replica hints plus a `reason_code`
-that names which ranking strategy produced them.
+inference request. It carries the prompt's prefix hash (or an ordered chain
+of per-block hashes — see §2.5), the tenant/model the request is for, the
+engine `hash_scheme`, and an optional `SLO` (TTFT / TBT budget). The response
+is a list of ranked replica hints plus a `reason_code` that names which
+ranking strategy produced them.
 
 The cache plane never routes. It only describes cache state:
 
@@ -49,6 +50,181 @@ This is the cache plane's job at its simplest. Everything else in this doc
 *layers on top of this formula* — it never replaces it. When the new
 strategies' inputs are absent, every factor reduces to 1 and the score
 collapses back to `matched_tokens × freshness`.
+
+## 2.5 Longest-prefix block-level matching — richer `PREFIX_MATCH`
+
+### Why the exact-full-hash path leaves hits on the table
+
+§2 looks up the request's `(tenant, model, hash_scheme, prefix_hash)` as
+**one opaque blob**. Two requests that share the first N KV blocks of a
+prefix but diverge after — common with a shared system prompt plus
+per-request RAG context — hash to different `prefix_hash` values and miss
+each other entirely. The replica that already holds 80% of the prefix
+gets `NO_HINT` and the gateway routes blind.
+
+vLLM and SGLang already chain their KV blocks: each block's hash is
+computed from its parent's hash plus the block's tokens, so holding
+`h_i` implies the engine computed `h_0..h_{i-1}` too. Expressing the
+prefix as that **ordered chain of block hashes** lets the cache plane
+match the longest common leading run instead of insisting on full
+equality.
+
+This is still `reason_code: PREFIX_MATCH` — same response shape, same
+ranker factors (pressure, SLO, freshness) compose on top unchanged. The
+only difference is *how* `matched_tokens` is computed.
+
+### Contract shape (additive on `v1alpha1`)
+
+Two new fields on `PrefixEntry` and `LookupRouteRequest` — paired
+parallel arrays, same length, same order:
+
+```
+PrefixEntry {
+  // ... existing legacy fields kept verbatim
+  repeated bytes block_hashes = 3;          // one engine block-hash per element
+  repeated int32 block_token_counts = 4;    // tokens covered by each block
+}
+
+LookupRouteRequest {
+  // ... existing fields including the legacy prefix_hash
+  repeated bytes block_hashes = 7;
+  repeated int32 block_token_counts = 8;
+}
+```
+
+Legacy `prefix_hash` / `token_count` stay in place at their original
+field numbers; old engines and old gateway clients keep working
+unchanged. `buf breaking --against main` is part of CI to catch any
+slip into a non-additive change.
+
+### How the lookup walks the chain
+
+For each block `block_hashes[i]` the request carries, the index already
+holds a `(tenant, model, hash_scheme, block_hash)` → `{replicaID →
+{tokenCount, lastSeen}}` entry — populated either from a single chain
+`PrefixEntry` (the index *expands* the chain into N per-block entries)
+or from N legacy single-blob `PrefixEntry` reports (one per block, the
+shape the vLLM subscriber already emits). The chain walk is one
+intersection per block:
+
+1. **At block 0**, seed a running set with every replica that holds
+   `block_hashes[0]` (filtered against TTL — stale blocks are skipped).
+   Each entry records `matched_tokens = block_token_counts[0]` and
+   `oldest_last_seen = entry.lastSeen`.
+2. **At block i > 0**, intersect the running set with the holders of
+   `block_hashes[i]`. Replicas that fall out had their match end at
+   block i−1 — freeze their score into a finalized map. Replicas that
+   stay update `matched_tokens += block_token_counts[i]` and pull
+   `oldest_last_seen` down to `min(running, entry.lastSeen)`.
+3. When the running set is empty, stop walking; the rest of the chain
+   would yield no further matches.
+4. Replicas still running at the end of the chain matched the full
+   request chain.
+5. Score each finalized replica:
+
+   ```
+   freshness        = freshnessAt(now, oldest_last_seen, ttl_for_tenant)
+   score (chain)    = matched_tokens × freshness × pressure_factor × slo_bias
+   ```
+
+   The pressure and SLO factors from §3–§5 layer on identically — the
+   chain walk only changes how the per-replica `matched_tokens` and
+   `freshness` inputs get derived.
+
+A few details that matter for correctness:
+
+- **Freshness is the weakest link.** A replica fresh on blocks 0–3 but
+  stale on block 4 cannot ride its early blocks' freshness; the run's
+  `oldest_last_seen` reflects the staler block. Stops a partially-aged
+  hold from looking better than it really is.
+- **Dropping out is final.** Once a replica fails to hold `block_hashes[i]`,
+  it can't re-enter at block i+1 — leading-run semantics, not "any
+  contiguous run of matches."
+- **Seeding is at block 0 only.** A replica that holds `block_hashes[5]`
+  of some unrelated chain (because the bytes happen to collide) doesn't
+  show up as a partial match against this request. The leading-run rule
+  is enforced by where we initialize, not by separate position tracking.
+- **`reason_code` is unchanged.** Any non-empty match — one block or
+  the whole chain — is `PREFIX_MATCH`. `NO_HINT` only fires when nobody
+  holds block 0 (or whenever the engine-opaque guards fire — empty
+  `hash_scheme`, mismatched parallel-array lengths, etc.).
+
+### Worked example — 5 blocks, 3 deep
+
+Request asks for the chain `[h1, h2, h3, h4, h5]` with per-block counts
+`[16, 16, 16, 16, 16]`. Index state for the requested
+`(tenant, model, scheme)`:
+
+| Block hash | Holders → `{tokenCount, lastSeen age}`                                   |
+|------------|---------------------------------------------------------------------------|
+| `h1`       | `replica-A: {16, 1m}, replica-B: {16, 2m}, replica-C: {16, 4m}`           |
+| `h2`       | `replica-A: {32, 1m}, replica-B: {32, 2m}`                                |
+| `h3`       | `replica-A: {48, 1m}`                                                     |
+| `h4`       | *(nobody)*                                                                |
+| `h5`       | *(nobody)*                                                                |
+
+Walking the chain:
+
+| Step      | Running set after this block                       | Finalized                                  |
+|-----------|----------------------------------------------------|--------------------------------------------|
+| seed `h1` | `A: {tok=16, oldest=1m}, B: {tok=16, oldest=2m}, C: {tok=16, oldest=4m}` | —                                          |
+| at `h2`   | `A: {tok=32, oldest=1m}, B: {tok=32, oldest=2m}`   | `C: {tok=16, oldest=4m}` *(dropped at h2)* |
+| at `h3`   | `A: {tok=48, oldest=1m}`                           | `+ B: {tok=32, oldest=2m}` *(dropped at h3)*|
+| at `h4`   | *(empty — A doesn't hold h4)* → stop walking       | `+ A: {tok=48, oldest=1m}`                 |
+
+Scoring each finalized replica (no pressure/SLO, TTL = 30 min, so
+`freshness = 1 − age/30m`):
+
+| Replica | matched_tokens | freshness | score | rank |
+|---------|----------------|-----------|-------|------|
+| `A`     | 48             | 0.97      | 46.4  | 1    |
+| `B`     | 32             | 0.93      | 29.8  | 2    |
+| `C`     | 16             | 0.87      | 13.9  | 3    |
+
+Response: `reason_code: PREFIX_MATCH`, scores `[A (46), B (30), C (14)]`
+— the gateway routes to A for the deepest cache hit, with B as a hot
+backup if A is overloaded.
+
+### Backward-compat — what an unmigrated producer or client sees
+
+- **Legacy producer, chain-aware client.** A producer that still emits
+  one `PrefixEntry` per block (the existing vLLM subscriber) populates
+  the per-block index keys directly. The chain lookup walks them
+  end-to-end without any engine-side change. *Switching the producer
+  to a single chain `PrefixEntry` is a future optimization, not a
+  requirement for the value to land.*
+- **Chain producer, legacy client.** A producer that sets both the
+  chain and the legacy `prefix_hash` on the same `PrefixEntry` gets
+  **both representations indexed** — the chain enables longest-prefix
+  matching for new clients; the legacy single-blob key keeps
+  unmigrated `LookupRoute` callers hitting via exact-match on
+  `prefix_hash`. The chain wins precedence for chain-aware lookups;
+  legacy is only added when the producer explicitly sets it alongside.
+- **Chain producer, chain-aware client, missing per-block counts.**
+  Mismatched parallel-array lengths (including the one-sided cases —
+  hashes without counts or counts without hashes) are treated as
+  malformed: dropped on ingest, `NO_HINT` on lookup. The handler does
+  not silently downgrade to legacy exact-match — a stale hint is fine,
+  a wrong hint is not.
+- **Chain-only or chain-plus-legacy request with the `minimumPrefixTokens`
+  gate active.** The handler uses `effectivePrefixTokens(req)`, which
+  gives the chain precedence: when `block_token_counts` is set the
+  gate uses `sum(block_token_counts)`; only when the chain is empty
+  does it fall back to the legacy `prefix_token_count`. A chain-bearing
+  request is therefore gated on what the chain actually reports — a
+  co-set stale legacy count cannot let it through nor zero it out.
+
+### Engine-opaque + parent-chain assumption
+
+Block hashes are still engine-defined opaque bytes; the cache plane
+matches them by exact byte equality within a `hash_scheme` and never
+interprets them. The longest-leading-run rank is **only meaningful when
+the engine's block hashes are parent-chained** — i.e. holding `h_i`
+implies having computed `h_0..h_{i-1}`. vLLM and SGLang both satisfy
+this. A future engine that emits position-blind block hashes (same
+bytes for a "middle" block as for a "leading" block) would violate the
+assumption and should not be ingested with the chain form. The contract
+doesn't enforce that — it's a producer-side discipline.
 
 ## 3. Pressure-aware scoring — locality vs. load
 
@@ -277,11 +453,11 @@ are set so that:
 
 ## 7. The reason-code summary
 
-| Code         | When it fires                                                                         | What the gateway treats it as           |
+| Code         | When it fires                                                                                                           | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH` | At least one replica holds the exact prefix in the right engine domain                 | Strongest hint — route to top-ranked    |
-| `TENANT_HOT`   | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`      | Softer hint — use or fall back          |
-| `NO_HINT`      | Empty hash_scheme, no prefix match, no warm replicas, or any other unspecified outcome | Default routing; cache plane invisible  |
+| `PREFIX_MATCH` | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain     | Strongest hint — route to top-ranked    |
+| `TENANT_HOT`   | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                       | Softer hint — use or fall back          |
+| `NO_HINT`      | Empty hash_scheme, malformed chain, no prefix match, no warm replicas, or any other unspecified outcome                 | Default routing; cache plane invisible  |
 
 `TIMEOUT` is reserved in the contract vocabulary for a per-tenant lookup
 deadline breach and is handled by the policy-server propagation path — not
@@ -434,7 +610,8 @@ AND no replica qualifies for `TENANT_HOT`. The gateway treats all three
 ## 9. Where the code lives
 
 - Scoring + strategy orchestration: [`pkg/index/index.go`](../../pkg/index/index.go)
-  — see `Lookup`, `LookupRoute`, `tenantHotCandidates`, `RankerConfig`.
+  — see `Lookup`, `lookupExact`, `lookupChain` (§2.5 chain walk),
+  `LookupRoute`, `tenantHotCandidates`, `RankerConfig`.
 - Handler glue (proto ↔ index, `Strategy` → `reason_code`):
   [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go).
 - Tests covering each strategy and the baseline-preservation invariant:

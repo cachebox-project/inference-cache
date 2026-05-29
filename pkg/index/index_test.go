@@ -1157,3 +1157,304 @@ func TestConcurrentTTLResolverMutation(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// Block-hash chain ingest + longest-prefix lookup
+// ---------------------------------------------------------------------------
+
+// chain assembles a parallel (hash, tokenCount) chain for the table-driven
+// tests below. Block hashes are opaque bytes so we use short strings.
+func chain(blocks ...string) (hashes [][]byte, counts []int32) {
+	hashes = make([][]byte, len(blocks))
+	counts = make([]int32, len(blocks))
+	for i, b := range blocks {
+		hashes[i] = []byte(b)
+		counts[i] = 16 // uniform per-block token count for the test
+	}
+	return hashes, counts
+}
+
+// TestChainLookupReturnsLongestCommonPrefix is the core longest-prefix behavior:
+// two replicas hold different 5-block chains; the one sharing more leading
+// blocks with the request wins, and matched_tokens reflects the partial run
+// (3 × 16 = 48), not the full request chain (80).
+func TestChainLookupReturnsLongestCommonPrefix(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+
+	reqHashes, reqCounts := chain("b1", "b2", "b3", "b4", "b5")
+	hashesA, countsA := chain("b1", "b2", "b3", "x4", "x5")
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashesA, BlockTokenCounts: countsA}}})
+	hashesB, countsB := chain("b1", "b2", "y3", "y4", "y5")
+	idx.Ingest(Update{ReplicaID: "replica-b", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashesB, BlockTokenCounts: countsB}}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: reqHashes, BlockTokenCounts: reqCounts})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 replica scores (both share at least block 0), got %d: %+v", len(got), got)
+	}
+	if got[0].ReplicaID != "replica-a" || got[0].MatchedTokens != 48 {
+		t.Fatalf("replica-a should win with matched_tokens=48 (3 blocks × 16); got %+v", got[0])
+	}
+	if got[1].ReplicaID != "replica-b" || got[1].MatchedTokens != 32 {
+		t.Fatalf("replica-b should follow with matched_tokens=32 (2 blocks × 16); got %+v", got[1])
+	}
+}
+
+// TestChainLookupFullChainMatch confirms a replica that holds the entire
+// request chain reports matched_tokens equal to the full chain's token count.
+func TestChainLookupFullChainMatch(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+
+	hashes, counts := chain("b1", "b2", "b3", "b4")
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(got) != 1 || got[0].ReplicaID != "replica-a" || got[0].MatchedTokens != 64 {
+		t.Fatalf("expected single full-chain hit for replica-a with matched_tokens=64, got %+v", got)
+	}
+}
+
+// TestChainLookupNoOverlapReturnsEmpty: zero shared blocks → no hint. Guards
+// against the longest-prefix walk silently returning matched_tokens=0 scores.
+func TestChainLookupNoOverlapReturnsEmpty(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashesHeld, countsHeld := chain("h1", "h2", "h3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashesHeld, BlockTokenCounts: countsHeld}}})
+	reqHashes, reqCounts := chain("q1", "q2", "q3")
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: reqHashes, BlockTokenCounts: reqCounts}); len(got) != 0 {
+		t.Fatalf("no overlap should yield no-hint, got %+v", got)
+	}
+}
+
+// TestLegacyExactMatchPathUnchanged locks in the migration-window guarantee:
+// legacy single-blob ingest + lookup behavior is unchanged from the B6 path.
+func TestLegacyExactMatchPathUnchanged(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 128}}})
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
+	if len(got) != 1 || got[0].ReplicaID != "r" || got[0].MatchedTokens != 128 {
+		t.Fatalf("legacy exact-match path changed: got %+v", got)
+	}
+}
+
+// TestChainLookupAgainstLegacyIngestExactOnly documents the migration window:
+// a legacy-style ingest (PrefixHash only) can still be matched exactly by the
+// chain path when the request's block 0 equals the stored single blob — but
+// it can't drive partial-prefix matching against a single-blob entry.
+func TestChainLookupAgainstLegacyIngestExactOnly(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}}})
+	reqHashes, reqCounts := chain("p", "x", "y")
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: reqHashes, BlockTokenCounts: reqCounts})
+	if len(got) != 1 || got[0].ReplicaID != "r" {
+		t.Fatalf("chain lookup against legacy entry should still hit on block 0: got %+v", got)
+	}
+	if got[0].MatchedTokens != 16 {
+		t.Fatalf("matched_tokens for 1-block partial = %d, want 16 (request BlockTokenCounts[0])", got[0].MatchedTokens)
+	}
+}
+
+// TestChainIngestMismatchedLengthsDropped: parallel arrays must agree in
+// length; a malformed PrefixEntry is dropped fail-soft (soft state — a
+// stale hint is OK, a wrong one is not).
+func TestChainIngestMismatchedLengthsDropped(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, _ := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: []int32{16}}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("mismatched chain lengths should drop the entry; got %d indexed", n)
+	}
+}
+
+// TestChainIngestEmptyHashSchemeFailsOpen: the engine-opaque guarantee
+// extends to chain ingest — no scheme, no indexing.
+func TestChainIngestEmptyHashSchemeFailsOpen(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("empty hash_scheme should drop chain ingest, got %d entries", n)
+	}
+}
+
+// TestChainLookupHashSchemeIsolation guards cross-engine isolation: a chain
+// stored under vllm must not match the same byte chain looked up under sglang.
+func TestChainLookupHashSchemeIsolation(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "sglang",
+		BlockHashes: hashes, BlockTokenCounts: counts}); len(got) != 0 {
+		t.Fatalf("cross-scheme chain lookup leaked: %+v", got)
+	}
+}
+
+// TestChainLookupRunFreshnessIsWeakestLink shows the oldest matched block
+// caps the run's freshness — a stale block in the middle of the chain
+// pulls the whole run's score down rather than letting a fresh tail
+// disguise an aging hold.
+func TestChainLookupRunFreshnessIsWeakestLink(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(7_000_000, 0)}
+	idx := New(withClock(clk.now), WithTTL(10*time.Minute))
+
+	hashes0, counts0 := chain("b1")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes0, BlockTokenCounts: counts0}}})
+	clk.add(8 * time.Minute) // b1 now 8m old → freshness ~0.2 at TTL=10m
+	hashesRest, countsRest := chain("b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashesRest, BlockTokenCounts: countsRest}}})
+
+	reqHashes, reqCounts := chain("b1", "b2", "b3")
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: reqHashes, BlockTokenCounts: reqCounts})
+	if len(got) != 1 {
+		t.Fatalf("expected one replica with the full chain, got %+v", got)
+	}
+	if got[0].EstimatedCacheHitProb >= 0.5 {
+		t.Fatalf("freshness should reflect the oldest block (~0.2), got %v", got[0].EstimatedCacheHitProb)
+	}
+}
+
+// TestChainLookupMismatchedLengthsFailOpen mirrors the Ingest-side guarantee
+// (TestChainIngestMismatchedLengthsDropped): when a request carries a chain
+// whose parallel arrays disagree in length, the lookup MUST return no hint
+// rather than silently downgrade to legacy exact-match on PrefixHash —
+// otherwise a chain-aware client with a producer bug could surface an
+// unrelated legacy entry as a partial-prefix match.
+func TestChainLookupMismatchedLengthsFailOpen(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	// Seed a legacy single-blob entry under PrefixHash="legacy-p" so the bug
+	// would manifest as a wrong hit if the lookup fell through.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("legacy-p"), TokenCount: 128}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash:       hash("legacy-p"),
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16}, // length 1 vs 2 — malformed
+	}); len(got) != 0 {
+		t.Fatalf("malformed chain must fail open (NO_HINT), got %+v — would have leaked legacy hit", got)
+	}
+}
+
+// TestChainIngestOneSidedHashesOnlyDropped covers the asymmetric malformed
+// shape (BlockHashes set but BlockTokenCounts empty). Symmetric to the
+// existing mismatched-length test; both paths must drop fail-soft.
+func TestChainIngestOneSidedHashesOnlyDropped(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+			BlockTokenCounts: nil,
+		}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("hashes-only chain should drop, got %d entries", n)
+	}
+}
+
+// TestChainIngestOneSidedCountsOnlyDropped covers the inverse asymmetric
+// shape (counts set but hashes empty). Without this guard the entry would
+// silently fall through to the legacy single-blob path with an empty
+// PrefixHash key — a wrong-hint surface area.
+func TestChainIngestOneSidedCountsOnlyDropped(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			PrefixHash:       []byte("legacy-p"),
+			TokenCount:       64,
+			BlockHashes:      nil,
+			BlockTokenCounts: []int32{16, 16},
+		}}})
+	if n := idx.EntryCountsByModel()["m"]; n != 0 {
+		t.Fatalf("counts-only chain should drop (must not downgrade to legacy), got %d entries", n)
+	}
+}
+
+// TestChainLookupOneSidedCountsOnlyFailsOpen guards the lookup side of the
+// same shape: a request with BlockTokenCounts set but no BlockHashes is
+// malformed and must return NO_HINT, not fall back to legacy exact-match.
+func TestChainLookupOneSidedCountsOnlyFailsOpen(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("legacy-p"), TokenCount: 128}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash:       hash("legacy-p"),
+		BlockTokenCounts: []int32{16, 16},
+	}); len(got) != 0 {
+		t.Fatalf("counts-only chain lookup must fail open, got %+v", got)
+	}
+}
+
+// TestChainIngestWithCoSetLegacyPrefixHashPreservesBoth covers v1alpha1
+// backward-compat: a producer that sets BOTH the new chain (block_hashes)
+// and the legacy single-blob (PrefixHash) on the same PrefixEntry must
+// have BOTH representations indexed. The chain enables longest-prefix
+// matching for new clients; the legacy key keeps unmigrated callers
+// (legacy LookupRoute on prefix_hash) hitting.
+func TestChainIngestWithCoSetLegacyPrefixHashPreservesBoth(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{
+			PrefixHash:       []byte("legacy-full"),
+			TokenCount:       128,
+			BlockHashes:      hashes,
+			BlockTokenCounts: counts,
+		}}})
+
+	// Chain lookup hits the per-block entries.
+	gotChain := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(gotChain) != 1 || gotChain[0].ReplicaID != "r" || gotChain[0].MatchedTokens != 48 {
+		t.Fatalf("chain lookup against co-set entry should hit all 3 blocks: got %+v", gotChain)
+	}
+
+	// Legacy lookup on the co-set PrefixHash MUST still hit (backward-compat).
+	gotLegacy := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: []byte("legacy-full")})
+	if len(gotLegacy) != 1 || gotLegacy[0].ReplicaID != "r" || gotLegacy[0].MatchedTokens != 128 {
+		t.Fatalf("legacy lookup against co-set entry must still hit prefix_hash with TokenCount=128: got %+v", gotLegacy)
+	}
+}
+
+// TestChainLookupSharesPressureAndSLOFactorsWithExact verifies the chain
+// scoring path composes the same pressure and SLO factors as lookupExact —
+// the chain walk changes how matched_tokens is computed but the score
+// formula is unchanged. Without this, a saturated replica that happens to
+// have a chain hit would outrank a fresher idle peer the chain-aware
+// formula was supposed to demote.
+func TestChainLookupSharesPressureAndSLOFactorsWithExact(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+
+	idx.Ingest(Update{ReplicaID: "big-but-hot", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}},
+		Stats:    &ReplicaStats{Pressure: 0.9}})
+	idx.Ingest(Update{ReplicaID: "small-cool", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes[:2], BlockTokenCounts: counts[:2]}},
+		Stats:    &ReplicaStats{Pressure: 0.0}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 chain scores, got %+v", got)
+	}
+	// big-but-hot: matched=48, fresh=1, pressureFactor=(1-1*0.9)=0.1, sloBias=1 → 4.8
+	// small-cool:  matched=32, fresh=1, pressureFactor=(1-1*0.0)=1.0, sloBias=1 → 32
+	// Without pressure folding, big-but-hot's 48 would beat small-cool's 32.
+	if got[0].ReplicaID != "small-cool" {
+		t.Fatalf("pressure factor missing from chain score: ranked %+v first (want small-cool)", got[0])
+	}
+}

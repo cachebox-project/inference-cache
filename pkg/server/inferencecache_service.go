@@ -85,8 +85,11 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	model := req.GetModelId()
 
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
-	// request that can't clear it — no index lock, no goroutine.
-	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && req.GetPrefixTokenCount() < minTokens {
+	// request that can't clear it — no index lock, no goroutine. A chain
+	// request reports its token budget via block_token_counts (the legacy
+	// prefix_token_count may be 0); fall back to that sum so chain callers
+	// aren't gated out by a zero legacy field.
+	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && effectivePrefixTokens(req) < minTokens {
 		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
@@ -110,13 +113,15 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 
 	slo := req.GetSlo()
 	lookupReq := index.LookupRequest{
-		Model:        model,
-		Tenant:       tenant,
-		HashScheme:   req.GetHashScheme(),
-		PrefixHash:   req.GetPrefixHash(),
-		TokenCount:   req.GetPrefixTokenCount(),
-		TTFTBudgetMs: slo.GetTtftMs(),
-		TBTBudgetMs:  slo.GetTbtMs(),
+		Model:            model,
+		Tenant:           tenant,
+		HashScheme:       req.GetHashScheme(),
+		PrefixHash:       req.GetPrefixHash(),
+		TokenCount:       req.GetPrefixTokenCount(),
+		BlockHashes:      req.GetBlockHashes(),
+		BlockTokenCounts: req.GetBlockTokenCounts(),
+		TTFTBudgetMs:     slo.GetTtftMs(),
+		TBTBudgetMs:      slo.GetTbtMs(),
 	}
 
 	// Default (and dominant) path: no policy budget AND no caller deadline.
@@ -316,8 +321,10 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 	}
 	for _, p := range u.GetPrefixes() {
 		out.Prefixes = append(out.Prefixes, index.PrefixRef{
-			PrefixHash: p.GetPrefixHash(),
-			TokenCount: p.GetTokenCount(),
+			PrefixHash:       p.GetPrefixHash(),
+			TokenCount:       p.GetTokenCount(),
+			BlockHashes:      p.GetBlockHashes(),
+			BlockTokenCounts: p.GetBlockTokenCounts(),
 		})
 	}
 	if st := u.GetStats(); st != nil {
@@ -357,4 +364,22 @@ func microsToTime(us int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMicro(us)
+}
+
+// effectivePrefixTokens returns the token count the request asserts its
+// prefix covers, picking the right field based on whether the request is in
+// chain or legacy form. Chain takes precedence over the legacy
+// prefix_token_count to match the documented precedence rule: a chain-bearing
+// request is a positive assertion of the new form, so a co-set legacy field
+// must not override what the chain reports. The handler uses the result to
+// gate against CachePolicy.minimumPrefixTokens before touching the index.
+func effectivePrefixTokens(req *icpb.LookupRouteRequest) int32 {
+	if counts := req.GetBlockTokenCounts(); len(counts) > 0 {
+		var sum int32
+		for _, v := range counts {
+			sum += v
+		}
+		return sum
+	}
+	return req.GetPrefixTokenCount()
 }
