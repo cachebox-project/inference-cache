@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -148,12 +149,18 @@ func (s *Service) Serve(ctx context.Context, grpcListener, httpListener net.List
 
 	select {
 	case <-ctx.Done():
+		slog.InfoContext(ctx, "graceful_shutdown_started")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(shutdownCtx)
+		slog.InfoContext(ctx, "graceful_shutdown_done")
 		return nil
 	case err := <-errCh:
+		// One terminal error per Serve return: cmd/server logs serve_error
+		// on the non-nil return. The second listener's flap (if both fail)
+		// stays in the buffered channel and is discarded by design, so this
+		// branch produces no log line itself.
 		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(context.Background())
 		return err
