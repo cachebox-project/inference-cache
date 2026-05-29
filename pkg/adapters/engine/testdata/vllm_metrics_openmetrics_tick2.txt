@@ -1,0 +1,17 @@
+# Tick 2 of the unsuffixed-counter fixture. Counters have advanced so the
+# scraper's delta produces a real hit_rate.
+# HELP vllm:kv_cache_usage_perc KV cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="m"} 0.30
+# HELP vllm:prefix_cache_hits Counter of cached blocks reused.
+# TYPE vllm:prefix_cache_hits counter
+vllm:prefix_cache_hits{model_name="m"} 70
+# HELP vllm:prefix_cache_queries Counter of prefix cache queries.
+# TYPE vllm:prefix_cache_queries counter
+vllm:prefix_cache_queries{model_name="m"} 120
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="m"} 2
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="m"} 0

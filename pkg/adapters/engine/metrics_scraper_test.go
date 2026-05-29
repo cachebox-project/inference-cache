@@ -208,14 +208,12 @@ func TestScraperExplicitTierPinsLookup(t *testing.T) {
 
 func TestScraperCountersWithoutTotalSuffix(t *testing.T) {
 	// Some prometheus clients expose counters under the unsuffixed family name
-	// (no `_total`). The scraper must still find them via the fallback.
-	srv := fixtureServer(t, "vllm_metrics_openmetrics.txt", "vllm_metrics_openmetrics.txt")
+	// (no `_total`). The scraper must still find them via the lookup fallback.
+	// Two distinct ticks so the hit_rate delta actually proves the counter
+	// lookup worked — identical ticks would produce 0 either way.
+	srv := fixtureServer(t, "vllm_metrics_openmetrics.txt", "vllm_metrics_openmetrics_tick2.txt")
 	defer srv.Close()
 
-	// Prime then read delta — but both ticks are identical so dQueries=0 →
-	// hit_rate stays 0. We just need to confirm the lookup didn't silently fail
-	// (hits/queries are 10/20 in the fixture; if they were missing the second
-	// tick would also yield 0, but a swap to a non-equal fixture proves it).
 	s := NewMetricsScraper(srv.Client(), ScraperConfig{URL: srv.URL, Tier: CacheTierAuto, CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 8}, nil)
 	if _, err := s.Scrape(context.Background()); err != nil {
 		t.Fatalf("prime: %v", err)
@@ -233,6 +231,11 @@ func TestScraperCountersWithoutTotalSuffix(t *testing.T) {
 	// pressure = (2+0)/8 = 0.25 — proves gauges were also read.
 	if got, want := stats.GetPressure(), float32(0.25); got < want-1e-4 || got > want+1e-4 {
 		t.Errorf("pressure = %v, want %v", got, want)
+	}
+	// Δhits = 70-10 = 60; Δqueries = 120-20 = 100 → 0.6. If sumCounter had
+	// failed to find the unsuffixed family this would stay 0.
+	if got, want := stats.GetHitRate(), float32(0.6); got < want-1e-4 || got > want+1e-4 {
+		t.Errorf("hit_rate = %v, want %v (unsuffixed counter lookup is dark)", got, want)
 	}
 }
 
