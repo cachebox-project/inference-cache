@@ -28,10 +28,11 @@ Both sit on the server's HTTP port (`:8080`), alongside `/healthz`,
 
 ## Snapshot semantics
 
-The controller always sends a FULL snapshot. The server adopts
-**replace-on-write**: the snapshot becomes the new state, and any
-namespace not present reverts to server defaults. A CR delete therefore
-propagates as "next snapshot omits this namespace."
+The controller always sends a FULL snapshot of one resolved policy per
+namespace (see "Multiple CachePolicies in one namespace" below). The
+server adopts **replace-on-write**: the snapshot becomes the new state,
+and any namespace not present reverts to server defaults. A CR delete
+therefore propagates as "next snapshot omits this namespace."
 
 The server's policy store is purely in-memory (soft state, like the cache
 index). If the server restarts and loses everything, the controller's
@@ -77,6 +78,24 @@ unknown field surfaces as HTTP 400 rather than silently dropping. Request
 body is capped at 1 MiB.
 
 Successful PUSH returns `HTTP 204 No Content` with an empty body.
+
+## Multiple CachePolicies in one namespace
+
+The `CachePolicy` CRD does **not** enforce a singleton per namespace.
+When the controller observes more than one CachePolicy in a single
+namespace it deduplicates deterministically: the entries are sorted by
+`(namespace, name)` ascending and the FIRST entry per namespace wins
+(i.e. the lexicographically smallest `metadata.name`). The losing
+policies do not appear in the wire snapshot.
+
+This rule:
+
+- Keeps the effective policy independent of apiserver list ordering.
+- Is observable from `kubectl get cachepolicies`, so an operator can
+  always predict which CR is in effect.
+- Is enforced by the controller, not the CRD: an admission webhook
+  enforcing one policy per namespace (singleton) would let us drop this
+  rule, and is a candidate for a future webhook addition.
 
 ## Tenant mapping (phase-1)
 
