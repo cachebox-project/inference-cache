@@ -335,15 +335,22 @@ func (i *Index) ApplyEvent(ev Event) {
 // When the request carries a non-empty block-hash chain (BlockHashes with a
 // matching-length BlockTokenCounts), the lookup walks the chain block-by-block
 // and computes each replica's longest common leading run; MatchedTokens
-// reflects the sum of the request's BlockTokenCounts for that run.
-// Otherwise the lookup falls back to exact-match on PrefixHash (legacy path).
+// reflects the sum of the request's BlockTokenCounts for that run. When
+// BlockHashes is set but BlockTokenCounts has a different length, the chain
+// is malformed; the lookup returns no hint rather than silently downgrading
+// to legacy exact-match on PrefixHash (symmetric with chain Ingest, which
+// drops the entry — "a wrong hint is worse than a stale one"). When
+// BlockHashes is empty the legacy exact-match path on PrefixHash is used.
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	// Without a known hash_scheme, opaque hash bytes cannot be matched
 	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
 		return nil
 	}
-	if len(req.BlockHashes) > 0 && len(req.BlockHashes) == len(req.BlockTokenCounts) {
+	if len(req.BlockHashes) > 0 {
+		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
+			return nil
+		}
 		return i.lookupChain(req)
 	}
 	return i.lookupExact(req)

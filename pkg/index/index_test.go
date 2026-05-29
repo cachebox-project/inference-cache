@@ -586,3 +586,24 @@ func TestChainLookupRunFreshnessIsWeakestLink(t *testing.T) {
 		t.Fatalf("freshness should reflect the oldest block (~0.2), got %v", got[0].EstimatedCacheHitProb)
 	}
 }
+
+// TestChainLookupMismatchedLengthsFailOpen mirrors the Ingest-side guarantee
+// (TestChainIngestMismatchedLengthsDropped): when a request carries a chain
+// whose parallel arrays disagree in length, the lookup MUST return no hint
+// rather than silently downgrade to legacy exact-match on PrefixHash —
+// otherwise a chain-aware client with a producer bug could surface an
+// unrelated legacy entry as a partial-prefix match.
+func TestChainLookupMismatchedLengthsFailOpen(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	// Seed a legacy single-blob entry under PrefixHash="legacy-p" so the bug
+	// would manifest as a wrong hit if the lookup fell through.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("legacy-p"), TokenCount: 128}}})
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash:       hash("legacy-p"),
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16}, // length 1 vs 2 — malformed
+	}); len(got) != 0 {
+		t.Fatalf("malformed chain must fail open (NO_HINT), got %+v — would have leaked legacy hit", got)
+	}
+}
