@@ -1,9 +1,11 @@
 namespace: inference-cache-system
 
 resources:
+- namespace.yaml
 - ../crd
 - ../rbac
 - ../manager
+- ../server
 - ../webhook
 - ../certmanager
 
@@ -15,6 +17,9 @@ labels:
 images:
 - name: controller
   newName: ghcr.io/cachebox-project/inference-cache-controller
+  newTag: dev
+- name: server
+  newName: ghcr.io/cachebox-project/inference-cache-server
   newTag: dev
 
 patches:
