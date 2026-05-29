@@ -36,7 +36,9 @@ KV events to nobody. Closing that gap is what this ADR is about.
 ## Decision
 
 **A unification of #1 and #3: subscriber-as-sidecar, injected by the existing C6 Pod
-webhook, gated by a new method on the C5 `KVCacheRuntimeAdapter` interface.**
+webhook, gated by a new method on the C5 `KVCacheRuntimeAdapter` interface. Auto-attach
+is opt-in by default — the operator passes the subscriber image via a controller flag
+to turn it on.**
 
 Concretely:
 
@@ -47,6 +49,12 @@ Concretely:
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
+* **The vLLM/LMCache adapter returns nil unless the controller's
+  `--kvevent-subscriber-image` flag is set.** An unconfigured image would put the sidecar
+  container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
+  exact "cache becomes a serving dependency" failure mode the fail-open posture exists
+  to prevent. Defaulting auto-attach off lets the controller install cleanly into any
+  cluster; operators turn it on when they're ready to ship a subscriber image alongside.
 * Sidecar identity flags are derived from the CR + pod: `--replica-id` ← `pod.Name`
   (via the downward API so `generateName` pods work), `--tenant-id` ← `pod.Namespace`
   (downward API likewise), `--model-id` ← `spec.backendConfig.model` (single source;

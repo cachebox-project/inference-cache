@@ -110,10 +110,19 @@ const (
 // SubscriberImage to a digest-pinned image and PolicyServerGRPCAddress to
 // the in-cluster Service DNS the operator's policy server actually exposes.
 const (
-	// DefaultSubscriberImage is the development-tag default image the
-	// kvevent-subscriber sidecar runs. The Makefile's subscriber-image
-	// target emits this tag; production operators override via the
-	// controller's --kvevent-subscriber-image flag.
+	// DefaultSubscriberImage is the well-known dev-tag the Makefile's
+	// subscriber-image target emits; operators pass it (or a
+	// production-pinned digest) to the controller's
+	// --kvevent-subscriber-image flag to enable auto-attach.
+	//
+	// Auto-attach is opt-in by design: when no image is configured the
+	// adapter returns no sidecar at all. A pulled-but-unavailable image
+	// would put the sidecar container into ImagePullBackOff, which keeps
+	// the engine pod from going Ready and would violate the "cache is an
+	// optimisation, never a serving dependency" posture. Defaulting off
+	// keeps the default install safe — operators turn auto-attach on
+	// when they're ready to ship a subscriber image alongside the
+	// controller.
 	DefaultSubscriberImage = "ghcr.io/cachebox-project/inference-cache-subscriber:dev"
 	// DefaultPolicyServerGRPCAddress is the in-cluster Service DNS the
 	// kvevent-subscriber sidecar dials by default. Mirrors the assumption
@@ -363,6 +372,16 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 	if pod == nil {
 		return nil, fmt.Errorf("observation sidecar: pod is nil")
 	}
+	// Auto-attach is opt-in: when the operator hasn't configured a
+	// subscriber image via the controller flag, skip the sidecar
+	// entirely. A nonexistent image would put the sidecar container into
+	// ImagePullBackOff, which keeps the engine pod from going Ready —
+	// that turns the cache into a serving dependency, the exact failure
+	// mode the fail-open posture exists to avoid. See
+	// [DefaultSubscriberImage] for the build-tag operators pin to.
+	if a.subscriberImage == "" {
+		return nil, nil
+	}
 	modelID := configOr(cache.Spec.BackendConfig, modelBackendConfigKey, "")
 	if modelID == "" {
 		// No --model-id ⇒ subscriber binary would refuse to start; skip
@@ -375,9 +394,6 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 		serverAddr = DefaultPolicyServerGRPCAddress
 	}
 	image := a.subscriberImage
-	if image == "" {
-		image = DefaultSubscriberImage
-	}
 
 	nonRoot := true
 	noPrivEsc := false

@@ -562,7 +562,11 @@ func TestUpsertArgPairAppendsAndReplaces(t *testing.T) {
 }
 
 func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
-	a := NewVLLMLMCacheAdapter()
+	// Auto-attach is opt-in: the operator passes the subscriber image via
+	// the controller flag. WithSubscriberImage here mirrors the production
+	// wiring. Without it ObservationSidecar would return nil (see
+	// TestVLLMLMCacheObservationSidecarSkipsWithoutImage).
+	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
 	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"})
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"},
@@ -573,13 +577,13 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 		t.Fatalf("ObservationSidecar: %v", err)
 	}
 	if c == nil {
-		t.Fatalf("ObservationSidecar returned nil for vLLM+LMCache with a model set")
+		t.Fatalf("ObservationSidecar returned nil for vLLM+LMCache with a model + image set")
 	}
 	if c.Name != SubscriberContainerName {
 		t.Fatalf("container name = %q, want %q", c.Name, SubscriberContainerName)
 	}
 	if c.Image != DefaultSubscriberImage {
-		t.Fatalf("container image = %q, want %q (default)", c.Image, DefaultSubscriberImage)
+		t.Fatalf("container image = %q, want %q", c.Image, DefaultSubscriberImage)
 	}
 	// Downward-API env vars carry the pod's name/namespace at start time —
 	// vital because pod.Name is empty at admission for generateName pods.
@@ -635,7 +639,7 @@ func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
 	// it the subscriber binary would refuse to start (model-id is a required
 	// flag), so the adapter returns (nil, nil) to skip the append. The next
 	// admission picks up the sidecar once the operator sets the field.
-	a := NewVLLMLMCacheAdapter()
+	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
 	cb := newLMCacheBackend(nil)
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a"}}
 
@@ -648,6 +652,25 @@ func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheObservationSidecarSkipsWithoutImage(t *testing.T) {
+	// Default install opts OUT of auto-attach: when the controller flag
+	// --kvevent-subscriber-image is unset, the adapter returns no sidecar
+	// at all — even when backendConfig.model is set — so an operator that
+	// hasn't yet shipped a subscriber image can't end up with engine pods
+	// stuck in ImagePullBackOff. Opt-in by passing WithSubscriberImage.
+	a := NewVLLMLMCacheAdapter() // no image configured
+	cb := newLMCacheBackend(map[string]string{"model": "MyOrg/MyModel"})
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a"}}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil {
+		t.Fatalf("ObservationSidecar: %v", err)
+	}
+	if c != nil {
+		t.Fatalf("expected nil sidecar when subscriber image is unconfigured, got %+v", c)
+	}
+}
+
 func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testing.T) {
 	// Regression: the Go flag package exits on unknown flags, so a sidecar
 	// arg that the kvevent-subscriber binary doesn't recognise crashes the
@@ -657,7 +680,7 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 	// parse cleanly. Keep the flag set in sync with
 	// cmd/kvevent-subscriber/main.go — adding a flag to the sidecar's args
 	// before the binary learns it is what this guard exists to catch.
-	a := NewVLLMLMCacheAdapter()
+	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
 	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"})
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"}}
 
@@ -693,7 +716,7 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 }
 
 func TestVLLMLMCacheObservationSidecarBadInput(t *testing.T) {
-	a := NewVLLMLMCacheAdapter()
+	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
 	cb := newLMCacheBackend(map[string]string{"model": "m"})
 	cases := []struct {
 		name string

@@ -62,7 +62,7 @@ func defaultOptions() options {
 		serverPolicyURL:         "http://inference-cache-server:8080/policy",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
-		subscriberImage:         adapterruntime.DefaultSubscriberImage,
+		subscriberImage:         "",
 		policyServerGRPCAddress: adapterruntime.DefaultPolicyServerGRPCAddress,
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -81,7 +81,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.serverPolicyURL, "server-policy-url", opts.serverPolicyURL, "URL of the cache server's /policy endpoint, the controller PUSHES resolved CachePolicy snapshots to.")
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
-	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to vLLM engine pods. Pin to a digest in production.")
+	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to vLLM engine pods. Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
 	flag.StringVar(&opts.policyServerGRPCAddress, "policy-server-grpc-address", opts.policyServerGRPCAddress, "host:port the kvevent-subscriber sidecar dials to ReportCacheState. Defaults to the in-cluster Service DNS in the inference-cache-system namespace.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()

@@ -147,6 +147,25 @@ func newHandler(t *testing.T, objs ...client.Object) *EngineInjector {
 	}
 }
 
+// newHandlerWithSubscriber returns a handler whose registry has the
+// kvevent-subscriber image configured, opting in to the sidecar auto-attach
+// path. Tests that exercise the sidecar behaviour use this helper; tests
+// that only need the engine config injection (or that want to confirm the
+// no-image default produces no sidecar) use newHandler.
+func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInjector {
+	t.Helper()
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	reg := adapterruntime.DefaultRegistry(
+		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
+	)
+	return &EngineInjector{
+		Reader:   c,
+		Registry: reg,
+		Log:      logr.Discard(),
+	}
+}
+
 func TestHandle_MatchAndInject(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
@@ -178,11 +197,13 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	// The vLLM/LMCache adapter returns a kvevent-subscriber sidecar
 	// the webhook MUST append after InjectEngineConfig, with identity flags
 	// derived from the CR + pod. This is the one test that pins the end-to-
-	// end auto-attach behaviour at the admission boundary.
+	// end auto-attach behaviour at the admission boundary. Auto-attach is
+	// opt-in via the controller flag; the handler helper here mirrors that
+	// wiring.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
-	h := newHandler(t, cb)
+	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
@@ -216,7 +237,7 @@ func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
-	h := newHandler(t, cb)
+	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 
 	first := h.Handle(context.Background(), newRequest(t, pod, ns))
@@ -260,12 +281,37 @@ func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
 	}
 }
 
+func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
+	// Default install must NOT auto-attach: when the controller flag is
+	// unset, the registry's vLLM adapter renders no sidecar even with a
+	// model configured. This protects operators who install the controller
+	// without yet shipping a subscriber image — engine pods stay
+	// single-container and the cache is purely opt-in for now.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
+	h := newHandler(t, cb) // default DefaultRegistry — no subscriber image
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("engine injection must still happen; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("default install must NOT auto-attach the sidecar; got %+v", c)
+	}
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
 func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	// Intentionally no backendConfig — adapter returns (nil, nil), so the
-	// engine wiring still happens but the sidecar append is skipped.
-	h := newHandler(t, cb)
+	// Sidecar opt-in via the configured handler, but no backendConfig.model
+	// — adapter returns (nil, nil) so the engine wiring still happens
+	// while the sidecar append is skipped.
+	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
@@ -310,7 +356,7 @@ func TestHandle_PreExistingSidecar_NotDuplicated(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
-	h := newHandler(t, cb)
+	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
 		Name:  adapterruntime.SubscriberContainerName,

@@ -90,6 +90,8 @@ The retired colocated-rendering keys (`image`, `profile`, `hfTokenSecret`) were 
 
 `model` is **not** retired: the pod-mutating webhook reads `backendConfig.model` as the served model id for the `kvevent-subscriber` sidecar's `--model-id` flag. When the key is unset, the adapter skips appending the sidecar (the subscriber binary requires the flag); the next pod admission after the operator sets the key picks it up. Set this to the served model identifier the engine container is loaded with (the value that ends up in the engine's `served_model_name`).
 
+The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` flag defaults to empty, in which case the adapter returns no sidecar regardless of `backendConfig.model`. Operators turn auto-attach on by passing a real (digest-pinned in production) image. This default protects an unconfigured install from `ImagePullBackOff` on a nonexistent sidecar image, which would otherwise block engine pod readiness.
+
 ## Status
 
 | Field | Type | Purpose |

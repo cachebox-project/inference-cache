@@ -89,8 +89,17 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
+	// Opt in to the subscriber sidecar auto-attach path by configuring
+	// the registry with a subscriber image — the integration test exists
+	// to gate that end-to-end behaviour. Production operators do the same
+	// by passing --kvevent-subscriber-image to the controller.
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
-		Handler: &EngineInjector{Reader: mgr.GetAPIReader()},
+		Handler: &EngineInjector{
+			Reader: mgr.GetAPIReader(),
+			Registry: adapterruntime.DefaultRegistry(
+				adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
+			),
+		},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
