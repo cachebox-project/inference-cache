@@ -24,6 +24,28 @@ const (
 	DefaultMaxEntries    = 1_000_000
 )
 
+// Defaults for the ranking-v2 knobs (pressure / SLO / tenant-hot fallback).
+// Calibrated so the formula reduces to the baseline matchedTokens × freshness
+// when no stats are present and no SLO hint is set — see DefaultRankerConfig.
+const (
+	// Pressure penalty: pressureFactor = 1 - PressureWeight × pressure.
+	// 1.0 → a fully-saturated replica (pressure=1.0) drops to score 0, so a
+	// fresher lower-pressure peer can win. Lower values are gentler.
+	DefaultPressureWeight = 1.0
+	// TTFT below this (ms) is treated as "tight" — the SLO bias kicks in.
+	// 200 ms is a conservative threshold; tune per workload.
+	DefaultSLOTightTTFTMs = 200
+	// Tight-SLO bias: sloBias = 1 + freshness × SLOTightBias, applied
+	// multiplicatively. Higher → freshness gets weighted more aggressively
+	// against matched-token count when latency is critical.
+	DefaultSLOTightBias = 1.0
+	// TENANT_HOT fallback: replicas with hit_rate >= this count as "warm".
+	DefaultTenantHotMinHitRate = 0.1
+	// TENANT_HOT fallback: stats lastSeen within this window count as
+	// "recent" — anything older is treated as cold for the fallback.
+	DefaultTenantHotMaxAge = 5 * time.Minute
+)
+
 // Metrics is the optional sink the index reports live entry counts to. It is
 // satisfied by the server's Prometheus wiring; kept as a tiny interface so the
 // index has no dependency on the metrics/registry implementation.
@@ -80,12 +102,17 @@ type Event struct {
 }
 
 // LookupRequest asks which replicas hold a given prefix, within a hash scheme.
+// TTFTBudgetMs / TBTBudgetMs carry the caller's SLO targets (proto SLO message);
+// 0 means "no SLO hint" and the ranker treats the request as baseline-latency.
 type LookupRequest struct {
 	Model      string
 	Tenant     string
 	HashScheme string
 	PrefixHash []byte
 	TokenCount int32
+
+	TTFTBudgetMs int32
+	TBTBudgetMs  int32
 }
 
 // ReplicaScore is one ranked hint returned to the gateway. Higher score = better.
@@ -94,6 +121,66 @@ type ReplicaScore struct {
 	Score                 float32
 	MatchedTokens         int32
 	EstimatedCacheHitProb float32
+}
+
+// Strategy names which ranking path produced a LookupResult, so the gRPC
+// handler can map it to the contract's reason_code vocabulary
+// (PREFIX_MATCH | TENANT_HOT | NO_HINT) without re-running the index logic.
+type Strategy int
+
+const (
+	// StrategyNone — no candidates from any strategy. Handler emits NO_HINT.
+	StrategyNone Strategy = iota
+	// StrategyPrefixMatch — at least one replica holds the requested prefix
+	// in this hash_scheme. Handler emits PREFIX_MATCH.
+	StrategyPrefixMatch
+	// StrategyTenantHot — no exact prefix match, but the tenant has recently
+	// warm replicas (hit_rate-based). A coarser locality signal than prefix
+	// match. Handler emits TENANT_HOT.
+	StrategyTenantHot
+)
+
+// LookupResult is the orchestrated outcome of LookupRoute — the ranked
+// scores plus which strategy produced them.
+type LookupResult struct {
+	Scores   []ReplicaScore
+	Strategy Strategy
+}
+
+// RankerConfig tunes the pressure / SLO / tenant-hot strategies layered on
+// the baseline matchedTokens × freshness score. Zero-valued knobs collapse
+// the formula back to the baseline — so the new ranker is safe to leave
+// enabled even when stats are absent or SLO is unspecified.
+//
+// Concretely:
+//
+//	score = matchedTokens × freshness × pressureFactor × sloBias
+//	pressureFactor = max(0, 1 - PressureWeight × pressure)         // 1 when no stats
+//	sloBias        = 1 + freshness × SLOTightBias                  // when TTFT tight
+//	               = 1                                              // otherwise
+//
+// PressureWeight = 0 disables the penalty (pressureFactor=1). SLOTightBias
+// = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables the
+// TENANT_HOT fallback entirely (LookupRoute returns NO_HINT on prefix-miss).
+type RankerConfig struct {
+	PressureWeight      float32
+	SLOTightTTFTMs      int32
+	SLOTightBias        float32
+	TenantHotMinHitRate float32
+	TenantHotMaxAge     time.Duration
+}
+
+// DefaultRankerConfig returns the calibrated default knobs — ranking v2 is
+// on out of the box, but reduces to the baseline whenever the supporting
+// inputs (replica stats, SLO hint) aren't there.
+func DefaultRankerConfig() RankerConfig {
+	return RankerConfig{
+		PressureWeight:      DefaultPressureWeight,
+		SLOTightTTFTMs:      DefaultSLOTightTTFTMs,
+		SLOTightBias:        DefaultSLOTightBias,
+		TenantHotMinHitRate: DefaultTenantHotMinHitRate,
+		TenantHotMaxAge:     DefaultTenantHotMaxAge,
+	}
 }
 
 type prefixKey struct {
@@ -126,6 +213,7 @@ type Index struct {
 	maxEntries    int
 	now           func() time.Time
 	metrics       Metrics
+	ranker        RankerConfig
 
 	ready atomic.Bool
 
@@ -155,6 +243,12 @@ func WithMaxEntries(n int) Option { return func(i *Index) { i.maxEntries = n } }
 // WithMetrics wires a metrics sink for inferencecache_index_entries.
 func WithMetrics(m Metrics) Option { return func(i *Index) { i.metrics = m } }
 
+// WithRanker overrides the ranking-v2 knobs. The default (set in New) is
+// DefaultRankerConfig() — sensible production values that collapse to the
+// matchedTokens × freshness baseline when stats and SLO are absent. Pass
+// RankerConfig{} to disable every v2 strategy and run pure baseline.
+func WithRanker(cfg RankerConfig) Option { return func(i *Index) { i.ranker = cfg } }
+
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
 
@@ -165,6 +259,7 @@ func New(opts ...Option) *Index {
 		sweepInterval:  DefaultSweepInterval,
 		maxEntries:     DefaultMaxEntries,
 		now:            time.Now,
+		ranker:         DefaultRankerConfig(),
 		prefixes:       make(map[prefixKey]map[string]replicaEntry),
 		stats:          make(map[statsKey]statEntry),
 		reportedModels: make(map[string]struct{}),
@@ -302,8 +397,16 @@ func (i *Index) ApplyEvent(ev Event) {
 }
 
 // Lookup returns replicas holding the requested prefix (exact hash match within
-// the same hash_scheme), ranked by matched tokens × freshness, best first.
-// Empty result means "no hint" — the caller fails open.
+// the same hash_scheme), ranked by the ranking-v2 score:
+//
+//	score = matchedTokens × freshness × pressureFactor × sloBias
+//
+// pressureFactor folds in ReplicaStats.Pressure when the replica has stats
+// reported in this (tenant, model) (otherwise 1 — a replica with no stats
+// is treated as unloaded). sloBias kicks in when the request's TTFT budget
+// is below RankerConfig.SLOTightTTFTMs, biasing toward fresher candidates.
+// With pressure=0 and no SLO hint, score reduces to matchedTokens × freshness
+// (the B6 baseline). Empty result means "no hint" — the caller fails open.
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	// Without a known hash_scheme, the opaque prefix_hash cannot be matched
 	// safely (it would span engines), so fail open with no hint.
@@ -312,6 +415,7 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	}
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
+	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
@@ -321,9 +425,15 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
+		pressure := float32(0)
+		if s, ok := i.stats[statsKey{req.Tenant, req.Model, id}]; ok {
+			pressure = s.stats.Pressure
+		}
+		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
+		sloBias := 1 + fresh*sloBiasFactor
 		scores = append(scores, ReplicaScore{
 			ReplicaID:             id,
-			Score:                 float32(e.tokenCount) * fresh,
+			Score:                 float32(e.tokenCount) * fresh * pressureFactor * sloBias,
 			MatchedTokens:         e.tokenCount,
 			EstimatedCacheHitProb: fresh,
 		})
@@ -337,6 +447,109 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 		return scores[a].ReplicaID < scores[b].ReplicaID // stable, deterministic
 	})
 	return scores
+}
+
+// LookupRoute is the orchestrated ranking entrypoint used by the gRPC
+// LookupRoute handler. It runs the prefix-match path first; on a miss it
+// falls back to TENANT_HOT (replicas warm for this tenant+model). The
+// returned Strategy tells the handler which contract reason_code to emit
+// (PREFIX_MATCH | TENANT_HOT | NO_HINT) — keeping that decision in the
+// index keeps the ranker pluggable and the handler stateless.
+//
+// TENANT_HOT is intentionally a SOFTER hint than PREFIX_MATCH: there is no
+// prefix overlap, so MatchedTokens is 0 and the gateway is free to ignore.
+func (i *Index) LookupRoute(req LookupRequest) LookupResult {
+	if scores := i.Lookup(req); len(scores) > 0 {
+		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}
+	}
+	if hot := i.tenantHotCandidates(req); len(hot) > 0 {
+		return LookupResult{Scores: hot, Strategy: StrategyTenantHot}
+	}
+	return LookupResult{Strategy: StrategyNone}
+}
+
+// tenantHotCandidates returns replicas warm for (tenant, model) — used when
+// the exact-prefix path returns nothing. "Warm" = stats reported within
+// RankerConfig.TenantHotMaxAge AND hit_rate ≥ TenantHotMinHitRate. The
+// fallback is gated on TenantHotMaxAge > 0 so RankerConfig{} disables it
+// entirely (back to NO_HINT on prefix-miss). The score uses hit_rate as the
+// locality proxy (in place of matched_tokens, which is zero by definition
+// here) and reuses the same pressure/SLO factors as the prefix-match path
+// so a tight-SLO caller still gets a freshness-biased ranking.
+func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
+	if i.ranker.TenantHotMaxAge <= 0 {
+		return nil
+	}
+	now := i.now()
+	maxAge := i.ranker.TenantHotMaxAge
+	minHitRate := i.ranker.TenantHotMinHitRate
+	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
+
+	i.mu.RLock()
+	var scores []ReplicaScore
+	for sk, s := range i.stats {
+		if sk.tenant != req.Tenant || sk.model != req.Model {
+			continue
+		}
+		age := now.Sub(s.lastSeen)
+		if age >= maxAge {
+			continue
+		}
+		if s.stats.HitRate < minHitRate {
+			continue
+		}
+		// Recency decays from 1 (just seen) to 0 (>= maxAge old). Same shape
+		// as freshness in the prefix-match path so the same SLO/pressure
+		// factors compose cleanly.
+		recency := 1 - float32(age)/float32(maxAge)
+		pressureFactor := pressureFactorAt(s.stats.Pressure, i.ranker.PressureWeight)
+		sloBias := 1 + recency*sloBiasFactor
+		scores = append(scores, ReplicaScore{
+			ReplicaID: sk.replicaID,
+			Score:     s.stats.HitRate * recency * pressureFactor * sloBias,
+			// No prefix matched in this strategy — leave MatchedTokens at 0
+			// so a downstream "best prefix hit" guard never mistakes a hot
+			// tenant signal for a prefix overlap.
+			MatchedTokens:         0,
+			EstimatedCacheHitProb: s.stats.HitRate,
+		})
+	}
+	i.mu.RUnlock()
+
+	sort.Slice(scores, func(a, b int) bool {
+		if scores[a].Score != scores[b].Score {
+			return scores[a].Score > scores[b].Score
+		}
+		return scores[a].ReplicaID < scores[b].ReplicaID
+	})
+	return scores
+}
+
+// sloTightBiasCoefficient returns the coefficient applied to the freshness
+// term inside (1 + freshness × coefficient). 0 → no bias (baseline). The
+// bias only fires when (a) the ranker has SLOTightTTFTMs and SLOTightBias
+// configured AND (b) the request carries a TTFT budget below the threshold.
+func (i *Index) sloTightBiasCoefficient(ttftMs int32) float32 {
+	if i.ranker.SLOTightTTFTMs <= 0 || i.ranker.SLOTightBias <= 0 {
+		return 0
+	}
+	if ttftMs <= 0 || ttftMs >= i.ranker.SLOTightTTFTMs {
+		return 0
+	}
+	return i.ranker.SLOTightBias
+}
+
+// pressureFactorAt computes 1 - weight × pressure, clamped to [0, 1]. Kept
+// pure so the prefix-match and tenant-hot scorers compute it identically.
+func pressureFactorAt(pressure, weight float32) float32 {
+	f := 1 - weight*pressure
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
 }
 
 // CacheState returns the per-replica stats and the distinct-prefix count for a

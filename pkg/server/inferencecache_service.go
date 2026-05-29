@@ -11,8 +11,11 @@ import (
 )
 
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
+// String, not enum — forward-compat per the gRPC contract decision (a new
+// code is a server-only addition; old clients degrade to NO_HINT).
 const (
 	reasonPrefixMatch = "PREFIX_MATCH"
+	reasonTenantHot   = "TENANT_HOT"
 	reasonNoHint      = "NO_HINT"
 	reasonOK          = "OK"
 )
@@ -41,23 +44,38 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 }
 
 // LookupRoute consults the index for replicas holding the request's prefix and
-// returns them ranked. No match → empty scores + NO_HINT (fail open).
+// returns them ranked. The index runs the ranking-v2 orchestrator
+// (index.LookupRoute) which:
+//
+//   - Scores exact prefix-hash matches with the pressure-aware and SLO-aware
+//     formula and returns them as StrategyPrefixMatch → reason_code
+//     PREFIX_MATCH.
+//   - On a prefix miss, falls back to tenant-warm replicas
+//     (StrategyTenantHot → reason_code TENANT_HOT). This is a softer locality
+//     hint than PREFIX_MATCH and the gateway is free to use or ignore it.
+//   - Returns no candidates (StrategyNone → NO_HINT, the fail-open default).
+//
+// The handler stays stateless about ranking — index.LookupRoute owns the
+// strategy decision; this layer just translates Strategy into the reason_code
+// vocabulary and shapes the proto envelope.
 func (s *inferenceCacheService) LookupRoute(_ context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
 	start := time.Now()
 
-	scores := s.index.Lookup(index.LookupRequest{
-		Model:      req.GetModelId(),
-		Tenant:     req.GetTenantId(),
-		HashScheme: req.GetHashScheme(),
-		PrefixHash: req.GetPrefixHash(),
-		TokenCount: req.GetPrefixTokenCount(),
+	slo := req.GetSlo()
+	result := s.index.LookupRoute(index.LookupRequest{
+		Model:        req.GetModelId(),
+		Tenant:       req.GetTenantId(),
+		HashScheme:   req.GetHashScheme(),
+		PrefixHash:   req.GetPrefixHash(),
+		TokenCount:   req.GetPrefixTokenCount(),
+		TTFTBudgetMs: slo.GetTtftMs(),
+		TBTBudgetMs:  slo.GetTbtMs(),
 	})
 
-	resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
-	if len(scores) > 0 {
-		resp.ReasonCode = reasonPrefixMatch
-		resp.ReplicaScores = make([]*icpb.ReplicaScore, 0, len(scores))
-		for _, sc := range scores {
+	resp := &icpb.LookupRouteResponse{ReasonCode: reasonForStrategy(result.Strategy)}
+	if len(result.Scores) > 0 {
+		resp.ReplicaScores = make([]*icpb.ReplicaScore, 0, len(result.Scores))
+		for _, sc := range result.Scores {
 			resp.ReplicaScores = append(resp.ReplicaScores, &icpb.ReplicaScore{
 				ReplicaId:             sc.ReplicaID,
 				Score:                 sc.Score,
@@ -69,8 +87,24 @@ func (s *inferenceCacheService) LookupRoute(_ context.Context, req *icpb.LookupR
 
 	elapsed := time.Since(start)
 	resp.LookupLatencyUs = elapsed.Microseconds()
-	s.metrics.observeLookup(req.GetModelId(), resp.ReasonCode, len(scores) > 0, elapsed)
+	s.metrics.observeLookup(req.GetModelId(), resp.ReasonCode, len(result.Scores) > 0, elapsed)
 	return resp, nil
+}
+
+// reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's
+// reason_code vocabulary. StrategyNone collapses to NO_HINT — the fail-open
+// default; an unknown strategy is treated the same so a future Strategy
+// addition (e.g. block-level matching) won't surface as a junk reason code
+// before its mapping ships.
+func reasonForStrategy(s index.Strategy) string {
+	switch s {
+	case index.StrategyPrefixMatch:
+		return reasonPrefixMatch
+	case index.StrategyTenantHot:
+		return reasonTenantHot
+	default:
+		return reasonNoHint
+	}
 }
 
 // LookupPDRoute: prefill/decode routing is Phase 2 — fail open.
