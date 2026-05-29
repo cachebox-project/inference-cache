@@ -703,16 +703,22 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	if req.HashScheme == "" {
 		return LookupResult{Strategy: StrategyNone}
 	}
-	// Malformed chain (mismatched parallel-array lengths, or one-sided
-	// chain-without-counts / counts-without-chain) must hard-fail to
-	// NO_HINT — not fall through to TENANT_HOT. The chain-bearing request
-	// is a positive assertion of the form the producer expects; downgrading
-	// it to a softer locality nudge would surface a hint against an
-	// unrelated tenant-warm replica, which is worse than no hint.
-	if len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0 {
+	// Chain-bearing requests short-circuit on ANY chain failure (malformed
+	// parallel arrays OR a well-formed chain with zero overlap) — never
+	// fall through to TENANT_HOT. The chain caller is asking specifically
+	// for longest-prefix matching; surfacing an unrelated tenant-warm
+	// replica as a soft locality nudge would be a wrong hint against what
+	// they explicitly requested. The contract doc spells this out:
+	// "NO_HINT when no replica matches the first block."
+	chainBearing := len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0
+	if chainBearing {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return LookupResult{Strategy: StrategyNone}
 		}
+		if scores := i.Lookup(req); len(scores) > 0 {
+			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}
+		}
+		return LookupResult{Strategy: StrategyNone}
 	}
 	if scores := i.Lookup(req); len(scores) > 0 {
 		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}

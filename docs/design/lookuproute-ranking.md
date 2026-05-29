@@ -206,12 +206,13 @@ backup if A is overloaded.
   malformed: dropped on ingest, `NO_HINT` on lookup. The handler does
   not silently downgrade to legacy exact-match — a stale hint is fine,
   a wrong hint is not.
-- **Chain-only request with the `minimumPrefixTokens` gate active.**
-  The handler uses `effectivePrefixTokens(req)` — falls back to
-  `sum(block_token_counts)` when the legacy `prefix_token_count` is
-  zero — so a chain-only caller is gated on its real token budget
-  rather than being short-circuited to `NO_HINT` against any positive
-  threshold.
+- **Chain-only or chain-plus-legacy request with the `minimumPrefixTokens`
+  gate active.** The handler uses `effectivePrefixTokens(req)`, which
+  gives the chain precedence: when `block_token_counts` is set the
+  gate uses `sum(block_token_counts)`; only when the chain is empty
+  does it fall back to the legacy `prefix_token_count`. A chain-bearing
+  request is therefore gated on what the chain actually reports — a
+  co-set stale legacy count cannot let it through nor zero it out.
 
 ### Engine-opaque + parent-chain assumption
 

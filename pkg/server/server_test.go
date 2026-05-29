@@ -911,3 +911,34 @@ func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot is the symmetric
+// guard to TestLookupRouteMalformedChainNeverFallsThroughToTenantHot: a
+// chain-bearing request with no first-block match must hard-stop at NO_HINT,
+// not surface a TENANT_HOT hint against an unrelated warm replica. The
+// chain caller asked specifically for longest-prefix matching; a soft
+// locality nudge is not what they requested and "no overlap → NO_HINT" is
+// the documented contract.
+func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("q1"), []byte("q2")},
+		BlockTokenCounts: []int32{16, 16}, // well-formed, but nobody holds q1
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — chain miss must not be downgraded to TENANT_HOT (got %d unrelated warm-tenant hint(s))", resp.GetReasonCode(), len(resp.GetReplicaScores()))
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("chain miss must not return any scores, got %+v", resp.GetReplicaScores())
+	}
+}
