@@ -196,6 +196,14 @@ type statsKey struct {
 	replicaID string
 }
 
+// scopeKey identifies a (tenant, model, hash_scheme) — the engine domain
+// granularity TENANT_HOT needs for its serving-membership check.
+type scopeKey struct {
+	tenant     string
+	model      string
+	hashScheme string
+}
+
 type replicaEntry struct {
 	tokenCount int32
 	lastSeen   time.Time
@@ -221,6 +229,14 @@ type Index struct {
 	prefixes     map[prefixKey]map[string]replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
+
+	// servingByScope counts, for each (tenant, model, hash_scheme), how many
+	// distinct prefix entries each replica currently holds. It exists purely
+	// to give the TENANT_HOT fallback an O(1) "does replica R serve scope S?"
+	// check instead of scanning the whole prefixes map on every prefix miss.
+	// The count goes up on Ingest of a new (scope, replica, prefix), down on
+	// removeReplicaLocked, and the entry is dropped when the count hits 0.
+	servingByScope map[scopeKey]map[string]int
 
 	// reportMu guards reportedModels, the set of models last pushed to the
 	// metrics sink — used to zero a model's gauge when it drains to empty.
@@ -262,6 +278,7 @@ func New(opts ...Option) *Index {
 		ranker:         DefaultRankerConfig(),
 		prefixes:       make(map[prefixKey]map[string]replicaEntry),
 		stats:          make(map[statsKey]statEntry),
+		servingByScope: make(map[scopeKey]map[string]int),
 		reportedModels: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
@@ -328,6 +345,11 @@ func (i *Index) Ingest(u Update) {
 			}
 			if _, existed := replicas[u.ReplicaID]; !existed {
 				i.totalEntries++
+				// Bump the (tenant, model, hash_scheme) → replica serving
+				// count so tenantHotCandidates can answer in O(1). Only
+				// increment on a *new* (replica, prefix) entry: a refresh
+				// of an existing one doesn't add a new prefix.
+				i.scopeIncLocked(scopeKey{u.Tenant, u.Model, u.HashScheme}, u.ReplicaID)
 			}
 			replicas[u.ReplicaID] = replicaEntry{tokenCount: p.TokenCount, lastSeen: ts}
 		}
@@ -425,8 +447,15 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
+		// Only fold in pressure when the replica's stats are themselves
+		// still fresh under the global TTL. Stats expire only on the sweep,
+		// so a refresh of the prefix entry can race with a stale stats
+		// record and otherwise demote (or zero) a perfectly fresh replica
+		// for no good reason. Mirror Lookup's prefix freshness rule on
+		// the stats side so the two stay symmetric.
 		pressure := float32(0)
-		if s, ok := i.stats[statsKey{req.Tenant, req.Model, id}]; ok {
+		if s, ok := i.stats[statsKey{req.Tenant, req.Model, id}]; ok &&
+			i.freshness(now, s.lastSeen) > 0 {
 			pressure = s.stats.Pressure
 		}
 		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
@@ -547,30 +576,21 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		return nil
 	}
 
-	// Pass 2: only now scan i.prefixes to confirm each warm replica actually
-	// serves the requested (tenant, model, hash_scheme) engine domain with a
-	// FRESH prefix entry. A stale prefix entry (past TTL but not yet swept)
-	// is not proof of current serving — Lookup applies the same freshness
-	// filter to score replicas, so the TENANT_HOT path mirrors that rule.
-	serving := make(map[string]struct{})
-	for key, replicas := range i.prefixes {
-		if key.tenant != req.Tenant || key.model != req.Model || key.hashScheme != req.HashScheme {
-			continue
-		}
-		for id, e := range replicas {
-			if _, ok := warm[id]; !ok {
-				continue // not warm anyway — skip the freshness compute
-			}
-			if i.freshness(now, e.lastSeen) <= 0 {
-				continue // stale prefix entry — not proof of current serving
-			}
-			serving[id] = struct{}{}
-		}
+	// Pass 2: confirm each warm replica actually serves the requested
+	// (tenant, model, hash_scheme) engine domain. The secondary
+	// servingByScope index gives this in O(1) per replica — no full scan
+	// of i.prefixes — so the hot path stays bounded by the number of warm
+	// replicas (typically tens). Stale prefix entries don't leak in:
+	// removeReplicaLocked decrements the count when a prefix is evicted
+	// (either by sweep or by event), so the count tracks live entries.
+	serving := i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}]
+	if len(serving) == 0 {
+		return nil
 	}
 
-	scores := make([]ReplicaScore, 0, len(serving))
+	scores := make([]ReplicaScore, 0, len(warm))
 	for id, w := range warm {
-		if _, ok := serving[id]; !ok {
+		if serving[id] == 0 {
 			continue
 		}
 		age := now.Sub(w.lastSeen)
@@ -769,6 +789,40 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
 	}
+	// Drop the replica from the (tenant, model, hash_scheme) serving count
+	// in lockstep with the prefix removal so TENANT_HOT's O(1) check stays
+	// consistent with what's actually in i.prefixes.
+	i.scopeDecLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
+}
+
+// scopeIncLocked increments the (scope, replica) serving count, creating
+// the inner map on first sight. Caller holds the write lock.
+func (i *Index) scopeIncLocked(scope scopeKey, replicaID string) {
+	m := i.servingByScope[scope]
+	if m == nil {
+		m = make(map[string]int)
+		i.servingByScope[scope] = m
+	}
+	m[replicaID]++
+}
+
+// scopeDecLocked decrements the (scope, replica) serving count and removes
+// the entry once it reaches zero (and the outer scope once it's empty), so
+// the map doesn't accumulate dead keys. Caller holds the write lock.
+func (i *Index) scopeDecLocked(scope scopeKey, replicaID string) {
+	m := i.servingByScope[scope]
+	if m == nil {
+		return
+	}
+	n := m[replicaID] - 1
+	if n <= 0 {
+		delete(m, replicaID)
+		if len(m) == 0 {
+			delete(i.servingByScope, scope)
+		}
+		return
+	}
+	m[replicaID] = n
 }
 
 // evictExpired removes entries older than the TTL. Runs on the sweep loop.

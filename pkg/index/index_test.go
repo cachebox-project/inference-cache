@@ -813,36 +813,84 @@ func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 	}
 }
 
-// TestTenantHotRequiresFreshServingPrefixEntry guards the freshness rule on
-// the engine-domain check: a prefix entry that is past the index TTL (not
-// yet swept) does NOT count as proof the replica is currently serving the
-// requested scheme. Lookup filters stale prefix entries via freshness <= 0;
-// tenantHotCandidates mirrors that rule so the two strategies treat staleness
-// identically. The replica below is recently warm by stats but its prefix
-// entry has aged past the TTL — TENANT_HOT must NOT promote it.
-func TestTenantHotRequiresFreshServingPrefixEntry(t *testing.T) {
+// TestTenantHotDropsReplicaAfterPrefixSweep guards that the TENANT_HOT
+// fallback stops promoting a replica once the sweeper has evicted its last
+// serving prefix entry. The secondary servingByScope index gives TENANT_HOT
+// an O(1) "does R serve scope S?" check; removeReplicaLocked must keep it
+// consistent with i.prefixes, so a stale entry that's been swept no longer
+// counts as proof of serving. (Before the sweep runs, soft-state semantics
+// allow a stale entry to keep the replica "serving" — at worst a suboptimal
+// hint, not a wrong answer; the sweep then cleans it.)
+func TestTenantHotDropsReplicaAfterPrefixSweep(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(11_500_000, 0)}
 	cfg := DefaultRankerConfig()
 	cfg.TenantHotMaxAge = time.Hour // warm window much wider than the TTL
 	idx := New(withClock(clk.now), WithTTL(10*time.Minute), WithRanker(cfg))
 
-	// Ingest the prefix entry first (it will go stale).
+	// Ingest a serving prefix; with warm stats this replica qualifies.
 	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}}})
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.9}})
 
-	// Advance past the TTL so the prefix entry is stale, but NOT past the
-	// TenantHotMaxAge — so the stats refresh below is still "recent".
+	// Sanity: pre-sweep the replica is a TENANT_HOT candidate.
+	if res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t",
+		HashScheme: "vllm", PrefixHash: hash("novel")}); res.Strategy != StrategyTenantHot {
+		t.Fatalf("pre-sweep should be TENANT_HOT, got %v", res.Strategy)
+	}
+
+	// Advance past the prefix TTL but NOT past TenantHotMaxAge, then refresh
+	// stats so the stats entry stays warm/recent. The prefix entry is now
+	// stale but not yet swept — soft-state semantics tolerate one more hint.
 	clk.add(15 * time.Minute)
-
-	// Refresh stats only (no new prefix entry, so the existing one stays stale).
 	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Stats: &ReplicaStats{HitRate: 0.9}})
+
+	// Run the sweep: the stale prefix is removed from i.prefixes AND from
+	// the servingByScope secondary index (via removeReplicaLocked). The
+	// stats are still fresh under TenantHotMaxAge, but the replica is no
+	// longer serving the requested scheme → TENANT_HOT must NOT fire.
+	idx.evictExpired()
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
-		t.Fatalf("stale serving prefix must NOT enable TENANT_HOT; got %v (%+v)",
+		t.Fatalf("after sweep, replica with no live serving prefix must NOT enable TENANT_HOT; got %v (%+v)",
 			res.Strategy, res.Scores)
+	}
+}
+
+// TestLookupIgnoresStaleStatsPressurePenalty guards a symmetric freshness
+// rule for the prefix-match path: a stats entry that has aged past the
+// index TTL (but not yet swept) must NOT demote a freshly refreshed prefix
+// score. Otherwise a high-pressure reading from minutes ago could zero a
+// replica that's actually idle right now, just because the sweeper hasn't
+// run yet. The fresh-prefix replica below has stale high-pressure stats;
+// its score must equal the unpenalized baseline (matched_tokens × freshness).
+func TestLookupIgnoresStaleStatsPressurePenalty(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(12_000_000, 0)}
+	idx := New(withClock(clk.now), WithTTL(10*time.Minute), WithRanker(DefaultRankerConfig()))
+
+	// Ingest stats first: high pressure, will be stale by the time the
+	// prefix is refreshed and looked up.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{Pressure: 0.9}})
+
+	// Advance past the stats freshness window.
+	clk.add(15 * time.Minute)
+
+	// Now ingest a fresh prefix entry. The stats are stale at this point.
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("p")})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 score, got %d (%+v)", len(got), got)
+	}
+	// Stale pressure must NOT be applied. Score should equal the baseline
+	// (50 tokens × 1.0 freshness × 1.0 pressure factor × 1.0 SLO bias) = 50.
+	if got[0].Score != 50 {
+		t.Fatalf("stale pressure leaked into score: got %v, want 50 (no penalty)", got[0].Score)
 	}
 }
 
