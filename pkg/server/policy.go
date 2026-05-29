@@ -35,10 +35,11 @@ type ResolvedPolicy struct {
 }
 
 // PolicySnapshot is the full set of CachePolicies the controller pushes on
-// each reconcile. Replace-on-write: the controller is the source of truth,
-// so the server discards its prior state and adopts the new snapshot. A
-// CachePolicy that disappears between snapshots reverts that namespace to
-// the server default.
+// each reconcile. Pushed via POST to /policy (PUT is accepted too for
+// callers that prefer it). Replace-on-write: the controller is the source
+// of truth, so the server discards its prior state and adopts the new
+// snapshot. A CachePolicy that disappears between snapshots reverts that
+// namespace to the server default.
 type PolicySnapshot struct {
 	Version  int              `json:"version"`
 	Policies []ResolvedPolicy `json:"policies"`

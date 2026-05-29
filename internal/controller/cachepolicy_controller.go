@@ -34,9 +34,10 @@ const DefaultPolicyPushInterval = 30 * time.Second
 // Push semantics: on every Reconcile (a CachePolicy create/update/delete)
 // AND on a periodic tick the reconciler lists all CachePolicies in the
 // cluster, flattens them into ResolvedPolicy entries (one per namespace,
-// keyed by the CR's namespace), and PUTs the full snapshot. The server
+// keyed by the CR's namespace), and POSTs the full snapshot. The server
 // adopts replace-on-write so a deleted CachePolicy reverts its namespace
-// to server defaults.
+// to server defaults. (The server accepts PUT too, for callers that
+// prefer that idempotent verb.)
 //
 // The reconciler intentionally never modifies CachePolicy.status — that
 // surface is reserved for future status writers (e.g. propagation health).
