@@ -191,10 +191,12 @@ func (s *MetricsScraper) consumeHitRate(hits, queries float64) float64 {
 
 // selectUsage picks the active cache-usage gauge given the tier policy. Returns
 // the chosen value plus a flag indicating whether a value was actually present.
-// CacheTierAuto probes kv → gpu → cpu in order and returns the first present
-// (so the scraper handles both modern vLLM 0.21+ — which exposes one unified
-// `vllm:kv_cache_usage_perc` — and older builds without operator action).
-// Explicit tier values pin the lookup to that one metric.
+//
+// CacheTierAuto picks the unified `vllm:kv_cache_usage_perc` if present (the
+// vLLM 0.21+ canonical metric) and otherwise takes max(gpu, cpu) across the
+// legacy gauges — legacy vLLM exposed both series and the inactive tier reads
+// 0, so max() collapses to whichever tier is active. Explicit tier values pin
+// the lookup to one metric.
 func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily) (float64, bool) {
 	switch tier {
 	case CacheTierKV:
@@ -204,11 +206,22 @@ func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily) (float64
 	case CacheTierCPU:
 		return singleGaugeValue(families, metricCPUUsage)
 	}
-	// CacheTierAuto (or unset, defaulted upstream): fallback chain.
-	for _, name := range []string{metricKVUsage, metricGPUUsage, metricCPUUsage} {
-		if v, ok := singleGaugeValue(families, name); ok {
-			return v, true
+	// CacheTierAuto.
+	if v, ok := singleGaugeValue(families, metricKVUsage); ok {
+		return v, true
+	}
+	gpu, haveGPU := singleGaugeValue(families, metricGPUUsage)
+	cpu, haveCPU := singleGaugeValue(families, metricCPUUsage)
+	switch {
+	case haveGPU && haveCPU:
+		if gpu >= cpu {
+			return gpu, true
 		}
+		return cpu, true
+	case haveGPU:
+		return gpu, true
+	case haveCPU:
+		return cpu, true
 	}
 	return 0, false
 }

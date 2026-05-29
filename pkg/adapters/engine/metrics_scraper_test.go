@@ -147,6 +147,27 @@ func TestScraperMissingMetricsDegradeGracefully(t *testing.T) {
 	}
 }
 
+func TestScraperLegacyCPUWithZeroGPU(t *testing.T) {
+	// Legacy vLLM exposes both `vllm:gpu_cache_usage_perc` and
+	// `vllm:cpu_cache_usage_perc`; the inactive tier reads 0. Auto-tier must
+	// pick the non-zero one, not stop at the first present in lookup order.
+	srv := fixtureServer(t, "vllm_metrics_legacy_cpu.txt")
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{
+		URL: srv.URL, Tier: CacheTierAuto, CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 256,
+	}, nil)
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	cap1GiB := float64(int64(1) << 30)
+	wantBytes := int64(cap1GiB * 0.42)
+	if got := stats.GetCacheMemoryBytes(); got < wantBytes-2 || got > wantBytes+2 {
+		t.Errorf("cacheMemoryBytes = %d, want ~%d (active legacy tier is CPU, gpu=0)", got, wantBytes)
+	}
+}
+
 func TestScraperLegacyGPUFallback(t *testing.T) {
 	// Legacy vLLM (pre-0.21) exposes vllm:gpu_cache_usage_perc instead of
 	// vllm:kv_cache_usage_perc. Auto-tier must fall through to it.
