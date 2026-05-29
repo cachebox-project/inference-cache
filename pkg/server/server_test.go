@@ -376,8 +376,8 @@ func TestInferenceCacheServiceOverGRPC(t *testing.T) {
 // reflection over the wire and asserts the server enumerates both registered
 // services (InferenceCache + grpc.health.v1.Health) without the client having
 // to ship the .proto. This is the test gate for the operator-tooling promise —
-// grpcurl/grpc_health_probe must work against a running policy server without
-// `-proto` flags.
+// grpcurl list/describe and grpcurl generic-call must work against a running
+// policy server without `-proto` flags.
 func TestGRPCServerReflectionEnumeratesRegisteredServices(t *testing.T) {
 	conn, _, stop := startInProcessServerConn(t)
 	defer stop()

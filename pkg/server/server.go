@@ -57,9 +57,11 @@ func New() *Service {
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics, policies))
-	// Register gRPC server reflection so operators can use grpcurl,
-	// grpc_health_probe, and similar debug tooling without shipping the .proto.
-	// Reflection exposes only the service schema, never KV or prompt data.
+	// Register gRPC server reflection so operators can use grpcurl
+	// (list / describe / generic call) and similar schema-aware debug tooling
+	// without shipping the .proto. Reflection exposes only the service schema,
+	// never KV or prompt data. grpc_health_probe is unrelated — it speaks the
+	// standard grpc.health.v1 service and does not need reflection.
 	reflection.Register(grpcServer)
 
 	mux := http.NewServeMux()
