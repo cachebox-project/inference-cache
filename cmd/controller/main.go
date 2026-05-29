@@ -43,7 +43,9 @@ type options struct {
 	enableLeaderElection   bool
 	probeAddr              string
 	serverSnapshotURL      string
+	serverPolicyURL        string
 	cacheIndexRefreshEvery time.Duration
+	policyPushEvery        time.Duration
 	zapOpts                zap.Options
 }
 
@@ -54,7 +56,9 @@ func defaultOptions() options {
 		secureMetrics:          false,
 		enableHTTP2:            false,
 		serverSnapshotURL:      "http://inference-cache-server:8080/snapshot",
+		serverPolicyURL:        "http://inference-cache-server:8080/policy",
 		cacheIndexRefreshEvery: controller.DefaultRefreshInterval,
+		policyPushEvery:        controller.DefaultPolicyPushInterval,
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
 		},
@@ -69,7 +73,9 @@ func parseOptions() options {
 	flag.BoolVar(&opts.enableLeaderElection, "leader-elect", opts.enableLeaderElection, "Enable leader election for controller manager.")
 	flag.StringVar(&opts.probeAddr, "health-probe-bind-address", opts.probeAddr, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.serverSnapshotURL, "server-snapshot-url", opts.serverSnapshotURL, "URL of the cache server's /snapshot endpoint, scraped to populate the CacheIndex status.")
+	flag.StringVar(&opts.serverPolicyURL, "server-policy-url", opts.serverPolicyURL, "URL of the cache server's /policy endpoint, the controller PUSHES resolved CachePolicy snapshots to.")
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
+	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -121,6 +127,16 @@ func main() {
 		Interval:    opts.cacheIndexRefreshEvery,
 	}); err != nil {
 		setupLog.Error(err, "unable to add CacheIndex poller")
+		os.Exit(1)
+	}
+
+	if err := (&controller.CachePolicyReconciler{
+		Client:          mgr.GetClient(),
+		Log:             ctrl.Log.WithName("controllers").WithName("CachePolicy"),
+		ServerPolicyURL: opts.serverPolicyURL,
+		PushInterval:    opts.policyPushEvery,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "CachePolicy")
 		os.Exit(1)
 	}
 

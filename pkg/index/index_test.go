@@ -416,3 +416,107 @@ func TestIngestSanitizesNegativeInfinity(t *testing.T) {
 		t.Fatalf("-Inf HitRate should be clamped to 0, got %+v", replicas)
 	}
 }
+
+// staticTTL is a TTLResolver returning fixed per-tenant TTLs for tests.
+type staticTTL map[string]time.Duration
+
+func (s staticTTL) TTL(tenant string) time.Duration { return s[tenant] }
+
+func TestPerTenantTTLDrivesFreshnessAndEviction(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(4_000_000, 0)}
+	// Global TTL is long; tenant-short overrides to 5m, tenant-long uses default.
+	resolver := staticTTL{"tenant-short": 5 * time.Minute}
+	idx := New(
+		withClock(clk.now),
+		WithTTL(time.Hour),
+		WithTTLResolver(resolver),
+	)
+
+	for _, tenant := range []string{"tenant-short", "tenant-long"} {
+		idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: tenant, HashScheme: "vllm",
+			Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}}})
+	}
+
+	// Advance 10m: tenant-short's TTL (5m) has elapsed; tenant-long's (1h) has not.
+	clk.add(10 * time.Minute)
+
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "tenant-short", HashScheme: "vllm", PrefixHash: hash("p")}); len(got) != 0 {
+		t.Fatalf("tenant-short entry should be stale under 5m TTL, got %+v", got)
+	}
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "tenant-long", HashScheme: "vllm", PrefixHash: hash("p")}); len(got) != 1 {
+		t.Fatalf("tenant-long entry should still be fresh under 1h TTL, got %+v", got)
+	}
+
+	// Eviction sweep removes only tenant-short; tenant-long survives.
+	idx.evictExpired()
+	if n := idx.EntryCountsByModel()["m"]; n != 1 {
+		t.Fatalf("after sweep, only tenant-long should remain (count = %d, want 1)", n)
+	}
+}
+
+func TestNilTTLResolverFallsBackToGlobalTTL(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(4_500_000, 0)}
+	idx := New(withClock(clk.now), WithTTL(time.Hour), WithTTLResolver(staticTTL{}))
+
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "anything", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}}})
+
+	clk.add(30 * time.Minute) // half the global TTL → still fresh
+	if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "anything", HashScheme: "vllm", PrefixHash: hash("p")}); len(got) != 1 {
+		t.Fatalf("resolver returning 0 should fall back to global TTL (entry should be fresh), got %+v", got)
+	}
+}
+
+// dynamicTTL exposes a setter so the test can mutate while the index reads.
+type dynamicTTL struct {
+	mu sync.RWMutex
+	v  time.Duration
+}
+
+func (d *dynamicTTL) set(v time.Duration) {
+	d.mu.Lock()
+	d.v = v
+	d.mu.Unlock()
+}
+func (d *dynamicTTL) TTL(string) time.Duration {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.v
+}
+
+// TestConcurrentTTLResolverMutation hammers Lookup while a writer flips the
+// per-tenant TTL — the race detector catches a missing lock in the resolver
+// path.
+func TestConcurrentTTLResolverMutation(t *testing.T) {
+	r := &dynamicTTL{v: time.Hour}
+	idx := New(WithTTL(time.Hour), WithTTLResolver(r))
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}}})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 200; i++ {
+		if i%2 == 0 {
+			r.set(time.Minute)
+		} else {
+			r.set(time.Hour)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
