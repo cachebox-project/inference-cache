@@ -1,0 +1,64 @@
+# Per-PR install smoke for `kubectl apply -k config/default`.
+#
+# Runs docs/reference-stack/scripts/default_install_smoke.sh: builds controller
+# + server images at the PR SHA, brings up a kind cluster, installs
+# cert-manager, applies the default overlay with the SHA-tagged images, and
+# asserts:
+#   - controller-manager + server Deployments reach Available
+#   - cacheindex/cluster-default.status.observedServer is populated (proves the
+#     controller's CacheIndex poller is talking to the server's /snapshot)
+#   - gRPC LookupRoute returns reason_code=NO_HINT (fail-open default)
+#
+# Lightweight (two distroless ~30 MB images + cert-manager), so it runs on
+# every PR. Sister-canaries (c2-reconciler-canary, c6-engine-wiring-canary,
+# cpu-substrate-canary) cover real engine pods + cross-pod cache reuse with
+# multi-GB images; they stay schedule-only.
+name: default-install-smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install-smoke:
+    runs-on: ubuntu-latest
+    # Script targets ~5 min end-to-end; the timeout is a circuit breaker for a
+    # wedged kind cluster / image pull, not the expected runtime.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
+        with:
+          install_only: true
+
+      - name: Install grpcurl
+        run: go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
+
+      - name: Run default-install smoke
+        env:
+          TAG: ${{ github.sha }}
+        run: docs/reference-stack/scripts/default_install_smoke.sh
+
+      - name: Upload install-smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: default-install-smoke-logs
+          path: /tmp/install-smoke-logs/
+          if-no-files-found: ignore
