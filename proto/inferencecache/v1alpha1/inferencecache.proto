@@ -12,8 +12,8 @@ option go_package = "github.com/cachebox-project/inference-cache/pkg/server/prot
 //     side-effect-free apart from emitting metrics.
 //   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
 //     treat it as a no-op and route as they normally would.
-//   - prefix_hash bytes are engine-defined and only matched within a matching
-//     hash_scheme; the server never interprets them.
+//   - prefix_hash and block_hashes bytes are engine-defined and only matched
+//     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
 //     (template_ref, variables, template_revision).
 //   - CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or
@@ -60,6 +60,14 @@ message LookupRouteRequest {
   int32 prefix_token_count = 4;
   string hash_scheme = 5; // engine-defined compatibility tag
   SLO slo = 6;
+  // Engine-aligned ordered block-hash chain for longest-prefix matching. When
+  // non-empty the server walks the chain block-by-block and returns each
+  // replica's longest common leading run; matched_tokens reflects that run's
+  // token count. block_token_counts is parallel to block_hashes (same length,
+  // same order) — the per-block token count is used to compute matched_tokens.
+  // Empty (or length-mismatched) falls back to exact-match on prefix_hash.
+  repeated bytes block_hashes = 7;
+  repeated int32 block_token_counts = 8;
 }
 
 message ReplicaScore {
@@ -93,6 +101,15 @@ message LookupPDRouteResponse {
 message PrefixEntry {
   bytes prefix_hash = 1;
   int32 token_count = 2;
+  // Engine-aligned ordered chain of block hashes covered by this entry, paired
+  // with their per-block token counts (parallel arrays — same length, same
+  // order). Engines that hash per KV block (vLLM, SGLang) can report the chain
+  // here in a single entry; the server expands it into per-block index entries
+  // so longest-prefix lookups can compute the longest common leading run.
+  // Optional — entries that only set prefix_hash + token_count remain valid
+  // for exact-match indexing (legacy path).
+  repeated bytes block_hashes = 3;
+  repeated int32 block_token_counts = 4;
 }
 
 message ReplicaStats {

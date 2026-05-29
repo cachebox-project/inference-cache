@@ -46,11 +46,13 @@ func (s *inferenceCacheService) LookupRoute(_ context.Context, req *icpb.LookupR
 	start := time.Now()
 
 	scores := s.index.Lookup(index.LookupRequest{
-		Model:      req.GetModelId(),
-		Tenant:     req.GetTenantId(),
-		HashScheme: req.GetHashScheme(),
-		PrefixHash: req.GetPrefixHash(),
-		TokenCount: req.GetPrefixTokenCount(),
+		Model:            req.GetModelId(),
+		Tenant:           req.GetTenantId(),
+		HashScheme:       req.GetHashScheme(),
+		PrefixHash:       req.GetPrefixHash(),
+		TokenCount:       req.GetPrefixTokenCount(),
+		BlockHashes:      req.GetBlockHashes(),
+		BlockTokenCounts: req.GetBlockTokenCounts(),
 	})
 
 	resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
@@ -147,8 +149,10 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 	}
 	for _, p := range u.GetPrefixes() {
 		out.Prefixes = append(out.Prefixes, index.PrefixRef{
-			PrefixHash: p.GetPrefixHash(),
-			TokenCount: p.GetTokenCount(),
+			PrefixHash:       p.GetPrefixHash(),
+			TokenCount:       p.GetTokenCount(),
+			BlockHashes:      p.GetBlockHashes(),
+			BlockTokenCounts: p.GetBlockTokenCounts(),
 		})
 	}
 	if st := u.GetStats(); st != nil {

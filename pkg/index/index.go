@@ -41,9 +41,19 @@ type ReplicaStats struct {
 
 // PrefixRef is one prefix a replica reports holding: engine-opaque hash bytes
 // plus how many tokens that prefix covers.
+//
+// Engines that hash per KV block (vLLM, SGLang) may report the prefix as an
+// ordered chain of block hashes via BlockHashes + a parallel BlockTokenCounts
+// (same length, per-block). The index then stores one per-block entry per
+// hash so longest-prefix lookups can compute the longest common leading run.
+// When the chain fields are set the legacy PrefixHash / TokenCount are
+// ignored; entries that only set PrefixHash + TokenCount remain valid for
+// legacy exact-match indexing.
 type PrefixRef struct {
-	PrefixHash []byte
-	TokenCount int32
+	PrefixHash       []byte
+	TokenCount       int32
+	BlockHashes      [][]byte
+	BlockTokenCounts []int32
 }
 
 // Update is the authoritative state a replica reports (from ReportCacheState).
@@ -80,12 +90,20 @@ type Event struct {
 }
 
 // LookupRequest asks which replicas hold a given prefix, within a hash scheme.
+//
+// When BlockHashes is non-empty (and BlockTokenCounts has the same length),
+// the index walks the chain block-by-block and returns each replica's longest
+// common leading run; MatchedTokens reflects the sum of the request's
+// BlockTokenCounts up to the last matched block. Otherwise it falls back to
+// exact-match on PrefixHash (legacy path).
 type LookupRequest struct {
-	Model      string
-	Tenant     string
-	HashScheme string
-	PrefixHash []byte
-	TokenCount int32
+	Model            string
+	Tenant           string
+	HashScheme       string
+	PrefixHash       []byte
+	TokenCount       int32
+	BlockHashes      [][]byte
+	BlockTokenCounts []int32
 }
 
 // ReplicaScore is one ranked hint returned to the gateway. Higher score = better.
@@ -225,16 +243,21 @@ func (i *Index) Ingest(u Update) {
 	// do not index prefixes without one (fail open). Stats are scheme-independent.
 	if u.HashScheme != "" {
 		for _, p := range u.Prefixes {
-			key := prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}
-			replicas := i.prefixes[key]
-			if replicas == nil {
-				replicas = make(map[string]replicaEntry)
-				i.prefixes[key] = replicas
+			// Chain form: expand into one per-block entry per hash, keyed by
+			// the block hash with cumulative tokenCount so a legacy exact-match
+			// against any single block hash still works. Parallel arrays must
+			// have equal lengths; a length mismatch is dropped silently
+			// (fail-soft — a stale hint is preferable to a bad one).
+			if len(p.BlockHashes) > 0 && len(p.BlockHashes) == len(p.BlockTokenCounts) {
+				var cumulative int32
+				for j, h := range p.BlockHashes {
+					cumulative += p.BlockTokenCounts[j]
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(h)}, u.ReplicaID, cumulative, ts)
+				}
+				continue
 			}
-			if _, existed := replicas[u.ReplicaID]; !existed {
-				i.totalEntries++
-			}
-			replicas[u.ReplicaID] = replicaEntry{tokenCount: p.TokenCount, lastSeen: ts}
+			// Legacy single-blob exact-match entry.
+			i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, ts)
 		}
 	}
 	if u.Stats != nil {
@@ -301,15 +324,30 @@ func (i *Index) ApplyEvent(ev Event) {
 	i.reportEntries()
 }
 
-// Lookup returns replicas holding the requested prefix (exact hash match within
-// the same hash_scheme), ranked by matched tokens × freshness, best first.
-// Empty result means "no hint" — the caller fails open.
+// Lookup returns replicas holding the requested prefix, ranked by matched
+// tokens × freshness, best first. Empty result means "no hint" — the caller
+// fails open.
+//
+// When the request carries a non-empty block-hash chain (BlockHashes with a
+// matching-length BlockTokenCounts), the lookup walks the chain block-by-block
+// and computes each replica's longest common leading run; MatchedTokens
+// reflects the sum of the request's BlockTokenCounts for that run.
+// Otherwise the lookup falls back to exact-match on PrefixHash (legacy path).
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
-	// Without a known hash_scheme, the opaque prefix_hash cannot be matched
-	// safely (it would span engines), so fail open with no hint.
+	// Without a known hash_scheme, opaque hash bytes cannot be matched
+	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
 		return nil
 	}
+	if len(req.BlockHashes) > 0 && len(req.BlockHashes) == len(req.BlockTokenCounts) {
+		return i.lookupChain(req)
+	}
+	return i.lookupExact(req)
+}
+
+// lookupExact is the legacy single-blob exact-match path. Preserved
+// unchanged so existing callers (no block-hash chain) keep their behavior.
+func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 
@@ -330,13 +368,94 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	}
 	i.mu.RUnlock()
 
+	sortScoresDescByScoreThenID(scores)
+	return scores
+}
+
+// lookupChain implements longest-common-prefix matching against the
+// per-block-hash index. For each replica we find the longest leading run
+// [block_hashes[0]..block_hashes[k]] it holds; MatchedTokens is the sum of
+// the request's BlockTokenCounts up to k (the request's view of how many
+// tokens the matched prefix covers). The freshness signal is the OLDEST
+// lastSeen across the matched blocks (the run's weakest link), so a single
+// stale block can't make the whole run look fresher than it is.
+func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
+	type running struct {
+		matchedTokens  int32
+		oldestLastSeen time.Time
+	}
+	now := i.now()
+
+	i.mu.RLock()
+	current := map[string]running{}
+	finalized := map[string]running{}
+	for blockIdx, h := range req.BlockHashes {
+		key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(h)}
+		holders := i.prefixes[key]
+		blockTokens := req.BlockTokenCounts[blockIdx]
+		if blockIdx == 0 {
+			for id, e := range holders {
+				if i.freshness(now, e.lastSeen) <= 0 {
+					continue // stale; will be swept
+				}
+				current[id] = running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen}
+			}
+		} else {
+			next := make(map[string]running, len(current))
+			for id, st := range current {
+				e, ok := holders[id]
+				if !ok || i.freshness(now, e.lastSeen) <= 0 {
+					finalized[id] = st
+					continue
+				}
+				oldest := st.oldestLastSeen
+				if e.lastSeen.Before(oldest) {
+					oldest = e.lastSeen
+				}
+				next[id] = running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest}
+			}
+			current = next
+		}
+		if len(current) == 0 {
+			break
+		}
+	}
+	// Replicas still running at the end matched the full chain.
+	for id, st := range current {
+		finalized[id] = st
+	}
+	i.mu.RUnlock()
+
+	scores := make([]ReplicaScore, 0, len(finalized))
+	for id, st := range finalized {
+		if st.matchedTokens <= 0 {
+			continue
+		}
+		fresh := i.freshness(now, st.oldestLastSeen)
+		if fresh <= 0 {
+			continue
+		}
+		scores = append(scores, ReplicaScore{
+			ReplicaID:             id,
+			Score:                 float32(st.matchedTokens) * fresh,
+			MatchedTokens:         st.matchedTokens,
+			EstimatedCacheHitProb: fresh,
+		})
+	}
+
+	sortScoresDescByScoreThenID(scores)
+	return scores
+}
+
+// sortScoresDescByScoreThenID gives both lookup paths the same deterministic
+// ordering: higher score first, then lexicographic replica ID for tie-break.
+func sortScoresDescByScoreThenID(scores []ReplicaScore) {
 	sort.Slice(scores, func(a, b int) bool {
 		if scores[a].Score != scores[b].Score {
 			return scores[a].Score > scores[b].Score
 		}
-		return scores[a].ReplicaID < scores[b].ReplicaID // stable, deterministic
+		return scores[a].ReplicaID < scores[b].ReplicaID
 	})
-	return scores
 }
 
 // CacheState returns the per-replica stats and the distinct-prefix count for a
@@ -468,6 +587,21 @@ func (i *Index) freshness(now, lastSeen time.Time) float32 {
 		return 0
 	}
 	return float32(1 - float64(age)/float64(i.ttl))
+}
+
+// upsertReplicaLocked refreshes (or inserts) a replica's hold on one prefix
+// key. Caller holds the write lock. Bumps totalEntries on first insert so the
+// memory cap stays accurate when chains expand into N per-block entries.
+func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount int32, ts time.Time) {
+	replicas := i.prefixes[key]
+	if replicas == nil {
+		replicas = make(map[string]replicaEntry)
+		i.prefixes[key] = replicas
+	}
+	if _, existed := replicas[replicaID]; !existed {
+		i.totalEntries++
+	}
+	replicas[replicaID] = replicaEntry{tokenCount: tokenCount, lastSeen: ts}
 }
 
 // removeReplicaLocked drops a replica from a prefix, deleting the prefix if it
