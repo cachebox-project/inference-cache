@@ -1,0 +1,18 @@
+# Counter exposed as a family name WITHOUT the `_total` suffix (some
+# prometheus clients / OpenMetrics writers do this). The scraper must still
+# find it via the non-suffixed lookup fallback.
+# HELP vllm:kv_cache_usage_perc KV cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="m"} 0.30
+# HELP vllm:prefix_cache_hits Counter of cached blocks reused.
+# TYPE vllm:prefix_cache_hits counter
+vllm:prefix_cache_hits{model_name="m"} 10
+# HELP vllm:prefix_cache_queries Counter of prefix cache queries.
+# TYPE vllm:prefix_cache_queries counter
+vllm:prefix_cache_queries{model_name="m"} 20
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="m"} 2
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="m"} 0

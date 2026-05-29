@@ -37,6 +37,35 @@ func (c Config) Update(tsUs int64, prefixes []*icpb.PrefixEntry) *icpb.CacheStat
 	}
 }
 
+// StatsUpdate stamps the replica/model/tenant/hash_scheme identity onto a
+// scraped ReplicaStats and produces a stats-only CacheStateUpdate (empty
+// prefixes). The contract treats a CSU as an additive delta, so a stats-only
+// update refreshes liveness + the per-replica stats without touching prefixes.
+// Returns nil if stats is nil.
+//
+// The nested stats are rebuilt by-field rather than copied — proto messages
+// embed a sync.Mutex via MessageState, so go vet rejects value copies.
+func (c Config) StatsUpdate(tsUs int64, stats *icpb.ReplicaStats) *icpb.CacheStateUpdate {
+	if stats == nil {
+		return nil
+	}
+	return &icpb.CacheStateUpdate{
+		ReplicaId:   c.ReplicaID,
+		ModelId:     c.ModelID,
+		TenantId:    c.TenantID,
+		HashScheme:  c.HashScheme,
+		TimestampUs: tsUs,
+		Stats: &icpb.ReplicaStats{
+			// The top-level replica_id is authoritative server-side; mirror it
+			// onto the nested ReplicaStats so wire captures are self-describing.
+			ReplicaId:        c.ReplicaID,
+			CacheMemoryBytes: stats.GetCacheMemoryBytes(),
+			HitRate:          stats.GetHitRate(),
+			Pressure:         stats.GetPressure(),
+		},
+	}
+}
+
 // StoredPrefixes renders a BlockStored event as PrefixEntry values: one per block
 // hash. token_count is cumulative: vLLM block hashes chain their parent, so block
 // i's hash identifies the prefix up to and including block i and therefore covers

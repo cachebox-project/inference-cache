@@ -1,0 +1,18 @@
+# Legacy vLLM (pre-0.21) GPU engine. Exposes the older `vllm:gpu_cache_usage_perc`
+# (not the unified `vllm:kv_cache_usage_perc`) — used to test the auto-fallback
+# chain kv → gpu → cpu.
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc{model_name="meta-llama/Llama-3-8B"} 0.61
+# HELP vllm:prefix_cache_hits_total Counter of cached blocks reused.
+# TYPE vllm:prefix_cache_hits_total counter
+vllm:prefix_cache_hits_total{model_name="meta-llama/Llama-3-8B"} 800
+# HELP vllm:prefix_cache_queries_total Counter of prefix cache queries.
+# TYPE vllm:prefix_cache_queries_total counter
+vllm:prefix_cache_queries_total{model_name="meta-llama/Llama-3-8B"} 1000
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="meta-llama/Llama-3-8B"} 12
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="meta-llama/Llama-3-8B"} 0

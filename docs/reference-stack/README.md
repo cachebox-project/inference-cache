@@ -170,6 +170,22 @@ and asserts both an engine prefix-cache hit and that the server index populated
 (`inferencecache_index_entries > 0`). Builds the binaries, manages the engine
 container, cleans up after itself, exits non-zero on failure.
 
+The subscriber additionally scrapes the engine's Prometheus `/metrics` and emits
+a per-replica `ReplicaStats` (`cacheMemoryBytes`, `hitRate`, `pressure`) on a
+configurable tick (default `--stats-interval=10s`), so the policy server's
+`/snapshot.replicas[]` (and the `CacheIndex.status.replicas[]` surface the
+controller scrapes from it) populate alongside the prefix stream. Map
+`cacheMemoryBytes` to the engine's KV cache by passing
+`--engine-cache-size-bytes` (it is multiplied by the active `*_cache_usage_perc`
+gauge); leave it `0` to publish `cacheMemoryBytes=0` and let the other fields
+populate normally.
+
+If the engine serves more than one model on the same `/metrics` endpoint, pass
+`--engine-model-name=<served-model>` to filter by vLLM's `model_name` label —
+that label tracks the engine's identifier, which is independent of the cache
+plane's `--model-id` index key. Leave it empty when the engine serves one model
+and you want the scraper to consume every series unfiltered.
+
 ```bash
 docs/reference-stack/scripts/canary_e2e.sh
 ```
