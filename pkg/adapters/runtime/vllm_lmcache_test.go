@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -594,7 +596,6 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 		"--tenant-id=$(POD_NAMESPACE)",
 		"--model-id=Qwen/Qwen2.5-0.5B-Instruct",
 		"--hash-scheme=vllm",
-		"--engine-metrics-url=http://127.0.0.1:8000/metrics",
 	}
 	for _, want := range wantArgFragments {
 		if !containsArg(c.Args, want) {
@@ -644,6 +645,50 @@ func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
 	}
 	if c != nil {
 		t.Fatalf("expected nil sidecar when backendConfig.model is unset, got %+v", c)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testing.T) {
+	// Regression: the Go flag package exits on unknown flags, so a sidecar
+	// arg that the kvevent-subscriber binary doesn't recognise crashes the
+	// container at startup and the engine pod silently fails to report
+	// cache state. This test parses the rendered args through a FlagSet
+	// mirroring the subscriber binary's flag surface and asserts they
+	// parse cleanly. Keep the flag set in sync with
+	// cmd/kvevent-subscriber/main.go — adding a flag to the sidecar's args
+	// before the binary learns it is what this guard exists to catch.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"})
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"}}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil || c == nil {
+		t.Fatalf("ObservationSidecar: (%v, %v)", c, err)
+	}
+
+	fs := flag.NewFlagSet("kvevent-subscriber", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	// Subset of cmd/kvevent-subscriber/main.go's flag surface (the
+	// event-path flags every shipped subscriber accepts). Stats-path
+	// flags are intentionally absent here AND in the rendered args; both
+	// land in the same follow-up.
+	fs.String("engine-endpoint", "", "")
+	fs.String("topic", "", "")
+	fs.String("server", "", "")
+	fs.String("replica-id", "", "")
+	fs.String("model-id", "", "")
+	fs.String("tenant-id", "", "")
+	fs.String("hash-scheme", "", "")
+	fs.Duration("window", 0, "")
+
+	if err := fs.Parse(c.Args); err != nil {
+		t.Fatalf("rendered sidecar args rejected by subscriber FlagSet: %v\nargs = %v", err, c.Args)
+	}
+	// Belt-and-suspenders: parse a control case that should fail so the
+	// FlagSet isn't silently accepting unknown flags (rules out the test
+	// being a tautology if someone passes the wrong FlagSet mode).
+	if err := fs.Parse(append(c.Args, "--definitely-not-a-real-flag=x")); err == nil {
+		t.Fatalf("control: FlagSet must reject unknown flag --definitely-not-a-real-flag")
 	}
 }
 

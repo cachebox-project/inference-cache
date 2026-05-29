@@ -121,13 +121,11 @@ const (
 	// Deployment landing in the inference-cache-system namespace.
 	DefaultPolicyServerGRPCAddress = "inference-cache-server.inference-cache-system.svc.cluster.local:9090"
 
-	// vLLM engine convention: the OpenAI/HTTP server listens on :8000 and
-	// the KV-event ZMQ PUB endpoint binds on :5557 by default (the
-	// reference stack's --kv-events-config sets endpoint=tcp://*:5557).
-	// Parameterising via the adapter (not hardcoding in the webhook) lets
-	// SGLang or another engine adapter pick different ports without
-	// touching the webhook.
-	defaultEngineHTTPPort   = 8000
+	// vLLM engine convention: the KV-event ZMQ PUB endpoint binds on :5557
+	// by default (the reference stack's --kv-events-config sets
+	// endpoint=tcp://*:5557). Parameterising via the adapter (not
+	// hardcoding in the webhook) lets SGLang or another engine adapter
+	// pick a different port without touching the webhook.
 	defaultEngineZMQPortStr = "5557"
 
 	// subscriberHashScheme is the canonical hash-scheme tag the vLLM
@@ -340,11 +338,18 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint strin
 // webhook appends to a vLLM engine pod so its KV-cache events flow to the
 // policy server with no out-of-band bring-up. The container shares the
 // engine pod's network namespace, so the subscriber dials the engine over
-// 127.0.0.1 (the vLLM ZMQ PUB endpoint defaults to :5557 and /metrics to
-// :8000); identity flags are derived from cache + pod (--replica-id from
-// pod.Name via the downward API, --tenant-id from pod.Namespace ditto,
-// --model-id from cache.Spec.BackendConfig["model"], --hash-scheme fixed
-// to "vllm") so the CR is the single source of truth.
+// 127.0.0.1 (the vLLM ZMQ PUB endpoint defaults to :5557); identity flags
+// are derived from cache + pod (--replica-id from pod.Name via the
+// downward API, --tenant-id from pod.Namespace ditto, --model-id from
+// cache.Spec.BackendConfig["model"], --hash-scheme fixed to "vllm") so
+// the CR is the single source of truth.
+//
+// The flag surface here is deliberately the intersection of what the
+// shipped kvevent-subscriber binary accepts: passing flags the binary
+// doesn't know would crash the sidecar on startup (Go's flag package
+// rejects unknown flags). Stats-path flags (--engine-metrics-url,
+// --stats-interval, etc.) are added when the binary itself learns to
+// scrape and emit ReplicaStats.
 //
 // Returns (nil, nil) when the served model id is not derivable from the CR
 // — the subscriber's --model-id flag is required, so emitting a container
@@ -405,7 +410,6 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 			"--tenant-id=$(POD_NAMESPACE)",
 			"--model-id=" + modelID,
 			"--hash-scheme=" + subscriberHashScheme,
-			fmt.Sprintf("--engine-metrics-url=http://127.0.0.1:%d/metrics", defaultEngineHTTPPort),
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
