@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
@@ -214,11 +216,20 @@ func TestRenderTemplateFailsOpen(t *testing.T) {
 // (bufconn) plus a loopback HTTP listener. It returns a connected gRPC client,
 // the HTTP base URL ("http://host:port") for the health/metrics endpoints, and
 // a stop func that tears the server down and fails the test if Serve reported
-// an error. bufSize is the size of bufconn's in-memory pipe buffer — it bounds
-// bytes in flight on the fake socket, unrelated to the size of any individual
-// CacheStateUpdate; 1 MiB is the standard bufconn default and is ample for
-// these metadata-only messages.
+// an error.
 func startInProcessServer(t *testing.T) (client icpb.InferenceCacheClient, httpBaseURL string, stop func()) {
+	t.Helper()
+	conn, httpBaseURL, stop := startInProcessServerConn(t)
+	return icpb.NewInferenceCacheClient(conn), httpBaseURL, stop
+}
+
+// startInProcessServerConn is the underlying helper that returns the raw gRPC
+// client connection so tests using non-InferenceCache services (e.g. server
+// reflection, grpc.health.v1) can attach their own clients to the same wire.
+// bufSize is the bufconn in-memory pipe buffer — it bounds bytes in flight on
+// the fake socket, unrelated to the size of any individual CacheStateUpdate;
+// 1 MiB is the bufconn default and is ample for these metadata-only messages.
+func startInProcessServerConn(t *testing.T) (*grpc.ClientConn, string, func()) {
 	t.Helper()
 
 	const bufSize = 1024 * 1024
@@ -247,14 +258,14 @@ func startInProcessServer(t *testing.T) (client icpb.InferenceCacheClient, httpB
 		t.Fatalf("dial bufnet: %v", err)
 	}
 
-	stop = func() {
+	stop := func() {
 		_ = conn.Close()
 		cancel()
 		if err := <-errCh; err != nil {
 			t.Errorf("serve shutdown: %v", err)
 		}
 	}
-	return icpb.NewInferenceCacheClient(conn), "http://" + httpListener.Addr().String(), stop
+	return conn, "http://" + httpListener.Addr().String(), stop
 }
 
 // getString issues a GET against the server's HTTP endpoint and returns the
@@ -358,6 +369,54 @@ func TestInferenceCacheServiceOverGRPC(t *testing.T) {
 	}
 	if !ack.GetAccepted() {
 		t.Fatalf("ack.Accepted = false, want true")
+	}
+}
+
+// TestGRPCServerReflectionEnumeratesRegisteredServices exercises gRPC server
+// reflection over the wire and asserts the server enumerates both registered
+// services (InferenceCache + grpc.health.v1.Health) without the client having
+// to ship the .proto. This is the test gate for the operator-tooling promise:
+// `grpcurl list` (and the file-descriptor lookups that back `grpcurl describe`
+// and generic calls, all routed through the same reflection service)
+// must work against a running policy server without `-proto` flags. The
+// assertions here cover the list path; the describe/generic-call paths share
+// the same registration and need no separate wire test.
+func TestGRPCServerReflectionEnumeratesRegisteredServices(t *testing.T) {
+	conn, _, stop := startInProcessServerConn(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := reflectpb.NewServerReflectionClient(conn).ServerReflectionInfo(ctx)
+	if err != nil {
+		t.Fatalf("open ServerReflectionInfo: %v", err)
+	}
+	if err := stream.Send(&reflectpb.ServerReflectionRequest{
+		MessageRequest: &reflectpb.ServerReflectionRequest_ListServices{ListServices: ""},
+	}); err != nil {
+		t.Fatalf("send ListServices: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("recv reflection response: %v", err)
+	}
+	listResp := resp.GetListServicesResponse()
+	if listResp == nil {
+		t.Fatalf("expected ListServicesResponse, got %T (%v)", resp.GetMessageResponse(), resp.GetMessageResponse())
+	}
+
+	got := make([]string, 0, len(listResp.GetService()))
+	for _, svc := range listResp.GetService() {
+		got = append(got, svc.GetName())
+	}
+	for _, want := range []string{
+		"grpc.health.v1.Health",
+		"inferencecache.v1alpha1.InferenceCache",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("reflection ListServices missing %q; got %v", want, got)
+		}
 	}
 }
 
