@@ -6,6 +6,8 @@ metadata:
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: server
+# The server does not call the Kubernetes API; don't automount a token.
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: Service
@@ -58,6 +60,7 @@ spec:
         prometheus.io/port: "8080"
     spec:
       serviceAccountName: inference-cache-server
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 10
       securityContext:
         runAsNonRoot: true
