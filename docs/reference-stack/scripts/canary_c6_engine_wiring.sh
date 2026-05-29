@@ -83,16 +83,33 @@ docker build -f dockerfiles/Dockerfile --target server -t "$SERVER_IMG" .
 "$KIND" load docker-image "$SERVER_IMG" --name "$KIND_CLUSTER"
 
 log "rendering + applying config/default (controller + server + webhook + cert-manager wiring)"
-# kustomize edit: point both the controller and server Deployments at our
-# canary images. The default overlay now ships an inference-cache-server
-# Deployment too; without rewriting its image the canary would resolve to
-# the published :dev tag, not the image built from this commit.
-command -v kustomize >/dev/null 2>&1 || fail "kustomize is required for the canary (set image rewrite); install kustomize and retry"
+# Point both the controller and server Deployments at our canary images.
+# The default overlay now ships an inference-cache-server Deployment too;
+# without rewriting its image the canary would resolve to the published
+# :dev tag, not the image built from this commit. Prefer `kustomize edit`
+# when available; otherwise fall back to a sed that scopes the rewrite to
+# each `- name: ...` block (both blocks share `newTag: dev`, so an
+# unscoped substitute would collapse them onto the same value).
 tmpdir="$(mktemp -d)"
 trap "rm -rf $tmpdir; cleanup" EXIT
 cp -r config "$tmpdir/config"
-( cd "$tmpdir/config/default" && \
-  kustomize edit set image controller="$CONTROLLER_IMG" server="$SERVER_IMG" )
+(
+  cd "$tmpdir/config/default"
+  if command -v kustomize >/dev/null 2>&1; then
+    kustomize edit set image controller="$CONTROLLER_IMG" server="$SERVER_IMG"
+  else
+    sed -i.bak \
+      -e "/^- name: controller$/,/^- name: server$/ {
+            s|^  newName: .*|  newName: ${CONTROLLER_IMG%%:*}|
+            s|^  newTag: .*|  newTag: ${CONTROLLER_IMG##*:}|
+          }" \
+      -e "/^- name: server$/,\$ {
+            s|^  newName: .*|  newName: ${SERVER_IMG%%:*}|
+            s|^  newTag: .*|  newTag: ${SERVER_IMG##*:}|
+          }" \
+      kustomization.yaml
+  fi
+)
 kubectl "${KCTX[@]}" apply -k "$tmpdir/config/default"
 kubectl "${KCTX[@]}" -n inference-cache-system wait --for=condition=Available deployment --all --timeout=180s
 
