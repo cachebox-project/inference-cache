@@ -403,25 +403,31 @@ func TestValidator_RuntimeAdapter_EngineNormalisedToLowerCase(t *testing.T) {
 	}
 }
 
-func TestValidator_RuntimeAdapter_EmptyEngineSkipsCheck(t *testing.T) {
-	// Edge case: an empty engine string must NOT produce a C7
-	// rejection. CRD-level (and future field-level) validation owns the
-	// "engine is required" message; doubling up here would surface a
-	// confusing "no adapter for engine=\"\"" error on top.
+func TestValidator_RuntimeAdapter_EmptyEngineDefaultsToVLLM(t *testing.T) {
+	// Engine is optional on the CRD; the reconciler and pod webhook
+	// default it to vLLM via adapterruntime.ResolveRuntimeID, so
+	// admission must use the same defaulting or pairs like
+	// "type: Mooncake with no engine" slip past the webhook and only
+	// fail at reconcile (the exact gap C7 closes).
+	//
+	// With LMCache the default vLLM pair is supported → admit.
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend() // type=LMCache, no Integration block
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("empty engine must not trigger C7; got %v", err)
+		t.Fatalf("LMCache + defaulted vLLM engine rejected: %v", err)
 	}
+}
 
-	// Same shape with a whitespace-only engine (operator typo) — must
-	// still skip the C7 check rather than fall into Registry.Select
-	// with a blank runtime ID.
-	cb2 := newBackend()
-	cb2.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "   "}
-	if _, err := v.ValidateCreate(context.Background(), cb2); err != nil {
-		t.Fatalf("whitespace engine must not trigger C7; got %v", err)
-	}
+func TestValidator_RuntimeAdapter_EmptyEngineWithUnsupportedTypeRejected(t *testing.T) {
+	// Counterpart to the previous test: the default vLLM resolution
+	// must also fire C7 — type: Mooncake with no engine must be
+	// rejected at admission, since the reconciler would otherwise try
+	// vllm+Mooncake and fall back to unmanaged.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	requireInvalidWithCause(t, v, cb, "spec.integration.engine",
+		"backend=\"Mooncake\"")
 }
 
 func TestValidator_RuntimeAdapter_EmptyTypeSkipsCheck(t *testing.T) {
@@ -433,6 +439,21 @@ func TestValidator_RuntimeAdapter_EmptyTypeSkipsCheck(t *testing.T) {
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("empty type must not trigger C7; got %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_ExternalSkipsCheck(t *testing.T) {
+	// External backends are pre-existing services the controller mirrors
+	// to status — they never reach the adapter registry at reconcile, so
+	// admission must not reject them for "no adapter". The endpoint rule
+	// (and the cross-namespace rule) still apply.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("External with engine=vllm rejected by C7: %v", err)
 	}
 }
 

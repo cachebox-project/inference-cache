@@ -192,27 +192,36 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 	)
 }
 
-// checkRuntimeAdapter rejects a CacheBackend whose (engine, type) pair no
-// installed runtime adapter supports. The check skips when either side of
-// the pair is unset so the underlying "engine/type is required" surfaces
-// from CRD-level (or future field-level) validation instead of doubling up
-// with a redundant unsupported-pair complaint. cb.Spec.Type is the
-// canonical CacheBackendType enum; the engine string is normalised to
-// lower case so a CR that spells the engine "VLLM" matches the same
-// adapter the reconciler will pick.
+// checkRuntimeAdapter rejects a CacheBackend whose effective (engine, type)
+// pair no installed runtime adapter supports. The effective engine is
+// resolved through [adapterruntime.ResolveRuntimeID] — the same helper the
+// reconciler and pod-mutating webhook consult — so admission, reconcile,
+// and pod injection agree on which adapter the registry should pick. In
+// particular, an unset engine defaults to vLLM here just as it does at
+// reconcile, so a CR with `type: Mooncake` and no engine no longer slips
+// past admission only to fail downstream.
+//
+// The check is bypassed for two CR shapes that never reach the adapter
+// registry at reconcile:
+//
+//   - Spec.Type is empty: there is no defaulting for type and the
+//     missing-type rejection is owned by CRD-level / future field-level
+//     validation; piling an "adapter for backend=\"\"" cause on top would
+//     not help the user.
+//   - Spec.Type is [cachev1alpha1.CacheBackendTypeExternal]: External
+//     backends are pre-existing services the controller only mirrors to
+//     status, not managed workloads — the reconciler routes them through
+//     reconcileExternal before any adapter lookup, so admission must not
+//     reject them for "no adapter".
 func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	engine := ""
-	if cb.Spec.Integration != nil {
-		engine = strings.TrimSpace(cb.Spec.Integration.Engine)
-	}
-	if engine == "" || strings.TrimSpace(string(cb.Spec.Type)) == "" {
+	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		return nil
 	}
 	registry := v.Registry
 	if registry == nil {
 		registry = adapterruntime.DefaultRegistry()
 	}
-	runtimeID := adapterruntime.RuntimeID(strings.ToLower(engine))
+	runtimeID := adapterruntime.ResolveRuntimeID(cb)
 	if _, err := registry.Select(runtimeID, cb); err != nil {
 		if !errors.Is(err, adapterruntime.ErrNoAdapter) {
 			// Registry currently only returns ErrNoAdapter from Select; a
@@ -222,11 +231,20 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 				field.InternalError(field.NewPath("spec", "integration", "engine"), err),
 			}
 		}
+		// Field path points at spec.integration.engine even when the user
+		// did not set it — the offending knob is "which runtime should we
+		// wire to this backend", which the resolver answered for them
+		// using the default. Reporting the resolved value (not "") in the
+		// message gives the user the literal pair to fix.
+		shownValue := ""
+		if cb.Spec.Integration != nil {
+			shownValue = cb.Spec.Integration.Engine
+		}
 		return field.ErrorList{
 			field.Invalid(
 				field.NewPath("spec", "integration", "engine"),
-				cb.Spec.Integration.Engine,
-				unsupportedPairMessage(engine, cb.Spec.Type, registry),
+				shownValue,
+				unsupportedPairMessage(runtimeID, cb.Spec.Type, registry),
 			),
 		}
 	}
@@ -241,7 +259,7 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 // enumerate no pairs (e.g. only the permissive reference adapter is
 // installed) we surface that as "(none)" rather than printing a
 // misleading empty list.
-func unsupportedPairMessage(engine string, backend cachev1alpha1.CacheBackendType, registry *adapterruntime.Registry) string {
+func unsupportedPairMessage(engine adapterruntime.RuntimeID, backend cachev1alpha1.CacheBackendType, registry *adapterruntime.Registry) string {
 	pairs := registry.SupportedPairs()
 	pretty := make([]string, 0, len(pairs))
 	for _, p := range pairs {

@@ -3,6 +3,7 @@ package runtime
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -164,6 +165,27 @@ func (r *Registry) SupportedPairs() []SupportedPair {
 		}
 	}
 	return out
+}
+
+// ResolveRuntimeID picks the [RuntimeID] every layer (admission validator,
+// reconciler, pod-mutating webhook) consults the [Registry] with for a given
+// CacheBackend. Centralising the rule here keeps the three layers from
+// drifting: whatever pair admission admits must be the pair the reconciler
+// renders and the pod webhook injects, so the three callers must read the
+// CR identically.
+//
+// The CR carries the engine name in Spec.Integration.Engine. When it is
+// unset, vLLM is the Phase-1 default — the only engine the shipping
+// adapters target — so a CacheBackend that omits the field is treated the
+// same way the reconciler used to treat it before C7 landed. Engine values
+// are normalised to lower case so common spellings ("vLLM", "VLLM",
+// "SGLang") route to the canonical [RuntimeID] constants ([RuntimeVLLM]
+// etc.).
+func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
+	if cache == nil || cache.Spec.Integration == nil || cache.Spec.Integration.Engine == "" {
+		return RuntimeVLLM
+	}
+	return RuntimeID(strings.ToLower(cache.Spec.Integration.Engine))
 }
 
 // DefaultRegistry returns a Registry pre-populated with the runtime adapters
