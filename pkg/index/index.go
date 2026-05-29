@@ -245,10 +245,14 @@ func (i *Index) Ingest(u Update) {
 		for _, p := range u.Prefixes {
 			// Chain form: expand into one per-block entry per hash, keyed by
 			// the block hash with cumulative tokenCount so a legacy exact-match
-			// against any single block hash still works. Parallel arrays must
-			// have equal lengths; a length mismatch is dropped silently
-			// (fail-soft — a stale hint is preferable to a bad one).
-			if len(p.BlockHashes) > 0 && len(p.BlockHashes) == len(p.BlockTokenCounts) {
+			// against any single block hash still works. The parallel arrays
+			// must agree in length; a chain with mismatched lengths is dropped
+			// silently (fail-soft — a stale hint is OK, a wrong one isn't) and
+			// is NOT downgraded to the legacy single-blob path.
+			if len(p.BlockHashes) > 0 {
+				if len(p.BlockHashes) != len(p.BlockTokenCounts) {
+					continue
+				}
 				var cumulative int32
 				for j, h := range p.BlockHashes {
 					cumulative += p.BlockTokenCounts[j]

@@ -408,3 +408,51 @@ func TestMicrosToTime(t *testing.T) {
 		t.Fatalf("microsToTime(1e6) should be non-zero")
 	}
 }
+
+// TestLookupRouteChainReturnsPartialPrefixMatch is the longest-prefix e2e: a replica
+// reports a chain via ReportCacheState, then a LookupRoute carrying a longer
+// chain that shares the first K blocks returns PREFIX_MATCH with
+// matched_tokens reflecting the partial run (not the full request chain).
+func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
+	client, _, stop := startInProcessServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ingestHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
+	ingestCounts := []int32{16, 16, 16}
+
+	stream, err := client.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId: "replica-a", ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
+		Prefixes: []*icpb.PrefixEntry{{BlockHashes: ingestHashes, BlockTokenCounts: ingestCounts}},
+	}); err != nil {
+		t.Fatalf("send update: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	lookupHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3"), []byte("x4"), []byte("x5")}
+	lookupCounts := []int32{16, 16, 16, 16, 16}
+	resp, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
+		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
+		BlockHashes: lookupHashes, BlockTokenCounts: lookupCounts,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH (partial chain still counts)", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-a" {
+		t.Fatalf("expected single hit for replica-a, got %+v", resp.GetReplicaScores())
+	}
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 48 {
+		t.Fatalf("matched_tokens = %d, want 48 (3 blocks × 16 — the partial run, not the full request chain)", got)
+	}
+}
