@@ -92,6 +92,7 @@ func main() {
 		engine.ScraperConfig{
 			URL:                   *metricsURL,
 			Tier:                  tier,
+			ModelLabel:            *model, // filter /metrics by model_name="<model>"
 			CacheSizeBytes:        *cacheSizeBytes,
 			MaxConcurrencyCeiling: *ceiling,
 		},

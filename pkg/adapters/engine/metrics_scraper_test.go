@@ -236,6 +236,69 @@ func TestScraperCountersWithoutTotalSuffix(t *testing.T) {
 	}
 }
 
+func TestScraperFiltersByModelLabel(t *testing.T) {
+	// Two models share one /metrics. The scraper must only read the configured
+	// model's series — anything else would pollute /snapshot.replicas[] with
+	// another model's load/hit-rate.
+	srv := fixtureServer(t, "vllm_metrics_multimodel.txt", "vllm_metrics_multimodel.txt")
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{
+		URL: srv.URL, Tier: CacheTierAuto, ModelLabel: "primary",
+		CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 8,
+	}, nil)
+	if _, err := s.Scrape(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	// kv_cache_usage_perc{primary}=0.20 → bytes = 0.20 × 1 GiB
+	cap1GiB := float64(int64(1) << 30)
+	wantBytes := int64(cap1GiB * 0.20)
+	if got := stats.GetCacheMemoryBytes(); got < wantBytes-2 || got > wantBytes+2 {
+		t.Errorf("cacheMemoryBytes = %d, want ~%d (other model's 0.95 must NOT leak in)", got, wantBytes)
+	}
+	// pressure{primary} = (2+0)/8 = 0.25; the other model's (50+30)/8 = 10 →
+	// clamp 1.0 must NOT show up.
+	if got, want := stats.GetPressure(), float32(0.25); got < want-1e-4 || got > want+1e-4 {
+		t.Errorf("pressure = %v, want %v (other model bled through)", got, want)
+	}
+	// First tick primed prev_{hits=10, queries=40}; second tick is identical
+	// (fixtureServer locks on the last file), so dQueries=0 → hit_rate=0.
+	// What matters: the filter must not let the OTHER model's huge counters
+	// (999/1000) appear in the delta computation.
+	if stats.GetHitRate() != 0 {
+		t.Errorf("hit_rate = %v, want 0 (identical ticks; if non-zero, other model's counters leaked)", stats.GetHitRate())
+	}
+}
+
+func TestScraperUnlabeledMetricExcludedWhenFilterSet(t *testing.T) {
+	// A series missing the model_name label entirely must NOT be attributed to
+	// the configured model — silent under-report beats silent misattribution.
+	const body = `# HELP vllm:kv_cache_usage_perc KV cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc 0.42
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{
+		URL: srv.URL, ModelLabel: "primary", CacheSizeBytes: 1 << 30,
+	}, nil)
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	if stats.GetCacheMemoryBytes() != 0 {
+		t.Errorf("unlabeled series leaked in: cacheMemoryBytes = %d, want 0", stats.GetCacheMemoryBytes())
+	}
+}
+
 func TestCacheTierIsValid(t *testing.T) {
 	for _, ok := range ValidCacheTiers {
 		if !ok.IsValid() {

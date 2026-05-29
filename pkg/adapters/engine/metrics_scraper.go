@@ -65,6 +65,13 @@ type ScraperConfig struct {
 	// Tier selects which cache-usage gauge feeds cache_memory_bytes.
 	// Defaults to CacheTierAuto.
 	Tier CacheTier
+	// ModelLabel filters every series by the `model_name` Prometheus label
+	// (the one vLLM stamps on its metrics). When non-empty, only series whose
+	// label matches participate in the scrape — so a /metrics endpoint that
+	// happens to expose multiple models cannot attribute another model's
+	// usage/load/hit-rate to the replica this scraper is configured for. When
+	// empty, every series is included (the legacy aggregate behaviour).
+	ModelLabel string
 	// CacheSizeBytes is the engine's total KV-cache capacity, used to map a
 	// usage_perc gauge (0..1) to bytes. When zero, cache_memory_bytes is
 	// emitted as 0 — the ranker doesn't consume this field, so an honest
@@ -77,6 +84,8 @@ type ScraperConfig struct {
 	// Timeout bounds each scrape; defaults to defaultScrapeTimeout when <= 0.
 	Timeout time.Duration
 }
+
+const modelLabelName = "model_name"
 
 // MetricsScraper polls vLLM's Prometheus /metrics endpoint and projects the
 // payload into a ReplicaStats. It is fail-soft: any HTTP/parse error returns a
@@ -99,8 +108,8 @@ type MetricsScraper struct {
 	havePrev    bool
 }
 
-// NewMetricsScraper builds a scraper. If httpClient is nil, http.DefaultClient
-// with the configured timeout is used.
+// NewMetricsScraper builds a scraper. If httpClient is nil, a fresh
+// *http.Client with the configured Timeout is used.
 func NewMetricsScraper(httpClient *http.Client, cfg ScraperConfig, logger *slog.Logger) *MetricsScraper {
 	if logger == nil {
 		logger = slog.Default()
@@ -147,14 +156,14 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 		return &icpb.ReplicaStats{}, fmt.Errorf("parse metrics: %w", err)
 	}
 
-	usage, _ := selectUsage(s.cfg.Tier, families)
+	usage, _ := selectUsage(s.cfg.Tier, families, s.cfg.ModelLabel)
 
-	hits := sumCounter(families, metricHits)
-	queries := sumCounter(families, metricQueries)
+	hits := sumCounter(families, metricHits, s.cfg.ModelLabel)
+	queries := sumCounter(families, metricQueries, s.cfg.ModelLabel)
 	hitRate := s.consumeHitRate(hits, queries)
 
-	running, _ := singleGaugeValue(families, metricRunning)
-	waiting, _ := singleGaugeValue(families, metricWaiting)
+	running, _ := singleGaugeValue(families, metricRunning, s.cfg.ModelLabel)
+	waiting, _ := singleGaugeValue(families, metricWaiting, s.cfg.ModelLabel)
 	pressure := pressureFrom(running+waiting, s.cfg.MaxConcurrencyCeiling)
 
 	var cacheBytes int64
@@ -197,21 +206,21 @@ func (s *MetricsScraper) consumeHitRate(hits, queries float64) float64 {
 // legacy gauges — legacy vLLM exposed both series and the inactive tier reads
 // 0, so max() collapses to whichever tier is active. Explicit tier values pin
 // the lookup to one metric.
-func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily) (float64, bool) {
+func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily, modelLabel string) (float64, bool) {
 	switch tier {
 	case CacheTierKV:
-		return singleGaugeValue(families, metricKVUsage)
+		return singleGaugeValue(families, metricKVUsage, modelLabel)
 	case CacheTierGPU:
-		return singleGaugeValue(families, metricGPUUsage)
+		return singleGaugeValue(families, metricGPUUsage, modelLabel)
 	case CacheTierCPU:
-		return singleGaugeValue(families, metricCPUUsage)
+		return singleGaugeValue(families, metricCPUUsage, modelLabel)
 	}
 	// CacheTierAuto.
-	if v, ok := singleGaugeValue(families, metricKVUsage); ok {
+	if v, ok := singleGaugeValue(families, metricKVUsage, modelLabel); ok {
 		return v, true
 	}
-	gpu, haveGPU := singleGaugeValue(families, metricGPUUsage)
-	cpu, haveCPU := singleGaugeValue(families, metricCPUUsage)
+	gpu, haveGPU := singleGaugeValue(families, metricGPUUsage, modelLabel)
+	cpu, haveCPU := singleGaugeValue(families, metricCPUUsage, modelLabel)
 	switch {
 	case haveGPU && haveCPU:
 		if gpu >= cpu {
@@ -226,27 +235,34 @@ func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily) (float64
 	return 0, false
 }
 
-// singleGaugeValue returns the single (or first) gauge value for a metric
-// family. Returns (0, false) if the family is absent or empty.
-func singleGaugeValue(families map[string]*dto.MetricFamily, name string) (float64, bool) {
+// singleGaugeValue returns the first gauge value for a metric family whose
+// `model_name` label matches modelLabel. modelLabel == "" disables the filter
+// (every series qualifies). Returns (0, false) if the family is absent or
+// nothing matches.
+func singleGaugeValue(families map[string]*dto.MetricFamily, name, modelLabel string) (float64, bool) {
 	mf := families[name]
-	if mf == nil || len(mf.Metric) == 0 {
+	if mf == nil {
 		return 0, false
 	}
-	g := mf.Metric[0].GetGauge()
-	if g == nil {
-		return 0, false
+	for _, m := range mf.Metric {
+		if !modelLabelMatches(m, modelLabel) {
+			continue
+		}
+		if g := m.GetGauge(); g != nil {
+			return g.GetValue(), true
+		}
 	}
-	return g.GetValue(), true
+	return 0, false
 }
 
-// sumCounter returns the sum of counter values for a metric across all label
-// combinations. The Python prometheus_client exposes Counter("foo") under the
-// family name "foo_total" in the text format, but other Prometheus clients use
-// the unsuffixed form — we check both so the scraper is portable across them.
-// One vLLM replica generally exposes one series per metric, but summing is the
-// safe thing to do under unexpected label cardinality.
-func sumCounter(families map[string]*dto.MetricFamily, name string) float64 {
+// sumCounter returns the sum of counter values for a metric whose `model_name`
+// label matches modelLabel (modelLabel == "" disables the filter). The Python
+// prometheus_client exposes Counter("foo") under the family name "foo_total"
+// in the text format, but other Prometheus clients use the unsuffixed form —
+// we check both so the scraper is portable across them. One vLLM replica
+// generally exposes one series per metric, but summing is the safe thing to
+// do under unexpected label cardinality.
+func sumCounter(families map[string]*dto.MetricFamily, name, modelLabel string) float64 {
 	mf := families[name+"_total"]
 	if mf == nil {
 		mf = families[name]
@@ -256,11 +272,31 @@ func sumCounter(families map[string]*dto.MetricFamily, name string) float64 {
 	}
 	var v float64
 	for _, m := range mf.Metric {
+		if !modelLabelMatches(m, modelLabel) {
+			continue
+		}
 		if c := m.GetCounter(); c != nil {
 			v += c.GetValue()
 		}
 	}
 	return v
+}
+
+// modelLabelMatches reports whether m's `model_name` label equals want.
+// want == "" disables the filter (any series qualifies). A series that does
+// not carry the label at all does NOT qualify when want is non-empty — we'd
+// rather under-report a single tick than risk attributing another model's
+// metrics to this replica.
+func modelLabelMatches(m *dto.Metric, want string) bool {
+	if want == "" {
+		return true
+	}
+	for _, lp := range m.GetLabel() {
+		if lp.GetName() == modelLabelName {
+			return lp.GetValue() == want
+		}
+	}
+	return false
 }
 
 func pressureFrom(load float64, ceiling int) float64 {
