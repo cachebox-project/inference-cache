@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Full-chain CPU canary for the cache substrate. Brings up the real stack on a
-# CPU vLLM engine (no GPU) and asserts the end-to-end path works:
+# Full-chain CPU canary for the cache substrate, BINARY data-path edition.
+# Brings up the engine + server + subscriber as host processes (no Kubernetes
+# admission in the loop) and asserts the binaries wire correctly:
 #
 #   vLLM engine --ZMQ KV events--> kvevent-subscriber --gRPC--> policy server --> index
+#
+# The subscriber is hand-launched on purpose here: this canary's job is to
+# pin the binaries' wire protocol. The in-cluster auto-attach path (the
+# webhook injects the subscriber sidecar onto labeled engine pods) is gated
+# by the webhook envtest (internal/webhook/pod/envtest_integration_test.go) —
+# see docs/design/kvevent-subscriber-wiring.md for the shape decision.
 #
 # Checks (exit 0 = PASS, 1 = FAIL):
 #   1. Engine prefix-cache hit      — vllm:prefix_cache_hits_total increases

@@ -174,6 +174,221 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
+func TestHandle_AppendsObservationSidecar(t *testing.T) {
+	// The vLLM/LMCache adapter returns a kvevent-subscriber sidecar
+	// the webhook MUST append after InjectEngineConfig, with identity flags
+	// derived from the CR + pod. This is the one test that pins the end-to-
+	// end auto-attach behaviour at the admission boundary.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("expected Allowed with patches; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if len(mutated.Spec.Containers) != 2 {
+		t.Fatalf("expected 2 containers (engine + subscriber), got %d: %v", len(mutated.Spec.Containers), containerNames(mutated))
+	}
+	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	if sub == nil {
+		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
+	}
+	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--replica-id=$(POD_NAME)") {
+		t.Fatalf("--replica-id MUST use downward-API POD_NAME; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--tenant-id=$(POD_NAMESPACE)") {
+		t.Fatalf("--tenant-id MUST use downward-API POD_NAMESPACE; args = %v", sub.Args)
+	}
+	// The engine container is still wired with LMCache env — appending the
+	// sidecar must not regress the engine-side injection.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
+func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+
+	first := h.Handle(context.Background(), newRequest(t, pod, ns))
+	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, first)
+	if len(injected.Spec.Containers) != 2 {
+		t.Fatalf("first admission must add the sidecar; containers = %v", containerNames(injected))
+	}
+
+	second := h.Handle(context.Background(), newRequest(t, injected, ns))
+	if !second.Allowed {
+		t.Fatalf("re-admission rejected: %+v", second.Result)
+	}
+	if len(second.Patches) != 0 {
+		t.Fatalf("re-admission of fully-injected pod must produce no patches, got %d: %+v", len(second.Patches), second.Patches)
+	}
+}
+
+func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
+	// Negative case: a CacheBackend matched by a
+	// runtime whose adapter returns no sidecar (the reference adapter here,
+	// standing in for any future External-type adapter) admits the pod
+	// without appending a kvevent-subscriber container.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.Integration.Engine = string(adapterruntime.RuntimeReference)
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.NewRegistry()
+	reg.Register(adapterruntime.NewReferenceAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("External-style backend must NOT get a subscriber sidecar; found %+v", c)
+	}
+}
+
+func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	// Intentionally no backendConfig — adapter returns (nil, nil), so the
+	// engine wiring still happens but the sidecar append is skipped.
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("engine injection must still happen; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("sidecar must be skipped without a model id; got %+v", c)
+	}
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
+func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
+	// If the adapter's ObservationSidecar errors, admission must still
+	// succeed and the engine-side injection must still apply — the cache
+	// is an optimisation, never a serving dependency.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.Integration.Engine = "stub-fail"
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.NewRegistry()
+	reg.Register(sidecarErrorAdapter{})
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed (fail-open on sidecar error); got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, "STUB_INJECTED", "yes")
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("sidecar errored — webhook must not append a partial container, got %+v", c)
+	}
+}
+
+func TestHandle_PreExistingSidecar_NotDuplicated(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+		Name:  adapterruntime.SubscriberContainerName,
+		Image: "operator/pre-baked:tag",
+	})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed; got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	subs := 0
+	for _, c := range mutated.Spec.Containers {
+		if c.Name == adapterruntime.SubscriberContainerName {
+			subs++
+		}
+	}
+	if subs != 1 {
+		t.Fatalf("expected exactly one %s container after admission, got %d: %v",
+			adapterruntime.SubscriberContainerName, subs, containerNames(mutated))
+	}
+}
+
+// sidecarErrorAdapter is a stub adapter whose ObservationSidecar always
+// errors so the webhook's fail-open path on the sidecar branch is exercised.
+type sidecarErrorAdapter struct{}
+
+func (sidecarErrorAdapter) Supports(adapterruntime.RuntimeID, *cachev1alpha1.CacheBackend) bool {
+	return true
+}
+
+func (sidecarErrorAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
+}
+
+func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *cachev1alpha1.CacheBackend) error {
+	if pod == nil || len(pod.Containers) == 0 {
+		return errors.New("nope")
+	}
+	pod.Containers[0].Env = append(pod.Containers[0].Env, corev1.EnvVar{Name: "STUB_INJECTED", Value: "yes"})
+	return nil
+}
+
+func (sidecarErrorAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+
+func (sidecarErrorAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, errors.New("synthetic sidecar render failure")
+}
+
+func findContainer(pod *corev1.Pod, name string) *corev1.Container {
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == name {
+			return &pod.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+func containerNames(pod *corev1.Pod) []string {
+	out := make([]string, len(pod.Spec.Containers))
+	for i, c := range pod.Spec.Containers {
+		out[i] = c.Name
+	}
+	return out
+}
+
+func argPresent(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHandle_NoMatch_Passthrough(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})

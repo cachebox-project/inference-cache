@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -555,6 +556,140 @@ func TestUpsertArgPairAppendsAndReplaces(t *testing.T) {
 	want = []string{"--flag", "v2"}
 	if !equalStrSlice(got, want) {
 		t.Fatalf("upsertArgPair equals-then-two-arg idempotence = %v, want %v", got, want)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"},
+	}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil {
+		t.Fatalf("ObservationSidecar: %v", err)
+	}
+	if c == nil {
+		t.Fatalf("ObservationSidecar returned nil for vLLM+LMCache with a model set")
+	}
+	if c.Name != SubscriberContainerName {
+		t.Fatalf("container name = %q, want %q", c.Name, SubscriberContainerName)
+	}
+	if c.Image != DefaultSubscriberImage {
+		t.Fatalf("container image = %q, want %q (default)", c.Image, DefaultSubscriberImage)
+	}
+	// Downward-API env vars carry the pod's name/namespace at start time —
+	// vital because pod.Name is empty at admission for generateName pods.
+	if !envHasFieldRef(c.Env, "POD_NAME", "metadata.name") {
+		t.Fatalf("env missing POD_NAME via downward API: %v", c.Env)
+	}
+	if !envHasFieldRef(c.Env, "POD_NAMESPACE", "metadata.namespace") {
+		t.Fatalf("env missing POD_NAMESPACE via downward API: %v", c.Env)
+	}
+	wantArgFragments := []string{
+		"--engine-endpoint=tcp://127.0.0.1:5557",
+		"--server=" + DefaultPolicyServerGRPCAddress,
+		"--replica-id=$(POD_NAME)",
+		"--tenant-id=$(POD_NAMESPACE)",
+		"--model-id=Qwen/Qwen2.5-0.5B-Instruct",
+		"--hash-scheme=vllm",
+		"--engine-metrics-url=http://127.0.0.1:8000/metrics",
+	}
+	for _, want := range wantArgFragments {
+		if !containsArg(c.Args, want) {
+			t.Fatalf("subscriber args missing %q; args = %v", want, c.Args)
+		}
+	}
+	if c.SecurityContext == nil || c.SecurityContext.RunAsNonRoot == nil || !*c.SecurityContext.RunAsNonRoot {
+		t.Fatalf("SecurityContext must run non-root; got %+v", c.SecurityContext)
+	}
+	if c.SecurityContext.Capabilities == nil || len(c.SecurityContext.Capabilities.Drop) == 0 {
+		t.Fatalf("SecurityContext must drop ALL capabilities; got %+v", c.SecurityContext.Capabilities)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarHonoursOptions(t *testing.T) {
+	a := NewVLLMLMCacheAdapter(
+		WithSubscriberImage("registry.example.com/subscriber:pinned"),
+		WithPolicyServerGRPCAddress("ic-server.custom-ns.svc.cluster.local:9090"),
+	)
+	cb := newLMCacheBackend(map[string]string{"model": "MyOrg/MyModel"})
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-z", Namespace: "engines"}}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil || c == nil {
+		t.Fatalf("ObservationSidecar: (%v, %v)", c, err)
+	}
+	if c.Image != "registry.example.com/subscriber:pinned" {
+		t.Fatalf("image override ignored: got %q", c.Image)
+	}
+	if !containsArg(c.Args, "--server=ic-server.custom-ns.svc.cluster.local:9090") {
+		t.Fatalf("server address override ignored; args = %v", c.Args)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
+	// BackendConfig["model"] is the documented source of --model-id. Without
+	// it the subscriber binary would refuse to start (model-id is a required
+	// flag), so the adapter returns (nil, nil) to skip the append. The next
+	// admission picks up the sidecar once the operator sets the field.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a"}}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil {
+		t.Fatalf("ObservationSidecar: %v", err)
+	}
+	if c != nil {
+		t.Fatalf("expected nil sidecar when backendConfig.model is unset, got %+v", c)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarBadInput(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(map[string]string{"model": "m"})
+	cases := []struct {
+		name string
+		cb   *cachev1alpha1.CacheBackend
+		pod  *corev1.Pod
+	}{
+		{"nil cache", nil, &corev1.Pod{}},
+		{"nil pod", cb, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := a.ObservationSidecar(tc.cb, tc.pod); err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+		})
+	}
+}
+
+// envHasFieldRef returns true if env contains an entry named name backed by
+// a fieldRef whose FieldPath matches the given path. Used to assert the
+// downward-API env the subscriber needs to resolve $(POD_NAME) /
+// $(POD_NAMESPACE) at container start.
+func envHasFieldRef(env []corev1.EnvVar, name, path string) bool {
+	for _, e := range env {
+		if e.Name == name && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReferenceAdapterObservationSidecarIsNil(t *testing.T) {
+	a := NewReferenceAdapter()
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ref-pod"}}
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil {
+		t.Fatalf("ObservationSidecar: %v", err)
+	}
+	if c != nil {
+		t.Fatalf("reference adapter ObservationSidecar must return nil, got %+v", c)
 	}
 }
 

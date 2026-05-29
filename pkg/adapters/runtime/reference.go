@@ -72,6 +72,15 @@ func (referenceAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string,
 	return injectEndpointEnv(pod, endpoint, cache, EnvRouterEndpoint, "router")
 }
 
+// ObservationSidecar returns (nil, nil): the reference adapter is the
+// dependency-free worked example of the interface contract and ships no
+// engine to observe. Real adapters (vLLM/LMCache today) return a non-nil
+// container; future adapters that observe a backend out-of-band (DaemonSet,
+// scrape-only) can keep returning nil here without breaking the seam.
+func (referenceAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, nil
+}
+
 // injectEndpointEnv is the shared implementation behind the reference
 // adapter's two inject paths. It is the worked example future adapters
 // should mirror: validate inputs, locate the role-specific containers, and

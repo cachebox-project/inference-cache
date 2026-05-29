@@ -120,6 +120,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	waitForWebhookReady(t, wopts.LocalServingHost, wopts.LocalServingPort)
 
 	const ns = "default"
+	const modelID = "Qwen/Qwen2.5-0.5B-Instruct"
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "envtest-cb", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
@@ -131,6 +132,10 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm-test"},
 			},
+			// backendConfig.model is the source of the
+			// subscriber sidecar's --model-id flag. Set it here so
+			// the auto-attach assertion below has something to match.
+			BackendConfig: map[string]string{"model": modelID},
 		},
 	}
 	if err := mgr.GetClient().Create(ctx, cb); err != nil {
@@ -178,6 +183,23 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("user --model arg was lost; args = %v", got.Spec.Containers[0].Args)
 	}
 
+	// The persisted pod must carry the kvevent-subscriber sidecar
+	// the adapter rendered, with --model-id derived from the CR — the end-
+	// to-end auto-attach gate the ticket DoD calls out.
+	if len(got.Spec.Containers) != 2 {
+		t.Fatalf("expected 2 containers (engine + subscriber); got %d: %v", len(got.Spec.Containers), envtestContainerNames(&got))
+	}
+	sub := envtestFindContainer(&got, adapterruntime.SubscriberContainerName)
+	if sub == nil {
+		t.Fatalf("subscriber sidecar missing; containers = %v", envtestContainerNames(&got))
+	}
+	if !containsArgFlag(sub.Args, "--model-id="+modelID) {
+		t.Fatalf("subscriber --model-id not derived from CR; args = %v", sub.Args)
+	}
+	if !containsArgFlag(sub.Args, "--replica-id=$(POD_NAME)") {
+		t.Fatalf("subscriber --replica-id must use downward-API POD_NAME; args = %v", sub.Args)
+	}
+
 	pod2 := pod.DeepCopy()
 	pod2.Name = "vllm-engine-2"
 	pod2.ResourceVersion = ""
@@ -207,6 +229,28 @@ func mustHaveContainerEnv(t *testing.T, pod *corev1.Pod, name, value string) {
 		}
 	}
 	t.Fatalf("env %s missing on %s; have %v", name, pod.Name, pod.Spec.Containers[0].Env)
+}
+
+// envtestFindContainer returns the container in pod with the given name, or
+// nil if absent. The non-envtest unit tests have a similarly named helper —
+// the two test files don't share state (envtest_integration_test.go skips
+// without KUBEBUILDER_ASSETS), so each file declares its own.
+func envtestFindContainer(pod *corev1.Pod, name string) *corev1.Container {
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == name {
+			return &pod.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+// envtestContainerNames returns the container names of pod for error messages.
+func envtestContainerNames(pod *corev1.Pod) []string {
+	out := make([]string, len(pod.Spec.Containers))
+	for i, c := range pod.Spec.Containers {
+		out[i] = c.Name
+	}
+	return out
 }
 
 func containsArgFlag(args []string, flag string) bool {
