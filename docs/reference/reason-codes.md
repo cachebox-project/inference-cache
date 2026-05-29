@@ -28,13 +28,28 @@ and for ops dashboards.
 
 | Code | Status | When the server emits it | Response shape | What the gateway does |
 |---|---|---|---|---|
-| `PREFIX_MATCH` | **shipped** | The index has at least one replica holding `(tenant, model, hash_scheme, prefix_hash)` and the ranker returned a non-empty set. | `replica_scores` non-empty, ranked by `matched_tokens × freshness` (top-K). | Route to the top-ranked replica → prefix-cache hit; lower TTFT. |
+| `PREFIX_MATCH` | **shipped** | The index has at least one replica holding `(tenant, model, hash_scheme, prefix_hash)` and the ranker returned a non-empty set. | `replica_scores` non-empty, ranked best-first by `matched_tokens × freshness × pressure_factor × slo_bias`. The last two factors collapse to 1 when no replica stats are reported and no SLO hint is set, so the baseline is `matched_tokens × freshness`. Every qualifying replica is returned today (no top-K limit); the gateway typically uses the top entry. | Route to the top-ranked replica → prefix-cache hit; lower TTFT. |
 | `NO_HINT` | **shipped** | Anything that yields no useful hint: prefix not in index, `hash_scheme` empty or unknown, the ranker returned empty, an index-disabled state. **This is the fail-open default.** | `replica_scores` **empty**. Not an error. | Route per the gateway's default policy (round-robin, least-loaded, …). The cache plane is invisible to this request. |
-| `TENANT_HOT` | spec'd, not emitted | Planned for the future ranking-v2 work: no exact prefix match, but the index knows this tenant has hot replicas worth biasing toward. | `replica_scores` non-empty (tenant-hot ranked); shape unchanged. | Treat as a softer hint than `PREFIX_MATCH`; gateway free to use or ignore. |
-| `TIMEOUT` | spec'd, not emitted server-side today | The server's lookup deadline expired before it could rank. Gateway clients also synthesize this locally when *they* cancel a slow `LookupRoute` RPC. | Server: empty `replica_scores`. Client-side synth: same. | Treat as `NO_HINT`. |
+| `TENANT_HOT` | **shipped** | No exact prefix match for `(tenant, model, hash_scheme, prefix_hash)`, but the tenant has at least one replica that (a) has reported stats recently (within ~5 minutes by default), (b) has a `hit_rate` above a small floor (default 0.1), AND (c) currently has **at least one prefix entry in the requested `(tenant, model, hash_scheme)` in the index** — proving the replica serves the requested engine domain. The "in the index" check is sweep-driven (an entry past TTL stays counted until the next sweep removes it), so for at most one sweep interval a recently-stale entry can briefly still satisfy the check; per soft-state semantics that yields at worst a soft hint that turns into a cache miss, never a wrong answer. A coarser locality signal than `PREFIX_MATCH` — useful when the prefix is novel but the tenant already has servers warm in the cache rotation. | `replica_scores` non-empty (tenant-hot ranked); `matched_tokens` is **0** because there is no prefix overlap (the gateway must rely on `reason_code`, not `matched_tokens`, to recognize this branch). Shape otherwise unchanged. | Treat as a softer hint than `PREFIX_MATCH`; gateway free to use or ignore. |
+| `TIMEOUT` | **shipped** | The lookup deadline expired before the index could rank — either the caller's context was already past its deadline on arrival or the per-tenant `CachePolicy.spec.lookupTimeoutMs` budget elapsed during the lookup. Gateway clients also synthesize this locally when *they* cancel a slow `LookupRoute` RPC. | Server: empty `replica_scores`. Client-side synth: same. | Treat as `NO_HINT`. |
 
-**Constants in code:** `reasonPrefixMatch`, `reasonNoHint` in
+**Constants in code:** `reasonPrefixMatch`, `reasonTenantHot`, `reasonNoHint`, `reasonTimeout` in
 `pkg/server/inferencecache_service.go`.
+
+### Ranking inputs beyond `matched_tokens × freshness`
+
+The server-side ranker (`pkg/index`) is configurable via `RankerConfig`. Every
+knob defaults to a value that reduces the score to the baseline when its
+supporting signal is absent — so a deployment without replica stats or SLO
+hints behaves exactly like the original B6 ranker.
+
+| Knob | What it does | Default | Off switch |
+|---|---|---|---|
+| `PressureWeight` | Penalty applied to a replica's score from `ReplicaStats.pressure`: `pressure_factor = max(0, 1 - PressureWeight × pressure)`. Avoids blindly preferring a saturated cache holder over a fresher, lower-pressure peer. | `1.0` | `0` → no penalty |
+| `SLOTightTTFTMs` | TTFT budget (ms) below which the request is "tight" and the SLO bias kicks in. Uses `LookupRouteRequest.slo.ttft_ms`. | `200` | `0` → bias never fires |
+| `SLOTightBias` | Coefficient in the freshness boost: `slo_bias = 1 + freshness × SLOTightBias` when the request is tight. Higher → fresher candidates are favored more aggressively. | `1.0` | `0` → no boost |
+| `TenantHotMinHitRate` | Minimum `hit_rate` for a replica to count as "warm" for the `TENANT_HOT` fallback. | `0.1` | n/a (use `TenantHotMaxAge = 0` to disable the fallback) |
+| `TenantHotMaxAge` | Maximum stats age for a replica to count as "warm". | `5m` | `0` → fallback disabled (prefix-miss always lands at `NO_HINT`) |
 
 ---
 
@@ -79,9 +94,9 @@ inferencecache_lookup_route_calls_total{model="...", reason_code="PREFIX_MATCH",
 inferencecache_lookup_route_calls_total{model="...", reason_code="NO_HINT",      hint_used="false"} 318
 ```
 
-`hint_used="true"` ⇔ `replica_scores` was non-empty in the response. Today this
-correlates with `PREFIX_MATCH`; once `TENANT_HOT` ships it'll correlate with
-either.
+`hint_used="true"` ⇔ `replica_scores` was non-empty in the response. It
+correlates with either `PREFIX_MATCH` or `TENANT_HOT` (both shipped codes
+return non-empty scores).
 
 See [metrics.md](metrics.md) for the full metric surface.
 

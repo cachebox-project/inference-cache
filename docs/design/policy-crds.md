@@ -19,7 +19,7 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 `status.conditions` and `status.observedGeneration` are reserved for controller observations.
 
-This PR ships the declarative `CachePolicy` contract only. Runtime propagation into the in-memory index and lookup path remains follow-up work in the server/controller layer.
+Runtime propagation (controller → server `/policy`) is described in [policy-propagation.md](policy-propagation.md): `evictionTTL` drives per-tenant index eviction, `minimumPrefixTokens` and `lookupTimeoutMs` are enforced on the `LookupRoute` path. `failOpen` and `tenantScoped` are declarative-only today.
 
 ## CacheTenant
 
