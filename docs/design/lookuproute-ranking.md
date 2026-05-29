@@ -247,8 +247,12 @@ with
 
 ```
 pressure_factor = max(0, 1 − PressureWeight × pressure)
-slo_bias        = 1 + freshness × SLOTightBias       (when TTFT is tight)
+slo_bias        = 1 + decay × SLOTightBias           (when TTFT is tight)
                 = 1                                  (otherwise)
+
+where `decay` is:
+  - `freshness` in the PREFIX_MATCH path (prefix entry's lastSeen vs. TTL)
+  - `recency`   in the TENANT_HOT  path (stats entry's statsReported vs. TenantHotMaxAge)
 ```
 
 And the strategies compose into a single orchestrator:
