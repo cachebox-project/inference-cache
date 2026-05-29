@@ -277,6 +277,33 @@ func TestScraperFiltersByModelLabel(t *testing.T) {
 	}
 }
 
+// TestScraperEmptyModelLabelAggregatesSeriesEvenWhenAliased pins the
+// regression that prompted decoupling ScraperConfig.ModelLabel from the cache
+// plane's --model-id: when the operator's index key (e.g. "canary") differs
+// from the vLLM-side label value (e.g. the served model path), leaving
+// ModelLabel empty must aggregate every series and report non-zero stats.
+// Previously the subscriber wired --model-id into ModelLabel, so the common
+// docs/reference-stack/scripts/canary_e2e.sh setup (MODEL_ID=canary,
+// vLLM model_name=Qwen/...) silently dropped every series and emitted zeros.
+func TestScraperEmptyModelLabelAggregatesSeriesEvenWhenAliased(t *testing.T) {
+	srv := fixtureServer(t, "vllm_metrics_cpu.txt")
+	defer srv.Close()
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{
+		URL: srv.URL, Tier: CacheTierAuto, // ModelLabel: "" (operator opt-out)
+		CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 256,
+	}, nil)
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	if stats.GetCacheMemoryBytes() == 0 {
+		t.Error("ModelLabel='' must aggregate; cacheMemoryBytes=0 means the filter rejected every series")
+	}
+	if stats.GetPressure() == 0 {
+		t.Error("ModelLabel='' must aggregate; pressure=0 means the filter rejected the gauges")
+	}
+}
+
 func TestScraperUnlabeledMetricExcludedWhenFilterSet(t *testing.T) {
 	// A series missing the model_name label entirely must NOT be attributed to
 	// the configured model — silent under-report beats silent misattribution.

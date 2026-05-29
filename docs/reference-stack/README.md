@@ -180,6 +180,12 @@ controller scrapes from it) populate alongside the prefix stream. Map
 gauge); leave it `0` to publish `cacheMemoryBytes=0` and let the other fields
 populate normally.
 
+If the engine serves more than one model on the same `/metrics` endpoint, pass
+`--engine-model-name=<served-model>` to filter by vLLM's `model_name` label —
+that label tracks the engine's identifier, which is independent of the cache
+plane's `--model-id` index key. Leave it empty when the engine serves one model
+and you want the scraper to consume every series unfiltered.
+
 ```bash
 docs/reference-stack/scripts/canary_e2e.sh
 ```
