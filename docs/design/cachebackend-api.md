@@ -143,8 +143,9 @@ Rejects structurally-broken specs that the reconciler cannot do anything useful 
 | `External` requires `spec.endpoint` | `spec.type=External` with no endpoint — the external backend has no address to mirror to `status.endpoint`. |
 | Memory-only backends cannot declare PVC storage | `spec.storage.pvc` set when `spec.type` is in the Phase-1 memory-only set (`AIBrix`, `NIXL`). These backends have no persistent tier; a PVC would never mount. |
 | Cross-namespace endpoint requires opt-in | `spec.endpoint` resolves to a Service in a namespace other than the CacheBackend's, and `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator should acknowledge. Bare hostnames, IPs, and unqualified names pass through (no namespace to compare against). |
+| Runtime/backend pair must be supported by an installed adapter | Effective `(engine, spec.type)` pair has no registered runtime adapter, so the reconciler would fall back to unmanaged. The effective engine is resolved with the same helper the reconciler and pod webhook use: `spec.integration.engine` lower-cased, defaulting to `vllm` when unset (Phase-1 default — the only engine the shipping adapters target). Bypassed for `spec.type=External` (mirrored, not managed) and for an empty `spec.type` (required-field rejection wins). The rejection message names both sides of the offending pair and lists the supported pairs the controller's registered adapters expose, e.g. `no runtime adapter supports the (engine="vllm", backend="Mooncake") pair; supported pairs in this build: vllm/LMCache`. |
 
-Rules are an ordered, pluggable list (`CacheBackendValidator.Rules`); admission rules planned in later modules (e.g. the runtime/backend compatibility check from M6) plug in as a one-line append.
+The structural rules are an ordered, pluggable list (`CacheBackendValidator.Rules`); the runtime/backend compatibility check runs separately because it needs to consult the shared `adapterruntime.Registry` rather than just the spec.
 
 ### Migration
 

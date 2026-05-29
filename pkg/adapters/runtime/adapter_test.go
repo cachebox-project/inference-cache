@@ -279,6 +279,51 @@ func TestRegistryResolvesReferenceAdapterByRuntime(t *testing.T) {
 	}
 }
 
+func TestResolveRuntimeID(t *testing.T) {
+	// ResolveRuntimeID is the single rule the admission validator, the
+	// reconciler, and the pod-mutating webhook all read the engine name
+	// through — pinning it here prevents a future tweak in one layer
+	// from quietly diverging from the others.
+	cases := []struct {
+		name string
+		in   *cachev1alpha1.CacheBackend
+		want RuntimeID
+	}{
+		{
+			name: "nil cache defaults to vllm",
+			in:   nil,
+			want: RuntimeVLLM,
+		},
+		{
+			name: "unset integration defaults to vllm",
+			in:   &cachev1alpha1.CacheBackend{},
+			want: RuntimeVLLM,
+		},
+		{
+			name: "empty engine defaults to vllm",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{}}},
+			want: RuntimeVLLM,
+		},
+		{
+			name: "case-folded vLLM routes to canonical id",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vLLM"}}},
+			want: RuntimeVLLM,
+		},
+		{
+			name: "free-form engine passes through lowercased",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "SGLang"}}},
+			want: RuntimeID("sglang"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveRuntimeID(tc.in); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func lookupEnv(env []corev1.EnvVar, name string) (string, bool) {
 	for _, e := range env {
 		if e.Name == name {

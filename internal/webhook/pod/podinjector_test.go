@@ -464,42 +464,6 @@ func TestHandle_SkipAnnotationFalse_StillInjects(t *testing.T) {
 	}
 }
 
-func TestResolveRuntimeID(t *testing.T) {
-	cases := []struct {
-		name string
-		in   *cachev1alpha1.CacheBackend
-		want adapterruntime.RuntimeID
-	}{
-		{
-			name: "unset integration defaults to vllm",
-			in:   &cachev1alpha1.CacheBackend{},
-			want: adapterruntime.RuntimeVLLM,
-		},
-		{
-			name: "empty engine defaults to vllm",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{}}},
-			want: adapterruntime.RuntimeVLLM,
-		},
-		{
-			name: "case-folded vLLM routes to canonical id",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vLLM"}}},
-			want: adapterruntime.RuntimeVLLM,
-		},
-		{
-			name: "free-form engine passes through lowercased",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "SGLang"}}},
-			want: adapterruntime.RuntimeID("sglang"),
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveRuntimeID(tc.in); got != tc.want {
-				t.Fatalf("got %q want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 func mustHaveEnv(t *testing.T, pod *corev1.Pod, name, value string) {
 	t.Helper()
 	if len(pod.Spec.Containers) == 0 {

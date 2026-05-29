@@ -139,7 +139,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// idempotently (upsertEnv / upsertArgPair) and a no-op merge produces an
 	// empty patch set, so re-admissions on an already-injected pod are
 	// free at the apiserver.
-	runtimeID := resolveRuntimeID(cache)
+	runtimeID := adapterruntime.ResolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
 		registry = adapterruntime.DefaultRegistry()
@@ -229,17 +229,6 @@ func skipAnnotationOptsOut(value string) bool {
 		return false
 	}
 	return true
-}
-
-// resolveRuntimeID picks the [adapterruntime.RuntimeID] the handler asks the
-// registry to match. Mirrors internal/controller/resolveRuntimeID — both
-// callers must agree so the admission webhook injects the same adapter the
-// reconciler renders the cache-server for.
-func resolveRuntimeID(cache *cachev1alpha1.CacheBackend) adapterruntime.RuntimeID {
-	if cache.Spec.Integration != nil && cache.Spec.Integration.Engine != "" {
-		return adapterruntime.RuntimeID(strings.ToLower(cache.Spec.Integration.Engine))
-	}
-	return adapterruntime.RuntimeVLLM
 }
 
 // logger returns the handler's configured logger if set, otherwise the

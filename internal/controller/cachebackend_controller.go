@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -146,12 +145,14 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	if registry == nil {
 		registry = adapterruntime.DefaultRegistry()
 	}
-	runtimeID := resolveRuntimeID(backend)
+	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	adapter, err := registry.Select(runtimeID, backend)
 	if err != nil {
-		// No adapter knows how to wire this (runtime, backend) pair. Shed any
-		// previously managed workload and log; a future admission validator
-		// will surface the same condition as a user-visible rejection.
+		// No adapter knows how to wire this (runtime, backend) pair. The
+		// admission validator (M6/C7) rejects this at write time, so
+		// reaching this branch means a CR already in etcd from before the
+		// webhook was installed (or with a registry that has since
+		// shrunk). Shed any previously managed workload and log.
 		logger.V(1).Info("no runtime adapter for backend",
 			"runtime", runtimeID, "type", backend.Spec.Type,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
@@ -159,23 +160,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	}
 
 	return r.reconcileManaged(ctx, logger, backend, adapter)
-}
-
-// resolveRuntimeID picks the [adapterruntime.RuntimeID] the reconciler asks
-// the registry to match. The CacheBackend carries the engine name in
-// Spec.Integration.Engine; when unset, vLLM is the Phase-1 default (the only
-// engine the shipping adapters target).
-//
-// Engine values are normalised to lower-case so common spellings ("vLLM",
-// "VLLM", "SGLang") route to the canonical RuntimeID constants
-// ([adapterruntime.RuntimeVLLM] etc.); a free-form string in the CR should
-// never silently drop a CacheBackend into the unmanaged path just because of
-// case.
-func resolveRuntimeID(backend *cachev1alpha1.CacheBackend) adapterruntime.RuntimeID {
-	if backend.Spec.Integration != nil && backend.Spec.Integration.Engine != "" {
-		return adapterruntime.RuntimeID(strings.ToLower(backend.Spec.Integration.Engine))
-	}
-	return adapterruntime.RuntimeVLLM
 }
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to status.

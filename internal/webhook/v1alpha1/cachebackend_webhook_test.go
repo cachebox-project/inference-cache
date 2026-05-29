@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // newBackend returns a minimally-valid managed CacheBackend the test cases
@@ -284,6 +286,216 @@ func TestValidator_PluggableRuleAppendable(t *testing.T) {
 	v := &CacheBackendValidator{Rules: append(DefaultValidationRules, rejectAll)}
 	cb := newBackend()
 	requireInvalidWithCause(t, v, cb, "spec", "synthetic")
+}
+
+// stubVLLMLMCacheAdapter is a hermetic stand-in for the production
+// vLLM+LMCache adapter that exercises the validator without dragging in the
+// reference-stack adapter wiring. It supports exactly the vLLM/LMCache pair
+// and exposes it via PairLister so the registry surfaces the same option to
+// admission error messages.
+type stubVLLMLMCacheAdapter struct{}
+
+func (stubVLLMLMCacheAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1alpha1.CacheBackend) bool {
+	if cb == nil {
+		return false
+	}
+	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+}
+
+func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
+}
+func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+func (stubVLLMLMCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
+	return []adapterruntime.SupportedPair{{
+		Runtime: adapterruntime.RuntimeVLLM,
+		Backend: cachev1alpha1.CacheBackendTypeLMCache,
+	}}
+}
+
+// stubRegistry returns a Registry with only the stub vLLM+LMCache adapter
+// installed. Hermetic — tests don't depend on the in-tree
+// adapterruntime.DefaultRegistry() composition, so they keep passing if a
+// future adapter joins or leaves the default set.
+func stubRegistry() *adapterruntime.Registry {
+	r := adapterruntime.NewRegistry()
+	r.Register(stubVLLMLMCacheAdapter{})
+	return r
+}
+
+func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
+	// Happy path: an explicit (vLLM, LMCache) pair the stub registry
+	// supports must be admitted. Pins the C7 check's positive side so a
+	// regression doesn't silently start rejecting the only currently
+	// shipping combination.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vLLM+LMCache rejected: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_VLLMPlusMooncakeRejected(t *testing.T) {
+	// Rejection path: a (vLLM, Mooncake) pair no installed adapter
+	// supports must be rejected with a message that names BOTH sides of
+	// the offending pair and lists the supported pairs so the user has
+	// an actionable next step.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+
+	_, err := v.ValidateCreate(context.Background(), cb)
+	if err == nil {
+		t.Fatalf("expected vLLM+Mooncake to be rejected")
+	}
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok {
+		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
+	}
+	if statusErr.Status().Details == nil || len(statusErr.Status().Details.Causes) == 0 {
+		t.Fatalf("Invalid status carried no causes: %v", statusErr.Status())
+	}
+	var match *metav1.StatusCause
+	causes := statusErr.Status().Details.Causes
+	for i := range causes {
+		if causes[i].Field == "spec.integration.engine" {
+			match = &causes[i]
+			break
+		}
+	}
+	if match == nil {
+		t.Fatalf("no cause on spec.integration.engine; got: %+v", causes)
+	}
+	for _, want := range []string{"vllm", "Mooncake", "vllm/LMCache"} {
+		if !strings.Contains(match.Message, want) {
+			t.Errorf("rejection message missing %q; got %q", want, match.Message)
+		}
+	}
+}
+
+func TestValidator_RuntimeAdapter_UnknownEngineRejected(t *testing.T) {
+	// An engine name no adapter handles must also be rejected — guards
+	// against a typo (`engin: vllmm`) silently riding through admission
+	// and only failing at reconcile.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllmm"}
+	requireInvalidWithCause(t, v, cb, "spec.integration.engine",
+		"engine=\"vllmm\"")
+}
+
+func TestValidator_RuntimeAdapter_EngineNormalisedToLowerCase(t *testing.T) {
+	// The reconciler downcases the engine string before looking up an
+	// adapter; admission must do the same so a CR that spells "VLLM" is
+	// not admitted by one layer and rejected by the other.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "VLLM"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("VLLM (uppercase) + LMCache rejected: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_EmptyEngineDefaultsToVLLM(t *testing.T) {
+	// Engine is optional on the CRD; the reconciler and pod webhook
+	// default it to vLLM via adapterruntime.ResolveRuntimeID, so
+	// admission must use the same defaulting or pairs like
+	// "type: Mooncake with no engine" slip past the webhook and only
+	// fail at reconcile (the exact gap C7 closes).
+	//
+	// With LMCache the default vLLM pair is supported → admit.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache, no Integration block
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("LMCache + defaulted vLLM engine rejected: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_EmptyEngineWithUnsupportedTypeRejected(t *testing.T) {
+	// Counterpart to the previous test: the default vLLM resolution
+	// must also fire C7 — type: Mooncake with no engine must be
+	// rejected at admission, since the reconciler would otherwise try
+	// vllm+Mooncake and fall back to unmanaged.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	requireInvalidWithCause(t, v, cb, "spec.integration.engine",
+		"backend=\"Mooncake\"")
+}
+
+func TestValidator_RuntimeAdapter_EmptyTypeSkipsCheck(t *testing.T) {
+	// Mirror edge case: an empty type must not trigger C7 either, for
+	// the same "defer to required-field validation" reason.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = ""
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("empty type must not trigger C7; got %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_ExternalSkipsCheck(t *testing.T) {
+	// External backends are pre-existing services the controller mirrors
+	// to status — they never reach the adapter registry at reconcile, so
+	// admission must not reject them for "no adapter". The endpoint rule
+	// (and the cross-namespace rule) still apply.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("External with engine=vllm rejected by C7: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_UpdateAlsoChecks(t *testing.T) {
+	// ValidateUpdate runs the same check as ValidateCreate — a kubectl
+	// edit that flips engine to something the registry doesn't support
+	// must be rejected just as it would on create.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	old := newBackend()
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	newCB := old.DeepCopy()
+	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+
+	_, err := v.ValidateUpdate(context.Background(), old, newCB)
+	if err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("expected Invalid on update with unsupported pair, got %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_DeleteSkipsCheck(t *testing.T) {
+	// Deletion of a CR that would now be rejected (e.g. registry shrank
+	// since admission) must still be allowed so operators can clean up.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateDelete(context.Background(), cb); err != nil {
+		t.Fatalf("ValidateDelete rejected unsupported pair: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
+	// A zero-value validator (Registry nil) must still run the C7 check
+	// against [adapterruntime.DefaultRegistry] — the production safety
+	// net for cmd/controller wiring drift. The default registry ships
+	// the vLLM+LMCache adapter, so the happy pair admits.
+	v := &CacheBackendValidator{}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("nil-registry fallback rejected vLLM+LMCache: %v", err)
+	}
 }
 
 func TestServiceDNSNamespace(t *testing.T) {
