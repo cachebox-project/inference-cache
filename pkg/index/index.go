@@ -476,16 +476,37 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	return LookupResult{Strategy: StrategyNone}
 }
 
-// tenantHotCandidates returns replicas warm for (tenant, model) — used when
-// the exact-prefix path returns nothing. "Warm" = stats reported within
-// RankerConfig.TenantHotMaxAge AND hit_rate ≥ TenantHotMinHitRate. The
-// fallback is gated on TenantHotMaxAge > 0 so RankerConfig{} disables it
-// entirely (back to NO_HINT on prefix-miss). The score uses hit_rate as the
-// locality proxy (in place of matched_tokens, which is zero by definition
-// here) and reuses the same pressure/SLO factors as the prefix-match path
-// so a tight-SLO caller still gets a freshness-biased ranking.
+// tenantHotCandidates returns replicas warm for (tenant, model) within the
+// requested hash_scheme — used when the exact-prefix path returns nothing.
+// "Warm" requires three things:
+//
+//  1. The replica has reported at least one prefix entry for
+//     (tenant, model, req.HashScheme). Stats in the index are deliberately
+//     scheme-independent (PROJECT_CONTEXT §5), so without this check a
+//     stats-only update with an empty/unrelated hash_scheme could leak into
+//     a TENANT_HOT hint for the wrong engine domain. Proving the replica
+//     has SOME prefix in the requested scheme is the cheapest way to assert
+//     "this replica actually serves this engine".
+//  2. The replica's stats were reported within RankerConfig.TenantHotMaxAge
+//     (the recency cutoff). Older stats are stale hints.
+//  3. The replica's hit_rate is at least RankerConfig.TenantHotMinHitRate.
+//     Below that, it's "not warm enough" to be a useful hint.
+//
+// The fallback is gated on TenantHotMaxAge > 0 so RankerConfig{} disables
+// it entirely (back to NO_HINT on prefix-miss). The score uses hit_rate as
+// the locality proxy (in place of matched_tokens, which is zero by
+// definition here) and reuses the same pressure/SLO factors as the
+// prefix-match path so a tight-SLO caller still gets a freshness-biased
+// ranking.
 func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 	if i.ranker.TenantHotMaxAge <= 0 {
+		return nil
+	}
+	// LookupRoute already short-circuits an empty hash_scheme to NO_HINT,
+	// but enforce the same guard here so the helper stays safe to call
+	// independently: an empty scheme can't be matched against any stored
+	// prefix entry, so no candidate could ever qualify.
+	if req.HashScheme == "" {
 		return nil
 	}
 	now := i.now()
@@ -494,10 +515,26 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	i.mu.RLock()
+	// Build the set of replicas that have at least one prefix entry for the
+	// requested (tenant, model, hash_scheme). Only these are proven to serve
+	// the engine domain the caller asked about.
+	serving := make(map[string]struct{})
+	for key, replicas := range i.prefixes {
+		if key.tenant != req.Tenant || key.model != req.Model || key.hashScheme != req.HashScheme {
+			continue
+		}
+		for id := range replicas {
+			serving[id] = struct{}{}
+		}
+	}
+
 	var scores []ReplicaScore
 	for sk, s := range i.stats {
 		if sk.tenant != req.Tenant || sk.model != req.Model {
 			continue
+		}
+		if _, ok := serving[sk.replicaID]; !ok {
+			continue // stats exist but replica doesn't serve this hash_scheme
 		}
 		age := now.Sub(s.lastSeen)
 		if age >= maxAge {

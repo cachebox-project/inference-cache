@@ -708,11 +708,13 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 // candidate carries MatchedTokens=0 because there is no prefix overlap. A
 // gateway client that filters or weights by MatchedTokens must therefore
 // treat 0 as "softer hint" rather than "no overlap → ignore"; the reason_code
-// is the load-bearing signal.
+// is the load-bearing signal. Ingests an unrelated prefix entry under the
+// requested hash_scheme so the replica clears the engine-domain guard.
 func TestTenantHotMatchedTokensIsZero(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Stats: &ReplicaStats{HitRate: 0.8}})
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.8}})
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
@@ -733,8 +735,11 @@ func TestTenantHotRequiresRecentStats(t *testing.T) {
 	cfg.TenantHotMaxAge = 5 * time.Minute
 	idx := New(withClock(clk.now), WithTTL(time.Hour), WithRanker(cfg))
 
+	// Ingest a prefix entry so the engine-domain guard is satisfied; the
+	// test is about stats recency, not the domain check.
 	idx.Ingest(Update{ReplicaID: "stale-warm", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Stats: &ReplicaStats{HitRate: 0.9}})
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.9}})
 
 	// Advance past TenantHotMaxAge — the stats are now "old" for fallback
 	// purposes (even though they're still inside the global TTL).
@@ -749,14 +754,16 @@ func TestTenantHotRequiresRecentStats(t *testing.T) {
 
 // TestTenantHotHonorsHitRateThreshold pins the warmth threshold: a replica
 // with hit_rate below TenantHotMinHitRate is "not warm enough" to be a
-// useful hint, even if it was reported recently.
+// useful hint, even if it was reported recently AND serves the engine
+// domain.
 func TestTenantHotHonorsHitRateThreshold(t *testing.T) {
 	cfg := DefaultRankerConfig()
 	cfg.TenantHotMinHitRate = 0.5
 	idx := New(WithRanker(cfg))
 
 	idx.Ingest(Update{ReplicaID: "tepid", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Stats: &ReplicaStats{HitRate: 0.2}}) // below the 0.5 threshold
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.2}}) // below the 0.5 threshold
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
@@ -775,12 +782,51 @@ func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 	idx := New(WithRanker(cfg))
 
 	idx.Ingest(Update{ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Stats: &ReplicaStats{HitRate: 0.9}})
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.9}})
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
 		t.Fatalf("TenantHotMaxAge=0 must disable fallback; got %v (%+v)", res.Strategy, res.Scores)
+	}
+}
+
+// TestTenantHotRequiresReplicaServingRequestedScheme guards the
+// engine-domain check: a replica with high hit_rate stats but NO prefix
+// entries in the requested hash_scheme cannot become a TENANT_HOT hint —
+// it isn't proven to serve this engine. Otherwise stats-only updates (or
+// updates under a different scheme) could leak into hints for the wrong
+// domain. The replica below holds a prefix only under "sglang"; a lookup
+// under "vllm" must NOT promote it via TENANT_HOT.
+func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
+	idx := New(WithRanker(DefaultRankerConfig()))
+	idx.Ingest(Update{ReplicaID: "wrong-engine", Model: "m", Tenant: "t", HashScheme: "sglang",
+		Prefixes: []PrefixRef{{PrefixHash: hash("other"), TokenCount: 1}},
+		Stats:    &ReplicaStats{HitRate: 0.9}})
+
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("novel")})
+	if res.Strategy != StrategyNone {
+		t.Fatalf("replica serving sglang must NOT surface for a vllm lookup; got %v (%+v)",
+			res.Strategy, res.Scores)
+	}
+}
+
+// TestTenantHotIgnoresStatsOnlyReplicas guards the same engine-domain check
+// for a more subtle case: an update that carries stats but NO prefix entry
+// (regardless of HashScheme) cannot become a TENANT_HOT candidate, because
+// the index has no evidence the replica serves any prefix at all.
+func TestTenantHotIgnoresStatsOnlyReplicas(t *testing.T) {
+	idx := New(WithRanker(DefaultRankerConfig()))
+	idx.Ingest(Update{ReplicaID: "stats-only", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{HitRate: 0.95}})
+
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		PrefixHash: hash("novel")})
+	if res.Strategy != StrategyNone {
+		t.Fatalf("stats-only update must NOT surface in TENANT_HOT; got %v (%+v)",
+			res.Strategy, res.Scores)
 	}
 }
 
