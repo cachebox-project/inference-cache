@@ -71,6 +71,105 @@ func TestLookupRouteFailsOpen(t *testing.T) {
 	}
 }
 
+// TestLookupRouteReasonCodes exercises the handler's strategy-to-reason_code
+// mapping end-to-end: a primed index + a crafted request must surface as
+// PREFIX_MATCH or TENANT_HOT through the gRPC envelope, not just inside the
+// index. Pins the contract surface the gateway reads.
+func TestLookupRouteReasonCodes(t *testing.T) {
+	t.Run("PREFIX_MATCH on exact prefix hit", func(t *testing.T) {
+		svc := newTestService()
+		svc.index.Ingest(index.Update{
+			ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+		})
+		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
+		})
+		if err != nil {
+			t.Fatalf("LookupRoute: %v", err)
+		}
+		if resp.GetReasonCode() != "PREFIX_MATCH" {
+			t.Fatalf("reason = %q, want PREFIX_MATCH", resp.GetReasonCode())
+		}
+		if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "r1" {
+			t.Fatalf("scores = %+v, want one r1", resp.GetReplicaScores())
+		}
+	})
+
+	t.Run("TENANT_HOT on prefix miss with warm replica", func(t *testing.T) {
+		svc := newTestService()
+		svc.index.Ingest(index.Update{
+			ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("other"), TokenCount: 1}},
+			Stats:    &index.ReplicaStats{HitRate: 0.8},
+		})
+		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("novel"),
+		})
+		if err != nil {
+			t.Fatalf("LookupRoute: %v", err)
+		}
+		if resp.GetReasonCode() != "TENANT_HOT" {
+			t.Fatalf("reason = %q, want TENANT_HOT", resp.GetReasonCode())
+		}
+		if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "warm" {
+			t.Fatalf("scores = %+v, want one warm replica", resp.GetReplicaScores())
+		}
+		// MatchedTokens is 0 in the TENANT_HOT branch (no prefix overlap);
+		// the gateway must rely on reason_code, not MatchedTokens, for that.
+		if resp.GetReplicaScores()[0].GetMatchedTokens() != 0 {
+			t.Fatalf("TENANT_HOT MatchedTokens = %d, want 0", resp.GetReplicaScores()[0].GetMatchedTokens())
+		}
+	})
+}
+
+// TestLookupRouteSLOFlowsThroughHandler proves the proto SLO field actually
+// reaches the index ranker. Two replicas hold the prefix and are ingested
+// at "now" (so freshness ≈ 1 for both). With a tight SLO the score gets
+// the freshness boost; with no SLO it does not. Guards against a future
+// refactor that drops req.GetSlo() on the floor without anyone noticing.
+func TestLookupRouteSLOFlowsThroughHandler(t *testing.T) {
+	svc := newTestService()
+
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 50}},
+	})
+
+	base := &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
+	}
+	tight := &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
+		Slo: &icpb.SLO{TtftMs: 50}, // < DefaultSLOTightTTFTMs (200) → tight
+	}
+
+	baseResp, err := svc.LookupRoute(context.Background(), base)
+	if err != nil {
+		t.Fatalf("LookupRoute (no SLO): %v", err)
+	}
+	tightResp, err := svc.LookupRoute(context.Background(), tight)
+	if err != nil {
+		t.Fatalf("LookupRoute (tight SLO): %v", err)
+	}
+	if baseResp.GetReasonCode() != "PREFIX_MATCH" || tightResp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("both should be PREFIX_MATCH, got base=%q tight=%q",
+			baseResp.GetReasonCode(), tightResp.GetReasonCode())
+	}
+	if len(baseResp.GetReplicaScores()) != 1 || len(tightResp.GetReplicaScores()) != 1 {
+		t.Fatalf("expected one score each, got base=%d tight=%d",
+			len(baseResp.GetReplicaScores()), len(tightResp.GetReplicaScores()))
+	}
+	// The freshness boost (1 + freshness × DefaultSLOTightBias) is strictly
+	// > 1 for any positive freshness, so the tight-SLO score must exceed
+	// the no-SLO baseline. If the handler drops req.GetSlo() the index sees
+	// TTFTBudgetMs=0, no bias is applied, and the two scores match.
+	if tightResp.GetReplicaScores()[0].GetScore() <= baseResp.GetReplicaScores()[0].GetScore() {
+		t.Fatalf("tight SLO did not reach the ranker — score not boosted (base=%v tight=%v)",
+			baseResp.GetReplicaScores()[0].GetScore(), tightResp.GetReplicaScores()[0].GetScore())
+	}
+}
+
 func TestRenderTemplateFailsOpen(t *testing.T) {
 	resp, err := newTestService().RenderTemplate(context.Background(), &icpb.RenderTemplateRequest{TemplateRef: "t"})
 	if err != nil {
