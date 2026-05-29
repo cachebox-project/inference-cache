@@ -31,6 +31,14 @@ type Metrics interface {
 	SetIndexEntries(model string, entries int)
 }
 
+// TTLResolver returns the per-tenant eviction TTL applied by the index. A
+// return of <=0 (or a nil resolver) means "use the global default TTL". The
+// index does not import any CRD/policy types; the resolver is satisfied by the
+// server's policy store. Kept tiny on purpose, matching the Metrics interface.
+type TTLResolver interface {
+	TTL(tenant string) time.Duration
+}
+
 // ReplicaStats is the per-replica cache health reported alongside an update.
 type ReplicaStats struct {
 	ReplicaID        string
@@ -126,6 +134,7 @@ type Index struct {
 	maxEntries    int
 	now           func() time.Time
 	metrics       Metrics
+	ttlResolver   TTLResolver
 
 	ready atomic.Bool
 
@@ -154,6 +163,12 @@ func WithMaxEntries(n int) Option { return func(i *Index) { i.maxEntries = n } }
 
 // WithMetrics wires a metrics sink for inferencecache_index_entries.
 func WithMetrics(m Metrics) Option { return func(i *Index) { i.metrics = m } }
+
+// WithTTLResolver wires a per-tenant TTL resolver. A nil resolver, or one that
+// returns <=0 for a tenant, falls back to the global TTL set via WithTTL (or
+// DefaultTTL). The index reads it on every freshness/eviction decision; the
+// resolver implementation owns its own concurrency.
+func WithTTLResolver(r TTLResolver) Option { return func(i *Index) { i.ttlResolver = r } }
 
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
@@ -313,11 +328,13 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 
+	ttl := i.ttlFor(req.Tenant)
+
 	i.mu.RLock()
 	replicas := i.prefixes[key]
 	scores := make([]ReplicaScore, 0, len(replicas))
 	for id, e := range replicas {
-		fresh := i.freshness(now, e.lastSeen)
+		fresh := freshnessAt(now, e.lastSeen, ttl)
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
@@ -458,16 +475,34 @@ func (i *Index) EntryCountsByModel() map[string]int {
 	return counts
 }
 
-// freshness decays linearly from 1 (just seen) to 0 (>= ttl old).
-func (i *Index) freshness(now, lastSeen time.Time) float32 {
+// ttlFor returns the effective TTL for a tenant. A nil resolver, or one that
+// returns <=0, falls back to the index's global TTL (which is itself clamped
+// to DefaultTTL in New). Per-tenant TTL lets a namespace's CachePolicy widen
+// or shrink the freshness window independently of every other namespace.
+func (i *Index) ttlFor(tenant string) time.Duration {
+	if i.ttlResolver != nil {
+		if d := i.ttlResolver.TTL(tenant); d > 0 {
+			return d
+		}
+	}
+	return i.ttl
+}
+
+// freshnessAt decays linearly from 1 (just seen) to 0 (>= ttl old). Pure
+// function so the index can compute it under per-tenant TTL without taking
+// the resolver lock inside the per-entry loop.
+func freshnessAt(now, lastSeen time.Time, ttl time.Duration) float32 {
+	if ttl <= 0 {
+		return 0
+	}
 	age := now.Sub(lastSeen)
 	if age <= 0 {
 		return 1
 	}
-	if age >= i.ttl {
+	if age >= ttl {
 		return 0
 	}
-	return float32(1 - float64(age)/float64(i.ttl))
+	return float32(1 - float64(age)/float64(ttl))
 }
 
 // removeReplicaLocked drops a replica from a prefix, deleting the prefix if it
@@ -483,19 +518,37 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 	}
 }
 
-// evictExpired removes entries older than the TTL. Runs on the sweep loop.
+// evictExpired removes entries older than each tenant's TTL. Runs on the
+// sweep loop. The TTL is resolved per-tenant outside the lock so two
+// namespaces with very different CachePolicy TTLs evict on independent
+// schedules (the sweep itself remains shared).
 func (i *Index) evictExpired() {
 	now := i.now()
+
+	// Cache per-tenant TTL across the sweep so a slow resolver isn't called
+	// once per entry. Built lazily — populated only as we encounter a tenant.
+	ttlCache := make(map[string]time.Duration)
+	ttlOf := func(tenant string) time.Duration {
+		if d, ok := ttlCache[tenant]; ok {
+			return d
+		}
+		d := i.ttlFor(tenant)
+		ttlCache[tenant] = d
+		return d
+	}
+
 	i.mu.Lock()
 	for key, replicas := range i.prefixes {
+		ttl := ttlOf(key.tenant)
 		for id, e := range replicas {
-			if now.Sub(e.lastSeen) >= i.ttl {
+			if ttl > 0 && now.Sub(e.lastSeen) >= ttl {
 				i.removeReplicaLocked(key, replicas, id)
 			}
 		}
 	}
 	for sk, s := range i.stats {
-		if now.Sub(s.lastSeen) >= i.ttl {
+		ttl := ttlOf(sk.tenant)
+		if ttl > 0 && now.Sub(s.lastSeen) >= ttl {
 			delete(i.stats, sk)
 		}
 	}

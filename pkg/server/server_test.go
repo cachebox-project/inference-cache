@@ -20,10 +20,14 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
-// newTestService builds a service backed by a fresh, empty index for
-// handler-level unit tests.
+// newTestService builds a service backed by a fresh, empty index + policy
+// store for handler-level unit tests. The index uses the policy store as its
+// TTL resolver so per-tenant TTL changes during a test are reflected exactly
+// as they would be in the running binary.
 func newTestService() *inferenceCacheService {
-	return newInferenceCacheService(index.New(), newServerMetrics())
+	policies := NewPolicyStore()
+	idx := index.New(index.WithTTLResolver(policies))
+	return newInferenceCacheService(idx, newServerMetrics(), policies)
 }
 
 func TestHealthAndReadinessReturnOK(t *testing.T) {
@@ -406,5 +410,132 @@ func TestMicrosToTime(t *testing.T) {
 	}
 	if got := microsToTime(1_000_000); got.IsZero() {
 		t.Fatalf("microsToTime(1e6) should be non-zero")
+	}
+}
+
+// TestLookupRouteRespectsMinimumPrefixTokens seeds two replicas with different
+// matched-token counts under one tenant's CachePolicy threshold; only the one
+// at or above the threshold should be returned, and the response shape stays
+// fail-open when none clear the bar.
+func TestLookupRouteRespectsMinimumPrefixTokens(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 50},
+	})
+
+	// replica-low has 10 tokens; replica-high has 100. Threshold is 50.
+	for r, tok := range map[string]int32{"replica-low": 10, "replica-high": 100} {
+		svc.index.Ingest(index.Update{
+			ReplicaID: r, Model: "m", Tenant: "team-a", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: tok}},
+		})
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH (replica-high clears the threshold)", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-high" {
+		t.Fatalf("expected only replica-high after filter, got %+v", resp.GetReplicaScores())
+	}
+}
+
+func TestLookupRouteReturnsNoHintWhenAllBelowThreshold(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 200},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT when nothing clears the threshold", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("expected empty scores when filtered out, got %+v", resp.GetReplicaScores())
+	}
+}
+
+func TestLookupRouteReturnsTimeoutWhenCallerDeadlineBreached(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 100}},
+	})
+
+	// Build a context whose deadline has already passed so the handler's
+	// pre-lookup ctx.Err() check fires deterministically.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+
+	resp, err := svc.LookupRoute(ctx, &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "TIMEOUT" {
+		t.Fatalf("reason = %q, want TIMEOUT when caller deadline has passed", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("expected empty scores on TIMEOUT, got %+v", resp.GetReplicaScores())
+	}
+}
+
+func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
+	svc := newTestService()
+	// Tiny budget; lookup itself is sub-µs on an empty index but the
+	// pre-lookup ctx.Err() check is what we exercise here.
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", LookupTimeoutMs: 1},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 100}},
+	})
+
+	// Within budget — TIMEOUT must NOT fire on a fast path.
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() == "TIMEOUT" {
+		t.Fatalf("a sub-millisecond in-memory lookup should not breach a 1ms budget; got %+v", resp)
+	}
+}
+
+func TestLookupRouteUnaffectedByPolicyForUnknownTenant(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{
+		{Namespace: "team-a", MinimumPrefixTokens: 200, LookupTimeoutMs: 1},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r", Model: "m", Tenant: "team-b", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-b", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" || len(resp.GetReplicaScores()) != 1 {
+		t.Fatalf("team-b has no policy; lookup should pass through unfiltered. Got %+v", resp)
 	}
 }

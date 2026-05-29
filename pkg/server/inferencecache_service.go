@@ -11,9 +11,11 @@ import (
 )
 
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
+// String, not enum — forward-compat per the gRPC contract decision.
 const (
 	reasonPrefixMatch = "PREFIX_MATCH"
 	reasonNoHint      = "NO_HINT"
+	reasonTimeout     = "TIMEOUT"
 	reasonOK          = "OK"
 )
 
@@ -26,12 +28,13 @@ const (
 type inferenceCacheService struct {
 	icpb.UnimplementedInferenceCacheServer
 
-	index   *index.Index
-	metrics *serverMetrics
+	index    *index.Index
+	metrics  *serverMetrics
+	policies *PolicyStore
 }
 
-func newInferenceCacheService(idx *index.Index, metrics *serverMetrics) *inferenceCacheService {
-	return &inferenceCacheService{index: idx, metrics: metrics}
+func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
+	return &inferenceCacheService{index: idx, metrics: metrics, policies: policies}
 }
 
 // RenderTemplate: no rendering yet (M7). An empty stable_prefix_hash signals the
@@ -41,17 +44,66 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 }
 
 // LookupRoute consults the index for replicas holding the request's prefix and
-// returns them ranked. No match → empty scores + NO_HINT (fail open).
-func (s *inferenceCacheService) LookupRoute(_ context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
-	start := time.Now()
+// returns them ranked. The handler honors the tenant's CachePolicy:
+//
+//   - minimumPrefixTokens: candidates whose matched-token count is below the
+//     threshold are dropped; if none survive, the response is NO_HINT.
+//   - lookupTimeoutMs: a deadline is applied around the lookup. If the caller's
+//     ctx is already past its deadline, or if the in-memory lookup exceeds the
+//     policy budget, the response is TIMEOUT (still fail-open: empty scores).
+//
+// A no-match still returns NO_HINT (fail open) — never an error on the hot path.
+func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
+	tenant := req.GetTenantId()
+	model := req.GetModelId()
 
+	// Apply the per-tenant lookup budget as a derived context deadline so we
+	// honor whichever is tighter — the caller's deadline or the policy budget.
+	budget := s.policyTimeout(tenant)
+	var cancel context.CancelFunc
+	if budget > 0 {
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
+	// Fast-path the timeout check: an upstream deadline already breached means
+	// running the lookup will produce a stale answer for a caller that has
+	// given up. Still fail open (no error).
+	if err := ctx.Err(); err != nil {
+		return s.timeoutResponse(model, 0), nil
+	}
+
+	start := time.Now()
 	scores := s.index.Lookup(index.LookupRequest{
-		Model:      req.GetModelId(),
-		Tenant:     req.GetTenantId(),
+		Model:      model,
+		Tenant:     tenant,
 		HashScheme: req.GetHashScheme(),
 		PrefixHash: req.GetPrefixHash(),
 		TokenCount: req.GetPrefixTokenCount(),
 	})
+	elapsed := time.Since(start)
+
+	// If the budget was breached during the (in-memory, normally sub-ms)
+	// lookup, surface that as TIMEOUT — the caller's policy was that this
+	// lookup was not worth waiting longer for.
+	if budget > 0 && elapsed > budget {
+		return s.timeoutResponse(model, elapsed), nil
+	}
+
+	// Drop candidates below the per-tenant minimum-prefix-tokens threshold
+	// (a coarse "is this match worth a routing hint" filter). Keep them
+	// pre-filter so we can still report PREFIX_MATCH semantics correctly
+	// when at least one candidate clears the bar.
+	minTokens := s.policyMinimumPrefixTokens(tenant)
+	if minTokens > 0 {
+		filtered := scores[:0]
+		for _, sc := range scores {
+			if sc.MatchedTokens >= minTokens {
+				filtered = append(filtered, sc)
+			}
+		}
+		scores = filtered
+	}
 
 	resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
 	if len(scores) > 0 {
@@ -67,10 +119,37 @@ func (s *inferenceCacheService) LookupRoute(_ context.Context, req *icpb.LookupR
 		}
 	}
 
-	elapsed := time.Since(start)
 	resp.LookupLatencyUs = elapsed.Microseconds()
-	s.metrics.observeLookup(req.GetModelId(), resp.ReasonCode, len(scores) > 0, elapsed)
+	s.metrics.observeLookup(model, resp.ReasonCode, len(scores) > 0, elapsed)
 	return resp, nil
+}
+
+// timeoutResponse builds the fail-open TIMEOUT envelope plus its metric
+// observation. Kept as a helper because both the pre-lookup deadline-breach
+// branch and the post-lookup budget-breach branch share the same shape.
+func (s *inferenceCacheService) timeoutResponse(model string, elapsed time.Duration) *icpb.LookupRouteResponse {
+	resp := &icpb.LookupRouteResponse{
+		ReasonCode:      reasonTimeout,
+		LookupLatencyUs: elapsed.Microseconds(),
+	}
+	s.metrics.observeLookup(model, reasonTimeout, false, elapsed)
+	return resp
+}
+
+// policyTimeout returns the per-tenant LookupRoute deadline, or 0 if none.
+func (s *inferenceCacheService) policyTimeout(tenant string) time.Duration {
+	if s.policies == nil {
+		return 0
+	}
+	return s.policies.LookupTimeout(tenant)
+}
+
+// policyMinimumPrefixTokens returns the per-tenant threshold, or 0 if none.
+func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
+	if s.policies == nil {
+		return 0
+	}
+	return s.policies.MinimumPrefixTokens(tenant)
 }
 
 // LookupPDRoute: prefill/decode routing is Phase 2 — fail open.
