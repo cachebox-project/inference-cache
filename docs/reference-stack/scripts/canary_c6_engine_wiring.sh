@@ -42,6 +42,7 @@ READY_TIMEOUT="${READY_TIMEOUT:-900}"
 SKIP_TRAFFIC="${SKIP_TRAFFIC:-0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
 CONTROLLER_IMG="${CONTROLLER_IMG:-localhost/inference-cache-controller:canary}"
+SERVER_IMG="${SERVER_IMG:-localhost/inference-cache-server:canary}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
@@ -72,19 +73,26 @@ kubectl "${KCTX[@]}" apply -f \
   "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml"
 kubectl "${KCTX[@]}" -n cert-manager wait --for=condition=Available deployment --all --timeout=180s
 
-# --- controller image + install --------------------------------------------
+# --- controller + server images + install ----------------------------------
 log "building controller image $CONTROLLER_IMG"
 docker build -f dockerfiles/Dockerfile --target controller -t "$CONTROLLER_IMG" .
 "$KIND" load docker-image "$CONTROLLER_IMG" --name "$KIND_CLUSTER"
 
-log "rendering + applying config/default (controller + webhook + cert-manager wiring)"
-# kustomize edit: point the controller Deployment at our canary image.
+log "building server image $SERVER_IMG"
+docker build -f dockerfiles/Dockerfile --target server -t "$SERVER_IMG" .
+"$KIND" load docker-image "$SERVER_IMG" --name "$KIND_CLUSTER"
+
+log "rendering + applying config/default (controller + server + webhook + cert-manager wiring)"
+# kustomize edit: point both the controller and server Deployments at our
+# canary images. The default overlay now ships an inference-cache-server
+# Deployment too; without rewriting its image the canary would resolve to
+# the published :dev tag, not the image built from this commit.
+command -v kustomize >/dev/null 2>&1 || fail "kustomize is required for the canary (set image rewrite); install kustomize and retry"
 tmpdir="$(mktemp -d)"
 trap "rm -rf $tmpdir; cleanup" EXIT
 cp -r config "$tmpdir/config"
 ( cd "$tmpdir/config/default" && \
-  (command -v kustomize >/dev/null 2>&1 && kustomize edit set image controller="$CONTROLLER_IMG" \
-    || sed -i.bak "s|newName: ghcr.io/cachebox-project/inference-cache-controller|newName: ${CONTROLLER_IMG%%:*}|;s|newTag: dev|newTag: ${CONTROLLER_IMG##*:}|" kustomization.yaml) )
+  kustomize edit set image controller="$CONTROLLER_IMG" server="$SERVER_IMG" )
 kubectl "${KCTX[@]}" apply -k "$tmpdir/config/default"
 kubectl "${KCTX[@]}" -n inference-cache-system wait --for=condition=Available deployment --all --timeout=180s
 
