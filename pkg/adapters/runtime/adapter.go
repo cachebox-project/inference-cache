@@ -201,13 +201,19 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 }
 
 // Options configures the runtime adapters [DefaultRegistry] constructs.
-// Zero values are valid: any field left empty falls back to the package-level
-// default the corresponding adapter ships with.
+// Zero values are valid: empty PolicyServerGRPCAddress falls back to the
+// package default, and empty SubscriberImage disables sidecar auto-attach
+// (see the field doc for why).
 type Options struct {
-	// SubscriberImage overrides the image reference the vLLM/LMCache
-	// adapter uses for the kvevent-subscriber sidecar. Empty selects the
-	// package default ([DefaultSubscriberImage]). Operators pin to a digest
-	// in production via a controller flag.
+	// SubscriberImage is the image reference the vLLM/LMCache adapter
+	// uses for the kvevent-subscriber sidecar. Empty (the zero value)
+	// **disables** sidecar auto-attach — the adapter returns no sidecar
+	// at all. Auto-attach is opt-in by design: a nonexistent default
+	// image would put the sidecar container into ImagePullBackOff and
+	// keep the engine pod from going Ready. See [DefaultSubscriberImage]
+	// for the build-tag operators pin to (or a digest-pinned production
+	// image), passed through the controller's --kvevent-subscriber-image
+	// flag.
 	SubscriberImage string
 
 	// PolicyServerGRPCAddress overrides the host:port the kvevent-

@@ -163,8 +163,10 @@ const (
 // Phase 1 only wires vLLM. SGLang HiCache and Mooncake adapters will live in
 // their own files when those backends are picked up.
 type vllmLMCacheAdapter struct {
-	// subscriberImage overrides the default kvevent-subscriber sidecar
-	// image when set. Empty falls back to [DefaultSubscriberImage].
+	// subscriberImage is the image the kvevent-subscriber sidecar runs.
+	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
+	// returns nil — so an unconfigured controller install doesn't push
+	// engine pods into ImagePullBackOff on a nonexistent default image.
 	subscriberImage string
 	// policyServerGRPCAddress overrides the default in-cluster Service DNS
 	// the sidecar dials to ReportCacheState. Empty falls back to

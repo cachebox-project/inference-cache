@@ -163,12 +163,22 @@ offload); real LMCache offload still needs a GPU (the default `gpu` profile).
 
 ## In-cluster auto-attach (production path)
 
-When the controller is installed in a cluster, the pod-mutating webhook
-auto-attaches the `kvevent-subscriber` as a sidecar to every engine pod whose
-labels match a `CacheBackend.spec.engineSelector`. The subscriber's identity
-flags (`--replica-id`, `--tenant-id`, `--model-id`, `--hash-scheme`) are
-derived from the CR + pod — no operator-supplied flags, no out-of-band
-`kubectl port-forward` + manual binary launch on the demo path.
+When the controller is installed in a cluster **and the operator passes
+`--kvevent-subscriber-image=<ref>` on the controller** (the
+`subscriber-image` make target emits the well-known dev tag; pin to a
+digest in production), the pod-mutating webhook auto-attaches the
+`kvevent-subscriber` as a sidecar to every engine pod whose labels match a
+`CacheBackend.spec.engineSelector` and whose backend sets
+`backendConfig.model`. The subscriber's identity flags (`--replica-id`,
+`--tenant-id`, `--model-id`, `--hash-scheme`) are derived from the CR + pod
+— no operator-supplied flags, no out-of-band `kubectl port-forward` + manual
+binary launch on the demo path.
+
+The default install ships with the flag unset and therefore does not
+auto-attach: a nonexistent image would put the sidecar container into
+`ImagePullBackOff`, which would keep the engine pod from going Ready and
+turn the cache into a serving dependency. Operators opt in by passing the
+image once they have one ready to ship.
 
 The shape decision and rationale are in
 [`docs/design/kvevent-subscriber-wiring.md`](../design/kvevent-subscriber-wiring.md);
