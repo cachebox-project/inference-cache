@@ -123,6 +123,29 @@ func TestLookupRouteReasonCodes(t *testing.T) {
 	})
 }
 
+// TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC pins the contract through
+// the handler: even if the tenant has warm replicas that would qualify for
+// TENANT_HOT, an unspecified hash_scheme on the request must surface as
+// NO_HINT with empty scores — never a soft hint based on tenant stats alone.
+func TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &index.ReplicaStats{HitRate: 0.9},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "", PrefixHash: []byte("novel"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" || len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("empty hash_scheme must fail open; got reason=%q scores=%+v",
+			resp.GetReasonCode(), resp.GetReplicaScores())
+	}
+}
+
 // TestLookupRouteSLOFlowsThroughHandler proves the proto SLO field actually
 // reaches the index ranker. Two replicas hold the prefix and are ingested
 // at "now" (so freshness ≈ 1 for both). With a tight SLO the score gets

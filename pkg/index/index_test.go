@@ -799,6 +799,26 @@ func TestTenantHotIsolatedByTenant(t *testing.T) {
 	}
 }
 
+// TestLookupRouteEmptyHashSchemeFailsOpenAcrossStrategies guards that an
+// unspecified hash_scheme produces NO_HINT through BOTH ranking paths, not
+// just the prefix-match one. The TENANT_HOT fallback keys only on
+// (tenant, model) and would otherwise still emit a hint based on stats
+// alone — but a request whose engine domain we can't identify must fail
+// open, per the soft-state / fail-open contract (PROJECT_CONTEXT §5).
+func TestLookupRouteEmptyHashSchemeFailsOpenAcrossStrategies(t *testing.T) {
+	idx := New(WithRanker(DefaultRankerConfig()))
+	// Warm replica with high hit_rate would normally qualify for TENANT_HOT.
+	idx.Ingest(Update{ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Stats: &ReplicaStats{HitRate: 0.9}})
+
+	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t",
+		HashScheme: "", PrefixHash: hash("novel")})
+	if res.Strategy != StrategyNone || len(res.Scores) != 0 {
+		t.Fatalf("empty hash_scheme must fail open; got strategy=%v scores=%+v",
+			res.Strategy, res.Scores)
+	}
+}
+
 // TestTenantHotIsolatedByModel guards the analogous model isolation: a warm
 // replica for model A in tenant t doesn't surface for model B in tenant t.
 // Different models have disjoint cache state; mixing them would mis-hint.

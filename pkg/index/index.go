@@ -459,6 +459,14 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 // TENANT_HOT is intentionally a SOFTER hint than PREFIX_MATCH: there is no
 // prefix overlap, so MatchedTokens is 0 and the gateway is free to ignore.
 func (i *Index) LookupRoute(req LookupRequest) LookupResult {
+	// Empty/unspecified hash_scheme fails open across BOTH strategies. The
+	// prefix-match path already guards this in Lookup, but the TENANT_HOT
+	// fallback keys only on (tenant, model) and would otherwise still emit
+	// a hint — that violates the contract: a request the engine domain of
+	// can't be identified must produce NO_HINT, not a soft locality nudge.
+	if req.HashScheme == "" {
+		return LookupResult{Strategy: StrategyNone}
+	}
 	if scores := i.Lookup(req); len(scores) > 0 {
 		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}
 	}
