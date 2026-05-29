@@ -55,7 +55,7 @@ func TestScraperFirstTickReturnsZeroHitRate(t *testing.T) {
 	if stats.GetHitRate() != 0 {
 		t.Errorf("first-tick hit_rate = %v, want 0 (no delta available)", stats.GetHitRate())
 	}
-	// usage = 0.42 (CPU; GPU is zero so auto picks CPU)
+	// vLLM 0.21: unified kv_cache_usage_perc = 0.42 → bytes = 0.42 × 1 GiB
 	cap1GiB := float64(int64(1) << 30)
 	wantBytes := int64(cap1GiB * 0.42)
 	if got := stats.GetCacheMemoryBytes(); got < wantBytes-1 || got > wantBytes+1 {
@@ -147,7 +147,9 @@ func TestScraperMissingMetricsDegradeGracefully(t *testing.T) {
 	}
 }
 
-func TestScraperGPUTierAutoDetect(t *testing.T) {
+func TestScraperLegacyGPUFallback(t *testing.T) {
+	// Legacy vLLM (pre-0.21) exposes vllm:gpu_cache_usage_perc instead of
+	// vllm:kv_cache_usage_perc. Auto-tier must fall through to it.
 	srv := fixtureServer(t, "vllm_metrics_gpu.txt")
 	defer srv.Close()
 
@@ -158,15 +160,16 @@ func TestScraperGPUTierAutoDetect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}
-	// usage = max(gpu=0.61, cpu=0) → 0.61
 	cap1GiB := float64(int64(1) << 30)
 	wantBytes := int64(cap1GiB * 0.61)
 	if got := stats.GetCacheMemoryBytes(); got < wantBytes-2 || got > wantBytes+2 {
-		t.Errorf("cacheMemoryBytes = %d, want ~%d (gpu tier auto-detected)", got, wantBytes)
+		t.Errorf("cacheMemoryBytes = %d, want ~%d (legacy gpu fallback)", got, wantBytes)
 	}
 }
 
-func TestScraperExplicitTier(t *testing.T) {
+func TestScraperExplicitTierPinsLookup(t *testing.T) {
+	// kv-only fixture; an explicit --cache-tier=gpu should NOT fall back to kv
+	// and therefore reports 0 bytes.
 	srv := fixtureServer(t, "vllm_metrics_cpu.txt")
 	defer srv.Close()
 
@@ -177,9 +180,51 @@ func TestScraperExplicitTier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gpu scrape: %v", err)
 	}
-	// CPU fixture has gpu_cache_usage_perc=0 → bytes=0 in explicit gpu mode.
 	if stats.GetCacheMemoryBytes() != 0 {
-		t.Errorf("explicit GPU tier on CPU fixture: bytes = %d, want 0", stats.GetCacheMemoryBytes())
+		t.Errorf("explicit GPU tier on kv-only fixture: bytes = %d, want 0", stats.GetCacheMemoryBytes())
+	}
+}
+
+func TestScraperCountersWithoutTotalSuffix(t *testing.T) {
+	// Some prometheus clients expose counters under the unsuffixed family name
+	// (no `_total`). The scraper must still find them via the fallback.
+	srv := fixtureServer(t, "vllm_metrics_openmetrics.txt", "vllm_metrics_openmetrics.txt")
+	defer srv.Close()
+
+	// Prime then read delta — but both ticks are identical so dQueries=0 →
+	// hit_rate stays 0. We just need to confirm the lookup didn't silently fail
+	// (hits/queries are 10/20 in the fixture; if they were missing the second
+	// tick would also yield 0, but a swap to a non-equal fixture proves it).
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{URL: srv.URL, Tier: CacheTierAuto, CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 8}, nil)
+	if _, err := s.Scrape(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	// kv_cache_usage_perc = 0.30 → bytes = 0.30 × 1 GiB.
+	cap1GiB := float64(int64(1) << 30)
+	wantBytes := int64(cap1GiB * 0.30)
+	if got := stats.GetCacheMemoryBytes(); got < wantBytes-2 || got > wantBytes+2 {
+		t.Errorf("cacheMemoryBytes = %d, want ~%d (unsuffixed counter fixture)", got, wantBytes)
+	}
+	// pressure = (2+0)/8 = 0.25 — proves gauges were also read.
+	if got, want := stats.GetPressure(), float32(0.25); got < want-1e-4 || got > want+1e-4 {
+		t.Errorf("pressure = %v, want %v", got, want)
+	}
+}
+
+func TestCacheTierIsValid(t *testing.T) {
+	for _, ok := range ValidCacheTiers {
+		if !ok.IsValid() {
+			t.Errorf("%q reported invalid", ok)
+		}
+	}
+	for _, bad := range []CacheTier{"", "xpu", "AUTO", "default"} {
+		if bad.IsValid() {
+			t.Errorf("%q reported valid", bad)
+		}
 	}
 }
 

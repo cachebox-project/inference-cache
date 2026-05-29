@@ -125,12 +125,12 @@ func (r *StatsReporter) send(ctx context.Context, csu *icpb.CacheStateUpdate) {
 		return
 	}
 	if err := stream.Send(csu); err != nil {
-		// io.EOF on Send means the server closed the stream early — surface its
-		// reason via CloseAndRecv where possible.
+		// io.EOF on Send means the server closed the stream early; CloseAndRecv
+		// will surface the actual status. Fall through into it rather than
+		// returning here so the recv'd reason ends up in the log.
 		if !errors.Is(err, context.Canceled) {
-			r.logger.Warn("stats send failed; dropping stats", "err", err)
+			r.logger.Warn("stats send failed; awaiting close for reason", "err", err)
 		}
-		return
 	}
 	if _, err := stream.CloseAndRecv(); err != nil {
 		r.logger.Warn("stats report close failed", "err", err)

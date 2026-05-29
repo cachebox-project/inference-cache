@@ -17,22 +17,41 @@ import (
 )
 
 // CacheTier selects which vLLM cache-usage gauge feeds cache_memory_bytes.
-// "auto" picks whichever is non-zero on a given scrape (max of gpu/cpu); this
-// correctly degrades to the right tier whether the engine runs on GPU or CPU
-// (vLLM 0.21 exposes both metric series — the inactive tier reads 0).
+// vLLM 0.21+ exposes a single unified `vllm:kv_cache_usage_perc`; older vLLM
+// exposed `vllm:gpu_cache_usage_perc` and (on some builds) `vllm:cpu_cache_usage_perc`.
+// "auto" probes that fallback chain — kv → gpu → cpu — so the scraper degrades
+// across vLLM releases without operator action.
 type CacheTier string
 
 const (
 	CacheTierAuto CacheTier = "auto"
-	CacheTierGPU  CacheTier = "gpu"
-	CacheTierCPU  CacheTier = "cpu"
+	CacheTierKV   CacheTier = "kv"  // vLLM 0.21+: vllm:kv_cache_usage_perc
+	CacheTierGPU  CacheTier = "gpu" // legacy: vllm:gpu_cache_usage_perc
+	CacheTierCPU  CacheTier = "cpu" // legacy: vllm:cpu_cache_usage_perc
 )
 
+// ValidCacheTiers enumerates the accepted --cache-tier values, in fallback
+// order. Callers (e.g. the kvevent-subscriber main) use this to validate user
+// input at startup so a typo is rejected loudly rather than silently treated
+// as "auto".
+var ValidCacheTiers = []CacheTier{CacheTierAuto, CacheTierKV, CacheTierGPU, CacheTierCPU}
+
+// IsValid reports whether t is one of the documented tiers.
+func (t CacheTier) IsValid() bool {
+	for _, v := range ValidCacheTiers {
+		if t == v {
+			return true
+		}
+	}
+	return false
+}
+
 const (
-	metricGPUUsage = "vllm:gpu_cache_usage_perc"
-	metricCPUUsage = "vllm:cpu_cache_usage_perc"
-	metricHits     = "vllm:prefix_cache_hits_total"
-	metricQueries  = "vllm:prefix_cache_queries_total"
+	metricKVUsage  = "vllm:kv_cache_usage_perc"  // vLLM 0.21+
+	metricGPUUsage = "vllm:gpu_cache_usage_perc" // legacy
+	metricCPUUsage = "vllm:cpu_cache_usage_perc" // legacy
+	metricHits     = "vllm:prefix_cache_hits"    // Counter; exposition appends _total
+	metricQueries  = "vllm:prefix_cache_queries" // Counter; exposition appends _total
 	metricRunning  = "vllm:num_requests_running"
 	metricWaiting  = "vllm:num_requests_waiting"
 
@@ -128,16 +147,14 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 		return &icpb.ReplicaStats{}, fmt.Errorf("parse metrics: %w", err)
 	}
 
-	gpuUsage, haveGPU := singleGaugeValue(families[metricGPUUsage])
-	cpuUsage, haveCPU := singleGaugeValue(families[metricCPUUsage])
-	usage, _ := selectUsage(s.cfg.Tier, gpuUsage, haveGPU, cpuUsage, haveCPU)
+	usage, _ := selectUsage(s.cfg.Tier, families)
 
-	hits := sumCounter(families[metricHits])
-	queries := sumCounter(families[metricQueries])
+	hits := sumCounter(families, metricHits)
+	queries := sumCounter(families, metricQueries)
 	hitRate := s.consumeHitRate(hits, queries)
 
-	running, _ := singleGaugeValue(families[metricRunning])
-	waiting, _ := singleGaugeValue(families[metricWaiting])
+	running, _ := singleGaugeValue(families, metricRunning)
+	waiting, _ := singleGaugeValue(families, metricWaiting)
 	pressure := pressureFrom(running+waiting, s.cfg.MaxConcurrencyCeiling)
 
 	var cacheBytes int64
@@ -174,34 +191,32 @@ func (s *MetricsScraper) consumeHitRate(hits, queries float64) float64 {
 
 // selectUsage picks the active cache-usage gauge given the tier policy. Returns
 // the chosen value plus a flag indicating whether a value was actually present.
-// In CacheTierAuto, missing metrics degrade to whichever is present; if both
-// are present we take the max — vLLM exposes both series on every platform and
-// the inactive tier reads 0, so max() collapses to the active tier in practice.
-func selectUsage(tier CacheTier, gpu float64, haveGPU bool, cpu float64, haveCPU bool) (float64, bool) {
+// CacheTierAuto probes kv → gpu → cpu in order and returns the first present
+// (so the scraper handles both modern vLLM 0.21+ — which exposes one unified
+// `vllm:kv_cache_usage_perc` — and older builds without operator action).
+// Explicit tier values pin the lookup to that one metric.
+func selectUsage(tier CacheTier, families map[string]*dto.MetricFamily) (float64, bool) {
 	switch tier {
+	case CacheTierKV:
+		return singleGaugeValue(families, metricKVUsage)
 	case CacheTierGPU:
-		return gpu, haveGPU
+		return singleGaugeValue(families, metricGPUUsage)
 	case CacheTierCPU:
-		return cpu, haveCPU
-	default: // auto
-		switch {
-		case haveGPU && haveCPU:
-			if gpu >= cpu {
-				return gpu, true
-			}
-			return cpu, true
-		case haveGPU:
-			return gpu, true
-		case haveCPU:
-			return cpu, true
-		}
-		return 0, false
+		return singleGaugeValue(families, metricCPUUsage)
 	}
+	// CacheTierAuto (or unset, defaulted upstream): fallback chain.
+	for _, name := range []string{metricKVUsage, metricGPUUsage, metricCPUUsage} {
+		if v, ok := singleGaugeValue(families, name); ok {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
-// singleGaugeValue returns the single (or first) gauge value in a MetricFamily.
-// Returns (0, false) if the family is absent or empty.
-func singleGaugeValue(mf *dto.MetricFamily) (float64, bool) {
+// singleGaugeValue returns the single (or first) gauge value for a metric
+// family. Returns (0, false) if the family is absent or empty.
+func singleGaugeValue(families map[string]*dto.MetricFamily, name string) (float64, bool) {
+	mf := families[name]
 	if mf == nil || len(mf.Metric) == 0 {
 		return 0, false
 	}
@@ -212,10 +227,17 @@ func singleGaugeValue(mf *dto.MetricFamily) (float64, bool) {
 	return g.GetValue(), true
 }
 
-// sumCounter returns the sum of counter values across all label combinations.
+// sumCounter returns the sum of counter values for a metric across all label
+// combinations. The Python prometheus_client exposes Counter("foo") under the
+// family name "foo_total" in the text format, but other Prometheus clients use
+// the unsuffixed form — we check both so the scraper is portable across them.
 // One vLLM replica generally exposes one series per metric, but summing is the
 // safe thing to do under unexpected label cardinality.
-func sumCounter(mf *dto.MetricFamily) float64 {
+func sumCounter(families map[string]*dto.MetricFamily, name string) float64 {
+	mf := families[name+"_total"]
+	if mf == nil {
+		mf = families[name]
+	}
 	if mf == nil {
 		return 0
 	}

@@ -1,9 +1,8 @@
-# HELP vllm:cpu_cache_usage_perc CPU KV-cache usage. 1 means 100 percent usage.
-# TYPE vllm:cpu_cache_usage_perc gauge
-vllm:cpu_cache_usage_perc{model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.55
-# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.0
+# vLLM 0.21 CPU engine, second tick. Counters have advanced; the scraper takes
+# the delta against tick 1.
+# HELP vllm:kv_cache_usage_perc KV cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.55
 # HELP vllm:prefix_cache_hits_total Counter of cached blocks reused.
 # TYPE vllm:prefix_cache_hits_total counter
 vllm:prefix_cache_hits_total{model_name="Qwen/Qwen2.5-0.5B-Instruct"} 95

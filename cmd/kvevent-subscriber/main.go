@@ -47,7 +47,7 @@ func main() {
 		statsInterval  = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
 		cacheSizeBytes = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
 		ceiling        = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
-		cacheTier      = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" | "gpu" | "cpu"`)
+		cacheTier      = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
 	)
 	flag.Parse()
 
@@ -61,6 +61,11 @@ func main() {
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid config", "err", err)
+		os.Exit(2)
+	}
+	tier := engine.CacheTier(*cacheTier)
+	if !tier.IsValid() {
+		logger.Error("invalid --cache-tier", "value", *cacheTier, "valid", engine.ValidCacheTiers)
 		os.Exit(2)
 	}
 
@@ -86,7 +91,7 @@ func main() {
 		&http.Client{Timeout: 5 * time.Second},
 		engine.ScraperConfig{
 			URL:                   *metricsURL,
-			Tier:                  engine.CacheTier(*cacheTier),
+			Tier:                  tier,
 			CacheSizeBytes:        *cacheSizeBytes,
 			MaxConcurrencyCeiling: *ceiling,
 		},
