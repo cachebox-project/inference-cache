@@ -1428,3 +1428,33 @@ func TestChainIngestWithCoSetLegacyPrefixHashPreservesBoth(t *testing.T) {
 		t.Fatalf("legacy lookup against co-set entry must still hit prefix_hash with TokenCount=128: got %+v", gotLegacy)
 	}
 }
+
+// TestChainLookupSharesPressureAndSLOFactorsWithExact verifies the chain
+// scoring path composes the same pressure and SLO factors as lookupExact —
+// the chain walk changes how matched_tokens is computed but the score
+// formula is unchanged. Without this, a saturated replica that happens to
+// have a chain hit would outrank a fresher idle peer the chain-aware
+// formula was supposed to demote.
+func TestChainLookupSharesPressureAndSLOFactorsWithExact(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+
+	idx.Ingest(Update{ReplicaID: "big-but-hot", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}},
+		Stats:    &ReplicaStats{Pressure: 0.9}})
+	idx.Ingest(Update{ReplicaID: "small-cool", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes[:2], BlockTokenCounts: counts[:2]}},
+		Stats:    &ReplicaStats{Pressure: 0.0}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 chain scores, got %+v", got)
+	}
+	// big-but-hot: matched=48, fresh=1, pressureFactor=(1-1*0.9)=0.1, sloBias=1 → 4.8
+	// small-cool:  matched=32, fresh=1, pressureFactor=(1-1*0.0)=1.0, sloBias=1 → 32
+	// Without pressure folding, big-but-hot's 48 would beat small-cool's 32.
+	if got[0].ReplicaID != "small-cool" {
+		t.Fatalf("pressure factor missing from chain score: ranked %+v first (want small-cool)", got[0])
+	}
+}

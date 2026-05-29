@@ -839,3 +839,75 @@ func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 		t.Fatalf("reason = %q, want NO_HINT when chain budget is below the threshold", resp.GetReasonCode())
 	}
 }
+
+// TestLookupRouteMalformedChainNeverFallsThroughToTenantHot guards the
+// orchestrator: a chain-bearing request with mismatched parallel-array
+// lengths must hard-fail to NO_HINT, NOT fall through to TENANT_HOT — a
+// soft locality hint against an unrelated warm replica would surface a
+// wrong answer for what the producer asserted as a chain.
+func TestLookupRouteMalformedChainNeverFallsThroughToTenantHot(t *testing.T) {
+	svc := newTestService()
+	// Seed a TENANT_HOT-eligible replica: warm stats AND a prefix entry in
+	// the requested engine domain (the engine-domain guard requires that).
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm",
+		BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+		BlockTokenCounts: []int32{16}, // mismatched: 2 hashes, 1 count
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — malformed chain must not be downgraded to TENANT_HOT (would surface %d unrelated warm-tenant hint(s))", resp.GetReasonCode(), len(resp.GetReplicaScores()))
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("malformed chain must not return any scores, got %+v", resp.GetReplicaScores())
+	}
+}
+
+// TestEffectivePrefixTokensChainTakesPrecedence verifies the precedence
+// rule the doc claims: when both the chain and the legacy
+// prefix_token_count are set, the chain's sum wins so the
+// CachePolicy.minimumPrefixTokens gate uses what the chain producer
+// actually reported, not whatever stale legacy count was tagged along.
+func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *icpb.LookupRouteRequest
+		want int32
+	}{
+		{
+			name: "chain wins over legacy",
+			req: &icpb.LookupRouteRequest{
+				PrefixTokenCount: 999,
+				BlockTokenCounts: []int32{16, 16, 16}, // sum = 48
+			},
+			want: 48,
+		},
+		{
+			name: "legacy used when chain empty",
+			req:  &icpb.LookupRouteRequest{PrefixTokenCount: 128},
+			want: 128,
+		},
+		{
+			name: "chain-only request reports chain sum",
+			req: &icpb.LookupRouteRequest{
+				BlockTokenCounts: []int32{32, 32, 32},
+			},
+			want: 96,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectivePrefixTokens(tc.req); got != tc.want {
+				t.Fatalf("effectivePrefixTokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

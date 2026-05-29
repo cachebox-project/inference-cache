@@ -588,6 +588,10 @@ func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 // tokens the matched prefix covers). The freshness signal is the OLDEST
 // lastSeen across the matched blocks (the run's weakest link), so a single
 // stale block can't make the whole run look fresher than it is.
+//
+// The pressure and SLO factors from lookupExact compose unchanged: the chain
+// walk only changes how matched_tokens is derived; the score formula
+// (matched_tokens × freshness × pressureFactor × sloBias) is the same.
 func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	type running struct {
 		matchedTokens  int32
@@ -595,6 +599,7 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	}
 	now := i.now()
 	ttl := i.ttlFor(req.Tenant)
+	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	i.mu.RLock()
 	current := map[string]running{}
@@ -634,7 +639,6 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	for id, st := range current {
 		finalized[id] = st
 	}
-	i.mu.RUnlock()
 
 	scores := make([]ReplicaScore, 0, len(finalized))
 	for id, st := range finalized {
@@ -645,13 +649,26 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 		if fresh <= 0 {
 			continue
 		}
+		// Pressure / SLO compose exactly as in lookupExact: same source of
+		// truth (statsReported within TTL), same factor formulas. The chain
+		// walk only changes matched_tokens and the freshness anchor; the
+		// rest of the score formula is unchanged so a chain request lands in
+		// the same calibration the legacy path is tuned against.
+		pressure := float32(0)
+		if s, ok := i.stats[statsKey{req.Tenant, req.Model, id}]; ok &&
+			freshnessAt(now, s.statsReported, ttl) > 0 {
+			pressure = s.stats.Pressure
+		}
+		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
+		sloBias := 1 + fresh*sloBiasFactor
 		scores = append(scores, ReplicaScore{
 			ReplicaID:             id,
-			Score:                 float32(st.matchedTokens) * fresh,
+			Score:                 float32(st.matchedTokens) * fresh * pressureFactor * sloBias,
 			MatchedTokens:         st.matchedTokens,
 			EstimatedCacheHitProb: fresh,
 		})
 	}
+	i.mu.RUnlock()
 
 	sortScoresDescByScoreThenID(scores)
 	return scores
@@ -685,6 +702,17 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	// can't be identified must produce NO_HINT, not a soft locality nudge.
 	if req.HashScheme == "" {
 		return LookupResult{Strategy: StrategyNone}
+	}
+	// Malformed chain (mismatched parallel-array lengths, or one-sided
+	// chain-without-counts / counts-without-chain) must hard-fail to
+	// NO_HINT — not fall through to TENANT_HOT. The chain-bearing request
+	// is a positive assertion of the form the producer expects; downgrading
+	// it to a softer locality nudge would surface a hint against an
+	// unrelated tenant-warm replica, which is worse than no hint.
+	if len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0 {
+		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
+			return LookupResult{Strategy: StrategyNone}
+		}
 	}
 	if scores := i.Lookup(req); len(scores) > 0 {
 		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}

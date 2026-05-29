@@ -40,7 +40,7 @@ service InferenceCache {
 - **RenderTemplateRequest** `{ string template_ref; map<string,string> variables; string tenant_id; }`
 - **RenderTemplateResponse** `{ bytes rendered_prompt; bytes stable_prefix_hash; bytes tenant_namespace; string reason_code; string template_revision; }`
   reason ∈ `OK | TEMPLATE_NOT_FOUND | RENDER_ERROR`
-- **LookupRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string hash_scheme; SLO slo; repeated bytes block_hashes; repeated int32 block_token_counts; }`
+- **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; }`
 - **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; }`
   reason ∈ `PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT`
 - **LookupPDRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string pd_topology_ref; }`
@@ -49,7 +49,7 @@ service InferenceCache {
 - **GetCacheStateRequest** `{ string model_id; string tenant_id; }` / **GetCacheStateResponse** `{ repeated ReplicaStats replicas; CacheSummary summary; }`
 - **ReplicaScore** `{ string replica_id; float score; int32 matched_tokens; float estimated_cache_hit_prob; }`
 - **CacheStateUpdate** `{ string replica_id; string model_id; string tenant_id; string hash_scheme; int64 timestamp_us; repeated PrefixEntry prefixes; ReplicaStats stats; }`
-- **PrefixEntry** `{ bytes prefix_hash; int32 token_count; repeated bytes block_hashes; repeated int32 block_token_counts; }` — **metadata only**
+- **PrefixEntry** `{ bytes prefix_hash = 1; int32 token_count = 2; repeated bytes block_hashes = 3; repeated int32 block_token_counts = 4; }` — **metadata only**
 - **ReplicaStats** `{ string replica_id; int64 cache_memory_bytes; float hit_rate; float pressure; }`
 - **CacheEvent** `{ Type type; string replica_id; string model_id; string tenant_id; bytes prefix_hash; int64 timestamp_us; }`
   Type ∈ `PREFIX_ADDED | PREFIX_EVICTED | REPLICA_UPDATED | ALL_CLEARED`

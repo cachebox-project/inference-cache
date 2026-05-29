@@ -368,18 +368,18 @@ func microsToTime(us int64) time.Time {
 
 // effectivePrefixTokens returns the token count the request asserts its
 // prefix covers, picking the right field based on whether the request is in
-// chain or legacy form. A chain-only request (no prefix_token_count, but
-// block_token_counts populated) reports its budget as the sum of per-block
-// counts — otherwise the legacy prefix_token_count would zero-out the
-// CachePolicy.minimumPrefixTokens gate. Mismatched-length chains are still
-// dropped downstream by the index; here we fall back to whichever is set.
+// chain or legacy form. Chain takes precedence over the legacy
+// prefix_token_count to match the documented precedence rule: a chain-bearing
+// request is a positive assertion of the new form, so a co-set legacy field
+// must not override what the chain reports. The handler uses the result to
+// gate against CachePolicy.minimumPrefixTokens before touching the index.
 func effectivePrefixTokens(req *icpb.LookupRouteRequest) int32 {
-	if c := req.GetPrefixTokenCount(); c > 0 {
-		return c
+	if counts := req.GetBlockTokenCounts(); len(counts) > 0 {
+		var sum int32
+		for _, v := range counts {
+			sum += v
+		}
+		return sum
 	}
-	var sum int32
-	for _, v := range req.GetBlockTokenCounts() {
-		sum += v
-	}
-	return sum
+	return req.GetPrefixTokenCount()
 }
