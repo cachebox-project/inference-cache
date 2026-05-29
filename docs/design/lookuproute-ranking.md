@@ -209,6 +209,31 @@ for a future tuning hook — e.g. a tight TBT budget might bias toward
 replicas with low pressure so the decode loop isn't queued behind other
 work. Wiring is in place; the factor is currently a no-op.
 
+### Where the SLO budget comes from
+
+`SLO` is **set by the gateway, per request** — there is no `SLO` field
+on any cache-plane CRD. The cache plane consumes whatever budget the
+gateway sends in `LookupRouteRequest.slo` and uses it to rank the
+response. How the gateway derives that budget is its own decision:
+
+- From the inference request itself (e.g. a header or parameter on the
+  inbound API call).
+- From the gateway's own per-tenant or per-model routing policy.
+- From a global deployment configuration.
+
+A request with no SLO message (or `ttft_ms = 0`) is treated as
+"unspecified" and the SLO bias factor collapses to `1` — the cache plane
+never invents a budget on its own.
+
+> **Not the same as `CachePolicy.lookupTimeoutMs`.** That field (in the
+> `CachePolicy` CRD, set per tenant by a cluster operator) is the budget
+> the **server** spends on its own lookup before giving up — "if I can't
+> rank in N milliseconds, answer `TIMEOUT`." It governs the server's
+> internal time. The `SLO.ttft_ms` on `LookupRouteRequest` is the
+> **gateway's end-to-end TTFT target for the inference request itself**
+> and is used purely as a *ranking signal*, never as enforcement. Two
+> different things that both sound like "SLO."
+
 ## 6. Putting the factors together
 
 A single score expression covers both shipped scoring paths:
@@ -258,7 +283,151 @@ are set so that:
 deadline breach and is handled by the policy-server propagation path — not
 by this ranking layer.
 
-## 8. Where the code lives
+## 8. Worked examples
+
+Six concrete scenarios that exercise the strategies in §2–5 end-to-end.
+Each shows the relevant index state, the request, the score
+computation, and the response. All examples use the default
+`RankerConfig`: `PressureWeight = 1`, `SLOTightTTFTMs = 200 ms`,
+`SLOTightBias = 1`, `TenantHotMaxAge = 5 min`,
+`TenantHotMinHitRate = 0.1`.
+
+### 8.1. Baseline: one replica holds the prefix
+
+Index state — tenant `team-a`, model `m`, scheme `vllm`:
+
+| Replica | Prefix | Tokens | Freshness | Pressure |
+|---|---|---|---|---|
+| `r1`    | `p`    | 100    | 1.0       | 0.0      |
+
+Request: `{tenant=team-a, model=m, hash_scheme=vllm, prefix_hash=p}`, no SLO.
+
+Computation: `100 × 1.0 × (1 − 1 × 0.0) × 1 = 100`.
+
+Response: `reason_code=PREFIX_MATCH`, scores `[{r1, score=100, matched_tokens=100}]`.
+
+This is the exact pre-PR baseline: with no stats and no SLO, every new
+factor collapses to 1 and the score is `matched_tokens × freshness`.
+
+### 8.2. Pressure breaks a tie the baseline didn't see
+
+Index state:
+
+| Replica       | Prefix | Tokens | Freshness | Pressure |
+|---|---|---|---|---|
+| `big-but-hot` | `p`    | 100    | 1.0       | 0.9      |
+| `small-cool`  | `p`    |  50    | 1.0       | 0.0      |
+
+Request: same as §8.1, no SLO.
+
+Computation:
+- `big-but-hot`: `100 × 1.0 × (1 − 1 × 0.9) × 1 = 100 × 0.1 = 10`
+- `small-cool`:  `50 × 1.0 × (1 − 1 × 0.0) × 1 = 50`
+
+Response: `PREFIX_MATCH`, ranked `[small-cool (50), big-but-hot (10)]`.
+
+The pure baseline (`tokens × freshness`) would have given `big-but-hot`
+a score of `100` vs `small-cool`'s `50` and routed traffic to the
+already-saturated replica. The pressure factor flips it: locality
+weighed against load.
+
+### 8.3. Tight TTFT bias reshapes ordering
+
+Index state:
+
+| Replica       | Prefix | Tokens | Freshness | Pressure |
+|---|---|---|---|---|
+| `big-old`     | `p`    | 100    | 0.6       | 0.0      |
+| `small-fresh` | `p`    |  50    | 1.0       | 0.0      |
+
+**Request A — no SLO**:
+- `big-old`:     `100 × 0.6 × 1 × 1 = 60`
+- `small-fresh`: `50 × 1.0 × 1 × 1 = 50`
+- Response: `PREFIX_MATCH`, `[big-old (60), small-fresh (50)]`.
+
+**Request B — `slo.ttft_ms = 50`** (below the 200 ms threshold → tight):
+- `big-old`:     `100 × 0.6 × 1 × (1 + 0.6 × 1) = 100 × 0.6 × 1.6 = 96`
+- `small-fresh`: `50 × 1.0 × 1 × (1 + 1.0 × 1) = 50 × 1.0 × 2.0 = 100`
+- Response: `PREFIX_MATCH`, `[small-fresh (100), big-old (96)]`.
+
+Under loose latency the token-rich older replica wins; under a tight
+TTFT budget the fresher one does. Both responses still say
+`PREFIX_MATCH` — the shape doesn't change, the internal ranking does.
+
+### 8.4. Prefix miss + warm tenant replica → `TENANT_HOT`
+
+Index state (no replica holds the *requested* prefix; one replica is
+"warm" for the tenant in the requested engine domain):
+
+| Replica  | Scheme | Prefix held | Hit rate | Pressure | Stats age |
+|---|---|---|---|---|---|
+| `r-warm` | vllm   | `other`     | 0.8      | 0.1      | 30 s      |
+
+Request: `{tenant=team-a, model=m, hash_scheme=vllm, prefix_hash=novel}`,
+no SLO.
+
+Prefix-match path: empty (no replica holds `novel`).
+
+Tenant-hot fallback (defaults `TenantHotMaxAge = 5 min`,
+`TenantHotMinHitRate = 0.1`):
+- `r-warm` reported 30 s ago (well under 5 min), `hit_rate = 0.8 ≥ 0.1`,
+  and it holds at least one prefix in `vllm` (`other`) — qualifies.
+- `recency = 1 − 30 s / 5 min = 0.9`
+- `pressure_factor = 1 − 1 × 0.1 = 0.9`
+- `slo_bias = 1`
+- `score = 0.8 × 0.9 × 0.9 × 1 = 0.648`
+
+Response: `TENANT_HOT`, scores `[{r-warm, score=0.648, matched_tokens=0}]`.
+
+`matched_tokens` is `0` because there's no prefix overlap — the gateway
+must rely on `reason_code` (not `matched_tokens`) to tell `TENANT_HOT`
+apart from a real prefix hit.
+
+### 8.5. Engine-domain guard rejects a warm replica from a different scheme
+
+Index state — both replicas warm, but for different engines:
+
+| Replica   | Scheme | Prefix held | Hit rate | Pressure | Stats age |
+|---|---|---|---|---|---|
+| `r-vllm`  | vllm   | `p1`        | 0.7      | 0.0      | 1 min     |
+| `r-sgl`   | sglang | `p2`        | 0.9      | 0.0      | 1 min     |
+
+Request: `{model=m, hash_scheme=vllm, prefix_hash=novel}`, no SLO.
+
+Prefix-match path: empty.
+
+Tenant-hot fallback:
+- `r-vllm`: warm AND holds at least one prefix under `vllm` → qualifies.
+- `r-sgl`:  warm AND has a higher hit rate, but its only prefix entry
+  is in `sglang` — it does not serve the requested engine domain.
+  **Rejected**: hinting to it would route across engines, which the
+  contract forbids.
+
+Response: `TENANT_HOT`, scores only `[{r-vllm, ...}]`. `r-sgl` does not
+appear.
+
+This is the bug the engine-domain guard prevents: stats are
+scheme-independent in the index (a `ReplicaStats` applies across
+engines), so without this check a stats-only update — or an update
+under a different scheme — could leak into a hint for the wrong engine.
+
+### 8.6. Empty `hash_scheme` → unconditional `NO_HINT`
+
+Index state: any.
+
+Request: `{model=m, hash_scheme="", prefix_hash=<any bytes>}`.
+
+The cache plane can't safely match an opaque `prefix_hash` without
+knowing which engine domain it belongs to (a vLLM hash and an SGLang
+hash of the same bytes are unrelated). Both strategies short-circuit
+on the empty `hash_scheme` and the response is unconditionally
+`NO_HINT` with empty scores — fail open.
+
+This is also the response shape whenever the prefix-match path is empty
+AND no replica qualifies for `TENANT_HOT`. The gateway treats all three
+"no useful hint" outcomes identically: route per its default policy.
+
+## 9. Where the code lives
 
 - Scoring + strategy orchestration: [`pkg/index/index.go`](../../pkg/index/index.go)
   — see `Lookup`, `LookupRoute`, `tenantHotCandidates`, `RankerConfig`.
