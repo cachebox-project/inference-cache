@@ -18,7 +18,12 @@ type ReplicaCacheStatus struct {
 	// derives it from the engine pod's namespace, so two pods sharing a
 	// metadata.name across namespaces are kept as separate replica rows.
 	// Listed alongside ID in the map-list key so cross-tenant collisions
-	// cannot violate the listMapKey uniqueness invariant.
+	// cannot violate the listMapKey uniqueness invariant. Optional for
+	// backward compatibility with consumers that wrote replicas without
+	// tenant before this field existed; an omitted value defaults to
+	// empty-string for keying (the apiserver defaults the field on read).
+	// +optional
+	// +kubebuilder:default=""
 	Tenant string `json:"tenant"`
 	// CacheMemoryBytes is the cache memory the replica reports using.
 	// +optional
