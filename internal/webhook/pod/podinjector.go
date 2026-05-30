@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -183,6 +184,16 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 // selectors overlap is misconfigured, and the handler logs the chosen one
 // so the ambiguity is observable.
 //
+// Iteration order is metadata.name ascending so the "first match" is
+// deterministic across apiserver List cache states and is shared with the
+// CacheIndex poller's annotation-fallback path (see
+// internal/controller/cacheindex_controller.go's attributePod). The two
+// surfaces MUST agree on which backend owns a given engine pod — the
+// webhook stamps `inferencecache.io/injected-by` and the poller relies
+// on it as the authoritative signal, but on overlapping-selector
+// fallback both sides need to pick the same backend or status will
+// disagree with what the engine was wired to.
+//
 // A CacheBackend with no EngineSelector or with an empty MatchLabels map is
 // skipped: a "match everything" selector at admission time would silently
 // claim every pod (including the controller's own and the lmcache-server's),
@@ -193,8 +204,15 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 	if err := h.Reader.List(ctx, &list, client.InNamespace(pod.Namespace)); err != nil {
 		return nil, fmt.Errorf("list CacheBackends in %s: %w", pod.Namespace, err)
 	}
-	podLabels := labels.Set(pod.Labels)
+	idxs := make([]int, 0, len(list.Items))
 	for i := range list.Items {
+		idxs = append(idxs, i)
+	}
+	sort.Slice(idxs, func(a, b int) bool {
+		return list.Items[idxs[a]].Name < list.Items[idxs[b]].Name
+	})
+	podLabels := labels.Set(pod.Labels)
+	for _, i := range idxs {
 		cb := &list.Items[i]
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
 			continue
