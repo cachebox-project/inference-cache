@@ -1,0 +1,39 @@
+# Restrict ingress to the cache server's internal :8081 snapshot listener.
+#
+# Defence in depth — paired with the server-side TokenReview middleware that
+# requires a controller ServiceAccount bearer token on /snapshot. The L7 auth
+# blocks any pod that lacks a valid SA token; this L3/L4 gate stops a peer
+# from ever reaching the listener (and from harvesting metadata via a
+# cleartext network capture).
+#
+# Scope:
+#   - podSelector matches the inference-cache server pods.
+#   - policyTypes: [Ingress] — outbound traffic from the server is unrestricted.
+#   - One ingress rule: TCP 8081 from pods carrying the controller's labels.
+#   - All other ports (9090 grpc, 8080 healthz/metrics/policy) are NOT covered
+#     here; kubelet probes and Prometheus scrapes need them open. Restricting
+#     them is a separate, broader change.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inference-cache-server-snapshot
+  namespace: inference-cache-system
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: inference-cache
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inference-cache
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8081

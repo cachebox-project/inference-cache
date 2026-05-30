@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -24,6 +26,12 @@ import (
 const (
 	DefaultCacheIndexName  = "cluster-default"
 	DefaultRefreshInterval = 30 * time.Second
+
+	// DefaultBearerTokenPath is the standard in-cluster location kubelet
+	// projects the controller's ServiceAccount token to. It is a tmpfs
+	// file kubelet rewrites on rotation; the poller re-reads on every
+	// scrape so a rotated token is picked up immediately.
+	DefaultBearerTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 )
 
 // CacheIndexPoller periodically scrapes the server's internal /snapshot endpoint
@@ -35,10 +43,15 @@ const (
 type CacheIndexPoller struct {
 	Client      client.Client
 	Log         logr.Logger
-	SnapshotURL string        // e.g. http://inference-cache-server:8080/snapshot
+	SnapshotURL string        // e.g. http://inference-cache-server:8081/snapshot
 	Interval    time.Duration // refresh cadence; <=0 → DefaultRefreshInterval
 	HTTPClient  *http.Client  // optional; injected in tests
 	Name        string        // singleton CR name; "" → DefaultCacheIndexName
+	// BearerTokenPath is the file the projected ServiceAccount token is
+	// mounted at. "" → DefaultBearerTokenPath. A path that does not exist
+	// fails the scrape soft (logged, skipped) so local development without
+	// a token still works.
+	BearerTokenPath string
 }
 
 // The poller reads via the manager's cached client (a Get is backed by an
@@ -97,7 +110,7 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 		return fmt.Errorf("get CacheIndex %q: %w", name, err)
 	}
 
-	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL)
+	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL, p.bearerToken())
 	if err != nil {
 		return err
 	}
@@ -134,11 +147,34 @@ func (p *CacheIndexPoller) logger(ctx context.Context) logr.Logger {
 	return log.FromContext(ctx)
 }
 
-// fetchSnapshot GETs and decodes the server's /snapshot JSON.
-func fetchSnapshot(ctx context.Context, hc *http.Client, url string) (index.Snapshot, error) {
+// bearerToken reads the projected ServiceAccount token. Re-read on every
+// scrape so kubelet rotations are picked up without process restarts; the
+// file is tmpfs so the read is cheap. Returns "" if the file is missing or
+// unreadable — the caller still issues an unauthenticated request, which
+// the server will reject loudly. Local development without a token mounted
+// (e.g. running the controller out of cluster) flows through this path.
+func (p *CacheIndexPoller) bearerToken() string {
+	path := p.BearerTokenPath
+	if path == "" {
+		path = DefaultBearerTokenPath
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// fetchSnapshot GETs and decodes the server's /snapshot JSON. When token is
+// non-empty it is sent as an Authorization: Bearer header so the server's
+// auth middleware can validate it via TokenReview.
+func fetchSnapshot(ctx context.Context, hc *http.Client, url, token string) (index.Snapshot, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return index.Snapshot{}, fmt.Errorf("build snapshot request %q: %w", url, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

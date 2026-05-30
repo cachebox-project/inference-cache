@@ -252,4 +252,47 @@ if ! grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"NO_HINT"' <<<
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works"
+# --- /snapshot auth assertion ---------------------------------------------
+# The CacheIndex CR being populated above already proves the controller can
+# scrape /snapshot with its SA token (the bearer path). The complementary
+# half — that an UNAUTHENTICATED caller is rejected — is what this section
+# checks, since it's the failure mode the new auth middleware is meant to
+# prevent. A short-lived busybox pod outside the controller's identity tries
+# to GET /snapshot; the server must respond 401.
+log "asserting unauthenticated /snapshot scrape from a side pod is rejected"
+SIDE_POD="ic-snapshot-probe"
+kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # -w prints the HTTP status; -o /dev/null discards the (error) body so the
+    # status is the only line on stdout. Timeout protects against the listener
+    # being unreachable (NetworkPolicy drop), in which case curl exits non-zero.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      http://inference-cache-server:8081/snapshot || echo "curl_failed:$?"
+  ' >/dev/null 2>&1 || true
+
+# Wait for the probe pod to finish (Succeeded or Failed) — either is fine; we
+# read its logs to learn the outcome.
+for _ in $(seq 1 30); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD" 2>/dev/null || true)"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient): an HTTP 401 means the L7 auth
+# rejected the request; "curl_failed:*" means the L3/L4 NetworkPolicy dropped
+# the connection before the server saw it. A 200 means the endpoint is
+# unauthenticated — regression.
+case "$probe_out" in
+  "401"|*"curl_failed:"*)
+    log "unauthenticated /snapshot probe rejected (probe output: $probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /snapshot probe was not rejected; got: $probe_out"
+    ;;
+esac
+
+log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, /snapshot rejects unauth"

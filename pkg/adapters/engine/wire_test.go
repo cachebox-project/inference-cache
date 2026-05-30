@@ -41,15 +41,19 @@ func TestStatsReporterPopulatesSnapshotReplicas(t *testing.T) {
 	}))
 	defer metrics.Close()
 
-	// 2. Real policy server on a bufconn + loopback HTTP listener.
+	// 2. Real policy server on a bufconn + loopback HTTP listeners (public + snapshot).
 	grpcLis := bufconn.Listen(1 << 20)
 	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen http: %v", err)
 	}
+	snapLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen snapshot: %v", err)
+	}
 	serveCtx, serveCancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.New().Serve(serveCtx, grpcLis, httpLis) }()
+	go func() { serveDone <- server.New().Serve(serveCtx, grpcLis, httpLis, snapLis) }()
 	t.Cleanup(func() {
 		serveCancel()
 		if err := <-serveDone; err != nil {
@@ -83,7 +87,9 @@ func TestStatsReporterPopulatesSnapshotReplicas(t *testing.T) {
 	go func() { _ = reporter.Run(ctx) }()
 
 	// 4. Poll /snapshot until replicas[] reflects the scraped stats.
-	baseURL := "http://" + httpLis.Addr().String()
+	// /snapshot is served on its own listener (split for NetworkPolicy /
+	// auth scoping); the test reads it directly since no auth is configured.
+	baseURL := "http://" + snapLis.Addr().String()
 	deadline := time.Now().Add(5 * time.Second)
 	var snap index.Snapshot
 	for time.Now().Before(deadline) {

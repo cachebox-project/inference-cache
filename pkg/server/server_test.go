@@ -17,6 +17,7 @@ import (
 	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	authnv1 "k8s.io/api/authentication/v1"
 
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
@@ -213,23 +214,31 @@ func TestRenderTemplateFailsOpen(t *testing.T) {
 }
 
 // startInProcessServer starts the service on an in-memory gRPC listener
-// (bufconn) plus a loopback HTTP listener. It returns a connected gRPC client,
-// the HTTP base URL ("http://host:port") for the health/metrics endpoints, and
-// a stop func that tears the server down and fails the test if Serve reported
-// an error.
+// (bufconn) plus loopback HTTP listeners. It returns a connected gRPC client,
+// the public HTTP base URL ("http://host:port") for the health/metrics
+// endpoints, and a stop func that tears the server down and fails the test if
+// Serve reported an error.
 func startInProcessServer(t *testing.T) (client icpb.InferenceCacheClient, httpBaseURL string, stop func()) {
 	t.Helper()
-	conn, httpBaseURL, stop := startInProcessServerConn(t)
+	conn, httpBaseURL, _, stop := startInProcessServerConnFull(t)
 	return icpb.NewInferenceCacheClient(conn), httpBaseURL, stop
 }
 
 // startInProcessServerConn is the underlying helper that returns the raw gRPC
 // client connection so tests using non-InferenceCache services (e.g. server
 // reflection, grpc.health.v1) can attach their own clients to the same wire.
+func startInProcessServerConn(t *testing.T) (*grpc.ClientConn, string, func()) {
+	t.Helper()
+	conn, httpBaseURL, _, stop := startInProcessServerConnFull(t)
+	return conn, httpBaseURL, stop
+}
+
+// startInProcessServerConnFull additionally returns the snapshot listener's
+// base URL so tests that exercise /snapshot can target the dedicated port.
 // bufSize is the bufconn in-memory pipe buffer — it bounds bytes in flight on
 // the fake socket, unrelated to the size of any individual CacheStateUpdate;
 // 1 MiB is the bufconn default and is ample for these metadata-only messages.
-func startInProcessServerConn(t *testing.T) (*grpc.ClientConn, string, func()) {
+func startInProcessServerConnFull(t *testing.T) (*grpc.ClientConn, string, string, func()) {
 	t.Helper()
 
 	const bufSize = 1024 * 1024
@@ -239,11 +248,16 @@ func startInProcessServerConn(t *testing.T) (*grpc.ClientConn, string, func()) {
 	if err != nil {
 		t.Fatalf("listen http: %v", err)
 	}
+	snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = httpListener.Close()
+		t.Fatalf("listen snapshot http: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- New().Serve(ctx, grpcListener, httpListener)
+		errCh <- New().Serve(ctx, grpcListener, httpListener, snapshotListener)
 	}()
 
 	conn, err := grpc.NewClient(
@@ -265,7 +279,7 @@ func startInProcessServerConn(t *testing.T) (*grpc.ClientConn, string, func()) {
 			t.Errorf("serve shutdown: %v", err)
 		}
 	}
-	return conn, "http://" + httpListener.Addr().String(), stop
+	return conn, "http://" + httpListener.Addr().String(), "http://" + snapshotListener.Addr().String(), stop
 }
 
 // getString issues a GET against the server's HTTP endpoint and returns the
@@ -289,7 +303,8 @@ func getString(t *testing.T, url string) (int, string) {
 // internal /snapshot HTTP endpoint reflects it as JSON (the controller scrapes
 // this to populate the CacheIndex status).
 func TestSnapshotEndpointReflectsIngest(t *testing.T) {
-	grpcClient, baseURL, stop := startInProcessServer(t)
+	conn, _, snapshotURL, stop := startInProcessServerConnFull(t)
+	grpcClient := icpb.NewInferenceCacheClient(conn)
 	defer stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -313,7 +328,7 @@ func TestSnapshotEndpointReflectsIngest(t *testing.T) {
 		t.Fatalf("CloseAndRecv: %v", err)
 	}
 
-	code, body := getString(t, baseURL+"/snapshot")
+	code, body := getString(t, snapshotURL+"/snapshot")
 	if code != http.StatusOK {
 		t.Fatalf("/snapshot status = %d, want 200", code)
 	}
@@ -330,6 +345,114 @@ func TestSnapshotEndpointReflectsIngest(t *testing.T) {
 	if len(snap.Tenants) != 1 || snap.Tenants[0].TenantID != "tenant-a" {
 		t.Fatalf("tenants = %+v, want tenant-a", snap.Tenants)
 	}
+}
+
+// TestSnapshotNotServedOnPublicListener confirms /snapshot is *only* exposed
+// on the dedicated listener — the same listener the NetworkPolicy restricts.
+// A regression here would silently re-open the endpoint to every pod that can
+// reach :8080 (the kubelet- and Prometheus-facing port).
+func TestSnapshotNotServedOnPublicListener(t *testing.T) {
+	_, publicURL, _, stop := startInProcessServerConnFull(t)
+	defer stop()
+
+	code, _ := getString(t, publicURL+"/snapshot")
+	if code != http.StatusNotFound {
+		t.Fatalf("/snapshot on public listener returned %d, want 404", code)
+	}
+}
+
+// TestSnapshotAuth_RejectsUnauthenticated runs the full Service with the auth
+// middleware wired in (using a fake TokenReviewer) and confirms the snapshot
+// listener responds 401 without a bearer and 200 with the controller SA.
+func TestSnapshotAuth_RejectsUnauthenticated(t *testing.T) {
+	const sa = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
+
+	reviewer := fakeReviewerFunc(func(_ context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		if tr.Spec.Token == "good" {
+			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+				Authenticated: true,
+				User:          authnv1.UserInfo{Username: sa},
+			}}, nil
+		}
+		return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: false}}, nil
+	})
+
+	const bufSize = 1024 * 1024
+	grpcListener := bufconn.Listen(bufSize)
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen public: %v", err)
+	}
+	snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen snapshot: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	svc := New(WithSnapshotAuth(reviewer, sa))
+	go func() {
+		errCh <- svc.Serve(ctx, grpcListener, httpListener, snapshotListener)
+	}()
+	defer func() {
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Errorf("serve shutdown: %v", err)
+		}
+	}()
+
+	snapshotURL := "http://" + snapshotListener.Addr().String() + "/snapshot"
+
+	code, _ := getString(t, snapshotURL)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unauth /snapshot status = %d, want 401", code)
+	}
+
+	code, _ = getStringWithBearer(t, snapshotURL, "good")
+	if code != http.StatusOK {
+		t.Fatalf("authed /snapshot status = %d, want 200", code)
+	}
+
+	// The auth metric must surface both outcomes.
+	publicURL := "http://" + httpListener.Addr().String()
+	mcode, body := getString(t, publicURL+"/metrics")
+	if mcode != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want 200", mcode)
+	}
+	if !strings.Contains(body, `inferencecache_snapshot_auth_total{result="unauth"} 1`) {
+		t.Fatalf("metrics missing unauth counter; body:\n%s", body)
+	}
+	if !strings.Contains(body, `inferencecache_snapshot_auth_total{result="ok"} 1`) {
+		t.Fatalf("metrics missing ok counter; body:\n%s", body)
+	}
+}
+
+// fakeReviewerFunc adapts a plain func to auth.TokenReviewer for server-side
+// tests that don't need the auth package's test-only fakes.
+type fakeReviewerFunc func(context.Context, *authnv1.TokenReview) (*authnv1.TokenReview, error)
+
+func (f fakeReviewerFunc) CreateTokenReview(ctx context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+	return f(ctx, tr)
+}
+
+func getStringWithBearer(t *testing.T, url, token string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	httpClient := http.Client{Timeout: 2 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(body)
 }
 
 // TestInferenceCacheServiceOverGRPC exercises the service over a real gRPC

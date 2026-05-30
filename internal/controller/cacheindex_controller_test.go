@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -92,7 +93,7 @@ func TestFetchSnapshot(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL)
+	got, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, "")
 	if err != nil {
 		t.Fatalf("fetchSnapshot: %v", err)
 	}
@@ -107,8 +108,49 @@ func TestFetchSnapshotNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL); err == nil {
+	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, ""); err == nil {
 		t.Fatal("expected error on non-200 snapshot response")
+	}
+}
+
+// TestFetchSnapshotSendsBearerToken proves the scrape carries the SA token in
+// the Authorization header — that's what the server's TokenReview middleware
+// looks at. Pins the over-the-wire contract between the poller and the
+// auth-gated /snapshot listener.
+func TestFetchSnapshotSendsBearerToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(index.Snapshot{TotalPrefixes: 1})
+	}))
+	defer srv.Close()
+
+	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, "test-token"); err != nil {
+		t.Fatalf("fetchSnapshot: %v", err)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer test-token")
+	}
+}
+
+// TestBearerToken_ReadsAndTrimsFile checks that the poller re-reads its
+// projected SA token from disk and trims trailing whitespace — the projected
+// token kubelet writes ends with a newline.
+func TestBearerToken_ReadsAndTrimsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("a-real-token\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	p := &CacheIndexPoller{BearerTokenPath: path}
+	if got := p.bearerToken(); got != "a-real-token" {
+		t.Fatalf("bearerToken() = %q, want %q", got, "a-real-token")
+	}
+
+	// Missing path → "" (the server will reject; poller does not crash).
+	p.BearerTokenPath = dir + "/does-not-exist"
+	if got := p.bearerToken(); got != "" {
+		t.Fatalf("bearerToken() on missing file = %q, want \"\"", got)
 	}
 }
 
