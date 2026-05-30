@@ -161,7 +161,25 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			Spec: authnv1.TokenReviewSpec{Token: token},
 		})
 		if err != nil {
-			// Fail-closed: don't admit on apiserver flakes.
+			// Fail-closed: don't admit on apiserver flakes (transport
+			// error, timeout, RBAC reject before the review was even
+			// performed).
+			a.record(ResultError)
+			http.Error(w, "token review unavailable\n", http.StatusServiceUnavailable)
+			return
+		}
+		// Fail-closed on review-side failures too. A TokenReview can return a
+		// non-error HTTP response but with Status.Error populated — that
+		// means the apiserver accepted the request but the authenticator
+		// backend could not decide (e.g. webhook authenticator down,
+		// authenticator timeout). Treating that as !Authenticated → 401
+		// would mislabel an infrastructure failure as a client identity
+		// problem; surface it as 503/error instead so the poller's
+		// fail-soft retry loop kicks in and the metric reflects reality.
+		// nil tr is defensive — production clients never see it, but a
+		// fake reviewer that returns (nil, nil) by accident would
+		// otherwise panic on the .Status access below.
+		if tr == nil || tr.Status.Error != "" {
 			a.record(ResultError)
 			http.Error(w, "token review unavailable\n", http.StatusServiceUnavailable)
 			return

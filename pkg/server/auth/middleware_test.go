@@ -123,6 +123,20 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 			}}, nil
 		case "boom":
 			return nil, errors.New("apiserver unavailable")
+		case "authenticator-down":
+			// TokenReview succeeded as an API call but the authenticator
+			// backend could not decide (e.g. webhook authenticator
+			// unreachable). Status.Error is the apiserver's surface for
+			// that; treat it as fail-closed → 503, not as a client
+			// identity problem.
+			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+				Error: "webhook authenticator: timed out",
+			}}, nil
+		case "nil-review":
+			// Defensive: a fake/buggy reviewer that returns (nil, nil) must
+			// not panic on the .Status access; we treat it as the same
+			// fail-closed branch as Status.Error.
+			return nil, nil
 		}
 		return nil, errors.New("unexpected token")
 	}}
@@ -145,6 +159,8 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		{"wrong identity", "Bearer wrong-sa", http.StatusForbidden, ResultForbidden, false},
 		{"valid token", "Bearer good", http.StatusOK, ResultOK, true},
 		{"apiserver error", "Bearer boom", http.StatusServiceUnavailable, ResultError, false},
+		{"authenticator backend error", "Bearer authenticator-down", http.StatusServiceUnavailable, ResultError, false},
+		{"nil token review", "Bearer nil-review", http.StatusServiceUnavailable, ResultError, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
