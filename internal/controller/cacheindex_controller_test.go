@@ -52,6 +52,31 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	}
 }
 
+// TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner asserts the two
+// guards on the cluster-wide CacheIndex.status.replicas:
+//   - A row with no stats yet (LastUpdate zero) is dropped, so the v1alpha1
+//     surface doesn't fabricate hitRate/pressure/memory zeros.
+//   - On an id collision across tenants, the lexicographically-later tenant
+//     wins deterministically (preserves listMapKey=id uniqueness).
+func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	snap := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "ns-a", CacheMemoryBytes: 100, LastUpdate: now},
+			{ReplicaID: "vllm-0", Tenant: "ns-b", CacheMemoryBytes: 200, LastUpdate: now},
+			{ReplicaID: "prefix-only", Tenant: "ns-a", PrefixCount: 5},
+		},
+	}
+	st := buildCacheIndexStatus(snap, "http://server/snapshot", now)
+	if len(st.Replicas) != 1 {
+		t.Fatalf("replicas = %+v, want 1 row (prefix-only filtered, collision deduped)", st.Replicas)
+	}
+	got := st.Replicas[0]
+	if got.ID != "vllm-0" || got.Tenant != "ns-b" || got.CacheMemoryBytes != 200 {
+		t.Fatalf("collision winner = %+v, want id vllm-0 tenant ns-b memory 200 (lex-later tenant wins)", got)
+	}
+}
+
 func TestEmptyIndexStatusRendersZeroSummary(t *testing.T) {
 	// An empty index must still render prefixes.summary.{total,hot}=0 explicitly
 	// (not omit them), matching the contract shape.
@@ -128,7 +153,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 		Build()
 
 	var mu sync.Mutex
-	served := index.Snapshot{TotalPrefixes: 3, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 100, HitRate: 0.8}}}
+	served := index.Snapshot{TotalPrefixes: 3, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 100, HitRate: 0.8, LastUpdate: time.Unix(1_700_000_000, 0)}}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -166,7 +191,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 
 	// Change the served snapshot → status updates.
 	mu.Lock()
-	served = index.Snapshot{TotalPrefixes: 9, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 500, HitRate: 0.9}}}
+	served = index.Snapshot{TotalPrefixes: 9, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 500, HitRate: 0.9, LastUpdate: time.Unix(1_700_000_100, 0)}}}
 	mu.Unlock()
 	if err := p.refresh(ctx); err != nil {
 		t.Fatalf("third refresh: %v", err)

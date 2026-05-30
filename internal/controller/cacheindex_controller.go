@@ -401,7 +401,28 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		ObservedServer: serverURL,
 		LastUpdated:    metav1.NewTime(now),
 	}
+	// Cluster-wide CacheIndex.status.replicas is keyed by `id` alone
+	// (v1alpha1 surface). Two scenarios complicate that:
+	//   - Prefix-only replicas (no stats reported yet) should not appear
+	//     here at all — surfacing them would fabricate `0` for hitRate,
+	//     pressure, memory, and lastUpdate while the type says these are
+	//     latest reported stats. They are still tracked per-backend via
+	//     CacheBackend.status.indexParticipation.
+	//   - Two stats-reporting replicas sharing a name across namespaces
+	//     collide on `id` — pick the lexicographically-later tenant
+	//     deterministically so the chosen row is stable across ticks.
+	//     The `tenant` field on each row keeps the source identifiable.
+	byID := make(map[string]index.ReplicaSnapshot, len(snap.Replicas))
 	for _, r := range snap.Replicas {
+		if r.LastUpdate.IsZero() {
+			continue
+		}
+		if existing, ok := byID[r.ReplicaID]; ok && existing.Tenant >= r.Tenant {
+			continue
+		}
+		byID[r.ReplicaID] = r
+	}
+	for _, r := range byID {
 		st.Replicas = append(st.Replicas, cachev1alpha1.ReplicaCacheStatus{
 			ID:               r.ReplicaID,
 			Tenant:           r.Tenant,
@@ -411,6 +432,7 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 			LastUpdate:       metav1.NewTime(r.LastUpdate),
 		})
 	}
+	sort.Slice(st.Replicas, func(a, b int) bool { return st.Replicas[a].ID < st.Replicas[b].ID })
 	for _, t := range snap.Tenants {
 		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
 			ID:         t.TenantID,
