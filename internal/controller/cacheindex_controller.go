@@ -215,20 +215,26 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 	// pod can host many replicas/prefixes across (model, hash_scheme) and
 	// always presents the same labels + annotations, so we never need more
 	// than one Get per (namespace, pod-name) per tick. ownerIdx == -1 means
-	// "no owning backend found"; the entry still caches the negative result.
+	// "looked up and no owner"; the entry caches the negative result.
 	type podKey struct{ ns, name string }
-	type podAttr struct {
-		ownerIdx int
-		valid    bool
-	}
-	podAttrs := make(map[podKey]podAttr)
+	podAttrs := make(map[podKey]int)
+	// taintedNamespaces tracks namespaces where at least one pod lookup
+	// failed with a transient (non-NotFound) error. We cannot distinguish
+	// "this replica had no owner" from "we don't know who its owner was"
+	// in those namespaces, so we preserve every prior CacheBackend status
+	// in them rather than risk publishing a false drain on a backend whose
+	// replicas all happened to error out this tick.
+	taintedNamespaces := make(map[string]struct{})
 
 	for _, r := range snap.Replicas {
 		if r.Tenant == "" || r.ReplicaID == "" {
 			continue
 		}
+		if _, tainted := taintedNamespaces[r.Tenant]; tainted {
+			continue
+		}
 		key := podKey{r.Tenant, r.ReplicaID}
-		attr, cached := podAttrs[key]
+		ownerIdx, cached := podAttrs[key]
 		if !cached {
 			var pod corev1.Pod
 			err := p.Client.Get(ctx, types.NamespacedName{Namespace: r.Tenant, Name: r.ReplicaID}, &pod)
@@ -236,22 +242,24 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 			case apierrors.IsNotFound(err):
 				// Engine pod is gone — common after a scale-down. The
 				// cluster-wide CacheIndex still reflects the data until TTL.
-				podAttrs[key] = podAttr{ownerIdx: -1, valid: true}
+				podAttrs[key] = -1
 				continue
 			case err != nil:
-				// Transient API error: log + skip this replica only.
-				p.logger(ctx).V(1).Info("lookup engine pod for replica attribution failed; skipping",
+				// Transient API error: taint the namespace so we don't
+				// publish under-counted projections for any backend in it.
+				// The next successful tick will resume normal projection.
+				p.logger(ctx).V(1).Info("lookup engine pod failed; tainting namespace to preserve prior CacheBackend status",
 					"namespace", r.Tenant, "name", r.ReplicaID, "err", err.Error())
-				podAttrs[key] = podAttr{ownerIdx: -1, valid: true}
+				taintedNamespaces[r.Tenant] = struct{}{}
 				continue
 			}
-			attr = podAttr{ownerIdx: p.attributePod(&pod, backendsByNS[r.Tenant], backendsByNSName, backends.Items), valid: true}
-			podAttrs[key] = attr
+			ownerIdx = p.attributePod(&pod, backendsByNS[r.Tenant], backendsByNSName, backends.Items)
+			podAttrs[key] = ownerIdx
 		}
-		if attr.ownerIdx < 0 {
+		if ownerIdx < 0 {
 			continue
 		}
-		a := perBackend[attr.ownerIdx]
+		a := perBackend[ownerIdx]
 		a.prefixCount += int64(r.PrefixCount)
 		if r.LastEventAt.After(a.lastEventAt) {
 			a.lastEventAt = r.LastEventAt
@@ -260,6 +268,11 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 
 	for i, a := range perBackend {
 		cb := &backends.Items[i]
+		if _, tainted := taintedNamespaces[cb.Namespace]; tainted {
+			// Soft-state: preserve prior status when we couldn't compute
+			// a trustworthy projection for this backend's namespace.
+			continue
+		}
 		desired := &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: a.prefixCount}
 		if !a.lastEventAt.IsZero() {
 			t := metav1.NewTime(a.lastEventAt)

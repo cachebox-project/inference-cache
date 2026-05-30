@@ -11,12 +11,14 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
@@ -729,6 +731,79 @@ func TestRefreshAnnotationOverridesSelectorMatch(t *testing.T) {
 	beta := getBackendDirect(t, cl, "beta", "default")
 	if beta.Status.IndexParticipation == nil || beta.Status.IndexParticipation.PrefixCount != 6 {
 		t.Fatalf("beta should get attribution per annotation, got %+v", beta.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshPodLookupErrorPreservesPriorStatus: a transient apiserver
+// error during the per-replica pod lookup must NOT cause the poller to
+// publish a false drain. The namespace is "tainted" for the tick and
+// every CacheBackend in it keeps its prior status until a clean tick
+// can recompute attribution. This is the soft-state guarantee Codex
+// flagged: skipping replicas after a Get failure used to under-count
+// the backend's prefixCount and overwrite a real positive value with 0.
+func TestRefreshPodLookupErrorPreservesPriorStatus(t *testing.T) {
+	cb := cbFixture("backend", "default", map[string]string{"app": "vllm"})
+	pod := enginePod("vllm-0", "default", map[string]string{"app": "vllm"})
+
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+
+	// First refresh: clean client, publishes a positive participation.
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 9, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	cleanBuilder := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheIndex{}, &cachev1alpha1.CacheBackend{}).
+		WithObjects(cb, pod)
+	cl := cleanBuilder.Build()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(served)
+	}))
+	defer srv.Close()
+	p := &CacheIndexPoller{Client: cl, SnapshotURL: srv.URL, HTTPClient: srv.Client(), Name: "cluster-default"}
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	got := getBackendDirect(t, cl, "backend", "default")
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 9 {
+		t.Fatalf("seed participation = %+v, want prefixCount 9", got.Status.IndexParticipation)
+	}
+
+	// Rebuild the poller with a client that fails Pod Get with a non-
+	// NotFound error. Carry over the status we just published into the
+	// new client by including the read-back CacheBackend as a fixture.
+	failingCl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheIndex{}, &cachev1alpha1.CacheBackend{}).
+		WithObjects(got, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewServiceUnavailable("apiserver flake")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	failingPoller := &CacheIndexPoller{Client: failingCl, SnapshotURL: srv.URL, HTTPClient: srv.Client(), Name: "cluster-default"}
+
+	if err := failingPoller.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh under failing pod Get: %v", err)
+	}
+	after := getBackendDirect(t, failingCl, "backend", "default")
+	if after.Status.IndexParticipation == nil || after.Status.IndexParticipation.PrefixCount != 9 {
+		t.Fatalf("transient pod-Get error must preserve prior participation; got %+v", after.Status.IndexParticipation)
 	}
 }
 
