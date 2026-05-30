@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -392,33 +393,48 @@ func checkEngineOverrideEnvShape(env []corev1.EnvVar, basePath *field.Path) fiel
 }
 
 // checkEnvVarSource enforces the K8s one-of constraint on EnvVarSource:
-// exactly one of FieldRef / ResourceFieldRef / ConfigMapKeyRef /
-// SecretKeyRef must be set. Both an empty valueFrom and a valueFrom with
-// multiple selectors fail K8s Pod validation; admitting either would
-// cascade a cache misconfiguration into an engine-pod admission failure.
+// exactly one source selector must be set. Both an empty valueFrom and a
+// valueFrom with multiple selectors fail K8s Pod validation; admitting
+// either would cascade a cache misconfiguration into engine-pod admission
+// failure.
+//
+// Source detection uses reflection over the pointer fields of
+// [corev1.EnvVarSource] so the count is future-proof: when a newer
+// k8s.io/api adds a new selector (e.g. fileKeyRef, which controller-gen
+// already embeds in the generated CRD schema from the upstream OpenAPI),
+// the validator picks it up without code changes. Counting a hard-coded
+// list of fields would silently undercount and let a multi-source shape
+// slip past admission only to be rejected at engine-pod CREATE.
 func checkEnvVarSource(src *corev1.EnvVarSource, path *field.Path) field.ErrorList {
-	n := 0
-	if src.FieldRef != nil {
-		n++
-	}
-	if src.ResourceFieldRef != nil {
-		n++
-	}
-	if src.ConfigMapKeyRef != nil {
-		n++
-	}
-	if src.SecretKeyRef != nil {
-		n++
-	}
+	n := envVarSourceCount(src)
 	switch {
 	case n == 0:
 		return field.ErrorList{field.Required(path,
-			"valueFrom must select exactly one source (fieldRef, resourceFieldRef, configMapKeyRef, or secretKeyRef)")}
+			"valueFrom must select exactly one source (e.g. fieldRef, resourceFieldRef, configMapKeyRef, or secretKeyRef)")}
 	case n > 1:
 		return field.ErrorList{field.Invalid(path, n,
 			"valueFrom must select exactly one source — multiple set")}
 	}
 	return nil
+}
+
+// envVarSourceCount returns the number of non-nil pointer fields on src.
+// Each pointer field on [corev1.EnvVarSource] models one selectable
+// source; the K8s API rule is exactly one of them. Reflection keeps the
+// count aligned with k8s.io/api as it evolves.
+func envVarSourceCount(src *corev1.EnvVarSource) int {
+	if src == nil {
+		return 0
+	}
+	v := reflect.ValueOf(*src)
+	n := 0
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		if f.Kind() == reflect.Pointer && !f.IsNil() {
+			n++
+		}
+	}
+	return n
 }
 
 // reservedArgMessage formats the rejection a user sees when their

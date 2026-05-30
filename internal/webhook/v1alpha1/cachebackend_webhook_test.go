@@ -730,6 +730,49 @@ func TestValidator_EngineOverrides_RejectsMultipleValueFromSources(t *testing.T)
 		"multiple set")
 }
 
+func TestEnvVarSourceCount_CountsAllNonNilPointerFields(t *testing.T) {
+	// Pin the reflection-based count's contract: it walks pointer fields
+	// on EnvVarSource and counts non-nil ones. This is the future-proof
+	// path for new source kinds upstream adds (e.g. fileKeyRef) — the
+	// generated CRD already embeds them from the upstream OpenAPI, and the
+	// validator's one-of check needs to stay aligned without a code
+	// change for each new field.
+	cases := []struct {
+		name string
+		src  *corev1.EnvVarSource
+		want int
+	}{
+		{"nil", nil, 0},
+		{"empty", &corev1.EnvVarSource{}, 0},
+		{
+			"one source",
+			&corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+			1,
+		},
+		{
+			"two sources",
+			&corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+					Key:                  "k",
+				},
+			},
+			2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := envVarSourceCount(tc.src)
+			if got != tc.want {
+				t.Fatalf("envVarSourceCount = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
 	// Positive case: a ValueFrom-only entry (no Value) is a valid K8s env
 	// shape and must pass.
