@@ -1,6 +1,7 @@
 package pod
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -818,9 +819,14 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgSuppress(t *testing.T) {
 
 // TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline pins the
 // backward-compat invariant from locked decision #7: a CacheBackend with no
-// engineOverrides block produces a JSON patch byte-identical to the same CR
-// reconstructed without the field at all. A drift here would surface as a
-// non-empty diff between baseline and override-CR patches.
+// engineOverrides block produces an admitted pod byte-identical to the same
+// CR reconstructed with EngineOverrides explicitly nil. The handler's
+// emitted JSON-patch ops carry no guaranteed ordering (the controller-runtime
+// diff implementation walks maps), so we compare what an operator would
+// actually observe: the marshalled bytes of the reconstructed pod — the end
+// state the apiserver would persist. Catches a reorder/extra container/extra
+// env op the override path could leak on the "no override" code path, which
+// the previous field-presence checks would have missed.
 func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T) {
 	const ns = "engines"
 	// Baseline: no engineOverrides block at all.
@@ -832,6 +838,7 @@ func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T)
 	withNilOverride := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	withNilOverride.Spec.Integration.EngineOverrides = nil
 
+	mutatedRaw := make([][]byte, 0, 2)
 	for _, cb := range []*cachev1alpha1.CacheBackend{baseline, withNilOverride} {
 		h := newHandler(t, cb)
 		pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -842,18 +849,21 @@ func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T)
 			t.Fatalf("expected Allowed, got %+v", resp.Result)
 		}
 		mutated := applyPatches(t, req.Object.Raw, resp)
-		// The canonical injection contract — env + arg — must land on the
-		// pod exactly as before, with no extra entries the override surface
-		// could have added.
+		// Sanity: canonical injection lands as expected — so a green test
+		// is meaningful (not green by producing an empty patch set).
 		mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
 		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 		mustHaveArgFlag(t, mutated, "--kv-transfer-config")
-		// And no spurious env from the override path.
-		for _, e := range mutated.Spec.Containers[0].Env {
-			if e.Name == "FOO" {
-				t.Fatalf("no-override CR leaked an override env: %v", e)
-			}
+
+		raw, err := json.Marshal(mutated)
+		if err != nil {
+			t.Fatalf("marshal mutated pod: %v", err)
 		}
+		mutatedRaw = append(mutatedRaw, raw)
+	}
+	if !bytes.Equal(mutatedRaw[0], mutatedRaw[1]) {
+		t.Fatalf("no-override CR and explicit-nil-override CR produced different admitted pods\nbaseline:     %s\nexplicit-nil: %s",
+			string(mutatedRaw[0]), string(mutatedRaw[1]))
 	}
 }
 
