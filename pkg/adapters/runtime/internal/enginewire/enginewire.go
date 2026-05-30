@@ -139,13 +139,20 @@ func EngineContainerIndex(pod *corev1.PodSpec) (int, error) {
 }
 
 // LMCacheRemoteURL prefixes an engine-agnostic host:port endpoint with the
-// LMCache lm:// scheme. An endpoint already carrying lm:// (e.g. when an
-// operator pre-wired spec.endpoint with the scheme) is passed through.
+// LMCache lm:// scheme. An endpoint already carrying the lm:// scheme is
+// normalised to lower-case `lm://` — the admission validator lowercases
+// the scheme during shape checks (so `LM://cache.example` admits), and
+// without normalisation here that would inject
+// `LMCACHE_REMOTE_URL=lm://LM://cache.example`, a double-prefix the engine
+// connector rejects. The prefix match is case-insensitive on the scheme
+// only; the host portion is preserved verbatim (DNS is case-insensitive
+// but rewriting operator-typed casing is not the helper's job).
 func LMCacheRemoteURL(endpoint string) string {
-	if strings.HasPrefix(endpoint, "lm://") {
-		return endpoint
+	const scheme = "lm://"
+	if len(endpoint) >= len(scheme) && strings.EqualFold(endpoint[:len(scheme)], scheme) {
+		return scheme + endpoint[len(scheme):]
 	}
-	return "lm://" + endpoint
+	return scheme + endpoint
 }
 
 // FailOpenString returns the bool form of the effective fail-open mode for

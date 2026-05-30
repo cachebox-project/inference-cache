@@ -420,6 +420,51 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 	}
 }
 
+func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
+	// Admission lowercases the scheme during shape validation, so
+	// `LM://cache.example:8200` admits. The pod webhook must then
+	// normalise to lower-case `lm://` at injection — passing the
+	// operator-typed value through verbatim would produce
+	// `LMCACHE_REMOTE_URL=lm://LM://cache.example:8200`, a double-
+	// prefix the engine connector rejects.
+	const (
+		ns            = "engines"
+		operatorTyped = "LM://cache.example.com:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-up", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: operatorTyped,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-up", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	// Must be the canonical lower-case scheme, with the original
+	// host portion preserved verbatim.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://cache.example.com:8200")
+}
+
 func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 	// A CR that predates the trim-in-reconciler change could carry a
 	// whitespace-only status.endpoint. The webhook MUST treat that as
