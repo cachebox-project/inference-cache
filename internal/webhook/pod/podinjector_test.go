@@ -420,6 +420,45 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 	}
 }
 
+func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
+	// A CR that predates the trim-in-reconciler change could carry a
+	// whitespace-only status.endpoint. The webhook MUST treat that as
+	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
+	// the engine connector would reject at runtime. Defensive trim
+	// applies to both External (spec also whitespace, fallback to
+	// status) and managed (no fallback, just status).
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "   "},
+	}
+
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-ws", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+			t.Fatalf("whitespace status.endpoint must not become injected env; got %s=%q", e.Name, e.Value)
+		}
+	}
+}
+
 func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 	// Counterpart to the External fallback: managed backends MUST wait
 	// for status.endpoint (the reconciler builds it from the rendered

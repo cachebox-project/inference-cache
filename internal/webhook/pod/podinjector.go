@@ -278,10 +278,21 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 //     else to fall back on. The webhook must wait for status.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
+//
+// Every return path is `strings.TrimSpace`-d so a whitespace-only value
+// (a pre-admission CR that mirrored whitespace into status, an
+// externally-edited Service endpoint that picked up stray padding) is
+// treated as missing and fails open instead of injecting
+// `LMCACHE_REMOTE_URL=lm://   ` which the engine connector would reject
+// at runtime. The reconciler already trims before publishing
+// status.endpoint, but the webhook trims defensively here too so a
+// race against an old controller build can't leak whitespace to the
+// engine wire.
 func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
 		return ""
 	}
+	status := strings.TrimSpace(cache.Status.Endpoint)
 	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		if v := strings.TrimSpace(cache.Spec.Endpoint); v != "" {
 			return v
@@ -290,9 +301,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 		// (a CR predating admission) but status still carries a value,
 		// fall back to it rather than fail-open. Same direction as the
 		// reconciler's own defensive Ready=False/Missing branch.
-		return cache.Status.Endpoint
+		return status
 	}
-	return cache.Status.Endpoint
+	return status
 }
 
 // hasContainer reports whether containers already includes one named name.
