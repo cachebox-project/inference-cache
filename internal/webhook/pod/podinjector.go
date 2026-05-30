@@ -259,32 +259,40 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 	return logf.FromContext(ctx)
 }
 
-// effectiveEndpoint returns the address the engine pod should be wired to
-// for the given CacheBackend. status.endpoint is the canonical signal —
-// the reconciler builds it from the live Service for managed backends, so
-// the webhook waits for the reconciler before injecting against a
-// half-rendered workload. For External backends the source of truth is
-// spec.endpoint (admission validates it; the reconciler just mirrors it
-// verbatim); falling back to a trimmed spec.endpoint avoids a CREATE-only
-// race where an engine pod admitted before the controller patches status
-// would otherwise boot un-wired forever (pod admission re-runs on
-// re-create only, not on subsequent status updates).
+// effectiveEndpoint returns the address the engine pod should be wired
+// to for the given CacheBackend. The source is type-scoped:
 //
-// The fallback is type-scoped to External by design: managed backends
-// MUST wait for status.endpoint because spec doesn't carry an authoritative
-// host:port until the Service materialises (`spec.endpoint` is admission-
-// rejected on managed types — see rejectEndpointOnNonExternal).
+//   - External: spec.endpoint is authoritative — the operator owns it,
+//     admission validates it, status.endpoint is just a reconciler
+//     mirror that may briefly lag during an update. If a new pod
+//     admits between an operator's spec.endpoint update and the
+//     status patch, status would still hold the OLD value and the
+//     pod would boot wired to the stale address; pod admission is
+//     CREATE-only so that bad wiring is permanent. Preferring
+//     trimmed spec.endpoint over status here avoids that race and is
+//     consistent with admission's view of the truth.
+//   - Managed types (LMCache today): status.endpoint is the only
+//     source — the reconciler builds it from the live Service it
+//     provisions, and spec.endpoint is admission-rejected for these
+//     types (see rejectEndpointOnNonExternal), so there's nothing
+//     else to fall back on. The webhook must wait for status.
+//
+// Returns "" when no endpoint is currently usable; callers fail-open.
 func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
 		return ""
 	}
-	if cache.Status.Endpoint != "" {
+	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		if v := strings.TrimSpace(cache.Spec.Endpoint); v != "" {
+			return v
+		}
+		// Defensive: if spec.endpoint somehow became empty/whitespace
+		// (a CR predating admission) but status still carries a value,
+		// fall back to it rather than fail-open. Same direction as the
+		// reconciler's own defensive Ready=False/Missing branch.
 		return cache.Status.Endpoint
 	}
-	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		return strings.TrimSpace(cache.Spec.Endpoint)
-	}
-	return ""
+	return cache.Status.Endpoint
 }
 
 // hasContainer reports whether containers already includes one named name.

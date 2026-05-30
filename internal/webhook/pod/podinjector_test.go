@@ -370,6 +370,56 @@ func TestHandle_ExternalBackend_StatusEmpty_FallsBackToSpec(t *testing.T) {
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
 }
 
+func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
+	// When the operator updates spec.endpoint for an External CR but a
+	// new engine pod admits before the reconciler patches status, the
+	// pod must be wired to the NEW spec.endpoint — not the stale
+	// status.endpoint. Pod admission is CREATE-only, so a pod wired to
+	// the old address on admission stays misrouted forever.
+	const (
+		ns          = "engines"
+		freshSpec   = "new-cache.example:8200"
+		staleStatus = "old-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: freshSpec,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: staleStatus},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-stale", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	// Must use spec.endpoint, NOT the stale status.endpoint.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+freshSpec)
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
+			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.endpoint %q", staleStatus, freshSpec)
+		}
+	}
+}
+
 func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 	// Counterpart to the External fallback: managed backends MUST wait
 	// for status.endpoint (the reconciler builds it from the rendered
