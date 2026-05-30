@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"reflect"
@@ -110,7 +112,19 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 		return fmt.Errorf("get CacheIndex %q: %w", name, err)
 	}
 
-	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL, p.bearerToken())
+	// bearerToken errors are surfaced separately from the scrape so a missing
+	// or unreadable projected token shows up in the controller's logs with the
+	// expected path, rather than silently degrading to an unauthenticated
+	// scrape that the server rejects as 401. The token is still treated as
+	// optional (empty token → unauthenticated request, useful for local-dev
+	// runs where the controller isn't pod-scoped) but a real read failure
+	// (e.g. file exists but unreadable) is no longer indistinguishable from
+	// "no token configured."
+	token, tokenErr := p.bearerToken()
+	if tokenErr != nil {
+		p.logger(ctx).Error(tokenErr, "read bearer token; scraping unauthenticated")
+	}
+	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL, token)
 	if err != nil {
 		return err
 	}
@@ -149,20 +163,31 @@ func (p *CacheIndexPoller) logger(ctx context.Context) logr.Logger {
 
 // bearerToken reads the projected ServiceAccount token. Re-read on every
 // scrape so kubelet rotations are picked up without process restarts; the
-// file is tmpfs so the read is cheap. Returns "" if the file is missing or
-// unreadable — the caller still issues an unauthenticated request, which
-// the server will reject loudly. Local development without a token mounted
-// (e.g. running the controller out of cluster) flows through this path.
-func (p *CacheIndexPoller) bearerToken() string {
+// file is tmpfs so the read is cheap.
+//
+// Error semantics:
+//   - File missing → (\"\", nil). Treated as "no token configured" so a local
+//     out-of-cluster run still flows through the same code path; the scrape
+//     goes out unauthenticated and the server rejects 401, which is the
+//     correct posture for that environment.
+//   - File present but unreadable (permissions, IO error, etc.) →
+//     (\"\", wrappedError). Caller surfaces this in the log so the operator
+//     sees the real cause instead of misattributing the eventual 401 to a
+//     server-side identity mismatch.
+func (p *CacheIndexPoller) bearerToken() (string, error) {
 	path := p.BearerTokenPath
 	if path == "" {
 		path = DefaultBearerTokenPath
 	}
 	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Local-dev / out-of-cluster: no token mounted is expected.
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("read bearer token %q: %w", path, err)
 	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimSpace(string(b)), nil
 }
 
 // fetchSnapshot GETs and decodes the server's /snapshot JSON. When token is

@@ -66,12 +66,15 @@ The default Kustomize overlay brings up both control-plane components:
 
 - `inference-cache-controller-manager` — the reconciler + admission webhooks.
 - `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
-  HTTP `/healthz`, `/readyz`, `/metrics`, `/snapshot` surface, fronted by a
-  `ClusterIP` Service `inference-cache-server` in the
-  `inference-cache-system` namespace with named ports `grpc:9090` and
-  `http:8080`. The controller's CacheIndex poller scrapes `http://inference-cache-server:8080/snapshot`
-  by default, so once both pods are Ready `kubectl get cacheindex` reports
-  live cluster-wide cache state.
+  HTTP `/healthz`, `/readyz`, `/metrics`, `/policy` surface, plus a dedicated
+  `/snapshot` endpoint on its own listener gated by ServiceAccount bearer
+  auth + a `NetworkPolicy`. Fronted by a `ClusterIP` Service
+  `inference-cache-server` in the `inference-cache-system` namespace with
+  named ports `grpc:9090` (gRPC API), `http:8080` (probes / metrics /
+  policy), and `snapshot:8081` (controller-only snapshot read). The
+  controller's CacheIndex poller scrapes `http://inference-cache-server:8081/snapshot`
+  by default and sends its projected ServiceAccount token; once both pods
+  are Ready `kubectl get cacheindex` reports live cluster-wide cache state.
 
 ```bash
 kubectl apply -k config/default

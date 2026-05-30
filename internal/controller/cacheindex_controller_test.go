@@ -143,14 +143,56 @@ func TestBearerToken_ReadsAndTrimsFile(t *testing.T) {
 		t.Fatalf("write token: %v", err)
 	}
 	p := &CacheIndexPoller{BearerTokenPath: path}
-	if got := p.bearerToken(); got != "a-real-token" {
+	got, err := p.bearerToken()
+	if err != nil {
+		t.Fatalf("bearerToken() unexpected error: %v", err)
+	}
+	if got != "a-real-token" {
 		t.Fatalf("bearerToken() = %q, want %q", got, "a-real-token")
 	}
 
-	// Missing path → "" (the server will reject; poller does not crash).
+	// Missing path → ("", nil): treated as "no token configured" so a
+	// local out-of-cluster run still proceeds (server rejects 401, poller
+	// stays running). This must NOT be conflated with a real read error.
 	p.BearerTokenPath = dir + "/does-not-exist"
-	if got := p.bearerToken(); got != "" {
+	got, err = p.bearerToken()
+	if err != nil {
+		t.Fatalf("bearerToken() on missing file: unexpected error %v", err)
+	}
+	if got != "" {
 		t.Fatalf("bearerToken() on missing file = %q, want \"\"", got)
+	}
+}
+
+// TestBearerToken_UnreadableFileReturnsError pins the should-fix semantics:
+// a real read failure (file present but unreadable) surfaces as an error so
+// the operator's log shows the path + cause, instead of silently degrading
+// to an unauth scrape that the server rejects as a generic 401.
+func TestBearerToken_UnreadableFileReturnsError(t *testing.T) {
+	// chmod-0 is a portable way to make a present file unreadable for the
+	// running user (unless we're root — skip then).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; chmod 0 does not deny read")
+	}
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("ignored"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod token: %v", err)
+	}
+
+	p := &CacheIndexPoller{BearerTokenPath: path}
+	got, err := p.bearerToken()
+	if err == nil {
+		t.Fatalf("bearerToken() on unreadable file: got %q + nil, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("bearerToken() on unreadable file = %q, want \"\"", got)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("bearerToken() error %q does not mention path %q", err, path)
 	}
 }
 
