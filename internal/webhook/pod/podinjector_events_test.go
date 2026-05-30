@@ -82,7 +82,11 @@ func TestHandle_EmitsInjectedEventOnSuccessPath(t *testing.T) {
 	containsNone(t, events, eventReasonNoMatchingCacheBackend)
 }
 
-func TestHandle_EmitsNoMatchEventOnNoMatchPath(t *testing.T) {
+func TestHandle_EmitsNoMatchEventWhenNamespaceHasCacheBackend(t *testing.T) {
+	// A pod in a namespace that DOES have a claim-capable CacheBackend
+	// but whose labels miss its selector is the actual operator-drift
+	// case. The NoMatchingCacheBackend Event must fire to surface the
+	// drift.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	h, rec := newHandlerWithRecorder(t, cb)
@@ -100,6 +104,56 @@ func TestHandle_EmitsNoMatchEventOnNoMatchPath(t *testing.T) {
 	containsAll(t, events, "Normal "+eventReasonNoMatchingCacheBackend)
 	containsAll(t, events, "uncached")
 	containsNone(t, events, eventReasonInjected)
+}
+
+func TestHandle_SuppressesNoMatchEventInNamespaceWithoutCacheBackend(t *testing.T) {
+	// The webhook is configured for every Pod CREATE cluster-wide
+	// (failurePolicy=ignore, scope=*) so it sees pods in every
+	// namespace — including namespaces that have nothing to do with
+	// this cache plane. Emitting a NoMatchingCacheBackend Event on
+	// every such pod would flood the cluster-wide event stream and
+	// regress the noise floor in unrelated workloads. Gate: emit only
+	// when the namespace has at least one claim-capable CacheBackend.
+	const ns = "unrelated"
+	h, rec := newHandlerWithRecorder(t /* no CacheBackend objects */)
+	pod := vllmEnginePod("some-app", map[string]string{"app": "router"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("expected no patches on no-match, got %d", len(resp.Patches))
+	}
+	events := drainRecorder(rec)
+	if len(events) != 0 {
+		t.Fatalf("expected no events in a namespace with no claim-capable CacheBackend; got %v", events)
+	}
+}
+
+func TestHandle_SuppressesNoMatchEventWhenAllSelectorsAreEmpty(t *testing.T) {
+	// A CacheBackend with no selector (or an empty MatchLabels map)
+	// is not claim-capable — the webhook skips it. From the no-match
+	// event's perspective such a CR doesn't count: there's nothing to
+	// drift away from. Confirms that "namespace has a CB" alone isn't
+	// enough; the CB must have a non-empty selector for the event to
+	// be a meaningful "drift" signal.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, nil)
+	cb.Spec.EngineSelector = nil
+	h, rec := newHandlerWithRecorder(t, cb)
+	pod := vllmEnginePod("any-pod", map[string]string{"app": "router"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	events := drainRecorder(rec)
+	if len(events) != 0 {
+		t.Fatalf("expected no events when no CB is claim-capable; got %v", events)
+	}
 }
 
 func TestHandle_NoEventOnReadmissionOfAlreadyInjectedPod(t *testing.T) {

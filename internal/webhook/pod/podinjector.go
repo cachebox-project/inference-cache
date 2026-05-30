@@ -128,7 +128,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 
-	cache, err := h.selectCacheBackend(ctx, &pod)
+	cache, candidates, err := h.selectCacheBackend(ctx, &pod)
 	if err != nil {
 		log.V(1).Info("fail-open: backend lookup failed", "error", err.Error())
 		return admission.Allowed(fmt.Sprintf("backend lookup failed (fail-open): %v", err))
@@ -139,7 +139,17 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// so this is the steady-state path; log only at V(2) so it
 		// doesn't drown reconciler logs.
 		log.V(2).Info("no matching CacheBackend; pass-through")
-		h.emitNoMatchEvent(&req, &pod)
+		// Emit a NoMatchingCacheBackend Event only when the namespace
+		// has at least one claim-capable CacheBackend. The webhook
+		// admits every pod cluster-wide, so emitting on every no-match
+		// would flood the event stream of every namespace that doesn't
+		// use this cache plane. Gating on candidates>0 narrows the
+		// signal to "the operator set up a CacheBackend in this
+		// namespace but the pod's labels missed its selector" — the
+		// actual drift case the event is here to diagnose.
+		if candidates > 0 {
+			h.emitNoMatchEvent(&req, &pod)
+		}
 		return admission.Allowed("no matching CacheBackend")
 	}
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
@@ -237,23 +247,37 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 // claim every pod (including the controller's own and the lmcache-server's),
 // which is the kind of broad mutation the fail-open posture is meant to
 // prevent.
-func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod) (*cachev1alpha1.CacheBackend, error) {
+//
+// The second return value is the number of CacheBackends in the namespace
+// with a non-empty selector — i.e. the number of "claim-capable" CRs the
+// pod could have matched. Callers use it to gate diagnostic Events: a
+// pod admitted into a namespace with zero claim-capable CacheBackends is
+// not a "binding drifted" case but a "this namespace doesn't use the
+// cache" case, and emitting a NoMatchingCacheBackend Event there would
+// just be cluster-wide event-stream noise.
+func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod) (*cachev1alpha1.CacheBackend, int, error) {
 	var list cachev1alpha1.CacheBackendList
 	if err := h.Reader.List(ctx, &list, client.InNamespace(pod.Namespace)); err != nil {
-		return nil, fmt.Errorf("list CacheBackends in %s: %w", pod.Namespace, err)
+		return nil, 0, fmt.Errorf("list CacheBackends in %s: %w", pod.Namespace, err)
 	}
 	podLabels := labels.Set(pod.Labels)
+	candidates := 0
+	var match *cachev1alpha1.CacheBackend
 	for i := range list.Items {
 		cb := &list.Items[i]
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
 			continue
 		}
+		candidates++
+		if match != nil {
+			continue
+		}
 		sel := labels.SelectorFromSet(cb.Spec.EngineSelector.MatchLabels)
 		if sel.Matches(podLabels) {
-			return cb, nil
+			match = cb
 		}
 	}
-	return nil, nil
+	return match, candidates, nil
 }
 
 // skipAnnotationOptsOut returns true when the value of [AnnotationSkip]

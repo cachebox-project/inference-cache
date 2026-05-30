@@ -21,6 +21,11 @@
 # CPU-runnable: the engine image is vLLM's dedicated CPU build, so this
 # pair works on kind without a GPU. Bump the host VM's memory to ~10 GiB
 # before applying (vLLM CPU baseline is ~5 GiB + KV cache).
+#
+# Image tags are ARCH-SPECIFIC — vLLM publishes separate tags for x86_64
+# and arm64 and there is no shared "latest" multi-arch tag today. The
+# default below targets x86_64 (the common cloud / CI shape). On Apple
+# Silicon hosts switch the image to `vllm/vllm-openai-cpu:latest-arm64`.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -61,8 +66,9 @@ spec:
     spec:
       containers:
         - name: vllm
-          # vLLM's dedicated CPU image (arch-tagged). Use -x86_64 on x86 hosts.
-          image: vllm/vllm-openai-cpu:latest-arm64
+          # vLLM's dedicated CPU image. Arch-specific — swap to
+          # `:latest-arm64` on Apple Silicon hosts.
+          image: vllm/vllm-openai-cpu:latest-x86_64
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
           args:

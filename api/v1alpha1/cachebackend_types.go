@@ -306,7 +306,7 @@ type CacheBackendStatus struct {
 	// is a pointer so nil ("not yet computed") is distinguishable from 0
 	// ("computed and zero pods matched"). 0 is the operator-actionable
 	// signal that the selector and the engine Deployment's pod labels
-	// have drifted apart — the C6 mutating webhook then silently no-ops
+	// have drifted apart — the mutating Pod webhook then silently no-ops
 	// and the engine runs uncached.
 	//
 	// This is a snapshot at reconcile time, not a real-time counter: it
