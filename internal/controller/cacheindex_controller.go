@@ -201,21 +201,14 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		prefixCount int64
 		lastEventAt time.Time
 	}
-	// Seed perBackend with every CacheBackend that EITHER has a non-empty
-	// EngineSelector (so a tick with no matching replicas resets it to
-	// zero) OR already published a non-nil indexParticipation (so a status
-	// previously written under an old selector still gets cleared when the
-	// selector is removed). Backends that are unselected AND never had
-	// participation published stay nil — the field is genuinely "not
-	// observed yet" for them, and writing a noise zero would invite
-	// operators to read meaning into it.
+	// Seed perBackend for EVERY CacheBackend so attributePod can return an
+	// annotation-owned backend even after its selector was removed (or for
+	// a manually annotated pod whose backend has no selector at all)
+	// without dereferencing a nil entry. The decision of whether to write
+	// a noise zero is taken at the write step below, not at seed time.
 	perBackend := make(map[int]*agg, len(backends.Items))
 	for i := range backends.Items {
-		cb := &backends.Items[i]
-		hasSelector := cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
-		if hasSelector || cb.Status.IndexParticipation != nil {
-			perBackend[i] = &agg{}
-		}
+		perBackend[i] = &agg{}
 	}
 
 	// Pod-attribution cache for the duration of this tick: a single engine
@@ -271,6 +264,18 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		if !a.lastEventAt.IsZero() {
 			t := metav1.NewTime(a.lastEventAt)
 			desired.LastEventAt = &t
+		}
+		// "Don't write noise zeros" gate: a backend that has no selector
+		// configured AND has never published participation AND has no
+		// real attribution this tick stays nil — writing a noise zero
+		// would invite operators to read meaning where there is none.
+		// A real non-zero attribution (e.g. via the injected-by
+		// annotation pointing at a selector-less backend) bypasses the
+		// gate so the data is still surfaced.
+		isZeroState := desired.PrefixCount == 0 && desired.LastEventAt == nil && desired.HitRate == nil
+		hasSelector := cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
+		if isZeroState && !hasSelector && cb.Status.IndexParticipation == nil {
+			continue
 		}
 		if participationEqual(cb.Status.IndexParticipation, desired) {
 			continue
@@ -399,6 +404,7 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 	for _, r := range snap.Replicas {
 		st.Replicas = append(st.Replicas, cachev1alpha1.ReplicaCacheStatus{
 			ID:               r.ReplicaID,
+			Tenant:           r.Tenant,
 			CacheMemoryBytes: r.CacheMemoryBytes,
 			HitRate:          formatRate(r.HitRate),
 			Pressure:         formatRate(r.Pressure),

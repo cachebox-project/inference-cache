@@ -29,7 +29,7 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 		TotalPrefixes: 5,
 		HotPrefixes:   0,
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "r1", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
+			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
 		},
 		Tenants: []index.TenantSnapshot{
 			{TenantID: "t1", MemoryUsed: 100, HitRate: 0.8},
@@ -44,8 +44,8 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	if st.ObservedServer != "http://server/snapshot" {
 		t.Fatalf("observedServer = %q", st.ObservedServer)
 	}
-	if len(st.Replicas) != 1 || st.Replicas[0].ID != "r1" || st.Replicas[0].HitRate != "0.8" || st.Replicas[0].Pressure != "0.5" {
-		t.Fatalf("replica = %+v, want id r1 hitRate 0.8 pressure 0.5 (decimal strings)", st.Replicas[0])
+	if len(st.Replicas) != 1 || st.Replicas[0].ID != "r1" || st.Replicas[0].Tenant != "ns-a" || st.Replicas[0].HitRate != "0.8" || st.Replicas[0].Pressure != "0.5" {
+		t.Fatalf("replica = %+v, want id r1 tenant ns-a hitRate 0.8 pressure 0.5", st.Replicas[0])
 	}
 	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].HitRate != "0.8" {
 		t.Fatalf("tenant = %+v", st.Tenants[0])
@@ -634,6 +634,42 @@ func TestRefreshOverlappingSelectorsFirstNameWins(t *testing.T) {
 	beta := getBackendDirect(t, cl, "beta", "default")
 	if beta.Status.IndexParticipation == nil || beta.Status.IndexParticipation.PrefixCount != 0 {
 		t.Fatalf("beta should get zero-state, got %+v", beta.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshAnnotationOwnedBackendWithNoSelector: a pod's injected-by
+// annotation points at a CacheBackend that itself has no EngineSelector
+// (e.g. its selector was cleared after admission). The poller must NOT
+// panic dereferencing perBackend and must attribute the replica to the
+// annotation-named backend regardless of selector state.
+func TestRefreshAnnotationOwnedBackendWithNoSelector(t *testing.T) {
+	cbNoSelector := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner", Namespace: "default"},
+	}
+	cbOther := cbFixture("other", "default", map[string]string{"app": "vllm"})
+	pod := enginePodInjectedBy("vllm-0", "default", "default", "owner", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbNoSelector, cbOther},
+		[]*corev1.Pod{pod},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	owner := getBackendDirect(t, cl, "owner", "default")
+	if owner.Status.IndexParticipation == nil || owner.Status.IndexParticipation.PrefixCount != 3 {
+		t.Fatalf("annotation-owned backend should be attributed even without a selector, got %+v", owner.Status.IndexParticipation)
+	}
+	other := getBackendDirect(t, cl, "other", "default")
+	if other.Status.IndexParticipation == nil || other.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("non-owner backend should publish zero-state, got %+v", other.Status.IndexParticipation)
 	}
 }
 

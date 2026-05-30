@@ -135,11 +135,21 @@ spec:
                         Pressure is the replica's memory-pressure heuristic in [0,1], as a decimal
                         string (e.g. "0.65").
                       type: string
+                    tenant:
+                      description: |-
+                        Tenant is the tenant the replica reports under. The subscriber sidecar
+                        derives it from the engine pod's namespace, so two pods sharing a
+                        metadata.name across namespaces are kept as separate replica rows.
+                        Listed alongside ID in the map-list key so cross-tenant collisions
+                        cannot violate the listMapKey uniqueness invariant.
+                      type: string
                   required:
                   - id
+                  - tenant
                   type: object
                 type: array
                 x-kubernetes-list-map-keys:
+                - tenant
                 - id
                 x-kubernetes-list-type: map
               tenants:

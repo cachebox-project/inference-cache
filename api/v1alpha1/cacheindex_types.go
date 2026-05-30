@@ -14,6 +14,12 @@ type CacheIndexSpec struct{}
 type ReplicaCacheStatus struct {
 	// ID is the replica identifier (the engine/pod that reported the state).
 	ID string `json:"id"`
+	// Tenant is the tenant the replica reports under. The subscriber sidecar
+	// derives it from the engine pod's namespace, so two pods sharing a
+	// metadata.name across namespaces are kept as separate replica rows.
+	// Listed alongside ID in the map-list key so cross-tenant collisions
+	// cannot violate the listMapKey uniqueness invariant.
+	Tenant string `json:"tenant"`
 	// CacheMemoryBytes is the cache memory the replica reports using.
 	// +optional
 	CacheMemoryBytes int64 `json:"cacheMemoryBytes,omitempty"`
@@ -76,6 +82,7 @@ type CacheIndexStatus struct {
 	// Replicas is the per-replica cache health.
 	// +optional
 	// +listType=map
+	// +listMapKey=tenant
 	// +listMapKey=id
 	Replicas []ReplicaCacheStatus `json:"replicas,omitempty"`
 	// Tenants is the per-tenant cache footprint.
