@@ -13,13 +13,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -101,11 +99,6 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 			Registry: adapterruntime.DefaultRegistry(
 				adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 			),
-			// Recorder writes K8s Events on each engine pod so the
-			// matched/no-match decision shows in `kubectl describe pod`.
-			// Production wiring (cmd/controller) passes the manager's
-			// EventRecorder the same way.
-			Recorder: mgr.GetEventRecorder("cachebackend-pod-webhook"),
 		},
 	})
 
@@ -235,77 +228,6 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("get second pod: %v", err)
 	}
 	mustHaveContainerEnv(t, &got2, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-
-	// No-match path: a pod whose labels don't satisfy any CacheBackend
-	// selector in the namespace must be admitted unchanged AND get a
-	// NoMatchingCacheBackend event on it — the highest-leverage operator
-	// signal when an engine Deployment's labels and a CacheBackend's
-	// selector have drifted apart.
-	noMatch := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "vllm-no-match",
-			Namespace: ns,
-			Labels:    map[string]string{"app": "router"},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{
-				Name:  adapterruntime.EngineContainerName,
-				Image: "vllm/vllm-openai-cpu:latest",
-			}},
-		},
-	}
-	if err := mgr.GetClient().Create(ctx, noMatch); err != nil {
-		t.Fatalf("create no-match Pod: %v", err)
-	}
-	var gotNoMatch corev1.Pod
-	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: noMatch.Name}, &gotNoMatch); err != nil {
-		t.Fatalf("get no-match pod: %v", err)
-	}
-	// A no-match pod must NOT carry the injected-by annotation.
-	if got := gotNoMatch.Annotations[AnnotationInjectedBy]; got != "" {
-		t.Fatalf("no-match pod carries injected-by annotation %q; expected unchanged", got)
-	}
-
-	// Poll the apiserver for the expected events. The events.EventRecorder
-	// broadcasts asynchronously, so the events lag the admission response
-	// by a few hundred ms.
-	want := map[string]struct {
-		podName string
-		reason  string
-	}{
-		"matched-engine":  {pod.Name, eventReasonInjected},
-		"matched-engine2": {pod2.Name, eventReasonInjected},
-		"no-match":        {noMatch.Name, eventReasonNoMatchingCacheBackend},
-	}
-	seen := map[string]bool{}
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) && len(seen) < len(want) {
-		var list eventsv1.EventList
-		if err := mgr.GetAPIReader().List(ctx, &list, client.InNamespace(ns)); err == nil {
-			for _, ev := range list.Items {
-				if ev.Regarding.Kind != "Pod" {
-					continue
-				}
-				for key, w := range want {
-					if seen[key] {
-						continue
-					}
-					if ev.Regarding.Name == w.podName && ev.Reason == w.reason {
-						seen[key] = true
-					}
-				}
-			}
-		}
-		if len(seen) == len(want) {
-			return
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	for key, w := range want {
-		if !seen[key] {
-			t.Errorf("did not observe Event reason=%s on pod %s/%s within timeout", w.reason, ns, w.podName)
-		}
-	}
 }
 
 // mustHaveContainerEnv fails the test if the first container's env array
@@ -432,7 +354,7 @@ webhooks:
     - CREATE
     resources:
     - pods
-  sideEffects: None
+  sideEffects: NoneOnDryRun
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pod-webhook.yaml")

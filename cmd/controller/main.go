@@ -164,6 +164,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// EnginePodEventsReconciler emits the InjectedByCacheBackend Event on
+	// each engine pod after the mutating webhook stamps it. The webhook
+	// itself can't emit: at admission time the apiserver hasn't assigned
+	// pod.metadata.uid, so a webhook-recorded event would land with
+	// involvedObject.uid="" and be invisible to `kubectl describe pod`.
+	if err := (&controller.EnginePodEventsReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EnginePodEvents")
+		os.Exit(1)
+	}
+
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, adapterRegistry); err != nil {
 		setupLog.Error(err, "unable to register webhook", "webhook", "CacheBackend")
 		os.Exit(1)
@@ -180,7 +193,6 @@ func main() {
 			Reader:   mgr.GetAPIReader(),
 			Registry: adapterRegistry,
 			Log:      ctrl.Log.WithName("webhooks").WithName("pod-injector"),
-			Recorder: mgr.GetEventRecorder("cachebackend-pod-webhook"),
 		},
 	})
 

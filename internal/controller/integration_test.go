@@ -644,6 +644,129 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 	})
 }
 
+// TestIntegrationEnginePodEvents exercises the engine-pod-events controller
+// against a real apiserver. The controller's contract is "emit a Normal
+// InjectedByCacheBackend Event on every pod the mutating webhook stamped
+// with inferencecache.io/injected-by". The user-visible promise is that
+// `kubectl describe pod` surfaces the event, and describe filters events
+// by involvedObject.uid — so this test asserts the recorded events carry
+// the persisted Pod UID, not just the name.
+//
+// (This is the regression the webhook-recorded approach would have
+// broken: at admission time the apiserver hasn't assigned the UID yet,
+// so an event recorded from the webhook lands with involvedObject.uid=""
+// and is invisible under describe.)
+func TestIntegrationEnginePodEvents(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := (&EnginePodEventsReconciler{
+		Client: mgr.GetClient(),
+		Log:    logr.Discard(),
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	ns := freshNS(t, k8s)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+		},
+	}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	// Create a pod with the injected-by annotation. The webhook is NOT
+	// installed in this test — we are exercising the controller's
+	// behavior on a pod that LOOKS like one the webhook would have
+	// stamped.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "engine-a",
+			Namespace:   ns,
+			Annotations: map[string]string{"inferencecache.io/injected-by": ns + "/" + cb.Name},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "engine",
+				Image: "registry.example.com/vllm:test",
+			}},
+		},
+	}
+	if err := k8s.Create(context.Background(), pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	if pod.UID == "" {
+		t.Fatalf("apiserver returned empty UID for persisted pod — envtest invariant broken")
+	}
+
+	// An unannotated pod that should NOT generate an event. Pins the
+	// predicate filtering.
+	unrelated := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: ns},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "x", Image: "x"}},
+		},
+	}
+	if err := k8s.Create(context.Background(), unrelated); err != nil {
+		t.Fatalf("create unrelated pod: %v", err)
+	}
+
+	// Poll for the InjectedByCacheBackend event on the persisted pod's
+	// UID. The events.EventRecorder broadcasts asynchronously, so the
+	// event lags pod creation by a few hundred ms.
+	deadline := time.Now().Add(20 * time.Second)
+	var sawInjected bool
+	var sawSpurious bool
+	for time.Now().Before(deadline) && !sawInjected {
+		var list eventsv1.EventList
+		if err := k8s.List(context.Background(), &list, client.InNamespace(ns)); err == nil {
+			for _, ev := range list.Items {
+				if ev.Regarding.Kind != "Pod" {
+					continue
+				}
+				if ev.Regarding.UID == pod.UID && ev.Reason == "InjectedByCacheBackend" {
+					sawInjected = true
+				}
+				if ev.Regarding.UID == unrelated.UID && ev.Reason == "InjectedByCacheBackend" {
+					sawSpurious = true
+				}
+			}
+		}
+		if sawInjected {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !sawInjected {
+		t.Errorf("did not observe InjectedByCacheBackend event with involvedObject.uid=%q within timeout", pod.UID)
+	}
+	if sawSpurious {
+		t.Errorf("controller emitted InjectedByCacheBackend on an unannotated pod (uid=%q) — predicate failed", unrelated.UID)
+	}
+}
+
 // TestIntegrationCacheBackendMatchedEnginePods exercises the
 // status.matchedEnginePods writer against a real apiserver: the count
 // reflects the live pod inventory in the CR's namespace, ignores pods in

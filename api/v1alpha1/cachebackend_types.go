@@ -311,10 +311,9 @@ type CacheBackendStatus struct {
 	//
 	// This is a snapshot at reconcile time, not a real-time counter: it
 	// is not updated on every pod birth/death. For per-pod real-time
-	// visibility, watch the K8s Events the mutating Pod webhook emits on
-	// the engine pods (Reason=InjectedByCacheBackend on the success path,
-	// Reason=NoMatchingCacheBackend when no CacheBackend in the namespace
-	// claims the pod).
+	// visibility, watch the K8s `InjectedByCacheBackend` Event the
+	// controller emits on the engine pod after the mutating Pod webhook
+	// stamps it (visible in `kubectl describe pod`).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MatchedEnginePods *int32 `json:"matchedEnginePods,omitempty"`
