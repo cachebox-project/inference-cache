@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -37,6 +38,21 @@ const AnnotationSkip = "inferencecache.io/skip-inject"
 // annotation, so a stripped-by-mistake annotation still does not cause a
 // duplicate injection.
 const AnnotationInjectedBy = "inferencecache.io/injected-by"
+
+// Event reasons emitted on the engine pod at admission time.
+//
+// InjectedByCacheBackend fires on the success path when a CacheBackend
+// matched the pod's labels and the adapter injected the engine wiring;
+// NoMatchingCacheBackend fires when no CacheBackend in the pod's namespace
+// matched and the engine will run uncached. Both are Normal events — the
+// no-match case is the steady state for most pods in the cluster, not an
+// error — but it's the highest-leverage operator-debug signal when an
+// engine Deployment's labels and a CacheBackend's selector have drifted
+// apart and the silent no-op is otherwise invisible.
+const (
+	eventReasonInjected               = "InjectedByCacheBackend"
+	eventReasonNoMatchingCacheBackend = "NoMatchingCacheBackend"
+)
 
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=ignore,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod.inferencecache.io,admissionReviewVersions=v1
 
@@ -68,6 +84,13 @@ type EngineInjector struct {
 	// Log is the handler's logger. nil falls back to logf.FromContext at
 	// call time; tests typically inject logr.Discard().
 	Log logr.Logger
+
+	// Recorder emits the InjectedByCacheBackend / NoMatchingCacheBackend
+	// events on the engine pod so operators can see binding decisions in
+	// `kubectl describe pod`. nil disables event emission — the handler's
+	// admission decision is unchanged. Production wiring passes the
+	// manager's EventRecorder; tests pass [events.NewFakeRecorder].
+	Recorder events.EventRecorder
 }
 
 // Handle implements [admission.Handler]. Any rejection at this layer
@@ -116,6 +139,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// so this is the steady-state path; log only at V(2) so it
 		// doesn't drown reconciler logs.
 		log.V(2).Info("no matching CacheBackend; pass-through")
+		h.emitNoMatchEvent(&req, &pod)
 		return admission.Allowed("no matching CacheBackend")
 	}
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
@@ -176,6 +200,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			"runtime", string(runtimeID), "container", sidecar.Name)
 	}
 
+	alreadyInjected := pod.Annotations[AnnotationInjectedBy] != ""
 	if mutated.Annotations == nil {
 		mutated.Annotations = map[string]string{}
 	}
@@ -188,6 +213,12 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 	resp := admission.PatchResponseFromRaw(req.Object.Raw, mutatedRaw)
 	log.V(1).Info("injected", "runtime", string(runtimeID), "endpoint", endpoint, "patches", len(resp.Patches))
+	// Emit only on the first mutation pass — a re-admission of an
+	// already-injected pod (idempotent adapter merge → empty patch set)
+	// must not double-emit the event.
+	if !alreadyInjected {
+		h.emitInjectedEvent(&req, mutated, cache)
+	}
 	return resp
 }
 
@@ -269,4 +300,39 @@ func hasContainer(containers []corev1.Container, name string) bool {
 		}
 	}
 	return false
+}
+
+// emitInjectedEvent records a Normal InjectedByCacheBackend event on the
+// engine pod naming the matched CacheBackend. The event's involvedObject is
+// the pod itself so `kubectl describe pod <engine-pod>` surfaces the binding
+// decision. Skipped on dry-run admissions to honor the webhook's
+// sideEffects=None contract.
+func (h *EngineInjector) emitInjectedEvent(req *admission.Request, pod *corev1.Pod, cache *cachev1alpha1.CacheBackend) {
+	if h.Recorder == nil || isDryRun(req) {
+		return
+	}
+	h.Recorder.Eventf(pod, cache, corev1.EventTypeNormal,
+		eventReasonInjected, eventReasonInjected,
+		"Injected engine config from CacheBackend %q", cache.Namespace+"/"+cache.Name)
+}
+
+// emitNoMatchEvent records a Normal NoMatchingCacheBackend event on the pod
+// when no CacheBackend in the pod's namespace claims it. The event is the
+// real-time per-pod signal that complements the snapshot count in
+// status.matchedEnginePods on the CacheBackend side: zero matches there and
+// this event here together pinpoint a selector/label drift.
+func (h *EngineInjector) emitNoMatchEvent(req *admission.Request, pod *corev1.Pod) {
+	if h.Recorder == nil || isDryRun(req) {
+		return
+	}
+	h.Recorder.Eventf(pod, nil, corev1.EventTypeNormal,
+		eventReasonNoMatchingCacheBackend, eventReasonNoMatchingCacheBackend,
+		"No CacheBackend matched pod labels; engine will run uncached")
+}
+
+// isDryRun reports whether the admission request opted into dry-run. The
+// webhook declares sideEffects=None, so dry-run admissions must not write
+// Events (Events would persist server-side and violate the contract).
+func isDryRun(req *admission.Request) bool {
+	return req != nil && req.DryRun != nil && *req.DryRun
 }

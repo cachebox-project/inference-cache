@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -77,6 +78,7 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -108,6 +110,14 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	before := snapshotState(&backend)
 
 	result, err := r.dispatch(ctx, logger, &backend)
+	// Refresh status.matchedEnginePods regardless of dispatch outcome — the
+	// pod-label snapshot is an observation about the engine fleet, not about
+	// the cache-server workload dispatch manages, so an apply error must not
+	// freeze it. Runs as its own Status().Patch (MergeFrom) so it never
+	// fights the status writes dispatch already issued, and is fail-soft on
+	// transient List/Patch errors so it never escalates a transient
+	// apiserver hiccup into a Reconcile error.
+	r.refreshMatchedEnginePods(ctx, &backend)
 	// Emit transitions whenever dispatch published a status change, even on
 	// an apply-error reconcile: the status path runs independently of apply
 	// success (so apply churn doesn't freeze user-visible health), and the
@@ -881,6 +891,71 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 		return fmt.Errorf("patch CacheBackend status %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	return nil
+}
+
+// refreshMatchedEnginePods refreshes status.matchedEnginePods from the live
+// pod-label set in the CacheBackend's namespace. Runs once per reconcile and
+// only touches the matchedEnginePods sub-field (via Status().Patch with
+// MergeFrom) so it coexists cleanly with the other status writers in this
+// reconciler and with any future status writers (e.g. an index-participation
+// projector) that touch different sub-fields.
+//
+// Cadence-by-reconcile, not real-time: counts via a single namespaced
+// client.List with the engineSelector — there is no Pod watch, and pod
+// births/deaths between reconciles are not reflected until the next pass.
+// The real-time per-pod signal lives on the engine pods themselves (the
+// mutating Pod webhook's InjectedByCacheBackend / NoMatchingCacheBackend
+// Events); this status field answers the cluster-wide "is anyone connected
+// at all?" question.
+//
+// Selector resolution mirrors the mutating webhook's policy: a nil or
+// empty MatchLabels matches nothing (a broad selector at admission time
+// would silently claim every pod). A CR with no selector therefore
+// reports no count — and a CR that previously had one and just lost it
+// gets its prior value cleared so the printer column doesn't advertise a
+// stale match for a CR that no longer claims engine pods.
+//
+// Fail-soft semantics:
+//   - List error → log + skip the tick; keep the existing value.
+//   - Status patch error → roll back the in-memory mutation so the rest of
+//     the reconcile (transition events, log fields) sees only what the
+//     apiserver actually persisted.
+//
+// Never returns an error: the matchedEnginePods refresh must not escalate
+// a transient observation failure into a Reconcile error that retries the
+// rest of the reconcile machinery unnecessarily.
+func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	before := backend.DeepCopy()
+
+	sel := backend.Spec.EngineSelector
+	if sel == nil || len(sel.MatchLabels) == 0 {
+		if backend.Status.MatchedEnginePods == nil {
+			return
+		}
+		backend.Status.MatchedEnginePods = nil
+	} else {
+		matcher := labels.SelectorFromSet(sel.MatchLabels)
+		var pods corev1.PodList
+		if err := r.List(ctx, &pods,
+			client.InNamespace(backend.Namespace),
+			client.MatchingLabelsSelector{Selector: matcher},
+		); err != nil {
+			log.FromContext(ctx).V(1).Info("matchedEnginePods refresh skipped: pod list failed",
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return
+		}
+		count := int32(len(pods.Items))
+		if backend.Status.MatchedEnginePods != nil && *backend.Status.MatchedEnginePods == count {
+			return
+		}
+		backend.Status.MatchedEnginePods = &count
+	}
+
+	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
+		backend.Status.MatchedEnginePods = before.Status.MatchedEnginePods
+		log.FromContext(ctx).V(1).Info("matchedEnginePods refresh: status patch failed",
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+	}
 }
 
 // stateSnapshot captures the prior-status fields that drive transition events.

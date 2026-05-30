@@ -180,6 +180,7 @@ func main() {
 			Reader:   mgr.GetAPIReader(),
 			Registry: adapterRegistry,
 			Log:      ctrl.Log.WithName("webhooks").WithName("pod-injector"),
+			Recorder: mgr.GetEventRecorder("cachebackend-pod-webhook"),
 		},
 	})
 

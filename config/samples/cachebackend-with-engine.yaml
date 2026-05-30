@@ -1,0 +1,97 @@
+# Paired sample: a CacheBackend and a matching engine Deployment.
+#
+# The label `app: qwen-demo` appears in TWO places — `CacheBackend.spec.
+# engineSelector.matchLabels` and the Deployment's pod template
+# `metadata.labels`. That label match is what binds the CR to the engine
+# pods: the controller's mutating Pod admission webhook intercepts each
+# pod CREATE, finds the matching CacheBackend, and injects the LMCache
+# wiring (env vars + `--kv-transfer-config` arg + kvevent-subscriber
+# sidecar). Drift the labels apart and the webhook silently no-ops, the
+# engine runs uncached, and `kubectl get cachebackend` reports `Matched: 0`.
+# See docs/concepts/cachebackend-engine-binding.md for the lifecycle and
+# the failure-mode table.
+#
+# Apply both objects in one shot:
+#   kubectl apply -f config/samples/cachebackend-with-engine.yaml
+#
+# Then watch the binding land:
+#   kubectl get cachebackend qwen-demo -w
+#   kubectl describe pod -l app=qwen-demo | grep -A1 Events
+#
+# CPU-runnable: the engine image is vLLM's dedicated CPU build, so this
+# pair works on kind without a GPU. Bump the host VM's memory to ~10 GiB
+# before applying (vLLM CPU baseline is ~5 GiB + KV cache).
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: qwen-demo
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: qwen-demo                # <-- binding key/value (1 of 2)
+  backendConfig:
+    # Served model the engine pods are loaded with. Plumbed to the
+    # auto-attached kvevent-subscriber sidecar so the index keys
+    # per-replica entries by model.
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    # Pin to a real digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-demo
+  labels:
+    app: qwen-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-demo
+  template:
+    metadata:
+      labels:
+        app: qwen-demo              # <-- binding key/value (2 of 2)
+    spec:
+      containers:
+        - name: vllm
+          # vLLM's dedicated CPU image (arch-tagged). Use -x86_64 on x86 hosts.
+          image: vllm/vllm-openai-cpu:latest-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

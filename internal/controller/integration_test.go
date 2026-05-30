@@ -644,6 +644,88 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 	})
 }
 
+// TestIntegrationCacheBackendMatchedEnginePods exercises the
+// status.matchedEnginePods writer against a real apiserver: the count
+// reflects the live pod inventory in the CR's namespace, ignores pods in
+// other namespaces, and survives pod birth/death between reconciles.
+//
+// The writer counts at reconcile cadence (no Pod watch); the test therefore
+// drives reconcile() explicitly after each pod mutation.
+func TestIntegrationCacheBackendMatchedEnginePods(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, _ := startEnv(t)
+	r := &CacheBackendReconciler{Client: k8s, Scheme: scheme, Log: logr.Discard()}
+	ctx := context.Background()
+
+	createPod := func(t *testing.T, namespace, name string, podLabels map[string]string) {
+		t.Helper()
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: podLabels},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "engine",
+					Image: "registry.example.com/vllm:test",
+				}},
+			},
+		}
+		if err := k8s.Create(ctx, p); err != nil {
+			t.Fatalf("create pod %s/%s: %v", namespace, name, err)
+		}
+	}
+
+	ns := freshNS(t, k8s)
+	other := freshNS(t, k8s)
+	sel := map[string]string{"app": "test-engine"}
+
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: sel}
+	if err := k8s.Create(ctx, cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	// No matching pods yet → after first reconcile the field is an
+	// observed 0 (not nil, which would mean "not yet computed").
+	reconcile(t, r, "cache", ns)
+	if got := getBackend(t, r, "cache", ns).Status.MatchedEnginePods; got == nil || *got != 0 {
+		t.Fatalf("with zero matching pods: matchedEnginePods = %v, want 0", got)
+	}
+
+	// Three matching pods land. A pod with the same labels in a
+	// different namespace and a non-matching pod in this one must not
+	// inflate the count.
+	createPod(t, ns, "engine-1", sel)
+	createPod(t, ns, "engine-2", sel)
+	createPod(t, ns, "engine-3", sel)
+	createPod(t, ns, "router-1", map[string]string{"app": "router"})
+	createPod(t, other, "engine-foreign", sel)
+
+	reconcile(t, r, "cache", ns)
+	if got := getBackend(t, r, "cache", ns).Status.MatchedEnginePods; got == nil || *got != 3 {
+		t.Fatalf("after creating 3 matching pods: matchedEnginePods = %v, want 3", got)
+	}
+
+	// Delete one of the matching pods (force, since envtest has no
+	// kubelet and pods never go past Pending → no graceful delete).
+	zero := int64(0)
+	if err := k8s.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-1", Namespace: ns}},
+		&client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+	// Tight poll: envtest's delete is async; reconcile until the count
+	// catches up (or the deadline fires).
+	deadline := time.Now().Add(10 * time.Second)
+	var last *int32
+	for time.Now().Before(deadline) {
+		reconcile(t, r, "cache", ns)
+		last = getBackend(t, r, "cache", ns).Status.MatchedEnginePods
+		if last != nil && *last == 2 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("after deleting 1 of 3 matching pods: matchedEnginePods = %v, want 2", last)
+}
+
 // TestIntegrationCacheBackendWatch runs a real manager so the Owns(...) watches
 // are exercised end to end: deleting the managed Deployment re-triggers
 // reconcile and the controller recreates it.

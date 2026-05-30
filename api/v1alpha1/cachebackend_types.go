@@ -89,7 +89,20 @@ type CacheBackendSpec struct {
 	// +optional
 	Integration *CacheBackendIntegrationSpec `json:"integration,omitempty"`
 
-	// EngineSelector selects engine pods or runtimes this cache backend applies to.
+	// EngineSelector selects which engine pods this CacheBackend claims, using
+	// standard Kubernetes label-selector semantics over the pod's labels.
+	// Pods that match get LMCache wiring (env vars, CLI args, and the
+	// kvevent-subscriber observation sidecar) injected by the mutating Pod
+	// admission webhook at pod CREATE time.
+	//
+	// The match is evaluated once at pod CREATE — pods whose labels change
+	// after creation are not re-evaluated; the wiring is sticky to the
+	// life of the pod. To opt a specific pod out of injection regardless
+	// of label match, set the annotation
+	// `inferencecache.io/skip-inject: "true"` on the pod template.
+	//
+	// See docs/concepts/cachebackend-engine-binding.md for the full
+	// lifecycle, an annotated example, and common failure modes.
 	// +optional
 	EngineSelector *CacheBackendEngineSelector `json:"engineSelector,omitempty"`
 
@@ -288,6 +301,24 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
+	// MatchedEnginePods is the number of pods in this CacheBackend's namespace
+	// whose labels match spec.engineSelector at the last reconcile. The field
+	// is a pointer so nil ("not yet computed") is distinguishable from 0
+	// ("computed and zero pods matched"). 0 is the operator-actionable
+	// signal that the selector and the engine Deployment's pod labels
+	// have drifted apart — the C6 mutating webhook then silently no-ops
+	// and the engine runs uncached.
+	//
+	// This is a snapshot at reconcile time, not a real-time counter: it
+	// is not updated on every pod birth/death. For per-pod real-time
+	// visibility, watch the K8s Events the mutating Pod webhook emits on
+	// the engine pods (Reason=InjectedByCacheBackend on the success path,
+	// Reason=NoMatchingCacheBackend when no CacheBackend in the namespace
+	// claims the pod).
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MatchedEnginePods *int32 `json:"matchedEnginePods,omitempty"`
+
 	// FailOpen mirrors the effective spec.integration.failOpen value the
 	// controller most recently observed. Surfaced so operators can confirm
 	// whether the cache is currently a soft optimization (true) or a
@@ -312,6 +343,7 @@ type CacheBackendStatus struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=cb
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
+// +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedEnginePods`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
