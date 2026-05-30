@@ -49,7 +49,8 @@
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
 #           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR, SAMPLE_NS,
-#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE.
+#           SAMPLE_ENDPOINT_TIMEOUT, SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
+#           SAMPLE_ENGINE_IMAGE.
 
 set -euo pipefail
 
@@ -64,7 +65,16 @@ LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 
 # Sample-smoke tunables — apply config/samples/cachebackend-with-engine.yaml,
 # assert the operator-facing signals, exercise the RequeueAfter drift case.
-SAMPLE_NS="${SAMPLE_NS:-default}"
+#
+# Default namespace is dedicated to this smoke so re-runs against an existing
+# cluster (KEEP_CLUSTER=1) don't mutate or delete a developer's own resources
+# in `default`. The script creates the namespace on entry and deletes it on
+# the way out.
+SAMPLE_NS="${SAMPLE_NS:-cb-engine-smoke}"
+# CacheBackend reconciler publishes status.endpoint once the managed
+# lmcache-server Service is created — typically within ~5s. 60s absorbs
+# cold-start jitter.
+SAMPLE_ENDPOINT_TIMEOUT="${SAMPLE_ENDPOINT_TIMEOUT:-60}"
 # Reconciler runs initial CacheBackend reconcile + first Matched refresh
 # within a few seconds of CB Create. 60s absorbs cold-start jitter.
 SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
@@ -309,17 +319,61 @@ fi
 # without paying a multi-GB vLLM pull. The webhook injects on pod CREATE;
 # the signals here all materialize from object state, not from the engine
 # actually running.
-log "applying paired sample"
+#
+# Two-step apply (CB first, wait for status.endpoint, then engine
+# Deployment) avoids a race the webhook would otherwise fail-open
+# through: if the engine pod's admission lands before the reconciler has
+# published the CacheBackend's status.endpoint, the webhook admits the
+# pod unmodified (no annotation, no Event) — the rest of the smoke
+# would then assert against a pod that's missing the signals through no
+# product fault. Pre-publishing the endpoint closes the race.
+log "creating sample namespace $SAMPLE_NS"
+kubectl create namespace "$SAMPLE_NS" --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
+
+log "splitting paired sample into CacheBackend doc and engine Deployment doc"
 sample_file="config/samples/cachebackend-with-engine.yaml"
-sample_tmp="$(mktemp)"
+sample_tmp_cb="$(mktemp)"
+sample_tmp_engine="$(mktemp)"
+# The paired sample is a two-doc YAML stream (CacheBackend, ---,
+# Deployment) — guaranteed ordering, so awk on the `---` separator is
+# enough. yq would be cleaner but isn't a guaranteed dependency on the
+# CI image.
+awk -v cb="$sample_tmp_cb" -v engine="$sample_tmp_engine" '
+  /^---$/ { sep=1; next }
+  !sep    { print > cb }
+  sep     { print > engine }
+' "$sample_file"
+
 # Patch the engine container's image to the lightweight stand-in. The
 # Deployment's metadata stays untouched (still qwen-engine, still
 # labeled app=qwen-demo), so the binding label flow is exercised exactly
 # as a real operator would experience it.
-sed "s|vllm/vllm-openai-cpu:latest-x86_64|$SAMPLE_ENGINE_IMAGE|g" \
-  "$sample_file" > "$sample_tmp"
-kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp" >/dev/null
-rm -f "$sample_tmp"
+sed -i.bak "s|vllm/vllm-openai-cpu:latest-x86_64|$SAMPLE_ENGINE_IMAGE|g" \
+  "$sample_tmp_engine"
+rm -f "${sample_tmp_engine}.bak"
+
+log "applying CacheBackend"
+kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_cb" >/dev/null
+
+log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for status.endpoint"
+deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
+endpoint=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  endpoint=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)
+  if [ -n "$endpoint" ]; then break; fi
+  sleep 2
+done
+if [ -z "$endpoint" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "CacheBackend.status.endpoint not populated after ${SAMPLE_ENDPOINT_TIMEOUT}s"
+fi
+log "status.endpoint=$endpoint"
+
+log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
+kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
+rm -f "$sample_tmp_cb" "$sample_tmp_engine"
 
 log "waiting up to ${SAMPLE_MATCH_TIMEOUT}s for status.matchedEnginePods=1"
 deadline=$(($(date +%s) + SAMPLE_MATCH_TIMEOUT))
@@ -406,7 +460,11 @@ if [ "$drifted" != "0" ]; then
 fi
 log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter cadence"
 
-# Sample cleanup (best-effort; failure here doesn't fail the smoke).
-kubectl -n "$SAMPLE_NS" delete -f "$sample_file" --ignore-not-found=true >/dev/null 2>&1 || true
+# Sample cleanup: tear down the whole dedicated namespace in one shot
+# (best-effort; failure here doesn't fail the smoke). The script created
+# the namespace at the start of this phase, so this leaves the cluster
+# in the state the rest of the smoke produced.
+kubectl delete namespace "$SAMPLE_NS" \
+  --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
 log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges"
