@@ -696,6 +696,40 @@ func TestValidator_EngineOverrides_RejectsValueAndValueFrom(t *testing.T) {
 		"value OR valueFrom, not both")
 }
 
+func TestValidator_EngineOverrides_RejectsEmptyValueFrom(t *testing.T) {
+	// valueFrom with zero sources fails K8s Pod validation; admission
+	// must catch it before it reaches engine pods.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name:      "BAD",
+			ValueFrom: &corev1.EnvVarSource{},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].valueFrom",
+		"exactly one source")
+}
+
+func TestValidator_EngineOverrides_RejectsMultipleValueFromSources(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name: "BAD",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+					Key:                  "k",
+				},
+			},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].valueFrom",
+		"multiple set")
+}
+
 func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
 	// Positive case: a ValueFrom-only entry (no Value) is a valid K8s env
 	// shape and must pass.

@@ -357,8 +357,10 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 // the upstream validation rules in k8s.io/kubernetes core validation:
 //
 //   - Name must be set and conform to [validation.IsEnvVarName].
-//   - Value and ValueFrom are mutually exclusive: setting both is invalid
-//     at the K8s API level.
+//   - Value and ValueFrom are mutually exclusive at the K8s API level.
+//   - When ValueFrom is set, it must select EXACTLY ONE source (FieldRef,
+//     ResourceFieldRef, ConfigMapKeyRef, or SecretKeyRef). Zero sources or
+//     multiple sources both fail K8s Pod validation.
 //
 // Without these checks an operator could admit a CacheBackend that then
 // makes every selected engine pod fail K8s pod validation after the
@@ -382,8 +384,41 @@ func checkEngineOverrideEnvShape(env []corev1.EnvVar, basePath *field.Path) fiel
 			errs = append(errs, field.Invalid(entryPath, entry.Name,
 				"env entry may set value OR valueFrom, not both — engine pods carrying this entry would fail Kubernetes Pod validation"))
 		}
+		if entry.ValueFrom != nil {
+			errs = append(errs, checkEnvVarSource(entry.ValueFrom, entryPath.Child("valueFrom"))...)
+		}
 	}
 	return errs
+}
+
+// checkEnvVarSource enforces the K8s one-of constraint on EnvVarSource:
+// exactly one of FieldRef / ResourceFieldRef / ConfigMapKeyRef /
+// SecretKeyRef must be set. Both an empty valueFrom and a valueFrom with
+// multiple selectors fail K8s Pod validation; admitting either would
+// cascade a cache misconfiguration into an engine-pod admission failure.
+func checkEnvVarSource(src *corev1.EnvVarSource, path *field.Path) field.ErrorList {
+	n := 0
+	if src.FieldRef != nil {
+		n++
+	}
+	if src.ResourceFieldRef != nil {
+		n++
+	}
+	if src.ConfigMapKeyRef != nil {
+		n++
+	}
+	if src.SecretKeyRef != nil {
+		n++
+	}
+	switch {
+	case n == 0:
+		return field.ErrorList{field.Required(path,
+			"valueFrom must select exactly one source (fieldRef, resourceFieldRef, configMapKeyRef, or secretKeyRef)")}
+	case n > 1:
+		return field.ErrorList{field.Invalid(path, n,
+			"valueFrom must select exactly one source — multiple set")}
+	}
+	return nil
 }
 
 // reservedArgMessage formats the rejection a user sees when their
