@@ -257,8 +257,11 @@ fi
 # scrape /snapshot with its SA token (the bearer path). The complementary
 # half — that an UNAUTHENTICATED caller is rejected — is what this section
 # checks, since it's the failure mode the new auth middleware is meant to
-# prevent. A short-lived busybox pod outside the controller's identity tries
-# to GET /snapshot; the server must respond 401.
+# prevent. A short-lived curl pod outside the controller's identity tries to
+# GET /snapshot; the server must respond 401, OR the NetworkPolicy must drop
+# the connection at L3/L4 (curl exits non-zero on timeout). Either outcome
+# proves the gate works; under kind's default kindnet CNI, NetworkPolicy is
+# not enforced so the 401 path is the one actually exercised.
 log "asserting unauthenticated /snapshot scrape from a side pod is rejected"
 SIDE_POD="ic-snapshot-probe"
 kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --restart=Never \

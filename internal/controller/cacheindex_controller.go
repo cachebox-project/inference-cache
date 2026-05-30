@@ -50,9 +50,13 @@ type CacheIndexPoller struct {
 	HTTPClient  *http.Client  // optional; injected in tests
 	Name        string        // singleton CR name; "" → DefaultCacheIndexName
 	// BearerTokenPath is the file the projected ServiceAccount token is
-	// mounted at. "" → DefaultBearerTokenPath. A path that does not exist
-	// fails the scrape soft (logged, skipped) so local development without
-	// a token still works.
+	// mounted at. "" → DefaultBearerTokenPath. A path that does not exist is
+	// treated as "no token configured" — the scrape goes out unauthenticated
+	// and the server's 401 surfaces as a normal fail-soft skipped tick.
+	// Local development without a token mounted still works this way. A
+	// present-but-unreadable token (permissions / IO error) is surfaced as
+	// an error in the controller's log so the operator sees the real cause
+	// instead of misattributing the 401 to a server-side identity mismatch.
 	BearerTokenPath string
 }
 
