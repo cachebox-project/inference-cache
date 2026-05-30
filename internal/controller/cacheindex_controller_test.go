@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
@@ -233,6 +234,17 @@ func enginePod(name, ns string, labels map[string]string) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "vllm", Image: "vllm/vllm-openai:latest"}}},
 	}
+}
+
+// enginePodInjectedBy builds an engine Pod with the webhook's "injected-by"
+// annotation stamped to <ns>/<backendName>. The poller treats this as the
+// authoritative attribution signal, ignoring the EngineSelector fallback.
+func enginePodInjectedBy(name, ns, backendNS, backendName string, labels map[string]string) *corev1.Pod {
+	p := enginePod(name, ns, labels)
+	p.Annotations = map[string]string{
+		podwebhook.AnnotationInjectedBy: backendNS + "/" + backendName,
+	}
+	return p
 }
 
 func getBackendDirect(t *testing.T, cl client.Client, name, ns string) *cachev1alpha1.CacheBackend {
@@ -590,13 +602,15 @@ func TestRefreshScrapeFailureDoesNotClearParticipation(t *testing.T) {
 	}
 }
 
-// TestRefreshOverlappingSelectorsAttributeToBoth: two CacheBackends with
-// overlapping EngineSelector that both match the same engine pod each get
-// the replica's contribution — the operator can intentionally overlap
-// selectors and each backend's status reflects what it sees.
-func TestRefreshOverlappingSelectorsAttributeToBoth(t *testing.T) {
-	cbStrict := cbFixture("strict", "default", map[string]string{"app": "vllm", "model": "llama"})
-	cbLoose := cbFixture("loose", "default", map[string]string{"app": "vllm"})
+// TestRefreshOverlappingSelectorsFirstNameWins: two CacheBackends with
+// overlapping EngineSelector that both match the same engine pod — the
+// poller must attribute only to the deterministic "first by name" backend,
+// mirroring the webhook's one-pod-one-backend wiring rule. Attributing to
+// both would tell operators a backend is contributing when its engine was
+// actually wired to the other backend's endpoint.
+func TestRefreshOverlappingSelectorsFirstNameWins(t *testing.T) {
+	cbAlpha := cbFixture("alpha", "default", map[string]string{"app": "vllm"})
+	cbBeta := cbFixture("beta", "default", map[string]string{"app": "vllm", "model": "llama"})
 	podMatch := enginePod("vllm-0", "default", map[string]string{"app": "vllm", "model": "llama"})
 	var mu sync.Mutex
 	served := index.Snapshot{
@@ -605,7 +619,7 @@ func TestRefreshOverlappingSelectorsAttributeToBoth(t *testing.T) {
 		},
 	}
 	p, cl, srv := buildPollerWithFixtures(t,
-		[]*cachev1alpha1.CacheBackend{cbStrict, cbLoose},
+		[]*cachev1alpha1.CacheBackend{cbAlpha, cbBeta},
 		[]*corev1.Pod{podMatch},
 		&served, &mu)
 	defer srv.Close()
@@ -613,11 +627,47 @@ func TestRefreshOverlappingSelectorsAttributeToBoth(t *testing.T) {
 	if err := p.refresh(context.Background()); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	for _, name := range []string{"strict", "loose"} {
-		got := getBackendDirect(t, cl, name, "default")
-		if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 4 {
-			t.Fatalf("%s participation = %+v, want prefixCount 4", name, got.Status.IndexParticipation)
-		}
+	alpha := getBackendDirect(t, cl, "alpha", "default")
+	if alpha.Status.IndexParticipation == nil || alpha.Status.IndexParticipation.PrefixCount != 4 {
+		t.Fatalf("alpha (first by name) should win, got %+v", alpha.Status.IndexParticipation)
+	}
+	beta := getBackendDirect(t, cl, "beta", "default")
+	if beta.Status.IndexParticipation == nil || beta.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("beta should get zero-state, got %+v", beta.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshAnnotationOverridesSelectorMatch: when the engine pod carries
+// the webhook's `inferencecache.io/injected-by` annotation, that signal
+// wins over the EngineSelector fallback. The labels in this test would
+// have selected backend "alpha" (sorted first), but the annotation points
+// at "beta" — beta MUST get the attribution, alpha MUST stay at zero.
+func TestRefreshAnnotationOverridesSelectorMatch(t *testing.T) {
+	cbAlpha := cbFixture("alpha", "default", map[string]string{"app": "vllm"})
+	cbBeta := cbFixture("beta", "default", map[string]string{"app": "vllm"})
+	podMatch := enginePodInjectedBy("vllm-0", "default", "default", "beta", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 6, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbAlpha, cbBeta},
+		[]*corev1.Pod{podMatch},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	alpha := getBackendDirect(t, cl, "alpha", "default")
+	if alpha.Status.IndexParticipation == nil || alpha.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("alpha should NOT get attribution (annotation points at beta), got %+v", alpha.Status.IndexParticipation)
+	}
+	beta := getBackendDirect(t, cl, "beta", "default")
+	if beta.Status.IndexParticipation == nil || beta.Status.IndexParticipation.PrefixCount != 6 {
+		t.Fatalf("beta should get attribution per annotation, got %+v", beta.Status.IndexParticipation)
 	}
 }
 

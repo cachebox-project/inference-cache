@@ -316,9 +316,14 @@ type CacheBackendStatus struct {
 }
 
 // CacheBackendIndexParticipation is the per-backend slice of the cluster-wide
-// CacheIndex, projected from the server's /snapshot replicas[] by matching
-// `replica_id` against `metadata.name + "-"`. The poller writes it write-only-
-// on-change and never clears it on a single failed scrape (soft state).
+// CacheIndex, projected from the server's /snapshot replicas[]. The poller
+// resolves each replica to its engine pod by (tenant, replica_id) and then
+// attributes it to the owning CacheBackend — either via the engine pod's
+// `inferencecache.io/injected-by` annotation (the authoritative wiring
+// signal stamped by the pod webhook) or, for pods that bypassed the
+// webhook, via a deterministic first-match on `spec.engineSelector.
+// matchLabels`. The poller writes write-only-on-change and never clears
+// it on a single failed scrape (soft state).
 type CacheBackendIndexParticipation struct {
 	// PrefixCount is the sum of distinct prefix entries currently attributed
 	// to this backend's replicas. Zero is a valid observed value — it means

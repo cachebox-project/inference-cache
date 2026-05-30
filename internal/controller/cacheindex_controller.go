@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
@@ -140,18 +143,19 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 //     replica_id=<pod-name>, tenant_id=<pod-namespace>. The CacheBackend
 //     points at the same engine pod via spec.engineSelector.matchLabels.
 //     So: look up the engine pod by (replica.Tenant, replica.ReplicaID),
-//     then attribute to every CacheBackend in that namespace whose
-//     EngineSelector matches the pod's labels.
+//     then attribute to the FIRST in-namespace CacheBackend whose
+//     EngineSelector matches the pod's labels — mirroring the pod
+//     webhook's "first-match wins" engine-wiring rule (see
+//     internal/webhook/pod/podinjector.go's selectCacheBackend). Two
+//     backends with overlapping selectors must agree on which one owns
+//     the pod, or status will disagree with what the engine was actually
+//     wired to.
 //   - A replica with no engine pod found (pod was deleted between events
 //     and now) is dropped — its contributions only show up in the
 //     cluster-wide CacheIndex.
 //   - A CacheBackend with no EngineSelector (or empty MatchLabels) cannot
 //     claim any replica and is skipped; otherwise EngineSelector would
 //     match every pod by vacuous truth and steal everyone else's stats.
-//   - If two CacheBackends in the same namespace both select the same
-//     engine pod, the replica is attributed to BOTH — the operator is
-//     free to overlap selectors and each backend's status reflects what
-//     it sees.
 //
 // Per-replica HitRate stays nil until the snapshot carries an explicit
 // presence bit for it (planned with the stats-reporter follow-up).
@@ -165,86 +169,99 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		return nil
 	}
 
-	// Group CacheBackends by namespace for fast scoped iteration. A backend
-	// with no EngineSelector or empty MatchLabels is skipped entirely (so an
-	// operator who hasn't selected anything doesn't accidentally claim all
-	// replicas in their namespace).
+	// Group CacheBackends by namespace for fast scoped iteration, and by
+	// (namespace, name) for O(1) annotation-based lookup. A backend with no
+	// EngineSelector or empty MatchLabels is excluded from the selector-
+	// matching fallback (otherwise an unset selector would silently claim
+	// every pod) but is still discoverable by annotation: if a webhook ever
+	// chose it (perhaps when its selector was non-empty in the past) the
+	// annotation is still authoritative.
 	backendsByNS := make(map[string][]int)
+	backendsByNSName := make(map[types.NamespacedName]int)
 	for i := range backends.Items {
 		cb := &backends.Items[i]
+		backendsByNSName[types.NamespacedName{Namespace: cb.Namespace, Name: cb.Name}] = i
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
 			continue
 		}
 		backendsByNS[cb.Namespace] = append(backendsByNS[cb.Namespace], i)
+	}
+	// Sort the per-namespace backend lists by metadata.name. This gives
+	// "first match" a deterministic meaning across poller restarts and
+	// makes the selector-fallback result independent of apiserver List
+	// ordering — operators who rely on the fallback can predict the winner.
+	for ns := range backendsByNS {
+		idxs := backendsByNS[ns]
+		sort.Slice(idxs, func(a, b int) bool {
+			return backends.Items[idxs[a]].Name < backends.Items[idxs[b]].Name
+		})
 	}
 
 	type agg struct {
 		prefixCount int64
 		lastEventAt time.Time
 	}
-	// Seed perBackend with every selectable CacheBackend (including ones
-	// with no matching replicas this tick) so a successful snapshot that
-	// drains a backend's replicas publishes prefixCount=0 instead of
-	// leaving stale positive state behind.
+	// Seed perBackend with every CacheBackend that EITHER has a non-empty
+	// EngineSelector (so a tick with no matching replicas resets it to
+	// zero) OR already published a non-nil indexParticipation (so a status
+	// previously written under an old selector still gets cleared when the
+	// selector is removed). Backends that are unselected AND never had
+	// participation published stay nil — the field is genuinely "not
+	// observed yet" for them, and writing a noise zero would invite
+	// operators to read meaning into it.
 	perBackend := make(map[int]*agg, len(backends.Items))
-	for _, idxs := range backendsByNS {
-		for _, i := range idxs {
+	for i := range backends.Items {
+		cb := &backends.Items[i]
+		hasSelector := cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
+		if hasSelector || cb.Status.IndexParticipation != nil {
 			perBackend[i] = &agg{}
 		}
 	}
 
-	// Pod-label lookup cache for the duration of this tick: a single engine
+	// Pod-attribution cache for the duration of this tick: a single engine
 	// pod can host many replicas/prefixes across (model, hash_scheme) and
-	// always presents the same labels, so we never need more than one Get
-	// per (namespace, pod-name) per tick.
+	// always presents the same labels + annotations, so we never need more
+	// than one Get per (namespace, pod-name) per tick. ownerIdx == -1 means
+	// "no owning backend found"; the entry still caches the negative result.
 	type podKey struct{ ns, name string }
-	podLabels := make(map[podKey]map[string]string)
-	missingPods := make(map[podKey]struct{})
+	type podAttr struct {
+		ownerIdx int
+		valid    bool
+	}
+	podAttrs := make(map[podKey]podAttr)
 
 	for _, r := range snap.Replicas {
 		if r.Tenant == "" || r.ReplicaID == "" {
 			continue
 		}
-		nsBackends := backendsByNS[r.Tenant]
-		if len(nsBackends) == 0 {
-			continue
-		}
 		key := podKey{r.Tenant, r.ReplicaID}
-		if _, gone := missingPods[key]; gone {
-			continue
-		}
-		labels, ok := podLabels[key]
-		if !ok {
+		attr, cached := podAttrs[key]
+		if !cached {
 			var pod corev1.Pod
 			err := p.Client.Get(ctx, types.NamespacedName{Namespace: r.Tenant, Name: r.ReplicaID}, &pod)
 			switch {
 			case apierrors.IsNotFound(err):
-				// Replica's engine pod is gone — common after a scale-down.
-				// Skip attribution (the cluster-wide CacheIndex still
-				// reflects the data until TTL eviction).
-				missingPods[key] = struct{}{}
+				// Engine pod is gone — common after a scale-down. The
+				// cluster-wide CacheIndex still reflects the data until TTL.
+				podAttrs[key] = podAttr{ownerIdx: -1, valid: true}
 				continue
 			case err != nil:
-				// Transient API error: log + skip this replica only; don't
-				// poison the rest of the tick.
+				// Transient API error: log + skip this replica only.
 				p.logger(ctx).V(1).Info("lookup engine pod for replica attribution failed; skipping",
 					"namespace", r.Tenant, "name", r.ReplicaID, "err", err.Error())
-				missingPods[key] = struct{}{}
+				podAttrs[key] = podAttr{ownerIdx: -1, valid: true}
 				continue
 			}
-			labels = pod.Labels
-			podLabels[key] = labels
+			attr = podAttr{ownerIdx: p.attributePod(&pod, backendsByNS[r.Tenant], backendsByNSName, backends.Items), valid: true}
+			podAttrs[key] = attr
 		}
-		for _, i := range nsBackends {
-			cb := &backends.Items[i]
-			if !matchLabelsSelects(cb.Spec.EngineSelector.MatchLabels, labels) {
-				continue
-			}
-			a := perBackend[i]
-			a.prefixCount += int64(r.PrefixCount)
-			if r.LastEventAt.After(a.lastEventAt) {
-				a.lastEventAt = r.LastEventAt
-			}
+		if attr.ownerIdx < 0 {
+			continue
+		}
+		a := perBackend[attr.ownerIdx]
+		a.prefixCount += int64(r.PrefixCount)
+		if r.LastEventAt.After(a.lastEventAt) {
+			a.lastEventAt = r.LastEventAt
 		}
 	}
 
@@ -285,6 +302,40 @@ func matchLabelsSelects(want, have map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// attributePod returns the index into backends of the CacheBackend that owns
+// the given engine pod, or -1 if none can be determined. Two-step resolution:
+//
+//  1. If the pod carries the webhook's `inferencecache.io/injected-by`
+//     annotation, parse it as namespace/name and resolve directly. This is
+//     the authoritative signal: it records the CacheBackend the webhook
+//     actually wired the engine to. Annotation in another namespace is
+//     ignored (cross-namespace attribution would be misleading).
+//  2. Fallback for pods that bypassed the webhook (manual sidecar, opt-out
+//     annotation): iterate the namespace's CacheBackends sorted by name and
+//     take the first whose EngineSelector matches the pod's labels —
+//     mirroring the webhook's first-match rule but ordered deterministically
+//     by name so the poller is stable across restarts.
+func (p *CacheIndexPoller) attributePod(pod *corev1.Pod, nsBackends []int, byNSName map[types.NamespacedName]int, items []cachev1alpha1.CacheBackend) int {
+	if raw := pod.Annotations[podwebhook.AnnotationInjectedBy]; raw != "" {
+		ns, name, ok := strings.Cut(raw, "/")
+		if ok && ns == pod.Namespace {
+			if idx, found := byNSName[types.NamespacedName{Namespace: ns, Name: name}]; found {
+				return idx
+			}
+			// Annotation references a backend that no longer exists.
+			// Don't fall back — the operator's intent was explicit.
+			return -1
+		}
+	}
+	for _, i := range nsBackends {
+		cb := &items[i]
+		if matchLabelsSelects(cb.Spec.EngineSelector.MatchLabels, pod.Labels) {
+			return i
+		}
+	}
+	return -1
 }
 
 // participationEqual is the no-churn guard: skip the Status().Patch when the

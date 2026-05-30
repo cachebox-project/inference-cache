@@ -962,72 +962,71 @@ func (i *Index) Snapshot() Snapshot {
 	i.mu.RLock()
 
 	type tenantReplica struct{ tenant, replica string }
-	latestByReplica := make(map[string]statEntry)
-	tenantByReplica := make(map[string]string) // replicaID → tenant of most-recent statEntry
+	// Cluster-wide replica snapshots key on (tenant, replicaID): two pods in
+	// different namespaces can legitimately share a metadata.name (e.g.
+	// "vllm-0"), and merging them into one row would mis-attribute prefixes
+	// across tenancy. We then aggregate ONLY across models / hash_schemes
+	// within the same (tenant, replicaID).
+	latestByReplica := make(map[tenantReplica]statEntry)
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
-		if cur, ok := latestByReplica[sk.replicaID]; !ok || s.lastSeen.After(cur.lastSeen) {
-			latestByReplica[sk.replicaID] = s
-			tenantByReplica[sk.replicaID] = sk.tenant
-		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
+		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
+			latestByReplica[tr] = s
+		}
 		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByTenantReplica[tr] = s
 		}
 	}
 
-	// Per-replica prefix counts + last KV-event timestamps. Derived from the
-	// prefix map (not the stats map) so the projection reflects what the
-	// replica actually holds, not just whether its stats are alive. A replica
-	// that only ever reported stats but no prefixes will show PrefixCount=0
-	// and LastEventAt=zero. Also captures tenant (from the prefixKey) as a
-	// fallback for the per-replica Tenant field — a replica with no stats
-	// entry still has its tenant identifiable via the prefix it holds.
+	// Per-replica prefix counts + last KV-event timestamps. Keyed on
+	// (tenant, replicaID) for the same reason as latestByReplica — so two
+	// pods in different namespaces with the same name do not merge into a
+	// single row. Derived from the prefix map (not the stats map) so the
+	// projection reflects what the replica actually holds, not just whether
+	// its stats are alive.
 	type replicaPrefixAgg struct {
 		count       int
 		lastEventAt time.Time
 	}
-	prefixByReplica := make(map[string]*replicaPrefixAgg)
+	prefixByReplica := make(map[tenantReplica]*replicaPrefixAgg)
 	for key, replicas := range i.prefixes {
 		for id, e := range replicas {
-			a := prefixByReplica[id]
+			tr := tenantReplica{key.tenant, id}
+			a := prefixByReplica[tr]
 			if a == nil {
 				a = &replicaPrefixAgg{}
-				prefixByReplica[id] = a
+				prefixByReplica[tr] = a
 			}
 			a.count++
 			if e.lastSeen.After(a.lastEventAt) {
 				a.lastEventAt = e.lastSeen
-			}
-			if _, hasStats := tenantByReplica[id]; !hasStats {
-				tenantByReplica[id] = key.tenant
 			}
 		}
 	}
 
 	snap := Snapshot{TotalPrefixes: len(i.prefixes)}
 
-	// Union of replicas seen in stats AND in prefixes — a replica may have
-	// reported prefixes via Ingest but had its stats entry evicted, or vice
-	// versa; the snapshot surfaces both so per-backend projection is robust.
-	seen := make(map[string]struct{}, len(latestByReplica)+len(prefixByReplica))
-	for id := range latestByReplica {
-		seen[id] = struct{}{}
+	// Union of (tenant, replicaID) seen in stats AND in prefixes — a replica
+	// may have reported prefixes via Ingest but had its stats entry evicted,
+	// or vice versa; the snapshot surfaces both so per-backend projection is
+	// robust. Each row is a unique (tenant, replicaID).
+	seen := make(map[tenantReplica]struct{}, len(latestByReplica)+len(prefixByReplica))
+	for tr := range latestByReplica {
+		seen[tr] = struct{}{}
 	}
-	for id := range prefixByReplica {
-		seen[id] = struct{}{}
+	for tr := range prefixByReplica {
+		seen[tr] = struct{}{}
 	}
-	for id := range seen {
-		var r ReplicaSnapshot
-		r.ReplicaID = id
-		r.Tenant = tenantByReplica[id]
-		if s, ok := latestByReplica[id]; ok {
+	for tr := range seen {
+		r := ReplicaSnapshot{ReplicaID: tr.replica, Tenant: tr.tenant}
+		if s, ok := latestByReplica[tr]; ok {
 			r.CacheMemoryBytes = s.stats.CacheMemoryBytes
 			r.HitRate = s.stats.HitRate
 			r.Pressure = s.stats.Pressure
 			r.LastUpdate = s.lastSeen
 		}
-		if a, ok := prefixByReplica[id]; ok {
+		if a, ok := prefixByReplica[tr]; ok {
 			r.PrefixCount = a.count
 			r.LastEventAt = a.lastEventAt
 		}
@@ -1059,7 +1058,12 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	i.mu.RUnlock()
 
-	sort.Slice(snap.Replicas, func(a, b int) bool { return snap.Replicas[a].ReplicaID < snap.Replicas[b].ReplicaID })
+	sort.Slice(snap.Replicas, func(a, b int) bool {
+		if snap.Replicas[a].Tenant != snap.Replicas[b].Tenant {
+			return snap.Replicas[a].Tenant < snap.Replicas[b].Tenant
+		}
+		return snap.Replicas[a].ReplicaID < snap.Replicas[b].ReplicaID
+	})
 	sort.Slice(snap.Tenants, func(a, b int) bool { return snap.Tenants[a].TenantID < snap.Tenants[b].TenantID })
 	return snap
 }
