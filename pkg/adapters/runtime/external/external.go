@@ -69,10 +69,13 @@ func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.Po
 // InjectEngineConfig wires the engine pod to the operator-supplied
 // spec.endpoint via the same LMCache engine wire format the managed
 // adapter uses (see enginewire.InjectVLLMLMCache). The pod-mutating
-// webhook hands us endpoint = cache.Status.Endpoint, which for External
-// backends the reconciler mirrors from cache.Spec.Endpoint — so the engine
-// container's LMCACHE_REMOTE_URL ends up pointing at the address the
-// operator put in the CR.
+// webhook resolves the endpoint type-scoped: for External CRs it
+// passes the trimmed cache.Spec.Endpoint (operator-authoritative;
+// preferred over status.endpoint so a pod admitting between a
+// spec.endpoint update and the reconciler's mirror is wired to the
+// fresh address, not the stale one). The adapter itself doesn't
+// know which field the caller pulled from — both paths land at the
+// same wire — so this method just delegates to the shared helper.
 func (adapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
 }
