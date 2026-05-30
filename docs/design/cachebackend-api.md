@@ -159,7 +159,9 @@ The structural rules are an ordered, pluggable list (`CacheBackendValidator.Rule
 The validating rules tighten what `v1alpha1` accepts, so they ship together with the admission webhook itself (a previously-uninstalled webhook). Tightening applies at write time only:
 
 - Existing stored CacheBackends that were applied before the webhook is installed remain in etcd and are unaffected until they are next created or mutated.
-- An operator with a now-invalid CR can read it (`kubectl get`), but a write (create or update) fails until the spec satisfies the new rules.
+- **Create** still applies the full rule set: a previously-stored-but-now-invalid CR cannot be re-created.
+- **Update** only rejects violations the new object *introduces* (the diff-only rule above): an unrelated edit (`kubectl annotate`, a label tweak, an unrelated spec field) on a now-invalid CR is allowed through, so operators aren't locked out of their existing objects. An edit that flips a previously-valid field into an invalid one — or that changes one bad value on a still-invalid field into a different bad value — is still rejected, because the violation is then new to the diff.
+- An operator who wants to bring a stored CR into compliance with the new rules can do so incrementally (clear the offending field, switch type, etc.); the diff-only semantics mean the bring-into-compliance edit doesn't have to atomically fix every existing violation.
 - The cluster-wide rollout knob is the webhook's `failurePolicy`; future tightenings that need a softer rollout can switch to `Ignore` for one release before flipping to `Fail`.
 
 ### Mutating Pod webhook (engine wiring)

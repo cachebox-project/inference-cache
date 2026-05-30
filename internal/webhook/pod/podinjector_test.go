@@ -323,6 +323,96 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_ExternalBackend_StatusEmpty_FallsBackToSpec(t *testing.T) {
+	// Pod admission is CREATE-only — if an engine pod admits before the
+	// controller has mirrored spec.endpoint into status.endpoint, the
+	// webhook would fail-open and leave the pod unwired *forever* (no
+	// re-admission on subsequent status updates). For External CRs the
+	// authoritative source is spec.endpoint, so the webhook falls back
+	// to it. Without this fallback, applying the External CacheBackend
+	// and the engine Deployment in the same kubectl apply silently
+	// produces unwired engine pods.
+	const (
+		ns       = "engines"
+		endpoint = "external-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: endpoint,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		// Deliberately no Status: simulates the race where pod admission
+		// fires before reconcileExternal has patched status.endpoint.
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-race", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
+}
+
+func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
+	// Counterpart to the External fallback: managed backends MUST wait
+	// for status.endpoint (the reconciler builds it from the rendered
+	// Service). spec.endpoint is admission-rejected on managed types,
+	// so there's nothing else to fall back on — the webhook must
+	// fail-open without injecting until status catches up.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		// No Status.Endpoint published yet.
+	}
+
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-managed", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	// The pod must NOT have LMCACHE_REMOTE_URL because there's no
+	// endpoint to wire it to — the fallback is External-only.
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if len(mutated.Spec.Containers) == 0 {
+		t.Fatalf("pod has no containers after admission")
+	}
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+			t.Fatalf("managed CR with no status.endpoint must NOT trigger injection; got %s=%q", e.Name, e.Value)
+		}
+	}
+}
+
 // containsArgPairLocal mirrors the helper in envtest_integration_test.go;
 // the two test files don't share state (envtest skips without
 // KUBEBUILDER_ASSETS) so each file has its own copy.

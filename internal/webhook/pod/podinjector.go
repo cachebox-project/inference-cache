@@ -120,7 +120,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
 
-	endpoint := cache.Status.Endpoint
+	endpoint := effectiveEndpoint(cache)
 	if endpoint == "" {
 		// The reconciler hasn't published the cache-server's endpoint
 		// yet. Without it the adapter would write LMCACHE_REMOTE_URL=lm://
@@ -257,6 +257,34 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 		return h.Log
 	}
 	return logf.FromContext(ctx)
+}
+
+// effectiveEndpoint returns the address the engine pod should be wired to
+// for the given CacheBackend. status.endpoint is the canonical signal —
+// the reconciler builds it from the live Service for managed backends, so
+// the webhook waits for the reconciler before injecting against a
+// half-rendered workload. For External backends the source of truth is
+// spec.endpoint (admission validates it; the reconciler just mirrors it
+// verbatim); falling back to a trimmed spec.endpoint avoids a CREATE-only
+// race where an engine pod admitted before the controller patches status
+// would otherwise boot un-wired forever (pod admission re-runs on
+// re-create only, not on subsequent status updates).
+//
+// The fallback is type-scoped to External by design: managed backends
+// MUST wait for status.endpoint because spec doesn't carry an authoritative
+// host:port until the Service materialises (`spec.endpoint` is admission-
+// rejected on managed types — see rejectEndpointOnNonExternal).
+func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
+	if cache == nil {
+		return ""
+	}
+	if cache.Status.Endpoint != "" {
+		return cache.Status.Endpoint
+	}
+	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		return strings.TrimSpace(cache.Spec.Endpoint)
+	}
+	return ""
 }
 
 // hasContainer reports whether containers already includes one named name.
