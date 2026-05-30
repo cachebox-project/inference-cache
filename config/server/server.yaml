@@ -10,21 +10,35 @@ metadata:
 # controller's /snapshot scrapes, so it needs a projected SA token.
 automountServiceAccountToken: true
 ---
-# system:auth-delegator grants permission to create TokenReview and
-# SubjectAccessReview objects. It's the canonical role API server extensions
-# (kube-aggregator) use and is exactly the slice of authentication.k8s.io
-# the server needs to validate bearer tokens on /snapshot.
+# Narrow ClusterRole + binding granting ONLY the permission the server
+# actually exercises: creating TokenReview objects to validate /snapshot
+# bearer tokens. The canonical alternative, system:auth-delegator, also
+# grants SubjectAccessReview (for authz delegation), which the server
+# does not call — least-privilege beats convenience here, especially for
+# a security-hardening change.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: inference-cache-server-tokenreview
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+rules:
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: inference-cache-server-auth-delegator
+  name: inference-cache-server-tokenreview
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: server
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: system:auth-delegator
+  name: inference-cache-server-tokenreview
 subjects:
 - kind: ServiceAccount
   name: inference-cache-server

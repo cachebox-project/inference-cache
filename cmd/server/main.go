@@ -24,7 +24,8 @@ func main() {
 	flag.StringVar(&cfg.GRPCAddr, "grpc-bind-address", cfg.GRPCAddr, "The address the gRPC server binds to.")
 	flag.StringVar(&cfg.HTTPAddr, "http-bind-address", cfg.HTTPAddr, "The address the public HTTP server binds to (serves /healthz, /readyz, /metrics, /policy).")
 	flag.StringVar(&cfg.SnapshotAddr, "snapshot-bind-address", cfg.SnapshotAddr, "The address the internal snapshot HTTP server binds to (serves /snapshot, gated by ServiceAccount bearer auth).")
-	expectedSA := flag.String("snapshot-allowed-sa", "", "Fully-qualified ServiceAccount username allowed to scrape /snapshot, e.g. system:serviceaccount:inference-cache-system:inference-cache-controller-manager. When empty, /snapshot is served without authentication (local development only).")
+	expectedSA := flag.String("snapshot-allowed-sa", "", "Fully-qualified ServiceAccount username allowed to scrape /snapshot, e.g. system:serviceaccount:inference-cache-system:inference-cache-controller-manager. REQUIRED in production. Without it the server refuses to start; passing --insecure-disable-snapshot-auth is the explicit, named escape hatch for local development.")
+	insecureNoAuth := flag.Bool("insecure-disable-snapshot-auth", false, "Local-development only: serve /snapshot without authentication. The flag is named to make any operator who runs it on a real cluster notice. Mutually exclusive with --snapshot-allowed-sa.")
 	flag.Parse()
 
 	format, err := server.ParseLogFormat(*logFormat)
@@ -47,6 +48,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Fail closed by default: refuse to start unless either a real allowed SA
+	// is configured or the operator explicitly opted into the unauthenticated
+	// local-dev path. The previous shape (empty flag → silent unauth) made it
+	// trivial for a real cluster deployment to accidentally ship a wide-open
+	// /snapshot endpoint, which defeats the point of the hardening.
+	switch {
+	case *expectedSA != "" && *insecureNoAuth:
+		fmt.Fprintln(os.Stderr, "--snapshot-allowed-sa and --insecure-disable-snapshot-auth are mutually exclusive")
+		os.Exit(2)
+	case *expectedSA == "" && !*insecureNoAuth:
+		fmt.Fprintln(os.Stderr, "missing --snapshot-allowed-sa; pass --insecure-disable-snapshot-auth to run /snapshot without authentication (local development only)")
+		os.Exit(2)
+	}
+
 	var opts []server.Option
 	if *expectedSA != "" {
 		restCfg, err := rest.InClusterConfig()
@@ -62,7 +77,9 @@ func main() {
 		opts = append(opts, server.WithSnapshotAuth(auth.FromClientset(clientset), *expectedSA))
 		slog.InfoContext(ctx, "snapshot_auth_enabled", "expected_sa", *expectedSA)
 	} else {
-		slog.WarnContext(ctx, "snapshot_auth_disabled", "reason", "no --snapshot-allowed-sa flag")
+		// *insecureNoAuth == true, verified above.
+		slog.WarnContext(ctx, "snapshot_auth_disabled",
+			"reason", "--insecure-disable-snapshot-auth was set; /snapshot is unauthenticated. This must NEVER be used in production.")
 	}
 
 	slog.InfoContext(ctx, "startup",
