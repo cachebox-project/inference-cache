@@ -235,7 +235,7 @@ func TestMiddleware_CachesValidatedTokens(t *testing.T) {
 	}
 }
 
-// TestMiddleware_CacheEvictsWhenOverCap exercises the LRU eviction path so
+// TestMiddleware_CacheEvictsWhenOverCap exercises the bounded-TTL eviction so
 // pathological token churn cannot grow the cache unboundedly.
 func TestMiddleware_CacheEvictsWhenOverCap(t *testing.T) {
 	reviewer := &fakeReviewer{respond: func(string) (*authnv1.TokenReview, error) {

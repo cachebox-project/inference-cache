@@ -48,7 +48,7 @@ func (f ResultRecorderFunc) RecordAuthResult(r Result) { f(r) }
 // the next scrape rather than persisting stale auth state.
 const DefaultCacheTTL = 30 * time.Second
 
-// DefaultCacheMaxEntries bounds the LRU. The expected steady-state population
+// DefaultCacheMaxEntries bounds the cache. The expected steady-state population
 // is one (the controller's projected token), so the cap exists only to absorb
 // transient rotation churn.
 const DefaultCacheMaxEntries = 32
@@ -102,7 +102,7 @@ type Options struct {
 	Recorder ResultRecorder
 	// CacheTTL controls how long a successful TokenReview is reused. <=0 → DefaultCacheTTL.
 	CacheTTL time.Duration
-	// CacheMaxEntries bounds the in-process LRU. <=0 → DefaultCacheMaxEntries.
+	// CacheMaxEntries bounds the in-process cache. <=0 → DefaultCacheMaxEntries.
 	CacheMaxEntries int
 	// Now is the clock; nil → time.Now. Exposed for tests.
 	Now func() time.Time
@@ -255,9 +255,13 @@ func (a *Authenticator) cacheHit(hash string) bool {
 }
 
 // cachePut stores hash with the configured TTL. If the cache is at capacity,
-// expired entries are pruned first; if still full, the entry expiring soonest
-// is evicted (approximate LRU — sufficient for a cache that holds 1-2 entries
-// in practice).
+// expired entries are pruned first; if still full, the entry expiring SOONEST
+// is evicted. This is bounded TTL eviction, not LRU — there is no recency
+// tracking on cacheHit, only an expiry check. The poller is the only
+// authorized caller and rotates through 1-2 distinct tokens at most under
+// kubelet's projected-token rotation, so the cache size effectively never
+// matters in practice; the bound exists to prevent unbounded growth from a
+// pathological reuse pattern or a misconfigured caller.
 func (a *Authenticator) cachePut(hash string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
