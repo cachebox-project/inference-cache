@@ -182,6 +182,7 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 		errs = append(errs, rule(cb)...)
 	}
 	errs = append(errs, v.checkRuntimeAdapter(cb)...)
+	errs = append(errs, v.checkEngineOverrides(cb)...)
 	if len(errs) == 0 {
 		return nil
 	}
@@ -249,6 +250,145 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 		}
 	}
 	return nil
+}
+
+// checkEngineOverrides rejects spec.integration.engineOverrides entries
+// that would touch the adapter's reserved args/env — the args/env strictly
+// required for the integration to function. Catching the overlap here
+// gives the operator a field-scoped error naming the offending flag/env
+// and the adapter, instead of a crashed engine later.
+//
+// The adapter is resolved through the same registry the reconciler and
+// pod webhook consult; an empty spec.type or a missing adapter is left
+// alone (the structural rules above already cover those). The validator
+// strips the value half of two-arg args from the operator's input so a
+// CR carrying `args: ["--kv-transfer-config", "{json}"]` rejects against
+// the reserved leading-flag token rather than treating the JSON value as
+// an unrelated entry.
+func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Integration == nil || cb.Spec.Integration.EngineOverrides == nil {
+		return nil
+	}
+	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		return nil
+	}
+	registry := v.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := adapterruntime.ResolveRuntimeID(cb)
+	adapter, err := registry.Select(runtimeID, cb)
+	if err != nil {
+		// checkRuntimeAdapter already reports the unsupported pair; piling
+		// a derived "engineOverrides vs (unknown adapter)" complaint on
+		// top would not help the user.
+		return nil
+	}
+
+	overrides := cb.Spec.Integration.EngineOverrides
+	reservedArgs := stringSet(adapter.ReservedArgs())
+	reservedEnv := stringSet(adapter.ReservedEnv())
+	basePath := field.NewPath("spec", "integration", "engineOverrides")
+	var errs field.ErrorList
+
+	if len(reservedArgs) > 0 {
+		argsPath := basePath.Child("args")
+		for i, entry := range overrides.Args {
+			token := overrideArgFlagToken(entry)
+			if token == "" {
+				continue
+			}
+			if reservedArgs[token] {
+				errs = append(errs, field.Forbidden(
+					argsPath.Index(i),
+					reservedArgMessage(token, runtimeID),
+				))
+			}
+		}
+		suppressPath := basePath.Child("suppressArgs")
+		for i, entry := range overrides.SuppressArgs {
+			if reservedArgs[entry] {
+				errs = append(errs, field.Forbidden(
+					suppressPath.Index(i),
+					reservedArgMessage(entry, runtimeID),
+				))
+			}
+		}
+	}
+
+	if len(reservedEnv) > 0 {
+		envPath := basePath.Child("env")
+		for i, entry := range overrides.Env {
+			if reservedEnv[entry.Name] {
+				errs = append(errs, field.Forbidden(
+					envPath.Index(i).Child("name"),
+					reservedEnvMessage(entry.Name, runtimeID),
+				))
+			}
+		}
+		suppressPath := basePath.Child("suppressEnv")
+		for i, entry := range overrides.SuppressEnv {
+			if reservedEnv[entry] {
+				errs = append(errs, field.Forbidden(
+					suppressPath.Index(i),
+					reservedEnvMessage(entry, runtimeID),
+				))
+			}
+		}
+	}
+	return errs
+}
+
+// reservedArgMessage formats the rejection a user sees when their
+// engineOverrides try to override or suppress an arg the adapter declares
+// as reserved. Naming both the flag and the adapter lets the operator
+// trace the contract back to its source without digging into adapter code.
+func reservedArgMessage(flag string, runtimeID adapterruntime.RuntimeID) string {
+	return fmt.Sprintf(
+		"arg %q is reserved by the %q runtime adapter and cannot be overridden or suppressed via spec.integration.engineOverrides; "+
+			"the adapter strictly requires this flag for the integration to function",
+		flag, runtimeID,
+	)
+}
+
+// reservedEnvMessage formats the rejection a user sees when their
+// engineOverrides try to override or suppress an env var the adapter
+// declares as reserved.
+func reservedEnvMessage(name string, runtimeID adapterruntime.RuntimeID) string {
+	return fmt.Sprintf(
+		"env %q is reserved by the %q runtime adapter and cannot be overridden or suppressed via spec.integration.engineOverrides; "+
+			"the adapter strictly requires this env for the integration to function",
+		name, runtimeID,
+	)
+}
+
+// overrideArgFlagToken returns the leading flag token of an arg entry,
+// matching the parser the pod-webhook merge uses so admission rejects
+// what the merge would otherwise treat as a flag. "--flag=value" returns
+// "--flag"; "--flag" returns "--flag"; a positional (no leading "-")
+// returns "" so admission ignores it (positionals never overlap a
+// reserved flag name).
+func overrideArgFlagToken(arg string) string {
+	if !strings.HasPrefix(arg, "-") {
+		return ""
+	}
+	if i := strings.IndexByte(arg, '='); i >= 0 {
+		return arg[:i]
+	}
+	return arg
+}
+
+// stringSet returns a set keyed by xs. nil/empty input returns nil so
+// callers can use len()/lookup-from-nil semantics without branching.
+func stringSet(xs []string) map[string]bool {
+	if len(xs) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(xs))
+	for _, s := range xs {
+		out[s] = true
+	}
+	return out
 }
 
 // unsupportedPairMessage formats the admission rejection a user sees when

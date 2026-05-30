@@ -194,6 +194,62 @@ type CacheBackendIntegrationSpec struct {
 	// +optional
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`
+
+	// EngineOverrides lets the operator override the args / env the
+	// pod-mutating webhook injects into the engine container, on top of
+	// what the runtime adapter would otherwise inject. Useful for CPU
+	// vLLM, plain vLLM without LMCache, and future engines that need to
+	// tune a flag/env the canonical injection hard-codes.
+	//
+	// Admission rejects overrides that overlap the adapter's reserved
+	// args/env (the ones strictly required for the integration to
+	// function); the operator gets a field-scoped error naming the
+	// offending flag/env and the adapter rather than discovering it via a
+	// crashed engine. See the package doc for the rationale.
+	// +optional
+	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
+}
+
+// EngineInjectionOverrides describes how the operator wants to amend the
+// args / env the pod-mutating webhook injects into the engine container.
+//
+// Known-fragile: nothing here is type-checked against the engine binary, so a
+// non-reserved value can still break the engine in subtle ways the validator
+// can't catch (e.g. an aggressive `--max-model-len` OOMing the engine).
+// Admission only blocks overrides that overlap the adapter's reserved set —
+// the args/env strictly required for the integration itself to function. The
+// operator owns the rest.
+type EngineInjectionOverrides struct {
+	// Args injected into the engine container, in addition to what the
+	// adapter would inject. Merged by leading flag token (e.g.
+	// "--max-model-len"): an override entry whose leading token matches a
+	// canonical entry replaces it; otherwise the entry is appended. Order
+	// is preserved.
+	//
+	// Admission rejects entries whose leading flag token overlaps
+	// the adapter's ReservedArgs().
+	// +optional
+	Args []string `json:"args,omitempty"`
+
+	// SuppressArgs lists leading flag names (e.g. "--some-tunable-flag")
+	// the adapter MUST NOT inject. Admission rejects entries that overlap
+	// the adapter's ReservedArgs(). A suppressed flag is removed from the
+	// canonical args before Args merges in, so suppress-then-re-add is a
+	// supported pattern for overriding a non-reserved flag's value.
+	// +optional
+	SuppressArgs []string `json:"suppressArgs,omitempty"`
+
+	// Env upserted into the engine container by Name. Override wins for
+	// duplicates with a canonical name; canonical entries for names not
+	// listed here are preserved. Admission rejects entries whose Name
+	// overlaps the adapter's ReservedEnv().
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// SuppressEnv lists env var Names the adapter MUST NOT inject.
+	// Admission rejects entries that overlap the adapter's ReservedEnv().
+	// +optional
+	SuppressEnv []string `json:"suppressEnv,omitempty"`
 }
 
 // IntegrationFailOpen returns the effective fail-open behavior for a

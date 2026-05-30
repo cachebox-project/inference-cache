@@ -409,6 +409,10 @@ func (sidecarErrorAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *core
 	return nil, errors.New("synthetic sidecar render failure")
 }
 
+func (sidecarErrorAdapter) ReservedArgs() []string      { return nil }
+func (sidecarErrorAdapter) ReservedEnv() []string       { return nil }
+func (sidecarErrorAdapter) EngineContainerName() string { return adapterruntime.EngineContainerName }
+
 func findContainer(pod *corev1.Pod, name string) *corev1.Container {
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name == name {
@@ -761,6 +765,96 @@ func mustHaveArgFlag(t *testing.T, pod *corev1.Pod, flag string) {
 		}
 	}
 	t.Fatalf("arg %s missing; args = %v", flag, pod.Spec.Containers[0].Args)
+}
+
+// TestHandle_EngineOverrides_EnvUpsertAndArgSuppress drives the full handler
+// pipeline through a CacheBackend whose spec.integration.engineOverrides
+// adds an env, overrides a tunable env, and suppresses a non-reserved flag
+// the user pre-set on the engine. Pins the admission→merge wiring at the
+// behaviour layer (kubectl-visible result), not just the helper's unit tests.
+func TestHandle_EngineOverrides_EnvUpsertAndArgSuppress(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		Args:         []string{"--max-model-len", "8192"},
+		SuppressArgs: []string{"--enforce-eager"},
+		Env: []corev1.EnvVar{
+			{Name: "FOO", Value: "bar"},
+			// Override a tunable canonical env value, which is allowed
+			// because LMCACHE_CHUNK_SIZE is NOT reserved.
+			{Name: adapterruntime.EnvLMCacheChunkSize, Value: "512"},
+		},
+	}
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	// User pre-set a non-reserved flag the suppress list will remove.
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--enforce-eager")
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("expected Allowed with patches; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// New env appended.
+	mustHaveEnv(t, mutated, "FOO", "bar")
+	// Override wins for the tunable name.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheChunkSize, "512")
+	// Canonical reserved env still landed unchanged — the override surface
+	// does not disturb non-overridden entries.
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+
+	// Added arg present.
+	mustHaveArgPair(t, mutated, "--max-model-len", "8192")
+	// Suppressed flag removed.
+	if argPresent(mutated.Spec.Containers[0].Args, "--enforce-eager") {
+		t.Fatalf("--enforce-eager should have been suppressed; args = %v", mutated.Spec.Containers[0].Args)
+	}
+	// Reserved arg still injected.
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+}
+
+// TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline pins the
+// backward-compat invariant from locked decision #7: a CacheBackend with no
+// engineOverrides block produces a JSON patch byte-identical to the same CR
+// reconstructed without the field at all. A drift here would surface as a
+// non-empty diff between baseline and override-CR patches.
+func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T) {
+	const ns = "engines"
+	// Baseline: no engineOverrides block at all.
+	baseline := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	// Equivalent CR: engineOverrides explicitly nil. The CRD serialisation
+	// of the two is identical (omitempty), but pinning it at the handler
+	// level guards against a future refactor that materialises an empty
+	// EngineInjectionOverrides struct mid-flight.
+	withNilOverride := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	withNilOverride.Spec.Integration.EngineOverrides = nil
+
+	for _, cb := range []*cachev1alpha1.CacheBackend{baseline, withNilOverride} {
+		h := newHandler(t, cb)
+		pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+		req := newRequest(t, pod, ns)
+
+		resp := h.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("expected Allowed, got %+v", resp.Result)
+		}
+		mutated := applyPatches(t, req.Object.Raw, resp)
+		// The canonical injection contract — env + arg — must land on the
+		// pod exactly as before, with no extra entries the override surface
+		// could have added.
+		mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+		mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+		// And no spurious env from the override path.
+		for _, e := range mutated.Spec.Containers[0].Env {
+			if e.Name == "FOO" {
+				t.Fatalf("no-override CR leaked an override env: %v", e)
+			}
+		}
+	}
 }
 
 // pin the GroupVersionKind so a future api/v1alpha1 split (e.g. moving

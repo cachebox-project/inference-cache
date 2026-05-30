@@ -159,6 +159,24 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed(fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
 
+	// Apply spec.integration.engineOverrides on top of canonical injection.
+	// Admission has already hard-rejected overrides that overlap the
+	// adapter's reserved args/env, so the entries surviving to this point
+	// are safe to merge. The override-target container is resolved via the
+	// adapter's [adapterruntime.KVCacheRuntimeAdapter.EngineContainerName];
+	// adapters with no canonical engine container (the reference adapter)
+	// return "" and the merge is skipped — the override surface is for
+	// production adapters that target a specific engine container.
+	if overrides := engineOverridesFor(cache); overrides != nil {
+		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
+			mutated.Spec.Containers[idx].Args, mutated.Spec.Containers[idx].Env = applyEngineInjectionOverrides(
+				mutated.Spec.Containers[idx].Args,
+				mutated.Spec.Containers[idx].Env,
+				overrides,
+			)
+		}
+	}
+
 	// Auto-attach the observation sidecar. The adapter owns the
 	// shape decision: vLLM/LMCache returns a kvevent-subscriber container,
 	// the reference adapter (and any future External-type adapter) returns

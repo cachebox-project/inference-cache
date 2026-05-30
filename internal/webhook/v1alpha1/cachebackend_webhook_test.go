@@ -320,6 +320,13 @@ func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 		Backend: cachev1alpha1.CacheBackendTypeLMCache,
 	}}
 }
+func (stubVLLMLMCacheAdapter) ReservedArgs() []string {
+	return []string{"--kv-transfer-config"}
+}
+func (stubVLLMLMCacheAdapter) ReservedEnv() []string {
+	return []string{"VLLM_USE_V1", "LMCACHE_REMOTE_URL", "INFERENCECACHE_FAIL_OPEN"}
+}
+func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 
 // stubRegistry returns a Registry with only the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
@@ -542,6 +549,129 @@ func TestServiceDNSNamespace(t *testing.T) {
 				t.Fatalf("ns = %q, want %q", ns, tc.wantNS)
 			}
 		})
+	}
+}
+
+// withVLLMOverrides returns a fresh stub-LMCache backend whose integration
+// declares vLLM and carries the supplied EngineInjectionOverrides — the
+// admission-test backing for the engine-overrides rule.
+func withVLLMOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine:          "vllm",
+		EngineOverrides: &o,
+	}
+	return cb
+}
+
+func TestValidator_EngineOverrides_NoOverrideAdmitted(t *testing.T) {
+	// Sanity baseline: a CacheBackend whose integration is set but carries
+	// no engineOverrides block must admit unchanged. Locked decision #7
+	// (byte-identical default) hinges on this.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("no-override CR rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_SuppressReservedArgRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	requireInvalidWithCause(t, v,
+		cb,
+		"spec.integration.engineOverrides.suppressArgs[0]",
+		"--kv-transfer-config")
+	// And the rejection MUST name the offending adapter so the operator
+	// can trace the contract back.
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressArgs[0]", "\"vllm\"")
+}
+
+func TestValidator_EngineOverrides_OverrideReservedArgRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	// Two forms: bare flag and equals form. Both must trip the rule, since
+	// both express the same leading flag token.
+	for _, form := range []string{"--kv-transfer-config", "--kv-transfer-config=alt"} {
+		cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+			Args: []string{form},
+		})
+		requireInvalidWithCause(t, v, cb,
+			"spec.integration.engineOverrides.args[0]",
+			"--kv-transfer-config")
+	}
+}
+
+func TestValidator_EngineOverrides_SuppressReservedEnvRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressEnv: []string{"VLLM_USE_V1"},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressEnv[0]",
+		"VLLM_USE_V1")
+}
+
+func TestValidator_EngineOverrides_OverrideReservedEnvRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"INFERENCECACHE_FAIL_OPEN")
+}
+
+func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {
+	// Positive case: a non-reserved arg + env + suppression combination
+	// must pass admission. This is the CPU-vLLM use case — the operator
+	// suppresses a flag the adapter wouldn't inject anyway (no-op) and
+	// adds a perf knob. We pin the happy path here so a future tightening
+	// of the rule doesn't accidentally reject legitimate overrides.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Args:         []string{"--max-model-len", "8192"},
+		SuppressArgs: []string{"--enforce-eager"},
+		Env: []corev1.EnvVar{
+			{Name: "LMCACHE_CHUNK_SIZE", Value: "512"},
+		},
+		SuppressEnv: []string{"VLLM_LOG_LEVEL"},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("non-reserved overrides rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_PositionalArgIgnored(t *testing.T) {
+	// Positionals (no leading "-") cannot overlap a reserved flag name
+	// because the merge classifies them differently. Admission must treat
+	// them the same way and not surface a spurious rejection — the engine
+	// would happily accept the positional, so admission must too.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Args: []string{"some-positional"},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("positional arg rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_ExternalBackendSkipsCheck(t *testing.T) {
+	// External backends never reach an adapter — the reconciler routes
+	// them through reconcileExternal — so engineOverrides on an External
+	// CR is structurally meaningless. The check is bypassed; the
+	// structural rules (endpoint required) still fire.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "shared.team-a.svc.cluster.local:9000"
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("External CR with engineOverrides rejected: %v", err)
 	}
 }
 
