@@ -38,7 +38,7 @@ const (
 )
 
 // EnginePodEventsReconciler watches engine pods that the mutating Pod
-// webhook stamped with [podwebhook.podwebhook.AnnotationInjectedBy] and emits a Normal
+// webhook stamped with [podwebhook.AnnotationInjectedBy] and emits a Normal
 // `InjectedByCacheBackend` Kubernetes Event on each pod, referencing the
 // matched CacheBackend. The controller is intentionally narrow — its only
 // job is to convert the webhook's injection annotation into a
@@ -103,8 +103,16 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Try to load the named CacheBackend so the event carries it as the
 	// Related object. Failure is non-fatal: emit the event anyway with
 	// related=nil. The annotation value alone carries the binding
-	// identity in the human-readable message.
-	cb, _ := r.lookupCacheBackend(ctx, cbRef)
+	// identity in the human-readable message. The lookup error is logged
+	// so RBAC failures, malformed refs, or transient API hiccups are not
+	// silently swallowed — the event still fires, but an operator
+	// inspecting controller logs sees why the Related reference is
+	// missing.
+	cb, lookupErr := r.lookupCacheBackend(ctx, cbRef)
+	if lookupErr != nil {
+		logger.V(1).Info("CacheBackend related-ref lookup failed; emitting event without Related",
+			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef, "error", lookupErr.Error())
+	}
 	r.Recorder.Eventf(&pod, cb, corev1.EventTypeNormal,
 		eventReasonEngineInjected, eventReasonEngineInjected,
 		"Injected engine config from CacheBackend %q", cbRef)

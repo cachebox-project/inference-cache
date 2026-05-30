@@ -904,9 +904,9 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 // client.List with the engineSelector — there is no Pod watch, and pod
 // births/deaths between reconciles are not reflected until the next pass.
 // The real-time per-pod signal lives on the engine pods themselves (the
-// mutating Pod webhook's InjectedByCacheBackend / NoMatchingCacheBackend
-// Events); this status field answers the cluster-wide "is anyone connected
-// at all?" question.
+// `InjectedByCacheBackend` Event the engine-pod-events controller emits
+// on every annotated pod); this status field answers the cluster-wide
+// "is anyone connected at all?" question.
 //
 // Selector resolution mirrors the mutating webhook's policy: a nil or
 // empty MatchLabels matches nothing (a broad selector at admission time
