@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 // vllm+LMCache canonical defaults. These template a standalone LMCache server
@@ -36,26 +37,6 @@ const (
 	// the system can address by name without hard-coding the integer.
 	defaultLMCacheServerPortName = "lmcache"
 
-	// vLLM engine-side defaults — what an engine pod must carry to use a
-	// remote LMCache server. The CPU-safe LMCACHE_REMOTE_SERDE is "naive";
-	// "cachegen" is faster but pulls in CUDA-only codepaths, so it is left
-	// for the user to opt into via BackendConfig once running on GPU.
-	defaultEngineLMCacheChunkSize    = "256"
-	defaultEngineLMCacheRemoteSerde  = "naive"
-	defaultEngineLMCacheLocalCPU     = "False"
-	defaultEngineLMCacheMaxLocalCPU  = "20"
-	defaultEngineKVTransferConfigArg = "--kv-transfer-config"
-	defaultEngineVLLMUseV1           = "1"
-
-	// kvRole values map the CacheBackend integration role onto LMCache's
-	// kv_role semantics carried in the --kv-transfer-config JSON: kv_consumer
-	// reads from the cache only, kv_producer writes only, kv_both reads and
-	// writes. The default (when integration is unset) is kv_both, matching
-	// the ReadWrite role's behaviour.
-	kvRoleConsumer = "kv_consumer"
-	kvRoleProducer = "kv_producer"
-	kvRoleBoth     = "kv_both"
-
 	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
 	// since they round-trip through CacheBackend.Spec.BackendConfig (a
 	// map[string]string).
@@ -68,35 +49,27 @@ const (
 	// ignored and the lmcache-server falls back to its default image.
 	cfgKeyServerImage   = "serverImage"
 	cfgKeyServerCommand = "serverCommand"
-	cfgKeyChunkSize     = "chunkSize"
-	cfgKeyRemoteSerde   = "remoteSerde"
-	cfgKeyLocalCPU      = "localCPU"
-	cfgKeyMaxLocalCPU   = "maxLocalCPU"
 )
 
-// Engine env var names. Exported so a future mutating webhook and tests in
-// other packages can assert on them without re-stringifying the contract.
+// Engine env var names. Re-exported from the internal enginewire package so
+// downstream callers (admission validators, integration tests, future
+// adapter authors) can assert on the wire contract without importing an
+// internal/ path. The constants live in enginewire so adapters that speak
+// the same wire (vLLM+LMCache and the External passthrough today) share a
+// single source of truth.
 const (
-	EnvLMCacheRemoteURL   = "LMCACHE_REMOTE_URL"
-	EnvLMCacheRemoteSerde = "LMCACHE_REMOTE_SERDE"
-	// EnvInferenceCacheFailOpen mirrors spec.integration.failOpen onto the
-	// engine pod so a future engine-side hook can decide whether to fall
-	// back to local prefill on cache unreachability (true) or treat the
-	// cache as a hard serving dependency (false). The LMCache connector
-	// today is fail-open by default at runtime regardless of this value;
-	// surfacing the bit lets the engine layer enforce fail-closed
-	// semantics when that work lands, and matches the API/design contract
-	// that this flag is plumbed by the engine adapter.
-	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
-	EnvLMCacheChunkSize       = "LMCACHE_CHUNK_SIZE"
-	EnvLMCacheLocalCPU        = "LMCACHE_LOCAL_CPU"
-	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
-	EnvVLLMUseV1              = "VLLM_USE_V1"
+	EnvLMCacheRemoteURL       = enginewire.EnvLMCacheRemoteURL
+	EnvLMCacheRemoteSerde     = enginewire.EnvLMCacheRemoteSerde
+	EnvLMCacheChunkSize       = enginewire.EnvLMCacheChunkSize
+	EnvLMCacheLocalCPU        = enginewire.EnvLMCacheLocalCPU
+	EnvLMCacheMaxLocalCPU     = enginewire.EnvLMCacheMaxLocalCPU
+	EnvVLLMUseV1              = enginewire.EnvVLLMUseV1
+	EnvInferenceCacheFailOpen = enginewire.EnvInferenceCacheFailOpen
 	// EngineContainerName is the conventional name for the vLLM container in
 	// an engine pod the adapter mutates. When no container with this name is
-	// present, the adapter injects into every container — the same defensive
-	// merge other adapters use.
-	EngineContainerName = "vllm"
+	// present, a single-container pod is treated as the engine; a multi-
+	// container pod is rejected.
+	EngineContainerName = enginewire.EngineContainerName
 	// SubscriberContainerName is the well-known name for the kvevent-
 	// subscriber sidecar the adapter renders. Webhook callers use it to
 	// short-circuit re-admission (skip the append if a container by this
@@ -220,7 +193,7 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
 	cfg := cache.Spec.BackendConfig
-	image := configOr(cfg, cfgKeyServerImage, defaultLMCacheServerImage)
+	image := enginewire.ConfigOr(cfg, cfgKeyServerImage, defaultLMCacheServerImage)
 
 	command, args := serverCommand(cfg)
 	container := corev1.Container{
@@ -293,41 +266,16 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
-// vLLM container in pod. It merges: existing args/env on the vLLM container
-// are preserved, repeat injections are idempotent, sidecars are left alone.
-// The engine container is identified by the canonical name
-// [EngineContainerName]; a single-container pod is also accepted (the lone
-// container is treated as the engine). A multi-container pod whose
-// containers are not named `vllm` is rejected — silently mutating every
-// container would inject vLLM-only flags onto sidecars and crash them.
+// vLLM container in pod, delegating to the shared engine-wire helper. The
+// External backend adapter calls the same helper with an operator-supplied
+// endpoint, keeping the rendered engine wiring byte-identical regardless of
+// who owns the cache lifecycle.
+//
+// spec.integration.role maps onto LMCache's kv_role in the connector
+// config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
+// (and unset / unknown) → kv_both.
 func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	if err := validateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
-		return err
-	}
-	cfg := cache.Spec.BackendConfig
-	env := []corev1.EnvVar{
-		{Name: EnvLMCacheRemoteURL, Value: lmcacheRemoteURL(endpoint)},
-		{Name: EnvLMCacheRemoteSerde, Value: configOr(cfg, cfgKeyRemoteSerde, defaultEngineLMCacheRemoteSerde)},
-		{Name: EnvLMCacheChunkSize, Value: configOr(cfg, cfgKeyChunkSize, defaultEngineLMCacheChunkSize)},
-		{Name: EnvLMCacheLocalCPU, Value: configOr(cfg, cfgKeyLocalCPU, defaultEngineLMCacheLocalCPU)},
-		{Name: EnvLMCacheMaxLocalCPU, Value: configOr(cfg, cfgKeyMaxLocalCPU, defaultEngineLMCacheMaxLocalCPU)},
-		{Name: EnvVLLMUseV1, Value: defaultEngineVLLMUseV1},
-		{Name: EnvInferenceCacheFailOpen, Value: failOpenString(cache)},
-	}
-	// spec.integration.role maps onto LMCache's kv_role in the connector
-	// config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
-	// (and unset / unknown) → kv_both.
-	args := []string{defaultEngineKVTransferConfigArg, kvTransferConfig(integrationRole(cache))}
-
-	i, err := engineContainerIndex(pod)
-	if err != nil {
-		return err
-	}
-	for _, e := range env {
-		pod.Containers[i].Env = upsertEnv(pod.Containers[i].Env, e)
-	}
-	pod.Containers[i].Args = upsertArgPair(pod.Containers[i].Args, args[0], args[1])
-	return nil
+	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
 }
 
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no
@@ -384,7 +332,7 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 	if a.subscriberImage == "" {
 		return nil, nil
 	}
-	modelID := configOr(cache.Spec.BackendConfig, modelBackendConfigKey, "")
+	modelID := enginewire.ConfigOr(cache.Spec.BackendConfig, modelBackendConfigKey, "")
 	if modelID == "" {
 		// No --model-id ⇒ subscriber binary would refuse to start; skip
 		// the append and let the next admission pick it up once the
@@ -449,128 +397,16 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 	}, nil
 }
 
-// engineContainerIndex returns the index of the engine container the adapter
-// should mutate. The engine container is identified by the canonical name
-// [EngineContainerName]; a single-container pod is also accepted (the lone
-// container is assumed to be the engine). Multi-container pods that don't
-// name a container `vllm` are rejected — blindly mutating every container
-// would inject vLLM-only flags (e.g. `--kv-transfer-config`) onto sidecars,
-// which would crash them on startup. The pod-template owner should name the
-// engine container `vllm` so the adapter has a stable target.
-func engineContainerIndex(pod *corev1.PodSpec) (int, error) {
-	for i := range pod.Containers {
-		if pod.Containers[i].Name == EngineContainerName {
-			return i, nil
-		}
-	}
-	if len(pod.Containers) == 1 {
-		return 0, nil
-	}
-	names := make([]string, len(pod.Containers))
-	for i := range pod.Containers {
-		names[i] = pod.Containers[i].Name
-	}
-	return -1, fmt.Errorf("inject engine config: pod has %d containers %v but none is named %q; injecting vLLM flags into unrelated sidecars would crash them — name the engine container %q",
-		len(pod.Containers), names, EngineContainerName, EngineContainerName)
-}
+// Package-local aliases to the engine-wire helpers. Kept so the in-place
+// unit tests in vllm_lmcache_test.go continue to assert on the wire format
+// through the canonical adapter API surface. New tests for the shared wire
+// (LMCache + External) belong in pkg/adapters/runtime/internal/enginewire.
+const defaultEngineKVTransferConfigArg = "--kv-transfer-config"
 
-// upsertArgPair inserts or updates the flag/value pair `flag value` in args,
-// preserving every other arg. Both the two-arg form (`--flag`, `value`) and
-// the equals form (`--flag=value`) are recognised: an existing entry in
-// either form is updated in place (to the two-arg form), no duplicate is
-// appended. A trailing two-arg `--flag` with no value is treated as missing.
-// Normalising on the two-arg form keeps the rendered args stable across
-// repeat injections so an idempotent reconcile doesn't churn.
-func upsertArgPair(args []string, flag, value string) []string {
-	prefix := flag + "="
-	for i, a := range args {
-		switch {
-		case a == flag:
-			if i+1 < len(args) {
-				args[i+1] = value
-				return args
-			}
-			return append(args, value)
-		case strings.HasPrefix(a, prefix):
-			// Replace the single equals-form entry with the two-arg form.
-			// Splice in `flag, value` at position i.
-			args[i] = flag
-			out := make([]string, 0, len(args)+1)
-			out = append(out, args[:i+1]...)
-			out = append(out, value)
-			out = append(out, args[i+1:]...)
-			return out
-		}
-	}
-	return append(args, flag, value)
-}
-
-// validateInjectInputs centralises the bad-input checks Inject*Config shares.
-// The role tag flows into the error message so callers can tell which path
-// rejected the input.
-func validateInjectInputs(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend, role string) error {
-	if pod == nil {
-		return fmt.Errorf("inject %s config: pod is nil", role)
-	}
-	if cache == nil {
-		return fmt.Errorf("inject %s config: cache is nil", role)
-	}
-	if endpoint == "" {
-		return fmt.Errorf("inject %s config: endpoint is empty", role)
-	}
-	if len(pod.Containers) == 0 {
-		return fmt.Errorf("inject %s config: pod has no containers", role)
-	}
-	return nil
-}
-
-// lmcacheRemoteURL prefixes an engine-agnostic host:port endpoint with the
-// LMCache lm:// scheme. An endpoint already carrying lm:// (e.g. when a user
-// pre-wired their status.endpoint) is passed through unchanged.
-func lmcacheRemoteURL(endpoint string) string {
-	if strings.HasPrefix(endpoint, "lm://") {
-		return endpoint
-	}
-	return "lm://" + endpoint
-}
-
-// failOpenString returns the bool form of the effective fail-open mode for
-// the engine env. The CRD defaults to fail-open via the defaulting webhook;
-// the helper handles nil Integration / nil failOpen too — pre-defaulting
-// code paths shouldn't crash. The rendered string is "true" / "false" so the
-// engine-side hook can parse it without LMCache-specific knowledge.
-func failOpenString(cache *cachev1alpha1.CacheBackend) string {
-	if cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration) {
-		return "true"
-	}
-	return "false"
-}
-
-// integrationRole returns the engine's participation role from cache.Spec.
-// Integration, defaulting to ReadWrite (matching the CRD's documented
-// behaviour when integration is unset).
-func integrationRole(cache *cachev1alpha1.CacheBackend) cachev1alpha1.CacheBackendIntegrationRole {
-	if cache.Spec.Integration == nil || cache.Spec.Integration.Role == "" {
-		return cachev1alpha1.CacheBackendIntegrationRoleReadWrite
-	}
-	return cache.Spec.Integration.Role
-}
-
-// kvTransferConfig renders the --kv-transfer-config JSON for the given role.
-// An unrecognised role falls back to kv_both so a future CRD value (added
-// after this adapter ships) is not silently dropped from the kv path.
-func kvTransferConfig(role cachev1alpha1.CacheBackendIntegrationRole) string {
-	kvRole := kvRoleBoth
-	switch role {
-	case cachev1alpha1.CacheBackendIntegrationRoleReadOnly:
-		kvRole = kvRoleConsumer
-	case cachev1alpha1.CacheBackendIntegrationRoleWriteOnly:
-		kvRole = kvRoleProducer
-	case cachev1alpha1.CacheBackendIntegrationRoleReadWrite:
-		kvRole = kvRoleBoth
-	}
-	return fmt.Sprintf(`{"kv_connector":"LMCacheConnectorV1","kv_role":%q}`, kvRole)
-}
+var (
+	kvTransferConfig = enginewire.KVTransferConfig
+	upsertArgPair    = enginewire.UpsertArgPair
+)
 
 // serverCommand returns the LMCache server command + args, with a single
 // BackendConfig override hook (cfgKeyServerCommand) for users who want to
@@ -578,7 +414,7 @@ func kvTransferConfig(role cachev1alpha1.CacheBackendIntegrationRole) string {
 // it stabilises. The default targets the older `lmcache_server <host> <port>
 // <storage>` form because it has a documented port (65432) and arg layout.
 func serverCommand(cfg map[string]string) (command, args []string) {
-	if raw := configOr(cfg, cfgKeyServerCommand, ""); raw != "" {
+	if raw := enginewire.ConfigOr(cfg, cfgKeyServerCommand, ""); raw != "" {
 		fields := strings.Fields(raw)
 		if len(fields) > 0 {
 			return []string{fields[0]}, fields[1:]
@@ -589,14 +425,4 @@ func serverCommand(cfg map[string]string) (command, args []string) {
 		fmt.Sprintf("%d", defaultLMCacheServerPort),
 		defaultLMCacheServerStorage,
 	}
-}
-
-// configOr reads key from cfg or returns fallback when key is absent or empty.
-// Mirrors the helper retired from pkg/adapters/backend so the adapter is
-// self-contained (the legacy package is removed in this change).
-func configOr(cfg map[string]string, key, fallback string) string {
-	if v, ok := cfg[key]; ok && v != "" {
-		return v
-	}
-	return fallback
 }

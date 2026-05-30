@@ -548,6 +548,77 @@ func TestReconcileExternalMirrorsEndpointToStatus(t *testing.T) {
 	}
 }
 
+func TestReconcileExternalSetsReadyTrue(t *testing.T) {
+	// External admission accepts spec.endpoint at write time, so the
+	// readiness signal is "operator says this endpoint exists and we
+	// accepted it" — there's no Service to wait on. Consumers (the
+	// future readiness gate, kubectl get cb, the indexParticipation
+	// poller for External) must see Ready=True.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "default", Generation: 3},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "ext.default.svc:8080",
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext", "default")
+
+	got := getBackend(t, r, "ext", "default")
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want %q", got.Status.Health, cachev1alpha1.CacheBackendHealthReady)
+	}
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatalf("Ready condition missing; conditions = %v", got.Status.Conditions)
+	}
+	if ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready status = %q, want %q", ready.Status, metav1.ConditionTrue)
+	}
+	if ready.Reason != "ExternalEndpointAccepted" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointAccepted", ready.Reason)
+	}
+	if ready.ObservedGeneration != 3 {
+		t.Fatalf("Ready.observedGeneration = %d, want 3", ready.ObservedGeneration)
+	}
+	progressing := findCondition(got.Status.Conditions, "Progressing")
+	if progressing == nil {
+		t.Fatalf("Progressing condition missing; conditions = %v", got.Status.Conditions)
+	}
+	if progressing.Status != metav1.ConditionFalse {
+		t.Fatalf("Progressing status = %q, want %q", progressing.Status, metav1.ConditionFalse)
+	}
+}
+
+func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
+	// Admission rejects this case at the webhook, but a CR already in etcd
+	// from before the webhook was installed must still publish a visible
+	// Ready=False so operators can see why the CR isn't usable instead of
+	// finding the condition simply absent.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-no-ep", Namespace: "default"},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext-no-ep", "default")
+
+	got := getBackend(t, r, "ext-no-ep", "default")
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready condition = %+v, want Status=False", ready)
+	}
+	if ready.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
+	}
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+	}
+}
+
 func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{

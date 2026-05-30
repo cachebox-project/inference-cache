@@ -59,6 +59,25 @@ const (
 	eventReasonFailOpenRestored  = "FailOpenRestored"
 )
 
+// Condition reasons published on a CacheBackend's Ready condition. Stable
+// strings so consumers (the CacheIndex poller, the future readiness gate
+// that watches lastEventAt, operator dashboards) can switch on reason
+// instead of regexing the message.
+const (
+	// conditionReasonExternalEndpointAccepted is set when an External
+	// CacheBackend's spec.endpoint is non-empty: admission accepted the
+	// operator-supplied endpoint and we trust it without probing
+	// reachability. A future enhancement could degrade Ready on a
+	// connection-probe failure, but that's out of scope for the
+	// passthrough adapter today (fail-soft, trust the operator).
+	conditionReasonExternalEndpointAccepted = "ExternalEndpointAccepted"
+	// conditionReasonExternalEndpointMissing is set defensively when an
+	// External CacheBackend has spec.endpoint empty. Admission rejects
+	// this at the validating webhook, so reaching this branch means a CR
+	// already in etcd from before the webhook was installed.
+	conditionReasonExternalEndpointMissing = "ExternalEndpointMissing"
+)
+
 // CacheBackendReconciler reconciles a CacheBackend object.
 type CacheBackendReconciler struct {
 	client.Client
@@ -162,15 +181,52 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	return r.reconcileManaged(ctx, logger, backend, adapter)
 }
 
-// reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
+// reconcileExternal mirrors a pre-existing backend's configured endpoint to
+// status and marks the backend Ready: there is no Service to wait on, so
+// admission acceptance of spec.endpoint is the only readiness signal the
+// controller has. status.health flips to Ready in lock step so the
+// printcolumn surface (kubectl get cb) doesn't show a blank Health column
+// for External CRs that admission has already accepted.
+//
+// When spec.endpoint is empty we publish Ready=False with reason
+// ExternalEndpointMissing rather than dropping the condition — admission
+// rejects this at the webhook, so the False state is reachable only for a
+// CR already in etcd from before the webhook was installed, and a visible
+// False is more useful than an absent condition.
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = backend.Spec.Endpoint
-		backend.Status.Health = ""
+		endpoint := backend.Spec.Endpoint
+		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
+		// Progressing=False: External backends complete admission immediately;
+		// there is no rollout we are still driving toward steady state.
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             conditionReasonExternalEndpointAccepted,
+			Message:            "External backends complete admission immediately",
+			ObservedGeneration: backend.Generation,
+		})
+		if endpoint == "" {
+			backend.Status.Health = cachev1alpha1.CacheBackendHealthPending
+			meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeReady,
+				Status:             metav1.ConditionFalse,
+				Reason:             conditionReasonExternalEndpointMissing,
+				Message:            "spec.endpoint is empty; set it to the address of the pre-existing backend",
+				ObservedGeneration: backend.Generation,
+			})
+			return
+		}
+		backend.Status.Health = cachev1alpha1.CacheBackendHealthReady
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             conditionReasonExternalEndpointAccepted,
+			Message:            "External endpoint accepted; controller does not provision cache pods for External backends",
+			ObservedGeneration: backend.Generation,
+		})
 	})
 }
 

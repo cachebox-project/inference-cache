@@ -23,6 +23,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 // newScheme returns a scheme with corev1 + the CRD types registered so a
@@ -253,6 +254,85 @@ func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 	if len(second.Patches) != 0 {
 		t.Fatalf("re-admission of fully-injected pod must produce no patches, got %d: %+v", len(second.Patches), second.Patches)
 	}
+}
+
+func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
+	// A pod that matches an External CR's engine selector must come out
+	// of admission wired to the operator-supplied endpoint via the
+	// LMCache engine wire format — the controller doesn't render a
+	// Service for the cache, so the only source of truth for the
+	// address is spec.endpoint (mirrored to status.endpoint by
+	// reconcileExternal).
+	const (
+		ns       = "engines"
+		endpoint = "external-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: endpoint,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	// Mirror what cmd/controller wires: DefaultRegistry + the External
+	// adapter registered on top. Without External in the registry the
+	// webhook would fail-open with "no adapter" and leave the engine
+	// unwired — that's the very gap the External adapter closes.
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// LMCACHE_REMOTE_URL must be the operator-supplied endpoint with the
+	// lm:// scheme prepended, identical to what the managed adapter
+	// would write for the same endpoint.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	// User --model arg survives the merge — the adapter only adds; it
+	// never clobbers user-set args.
+	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("user --model arg was lost; args = %v", mutated.Spec.Containers[0].Args)
+	}
+	// External path attaches no observation sidecar — the controller has
+	// no observability seam into an operator-managed cache.
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
+	}
+	if mutated.Annotations[AnnotationInjectedBy] != ns+"/ext" {
+		t.Fatalf("annotation %s = %q, want %q",
+			AnnotationInjectedBy, mutated.Annotations[AnnotationInjectedBy], ns+"/ext")
+	}
+}
+
+// containsArgPairLocal mirrors the helper in envtest_integration_test.go;
+// the two test files don't share state (envtest skips without
+// KUBEBUILDER_ASSETS) so each file has its own copy.
+func containsArgPairLocal(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {

@@ -163,6 +163,32 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 		"spec.type=External requires spec.endpoint")
 }
 
+func TestValidator_EndpointOnManagedTypeRejected(t *testing.T) {
+	// spec.endpoint is the External-passthrough field; setting it on a
+	// managed type silently does nothing today (the reconciler overwrites
+	// status.endpoint from the live Service it provisions), so admission
+	// hard-rejects to make the misconfiguration visible at write time.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	cb.Spec.Endpoint = "user-supplied.example:8080"
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"spec.endpoint is only valid when spec.type=External")
+}
+
+func TestValidator_EndpointOnManagedTypeBlankAdmitted(t *testing.T) {
+	// Whitespace-only spec.endpoint on a managed type passes — same
+	// leniency the External-required rule applies; the field is treated
+	// as empty.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	cb.Spec.Endpoint = "   "
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("LMCache with whitespace endpoint rejected: %v", err)
+	}
+}
+
 func TestValidator_PersistentStorageOnMemoryOnlyBackendRejected(t *testing.T) {
 	v := &CacheBackendValidator{}
 	cb := newBackend()

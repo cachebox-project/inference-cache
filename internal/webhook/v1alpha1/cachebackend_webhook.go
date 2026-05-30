@@ -87,6 +87,7 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // handler changes.
 var DefaultValidationRules = []ValidationRule{
 	requireEndpointForExternal,
+	rejectEndpointOnNonExternal,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 }
@@ -291,6 +292,32 @@ func requireEndpointForExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList 
 		field.Required(
 			field.NewPath("spec", "endpoint"),
 			"CacheBackend with spec.type=External requires spec.endpoint to be set to the address of the pre-existing backend",
+		),
+	}
+}
+
+// rejectEndpointOnNonExternal rejects a non-External backend that carries a
+// non-empty spec.endpoint. The field is meaningful only for the External
+// passthrough adapter — for managed types the controller overwrites
+// status.endpoint from the live Service it provisions, so a user-supplied
+// spec.endpoint would be silently ignored. Hard-rejecting at admission
+// makes the misconfiguration visible at write time instead of leaving the
+// operator wondering why their endpoint never took effect.
+//
+// An empty spec.type is left to the External-required rule and CRD-level
+// validation; piling a "remove spec.endpoint" cause on top of a missing-
+// type rejection would not help the user.
+func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		return nil
+	}
+	if strings.TrimSpace(cb.Spec.Endpoint) == "" {
+		return nil
+	}
+	return field.ErrorList{
+		field.Forbidden(
+			field.NewPath("spec", "endpoint"),
+			fmt.Sprintf("spec.endpoint is only valid when spec.type=External; got spec.type=%q with non-empty spec.endpoint. Managed backends learn their endpoint from the controller-rendered Service.", cb.Spec.Type),
 		),
 	}
 }

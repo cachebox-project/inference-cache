@@ -519,8 +519,65 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		if cb.Status.Endpoint != "external.example.svc:8080" {
 			t.Fatalf("status.endpoint = %q, want mirrored external endpoint", cb.Status.Endpoint)
 		}
-		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond != nil {
-			t.Fatalf("Ready condition = %+v, want removed for external", cond)
+		// After the switch to External the controller publishes
+		// Ready=True with reason ExternalEndpointAccepted — admission
+		// acceptance of spec.endpoint is the only readiness signal we
+		// have without provisioning a Service to probe.
+		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
+		if ready == nil {
+			t.Fatalf("Ready condition missing after switch to External; conditions = %v", cb.Status.Conditions)
+		}
+		if ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
+			t.Fatalf("Ready condition = %+v, want Status=True Reason=ExternalEndpointAccepted", ready)
+		}
+		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+			t.Fatalf("status.health = %q, want Ready", cb.Status.Health)
+		}
+	})
+
+	t.Run("ExternalCreateProducesNoWorkloadAndReady", func(t *testing.T) {
+		// A CacheBackend{type: External} reconciled against a real
+		// apiserver must (a) leave the CR's namespace free of any
+		// controller-rendered Deployment or Service, (b) mirror
+		// spec.endpoint into status.endpoint verbatim, and (c) publish
+		// Ready=True with reason ExternalEndpointAccepted so downstream
+		// consumers (the future readiness gate, the indexParticipation
+		// poller) treat the CR as usable.
+		ns := freshNS(t, k8s)
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-fresh", Namespace: ns},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:     cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint: "lm://my-cache.example:8200",
+			},
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "ext-fresh", ns)
+
+		var deps appsv1.DeploymentList
+		if err := k8s.List(ctx, &deps, client.InNamespace(ns)); err != nil {
+			t.Fatalf("list deployments: %v", err)
+		}
+		if len(deps.Items) != 0 {
+			t.Fatalf("deployments = %d, want 0 for External backend", len(deps.Items))
+		}
+		var svcs corev1.ServiceList
+		if err := k8s.List(ctx, &svcs, client.InNamespace(ns)); err != nil {
+			t.Fatalf("list services: %v", err)
+		}
+		if len(svcs.Items) != 0 {
+			t.Fatalf("services = %d, want 0 for External backend", len(svcs.Items))
+		}
+
+		got := getBackend(t, r, "ext-fresh", ns)
+		if got.Status.Endpoint != "lm://my-cache.example:8200" {
+			t.Fatalf("status.endpoint = %q, want lm://my-cache.example:8200", got.Status.Endpoint)
+		}
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
+			t.Fatalf("Ready condition = %+v, want Status=True Reason=ExternalEndpointAccepted", ready)
 		}
 	})
 
