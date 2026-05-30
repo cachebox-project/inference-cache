@@ -1,9 +1,9 @@
 module github.com/cachebox-project/inference-cache/hack/internal/tools
 
-go 1.23
+go 1.26.3
 
 require (
-	github.com/golangci/golangci-lint v1.64.8
+	github.com/golangci/golangci-lint/v2 v2.12.2
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1
 	google.golang.org/protobuf v1.36.5
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20241105200929-48ec3b71211f
