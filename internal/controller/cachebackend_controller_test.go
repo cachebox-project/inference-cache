@@ -619,6 +619,41 @@ func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	}
 }
 
+func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {
+	// Admission rejects a whitespace-only spec.endpoint, but a CR already
+	// in etcd from before admission was installed can still carry one.
+	// The reconciler must treat it as missing — publishing a raw
+	// "LMCACHE_REMOTE_URL=lm://   " to the engine env is worse than
+	// publishing nothing, and Ready=True on whitespace would mislead
+	// every downstream consumer.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-ws", Namespace: "default"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "   \t  ",
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext-ws", "default")
+
+	got := getBackend(t, r, "ext-ws", "default")
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty (whitespace must be trimmed)", got.Status.Endpoint)
+	}
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready = %+v, want Status=False", ready)
+	}
+	if ready.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
+	}
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+	}
+}
+
 func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{

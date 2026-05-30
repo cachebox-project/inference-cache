@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -195,7 +196,18 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // False is more useful than an absent condition.
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
-		endpoint := backend.Spec.Endpoint
+		// TrimSpace before every decision (Ready vs Pending, the
+		// published status.endpoint, the engine-injection-readiness
+		// check downstream). Admission rejects a whitespace-only
+		// endpoint at write time, but a pre-existing CR in etcd from
+		// before admission was installed can still carry one — and a
+		// raw whitespace `LMCACHE_REMOTE_URL=lm://   ` is worse than a
+		// missing endpoint (the engine connector parses it and fails
+		// at runtime). Publishing the trimmed value here means the
+		// pod webhook's `endpoint == ""` short-circuit naturally
+		// catches whitespace too without a second TrimSpace at the
+		// consumer.
+		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation

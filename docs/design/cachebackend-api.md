@@ -80,7 +80,7 @@ Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod 
 The webhook also injects the flags every vLLM+LMCache engine needs:
 
 - `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"<role>"}'` — `<role>` is derived from `spec.integration.role`: `ReadOnly → kv_consumer`, `WriteOnly → kv_producer`, `ReadWrite → kv_both` (also the default when `integration` is unset).
-- `LMCACHE_REMOTE_URL=lm://<status.endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter (`status.endpoint` itself stays an engine-agnostic `host:port`).
+- `LMCACHE_REMOTE_URL=lm://<status.endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter. `status.endpoint` stays an engine-agnostic `host:port` for managed backends (the controller builds it from the rendered Service) and for the canonical External shape (the operator supplies `host:port` in `spec.endpoint`, the reconciler mirrors it verbatim). The injection helper is lenient: an operator who pre-fixes `spec.endpoint` with `lm://` for an External CR is accommodated — the prefix is preserved rather than doubled — but the bare host:port form is the documented contract.
 - `VLLM_USE_V1=1`.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — mirrors `spec.integration.failOpen` onto the engine pod (defaults to `true` when the field is unset). The LMCache connector is fail-open by default at runtime regardless of this value; surfacing the bit lets the engine layer enforce fail-closed semantics when that work lands, and keeps the adapter aligned with the contract that this flag is plumbed by the engine adapter.
 
