@@ -768,17 +768,16 @@ func mustHaveArgFlag(t *testing.T, pod *corev1.Pod, flag string) {
 	t.Fatalf("arg %s missing; args = %v", flag, pod.Spec.Containers[0].Args)
 }
 
-// TestHandle_EngineOverrides_EnvUpsertAndArgSuppress drives the full handler
+// TestHandle_EngineOverrides_EnvUpsertAndArgAppend drives the full handler
 // pipeline through a CacheBackend whose spec.integration.engineOverrides
-// adds an env, overrides a tunable env, and suppresses a non-reserved flag
-// the user pre-set on the engine. Pins the admission→merge wiring at the
-// behaviour layer (kubectl-visible result), not just the helper's unit tests.
-func TestHandle_EngineOverrides_EnvUpsertAndArgSuppress(t *testing.T) {
+// adds a new arg, adds an env, and overrides an adapter-owned tunable.
+// Pins the admission→merge wiring at the behaviour layer (kubectl-visible
+// result), not just the helper's unit tests.
+func TestHandle_EngineOverrides_EnvUpsertAndArgAppend(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
-		Args:         []string{"--max-model-len", "8192"},
-		SuppressArgs: []string{"--enforce-eager"},
+		Args: []string{"--max-model-len", "8192"},
 		Env: []corev1.EnvVar{
 			{Name: "FOO", Value: "bar"},
 			// Override a tunable canonical env value, which is allowed
@@ -788,8 +787,6 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgSuppress(t *testing.T) {
 	}
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
-	// User pre-set a non-reserved flag the suppress list will remove.
-	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--enforce-eager")
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
@@ -800,20 +797,57 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgSuppress(t *testing.T) {
 
 	// New env appended.
 	mustHaveEnv(t, mutated, "FOO", "bar")
-	// Override wins for the tunable name.
+	// Override wins for the tunable name (LMCACHE_CHUNK_SIZE is an
+	// adapter-owned canonical entry — the override surface can touch it).
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheChunkSize, "512")
-	// Canonical reserved env still landed unchanged — the override surface
-	// does not disturb non-overridden entries.
+	// Canonical reserved env still landed unchanged.
 	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	// User-template env preserved.
+	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 
 	// Added arg present.
 	mustHaveArgPair(t, mutated, "--max-model-len", "8192")
-	// Suppressed flag removed.
-	if argPresent(mutated.Spec.Containers[0].Args, "--enforce-eager") {
-		t.Fatalf("--enforce-eager should have been suppressed; args = %v", mutated.Spec.Containers[0].Args)
-	}
 	// Reserved arg still injected.
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+}
+
+// TestHandle_EngineOverrides_DoNotMutateUserTemplate pins the
+// adapter-owned scoping at the behaviour layer: a CR-driven Suppress or
+// Override that names a user pod-template arg/env the adapter did NOT
+// touch is a silent no-op. Catches the regression where the CR could
+// silently strip a user's flag or rewrite a user's env value.
+func TestHandle_EngineOverrides_DoNotMutateUserTemplate(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		// Try to strip a user flag the adapter doesn't inject.
+		SuppressArgs: []string{"--enforce-eager"},
+		// Try to rewrite a user env name the adapter doesn't inject.
+		Env: []corev1.EnvVar{{Name: "USER_FLAG", Value: "override-wins?"}},
+		// Try to suppress the user's own env. Also a no-op.
+		SuppressEnv: []string{"USER_FLAG"},
+	}
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--enforce-eager")
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// User-owned arg untouched by the CR-driven suppress.
+	if !argPresent(mutated.Spec.Containers[0].Args, "--enforce-eager") {
+		t.Fatalf("CR suppress wrongly stripped user-owned --enforce-eager; args = %v",
+			mutated.Spec.Containers[0].Args)
+	}
+	// User-owned env untouched by the CR-driven override + suppress.
+	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
+	// Canonical injection still landed.
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 

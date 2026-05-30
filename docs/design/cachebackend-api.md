@@ -169,10 +169,12 @@ Shape, in `corev1` vocabulary:
 
 | Field | Type | Behavior |
 |---|---|---|
-| `args` | `[]string` | Args appended to the engine container. Merged by leading flag token: an entry whose first token (e.g. `--max-model-len`) matches a canonical arg replaces it; otherwise it is appended. Order preserved. |
-| `suppressArgs` | `[]string` | Leading flag names (e.g. `--some-tunable-flag`) the adapter MUST NOT inject. |
-| `env` | `[]corev1.EnvVar` | Env upserted by `Name`. Override wins for duplicates; canonical entries for other names are preserved. |
-| `suppressEnv` | `[]string` | Env var names the adapter MUST NOT inject. |
+| `args` | `[]string` | Args added to the engine container, scoped to adapter-owned flags. An entry whose leading flag token matches an adapter-owned canonical arg replaces it; an entry whose token is in neither the adapter-owned set nor the user pod-template is appended; an entry colliding with a user-template flag the adapter did not touch is a silent no-op. Order preserved. |
+| `suppressArgs` | `[]string` | Leading flag names the adapter MUST NOT inject. Restricted to the adapter-owned set: a suppress entry that names a user-template flag the adapter did not inject is a silent no-op. |
+| `env` | `[]corev1.EnvVar` | Env upserted by `Name`, scoped to adapter-owned canonical entries. An override of an adapter-owned name wins; a new name (not on the user template) is appended; a name colliding with a user-owned env the adapter did not touch is a silent no-op. |
+| `suppressEnv` | `[]string` | Env var Names the adapter MUST NOT inject. Restricted to adapter-owned entries; user-owned env is protected. |
+
+The "adapter-owned" set is derived by the webhook at admission time by diffing the engine container's args/env immediately before and after `InjectEngineConfig` runs. A flag/env is adapter-owned if the adapter added it OR modified an existing value. User pod-template entries the adapter does not touch are protected from CR-driven mutation — the CR can amend the engine integration, but not silently rewrite the engine pod owner's own template.
 
 No `command` override (the entrypoint stays user-owned). No `resources` override here (engine-pod resources are user-owned via the engine's own pod template, not this CR). No override on the C2-managed lmcache-server pod in v1alpha1 — that surface stays adapter-owned until a managed component grows a knob that demands it.
 

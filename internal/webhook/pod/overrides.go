@@ -8,38 +8,52 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// applyEngineInjectionOverrides amends canonical args / env produced by the
-// runtime adapter with the operator-supplied overrides from
-// spec.integration.engineOverrides. It is the heart of the engine-injection
-// override surface: callers (the pod webhook) feed in the post-canonical
-// engine container's args and env, apply this, and assign the result back.
+// applyEngineInjectionOverrides amends the engine container's args/env
+// produced by the runtime adapter, scoped to the entries the adapter
+// itself injected. The webhook snapshots the container BEFORE
+// [adapter.InjectEngineConfig] runs and passes (preArgs, preEnv) here; the
+// post-injection slices are read from the container. The diff between pre
+// and post defines the "adapter-owned" set — what the override surface
+// can touch. User pod-template args/env that the adapter did not modify
+// are PROTECTED: a CR-driven Suppress or Override that names them is a
+// no-op rather than silently mutating the engine pod's own template.
 //
-// Merge contract (locked, see docs/design/cachebackend-api.md):
+// Merge contract (see docs/design/cachebackend-api.md):
 //
-//   - SuppressArgs: each leading flag token (e.g. "--max-model-len") removes
-//     the matching canonical entry. Two-arg form ("--flag", "value") drops
-//     both; equals form ("--flag=value") drops the single entry.
-//   - Args: each entry is parsed for its leading flag token; if the token
-//     matches a remaining canonical entry, the canonical entry is REPLACED
-//     in place (preserving order). Otherwise the entry is APPENDED.
-//   - SuppressEnv: removes any canonical entry whose Name matches.
-//   - Env: upserts by Name — override wins for duplicates with a canonical
-//     name; canonical entries for other names are preserved.
+//   - SuppressArgs strips an entry only when its leading flag token is
+//     in BOTH the suppress list AND the adapter-owned set.
+//   - Args overrides: for each entry whose leading flag token matches an
+//     adapter-owned entry, the canonical entry is REPLACED in place;
+//     entries whose token is in neither the adapter-owned nor the user
+//     pod's pre-injection set are APPENDED; tokens that collide with a
+//     user-owned, adapter-untouched entry are a silent no-op.
+//   - SuppressEnv strips by Name, restricted to adapter-owned env.
+//   - Env upserts: a Name matching an adapter-owned canonical entry is
+//     replaced; a Name not seen in pre-injection is appended; a Name
+//     that matches a user-owned, adapter-untouched entry is a silent
+//     no-op.
 //
-// Admission rejects entries that would touch the adapter's reserved
-// args/env, so this helper does not need to enforce reserved semantics
-// itself; it operates assuming the override struct is already valid.
+// Admission rejects entries that overlap the adapter's reserved set,
+// so this helper does not enforce reserved semantics — it operates
+// assuming the override struct already passed admission.
 //
-// Nil-safe: a nil overrides value returns the inputs unchanged.
-func applyEngineInjectionOverrides(args []string, env []corev1.EnvVar, overrides *cachev1alpha1.EngineInjectionOverrides) ([]string, []corev1.EnvVar) {
+// Nil-safe: a nil overrides argument returns post inputs unchanged.
+func applyEngineInjectionOverrides(
+	preArgs, postArgs []string,
+	preEnv, postEnv []corev1.EnvVar,
+	overrides *cachev1alpha1.EngineInjectionOverrides,
+) ([]string, []corev1.EnvVar) {
 	if overrides == nil {
-		return args, env
+		return postArgs, postEnv
 	}
-	args = suppressArgs(args, overrides.SuppressArgs)
-	args = overrideArgs(args, overrides.Args)
-	env = suppressEnv(env, overrides.SuppressEnv)
-	env = overrideEnv(env, overrides.Env)
-	return args, env
+	adapterArgs, userArgs := classifyArgFlags(preArgs, postArgs)
+	adapterEnv, userEnv := classifyEnvNames(preEnv, postEnv)
+
+	postArgs = suppressArgs(postArgs, overrides.SuppressArgs, adapterArgs)
+	postArgs = overrideArgs(postArgs, overrides.Args, adapterArgs, userArgs)
+	postEnv = suppressEnv(postEnv, overrides.SuppressEnv, adapterEnv)
+	postEnv = overrideEnv(postEnv, overrides.Env, adapterEnv, userEnv)
+	return postArgs, postEnv
 }
 
 // argFlagToken returns the leading flag token from an arg entry. For
@@ -56,15 +70,72 @@ func argFlagToken(arg string) string {
 	return arg
 }
 
+// argsByFlag walks args and returns a map from leading flag token to the
+// effective value carried by that flag — the value half of a two-arg pair,
+// the right-hand side of an "=" form, or "" for a toggle. Positionals are
+// not included (they have no flag identity to key on). Used to diff pre
+// vs post snapshots and identify what the adapter owns.
+func argsByFlag(args []string) map[string]string {
+	out := make(map[string]string, len(args))
+	for i := 0; i < len(args); i++ {
+		token := argFlagToken(args[i])
+		if token == "" {
+			continue
+		}
+		switch {
+		case strings.ContainsRune(args[i], '='):
+			out[token] = args[i][len(token)+1:]
+		case i+1 < len(args) && !strings.HasPrefix(args[i+1], "-"):
+			out[token] = args[i+1]
+			i++
+		default:
+			out[token] = ""
+		}
+	}
+	return out
+}
+
+// classifyArgFlags returns the set of flag tokens the adapter contributed
+// (added or value-changed between pre and post) and the set of flag tokens
+// the user pod-template owned and the adapter did NOT touch. Used to scope
+// override application so the CR cannot silently mutate user-template args.
+func classifyArgFlags(pre, post []string) (adapter, user map[string]bool) {
+	preMap := argsByFlag(pre)
+	postMap := argsByFlag(post)
+	adapter = make(map[string]bool)
+	for flag, postVal := range postMap {
+		preVal, inPre := preMap[flag]
+		if !inPre || preVal != postVal {
+			adapter[flag] = true
+		}
+	}
+	user = make(map[string]bool)
+	for flag := range preMap {
+		if !adapter[flag] {
+			user[flag] = true
+		}
+	}
+	return adapter, user
+}
+
 // suppressArgs returns args with every entry whose leading flag token
-// matches any name in suppress removed. Two-arg flags drop both their
-// own slot and the following value slot (when that slot is not itself a
-// flag); equals-form flags drop their single slot. Order is preserved.
-func suppressArgs(args []string, suppress []string) []string {
-	if len(suppress) == 0 || len(args) == 0 {
+// matches a name in suppress AND that name is in the adapter-owned set
+// removed. Two-arg flags drop both their own slot and the following value
+// slot (when not itself a flag); equals-form flags drop their single slot.
+// Order is preserved.
+func suppressArgs(args, suppress []string, adapter map[string]bool) []string {
+	if len(suppress) == 0 || len(args) == 0 || len(adapter) == 0 {
 		return args
 	}
-	drop := stringSet(suppress)
+	drop := make(map[string]bool, len(suppress))
+	for _, s := range suppress {
+		if adapter[s] {
+			drop[s] = true
+		}
+	}
+	if len(drop) == 0 {
+		return args
+	}
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		token := argFlagToken(args[i])
@@ -82,19 +153,20 @@ func suppressArgs(args []string, suppress []string) []string {
 	return out
 }
 
-// overrideArgs applies the operator's Args overrides on top of args.
-// For each override entry whose leading flag token matches a remaining
-// canonical entry, the canonical entry is replaced in place (the override's
-// form — two-arg vs equals — is preserved verbatim). Entries with no
-// matching canonical flag are appended in order. Positionals (no leading
-// `-`) are always appended.
-func overrideArgs(args []string, overrides []string) []string {
+// overrideArgs applies the operator's Args overrides on top of args, scoped
+// to adapter-owned flags. For each override entry whose leading flag token:
+//   - matches an adapter-owned canonical entry: the canonical entry is
+//     replaced in place (the override's form — two-arg vs equals — wins).
+//   - is absent from BOTH the adapter-owned set and the user pre-injection
+//     set: appended.
+//   - matches a user-owned, adapter-untouched entry: silently skipped (the
+//     CR has no authority over the engine pod's own template entries).
+//
+// Positionals (no leading `-`) are always appended. Order is preserved.
+func overrideArgs(args, overrides []string, adapter, user map[string]bool) []string {
 	if len(overrides) == 0 {
 		return args
 	}
-	// Walk the override list, classifying each entry into a logical
-	// override request: flag token + the slice of source slots it
-	// occupies (1 for equals form or toggle, 2 for two-arg form).
 	for i := 0; i < len(overrides); i++ {
 		entry := overrides[i]
 		token := argFlagToken(entry)
@@ -110,11 +182,17 @@ func overrideArgs(args []string, overrides []string) []string {
 		}
 
 		if token == "" {
-			// Positional: always append; positionals can't override a flag.
+			// Positional: append; positionals can't override a flag.
 			args = append(args, replacement...)
 			continue
 		}
-		args = replaceArgFlag(args, token, replacement)
+		switch {
+		case adapter[token]:
+			args = replaceArgFlag(args, token, replacement)
+		case !user[token]:
+			args = append(args, replacement...)
+		}
+		// else: user-owned, adapter-untouched — silent no-op.
 	}
 	return args
 }
@@ -144,13 +222,65 @@ func replaceArgFlag(args []string, flag string, replacement []string) []string {
 	return append(args, replacement...)
 }
 
-// suppressEnv returns env with every entry whose Name appears in suppress
-// removed. Order is preserved.
-func suppressEnv(env []corev1.EnvVar, suppress []string) []corev1.EnvVar {
-	if len(suppress) == 0 || len(env) == 0 {
+// envByName returns a map from env var Name to (Value, ValueFrom-present).
+// Used to diff pre vs post snapshots and identify adapter-owned env.
+// The bool half catches the case where the adapter swapped a Value-bearing
+// entry for a ValueFrom-bearing one (or vice versa) without changing Value,
+// so the change is still recognised as adapter-owned.
+func envByName(env []corev1.EnvVar) map[string]envSignature {
+	out := make(map[string]envSignature, len(env))
+	for i := range env {
+		out[env[i].Name] = envSignature{
+			value:     env[i].Value,
+			hasValueF: env[i].ValueFrom != nil,
+		}
+	}
+	return out
+}
+
+type envSignature struct {
+	value     string
+	hasValueF bool
+}
+
+// classifyEnvNames returns the set of env Names the adapter contributed
+// (added or value-changed) and the set of user-owned, adapter-untouched
+// Names. Used the same way as classifyArgFlags but on env.
+func classifyEnvNames(pre, post []corev1.EnvVar) (adapter, user map[string]bool) {
+	preMap := envByName(pre)
+	postMap := envByName(post)
+	adapter = make(map[string]bool)
+	for name, postSig := range postMap {
+		preSig, inPre := preMap[name]
+		if !inPre || preSig != postSig {
+			adapter[name] = true
+		}
+	}
+	user = make(map[string]bool)
+	for name := range preMap {
+		if !adapter[name] {
+			user[name] = true
+		}
+	}
+	return adapter, user
+}
+
+// suppressEnv returns env with every entry whose Name is in BOTH suppress
+// AND adapter removed. User-owned, adapter-untouched env is protected.
+// Order is preserved.
+func suppressEnv(env []corev1.EnvVar, suppress []string, adapter map[string]bool) []corev1.EnvVar {
+	if len(suppress) == 0 || len(env) == 0 || len(adapter) == 0 {
 		return env
 	}
-	drop := stringSet(suppress)
+	drop := make(map[string]bool, len(suppress))
+	for _, s := range suppress {
+		if adapter[s] {
+			drop[s] = true
+		}
+	}
+	if len(drop) == 0 {
+		return env
+	}
 	out := make([]corev1.EnvVar, 0, len(env))
 	for i := range env {
 		if drop[env[i].Name] {
@@ -161,25 +291,28 @@ func suppressEnv(env []corev1.EnvVar, suppress []string) []corev1.EnvVar {
 	return out
 }
 
-// overrideEnv upserts each override entry into env by Name: an existing
-// entry with the same Name is replaced in place; a new Name is appended.
-// Order of canonical entries is preserved.
-func overrideEnv(env []corev1.EnvVar, overrides []corev1.EnvVar) []corev1.EnvVar {
+// overrideEnv upserts each override entry into env, scoped to adapter-owned
+// Names. A Name that matches an adapter-owned canonical entry is replaced;
+// a Name not seen in pre-injection is appended; a Name that matches a
+// user-owned, adapter-untouched entry is silently skipped. Order of
+// canonical entries is preserved.
+func overrideEnv(env []corev1.EnvVar, overrides []corev1.EnvVar, adapter, user map[string]bool) []corev1.EnvVar {
 	if len(overrides) == 0 {
 		return env
 	}
 	for _, ovr := range overrides {
-		replaced := false
-		for i := range env {
-			if env[i].Name == ovr.Name {
-				env[i] = ovr
-				replaced = true
-				break
+		switch {
+		case adapter[ovr.Name]:
+			for i := range env {
+				if env[i].Name == ovr.Name {
+					env[i] = ovr
+					break
+				}
 			}
-		}
-		if !replaced {
+		case !user[ovr.Name]:
 			env = append(env, ovr)
 		}
+		// else: user-owned, adapter-untouched — silent no-op.
 	}
 	return env
 }
@@ -216,17 +349,4 @@ func overrideTargetIndex(containers []corev1.Container, engineContainerName stri
 		return 0, true
 	}
 	return -1, false
-}
-
-// stringSet returns a set built from xs. A nil or empty input returns nil,
-// which the callers above treat as "no items to filter against".
-func stringSet(xs []string) map[string]bool {
-	if len(xs) == 0 {
-		return nil
-	}
-	out := make(map[string]bool, len(xs))
-	for _, s := range xs {
-		out[s] = true
-	}
-	return out
 }

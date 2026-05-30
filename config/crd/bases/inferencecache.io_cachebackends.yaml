@@ -158,9 +158,11 @@ spec:
                         description: |-
                           Args injected into the engine container, in addition to what the
                           adapter would inject. Merged by leading flag token (e.g.
-                          "--max-model-len"): an override entry whose leading token matches a
-                          canonical entry replaces it; otherwise the entry is appended. Order
-                          is preserved.
+                          "--max-model-len"): an override entry whose leading token matches
+                          an adapter-owned canonical entry replaces it; entries whose token
+                          is in neither the adapter-owned set nor the user pod-template are
+                          appended; entries colliding with a user-template flag the adapter
+                          did not touch are a silent no-op. Order is preserved.
 
                           Admission rejects entries whose leading flag token overlaps
                           the adapter's ReservedArgs().
@@ -169,10 +171,12 @@ spec:
                         type: array
                       env:
                         description: |-
-                          Env upserted into the engine container by Name. Override wins for
-                          duplicates with a canonical name; canonical entries for names not
-                          listed here are preserved. Admission rejects entries whose Name
-                          overlaps the adapter's ReservedEnv().
+                          Env upserted into the engine container by Name, scoped to
+                          adapter-owned canonical entries. A Name matching an adapter-owned
+                          entry is replaced; a Name not seen on the user pod-template is
+                          appended; a Name colliding with a user-template env the adapter
+                          did not touch is a silent no-op. Admission rejects entries whose
+                          Name overlaps the adapter's ReservedEnv().
                         items:
                           description: EnvVar represents an environment variable present
                             in a Container.
@@ -334,8 +338,10 @@ spec:
                           SuppressArgs lists leading flag names (e.g. "--some-tunable-flag")
                           the adapter MUST NOT inject. Admission rejects entries that overlap
                           the adapter's ReservedArgs(). A suppressed flag is removed from the
-                          canonical args before Args merges in, so suppress-then-re-add is a
-                          supported pattern for overriding a non-reserved flag's value.
+                          adapter's canonical contribution before Args merges in, so
+                          suppress-then-re-add is a supported pattern for overriding a
+                          non-reserved adapter-owned flag's value. Suppress does NOT touch
+                          user pod-template flags the adapter did not inject.
                         items:
                           type: string
                         type: array
@@ -343,6 +349,8 @@ spec:
                         description: |-
                           SuppressEnv lists env var Names the adapter MUST NOT inject.
                           Admission rejects entries that overlap the adapter's ReservedEnv().
+                          Suppress does NOT touch user pod-template env the adapter did not
+                          inject.
                         items:
                           type: string
                         type: array

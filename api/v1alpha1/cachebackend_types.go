@@ -212,19 +212,27 @@ type CacheBackendIntegrationSpec struct {
 
 // EngineInjectionOverrides describes how the operator wants to amend the
 // args / env the pod-mutating webhook injects into the engine container.
+// The override surface is SCOPED to entries the runtime adapter itself
+// contributes (added or modified) during InjectEngineConfig — user
+// pod-template args / env that the adapter does not touch are protected,
+// and a Suppress or Override naming them is a silent no-op. This keeps the
+// CR from mutating engine-pod-template state the engine-pod owner did not
+// invite the CacheBackend to touch.
 //
-// Known-fragile: nothing here is type-checked against the engine binary, so a
-// non-reserved value can still break the engine in subtle ways the validator
-// can't catch (e.g. an aggressive `--max-model-len` OOMing the engine).
-// Admission only blocks overrides that overlap the adapter's reserved set —
-// the args/env strictly required for the integration itself to function. The
-// operator owns the rest.
+// Known-fragile: nothing here is type-checked against the engine binary, so
+// an override on an adapter-owned non-reserved value can still break the
+// engine in subtle ways the validator can't catch (e.g. an aggressive
+// `--max-model-len` OOMing the engine). Admission only blocks overrides
+// that overlap the adapter's reserved set — the args/env strictly required
+// for the integration itself to function.
 type EngineInjectionOverrides struct {
 	// Args injected into the engine container, in addition to what the
 	// adapter would inject. Merged by leading flag token (e.g.
-	// "--max-model-len"): an override entry whose leading token matches a
-	// canonical entry replaces it; otherwise the entry is appended. Order
-	// is preserved.
+	// "--max-model-len"): an override entry whose leading token matches
+	// an adapter-owned canonical entry replaces it; entries whose token
+	// is in neither the adapter-owned set nor the user pod-template are
+	// appended; entries colliding with a user-template flag the adapter
+	// did not touch are a silent no-op. Order is preserved.
 	//
 	// Admission rejects entries whose leading flag token overlaps
 	// the adapter's ReservedArgs().
@@ -234,20 +242,26 @@ type EngineInjectionOverrides struct {
 	// SuppressArgs lists leading flag names (e.g. "--some-tunable-flag")
 	// the adapter MUST NOT inject. Admission rejects entries that overlap
 	// the adapter's ReservedArgs(). A suppressed flag is removed from the
-	// canonical args before Args merges in, so suppress-then-re-add is a
-	// supported pattern for overriding a non-reserved flag's value.
+	// adapter's canonical contribution before Args merges in, so
+	// suppress-then-re-add is a supported pattern for overriding a
+	// non-reserved adapter-owned flag's value. Suppress does NOT touch
+	// user pod-template flags the adapter did not inject.
 	// +optional
 	SuppressArgs []string `json:"suppressArgs,omitempty"`
 
-	// Env upserted into the engine container by Name. Override wins for
-	// duplicates with a canonical name; canonical entries for names not
-	// listed here are preserved. Admission rejects entries whose Name
-	// overlaps the adapter's ReservedEnv().
+	// Env upserted into the engine container by Name, scoped to
+	// adapter-owned canonical entries. A Name matching an adapter-owned
+	// entry is replaced; a Name not seen on the user pod-template is
+	// appended; a Name colliding with a user-template env the adapter
+	// did not touch is a silent no-op. Admission rejects entries whose
+	// Name overlaps the adapter's ReservedEnv().
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// SuppressEnv lists env var Names the adapter MUST NOT inject.
 	// Admission rejects entries that overlap the adapter's ReservedEnv().
+	// Suppress does NOT touch user pod-template env the adapter did not
+	// inject.
 	// +optional
 	SuppressEnv []string `json:"suppressEnv,omitempty"`
 }

@@ -153,28 +153,46 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	mutated := pod.DeepCopy()
+
+	// Snapshot the engine container's pre-injection args/env so the
+	// override merge below can scope itself to the adapter-owned set. The
+	// override surface mutates only what InjectEngineConfig contributes;
+	// user pod-template args/env that the adapter does not touch stay
+	// protected. We snapshot before the adapter call (rather than re-deriving
+	// the canonical set afterwards) so this works for any adapter without
+	// changing the [adapterruntime.KVCacheRuntimeAdapter] contract.
+	overrides := engineOverridesFor(cache)
+	overrideIdx := -1
+	var preArgs []string
+	var preEnv []corev1.EnvVar
+	if overrides != nil {
+		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
+			overrideIdx = idx
+			preArgs = append([]string(nil), mutated.Spec.Containers[idx].Args...)
+			preEnv = append([]corev1.EnvVar(nil), mutated.Spec.Containers[idx].Env...)
+		}
+	}
+
 	if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
 		log.V(1).Info("fail-open: adapter rejected pod",
 			"runtime", string(runtimeID), "error", err.Error())
 		return admission.Allowed(fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
 
-	// Apply spec.integration.engineOverrides on top of canonical injection.
-	// Admission has already hard-rejected overrides that overlap the
-	// adapter's reserved args/env, so the entries surviving to this point
-	// are safe to merge. The override-target container is resolved via the
-	// adapter's [adapterruntime.KVCacheRuntimeAdapter.EngineContainerName];
-	// adapters with no canonical engine container (the reference adapter)
-	// return "" and the merge is skipped — the override surface is for
-	// production adapters that target a specific engine container.
-	if overrides := engineOverridesFor(cache); overrides != nil {
-		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
-			mutated.Spec.Containers[idx].Args, mutated.Spec.Containers[idx].Env = applyEngineInjectionOverrides(
-				mutated.Spec.Containers[idx].Args,
-				mutated.Spec.Containers[idx].Env,
-				overrides,
-			)
-		}
+	// Apply spec.integration.engineOverrides scoped to the adapter-owned
+	// args/env derived from the pre/post diff. Admission has already
+	// hard-rejected overrides that overlap the adapter's reserved
+	// declarations, so the entries surviving to this point are safe to
+	// merge. Adapters with no canonical engine container (the reference
+	// adapter) return EngineContainerName() == "" and overrideIdx stays
+	// -1, so the merge is skipped — the override surface is for production
+	// adapters that target a specific engine container.
+	if overrides != nil && overrideIdx >= 0 {
+		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
+			preArgs, mutated.Spec.Containers[overrideIdx].Args,
+			preEnv, mutated.Spec.Containers[overrideIdx].Env,
+			overrides,
+		)
 	}
 
 	// Auto-attach the observation sidecar. The adapter owns the
