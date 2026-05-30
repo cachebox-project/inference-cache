@@ -123,14 +123,18 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 			}}, nil
 		case "boom":
 			return nil, errors.New("apiserver unavailable")
-		case "authenticator-down":
-			// TokenReview succeeded as an API call but the authenticator
-			// backend could not decide (e.g. webhook authenticator
-			// unreachable). Status.Error is the apiserver's surface for
-			// that; treat it as fail-closed → 503, not as a client
-			// identity problem.
+		case "status-error":
+			// TokenReview returned a non-error HTTP response but with
+			// Status.Error populated. kube-apiserver does this for ANY
+			// authenticator-side error, including "invalid token format"
+			// — so we trust Authenticated as the authoritative bit and
+			// map !Authenticated → 401 (logging the Status.Error for the
+			// operator). This case pins that contract: error string is
+			// set, Authenticated is false, expected outcome is 401, not
+			// 503.
 			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
-				Error: "webhook authenticator: timed out",
+				Error:         "invalid bearer token",
+				Authenticated: false,
 			}}, nil
 		case "nil-review":
 			// Defensive: a fake/buggy reviewer that returns (nil, nil) must
@@ -159,7 +163,7 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		{"wrong identity", "Bearer wrong-sa", http.StatusForbidden, ResultForbidden, false},
 		{"valid token", "Bearer good", http.StatusOK, ResultOK, true},
 		{"apiserver error", "Bearer boom", http.StatusServiceUnavailable, ResultError, false},
-		{"authenticator backend error", "Bearer authenticator-down", http.StatusServiceUnavailable, ResultError, false},
+		{"token review status.error -> 401 (kube-apiserver returns this for plain bad tokens)", "Bearer status-error", http.StatusUnauthorized, ResultUnauth, false},
 		{"nil token review", "Bearer nil-review", http.StatusServiceUnavailable, ResultError, false},
 	}
 	for _, tc := range cases {

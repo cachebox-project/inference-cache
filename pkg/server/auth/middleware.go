@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -168,23 +169,31 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "token review unavailable\n", http.StatusServiceUnavailable)
 			return
 		}
-		// Fail-closed on review-side failures too. A TokenReview can return a
-		// non-error HTTP response but with Status.Error populated — that
-		// means the apiserver accepted the request but the authenticator
-		// backend could not decide (e.g. webhook authenticator down,
-		// authenticator timeout). Treating that as !Authenticated → 401
-		// would mislabel an infrastructure failure as a client identity
-		// problem; surface it as 503/error instead so the poller's
-		// fail-soft retry loop kicks in and the metric reflects reality.
-		// nil tr is defensive — production clients never see it, but a
-		// fake reviewer that returns (nil, nil) by accident would
-		// otherwise panic on the .Status access below.
-		if tr == nil || tr.Status.Error != "" {
+		// Defensive: a fake/buggy reviewer returning (nil, nil) would
+		// otherwise panic on the .Status access below. Production clients
+		// never see this shape, but treat it as fail-closed.
+		if tr == nil {
 			a.record(ResultError)
 			http.Error(w, "token review unavailable\n", http.StatusServiceUnavailable)
 			return
 		}
 		if !tr.Status.Authenticated {
+			// kube-apiserver's TokenReview populates Status.Error for any
+			// authenticator error — including ordinary "this isn't a
+			// valid token" cases. We can't distinguish "authenticator
+			// down" from "token is just bad" without parsing the error
+			// string, which would be brittle. Trust Authenticated as the
+			// authoritative bit: !Authenticated → 401. Surface the
+			// Status.Error message in the controller's log so the
+			// operator can still see WHY (a webhook authenticator
+			// timeout would show up here distinctly from "invalid bearer
+			// token"). Both still map to 401 on the wire, which is
+			// correct from the client's perspective — the client must
+			// not be admitted either way.
+			if tr.Status.Error != "" {
+				slog.WarnContext(r.Context(), "snapshot_auth_token_review_unauthenticated",
+					"error", tr.Status.Error)
+			}
 			a.record(ResultUnauth)
 			http.Error(w, "unauthorized\n", http.StatusUnauthorized)
 			return
