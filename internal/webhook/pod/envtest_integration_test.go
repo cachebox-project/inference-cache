@@ -354,7 +354,7 @@ webhooks:
     - CREATE
     resources:
     - pods
-  sideEffects: NoneOnDryRun
+  sideEffects: None
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pod-webhook.yaml")

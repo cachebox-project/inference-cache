@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -44,6 +45,16 @@ const (
 	defaultHPAMinReplicas                 = int32(1)
 	defaultHPATargetCPUUtilizationPercent = int32(80)
 )
+
+// matchedEnginePodsRequeueInterval is the steady-state cadence at which a
+// CacheBackend with a configured spec.engineSelector self-requeues, so the
+// `status.matchedEnginePods` snapshot does not stay stale forever between
+// otherwise-unrelated reconcile triggers. The reconciler does not Watch
+// Pods by design (see refreshMatchedEnginePods godoc); without a self-
+// requeue, the count would only refresh when the CR, the owned Deployment,
+// Service, or HPA changed. 30s strikes a balance between operator
+// responsiveness and reconcile pressure on a large fleet.
+const matchedEnginePodsRequeueInterval = 30 * time.Second
 
 // Event reasons emitted on a CacheBackend.
 //
@@ -118,6 +129,18 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// transient List/Patch errors so it never escalates a transient
 	// apiserver hiccup into a Reconcile error.
 	r.refreshMatchedEnginePods(ctx, &backend)
+	// When the CR has an EngineSelector, self-requeue so the count tracks
+	// pod birth/death between unrelated reconcile triggers. We deliberately
+	// don't Watch Pods (see refreshMatchedEnginePods godoc); the periodic
+	// self-requeue gives a bounded staleness without the watch's overhead.
+	// Don't shorten an already-shorter RequeueAfter dispatch may have set
+	// (none today, but preserve the contract): only fill in the cadence
+	// when no other requeue is pending.
+	if backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0 {
+		if result.RequeueAfter == 0 {
+			result.RequeueAfter = matchedEnginePodsRequeueInterval
+		}
+	}
 	// Emit transitions whenever dispatch published a status change, even on
 	// an apply-error reconcile: the status path runs independently of apply
 	// success (so apply churn doesn't freeze user-visible health), and the
@@ -903,10 +926,15 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 // Cadence-by-reconcile, not real-time: counts via a single namespaced
 // client.List with the engineSelector — there is no Pod watch, and pod
 // births/deaths between reconciles are not reflected until the next pass.
-// The real-time per-pod signal lives on the engine pods themselves (the
-// `InjectedByCacheBackend` Event the engine-pod-events controller emits
-// on every annotated pod); this status field answers the cluster-wide
-// "is anyone connected at all?" question.
+// To keep the count from going indefinitely stale between unrelated
+// reconcile triggers, the Reconcile path sets `result.RequeueAfter =
+// matchedEnginePodsRequeueInterval` whenever the CR has a non-empty
+// EngineSelector, giving the field a bounded staleness without paying
+// for a Pod informer. The real-time per-pod signal lives on the engine
+// pods themselves (the `InjectedByCacheBackend` Event the
+// engine-pod-events controller emits on every annotated pod); this
+// status field answers the cluster-wide "is anyone connected at all?"
+// question.
 //
 // Selector resolution mirrors the mutating webhook's policy: a nil or
 // empty MatchLabels matches nothing (a broad selector at admission time

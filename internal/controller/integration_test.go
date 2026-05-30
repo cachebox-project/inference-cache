@@ -767,6 +767,104 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 	}
 }
 
+// TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence verifies the
+// new self-requeue cadence: a manager-driven reconciler (no Pod watch, no
+// explicit reconcile() calls) must still converge `status.matchedEnginePods`
+// after a pod CREATE because the previous reconcile scheduled a
+// RequeueAfter when the CR's EngineSelector was non-empty. Without that
+// requeue, pod birth/death would only refresh the count when an unrelated
+// CR/owned-workload event fired, leaving the operator-facing column
+// indefinitely stale.
+func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := (&CacheBackendReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    logr.Discard(),
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	ns := freshNS(t, k8s)
+	sel := map[string]string{"app": "test-engine"}
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: sel}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	// Helper to read the live count.
+	read := func() *int32 {
+		var live cachev1alpha1.CacheBackend
+		if err := k8s.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: ns}, &live); err != nil {
+			t.Fatalf("get CacheBackend: %v", err)
+		}
+		return live.Status.MatchedEnginePods
+	}
+	waitForCount := func(want int32, what string) {
+		t.Helper()
+		// The cadence is 30s in production; that's too long for a unit
+		// test. The wait is generous because the apiserver's controller
+		// fires the initial reconcile-on-create immediately and we
+		// then need the NEXT requeue to land — which may take up to
+		// matchedEnginePodsRequeueInterval.
+		deadline := time.Now().Add(matchedEnginePodsRequeueInterval + 15*time.Second)
+		for time.Now().Before(deadline) {
+			got := read()
+			if got != nil && *got == want {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		t.Fatalf("status.matchedEnginePods did not converge to %d (%s) within timeout; last value = %v", want, what, read())
+	}
+
+	// First reconcile (manager-driven; no explicit reconcile() call):
+	// no matching pods → expect 0.
+	waitForCount(0, "no matching pods")
+
+	// Create matching pods AFTER the initial reconcile and verify the
+	// count catches up WITHOUT us forcing a reconcile. The self-
+	// requeue cadence is what makes this work.
+	for i := 0; i < 2; i++ {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("engine-%d", i),
+				Namespace: ns,
+				Labels:    sel,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+			},
+		}
+		if err := k8s.Create(context.Background(), p); err != nil {
+			t.Fatalf("create pod %s: %v", p.Name, err)
+		}
+	}
+	waitForCount(2, "after creating 2 matching pods")
+}
+
 // TestIntegrationCacheBackendMatchedEnginePods exercises the
 // status.matchedEnginePods writer against a real apiserver: the count
 // reflects the live pod inventory in the CR's namespace, ignores pods in

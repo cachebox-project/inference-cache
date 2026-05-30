@@ -87,7 +87,8 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: vllm/vllm-openai-cpu:latest
+          # Arch-tagged: swap to `:latest-arm64` on Apple Silicon hosts.
+          image: vllm/vllm-openai-cpu:latest-x86_64
           args: ["--model", "Qwen/Qwen2.5-0.5B-Instruct"]
 ```
 
