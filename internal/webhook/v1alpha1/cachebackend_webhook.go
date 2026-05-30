@@ -150,14 +150,37 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 	return nil, v.validate(cb)
 }
 
-// ValidateUpdate implements [admission.Validator]. Updates are validated
-// against the *new* object only: admission rules are functions of the
-// desired spec, and re-checking each admit catches a kubectl edit that
-// flips a previously-valid field just as it would on create.
-func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, _, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
+// ValidateUpdate implements [admission.Validator]. Updates only reject
+// violations the new object *introduces* — an error that already existed
+// on oldCB is filtered out so an unrelated update (a label tweak, a
+// status-subresource-adjacent edit) on a CR that was admitted under a
+// laxer rule set isn't suddenly un-updatable. A kubectl edit that flips a
+// previously-valid field into an invalid one is still rejected, because
+// the violation is then new to the diff.
+//
+// This is the standard pattern for tightening admission rules on a
+// v1alpha1 CRD: create-time is strict; update-time only rejects fresh
+// violations so existing CRs aren't trapped. Without it, adding a new
+// rule (e.g. rejectEndpointOnNonExternal) would break every existing CR
+// that happens to violate it the moment an operator runs `kubectl
+// annotate` on it.
+func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
 		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
-	return nil, v.validate(newCB)
+	newErrs := v.collectErrors(newCB)
+	if len(newErrs) == 0 {
+		return nil, nil
+	}
+	oldErrs := v.collectErrors(oldCB)
+	introduced := filterIntroducedErrors(oldErrs, newErrs)
+	if len(introduced) == 0 {
+		return nil, nil
+	}
+	return nil, apierrors.NewInvalid(
+		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
+		newCB.Name,
+		introduced,
+	)
 }
 
 // ValidateDelete implements [admission.Validator]. Deletion is always
@@ -168,12 +191,29 @@ func (v *CacheBackendValidator) ValidateDelete(_ context.Context, _ *cachev1alph
 }
 
 // validate runs the configured rule set against cb and returns a single
-// aggregated Invalid status, or nil when every rule accepts. Centralised
-// here so create + update share one code path. The runtime-adapter
-// compatibility check runs after the structural rules so a missing
-// required field surfaces as a single field-level error instead of
-// stacking an unsupported-pair complaint on top of it.
+// aggregated Invalid status, or nil when every rule accepts. Used by
+// ValidateCreate (every rule applies); ValidateUpdate calls
+// collectErrors directly so it can diff old vs new and only reject
+// newly introduced violations.
 func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
+	errs := v.collectErrors(cb)
+	if len(errs) == 0 {
+		return nil
+	}
+	return apierrors.NewInvalid(
+		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
+		cb.Name,
+		errs,
+	)
+}
+
+// collectErrors returns the field-scoped violations every configured
+// rule produced for cb, including the runtime-adapter compatibility
+// check. Centralised so ValidateCreate and ValidateUpdate share the
+// rule-evaluation path; the runtime-adapter check runs last so a
+// missing required field surfaces as a single field-level error
+// instead of stacking an unsupported-pair complaint on top of it.
+func (v *CacheBackendValidator) collectErrors(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	rules := v.Rules
 	if len(rules) == 0 {
 		rules = DefaultValidationRules
@@ -183,14 +223,51 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 		errs = append(errs, rule(cb)...)
 	}
 	errs = append(errs, v.checkRuntimeAdapter(cb)...)
-	if len(errs) == 0 {
+	return errs
+}
+
+// filterIntroducedErrors returns the subset of newErrs that does NOT
+// appear in oldErrs — the violations the update actually introduced.
+// Errors are compared by (Type, Field, BadValue, Detail); two errors
+// are "the same" only if all four match, so a different message or a
+// different bad value on the same field counts as a fresh violation.
+//
+// This is the v1alpha1 backward-compat seam: tightening admission
+// rules is always allowed at create time, and at update time only
+// rejects edits that newly trip the rule. A CR already in etcd that
+// happens to violate a newly-added rule can still be edited (labels,
+// annotations, unrelated spec fields) — the operator just can't
+// introduce more violations and can't make the bad field worse.
+func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
+	if len(newErrs) == 0 {
 		return nil
 	}
-	return apierrors.NewInvalid(
-		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
-		cb.Name,
-		errs,
-	)
+	type key struct {
+		Type     field.ErrorType
+		Field    string
+		BadValue string
+		Detail   string
+	}
+	keyOf := func(e *field.Error) key {
+		return key{
+			Type:     e.Type,
+			Field:    e.Field,
+			BadValue: fmt.Sprintf("%v", e.BadValue),
+			Detail:   e.Detail,
+		}
+	}
+	seen := make(map[key]struct{}, len(oldErrs))
+	for _, e := range oldErrs {
+		seen[keyOf(e)] = struct{}{}
+	}
+	out := make(field.ErrorList, 0, len(newErrs))
+	for _, e := range newErrs {
+		if _, dup := seen[keyOf(e)]; dup {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // checkRuntimeAdapter rejects a CacheBackend whose effective (engine, type)
@@ -202,20 +279,24 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 // reconcile, so a CR with `type: Mooncake` and no engine no longer slips
 // past admission only to fail downstream.
 //
-// The check is bypassed for two CR shapes that never reach the adapter
-// registry at reconcile:
+// External backends flow through this check the same way managed types
+// do: they have a real runtime adapter (vllm-only today, see
+// pkg/adapters/runtime/external), and the pod-mutating webhook calls
+// it to wire engine pods. A CR with `type: External, engine: sglang`
+// would be admitted into a state the pod webhook can't realise — the
+// engine pod would silently boot un-wired to the external cache —
+// without this check. Admission reject is the right surface: the
+// reconciler still short-circuits External via reconcileExternal before
+// any adapter lookup, so the only consumer of the (engine, External)
+// pair is the pod webhook, and admission rejecting upstream of it gives
+// the operator a useful error instead of a silent miss.
 //
-//   - Spec.Type is empty: there is no defaulting for type and the
-//     missing-type rejection is owned by CRD-level / future field-level
-//     validation; piling an "adapter for backend=\"\"" cause on top would
-//     not help the user.
-//   - Spec.Type is [cachev1alpha1.CacheBackendTypeExternal]: External
-//     backends are pre-existing services the controller only mirrors to
-//     status, not managed workloads — the reconciler routes them through
-//     reconcileExternal before any adapter lookup, so admission must not
-//     reject them for "no adapter".
+// The check is bypassed only when Spec.Type is empty: there is no
+// defaulting for type and the missing-type rejection is owned by
+// CRD-level / future field-level validation; piling an "adapter for
+// backend=\"\"" cause on top would not help the user.
 func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+	if cb.Spec.Type == "" {
 		return nil
 	}
 	registry := v.Registry
@@ -314,9 +395,18 @@ func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList
 	if strings.TrimSpace(cb.Spec.Endpoint) == "" {
 		return nil
 	}
+	// field.Invalid (not field.Forbidden) so the bad endpoint flows into
+	// the error's BadValue. ValidateUpdate's diff-vs-old logic keys on
+	// (Type, Field, BadValue, Detail); using Invalid lets it distinguish
+	// "operator edited the bad endpoint to a different bad endpoint"
+	// (newly-introduced violation, reject) from "operator left the same
+	// bad endpoint in place and changed only an unrelated field" (no
+	// fresh violation, allow). field.Forbidden has BadValue="forbidden"
+	// regardless of the actual value and would collapse the two cases.
 	return field.ErrorList{
-		field.Forbidden(
+		field.Invalid(
 			field.NewPath("spec", "endpoint"),
+			cb.Spec.Endpoint,
 			fmt.Sprintf("spec.endpoint is only valid when spec.type=External; got spec.type=%q with non-empty spec.endpoint. Managed backends learn their endpoint from the controller-rendered Service.", cb.Spec.Type),
 		),
 	}

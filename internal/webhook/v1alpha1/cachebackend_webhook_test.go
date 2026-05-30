@@ -126,6 +126,34 @@ func requireInvalidWithCause(t *testing.T, v *CacheBackendValidator, cb *cachev1
 		wantField, wantMsg, statusErr.Status().Details.Causes)
 }
 
+// requireUpdateInvalidWithCause is the ValidateUpdate-equivalent of
+// requireInvalidWithCause. Asserts the (old, new) pair fails validation
+// with an Invalid status carrying the named field + message substring.
+func requireUpdateInvalidWithCause(t *testing.T, v *CacheBackendValidator, oldCB, newCB *cachev1alpha1.CacheBackend, wantField, wantMsg string) {
+	t.Helper()
+	_, err := v.ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil {
+		t.Fatalf("expected validation error on update, got nil")
+	}
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok {
+		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected Invalid status, got %v", statusErr.Status())
+	}
+	if statusErr.Status().Details == nil {
+		t.Fatalf("Invalid status has no details: %v", statusErr.Status())
+	}
+	for _, c := range statusErr.Status().Details.Causes {
+		if c.Field == wantField && strings.Contains(c.Message, wantMsg) {
+			return
+		}
+	}
+	t.Fatalf("no cause on field %q containing %q; got causes: %+v",
+		wantField, wantMsg, statusErr.Status().Details.Causes)
+}
+
 func TestValidator_HappyPath_LMCacheAdmitted(t *testing.T) {
 	v := &CacheBackendValidator{}
 	cb := newBackend()
@@ -135,10 +163,14 @@ func TestValidator_HappyPath_LMCacheAdmitted(t *testing.T) {
 }
 
 func TestValidator_External_WithEndpointAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
+	// External now flows through the runtime-adapter check; use a registry
+	// that includes the External adapter (matching production cmd/controller
+	// wiring) so the (vllm, External) pair is supported.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("External with endpoint rejected: %v", err)
 	}
@@ -173,6 +205,65 @@ func TestValidator_EndpointOnManagedTypeRejected(t *testing.T) {
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	cb.Spec.Endpoint = "user-supplied.example:8080"
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"spec.endpoint is only valid when spec.type=External")
+}
+
+func TestValidator_EndpointOnManagedType_PreExistingUpdateAllowed(t *testing.T) {
+	// v1alpha1 backward-compat: a CR that was admitted before
+	// rejectEndpointOnNonExternal landed (e.g. LMCache with a stale
+	// spec.endpoint) must remain editable for unrelated changes — the
+	// new rule only rejects updates that *introduce* a new violation.
+	// Without this property, every existing CR with the legacy
+	// combination becomes un-updatable the moment an operator runs
+	// `kubectl annotate`.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	old := newBackend()
+	old.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	old.Spec.Endpoint = "legacy.example:9000"
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+
+	// Same offending fields; only an unrelated label change.
+	newCB := old.DeepCopy()
+	if newCB.Labels == nil {
+		newCB.Labels = map[string]string{}
+	}
+	newCB.Labels["edited"] = "true"
+
+	if _, err := v.ValidateUpdate(context.Background(), old, newCB); err != nil {
+		t.Fatalf("unrelated update on pre-existing CR rejected: %v", err)
+	}
+}
+
+func TestValidator_EndpointOnManagedType_UpdateThatWorsensIsRejected(t *testing.T) {
+	// The diff-only semantics must not turn into a loophole: if the
+	// update *changes* the bad value (different invalid endpoint), the
+	// error key differs and the new violation is rejected. The locked
+	// rule still bites when the operator actively edits the bad field.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	old := newBackend()
+	old.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	old.Spec.Endpoint = "legacy.example:9000"
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+
+	newCB := old.DeepCopy()
+	newCB.Spec.Endpoint = "freshly-typed.example:8080" // different bad value
+
+	requireUpdateInvalidWithCause(t, v, old, newCB, "spec.endpoint",
+		"spec.endpoint is only valid when spec.type=External")
+}
+
+func TestValidator_EndpointOnManagedType_UpdateThatIntroducesViolationIsRejected(t *testing.T) {
+	// If the old CR was clean (no spec.endpoint on a managed type) and
+	// the update adds one, the violation is freshly introduced — reject.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	old := newBackend()
+	old.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+
+	newCB := old.DeepCopy()
+	newCB.Spec.Endpoint = "user-supplied.example:8080"
+
+	requireUpdateInvalidWithCause(t, v, old, newCB, "spec.endpoint",
 		"spec.endpoint is only valid when spec.type=External")
 }
 
@@ -222,21 +313,23 @@ func TestValidator_CrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
 }
 
 func TestValidator_CrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "shared-cache.team-b.svc.cluster.local"
 	cb.Spec.AllowCrossNamespace = true
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("External cross-namespace endpoint with opt-in rejected: %v", err)
 	}
 }
 
 func TestValidator_SameNamespaceEndpointAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("same-namespace endpoint rejected: %v", err)
 	}
@@ -245,10 +338,11 @@ func TestValidator_SameNamespaceEndpointAdmitted(t *testing.T) {
 func TestValidator_ExternalHostnamePassesThrough(t *testing.T) {
 	// External hostnames are not in-cluster Service DNS — the cross-namespace
 	// rule has no namespace to compare against and must let them through.
-	v := &CacheBackendValidator{}
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "https://cache.example.com:443/api"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("external hostname rejected: %v", err)
 	}
@@ -347,13 +441,62 @@ func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 	}}
 }
 
-// stubRegistry returns a Registry with only the stub vLLM+LMCache adapter
+// stubExternalAdapter mirrors the real External adapter's Supports gate
+// (vllm-only). Used by validator tests so admission of an External CR
+// runs through the registry the same way production does — without
+// dragging in the real adapter package and its enginewire dependency
+// from a unit-test file.
+type stubExternalAdapter struct{}
+
+func (stubExternalAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1alpha1.CacheBackend) bool {
+	if cb == nil {
+		return false
+	}
+	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal
+}
+
+func (stubExternalAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
+}
+func (stubExternalAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+func (stubExternalAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+func (stubExternalAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, nil
+}
+func (stubExternalAdapter) SupportedPairs() []adapterruntime.SupportedPair {
+	return []adapterruntime.SupportedPair{{
+		Runtime: adapterruntime.RuntimeVLLM,
+		Backend: cachev1alpha1.CacheBackendTypeExternal,
+	}}
+}
+
+// stubRegistry returns a Registry with the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
 // adapterruntime.DefaultRegistry() composition, so they keep passing if a
-// future adapter joins or leaves the default set.
+// future adapter joins or leaves the default set. An External-specific
+// runtime adapter is added by stubRegistryWithExternal so tests that
+// exercise admission of External CRs run against both adapters the
+// production wiring registers.
 func stubRegistry() *adapterruntime.Registry {
 	r := adapterruntime.NewRegistry()
 	r.Register(stubVLLMLMCacheAdapter{})
+	return r
+}
+
+// stubRegistryWithExternal mirrors the production cmd/controller wiring:
+// the stub managed-LMCache adapter PLUS a stub External adapter that
+// supports the same (vllm, External) pair the real External adapter
+// supports. Tests of admission's External-with-supported-engine and
+// External-with-unsupported-engine branches use this so they assert
+// against the registry composition the running controller actually
+// sees, rather than the bare stubRegistry that omits External.
+func stubRegistryWithExternal() *adapterruntime.Registry {
+	r := stubRegistry()
+	r.Register(stubExternalAdapter{})
 	return r
 }
 
@@ -471,12 +614,12 @@ func TestValidator_RuntimeAdapter_EmptyTypeSkipsCheck(t *testing.T) {
 	}
 }
 
-func TestValidator_RuntimeAdapter_ExternalSkipsCheck(t *testing.T) {
-	// External backends are pre-existing services the controller mirrors
-	// to status — they never reach the adapter registry at reconcile, so
-	// admission must not reject them for "no adapter". The endpoint rule
-	// (and the cross-namespace rule) still apply.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+func TestValidator_RuntimeAdapter_ExternalWithSupportedEngineAdmitted(t *testing.T) {
+	// External flows through the adapter registry the same way managed
+	// types do (the pod webhook needs to find an adapter to wire engine
+	// pods to the operator-supplied endpoint). vLLM is the engine the
+	// External adapter supports today, so the pair must admit.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
@@ -484,6 +627,21 @@ func TestValidator_RuntimeAdapter_ExternalSkipsCheck(t *testing.T) {
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("External with engine=vllm rejected by C7: %v", err)
 	}
+}
+
+func TestValidator_RuntimeAdapter_ExternalWithUnsupportedEngineRejected(t *testing.T) {
+	// External + sglang is admittable on shape (endpoint present, type set)
+	// but no adapter in the registry handles that pair, so the pod webhook
+	// would fail-open and never inject — the engine boots un-wired to the
+	// external cache. Reject at admission with a useful error instead of
+	// letting the silent miss happen.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	requireInvalidWithCause(t, v, cb, "spec.integration.engine",
+		"backend=\"External\"")
 }
 
 func TestValidator_RuntimeAdapter_UpdateAlsoChecks(t *testing.T) {
