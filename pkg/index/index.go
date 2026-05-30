@@ -930,8 +930,15 @@ type Snapshot struct {
 // internal/controller/cacheindex_controller.go). LastEventAt is the zero
 // time when the replica holds no prefix entries — interpret a zero value as
 // "no KV event observed yet" rather than "epoch."
+//
+// Tenant is the tenant_id the subscriber reported with the replica. The
+// subscriber sidecar derives it from POD_NAMESPACE, so for the in-cluster
+// path it equals the engine pod's namespace and lets a controller-side
+// consumer scope a pod lookup. Empty when the replica is only known through
+// older code paths that did not carry tenant context.
 type ReplicaSnapshot struct {
 	ReplicaID        string    `json:"replicaId"`
+	Tenant           string    `json:"tenant,omitempty"`
 	CacheMemoryBytes int64     `json:"cacheMemoryBytes"`
 	HitRate          float32   `json:"hitRate"`
 	Pressure         float32   `json:"pressure"`
@@ -956,10 +963,12 @@ func (i *Index) Snapshot() Snapshot {
 
 	type tenantReplica struct{ tenant, replica string }
 	latestByReplica := make(map[string]statEntry)
+	tenantByReplica := make(map[string]string) // replicaID → tenant of most-recent statEntry
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
 		if cur, ok := latestByReplica[sk.replicaID]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[sk.replicaID] = s
+			tenantByReplica[sk.replicaID] = sk.tenant
 		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
@@ -971,13 +980,15 @@ func (i *Index) Snapshot() Snapshot {
 	// prefix map (not the stats map) so the projection reflects what the
 	// replica actually holds, not just whether its stats are alive. A replica
 	// that only ever reported stats but no prefixes will show PrefixCount=0
-	// and LastEventAt=zero.
+	// and LastEventAt=zero. Also captures tenant (from the prefixKey) as a
+	// fallback for the per-replica Tenant field — a replica with no stats
+	// entry still has its tenant identifiable via the prefix it holds.
 	type replicaPrefixAgg struct {
 		count       int
 		lastEventAt time.Time
 	}
 	prefixByReplica := make(map[string]*replicaPrefixAgg)
-	for _, replicas := range i.prefixes {
+	for key, replicas := range i.prefixes {
 		for id, e := range replicas {
 			a := prefixByReplica[id]
 			if a == nil {
@@ -987,6 +998,9 @@ func (i *Index) Snapshot() Snapshot {
 			a.count++
 			if e.lastSeen.After(a.lastEventAt) {
 				a.lastEventAt = e.lastSeen
+			}
+			if _, hasStats := tenantByReplica[id]; !hasStats {
+				tenantByReplica[id] = key.tenant
 			}
 		}
 	}
@@ -1006,6 +1020,7 @@ func (i *Index) Snapshot() Snapshot {
 	for id := range seen {
 		var r ReplicaSnapshot
 		r.ReplicaID = id
+		r.Tenant = tenantByReplica[id]
 		if s, ok := latestByReplica[id]; ok {
 			r.CacheMemoryBytes = s.stats.CacheMemoryBytes
 			r.HitRate = s.stats.HitRate

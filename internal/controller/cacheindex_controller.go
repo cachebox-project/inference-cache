@@ -6,12 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +52,8 @@ type CacheIndexPoller struct {
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Start runs the refresh loop until ctx is done. Satisfies manager.Runnable.
 func (p *CacheIndexPoller) Start(ctx context.Context) error {
@@ -133,18 +134,28 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 }
 
 // refreshCacheBackendParticipation projects the cluster-wide snapshot into each
-// CacheBackend's status.indexParticipation. Matching: a replica belongs to
-// CacheBackend X when its `replica_id` has the prefix `X.metadata.name + "-"`.
+// CacheBackend's status.indexParticipation. Attribution rules:
 //
-// The "Deployment-name prefix" rule is set by the kvevent-subscriber sidecar
-// injected via the pod webhook (`replica_id = <pod-name>`, where the pod's
-// owning Deployment name equals the CacheBackend name). If a future change
-// shifts replica identity to a label-selector model, this matcher and the
-// subscriber-sidecar identity convention must move together.
+//   - The subscriber sidecar runs inside the engine pod and reports
+//     replica_id=<pod-name>, tenant_id=<pod-namespace>. The CacheBackend
+//     points at the same engine pod via spec.engineSelector.matchLabels.
+//     So: look up the engine pod by (replica.Tenant, replica.ReplicaID),
+//     then attribute to every CacheBackend in that namespace whose
+//     EngineSelector matches the pod's labels.
+//   - A replica with no engine pod found (pod was deleted between events
+//     and now) is dropped — its contributions only show up in the
+//     cluster-wide CacheIndex.
+//   - A CacheBackend with no EngineSelector (or empty MatchLabels) cannot
+//     claim any replica and is skipped; otherwise EngineSelector would
+//     match every pod by vacuous truth and steal everyone else's stats.
+//   - If two CacheBackends in the same namespace both select the same
+//     engine pod, the replica is attributed to BOTH — the operator is
+//     free to overlap selectors and each backend's status reflects what
+//     it sees.
 //
-// Per-replica HitRate stays nil until the stats reporter starts emitting
-// per-replica hit_rate into the index — surfacing a fabricated 0 here would
-// mislead operators into thinking the backend served traffic with 0% hit rate.
+// Per-replica HitRate stays nil until the snapshot carries an explicit
+// presence bit for it (planned with the stats-reporter follow-up).
+// Surfacing a fabricated 0 here would mislead operators.
 func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap index.Snapshot) error {
 	var backends cachev1alpha1.CacheBackendList
 	if err := p.Client.List(ctx, &backends); err != nil {
@@ -154,89 +165,91 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		return nil
 	}
 
-	// CacheBackends are namespaced; replica_id is just the pod name (no
-	// namespace, by the sidecar identity convention), so two CacheBackends
-	// with the same metadata.name in different namespaces would each match
-	// the same replicas — we can't disambiguate. Detect this and skip those
-	// names entirely (preserve any existing status — fail-soft). Once the
-	// replica-identity scheme encodes namespace, this guard can drop.
-	type backendRef struct {
-		idx       int
-		ambiguous bool
-	}
-	byName := make(map[string]*backendRef, len(backends.Items))
+	// Group CacheBackends by namespace for fast scoped iteration. A backend
+	// with no EngineSelector or empty MatchLabels is skipped entirely (so an
+	// operator who hasn't selected anything doesn't accidentally claim all
+	// replicas in their namespace).
+	backendsByNS := make(map[string][]int)
 	for i := range backends.Items {
-		n := backends.Items[i].Name
-		if ref, ok := byName[n]; ok {
-			ref.ambiguous = true
+		cb := &backends.Items[i]
+		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
 			continue
 		}
-		byName[n] = &backendRef{idx: i}
+		backendsByNS[cb.Namespace] = append(backendsByNS[cb.Namespace], i)
 	}
-	for n, ref := range byName {
-		if ref.ambiguous {
-			p.logger(ctx).Info("ambiguous CacheBackend name across namespaces; skipping indexParticipation projection",
-				"name", n)
-		}
-	}
-
-	// Sort backend names by descending length so longest-prefix-first matching
-	// disambiguates names that are prefixes of each other (e.g. "cb" vs "cb-a"):
-	// without this, replica id "cb-a-0" would be claimed by "cb" instead of
-	// "cb-a". Unambiguous names only — ambiguous ones are excluded so they
-	// neither steal replicas nor get projected. Unowned replicas (no backend
-	// name is a prefix) are silently dropped — they only show up in the
-	// cluster-wide CacheIndex.
-	names := make([]string, 0, len(byName))
-	for n, ref := range byName {
-		if ref.ambiguous {
-			continue
-		}
-		names = append(names, n)
-	}
-	sort.Slice(names, func(a, b int) bool { return len(names[a]) > len(names[b]) })
 
 	type agg struct {
 		prefixCount int64
 		lastEventAt time.Time
 	}
-	// Seed perBackend with every unambiguous backend (including ones with no
-	// matching replicas) so a successful snapshot that drains a backend's
-	// replicas publishes prefixCount=0 instead of leaving stale positive
-	// state behind. Backends with no observed replicas this tick land in
-	// the "zero participation" bucket — semantically "no warm prefixes
-	// right now", consistent with the printer column showing 0.
-	perBackend := make(map[string]*agg, len(names))
-	for _, n := range names {
-		perBackend[n] = &agg{}
-	}
-	for _, r := range snap.Replicas {
-		owner := ""
-		for _, n := range names {
-			if strings.HasPrefix(r.ReplicaID, n+"-") {
-				owner = n
-				break
-			}
+	// Seed perBackend with every selectable CacheBackend (including ones
+	// with no matching replicas this tick) so a successful snapshot that
+	// drains a backend's replicas publishes prefixCount=0 instead of
+	// leaving stale positive state behind.
+	perBackend := make(map[int]*agg, len(backends.Items))
+	for _, idxs := range backendsByNS {
+		for _, i := range idxs {
+			perBackend[i] = &agg{}
 		}
-		if owner == "" {
-			continue
-		}
-		a := perBackend[owner]
-		a.prefixCount += int64(r.PrefixCount)
-		if r.LastEventAt.After(a.lastEventAt) {
-			a.lastEventAt = r.LastEventAt
-		}
-		// HitRate is intentionally NOT aggregated yet. The snapshot's
-		// per-replica hitRate is a float32 with no presence bit, so a real
-		// "served traffic with 0% hit rate" is indistinguishable from "no
-		// value reported." Surfacing a value would bias the aggregate
-		// upward as soon as a single non-zero replica appears. The status
-		// field stays nil until the snapshot carries an explicit presence
-		// signal (planned for the stats-reporter follow-up).
 	}
 
-	for name, a := range perBackend {
-		cb := &backends.Items[byName[name].idx]
+	// Pod-label lookup cache for the duration of this tick: a single engine
+	// pod can host many replicas/prefixes across (model, hash_scheme) and
+	// always presents the same labels, so we never need more than one Get
+	// per (namespace, pod-name) per tick.
+	type podKey struct{ ns, name string }
+	podLabels := make(map[podKey]map[string]string)
+	missingPods := make(map[podKey]struct{})
+
+	for _, r := range snap.Replicas {
+		if r.Tenant == "" || r.ReplicaID == "" {
+			continue
+		}
+		nsBackends := backendsByNS[r.Tenant]
+		if len(nsBackends) == 0 {
+			continue
+		}
+		key := podKey{r.Tenant, r.ReplicaID}
+		if _, gone := missingPods[key]; gone {
+			continue
+		}
+		labels, ok := podLabels[key]
+		if !ok {
+			var pod corev1.Pod
+			err := p.Client.Get(ctx, types.NamespacedName{Namespace: r.Tenant, Name: r.ReplicaID}, &pod)
+			switch {
+			case apierrors.IsNotFound(err):
+				// Replica's engine pod is gone — common after a scale-down.
+				// Skip attribution (the cluster-wide CacheIndex still
+				// reflects the data until TTL eviction).
+				missingPods[key] = struct{}{}
+				continue
+			case err != nil:
+				// Transient API error: log + skip this replica only; don't
+				// poison the rest of the tick.
+				p.logger(ctx).V(1).Info("lookup engine pod for replica attribution failed; skipping",
+					"namespace", r.Tenant, "name", r.ReplicaID, "err", err.Error())
+				missingPods[key] = struct{}{}
+				continue
+			}
+			labels = pod.Labels
+			podLabels[key] = labels
+		}
+		for _, i := range nsBackends {
+			cb := &backends.Items[i]
+			if !matchLabelsSelects(cb.Spec.EngineSelector.MatchLabels, labels) {
+				continue
+			}
+			a := perBackend[i]
+			a.prefixCount += int64(r.PrefixCount)
+			if r.LastEventAt.After(a.lastEventAt) {
+				a.lastEventAt = r.LastEventAt
+			}
+		}
+	}
+
+	for i, a := range perBackend {
+		cb := &backends.Items[i]
 		desired := &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: a.prefixCount}
 		if !a.lastEventAt.IsZero() {
 			t := metav1.NewTime(a.lastEventAt)
@@ -256,6 +269,22 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		}
 	}
 	return nil
+}
+
+// matchLabelsSelects mirrors the metav1.LabelSelector MatchLabels semantics:
+// every (k,v) in want must appear in have. Empty `want` returns false to
+// match the caller's "no selector ⇒ no claim" guard (so a selector that
+// accidentally got cleared in flight doesn't suddenly claim every pod).
+func matchLabelsSelects(want, have map[string]string) bool {
+	if len(want) == 0 {
+		return false
+	}
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // participationEqual is the no-churn guard: skip the Status().Patch when the

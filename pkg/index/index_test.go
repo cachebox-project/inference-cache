@@ -257,6 +257,13 @@ func TestSnapshotAggregates(t *testing.T) {
 		t.Fatalf("lastEventAt should be set after Ingest: %+v / %+v",
 			snap.Replicas[0].LastEventAt, snap.Replicas[1].LastEventAt)
 	}
+	// Tenant is the namespace the subscriber sidecar reports; the controller
+	// uses it to scope engine-pod lookups when attributing replicas to
+	// CacheBackends. Must reflect the Ingest's Tenant field.
+	if snap.Replicas[0].Tenant != "tenant-a" || snap.Replicas[1].Tenant != "tenant-b" {
+		t.Fatalf("tenants on replicas = %q / %q, want tenant-a / tenant-b",
+			snap.Replicas[0].Tenant, snap.Replicas[1].Tenant)
+	}
 	// Tenants sorted by id; tenant-a counts replica-a once despite two reports.
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)

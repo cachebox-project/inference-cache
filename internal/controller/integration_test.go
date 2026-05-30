@@ -726,30 +726,45 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 
 // TestIntegrationCacheIndexPollerProjectsParticipation exercises the poller
 // against a real apiserver to confirm that Status().Patch on CacheBackend
-// applies the indexParticipation projection, and that a steady snapshot does
-// not churn the backend's resourceVersion (the no-churn invariant under real
-// apiserver defaulting). Catches the class of bug a fake client misses — the
-// fake client skips apiserver defaulting that can flip semantic equality on
-// round-trip and cause spurious writes.
+// applies the indexParticipation projection (pod-label-based attribution),
+// and that a steady snapshot does not churn the backend's resourceVersion
+// (the no-churn invariant under real apiserver defaulting). Catches the
+// class of bug a fake client misses — the fake client skips apiserver
+// defaulting that can flip semantic equality on round-trip and cause
+// spurious writes.
 func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, _, _ := startEnv(t)
 	ctx := context.Background()
 	ns := freshNS(t, k8s)
 
-	// Seed two CacheBackends that the projection will own. We deliberately use
-	// plain (External-typed) fixtures so the CacheBackend reconciler is NOT
-	// running and we are testing the poller's Status().Patch in isolation.
-	for _, name := range []string{"backend-a", "backend-b"} {
-		cb := &cachev1alpha1.CacheBackend{
+	// Seed two CacheBackends with EngineSelectors plus an engine pod each.
+	// External type keeps the CacheBackend reconciler out of the picture —
+	// we are testing the poller's Status().Patch in isolation.
+	mkBackend := func(name string, selector map[string]string) *cachev1alpha1.CacheBackend {
+		return &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type:     cachev1alpha1.CacheBackendTypeExternal,
-				Endpoint: "external.example:6379",
+				Type:           cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint:       "external.example:6379",
+				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 			},
 		}
-		if err := k8s.Create(ctx, cb); err != nil {
-			t.Fatalf("create CacheBackend %s: %v", name, err)
+	}
+	mkPod := func(name string, labels map[string]string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "vllm", Image: "vllm/vllm-openai:latest"}}},
+		}
+	}
+	for _, obj := range []client.Object{
+		mkBackend("backend-a", map[string]string{"app": "vllm-a"}),
+		mkBackend("backend-b", map[string]string{"app": "vllm-b"}),
+		mkPod("vllm-a-0", map[string]string{"app": "vllm-a"}),
+		mkPod("vllm-b-0", map[string]string{"app": "vllm-b"}),
+	} {
+		if err := k8s.Create(ctx, obj); err != nil {
+			t.Fatalf("create %T %s: %v", obj, obj.GetName(), err)
 		}
 	}
 
@@ -757,8 +772,8 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 4, LastEventAt: tEvent},
-			{ReplicaID: "backend-b-0", PrefixCount: 1, LastEventAt: tEvent},
+			{ReplicaID: "vllm-a-0", Tenant: ns, PrefixCount: 4, LastEventAt: tEvent},
+			{ReplicaID: "vllm-b-0", Tenant: ns, PrefixCount: 1, LastEventAt: tEvent},
 		},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -177,19 +179,26 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 	}
 }
 
-// buildPollerWithBackends spins up a fake client + httptest server and returns
-// a poller wired to both. The served Snapshot is read under the supplied mutex.
-func buildPollerWithBackends(t *testing.T, backends []*cachev1alpha1.CacheBackend, served *index.Snapshot, mu *sync.Mutex) (*CacheIndexPoller, client.Client, *httptest.Server) {
+// buildPollerWithFixtures spins up a fake client + httptest server and returns
+// a poller wired to both. CacheBackends and engine pods are pre-loaded; the
+// served Snapshot is read under the supplied mutex.
+func buildPollerWithFixtures(t *testing.T, backends []*cachev1alpha1.CacheBackend, enginePods []*corev1.Pod, served *index.Snapshot, mu *sync.Mutex) (*CacheIndexPoller, client.Client, *httptest.Server) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
+	}
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
 	}
 	builder := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&cachev1alpha1.CacheIndex{}, &cachev1alpha1.CacheBackend{})
 	for _, cb := range backends {
 		builder = builder.WithObjects(cb)
+	}
+	for _, pod := range enginePods {
+		builder = builder.WithObjects(pod)
 	}
 	cl := builder.Build()
 
@@ -202,9 +211,27 @@ func buildPollerWithBackends(t *testing.T, backends []*cachev1alpha1.CacheBacken
 	return p, cl, srv
 }
 
-func cbFixture(name, ns string) *cachev1alpha1.CacheBackend {
+// cbFixture builds a CacheBackend whose EngineSelector picks engine pods with
+// the supplied labels. The match-labels must be non-empty: the poller refuses
+// to attribute to backends without an EngineSelector, mirroring the "no
+// selector ⇒ no claim" guard in matchLabelsSelects.
+func cbFixture(name, ns string, selectorLabels map[string]string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selectorLabels},
+		},
+	}
+}
+
+// enginePod builds an engine Pod the kvevent-subscriber sidecar would attach
+// to: the subscriber reports replica_id=<pod-name>, tenant_id=<pod-namespace>,
+// so the poller looks the pod up by that (namespace, name) and matches its
+// labels against each CacheBackend.Spec.EngineSelector.
+func enginePod(name, ns string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "vllm", Image: "vllm/vllm-openai:latest"}}},
 	}
 }
 
@@ -217,12 +244,16 @@ func getBackendDirect(t *testing.T, cl client.Client, name, ns string) *cachev1a
 	return &cb
 }
 
-// TestRefreshProjectsParticipationPerBackend (happy path): two CacheBackends,
-// a snapshot with replicas owned by each → indexParticipation reflects the
-// per-backend sum/max.
+// TestRefreshProjectsParticipationPerBackend (happy path): two CacheBackends
+// select engine pods via distinct EngineSelector labels; the snapshot reports
+// per-replica prefix counts; indexParticipation reflects the per-backend
+// sum/max after the poller resolves each replica to its engine pod.
 func TestRefreshProjectsParticipationPerBackend(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
-	cbB := cbFixture("backend-b", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	cbB := cbFixture("backend-b", "default", map[string]string{"app": "vllm-b"})
+	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
+	podA1 := enginePod("vllm-a-1", "default", map[string]string{"app": "vllm-a"})
+	podB0 := enginePod("vllm-b-0", "default", map[string]string{"app": "vllm-b"})
 
 	t1 := time.Unix(1_700_000_000, 0).UTC()
 	t2 := time.Unix(1_700_000_500, 0).UTC()
@@ -232,12 +263,15 @@ func TestRefreshProjectsParticipationPerBackend(t *testing.T) {
 	served := index.Snapshot{
 		TotalPrefixes: 6,
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 2, LastEventAt: t1},
-			{ReplicaID: "backend-a-1", PrefixCount: 3, LastEventAt: t2},
-			{ReplicaID: "backend-b-0", PrefixCount: 1, LastEventAt: t3},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: t1},
+			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, LastEventAt: t2},
+			{ReplicaID: "vllm-b-0", Tenant: "default", PrefixCount: 1, LastEventAt: t3},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA, cbB}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA, cbB},
+		[]*corev1.Pod{podA0, podA1, podB0},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
@@ -268,20 +302,24 @@ func TestRefreshProjectsParticipationPerBackend(t *testing.T) {
 }
 
 // TestRefreshNoEventsForBackendPublishesZeroParticipation: a CacheBackend with
-// no matching replicas in a SUCCESSFUL snapshot must have indexParticipation
-// published as {prefixCount: 0, lastEventAt: nil} — semantically "I'm visible
-// but holding no warm prefixes right now." A scrape-failure scenario keeps
-// existing state (see TestRefreshScrapeFailureDoesNotClearParticipation).
+// no matching engine pods must have indexParticipation published as
+// {prefixCount: 0, lastEventAt: nil} — semantically "I'm visible but holding
+// no warm prefixes right now."
 func TestRefreshNoEventsForBackendPublishesZeroParticipation(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
-	cbQuiet := cbFixture("backend-quiet", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	cbQuiet := cbFixture("backend-quiet", "default", map[string]string{"app": "vllm-quiet"})
+	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
+
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 1, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 1, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA, cbQuiet}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA, cbQuiet},
+		[]*corev1.Pod{podA},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
@@ -309,15 +347,19 @@ func TestRefreshNoEventsForBackendPublishesZeroParticipation(t *testing.T) {
 // matching replicas must reset prefixCount to 0 (and clear lastEventAt).
 // Otherwise the operator sees stale "still contributing" state forever.
 func TestRefreshClearsStaleParticipationOnReplicaDrain(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
 	tEvent := time.Unix(1_700_000_000, 0).UTC()
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 5, LastEventAt: tEvent},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 5, LastEventAt: tEvent},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA},
+		[]*corev1.Pod{podA},
+		&served, &mu)
 	defer srv.Close()
 	ctx := context.Background()
 
@@ -345,54 +387,60 @@ func TestRefreshClearsStaleParticipationOnReplicaDrain(t *testing.T) {
 	}
 }
 
-// TestRefreshAmbiguousBackendNameSkipsProjection: two CacheBackends share a
-// metadata.name across namespaces, so neither can be safely attributed via
-// the replica-id prefix matcher. Both must keep status.indexParticipation
-// nil (the controller logs the ambiguity and bails). A non-conflicting third
-// backend still gets projected normally.
-func TestRefreshAmbiguousBackendNameSkipsProjection(t *testing.T) {
-	cbDup1 := cbFixture("backend-a", "ns-1")
-	cbDup2 := cbFixture("backend-a", "ns-2")
-	cbUnique := cbFixture("backend-b", "ns-1")
+// TestRefreshSameNameDifferentNamespaceAttributesByLabel: two CacheBackends
+// share a metadata.name across namespaces but each lives in its own
+// namespace and matches its own engine pods. Each must see only its own
+// namespace's replicas — namespace scoping prevents cross-tenant bleed.
+func TestRefreshSameNameDifferentNamespaceAttributesByLabel(t *testing.T) {
+	cbNS1 := cbFixture("backend-a", "ns-1", map[string]string{"app": "vllm"})
+	cbNS2 := cbFixture("backend-a", "ns-2", map[string]string{"app": "vllm"})
+	podNS1 := enginePod("vllm-0", "ns-1", map[string]string{"app": "vllm"})
+	podNS2 := enginePod("vllm-0", "ns-2", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-			{ReplicaID: "backend-b-0", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-0", Tenant: "ns-1", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-0", Tenant: "ns-2", PrefixCount: 5, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbDup1, cbDup2, cbUnique}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbNS1, cbNS2},
+		[]*corev1.Pod{podNS1, podNS2},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 
-	for _, ns := range []string{"ns-1", "ns-2"} {
-		got := getBackendDirect(t, cl, "backend-a", ns)
-		if got.Status.IndexParticipation != nil {
-			t.Fatalf("backend-a/%s should be skipped due to name collision, got %+v", ns, got.Status.IndexParticipation)
-		}
+	got1 := getBackendDirect(t, cl, "backend-a", "ns-1")
+	if got1.Status.IndexParticipation == nil || got1.Status.IndexParticipation.PrefixCount != 2 {
+		t.Fatalf("ns-1 backend-a participation = %+v, want prefixCount 2", got1.Status.IndexParticipation)
 	}
-	gotB := getBackendDirect(t, cl, "backend-b", "ns-1")
-	if gotB.Status.IndexParticipation == nil || gotB.Status.IndexParticipation.PrefixCount != 3 {
-		t.Fatalf("backend-b should still be projected, got %+v", gotB.Status.IndexParticipation)
+	got2 := getBackendDirect(t, cl, "backend-a", "ns-2")
+	if got2.Status.IndexParticipation == nil || got2.Status.IndexParticipation.PrefixCount != 5 {
+		t.Fatalf("ns-2 backend-a participation = %+v, want prefixCount 5", got2.Status.IndexParticipation)
 	}
 }
 
-// TestRefreshIgnoresUnownedReplicas: a snapshot replica whose id doesn't
-// prefix-match any backend must be silently dropped — no panic, and other
-// backends still update.
-func TestRefreshIgnoresUnownedReplicas(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
+// TestRefreshDeletedEnginePodSkipsAttribution: a replica reported in the
+// snapshot whose engine pod no longer exists (drained pod, TTL not yet hit)
+// must be silently skipped — other backends still update.
+func TestRefreshDeletedEnginePodSkipsAttribution(t *testing.T) {
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
+	// vllm-a-1 reported in snapshot but no corresponding pod fixture.
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-			{ReplicaID: "orphan-7", PrefixCount: 99, LastEventAt: time.Unix(1_700_000_999, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 99, LastEventAt: time.Unix(1_700_000_999, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA},
+		[]*corev1.Pod{podA0},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
@@ -400,7 +448,42 @@ func TestRefreshIgnoresUnownedReplicas(t *testing.T) {
 	}
 	a := getBackendDirect(t, cl, "backend-a", "default")
 	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 2 {
-		t.Fatalf("backend-a should ignore orphan replica; got participation %+v", a.Status.IndexParticipation)
+		t.Fatalf("backend-a should ignore missing-pod replica; got %+v", a.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshBackendWithNoEngineSelectorSkipped: a CacheBackend without an
+// EngineSelector (or with empty MatchLabels) must NOT receive any attribution
+// — otherwise a misconfigured backend would silently claim every replica in
+// its namespace by vacuous truth.
+func TestRefreshBackendWithNoEngineSelectorSkipped(t *testing.T) {
+	cbNoSelector := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-selector", Namespace: "default"},
+	}
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbNoSelector, cbA},
+		[]*corev1.Pod{podA},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	no := getBackendDirect(t, cl, "no-selector", "default")
+	if no.Status.IndexParticipation != nil {
+		t.Fatalf("backend with no EngineSelector must not be projected, got %+v", no.Status.IndexParticipation)
+	}
+	a := getBackendDirect(t, cl, "backend-a", "default")
+	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 2 {
+		t.Fatalf("backend-a participation = %+v, want prefixCount 2", a.Status.IndexParticipation)
 	}
 }
 
@@ -408,14 +491,18 @@ func TestRefreshIgnoresUnownedReplicas(t *testing.T) {
 // identical snapshots must produce exactly one CacheBackend status write —
 // asserted via resource-version stability on the second tick.
 func TestRefreshNoChurnOnIdenticalSnapshot(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA},
+		[]*corev1.Pod{podA},
+		&served, &mu)
 	defer srv.Close()
 	ctx := context.Background()
 
@@ -438,15 +525,20 @@ func TestRefreshNoChurnOnIdenticalSnapshot(t *testing.T) {
 // follow-up adds a presence signal to the snapshot, status.indexParticipation
 // .hitRate stays nil regardless of replica values.
 func TestRefreshHitRateStaysNil(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
+	podA1 := enginePod("vllm-a-1", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 2, HitRate: 0.75, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-			{ReplicaID: "backend-a-1", PrefixCount: 3, HitRate: 0.85, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, HitRate: 0.75, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, HitRate: 0.85, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA},
+		[]*corev1.Pod{podA0, podA1},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
@@ -465,14 +557,18 @@ func TestRefreshHitRateStaysNil(t *testing.T) {
 // indexParticipation is published, a failing /snapshot scrape must NOT
 // clear it. Tested by seeding a status, then closing the server.
 func TestRefreshScrapeFailureDoesNotClearParticipation(t *testing.T) {
-	cbA := cbFixture("backend-a", "default")
+	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
+	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "backend-a-0", PrefixCount: 7, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 7, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbA}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbA},
+		[]*corev1.Pod{podA},
+		&served, &mu)
 
 	// Publish the initial projection, then take the server down so the next
 	// tick fails the scrape.
@@ -494,34 +590,34 @@ func TestRefreshScrapeFailureDoesNotClearParticipation(t *testing.T) {
 	}
 }
 
-// TestRefreshLongestPrefixWinsOnAmbiguousNames: backends "cb" and "cb-a"
-// — a replica named "cb-a-0" must be attributed to "cb-a", not "cb",
-// otherwise the strings.HasPrefix matcher's longest-first ordering is broken.
-func TestRefreshLongestPrefixWinsOnAmbiguousNames(t *testing.T) {
-	cbShort := cbFixture("cb", "default")
-	cbLong := cbFixture("cb-a", "default")
+// TestRefreshOverlappingSelectorsAttributeToBoth: two CacheBackends with
+// overlapping EngineSelector that both match the same engine pod each get
+// the replica's contribution — the operator can intentionally overlap
+// selectors and each backend's status reflects what it sees.
+func TestRefreshOverlappingSelectorsAttributeToBoth(t *testing.T) {
+	cbStrict := cbFixture("strict", "default", map[string]string{"app": "vllm", "model": "llama"})
+	cbLoose := cbFixture("loose", "default", map[string]string{"app": "vllm"})
+	podMatch := enginePod("vllm-0", "default", map[string]string{"app": "vllm", "model": "llama"})
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "cb-a-0", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
-	p, cl, srv := buildPollerWithBackends(t, []*cachev1alpha1.CacheBackend{cbShort, cbLong}, &served, &mu)
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbStrict, cbLoose},
+		[]*corev1.Pod{podMatch},
+		&served, &mu)
 	defer srv.Close()
 
 	if err := p.refresh(context.Background()); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	short := getBackendDirect(t, cl, "cb", "default")
-	if short.Status.IndexParticipation == nil {
-		t.Fatal("short-name backend should still get an empty zero-state participation written")
-	}
-	if short.Status.IndexParticipation.PrefixCount != 0 {
-		t.Fatalf("short-name backend should not steal replica from cb-a, got prefixCount %d", short.Status.IndexParticipation.PrefixCount)
-	}
-	long := getBackendDirect(t, cl, "cb-a", "default")
-	if long.Status.IndexParticipation == nil || long.Status.IndexParticipation.PrefixCount != 3 {
-		t.Fatalf("cb-a participation = %+v, want prefixCount 3", long.Status.IndexParticipation)
+	for _, name := range []string{"strict", "loose"} {
+		got := getBackendDirect(t, cl, name, "default")
+		if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 4 {
+			t.Fatalf("%s participation = %+v, want prefixCount 4", name, got.Status.IndexParticipation)
+		}
 	}
 }
 
