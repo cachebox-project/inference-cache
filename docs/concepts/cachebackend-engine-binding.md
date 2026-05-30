@@ -59,7 +59,7 @@ A single CacheBackend with a matching engine Deployment. The label `app: qwen-de
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
-  name: qwen-demo
+  name: qwen-demo-cache       # <-- CR name; deliberately distinct from the engine Deployment name (see note below)
 spec:
   type: LMCache
   integration:
@@ -67,14 +67,14 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: qwen-demo          # <-- selector key/value (1 of 2)
+      app: qwen-demo          # <-- selector key/value (1 of 2; binding is by label, not by resource name)
   backendConfig:
     model: Qwen/Qwen2.5-0.5B-Instruct
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen-demo
+  name: qwen-engine           # <-- engine Deployment name; must differ from the CR name above (the controller reconciles the CR into an lmcache-server Deployment whose name equals the CR's name, so sharing names would collide on Create)
 spec:
   replicas: 1
   selector:

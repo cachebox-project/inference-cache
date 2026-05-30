@@ -11,11 +11,18 @@
 # See docs/concepts/cachebackend-engine-binding.md for the lifecycle and
 # the failure-mode table.
 #
+# Resource naming: the CR is `qwen-demo-cache` and the engine Deployment
+# is `qwen-engine`. They are deliberately named differently because the
+# controller reconciles the CR into an `lmcache-server` Deployment whose
+# name equals the CR's name — sharing the name with the engine Deployment
+# would collide on Create. The label `app: qwen-demo` is what does the
+# binding work, not the resource names.
+#
 # Apply both objects in one shot:
 #   kubectl apply -f config/samples/cachebackend-with-engine.yaml
 #
 # Then watch the binding land:
-#   kubectl get cachebackend qwen-demo -w
+#   kubectl get cachebackend qwen-demo-cache -w
 #   kubectl describe pod -l app=qwen-demo | grep -A1 Events
 #
 # CPU-runnable: the engine image is vLLM's dedicated CPU build, so this
@@ -29,7 +36,7 @@
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
-  name: qwen-demo
+  name: qwen-demo-cache
 spec:
   type: LMCache
   deploymentKind: Deployment
@@ -51,7 +58,7 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen-demo
+  name: qwen-engine
   labels:
     app: qwen-demo
 spec:
