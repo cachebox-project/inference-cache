@@ -391,6 +391,56 @@ func TestValidator_ExternalEndpoint_PathRejected(t *testing.T) {
 		"must be a bare host[:port]")
 }
 
+func TestValidator_ExternalEndpoint_LMSchemeOnlyRejected(t *testing.T) {
+	// `lm://` alone is just the scheme — no host. Without this check
+	// the CR admits, goes Ready=True, and the pod webhook injects
+	// LMCACHE_REMOTE_URL=lm:// (the exact broken value the validation
+	// exists to prevent).
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must include a non-empty host")
+}
+
+func TestValidator_ExternalEndpoint_PortOnlyRejected(t *testing.T) {
+	// `:8200` is a port with no host — same broken-injection risk.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = ":8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must include a non-empty host")
+}
+
+func TestValidator_ExternalEndpoint_LMSchemePortOnlyRejected(t *testing.T) {
+	// Scheme + port with no host.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must include a non-empty host")
+}
+
+func TestValidator_ExternalEndpoint_IPv6Admitted(t *testing.T) {
+	// IPv6 literals require brackets in host:port form; the validator
+	// must accept them rather than mistaking the inner colons for
+	// scheme/port separators.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "[2001:db8::1]:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("IPv6 endpoint rejected: %v", err)
+	}
+}
+
 func TestValidator_ExternalEndpoint_LMSchemeWithPathRejected(t *testing.T) {
 	// Same concern as the bare-host case; the path-after-scheme variant
 	// is just as broken.
@@ -400,7 +450,7 @@ func TestValidator_ExternalEndpoint_LMSchemeWithPathRejected(t *testing.T) {
 	cb.Spec.Endpoint = "lm://cache.example.com:8200/path"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must not include a path")
+		"must be a bare host[:port]")
 }
 
 func TestValidator_AggregatesMultipleViolations(t *testing.T) {

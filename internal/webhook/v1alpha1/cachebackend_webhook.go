@@ -465,9 +465,10 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 	// "host" because it parses everything before the first `:` as a
 	// scheme. Hand-roll the scheme check on the leading `://` separator
 	// instead.
+	rest := raw
 	if i := strings.Index(raw, "://"); i >= 0 {
 		scheme := strings.ToLower(raw[:i])
-		rest := raw[i+3:]
+		rest = raw[i+3:]
 		if scheme != "lm" {
 			return field.ErrorList{
 				field.Invalid(
@@ -477,23 +478,12 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 				),
 			}
 		}
-		// scheme=lm; rest must not carry a path/query.
-		if strings.ContainsAny(rest, "/?#") {
-			return field.ErrorList{
-				field.Invalid(
-					field.NewPath("spec", "endpoint"),
-					cb.Spec.Endpoint,
-					"spec.endpoint must not include a path, query, or fragment; LMCache is a TCP-level protocol and would silently drop them — use host[:port] only",
-				),
-			}
-		}
-		return nil
 	}
-	// No scheme — must be a bare host[:port], so reject path-like
-	// payloads. Port presence is not enforced (lmcache_server defaults
-	// to 65432, but an operator pre-flighting a service mesh may bind
-	// elsewhere).
-	if strings.ContainsAny(raw, "/?#") {
+	// rest is the host[:port] portion (after stripping the optional
+	// lm:// scheme). Reject path/query/fragment components; LMCache is
+	// a TCP-level protocol and would silently drop them at the
+	// connector.
+	if strings.ContainsAny(rest, "/?#") {
 		return field.ErrorList{
 			field.Invalid(
 				field.NewPath("spec", "endpoint"),
@@ -502,7 +492,41 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 			),
 		}
 	}
+	// Require a non-empty host. "lm://" alone, ":port", "lm://:port"
+	// all pass the prior checks but would produce LMCACHE_REMOTE_URL=
+	// lm://[:port] at injection — the exact broken value this
+	// validation exists to prevent. Strip the optional port suffix
+	// (with IPv6 bracket-aware handling) and require what remains.
+	if extractEndpointHost(rest) == "" {
+		return field.ErrorList{
+			field.Invalid(
+				field.NewPath("spec", "endpoint"),
+				cb.Spec.Endpoint,
+				"spec.endpoint must include a non-empty host (e.g. cache.example.com[:8200] or lm://cache.example.com[:8200]); a scheme or port alone is not a valid LMCache endpoint",
+			),
+		}
+	}
 	return nil
+}
+
+// extractEndpointHost returns the host portion of a host[:port] string,
+// stripping the optional :port suffix with bracket-aware IPv6 handling:
+// `[::1]:8200` → `::1`, `[::1]` → `::1`, `cache:8200` → `cache`,
+// `cache` → `cache`, `:8200` → "" (port without host).
+func extractEndpointHost(s string) string {
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "[") {
+		if end := strings.Index(s, "]"); end > 1 {
+			return s[1:end]
+		}
+		return ""
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // rejectPersistentStorageOnMemoryOnly rejects a PVC-backed storage spec on
