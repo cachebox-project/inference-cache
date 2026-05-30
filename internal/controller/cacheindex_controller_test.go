@@ -732,6 +732,157 @@ func TestRefreshAnnotationOverridesSelectorMatch(t *testing.T) {
 	}
 }
 
+// TestRefreshUsesRealisticSidecarIdentityShape is the regression guard
+// against the original bug Codex caught: the kvevent-subscriber sidecar
+// derives replica_id from the engine POD NAME (not the CacheBackend name),
+// so a CacheBackend "cache" selecting an engine Deployment "vllm" sees
+// replicas like "vllm-7d9c8b6f4-abcd" — NOT "cache-0". This test uses the
+// realistic shape so any future change that re-introduces a name-prefix
+// matcher (or any other assumption tying replica_id to the CacheBackend
+// name) will fail loudly here.
+func TestRefreshUsesRealisticSidecarIdentityShape(t *testing.T) {
+	// CacheBackend's name has NO relationship to the engine Deployment name.
+	cache := cbFixture("cache", "default", map[string]string{"app": "vllm"})
+	// Pod name shaped like a real Deployment-managed ReplicaSet pod.
+	pod := enginePod("vllm-7d9c8b6f4-abcd", "default", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-7d9c8b6f4-abcd", Tenant: "default", PrefixCount: 12, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cache},
+		[]*corev1.Pod{pod},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	got := getBackendDirect(t, cl, "cache", "default")
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 12 {
+		t.Fatalf("CacheBackend 'cache' should be attributed via EngineSelector despite replica_id 'vllm-7d9c8b6f4-abcd' not starting with 'cache-'; got %+v",
+			got.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshAnnotationPointsAtMissingBackend: the pod's injected-by
+// annotation names a CacheBackend that no longer exists (likely just
+// deleted). The poller MUST NOT fall back to selector matching — the
+// annotation reflects an explicit operator decision. Skipping leaves
+// the cluster-wide CacheIndex as the source of truth for that data.
+func TestRefreshAnnotationPointsAtMissingBackend(t *testing.T) {
+	// Selector-matched backend "other" exists; the annotation names a
+	// non-existent "gone". Without the no-fallback rule, "other" would
+	// silently inherit attribution that was explicitly assigned away.
+	other := cbFixture("other", "default", map[string]string{"app": "vllm"})
+	pod := enginePodInjectedBy("vllm-0", "default", "default", "gone", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{other},
+		[]*corev1.Pod{pod},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	got := getBackendDirect(t, cl, "other", "default")
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("annotation pointing at missing backend must not fall back to selector match, got %+v",
+			got.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshAnnotationInWrongNamespaceFallsBack: an injected-by annotation
+// that references a CacheBackend in a DIFFERENT namespace from the pod is
+// ignored (cross-namespace attribution would be misleading and would let a
+// pod in ns-A poison status of a backend in ns-B). The poller falls back
+// to in-namespace selector matching.
+func TestRefreshAnnotationInWrongNamespaceFallsBack(t *testing.T) {
+	cbLocal := cbFixture("local", "ns-pod", map[string]string{"app": "vllm"})
+	cbForeign := cbFixture("foreign", "ns-other", map[string]string{"app": "vllm"})
+	// Pod in ns-pod, annotation points at ns-other/foreign — cross-namespace.
+	pod := enginePodInjectedBy("vllm-0", "ns-pod", "ns-other", "foreign", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "ns-pod", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbLocal, cbForeign},
+		[]*corev1.Pod{pod},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	local := getBackendDirect(t, cl, "local", "ns-pod")
+	if local.Status.IndexParticipation == nil || local.Status.IndexParticipation.PrefixCount != 4 {
+		t.Fatalf("cross-namespace annotation should be ignored; ns-pod selector fallback must attribute to local, got %+v",
+			local.Status.IndexParticipation)
+	}
+	foreign := getBackendDirect(t, cl, "foreign", "ns-other")
+	// foreign has a selector so it still gets the standard zero-state
+	// write, but the cross-namespace annotation must not promote its
+	// prefixCount.
+	if foreign.Status.IndexParticipation == nil || foreign.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("cross-namespace annotation must not attribute to foreign backend, got %+v", foreign.Status.IndexParticipation)
+	}
+}
+
+// TestRefreshSelectorClearedAfterPublishingDrains: a backend with a
+// selector publishes participation, then has its EngineSelector cleared
+// (operator edit). The next tick must reset prefixCount to 0 — stale
+// positive state after a selector removal would tell operators the
+// backend is contributing when it has no claim on any pod anymore.
+func TestRefreshSelectorClearedAfterPublishingDrains(t *testing.T) {
+	cb := cbFixture("backend", "default", map[string]string{"app": "vllm"})
+	pod := enginePod("vllm-0", "default", map[string]string{"app": "vllm"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 8, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cb},
+		[]*corev1.Pod{pod},
+		&served, &mu)
+	defer srv.Close()
+	ctx := context.Background()
+
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	got := getBackendDirect(t, cl, "backend", "default")
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 8 {
+		t.Fatalf("seed participation = %+v, want prefixCount 8", got.Status.IndexParticipation)
+	}
+
+	// Operator clears the EngineSelector.
+	got.Spec.EngineSelector = nil
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatalf("update backend (clear selector): %v", err)
+	}
+
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	got = getBackendDirect(t, cl, "backend", "default")
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 0 {
+		t.Fatalf("post-selector-clear participation = %+v, want prefixCount 0", got.Status.IndexParticipation)
+	}
+}
+
 func TestRefreshCreatesSingletonEvenWhenServerDown(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {

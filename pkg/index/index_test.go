@@ -276,6 +276,47 @@ func TestSnapshotAggregates(t *testing.T) {
 	}
 }
 
+// TestSnapshotJSONRoundtripPreservesTenantAndPrefixFields guards the wire
+// shape of /snapshot. The controller decodes the JSON into the same
+// Snapshot type, so a silent rename of one of the JSON tags (e.g. someone
+// dropping `Tenant` to `omitempty` and writing a tenant-less replica)
+// would still compile but break per-backend attribution downstream. This
+// test JSON-encodes a snapshot with all the new fields set and asserts
+// they survive the round-trip.
+func TestSnapshotJSONRoundtripPreservesTenantAndPrefixFields(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "vllm-0", Model: "m", Tenant: "ns-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.5, Pressure: 0.2},
+	})
+
+	raw, err := json.Marshal(idx.Snapshot())
+	if err != nil {
+		t.Fatalf("encode snapshot: %v", err)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(decoded.Replicas) != 1 {
+		t.Fatalf("replicas = %d, want 1", len(decoded.Replicas))
+	}
+	r := decoded.Replicas[0]
+	if r.ReplicaID != "vllm-0" || r.Tenant != "ns-a" {
+		t.Fatalf("identity round-trip lost: replicaId=%q tenant=%q", r.ReplicaID, r.Tenant)
+	}
+	if r.PrefixCount != 1 {
+		t.Fatalf("prefixCount round-trip = %d, want 1", r.PrefixCount)
+	}
+	if r.LastEventAt.IsZero() {
+		t.Fatal("lastEventAt round-trip lost (zero)")
+	}
+	if r.CacheMemoryBytes != 100 || r.HitRate != 0.5 || r.Pressure != 0.2 {
+		t.Fatalf("stats round-trip lost: %+v", r)
+	}
+}
+
 func TestReadyReflectsStartAndStop(t *testing.T) {
 	idx := New(WithSweepInterval(10 * time.Millisecond))
 	if idx.Ready() {
