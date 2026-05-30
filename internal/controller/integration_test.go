@@ -21,6 +21,7 @@ import (
 	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -801,6 +802,150 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 	a2 := getBackendDirect(t, k8s, "backend-a", ns)
 	if a2.ResourceVersion != rvA {
 		t.Fatalf("steady snapshot churned resourceVersion (%s → %s)", rvA, a2.ResourceVersion)
+	}
+}
+
+// TestIntegrationCacheBackendPrinterColumnsRenderParticipation verifies the
+// operator-facing promise: `kubectl get cachebackend` shows Prefixes and
+// LastEvent columns sourced from status.indexParticipation. We hit the
+// apiserver's Table content type — exactly the negotiation kubectl does
+// under the hood — and assert column headers, types, and per-row cell
+// values match. Catches accidental removal of the +kubebuilder:printcolumn
+// markers, JSONPath drift, and renames of the underlying status fields.
+func TestIntegrationCacheBackendPrinterColumnsRenderParticipation(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, cfg := startEnv(t)
+	ctx := context.Background()
+	ns := freshNS(t, k8s)
+
+	// Two backends: one with positive participation, one drained-but-quiet.
+	// External type keeps the CacheBackend reconciler out of the picture so
+	// we are testing the printer-column projection from status, not the
+	// reconciler.
+	active := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "backend-a", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "lm://cache-svc:6379",
+		},
+	}
+	if err := k8s.Create(ctx, active); err != nil {
+		t.Fatalf("create active: %v", err)
+	}
+	quiet := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "backend-b", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "lm://cache-svc:6379",
+		},
+	}
+	if err := k8s.Create(ctx, quiet); err != nil {
+		t.Fatalf("create quiet: %v", err)
+	}
+
+	// Set the participation status directly via the status subresource —
+	// same path the poller uses, no poller in this test.
+	lastEvent := metav1.NewTime(time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Second))
+	active.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{
+		PrefixCount: 42,
+		LastEventAt: &lastEvent,
+	}
+	if err := k8s.Status().Update(ctx, active); err != nil {
+		t.Fatalf("update active status: %v", err)
+	}
+	quiet.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{
+		PrefixCount: 0,
+		// LastEventAt deliberately nil — kubectl renders this as <none>.
+	}
+	if err := k8s.Status().Update(ctx, quiet); err != nil {
+		t.Fatalf("update quiet status: %v", err)
+	}
+
+	// Hit the apiserver with the Table accept header. This is exactly what
+	// `kubectl get` does: the server-side rendering is what defines the
+	// columns the operator sees, so this is the most honest test of the
+	// before/after promise.
+	// Use the typed REST client so namespace/resource path construction and
+	// auth wiring exactly match what kubectl does internally.
+	restCfg := rest.CopyConfig(cfg)
+	gv := cachev1alpha1.GroupVersion
+	restCfg.GroupVersion = &gv
+	restCfg.APIPath = "/apis"
+	restCfg.NegotiatedSerializer = serializer.NewCodecFactory(runtime.NewScheme()).WithoutConversion()
+	restClient, err := rest.RESTClientFor(restCfg)
+	if err != nil {
+		t.Fatalf("build REST client: %v", err)
+	}
+	raw, err := restClient.Get().
+		Namespace(ns).
+		Resource("cachebackends").
+		SetHeader("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io").
+		DoRaw(ctx)
+	if err != nil {
+		t.Fatalf("apiserver Table request: %v", err)
+	}
+
+	var table metav1.Table
+	if err := json.Unmarshal(raw, &table); err != nil {
+		t.Fatalf("decode Table: %v\nraw=%s", err, raw)
+	}
+	if len(table.ColumnDefinitions) == 0 || len(table.Rows) == 0 {
+		t.Fatalf("apiserver returned an empty Table: %+v", table)
+	}
+
+	// Find the Prefixes and LastEvent columns and assert their types match
+	// the +kubebuilder:printcolumn markers in api/v1alpha1/cachebackend_types.go.
+	wantCols := map[string]string{"Prefixes": "integer", "LastEvent": "date"}
+	colIdx := map[string]int{}
+	for i, col := range table.ColumnDefinitions {
+		if wantType, ok := wantCols[col.Name]; ok {
+			if col.Type != wantType {
+				t.Errorf("column %q type = %q, want %q", col.Name, col.Type, wantType)
+			}
+			colIdx[col.Name] = i
+		}
+	}
+	for name := range wantCols {
+		if _, ok := colIdx[name]; !ok {
+			t.Fatalf("column %q missing from `kubectl get cachebackend` output", name)
+		}
+	}
+
+	// Per-row cell assertions: active shows 42, quiet shows 0; LastEvent
+	// on quiet is the empty/<none> cell.
+	wantPrefixes := map[string]float64{"backend-a": 42, "backend-b": 0}
+	for _, row := range table.Rows {
+		var obj metav1.PartialObjectMetadata
+		if err := json.Unmarshal(row.Object.Raw, &obj); err != nil {
+			t.Fatalf("decode row object: %v", err)
+		}
+		expected, ok := wantPrefixes[obj.Name]
+		if !ok {
+			continue
+		}
+		gotPrefixes, ok := row.Cells[colIdx["Prefixes"]].(float64)
+		if !ok {
+			t.Fatalf("%s Prefixes cell type = %T (%v), want number", obj.Name, row.Cells[colIdx["Prefixes"]], row.Cells[colIdx["Prefixes"]])
+		}
+		if gotPrefixes != expected {
+			t.Errorf("%s Prefixes cell = %v, want %v", obj.Name, gotPrefixes, expected)
+		}
+		switch obj.Name {
+		case "backend-a":
+			// Set lastEventAt → cell should be a non-empty string (the apiserver
+			// renders date columns as relative ages like "5m").
+			cell, _ := row.Cells[colIdx["LastEvent"]].(string)
+			if cell == "" || cell == "<none>" {
+				t.Errorf("backend-a LastEvent cell = %q, want a rendered duration", cell)
+			}
+		case "backend-b":
+			// Nil lastEventAt → cell is empty / <none>; the apiserver returns
+			// the empty string for a missing date field.
+			cell := row.Cells[colIdx["LastEvent"]]
+			if s, ok := cell.(string); ok && s != "" && s != "<none>" {
+				t.Errorf("backend-b LastEvent cell = %q, want empty/<none>", s)
+			}
+		}
 	}
 }
 
