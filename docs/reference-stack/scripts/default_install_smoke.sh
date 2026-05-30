@@ -13,11 +13,26 @@
 #      cycles past the 30s default refresh).
 #   3. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
+#   4. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#      actually wire up end-to-end: applying config/samples/cachebackend-
+#      with-engine.yaml drives status.matchedEnginePods=1, stamps the
+#      injected-by annotation on the engine pod, and surfaces the
+#      InjectedByCacheBackend Event (with the persisted pod UID — the
+#      regression that hides events from `kubectl describe pod`). Then
+#      scaling the engine to 0 drives status.matchedEnginePods=0 via the
+#      reconciler's self-RequeueAfter cadence (no CR or owned-workload
+#      event needed) within ~30s, the bound on stale-Matched the
+#      cadence guarantees.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
-# at "the default install bundle wires together; gRPC fail-open works" -- light
-# enough to run on every PR.
+# at "the default install bundle wires together; gRPC fail-open works; the
+# CacheBackend ↔ engine-pod binding surfaces operators rely on actually
+# wire up end-to-end" -- light enough to run on every PR. The paired-sample
+# phase swaps the engine container's image to busybox before pod CREATE so
+# the smoke does not pay the multi-GB vLLM pull; the signals it asserts
+# (status, annotation, Event) all materialize from pod CREATE, not from the
+# engine actually running.
 #
 # Designed to catch the class of install regression that surfaced when the
 # default overlay was missing a Namespace resource: `kubectl apply -k` silently
@@ -33,7 +48,8 @@
 #
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
-#           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR.
+#           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR, SAMPLE_NS,
+#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE.
 
 set -euo pipefail
 
@@ -45,6 +61,21 @@ READY_TIMEOUT="${READY_TIMEOUT:-120s}"
 CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
 GRPC_LOCAL_PORT="${GRPC_LOCAL_PORT:-19090}"
 LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
+
+# Sample-smoke tunables — apply config/samples/cachebackend-with-engine.yaml,
+# assert the operator-facing signals, exercise the RequeueAfter drift case.
+SAMPLE_NS="${SAMPLE_NS:-default}"
+# Reconciler runs initial CacheBackend reconcile + first Matched refresh
+# within a few seconds of CB Create. 60s absorbs cold-start jitter.
+SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
+# Drift case waits for the 30s self-RequeueAfter cadence to fire after the
+# engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
+# terminate round-trip.
+SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
+# Tiny stand-in for the vLLM image. The webhook injects on pod CREATE; the
+# engine doesn't need to run for the operator-facing signals (Matched,
+# annotation, Event) to materialize. Avoids a multi-GB pull in CI.
+SAMPLE_ENGINE_IMAGE="${SAMPLE_ENGINE_IMAGE:-busybox:1.36}"
 
 # Image refs match the Makefile's REGISTRY/repo defaults so `kustomize edit set
 # image` (or the sed fallback) rewrites the in-tree controller=/server= entries
@@ -83,6 +114,14 @@ collect_diagnostics() {
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
+  # Paired-sample state — only populated if the sample-smoke phase ran;
+  # safe (|| true) if it didn't.
+  kubectl -n "$SAMPLE_NS" get cb -o yaml \
+    >"$LOG_DIR/sample-cb.yaml" 2>&1 || true
+  kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo -o yaml \
+    >"$LOG_DIR/sample-pods.yaml" 2>&1 || true
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io -o yaml \
+    >"$LOG_DIR/sample-events.yaml" 2>&1 || true
 }
 
 cleanup() {
@@ -252,4 +291,122 @@ if ! grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"NO_HINT"' <<<
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works"
+# --- paired-sample smoke ---------------------------------------------------
+# Applies config/samples/cachebackend-with-engine.yaml and asserts the
+# CacheBackend ↔ engine-pod binding's operator-facing signals materialize
+# end-to-end:
+#   - status.matchedEnginePods → 1
+#   - inferencecache.io/injected-by annotation on the engine pod
+#   - InjectedByCacheBackend Event on the engine pod whose regarding.uid
+#     equals the persisted pod's metadata.uid (so the Event surfaces
+#     under `kubectl describe pod`, not just `kubectl get events`)
+# Then exercises the drift case: scale the engine Deployment to 0, force-
+# delete the (terminating) pod, and assert status.matchedEnginePods → 0
+# via the reconciler's RequeueAfter cadence within SAMPLE_DRIFT_TIMEOUT.
+#
+# Engine-side image is swapped to SAMPLE_ENGINE_IMAGE (busybox by default)
+# BEFORE the engine Deployment lands so the sample exercises the wiring
+# without paying a multi-GB vLLM pull. The webhook injects on pod CREATE;
+# the signals here all materialize from object state, not from the engine
+# actually running.
+log "applying paired sample"
+sample_file="config/samples/cachebackend-with-engine.yaml"
+sample_tmp="$(mktemp)"
+# Patch the engine container's image to the lightweight stand-in. The
+# Deployment's metadata stays untouched (still qwen-engine, still
+# labeled app=qwen-demo), so the binding label flow is exercised exactly
+# as a real operator would experience it.
+sed "s|vllm/vllm-openai-cpu:latest-x86_64|$SAMPLE_ENGINE_IMAGE|g" \
+  "$sample_file" > "$sample_tmp"
+kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp" >/dev/null
+rm -f "$sample_tmp"
+
+log "waiting up to ${SAMPLE_MATCH_TIMEOUT}s for status.matchedEnginePods=1"
+deadline=$(($(date +%s) + SAMPLE_MATCH_TIMEOUT))
+matched=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  matched=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.matchedEnginePods}' 2>/dev/null || true)
+  if [ "$matched" = "1" ]; then break; fi
+  sleep 2
+done
+if [ "$matched" != "1" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo -o wide || true
+  fail "status.matchedEnginePods=$matched, want 1 after ${SAMPLE_MATCH_TIMEOUT}s"
+fi
+log "status.matchedEnginePods=1"
+
+# Persisted pod identity (UID is server-assigned post-admission; the
+# whole point of the engine-pod-events controller is to record the
+# Event with this UID, not the empty one a webhook-recorded Event
+# would have).
+engine_pod=$(kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+engine_uid=$(kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo \
+  -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null || true)
+if [ -z "$engine_pod" ] || [ -z "$engine_uid" ]; then
+  fail "no engine pod labeled app=qwen-demo found in namespace $SAMPLE_NS"
+fi
+log "engine pod: $engine_pod (uid=$engine_uid)"
+
+# The mutating webhook stamps the annotation on successful injection.
+# Absence here means the webhook either didn't fire or fail-opened.
+injected_by=$(kubectl -n "$SAMPLE_NS" get pod "$engine_pod" \
+  -o jsonpath='{.metadata.annotations.inferencecache\.io/injected-by}' 2>/dev/null || true)
+if [ "$injected_by" != "$SAMPLE_NS/qwen-demo-cache" ]; then
+  fail "annotation inferencecache.io/injected-by=$injected_by, want $SAMPLE_NS/qwen-demo-cache"
+fi
+log "annotation inferencecache.io/injected-by=$injected_by"
+
+# Event assertion. Polls because the events.EventRecorder broadcasts
+# asynchronously. Match on (regarding.uid, reason) — NOT just name —
+# because describe-by-UID is the user-facing contract.
+log "waiting for InjectedByCacheBackend Event with regarding.uid=$engine_uid"
+deadline=$(($(date +%s) + 30))
+seen=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  seen=$(kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=InjectedByCacheBackend \
+    -o jsonpath="{range .items[?(@.regarding.uid=='$engine_uid')]}{.reason}{'\n'}{end}" \
+    2>/dev/null || true)
+  if [ -n "$seen" ]; then break; fi
+  sleep 2
+done
+if [ -z "$seen" ]; then
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=InjectedByCacheBackend -o yaml || true
+  fail "InjectedByCacheBackend Event not observed on pod uid=$engine_uid within 30s"
+fi
+log "InjectedByCacheBackend Event present on the engine pod (UID matches the persisted pod)"
+
+# --- drift case: cadence-driven Matched → 0 --------------------------------
+# Scale engine to 0; force-delete to avoid the (terminating) pod still
+# being label-visible to the reconciler's pod List for an extended
+# time when the image is unavailable. Then wait for the next
+# RequeueAfter cycle (no CB-side change, no Owned watch event — pure
+# cadence) to drive Matched=0.
+log "scaling engine Deployment to 0 to exercise the RequeueAfter cadence"
+kubectl -n "$SAMPLE_NS" scale deploy qwen-engine --replicas=0 >/dev/null
+kubectl -n "$SAMPLE_NS" delete pod "$engine_pod" \
+  --force --grace-period=0 >/dev/null 2>&1 || true
+log "waiting up to ${SAMPLE_DRIFT_TIMEOUT}s for status.matchedEnginePods=0 via cadence"
+deadline=$(($(date +%s) + SAMPLE_DRIFT_TIMEOUT))
+drifted=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  drifted=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.matchedEnginePods}' 2>/dev/null || true)
+  if [ "$drifted" = "0" ]; then break; fi
+  sleep 2
+done
+if [ "$drifted" != "0" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo -o wide || true
+  fail "status.matchedEnginePods=$drifted after engine scaled to 0; want 0 via cadence within ${SAMPLE_DRIFT_TIMEOUT}s"
+fi
+log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter cadence"
+
+# Sample cleanup (best-effort; failure here doesn't fail the smoke).
+kubectl -n "$SAMPLE_NS" delete -f "$sample_file" --ignore-not-found=true >/dev/null 2>&1 || true
+
+log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges"
