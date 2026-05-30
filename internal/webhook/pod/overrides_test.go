@@ -232,6 +232,46 @@ func TestApplyEngineInjectionOverrides_Env(t *testing.T) {
 			},
 			want: []corev1.EnvVar{{Name: "X", Value: "override"}},
 		},
+		{
+			// Regression: SuppressEnv followed by Env for the same
+			// adapter-owned name must re-add the override. Earlier the
+			// replace-in-place loop dropped the override silently when
+			// suppress had already removed the canonical entry. Mirrors
+			// the args side's suppress-then-re-add behaviour.
+			name: "suppress then re-add adapter-owned env",
+			pre:  []corev1.EnvVar{},
+			post: []corev1.EnvVar{{Name: "LMCACHE_CHUNK_SIZE", Value: "256"}},
+			overrides: &cachev1alpha1.EngineInjectionOverrides{
+				SuppressEnv: []string{"LMCACHE_CHUNK_SIZE"},
+				Env:         []corev1.EnvVar{{Name: "LMCACHE_CHUNK_SIZE", Value: "512"}},
+			},
+			want: []corev1.EnvVar{{Name: "LMCACHE_CHUNK_SIZE", Value: "512"}},
+		},
+		{
+			// Env-side ownership detection: an adapter that swaps one
+			// ValueFrom source for another (without touching Value)
+			// must still be recognised as adapter-owned, so the override
+			// surface can amend it. reflect.DeepEqual over the whole
+			// EnvVar catches this; a Value-only comparison would have
+			// misclassified the swap as user-untouched.
+			name: "adapter ValueFrom swap is recognised as adapter-owned",
+			pre: []corev1.EnvVar{{
+				Name: "POD_INFO",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				},
+			}},
+			post: []corev1.EnvVar{{
+				Name: "POD_INFO",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+				},
+			}},
+			overrides: &cachev1alpha1.EngineInjectionOverrides{
+				Env: []corev1.EnvVar{{Name: "POD_INFO", Value: "literal"}},
+			},
+			want: []corev1.EnvVar{{Name: "POD_INFO", Value: "literal"}},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,6 +1,7 @@
 package pod
 
 import (
+	"reflect"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -222,25 +223,19 @@ func replaceArgFlag(args []string, flag string, replacement []string) []string {
 	return append(args, replacement...)
 }
 
-// envByName returns a map from env var Name to (Value, ValueFrom-present).
-// Used to diff pre vs post snapshots and identify adapter-owned env.
-// The bool half catches the case where the adapter swapped a Value-bearing
-// entry for a ValueFrom-bearing one (or vice versa) without changing Value,
-// so the change is still recognised as adapter-owned.
-func envByName(env []corev1.EnvVar) map[string]envSignature {
-	out := make(map[string]envSignature, len(env))
+// envByName indexes env by Name. Used to diff pre vs post snapshots and
+// identify the adapter-owned set. We hand the whole EnvVar to the equality
+// check (via reflect.DeepEqual) so a change that swaps one ValueFrom
+// source for another — without altering Value — is still recognised as
+// adapter-owned. Comparing only Value (+ a "has ValueFrom" bool) would
+// misclassify such a swap as user-untouched, which would silently make
+// the override surface unable to amend it.
+func envByName(env []corev1.EnvVar) map[string]corev1.EnvVar {
+	out := make(map[string]corev1.EnvVar, len(env))
 	for i := range env {
-		out[env[i].Name] = envSignature{
-			value:     env[i].Value,
-			hasValueF: env[i].ValueFrom != nil,
-		}
+		out[env[i].Name] = env[i]
 	}
 	return out
-}
-
-type envSignature struct {
-	value     string
-	hasValueF bool
 }
 
 // classifyEnvNames returns the set of env Names the adapter contributed
@@ -250,9 +245,9 @@ func classifyEnvNames(pre, post []corev1.EnvVar) (adapter, user map[string]bool)
 	preMap := envByName(pre)
 	postMap := envByName(post)
 	adapter = make(map[string]bool)
-	for name, postSig := range postMap {
-		preSig, inPre := preMap[name]
-		if !inPre || preSig != postSig {
+	for name, postEntry := range postMap {
+		preEntry, inPre := preMap[name]
+		if !inPre || !reflect.DeepEqual(preEntry, postEntry) {
 			adapter[name] = true
 		}
 	}
@@ -292,10 +287,12 @@ func suppressEnv(env []corev1.EnvVar, suppress []string, adapter map[string]bool
 }
 
 // overrideEnv upserts each override entry into env, scoped to adapter-owned
-// Names. A Name that matches an adapter-owned canonical entry is replaced;
-// a Name not seen in pre-injection is appended; a Name that matches a
-// user-owned, adapter-untouched entry is silently skipped. Order of
-// canonical entries is preserved.
+// Names. A Name that matches an adapter-owned canonical entry is replaced
+// in place; if SuppressEnv already removed that canonical entry, the
+// override is appended so suppress-then-re-add works the same way it does
+// for args. A Name not seen in pre-injection is appended; a Name that
+// matches a user-owned, adapter-untouched entry is silently skipped.
+// Order of canonical entries is preserved.
 func overrideEnv(env []corev1.EnvVar, overrides []corev1.EnvVar, adapter, user map[string]bool) []corev1.EnvVar {
 	if len(overrides) == 0 {
 		return env
@@ -303,11 +300,20 @@ func overrideEnv(env []corev1.EnvVar, overrides []corev1.EnvVar, adapter, user m
 	for _, ovr := range overrides {
 		switch {
 		case adapter[ovr.Name]:
+			replaced := false
 			for i := range env {
 				if env[i].Name == ovr.Name {
 					env[i] = ovr
+					replaced = true
 					break
 				}
+			}
+			if !replaced {
+				// SuppressEnv removed the canonical entry earlier in
+				// the merge; the override re-adds it (suppress-then-
+				// re-add pattern). Without this, the override would be
+				// silently dropped.
+				env = append(env, ovr)
 			}
 		case !user[ovr.Name]:
 			env = append(env, ovr)
