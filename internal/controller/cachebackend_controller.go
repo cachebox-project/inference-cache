@@ -211,12 +211,18 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		// Progressing=False: External backends complete admission immediately;
-		// there is no rollout we are still driving toward steady state.
+		// Pick the reason that matches Ready so a kubectl describe
+		// shows a coherent pair (both conditions report the same
+		// root cause); Progressing stays False either way because
+		// External backends never have a rollout in flight.
+		reason := conditionReasonExternalEndpointAccepted
+		if endpoint == "" {
+			reason = conditionReasonExternalEndpointMissing
+		}
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeProgressing,
 			Status:             metav1.ConditionFalse,
-			Reason:             conditionReasonExternalEndpointAccepted,
+			Reason:             reason,
 			Message:            "External backends complete admission immediately",
 			ObservedGeneration: backend.Generation,
 		})

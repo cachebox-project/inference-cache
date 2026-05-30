@@ -338,14 +338,69 @@ func TestValidator_SameNamespaceEndpointAdmitted(t *testing.T) {
 func TestValidator_ExternalHostnamePassesThrough(t *testing.T) {
 	// External hostnames are not in-cluster Service DNS — the cross-namespace
 	// rule has no namespace to compare against and must let them through.
+	// Use a bare host:port (the canonical External shape; the LMCache
+	// adapter prepends the lm:// scheme on injection).
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("external hostname rejected: %v", err)
+	}
+}
+
+func TestValidator_ExternalEndpoint_LMSchemeAdmitted(t *testing.T) {
+	// Operators who prefer to be explicit can pre-fix the endpoint with
+	// the LMCache lm:// scheme; the adapter passes it through unchanged.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://cache.example.com:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("External with lm:// scheme rejected: %v", err)
+	}
+}
+
+func TestValidator_ExternalEndpoint_HTTPSchemeRejected(t *testing.T) {
+	// A non-lm:// scheme would concatenate to LMCACHE_REMOTE_URL=lm://
+	// https://... at injection time, which the LMCache connector
+	// rejects. Catch the misconfiguration at admission instead of in
+	// engine-pod crash logs.
 	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
 	cb.Spec.Endpoint = "https://cache.example.com:443/api"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("external hostname rejected: %v", err)
-	}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		`scheme "https" is not supported for spec.type=External`)
+}
+
+func TestValidator_ExternalEndpoint_PathRejected(t *testing.T) {
+	// LMCache is a TCP-level protocol — paths/queries/fragments don't
+	// belong on the wire and would be silently dropped at the engine
+	// connector. Reject them at admission so the rejection message
+	// surfaces the problem.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:8200/path"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a bare host[:port]")
+}
+
+func TestValidator_ExternalEndpoint_LMSchemeWithPathRejected(t *testing.T) {
+	// Same concern as the bare-host case; the path-after-scheme variant
+	// is just as broken.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://cache.example.com:8200/path"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must not include a path")
 }
 
 func TestValidator_AggregatesMultipleViolations(t *testing.T) {

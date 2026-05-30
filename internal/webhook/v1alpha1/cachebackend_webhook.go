@@ -88,6 +88,7 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 var DefaultValidationRules = []ValidationRule{
 	requireEndpointForExternal,
 	rejectEndpointOnNonExternal,
+	rejectInvalidExternalEndpointScheme,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 }
@@ -410,6 +411,83 @@ func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList
 			fmt.Sprintf("spec.endpoint is only valid when spec.type=External; got spec.type=%q with non-empty spec.endpoint. Managed backends learn their endpoint from the controller-rendered Service.", cb.Spec.Type),
 		),
 	}
+}
+
+// rejectInvalidExternalEndpointScheme rejects an External CacheBackend
+// whose spec.endpoint carries a scheme other than `lm://`. The vLLM
+// External adapter renders the LMCache engine wire (LMCACHE_REMOTE_URL),
+// and the helper that builds the URL prepends `lm://` to any value that
+// doesn't already carry it — so a `https://...` endpoint would become
+// `LMCACHE_REMOTE_URL=lm://https://...` at injection time, which the
+// engine connector rejects at runtime. Catch the misconfiguration loudly
+// at write time instead of leaving the operator to discover it from
+// engine-pod crash logs.
+//
+// Allowed forms:
+//   - bare `host[:port]` (the canonical shape — the helper adds the
+//     `lm://` scheme on injection)
+//   - `lm://host[:port]` (operators who prefer to be explicit)
+//
+// Path components are also rejected — LMCache is a TCP-level protocol
+// and a path would be silently dropped by the connector. Empty
+// endpoint is left to [requireEndpointForExternal]; non-External types
+// are left to [rejectEndpointOnNonExternal].
+//
+// A future SGLang-shaped External adapter (different engine wire) will
+// have its own scheme rules; this rule narrows on
+// `Type == External` only because the vLLM wire is the only one we
+// ship today.
+func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
+		return nil
+	}
+	raw := strings.TrimSpace(cb.Spec.Endpoint)
+	if raw == "" {
+		return nil // requireEndpointForExternal handles this
+	}
+	// Parse the optional scheme. We deliberately do NOT use net/url
+	// here: net/url.Parse treats a bare `host:port` as having scheme=
+	// "host" because it parses everything before the first `:` as a
+	// scheme. Hand-roll the scheme check on the leading `://` separator
+	// instead.
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme := strings.ToLower(raw[:i])
+		rest := raw[i+3:]
+		if scheme != "lm" {
+			return field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "endpoint"),
+					cb.Spec.Endpoint,
+					fmt.Sprintf("spec.endpoint scheme %q is not supported for spec.type=External; use a bare host[:port] (the LMCache adapter adds the lm:// scheme) or an explicit lm:// URL — the vLLM engine wire injects LMCACHE_REMOTE_URL and would otherwise concatenate to an invalid value", scheme),
+				),
+			}
+		}
+		// scheme=lm; rest must not carry a path/query.
+		if strings.ContainsAny(rest, "/?#") {
+			return field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "endpoint"),
+					cb.Spec.Endpoint,
+					"spec.endpoint must not include a path, query, or fragment; LMCache is a TCP-level protocol and would silently drop them — use host[:port] only",
+				),
+			}
+		}
+		return nil
+	}
+	// No scheme — must be a bare host[:port], so reject path-like
+	// payloads. Port presence is not enforced (lmcache_server defaults
+	// to 65432, but an operator pre-flighting a service mesh may bind
+	// elsewhere).
+	if strings.ContainsAny(raw, "/?#") {
+		return field.ErrorList{
+			field.Invalid(
+				field.NewPath("spec", "endpoint"),
+				cb.Spec.Endpoint,
+				"spec.endpoint must be a bare host[:port] (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped",
+			),
+		}
+	}
+	return nil
 }
 
 // rejectPersistentStorageOnMemoryOnly rejects a PVC-backed storage spec on

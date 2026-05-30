@@ -617,6 +617,12 @@ func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
 		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
 	}
+	// Progressing reason mirrors Ready's reason on the missing path so
+	// `kubectl describe` shows a coherent pair.
+	progressing := findCondition(got.Status.Conditions, "Progressing")
+	if progressing == nil || progressing.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Progressing = %+v, want reason ExternalEndpointMissing", progressing)
+	}
 }
 
 func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {

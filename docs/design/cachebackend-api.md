@@ -125,7 +125,7 @@ There is no Deployment to roll out, so admission acceptance of `spec.endpoint` i
 |---|---|---|---|
 | `Ready` | `True` | `ExternalEndpointAccepted` | `spec.endpoint` is non-empty (admission already validated it); the controller does not provision pods for External, so admission acceptance is the readiness signal. |
 | `Ready` | `False` | `ExternalEndpointMissing` | `spec.endpoint` is empty or whitespace-only. Admission rejects this at the validating webhook, so this state is reachable only for a CR already in etcd from before the webhook was installed. Status reflects the gap loudly rather than dropping the condition. |
-| `Progressing` | `False` | `ExternalEndpointAccepted` | External backends complete admission immediately — there is no rollout the controller is still driving. Always `False` on External. |
+| `Progressing` | `False` | mirrors Ready's reason | External backends complete admission immediately — there is no rollout the controller is still driving. Always `False` on External; the reason matches Ready (`ExternalEndpointAccepted` or `ExternalEndpointMissing`) so `kubectl describe` shows a coherent pair. |
 
 Reachability of the external endpoint is **not** probed by the controller; trusting the operator is part of the External contract. A future enhancement could degrade `Ready` on a probe failure, but that's deliberately out of scope for the passthrough adapter today (fail-soft, never a serving dependency).
 

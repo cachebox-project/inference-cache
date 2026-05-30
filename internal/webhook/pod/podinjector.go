@@ -288,22 +288,22 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 // status.endpoint, but the webhook trims defensively here too so a
 // race against an old controller build can't leak whitespace to the
 // engine wire.
+//
+// For External CRs with an empty/whitespace spec.endpoint there is NO
+// fallback to status. The reconciler treats that state as
+// Ready=False/ExternalEndpointMissing — falling back here would wire
+// new pods to a stale status the reconciler considers unusable, which
+// is the kind of two-layer disagreement that hides bad CRs from
+// operators. Fail-open instead so the operator sees the same gap
+// reflected at admission as in status.
 func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
 		return ""
 	}
-	status := strings.TrimSpace(cache.Status.Endpoint)
 	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		if v := strings.TrimSpace(cache.Spec.Endpoint); v != "" {
-			return v
-		}
-		// Defensive: if spec.endpoint somehow became empty/whitespace
-		// (a CR predating admission) but status still carries a value,
-		// fall back to it rather than fail-open. Same direction as the
-		// reconciler's own defensive Ready=False/Missing branch.
-		return status
+		return strings.TrimSpace(cache.Spec.Endpoint)
 	}
-	return status
+	return strings.TrimSpace(cache.Status.Endpoint)
 }
 
 // hasContainer reports whether containers already includes one named name.
