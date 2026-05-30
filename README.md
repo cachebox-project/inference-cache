@@ -36,11 +36,21 @@ make test
 Run the server locally:
 
 ```bash
-bin/server --grpc-bind-address=:9090 --http-bind-address=:8080
+bin/server \
+  --grpc-bind-address=:9090 \
+  --http-bind-address=:8080 \
+  --snapshot-bind-address=:8081 \
+  --insecure-disable-snapshot-auth   # local-dev only; production passes --snapshot-allowed-sa instead
 curl -i http://localhost:8080/healthz   # liveness
 curl -i http://localhost:8080/readyz    # readiness
 curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
+curl -s http://localhost:8081/snapshot  # internal aggregate (auth-gated in production)
 ```
+
+The server fails closed by default: omitting both `--snapshot-allowed-sa` and
+`--insecure-disable-snapshot-auth` causes it to exit 2 with a stderr message.
+That keeps an operator who forgets the flag from accidentally shipping an
+unauthenticated `/snapshot` endpoint on a real cluster.
 
 ## Cluster Prerequisites
 
