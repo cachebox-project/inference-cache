@@ -13,6 +13,13 @@
 #      cycles past the 30s default refresh).
 #   3. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
+#   4. The External CacheBackend type end-to-end: applying a `type: External`
+#      CR renders NO Deployment/Service in its namespace, status.endpoint
+#      mirrors spec.endpoint, the CR goes Ready=True/ExternalEndpointAccepted,
+#      and a matching engine pod is admitted with `LMCACHE_REMOTE_URL=lm://
+#      <spec.endpoint>` injected by the pod-mutating webhook. Also exercises
+#      the new admission validation rules (non-External + endpoint and
+#      External + bad scheme are both rejected at write time).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -33,7 +40,8 @@
 #
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
-#           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR.
+#           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR,
+#           EXTERNAL_BACKEND_TIMEOUT, EXTERNAL_INJECT_TIMEOUT.
 
 set -euo pipefail
 
@@ -45,6 +53,13 @@ READY_TIMEOUT="${READY_TIMEOUT:-120s}"
 CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
 GRPC_LOCAL_PORT="${GRPC_LOCAL_PORT:-19090}"
 LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
+# External-backend gate timeouts. The reconciler patches status on the next
+# reconcile (sub-second on a fresh CR), and the pod webhook resolves the
+# endpoint synchronously at admission, so these are short. The values give
+# headroom for the initial APIReader cache warm-up and the leader-election
+# lease the External-reconcile path inherits from the C2 reconciler loop.
+EXTERNAL_BACKEND_TIMEOUT="${EXTERNAL_BACKEND_TIMEOUT:-30}" # seconds
+EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 
 # Image refs match the Makefile's REGISTRY/repo defaults so `kustomize edit set
 # image` (or the sed fallback) rewrites the in-tree controller=/server= entries
@@ -55,6 +70,15 @@ SERVER_IMG="$REGISTRY/inference-cache-server:$TAG"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
+
+# External-backend smoke fixture identifiers. Declared up front so the
+# diagnostics helper can reference them even if the smoke aborts before
+# the External section creates the objects.
+EXT_SMOKE_NS="${EXT_SMOKE_NS:-ic-smoke-external}"
+EXT_SMOKE_CB_NAME="${EXT_SMOKE_CB_NAME:-smoke-external}"
+EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
+EXT_SMOKE_LABEL="${EXT_SMOKE_LABEL:-app=ic-smoke-engine}"
+EXT_SMOKE_ENDPOINT="${EXT_SMOKE_ENDPOINT:-smoke-cache.example.com:8200}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
@@ -83,6 +107,16 @@ collect_diagnostics() {
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
+  # External-backend smoke artefacts. Best-effort — the CR/pod may not
+  # exist if the smoke aborted before that section.
+  kubectl get cb -A -o wide \
+    >"$LOG_DIR/cachebackends.txt" 2>&1 || true
+  kubectl get cb -n "$EXT_SMOKE_NS" "$EXT_SMOKE_CB_NAME" -o yaml \
+    >"$LOG_DIR/external-cb.yaml" 2>&1 || true
+  kubectl get pod -n "$EXT_SMOKE_NS" "$EXT_SMOKE_POD_NAME" -o yaml \
+    >"$LOG_DIR/external-engine-pod.yaml" 2>&1 || true
+  kubectl get deploy,svc -n "$EXT_SMOKE_NS" \
+    >"$LOG_DIR/external-ns-workloads.txt" 2>&1 || true
 }
 
 cleanup() {
@@ -252,4 +286,176 @@ if ! grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"NO_HINT"' <<<
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works"
+# --- External CacheBackend end-to-end ---------------------------------------
+# Exercises the External passthrough adapter on the running cluster: the
+# reconciler should NOT render a Deployment/Service, status.endpoint should
+# mirror spec.endpoint, Ready should be True with reason ExternalEndpointAccepted,
+# and a matching engine pod should come out of admission with LMCACHE_REMOTE_URL
+# pointing at the operator-supplied endpoint. Also exercises the new admission
+# validation rules (non-External with endpoint and External with a bad scheme
+# must be rejected at write time).
+log "exercising External CacheBackend end-to-end in namespace $EXT_SMOKE_NS"
+kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Apply the External CR. selector label matches the engine pod below.
+cat <<EOF | kubectl apply -f - >/dev/null || fail "kubectl apply CacheBackend(type:External) failed"
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: $EXT_SMOKE_CB_NAME
+  namespace: $EXT_SMOKE_NS
+spec:
+  type: External
+  endpoint: $EXT_SMOKE_ENDPOINT
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      ${EXT_SMOKE_LABEL%%=*}: ${EXT_SMOKE_LABEL##*=}
+EOF
+
+# Wait for the reconciler to publish status.endpoint + the Ready=True condition.
+# Sub-second on a quiet cluster; the timeout covers leader-election warm-up.
+log "waiting up to ${EXTERNAL_BACKEND_TIMEOUT}s for External CR to publish status + Ready=True"
+deadline=$(($(date +%s) + EXTERNAL_BACKEND_TIMEOUT))
+status_endpoint=""
+ready_status=""
+ready_reason=""
+until [ "$status_endpoint" = "$EXT_SMOKE_ENDPOINT" ] && \
+      [ "$ready_status" = "True" ] && \
+      [ "$ready_reason" = "ExternalEndpointAccepted" ]; do
+  status_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+  ready_status="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  ready_reason="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
+    fail "External CR didn't converge: status.endpoint=$status_endpoint Ready=$ready_status/$ready_reason (want $EXT_SMOKE_ENDPOINT True/ExternalEndpointAccepted)"
+  fi
+  sleep 1
+done
+log "External CR status: endpoint=$status_endpoint Ready=$ready_status/$ready_reason"
+
+# No Deployment, no Service should have been rendered for an External CR.
+# A leading API service `kubernetes` doesn't exist in this fresh namespace,
+# so a flat count of zero is the right assertion.
+dep_count="$(kubectl -n "$EXT_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
+svc_count="$(kubectl -n "$EXT_SMOKE_NS" get svc -o name 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$dep_count" != "0" ] || [ "$svc_count" != "0" ]; then
+  kubectl -n "$EXT_SMOKE_NS" get deploy,svc
+  fail "External CR rendered controller-owned workload (deploy=$dep_count svc=$svc_count, want 0/0)"
+fi
+log "no Deployment or Service in $EXT_SMOKE_NS (External backend skipped provisioning)"
+
+# Apply a matching engine pod with the conventional `vllm` container name.
+# `pause` keeps the pod alive long enough to inspect the injected env+args
+# without pulling a real vLLM image (which would be ~5+ GB).
+cat <<EOF | kubectl apply -f - >/dev/null || fail "kubectl apply engine pod failed"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $EXT_SMOKE_POD_NAME
+  namespace: $EXT_SMOKE_NS
+  labels:
+    ${EXT_SMOKE_LABEL%%=*}: ${EXT_SMOKE_LABEL##*=}
+spec:
+  containers:
+  - name: vllm
+    image: registry.k8s.io/pause:3.10
+EOF
+
+# The pod webhook is synchronous at admission, so the env should be present
+# the moment the API has the object. The retry loop here is a defensive
+# circuit-breaker against a slow first-admission (cert-manager certificate
+# becoming available, etc.), NOT an expected wait.
+log "waiting up to ${EXTERNAL_INJECT_TIMEOUT}s for pod webhook to inject External endpoint"
+deadline=$(($(date +%s) + EXTERNAL_INJECT_TIMEOUT))
+injected=""
+until [ -n "$injected" ]; do
+  injected="$(kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" \
+    -o jsonpath='{.spec.containers[?(@.name=="vllm")].env[?(@.name=="LMCACHE_REMOTE_URL")].value}' \
+    2>/dev/null || true)"
+  if [ -n "$injected" ]; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" -o yaml || true
+    fail "pod webhook did not inject LMCACHE_REMOTE_URL within ${EXTERNAL_INJECT_TIMEOUT}s"
+  fi
+  sleep 1
+done
+expected_url="lm://$EXT_SMOKE_ENDPOINT"
+if [ "$injected" != "$expected_url" ]; then
+  fail "LMCACHE_REMOTE_URL=$injected, want $expected_url (pod webhook should wire to spec.endpoint via the LMCache wire format)"
+fi
+log "pod webhook injected LMCACHE_REMOTE_URL=$injected"
+
+# Verify the --kv-transfer-config arg is also present — pins the full
+# engine wire contract the External adapter shares with the LMCache adapter.
+kv_arg="$(kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].args}' 2>/dev/null || true)"
+if ! grep -q -- "--kv-transfer-config" <<<"$kv_arg"; then
+  fail "pod webhook did not inject --kv-transfer-config arg; got args=$kv_arg"
+fi
+log "pod args contain --kv-transfer-config"
+
+# Negative-path admission checks. Each must be rejected with a specific
+# message; admission error goes to stderr so we capture both streams.
+log "exercising negative admission rules"
+
+reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: smoke-reject-https
+  namespace: $EXT_SMOKE_NS
+spec:
+  type: External
+  endpoint: https://cache.example.com:443/api
+  integration: { engine: vllm }
+EOF
+)"
+if ! grep -q 'scheme "https" is not supported' <<<"$reject_output"; then
+  fail "admission did not reject External+https scheme as expected; got: $reject_output"
+fi
+
+reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: smoke-reject-no-host
+  namespace: $EXT_SMOKE_NS
+spec:
+  type: External
+  endpoint: "lm://"
+  integration: { engine: vllm }
+EOF
+)"
+if ! grep -q "must include a non-empty host" <<<"$reject_output"; then
+  fail "admission did not reject External+lm:// (no host) as expected; got: $reject_output"
+fi
+
+reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: smoke-reject-managed-endpoint
+  namespace: $EXT_SMOKE_NS
+spec:
+  type: LMCache
+  endpoint: user-supplied.example:8080
+  integration: { engine: vllm }
+EOF
+)"
+if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_output"; then
+  fail "admission did not reject non-External + endpoint as expected; got: $reject_output"
+fi
+log "admission rejected External+https, External+empty-host, and non-External+endpoint"
+
+# Clean up — keeps the cluster reusable for KEEP_CLUSTER=1 reruns.
+kubectl delete pod -n "$EXT_SMOKE_NS" "$EXT_SMOKE_POD_NAME" --ignore-not-found --wait=false >/dev/null || true
+kubectl delete cb -n "$EXT_SMOKE_NS" "$EXT_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
+kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
+
+log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, External backend end-to-end works"
