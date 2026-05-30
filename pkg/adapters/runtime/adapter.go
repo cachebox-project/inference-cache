@@ -244,12 +244,11 @@ func WithPolicyServerGRPCAddress(addr string) Option {
 // passthrough adapter under pkg/adapters/runtime/external/: that package
 // imports this one (for the [KVCacheRuntimeAdapter] interface and the
 // [RuntimeID] constants), so registering it here would cycle. The
-// production wiring in cmd/controller registers the External adapter on
-// top of DefaultRegistry, and tests that exercise External admission /
-// pod-webhook paths must do the same. The validator + pod-webhook
-// nil-Registry fallback (which uses DefaultRegistry) therefore rejects
-// (vllm, External) for "no adapter" — admission is loud about the gap
-// rather than silently letting the pod webhook fail-open.
+// production wiring in cmd/controller and both webhook handlers'
+// nil-Registry fallbacks explicitly add the External adapter on top, so
+// the shipping admission/injection paths agree on the full supported
+// set; only direct uses of DefaultRegistry (e.g. some hermetic unit
+// tests) see the LMCache-only view.
 //
 // Options the controller cares about (subscriber sidecar image, policy-server
 // address) are passed in via the variadic [Option] helpers; the no-arg form

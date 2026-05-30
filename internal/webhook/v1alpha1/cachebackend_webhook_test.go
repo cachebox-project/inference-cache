@@ -727,6 +727,24 @@ func TestValidator_RuntimeAdapter_DeleteSkipsCheck(t *testing.T) {
 	}
 }
 
+func TestValidator_RuntimeAdapter_NilRegistry_AdmitsExternal(t *testing.T) {
+	// The nil-Registry fallback mirrors production cmd/controller wiring
+	// — DefaultRegistry PLUS the External adapter — so a bare
+	// `CacheBackendValidator{}` admits the same set the running
+	// controller does. Without the explicit External registration in
+	// the fallback, this CR would be rejected for "no adapter supports
+	// (vllm, External)" even though the production webhook wires it
+	// just fine.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "ext.example.com:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("nil-Registry fallback rejected vLLM+External: %v", err)
+	}
+}
+
 func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 	// A zero-value validator (Registry nil) must still run the C7 check
 	// against [adapterruntime.DefaultRegistry] — the production safety

@@ -16,6 +16,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
@@ -66,12 +67,26 @@ type CacheBackendValidator struct {
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair
 	// at admission time. A nil Registry falls back to
-	// [adapterruntime.DefaultRegistry] so unit tests and the bare zero
-	// value still validate against the controller's shipping adapter set;
-	// production wiring in cmd/controller passes the same registry
-	// instance the reconciler + pod webhook consume so all three agree on
-	// what's supported.
+	// [defaultShippingRegistry], which mirrors the production cmd/controller
+	// wiring: [adapterruntime.DefaultRegistry] plus the External adapter
+	// (registered explicitly because the External package lives in a
+	// subpackage that DefaultRegistry can't import without a cycle). The
+	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
+	// (engine, backend) pair the running controller supports, including
+	// External — so admission doesn't silently reject an otherwise-valid
+	// External CR just because the caller forgot to pass a registry.
 	Registry *adapterruntime.Registry
+}
+
+// defaultShippingRegistry returns a Registry with every adapter the
+// production cmd/controller wiring installs: the in-package vLLM+LMCache
+// adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
+// External adapter. Centralised here so the validator's nil-Registry
+// fallback admits the same set the running controller does.
+func defaultShippingRegistry() *adapterruntime.Registry {
+	r := adapterruntime.DefaultRegistry()
+	r.Register(externaladapter.NewAdapter())
+	return r
 }
 
 // ValidationRule is the seam plugged-in admission rules implement. It
@@ -302,7 +317,7 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 	}
 	registry := v.Registry
 	if registry == nil {
-		registry = adapterruntime.DefaultRegistry()
+		registry = defaultShippingRegistry()
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
 	if _, err := registry.Select(runtimeID, cb); err != nil {
