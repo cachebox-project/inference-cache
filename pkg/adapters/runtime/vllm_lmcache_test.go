@@ -524,11 +524,13 @@ func TestVLLMLMCacheReservedArgs(t *testing.T) {
 	}
 }
 
-// TestVLLMLMCacheReservedEnv pins the reserved-env list. Per the locked
-// scope, four entries are reserved (the integration strictly requires
-// them); known tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE /
-// LMCACHE_LOCAL_CPU / LMCACHE_MAX_LOCAL_CPU_SIZE) are NOT reserved, so this
-// test also asserts they are absent.
+// TestVLLMLMCacheReservedEnv pins the reserved-env list. Three env names
+// are reserved here (the integration strictly requires them): the resolved
+// remote URL, the v1-codepath selector, and the spec.integration.failOpen
+// mirror. Known tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE /
+// LMCACHE_LOCAL_CPU / LMCACHE_MAX_LOCAL_CPU_SIZE) are NOT reserved, and the
+// test also asserts they are absent. (--kv-transfer-config is reserved on
+// the args side, covered by TestVLLMLMCacheReservedArgs.)
 func TestVLLMLMCacheReservedEnv(t *testing.T) {
 	got := vllmLMCacheAdapter{}.ReservedEnv()
 	want := []string{EnvLMCacheRemoteURL, EnvVLLMUseV1, EnvInferenceCacheFailOpen}
