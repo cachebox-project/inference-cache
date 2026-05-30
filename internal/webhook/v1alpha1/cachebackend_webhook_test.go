@@ -659,6 +659,60 @@ func TestValidator_EngineOverrides_PositionalArgIgnored(t *testing.T) {
 	}
 }
 
+func TestValidator_EngineOverrides_RejectsEmptyEnvName(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "", Value: "x"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"must declare a Name")
+}
+
+func TestValidator_EngineOverrides_RejectsInvalidEnvName(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		// "=" is forbidden in K8s env var names.
+		Env: []corev1.EnvVar{{Name: "FOO=BAR", Value: "x"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"invalid env var name")
+}
+
+func TestValidator_EngineOverrides_RejectsValueAndValueFrom(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name:  "BOTH",
+			Value: "literal",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0]",
+		"value OR valueFrom, not both")
+}
+
+func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
+	// Positive case: a ValueFrom-only entry (no Value) is a valid K8s env
+	// shape and must pass.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		}},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("ValueFrom-only env rejected: %v", err)
+	}
+}
+
 func TestValidator_EngineOverrides_ExternalBackendSkipsCheck(t *testing.T) {
 	// External backends never reach an adapter — the reconciler routes
 	// them through reconcileExternal — so engineOverrides on an External

@@ -163,7 +163,7 @@ The validating rules tighten what `v1alpha1` accepts, so they ship together with
 
 ### Engine-injection overrides (`spec.integration.engineOverrides`)
 
-`spec.integration.engineOverrides` lets the operator override what the pod-mutating webhook injects into the engine container — without forking an adapter or giving up the integration entirely. It is the user-facing seam that future engines (CPU vLLM without LMCache, SGLang, Mooncake) reach to tune flags/env that the adapter would otherwise hard-code.
+`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and future engines (SGLang, Mooncake) reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
 
 Shape, in `corev1` vocabulary:
 

@@ -7,8 +7,10 @@ import (
 	"sort"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -269,8 +271,22 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 	if cb.Spec.Integration == nil || cb.Spec.Integration.EngineOverrides == nil {
 		return nil
 	}
+	overrides := cb.Spec.Integration.EngineOverrides
+	basePath := field.NewPath("spec", "integration", "engineOverrides")
+	var errs field.ErrorList
+
+	// Structural env-shape checks run regardless of whether an adapter
+	// matches. The pod webhook copies these EnvVar entries onto engine
+	// pods at admission; if any one is shaped in a way the apiserver
+	// rejects (empty name, invalid name, both value and valueFrom set),
+	// the mutated pod fails Kubernetes Pod validation, blocking workload
+	// admission. That would turn a cache misconfiguration into a serving
+	// outage — the exact failure mode the fail-open posture exists to
+	// avoid — so we reject the CR up front.
+	errs = append(errs, checkEngineOverrideEnvShape(overrides.Env, basePath.Child("env"))...)
+
 	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		return nil
+		return errs
 	}
 	registry := v.Registry
 	if registry == nil {
@@ -282,14 +298,11 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 		// checkRuntimeAdapter already reports the unsupported pair; piling
 		// a derived "engineOverrides vs (unknown adapter)" complaint on
 		// top would not help the user.
-		return nil
+		return errs
 	}
 
-	overrides := cb.Spec.Integration.EngineOverrides
 	reservedArgs := stringSet(adapter.ReservedArgs())
 	reservedEnv := stringSet(adapter.ReservedEnv())
-	basePath := field.NewPath("spec", "integration", "engineOverrides")
-	var errs field.ErrorList
 
 	if len(reservedArgs) > 0 {
 		argsPath := basePath.Child("args")
@@ -334,6 +347,40 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 					reservedEnvMessage(entry, runtimeID),
 				))
 			}
+		}
+	}
+	return errs
+}
+
+// checkEngineOverrideEnvShape rejects EnvVar entries the apiserver itself
+// would reject on the engine pod after the webhook copies them in. Mirrors
+// the upstream validation rules in k8s.io/kubernetes core validation:
+//
+//   - Name must be set and conform to [validation.IsEnvVarName].
+//   - Value and ValueFrom are mutually exclusive: setting both is invalid
+//     at the K8s API level.
+//
+// Without these checks an operator could admit a CacheBackend that then
+// makes every selected engine pod fail K8s pod validation after the
+// webhook mutation — a cache misconfiguration cascading into a workload
+// outage, which violates the fail-open posture.
+func checkEngineOverrideEnvShape(env []corev1.EnvVar, basePath *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	for i := range env {
+		entry := &env[i]
+		entryPath := basePath.Index(i)
+		if entry.Name == "" {
+			errs = append(errs, field.Required(entryPath.Child("name"),
+				"engineOverrides env entries must declare a Name"))
+		} else {
+			for _, msg := range validation.IsEnvVarName(entry.Name) {
+				errs = append(errs, field.Invalid(entryPath.Child("name"),
+					entry.Name, "invalid env var name: "+msg))
+			}
+		}
+		if entry.Value != "" && entry.ValueFrom != nil {
+			errs = append(errs, field.Invalid(entryPath, entry.Name,
+				"env entry may set value OR valueFrom, not both — engine pods carrying this entry would fail Kubernetes Pod validation"))
 		}
 	}
 	return errs

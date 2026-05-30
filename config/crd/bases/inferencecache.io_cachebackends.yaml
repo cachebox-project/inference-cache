@@ -142,11 +142,18 @@ spec:
                     type: string
                   engineOverrides:
                     description: |-
-                      EngineOverrides lets the operator override the args / env the
-                      pod-mutating webhook injects into the engine container, on top of
-                      what the runtime adapter would otherwise inject. Useful for CPU
-                      vLLM, plain vLLM without LMCache, and future engines that need to
-                      tune a flag/env the canonical injection hard-codes.
+                      EngineOverrides lets the operator amend the non-reserved args / env
+                      the pod-mutating webhook injects into the engine container, on top
+                      of what the runtime adapter would otherwise inject. Useful for
+                      tuning adapter-injected knobs (e.g. CPU-vLLM running against the
+                      LMCache integration with non-default chunk size / serdes / model
+                      length) and for future engines that surface their own non-reserved
+                      flags through the same adapter interface.
+
+                      EngineOverrides does NOT turn the integration off: every reserved
+                      arg/env the adapter declares is hard-rejected at admission, so an
+                      operator who wants to skip injection entirely on a particular pod
+                      should use the inferencecache.io/skip-inject pod annotation instead.
 
                       Admission rejects overrides that overlap the adapter's reserved
                       args/env (the ones strictly required for the integration to
