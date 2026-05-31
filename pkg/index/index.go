@@ -46,12 +46,32 @@ const (
 	DefaultTenantHotMaxAge = 5 * time.Minute
 )
 
-// Metrics is the optional sink the index reports live entry counts to. It is
-// satisfied by the server's Prometheus wiring; kept as a tiny interface so the
-// index has no dependency on the metrics/registry implementation.
+// Metrics is the optional sink the index reports to. It is satisfied by the
+// server's Prometheus wiring; kept as a tiny interface so the index has no
+// dependency on the metrics/registry implementation.
 type Metrics interface {
 	SetIndexEntries(model string, entries int)
+	// AddTenantEvictions records n quota-driven entry evictions for a tenant.
+	// reason is the budget that was exceeded (currently only "over_entries").
+	AddTenantEvictions(tenantID, reason string, n int)
 }
+
+// TenantQuotaResolver returns the per-tenant index-entry budget the index
+// enforces at ingest time. ok=false (a nil resolver, or no matching CacheTenant)
+// means "no quota" — the tenant is unbounded (fail open / soft state), matching
+// today's behavior before any CacheTenant exists. A configured budget of 0 is a
+// valid enforceable cap (admit nothing), distinct from "no quota". The index
+// does not import any CRD/policy types; the resolver is satisfied by the
+// server's policy store. Mirrors TTLResolver.
+type TenantQuotaResolver interface {
+	TenantQuota(tenant string) (maxEntries int64, ok bool)
+}
+
+// tenantEvictionReasonOverEntries is the only quota dimension enforced today:
+// the index entry table is the one cache resource the server authoritatively
+// owns. (Per-tenant memory is not enforceable on a shared, tenant-unaware
+// engine — see the CacheTenant CRD docs.)
+const tenantEvictionReasonOverEntries = "over_entries"
 
 // TTLResolver returns the per-tenant eviction TTL applied by the index. A
 // return of <=0 (or a nil resolver) means "use the global default TTL". The
@@ -267,6 +287,7 @@ type Index struct {
 	metrics       Metrics
 	ranker        RankerConfig
 	ttlResolver   TTLResolver
+	quotaResolver TenantQuotaResolver
 
 	ready atomic.Bool
 
@@ -274,6 +295,12 @@ type Index struct {
 	prefixes     map[prefixKey]map[string]replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
+
+	// entriesByTenant counts replica×prefix entries per tenant, so the per-
+	// tenant quota check at ingest is O(1) instead of scanning i.prefixes.
+	// Maintained in lockstep with totalEntries by upsert/removeReplicaLocked.
+	// It also backs the per-tenant indexEntries figure in Snapshot.
+	entriesByTenant map[string]int
 
 	// servingByScope counts, for each (tenant, model, hash_scheme), how many
 	// distinct prefix entries each replica currently holds. It exists purely
@@ -323,6 +350,15 @@ func WithRanker(cfg RankerConfig) Option { return func(i *Index) { i.ranker = cf
 // resolver implementation owns its own concurrency.
 func WithTTLResolver(r TTLResolver) Option { return func(i *Index) { i.ttlResolver = r } }
 
+// WithTenantQuotaResolver wires a per-tenant index-entry quota resolver. A nil
+// resolver, or one that reports no quota for a tenant, disables enforcement for
+// that tenant (unbounded — identical to today's behavior). The index reads it
+// once per Ingest, before taking the write lock; the resolver implementation
+// owns its own concurrency.
+func WithTenantQuotaResolver(r TenantQuotaResolver) Option {
+	return func(i *Index) { i.quotaResolver = r }
+}
+
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
 
@@ -336,6 +372,7 @@ func New(opts ...Option) *Index {
 		ranker:          DefaultRankerConfig(),
 		prefixes:        make(map[prefixKey]map[string]replicaEntry),
 		stats:           make(map[statsKey]statEntry),
+		entriesByTenant: make(map[string]int),
 		servingByScope:  make(map[scopeKey]map[string]int),
 		replicasByModel: make(map[modelKey]map[string]struct{}),
 		reportedModels:  make(map[string]struct{}),
@@ -389,6 +426,11 @@ func (i *Index) Ingest(u Update) {
 	if ts.IsZero() {
 		ts = i.now()
 	}
+
+	// Resolve the tenant's entry budget before locking: the resolver owns its
+	// own lock, and calling it under i.mu would nest the index lock with the
+	// policy-store lock on the hot ingest path. ok=false → no quota → unbounded.
+	maxEntries, hasQuota := i.tenantQuotaFor(u.Tenant)
 
 	i.mu.Lock()
 	// prefix_hash is engine-opaque and only safe within a known hash_scheme; an
@@ -446,9 +488,20 @@ func (i *Index) Ingest(u Update) {
 		}
 		i.statsScopeAddLocked(modelKey{u.Tenant, u.Model}, u.ReplicaID)
 	}
+	// Enforce the tenant's index-entry budget on the freshly-ingested state.
+	// Fairness mode: evict only THIS tenant's own oldest entries down to budget;
+	// other tenants are untouched. Memory budgets are not enforced here (the
+	// engine owns KV memory) — entry count is the only dimension we control.
+	evicted := 0
+	if hasQuota {
+		evicted = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
+	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
 
+	if evicted > 0 && i.metrics != nil {
+		i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evicted)
+	}
 	i.reportEntries()
 }
 
@@ -933,10 +986,16 @@ type ReplicaSnapshot struct {
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
+//
+// MemoryUsed is the sum of the tenant's replicas' cache_memory_bytes — a
+// cluster-wide observability figure only (the engine owns this memory; it is
+// not a per-tenant budget). IndexEntries is the tenant's live index entry
+// count, the quantity CacheTenant.spec.quota.maxIndexEntries actually bounds.
 type TenantSnapshot struct {
-	TenantID   string  `json:"tenantId"`
-	MemoryUsed int64   `json:"memoryUsed"`
-	HitRate    float32 `json:"hitRate"`
+	TenantID     string  `json:"tenantId"`
+	MemoryUsed   int64   `json:"memoryUsed"`
+	IndexEntries int64   `json:"indexEntries"`
+	HitRate      float32 `json:"hitRate"`
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest
@@ -987,12 +1046,39 @@ func (i *Index) Snapshot() Snapshot {
 		a.sumHit += float64(s.stats.HitRate)
 		a.n++
 	}
-	for t, a := range byTenant {
-		var hit float32
-		if a.n > 0 {
-			hit = float32(a.sumHit / float64(a.n))
+	// Union the stats-bearing tenants with the entry-bearing tenants: a tenant
+	// can have index entries but no stats reported yet (the engine reported
+	// prefixes without a stats payload), and the per-tenant status writer must
+	// still see its indexEntries. A tenant present in only one of the two maps
+	// gets zeroes for the other dimension.
+	seen := make(map[string]struct{}, len(byTenant)+len(i.entriesByTenant))
+	emit := func(t string) {
+		if _, ok := seen[t]; ok {
+			return
 		}
-		snap.Tenants = append(snap.Tenants, TenantSnapshot{TenantID: t, MemoryUsed: a.mem, HitRate: hit})
+		seen[t] = struct{}{}
+		var (
+			mem int64
+			hit float32
+		)
+		if a := byTenant[t]; a != nil {
+			mem = a.mem
+			if a.n > 0 {
+				hit = float32(a.sumHit / float64(a.n))
+			}
+		}
+		snap.Tenants = append(snap.Tenants, TenantSnapshot{
+			TenantID:     t,
+			MemoryUsed:   mem,
+			IndexEntries: int64(i.entriesByTenant[t]),
+			HitRate:      hit,
+		})
+	}
+	for t := range byTenant {
+		emit(t)
+	}
+	for t := range i.entriesByTenant {
+		emit(t)
 	}
 	i.mu.RUnlock()
 
@@ -1055,6 +1141,7 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 	}
 	if _, existed := replicas[replicaID]; !existed {
 		i.totalEntries++
+		i.entriesByTenant[key.tenant]++
 		i.scopeIncLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
 	}
 	replicas[replicaID] = replicaEntry{tokenCount: tokenCount, lastSeen: ts}
@@ -1068,6 +1155,11 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 	}
 	delete(replicas, replicaID)
 	i.totalEntries--
+	if n := i.entriesByTenant[key.tenant] - 1; n <= 0 {
+		delete(i.entriesByTenant, key.tenant)
+	} else {
+		i.entriesByTenant[key.tenant] = n
+	}
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
 	}
@@ -1201,6 +1293,68 @@ func (i *Index) enforceCapLocked() {
 		}
 		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
 	}
+}
+
+// tenantQuotaFor returns the tenant's index-entry budget and whether one is
+// configured. A nil resolver (or no matching CacheTenant) reports ok=false →
+// the index leaves the tenant unbounded (fail open), identical to the behavior
+// before any CacheTenant exists. Mirrors ttlFor.
+func (i *Index) tenantQuotaFor(tenant string) (maxEntries int64, ok bool) {
+	if i.quotaResolver == nil {
+		return 0, false
+	}
+	return i.quotaResolver.TenantQuota(tenant)
+}
+
+// evictOldestForTenantLocked evicts the tenant's oldest entries (by lastSeen)
+// until its entry count is within maxEntries, returning how many it removed.
+// Caller holds the write lock.
+//
+// This is the Fairness-mode primitive: it touches ONLY the named tenant's
+// entries, never another tenant's, so one tenant overrunning its budget can't
+// evict a well-behaved tenant's hints. It reuses the same removeReplicaLocked
+// removal and lastSeen ordering as the global cap backstop (enforceCapLocked),
+// scoped to one tenant. Ties on lastSeen break by (prefix hash, replica id) so
+// eviction order is fully deterministic.
+func (i *Index) evictOldestForTenantLocked(tenant string, maxEntries int64) int {
+	if maxEntries < 0 {
+		return 0
+	}
+	if int64(i.entriesByTenant[tenant]) <= maxEntries {
+		return 0
+	}
+	type ref struct {
+		key      prefixKey
+		replica  string
+		lastSeen time.Time
+	}
+	all := make([]ref, 0, i.entriesByTenant[tenant])
+	for key, replicas := range i.prefixes {
+		if key.tenant != tenant {
+			continue
+		}
+		for id, e := range replicas {
+			all = append(all, ref{key, id, e.lastSeen})
+		}
+	}
+	sort.Slice(all, func(a, b int) bool {
+		if !all[a].lastSeen.Equal(all[b].lastSeen) {
+			return all[a].lastSeen.Before(all[b].lastSeen)
+		}
+		if all[a].key.prefixHash != all[b].key.prefixHash {
+			return all[a].key.prefixHash < all[b].key.prefixHash
+		}
+		return all[a].replica < all[b].replica
+	})
+	removed := 0
+	for _, r := range all {
+		if int64(i.entriesByTenant[tenant]) <= maxEntries {
+			break
+		}
+		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
+		removed++
+	}
+	return removed
 }
 
 // reportEntries pushes live per-model counts to the metrics sink, if wired.

@@ -18,8 +18,14 @@ spec:
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.tenantID
-      name: TenantID
+      name: Tenant
       type: string
+    - jsonPath: .status.indexEntries
+      name: Entries
+      type: integer
+    - jsonPath: .spec.quota.maxIndexEntries
+      name: Quota
+      type: integer
     - jsonPath: .spec.isolationMode
       name: Isolation
       type: string
@@ -71,12 +77,6 @@ spec:
                     format: int64
                     minimum: 0
                     type: integer
-                  maxMemoryBytes:
-                    description: MaxMemoryBytes is the maximum cache memory attributed
-                      to the tenant.
-                    format: int64
-                    minimum: 0
-                    type: integer
                 type: object
               tenantID:
                 description: TenantID is the external tenant identifier used by gateway
@@ -87,7 +87,13 @@ spec:
             - tenantID
             type: object
           status:
-            description: CacheTenantStatus defines observed tenant state.
+            description: |-
+              CacheTenantStatus defines observed tenant state.
+
+              No MemoryUsed field: per-tenant memory is not honestly observable on a shared,
+              tenant-unaware engine (ReplicaStats.cache_memory_bytes is the engine total and
+              would be double-counted across tenants sharing it). Operators who want memory
+              signals read the cluster-wide CacheIndex tenant aggregate / Prometheus.
             properties:
               conditions:
                 description: Conditions describe the latest observations of the tenant.
@@ -150,11 +156,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               indexEntries:
-                description: IndexEntries is the observed tenant index entry count.
-                format: int64
-                type: integer
-              memoryUsed:
-                description: MemoryUsed is the observed tenant cache memory in bytes.
+                description: |-
+                  IndexEntries is the observed tenant index entry count. A nil pointer means
+                  "not yet computed" (no snapshot observed), distinct from an observed 0.
                 format: int64
                 type: integer
               observedGeneration:
