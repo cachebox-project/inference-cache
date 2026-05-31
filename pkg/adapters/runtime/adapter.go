@@ -79,6 +79,40 @@ type KVCacheRuntimeAdapter interface {
 	// the append). Identity flags MUST be derived from cache + pod so the
 	// CR is the single source of truth — no operator-supplied flags.
 	ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error)
+
+	// ReservedArgs returns the leading flag tokens (e.g.
+	// "--kv-transfer-config") this adapter will inject as part of
+	// [InjectEngineConfig] and that the integration cannot function
+	// without. The validating webhook for CacheBackend rejects any
+	// spec.integration.engineOverrides.{args,suppressArgs} entry whose
+	// leading flag token overlaps this list, so the operator cannot
+	// silently un-wire the integration by adding or suppressing one of
+	// these.
+	//
+	// Tunable flags the operator may legitimately want to change MUST NOT
+	// appear here. The list is exact: matching is per-leading-flag-token,
+	// so equality is the contract (no prefix/wildcards).
+	ReservedArgs() []string
+
+	// ReservedEnv returns the env var Names this adapter will inject as
+	// part of [InjectEngineConfig] and that the integration cannot
+	// function without. The validating webhook for CacheBackend rejects
+	// any spec.integration.engineOverrides.{env,suppressEnv} entry whose
+	// Name overlaps this list.
+	//
+	// Tunables the operator may legitimately want to change (perf knobs,
+	// mode toggles, etc.) MUST NOT appear here. Matching is per-Name
+	// (exact, case-sensitive).
+	ReservedEnv() []string
+
+	// EngineContainerName returns the canonical container Name this
+	// adapter targets when mutating an engine pod. The pod webhook uses
+	// it to find the container [InjectEngineConfig] modified so it can
+	// apply spec.integration.engineOverrides to the same Args / Env.
+	// Empty ("") signals that the adapter has no fixed engine-container
+	// name (e.g. the reference adapter writes to every container) — the
+	// webhook skips override application in that case.
+	EngineContainerName() string
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter

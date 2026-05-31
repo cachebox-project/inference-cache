@@ -110,5 +110,36 @@ func (adapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1
 	return nil, nil
 }
 
+// ReservedArgs returns the engine args the External adapter injects that
+// the integration cannot function without. The wire format is identical
+// to the managed vLLM+LMCache adapter (both call
+// enginewire.InjectVLLMLMCache), so the reserved set must be identical
+// too — an operator suppressing `--kv-transfer-config` on an External CR
+// would un-wire the LMCache connector exactly the way it would on a
+// managed CR, and the cache plane would silently stop routing through
+// the operator's pre-existing cache.
+func (adapter) ReservedArgs() []string {
+	return []string{"--kv-transfer-config"}
+}
+
+// ReservedEnv returns the env var names the External adapter injects that
+// the integration cannot function without. Same set as the managed
+// vLLM+LMCache adapter; the rationale is identical (the engine must
+// find the cache at the operator-supplied endpoint, run on the
+// LMCache-targeting vLLM codepath, and honor the fail-open contract).
+func (adapter) ReservedEnv() []string {
+	return []string{
+		enginewire.EnvLMCacheRemoteURL,
+		enginewire.EnvVLLMUseV1,
+		enginewire.EnvInferenceCacheFailOpen,
+	}
+}
+
+// EngineContainerName returns the canonical name of the vLLM engine
+// container the adapter mutates. The pod webhook uses this to scope
+// engineOverrides edits to the same container InjectEngineConfig writes
+// to — overrides land on the engine, not on user-attached sidecars.
+func (adapter) EngineContainerName() string { return enginewire.EngineContainerName }
+
 // Compile-time assertion: the adapter implements the full C5 interface.
 var _ runtimeadapter.KVCacheRuntimeAdapter = adapter{}

@@ -82,6 +82,27 @@ func (referenceAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.
 	return nil, nil
 }
 
+// ReservedArgs returns nil: the reference adapter injects no flag of its
+// own, so there is nothing the operator could un-wire by overriding or
+// suppressing. The empty contract demonstrates the interface seam without
+// adding a strict requirement of its own.
+func (referenceAdapter) ReservedArgs() []string { return nil }
+
+// ReservedEnv returns nil: the only env the reference adapter writes is
+// [EnvCacheEndpoint] / [EnvRouterEndpoint], which are tunable by design
+// (the adapter exists to demonstrate the merge contract, not enforce a
+// real integration). A future adapter built on this template would reserve
+// whatever it strictly requires.
+func (referenceAdapter) ReservedEnv() []string { return nil }
+
+// EngineContainerName returns "" — the reference adapter writes its env to
+// every container in the pod, not a single canonical engine container, so
+// it has no fixed name for the pod webhook to target. The webhook treats
+// an empty name as "skip override application", which matches the
+// reference adapter's role as a contract demo rather than a production
+// integration.
+func (referenceAdapter) EngineContainerName() string { return "" }
+
 // injectEndpointEnv is the shared implementation behind the reference
 // adapter's two inject paths. It is the worked example future adapters
 // should mirror: validate inputs, locate the role-specific containers, and

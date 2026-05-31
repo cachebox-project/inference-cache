@@ -2,10 +2,14 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +21,7 @@ import (
 	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -29,6 +34,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 // These tests run the reconciler against a real kube-apiserver (envtest), so they
@@ -774,6 +780,230 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("deployment was not recreated after deletion (Owns watch did not re-trigger)")
+}
+
+// TestIntegrationCacheIndexPollerProjectsParticipation exercises the poller
+// against a real apiserver to confirm that Status().Patch on CacheBackend
+// applies the indexParticipation projection (pod-label-based attribution),
+// and that a steady snapshot does not churn the backend's resourceVersion
+// (the no-churn invariant under real apiserver defaulting). Catches the
+// class of bug a fake client misses — the fake client skips apiserver
+// defaulting that can flip semantic equality on round-trip and cause
+// spurious writes.
+func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, _ := startEnv(t)
+	ctx := context.Background()
+	ns := freshNS(t, k8s)
+
+	// Seed two CacheBackends with EngineSelectors plus an engine pod each.
+	// External type keeps the CacheBackend reconciler out of the picture —
+	// we are testing the poller's Status().Patch in isolation.
+	mkBackend := func(name string, selector map[string]string) *cachev1alpha1.CacheBackend {
+		return &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:           cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint:       "external.example:6379",
+				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
+			},
+		}
+	}
+	mkPod := func(name string, labels map[string]string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "vllm", Image: "vllm/vllm-openai:latest"}}},
+		}
+	}
+	for _, obj := range []client.Object{
+		mkBackend("backend-a", map[string]string{"app": "vllm-a"}),
+		mkBackend("backend-b", map[string]string{"app": "vllm-b"}),
+		mkPod("vllm-a-0", map[string]string{"app": "vllm-a"}),
+		mkPod("vllm-b-0", map[string]string{"app": "vllm-b"}),
+	} {
+		if err := k8s.Create(ctx, obj); err != nil {
+			t.Fatalf("create %T %s: %v", obj, obj.GetName(), err)
+		}
+	}
+
+	tEvent := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-a-0", Tenant: ns, PrefixCount: 4, LastEventAt: tEvent},
+			{ReplicaID: "vllm-b-0", Tenant: ns, PrefixCount: 1, LastEventAt: tEvent},
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(served)
+	}))
+	defer srv.Close()
+
+	p := &CacheIndexPoller{Client: k8s, SnapshotURL: srv.URL, HTTPClient: srv.Client(), Name: "cluster-default"}
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+
+	a := getBackendDirect(t, k8s, "backend-a", ns)
+	if a.Status.IndexParticipation == nil || a.Status.IndexParticipation.PrefixCount != 4 {
+		t.Fatalf("backend-a participation = %+v, want prefixCount 4", a.Status.IndexParticipation)
+	}
+	rvA := a.ResourceVersion
+
+	// Second refresh on identical snapshot → no churn (apiserver-side).
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	a2 := getBackendDirect(t, k8s, "backend-a", ns)
+	if a2.ResourceVersion != rvA {
+		t.Fatalf("steady snapshot churned resourceVersion (%s → %s)", rvA, a2.ResourceVersion)
+	}
+}
+
+// TestIntegrationCacheBackendPrinterColumnsRenderParticipation verifies the
+// operator-facing promise: `kubectl get cachebackend` shows Prefixes and
+// LastEvent columns sourced from status.indexParticipation. We hit the
+// apiserver's Table content type — exactly the negotiation kubectl does
+// under the hood — and assert column headers, types, and per-row cell
+// values match. Catches accidental removal of the +kubebuilder:printcolumn
+// markers, JSONPath drift, and renames of the underlying status fields.
+func TestIntegrationCacheBackendPrinterColumnsRenderParticipation(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, cfg := startEnv(t)
+	ctx := context.Background()
+	ns := freshNS(t, k8s)
+
+	// Two backends: one with positive participation, one drained-but-quiet.
+	// External type keeps the CacheBackend reconciler out of the picture so
+	// we are testing the printer-column projection from status, not the
+	// reconciler.
+	active := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "backend-a", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "lm://cache-svc:6379",
+		},
+	}
+	if err := k8s.Create(ctx, active); err != nil {
+		t.Fatalf("create active: %v", err)
+	}
+	quiet := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "backend-b", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "lm://cache-svc:6379",
+		},
+	}
+	if err := k8s.Create(ctx, quiet); err != nil {
+		t.Fatalf("create quiet: %v", err)
+	}
+
+	// Set the participation status directly via the status subresource —
+	// same path the poller uses, no poller in this test.
+	lastEvent := metav1.NewTime(time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Second))
+	active.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{
+		PrefixCount: 42,
+		LastEventAt: &lastEvent,
+	}
+	if err := k8s.Status().Update(ctx, active); err != nil {
+		t.Fatalf("update active status: %v", err)
+	}
+	quiet.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{
+		PrefixCount: 0,
+		// LastEventAt deliberately nil — kubectl renders this as <none>.
+	}
+	if err := k8s.Status().Update(ctx, quiet); err != nil {
+		t.Fatalf("update quiet status: %v", err)
+	}
+
+	// Hit the apiserver with the Table accept header. This is exactly what
+	// `kubectl get` does: the server-side rendering is what defines the
+	// columns the operator sees, so this is the most honest test of the
+	// before/after promise.
+	// Use the typed REST client so namespace/resource path construction and
+	// auth wiring exactly match what kubectl does internally.
+	restCfg := rest.CopyConfig(cfg)
+	gv := cachev1alpha1.GroupVersion
+	restCfg.GroupVersion = &gv
+	restCfg.APIPath = "/apis"
+	restCfg.NegotiatedSerializer = serializer.NewCodecFactory(runtime.NewScheme()).WithoutConversion()
+	restClient, err := rest.RESTClientFor(restCfg)
+	if err != nil {
+		t.Fatalf("build REST client: %v", err)
+	}
+	raw, err := restClient.Get().
+		Namespace(ns).
+		Resource("cachebackends").
+		SetHeader("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io").
+		DoRaw(ctx)
+	if err != nil {
+		t.Fatalf("apiserver Table request: %v", err)
+	}
+
+	var table metav1.Table
+	if err := json.Unmarshal(raw, &table); err != nil {
+		t.Fatalf("decode Table: %v\nraw=%s", err, raw)
+	}
+	if len(table.ColumnDefinitions) == 0 || len(table.Rows) == 0 {
+		t.Fatalf("apiserver returned an empty Table: %+v", table)
+	}
+
+	// Find the Prefixes and LastEvent columns and assert their types match
+	// the +kubebuilder:printcolumn markers in api/v1alpha1/cachebackend_types.go.
+	wantCols := map[string]string{"Prefixes": "integer", "LastEvent": "date"}
+	colIdx := map[string]int{}
+	for i, col := range table.ColumnDefinitions {
+		if wantType, ok := wantCols[col.Name]; ok {
+			if col.Type != wantType {
+				t.Errorf("column %q type = %q, want %q", col.Name, col.Type, wantType)
+			}
+			colIdx[col.Name] = i
+		}
+	}
+	for name := range wantCols {
+		if _, ok := colIdx[name]; !ok {
+			t.Fatalf("column %q missing from `kubectl get cachebackend` output", name)
+		}
+	}
+
+	// Per-row cell assertions: active shows 42, quiet shows 0; LastEvent
+	// on quiet is the empty/<none> cell.
+	wantPrefixes := map[string]float64{"backend-a": 42, "backend-b": 0}
+	for _, row := range table.Rows {
+		var obj metav1.PartialObjectMetadata
+		if err := json.Unmarshal(row.Object.Raw, &obj); err != nil {
+			t.Fatalf("decode row object: %v", err)
+		}
+		expected, ok := wantPrefixes[obj.Name]
+		if !ok {
+			continue
+		}
+		gotPrefixes, ok := row.Cells[colIdx["Prefixes"]].(float64)
+		if !ok {
+			t.Fatalf("%s Prefixes cell type = %T (%v), want number", obj.Name, row.Cells[colIdx["Prefixes"]], row.Cells[colIdx["Prefixes"]])
+		}
+		if gotPrefixes != expected {
+			t.Errorf("%s Prefixes cell = %v, want %v", obj.Name, gotPrefixes, expected)
+		}
+		switch obj.Name {
+		case "backend-a":
+			// Set lastEventAt → cell should be a non-empty string (the apiserver
+			// renders date columns as relative ages like "5m").
+			cell, _ := row.Cells[colIdx["LastEvent"]].(string)
+			if cell == "" || cell == "<none>" {
+				t.Errorf("backend-a LastEvent cell = %q, want a rendered duration", cell)
+			}
+		case "backend-b":
+			// Nil lastEventAt → cell is empty / <none>; the apiserver returns
+			// the empty string for a missing date field.
+			cell := row.Cells[colIdx["LastEvent"]]
+			if s, ok := cell.(string); ok && s != "" && s != "<none>" {
+				t.Errorf("backend-b LastEvent cell = %q, want empty/<none>", s)
+			}
+		}
+	}
 }
 
 // TestIntegrationCacheBackendEvents runs a real manager (so the Recorder is

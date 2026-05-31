@@ -180,6 +180,48 @@ func (vllmLMCacheAdapter) SupportedPairs() []SupportedPair {
 	return []SupportedPair{{Runtime: RuntimeVLLM, Backend: cachev1alpha1.CacheBackendTypeLMCache}}
 }
 
+// ReservedArgs returns the leading flag tokens this adapter injects and that
+// the LMCache integration cannot function without. The validating webhook
+// blocks an spec.integration.engineOverrides entry that tries to override or
+// suppress any of these so the operator cannot silently un-wire the connector.
+//
+//   - "--kv-transfer-config" is the LMCache connector configuration the engine
+//     reads at startup; suppressing it means no LMCache wiring at all.
+//
+// Other tunables the operator may legitimately want to change (e.g. perf
+// knobs surfaced as backendConfig keys) are deliberately NOT reserved.
+func (vllmLMCacheAdapter) ReservedArgs() []string {
+	return []string{defaultEngineKVTransferConfigArg}
+}
+
+// EngineContainerName returns [EngineContainerName] — the canonical name the
+// vLLM engine container carries on a pod the adapter mutates. The pod
+// webhook resolves the override target via this method so admission overrides
+// land on the same container [InjectEngineConfig] modified.
+func (vllmLMCacheAdapter) EngineContainerName() string { return EngineContainerName }
+
+// ReservedEnv returns the env var names this adapter injects and that the
+// LMCache integration cannot function without:
+//
+//   - LMCACHE_REMOTE_URL is the address of the rendered cache server; an
+//     override re-points the engine at a different cache than the CR
+//     resolved to.
+//   - VLLM_USE_V1 selects the vLLM v1 codepath the LMCache connector targets.
+//   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the
+//     pod; allowing an override would silently desync the pod from the CR
+//     contract and from status.failOpen.
+//
+// Tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE / LMCACHE_LOCAL_CPU /
+// LMCACHE_MAX_LOCAL_CPU_SIZE) are perf/mode knobs the operator may legitimately
+// want to change and are deliberately NOT reserved.
+func (vllmLMCacheAdapter) ReservedEnv() []string {
+	return []string{
+		EnvLMCacheRemoteURL,
+		EnvVLLMUseV1,
+		EnvInferenceCacheFailOpen,
+	}
+}
+
 // ResolveCacheServer renders the standalone LMCache server's container set
 // and the Service's port set. The reconciler owns ObjectMeta, the Service
 // Selector, the workload kind (Deployment vs StatefulSet), and owner
