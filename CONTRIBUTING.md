@@ -142,7 +142,7 @@ The per-PR install-smoke gate — [`docs/reference-stack/scripts/default_install
 - the default-install bundle or its RBAC;
 - sample manifests.
 
-A good assertion drives the surface the way an operator would: apply the relevant CR, wait for the controller to write status, then assert the observable (a `.status` field, a printer column, a gRPC response). The smoke runs with **no engine traffic**, so assert the no-traffic / "observed-zero" steady state — e.g. the cluster `CacheIndex` reports a populated `.status.observedServer` with zero prefixes — rather than anything that needs real cache hits.
+A good assertion drives the surface the way an operator would: apply the relevant CR, wait for the controller to write status, then assert the observable (a `.status` field, a printer column, a gRPC response). The smoke runs with **no engine traffic**, so assert the no-traffic / "observed-zero" steady state — e.g. the cluster `CacheIndex` reports a populated `.status.observedServer` — rather than anything that needs real cache hits.
 
 Worked example: the CacheIndex poller assertion in that script applies nothing exotic but waits for the controller to populate `cacheindex/cluster-default`'s `.status.observedServer` and fails if it stays empty — the same shape every per-feature assertion should follow.
 
