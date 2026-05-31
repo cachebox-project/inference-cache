@@ -236,7 +236,16 @@ if [ "$ct_ready" != "True" ]; then
   kubectl get cachetenant cachetenant-sample -o yaml || true
   fail "expected cachetenant-sample Ready=True, got: ${ct_ready:-<unset>}"
 fi
-log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready"
+
+# The printer columns (Tenant / Entries / Quota) are themselves an operator-
+# facing surface. Verify `kubectl get cachetenants` renders them — a default
+# table with only NAME/AGE would mean the additionalPrinterColumns regressed.
+ct_table="$(kubectl get cachetenant cachetenant-sample 2>/dev/null || true)"
+if ! grep -q 'tenant-a' <<<"$ct_table" || ! grep -q '100000' <<<"$ct_table"; then
+  echo "$ct_table"
+  fail "expected CacheTenant printer columns (Tenant=tenant-a, Quota=100000) in kubectl get output"
+fi
+log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready (printer columns OK)"
 
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
