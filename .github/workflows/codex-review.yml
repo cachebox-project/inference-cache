@@ -57,39 +57,98 @@ jobs:
           You are reviewing PR #${{ github.event.pull_request.number }} for ${{ github.repository }},
           a vendor-neutral, open-source Kubernetes-native cache plane for LLM inference.
 
-          Review ONLY the changes introduced by this PR:
+          Treat this as a fresh, cold review — even if you've reviewed this PR before. Your
+          job is to surface ALL findings the project would want to know about, not a curated
+          subset. A fix push between rounds is not a license to roam to new territory; give
+          the same findings a fresh reviewer would give on the same diff.
+
+          ## Inputs
+
+          Diff under review:
             git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
-
-          Read the full diff and the surrounding code, then check against this project's standard:
-
-          1. Vendor-neutral naming (HARD RULE — see CONTRIBUTING.md). No `oci`, `oracle`,
-             `*.oci.com`, or `oraclecloud.com` may appear in any core-identity surface:
-             API/CRD group, kubebuilder domain, proto package, gRPC service/package, Go module
-             path, default namespace, image registry, Helm chart, or any user-facing default.
-             Cloud-specific integration is allowed ONLY in an isolated optional adapter under
-             pkg/adapters/.../ — never in core controllers, CRD types, the proto contract, or
-             default config/samples.
-          2. Contract & spec. Changes should match the design docs under docs/design/. Any
-             change to proto/ MUST be mirrored in docs/design/grpc-contract.md (field numbers,
-             reason-code enums, RPC signatures). v1alpha1 must stay backward-compatible: no
-             renumbered/removed proto fields, no breaking CRD field changes.
-          3. gRPC fail-open semantics. Lookups (RenderTemplate, LookupRoute, LookupPDRoute,
-             GetCacheState) must be side-effect-free and fail open (empty result + NO_HINT/OK),
-             never erroring on the hot path. prefix_hash is engine-opaque bytes;
-             CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors or prompt text.
-          4. Quality. New/changed behavior has tests (control-flow paths exercised, ideally over
-             the wire); errors are wrapped not swallowed; code lands in the right package;
-             generated code (config/crd, zz_generated*, pkg/server/proto) is regenerated, not
-             hand-edited.
-
-          Be concise and specific. Group findings by severity (Blocking / Should-fix / Nit) with
-          file:line references, then give a verdict (approve / approve-with-nits / changes-requested).
-          If there are no issues, say so briefly.
 
           Pull request title and body:
           ----
           ${{ github.event.pull_request.title }}
           ${{ github.event.pull_request.body }}
+
+          ## Method (follow in order, do not skip steps)
+
+          STEP 1 — Enumerate. List every file changed by this PR, grouped by directory.
+          Note (and skip review of) any generated files: anything under config/crd/,
+          config/rbac/role.yaml, pkg/server/proto/, any file named zz_generated*. These
+          are regenerated, not hand-edited; findings on them are noise.
+
+          STEP 2 — For each non-generated changed file, walk all four checks below. Even
+          if a file is clean against a check, you must explicitly note "Clean" for that
+          category in the per-category summary (STEP 4). Do not silently omit categories.
+
+          STEP 3 — Collect findings across all files. Be exhaustive: surface every issue
+          you would mention if asked "what's wrong with this PR?" Include nits — round-
+          to-round variance is worse than a long nit list.
+
+          STEP 4 — Output in this structure:
+
+              ## Files reviewed
+              <bulleted list, grouped by directory; mark each as `[reviewed]` or `[skipped — generated]`>
+
+              ## Findings
+
+              ### Blocking
+              <file:line — finding — 1-2 sentence rationale>
+              <or: "None.">
+
+              ### Should-fix
+              <same format>
+              <or: "None.">
+
+              ### Nit
+              <same format>
+              <or: "None.">
+
+              ## Per-category coverage
+              1. Vendor-neutral naming: <Clean | findings above at: file:line, file:line>
+              2. Contract & spec / docs sync: <Clean | findings above at: ...>
+              3. gRPC fail-open semantics: <Clean | findings above at: ...>
+              4. Quality (tests / error wrapping / package placement / generated drift): <Clean | findings above at: ...>
+
+              ## Verdict
+              <approve | approve-with-nits | changes-requested>
+
+          ## Checks (apply ALL to EVERY non-generated file)
+
+          1. Vendor-neutral naming (HARD RULE — see CONTRIBUTING.md). No `oci`, `oracle`,
+             `*.oci.com`, or `oraclecloud.com` may appear in any core-identity surface:
+             API/CRD group, kubebuilder domain, proto package, gRPC service/package, Go
+             module path, default namespace, image registry, Helm chart, or any user-facing
+             default. Cloud-specific integration is allowed ONLY in an isolated optional
+             adapter under pkg/adapters/.../ — never in core controllers, CRD types, the
+             proto contract, or default config/samples.
+
+          2. Contract & spec. Changes should match the design docs under docs/design/.
+             Any change to proto/ MUST be mirrored in docs/design/grpc-contract.md (field
+             numbers, reason-code enums, RPC signatures). v1alpha1 must stay backward-
+             compatible: no renumbered/removed proto fields, no breaking CRD field changes.
+
+          3. gRPC fail-open semantics. Lookups (RenderTemplate, LookupRoute, LookupPDRoute,
+             GetCacheState) must be side-effect-free and fail open (empty result +
+             NO_HINT/OK), never erroring on the hot path. prefix_hash is engine-opaque
+             bytes; CacheStateUpdate / PrefixEntry carry metadata only — never KV tensors
+             or prompt text.
+
+          4. Quality. New/changed behavior has tests (control-flow paths exercised, ideally
+             over the wire); errors are wrapped not swallowed; code lands in the right
+             package per the layout in CONTRIBUTING.md; generated code (config/crd,
+             zz_generated*, pkg/server/proto) is regenerated, not hand-edited.
+
+          ## Format constraints
+
+          - Per-finding rationale: 1-2 sentences max. Brevity per finding, not brevity
+            overall.
+          - File:line references required for every finding (use the post-diff line numbers).
+          - No prose preamble, no closing summary other than the Verdict line.
+          - If something is genuinely unclear from the diff alone, mark it as a Should-fix
+            "Verify:" finding rather than omitting it.
 
   post_feedback:
     name: Post Codex feedback
