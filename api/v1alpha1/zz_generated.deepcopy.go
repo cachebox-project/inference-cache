@@ -333,6 +333,11 @@ func (in *CacheBackendStatus) DeepCopyInto(out *CacheBackendStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.MatchedEnginePods != nil {
+		in, out := &in.MatchedEnginePods, &out.MatchedEnginePods
+		*out = new(int32)
+		**out = **in
+	}
 	if in.FailOpen != nil {
 		in, out := &in.FailOpen, &out.FailOpen
 		*out = new(bool)

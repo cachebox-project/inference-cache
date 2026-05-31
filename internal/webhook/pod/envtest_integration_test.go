@@ -212,6 +212,14 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	pod2 := pod.DeepCopy()
 	pod2.Name = "vllm-engine-2"
 	pod2.ResourceVersion = ""
+	// The first Create reads the post-admission persisted object back
+	// into `pod` (including the AnnotationInjectedBy stamp the webhook
+	// just added). A naive DeepCopy would carry that annotation into
+	// pod2 and trip the InjectedByCacheBackend event dedupe, even
+	// though pod2 is a brand-new pod about to enter admission for the
+	// first time. Strip it so the second admission is treated as a
+	// fresh injection.
+	delete(pod2.Annotations, AnnotationInjectedBy)
 	if err := mgr.GetClient().Create(ctx, pod2); err != nil {
 		t.Fatalf("create second Pod: %v", err)
 	}

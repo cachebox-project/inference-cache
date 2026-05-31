@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -12,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -44,6 +46,16 @@ const (
 	defaultHPATargetCPUUtilizationPercent = int32(80)
 )
 
+// matchedEnginePodsRequeueInterval is the steady-state cadence at which a
+// CacheBackend with a configured spec.engineSelector self-requeues, so the
+// `status.matchedEnginePods` snapshot does not stay stale forever between
+// otherwise-unrelated reconcile triggers. The reconciler does not Watch
+// Pods by design (see refreshMatchedEnginePods godoc); without a self-
+// requeue, the count would only refresh when the CR, the owned Deployment,
+// Service, or HPA changed. 30s strikes a balance between operator
+// responsiveness and reconcile pressure on a large fleet.
+const matchedEnginePodsRequeueInterval = 30 * time.Second
+
 // Event reasons emitted on a CacheBackend.
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
@@ -65,6 +77,17 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
+	// APIReader is an uncached live client used for the per-reconcile pod
+	// List that backs status.matchedEnginePods. The cached client would
+	// register a Pod informer with controller-runtime, which the locked
+	// design explicitly rejected (would watch all pods cluster-wide
+	// just to count per-CR; the per-reconcile namespaced live List is
+	// cheaper at the cluster sizes we target). Production wiring passes
+	// mgr.GetAPIReader(); tests that don't exercise the
+	// matchedEnginePods writer can leave it nil (a nil APIReader makes
+	// refreshMatchedEnginePods fall through to the embedded
+	// client.Client so existing fake-client tests still work).
+	APIReader client.Reader
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
 	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
 	// that need a custom adapter set.
@@ -77,6 +100,7 @@ type CacheBackendReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -108,6 +132,26 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	before := snapshotState(&backend)
 
 	result, err := r.dispatch(ctx, logger, &backend)
+	// Refresh status.matchedEnginePods regardless of dispatch outcome — the
+	// pod-label snapshot is an observation about the engine fleet, not about
+	// the cache-server workload dispatch manages, so an apply error must not
+	// freeze it. Runs as its own Status().Patch (MergeFrom) so it never
+	// fights the status writes dispatch already issued, and is fail-soft on
+	// transient List/Patch errors so it never escalates a transient
+	// apiserver hiccup into a Reconcile error.
+	r.refreshMatchedEnginePods(ctx, &backend)
+	// When the CR has an EngineSelector, self-requeue so the count tracks
+	// pod birth/death between unrelated reconcile triggers. We deliberately
+	// don't Watch Pods (see refreshMatchedEnginePods godoc); the periodic
+	// self-requeue gives a bounded staleness without the watch's overhead.
+	// Don't shorten an already-shorter RequeueAfter dispatch may have set
+	// (none today, but preserve the contract): only fill in the cadence
+	// when no other requeue is pending.
+	if backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0 {
+		if result.RequeueAfter == 0 {
+			result.RequeueAfter = matchedEnginePodsRequeueInterval
+		}
+	}
 	// Emit transitions whenever dispatch published a status change, even on
 	// an apply-error reconcile: the status path runs independently of apply
 	// success (so apply churn doesn't freeze user-visible health), and the
@@ -883,6 +927,87 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 	return nil
 }
 
+// refreshMatchedEnginePods refreshes status.matchedEnginePods from the live
+// pod-label set in the CacheBackend's namespace. Runs once per reconcile and
+// only touches the matchedEnginePods sub-field (via Status().Patch with
+// MergeFrom) so it coexists cleanly with the other status writers in this
+// reconciler and with any future status writers (e.g. an index-participation
+// projector) that touch different sub-fields.
+//
+// Cadence-by-reconcile, not real-time: counts via a single namespaced
+// client.List with the engineSelector — there is no Pod watch, and pod
+// births/deaths between reconciles are not reflected until the next pass.
+// To keep the count from going indefinitely stale between unrelated
+// reconcile triggers, the Reconcile path sets `result.RequeueAfter =
+// matchedEnginePodsRequeueInterval` whenever the CR has a non-empty
+// EngineSelector, giving the field a bounded staleness without paying
+// for a Pod informer. The real-time per-pod signal lives on the engine
+// pods themselves (the `InjectedByCacheBackend` Event the
+// engine-pod-events controller emits on every annotated pod); this
+// status field answers the cluster-wide "is anyone connected at all?"
+// question.
+//
+// Selector resolution mirrors the mutating webhook's policy: a nil or
+// empty MatchLabels matches nothing (a broad selector at admission time
+// would silently claim every pod). A CR with no selector therefore
+// reports no count — and a CR that previously had one and just lost it
+// gets its prior value cleared so the printer column doesn't advertise a
+// stale match for a CR that no longer claims engine pods.
+//
+// Fail-soft semantics:
+//   - List error → log + skip the tick; keep the existing value.
+//   - Status patch error → roll back the in-memory mutation so the rest of
+//     the reconcile (transition events, log fields) sees only what the
+//     apiserver actually persisted.
+//
+// Never returns an error: the matchedEnginePods refresh must not escalate
+// a transient observation failure into a Reconcile error that retries the
+// rest of the reconcile machinery unnecessarily.
+func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	before := backend.DeepCopy()
+
+	sel := backend.Spec.EngineSelector
+	if sel == nil || len(sel.MatchLabels) == 0 {
+		if backend.Status.MatchedEnginePods == nil {
+			return
+		}
+		backend.Status.MatchedEnginePods = nil
+	} else {
+		matcher := labels.SelectorFromSet(sel.MatchLabels)
+		var pods corev1.PodList
+		// Pin the pod read to the uncached APIReader so the controller-
+		// runtime cache does NOT register a Pod informer on first use —
+		// otherwise the manager would watch every pod cluster-wide just to
+		// keep this snapshot count fresh, which the locked design
+		// explicitly rejected. Fall back to the cached client only when
+		// APIReader is unset (test wiring without a real APIReader); the
+		// reconciler still functions, it just uses the cache.
+		reader := client.Reader(r.APIReader)
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.List(ctx, &pods,
+			client.InNamespace(backend.Namespace),
+			client.MatchingLabelsSelector{Selector: matcher},
+		); err != nil {
+			log.FromContext(ctx).V(1).Info("matchedEnginePods refresh skipped: pod list failed",
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return
+		}
+		count := int32(len(pods.Items))
+		if backend.Status.MatchedEnginePods != nil && *backend.Status.MatchedEnginePods == count {
+			return
+		}
+		backend.Status.MatchedEnginePods = &count
+	}
+
+	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
+		backend.Status.MatchedEnginePods = before.Status.MatchedEnginePods
+		log.FromContext(ctx).V(1).Info("matchedEnginePods refresh: status patch failed",
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+	}
+}
+
 // stateSnapshot captures the prior-status fields that drive transition events.
 // Health is the observed phase enum and failOpen is the previously-echoed
 // integration.failOpen (nil ⇒ never observed ⇒ treated as the API default of
@@ -970,6 +1095,14 @@ func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
+	}
+	if r.APIReader == nil {
+		// Default to the manager's uncached APIReader so production
+		// wiring doesn't have to thread it explicitly, AND envtest
+		// integration tests that boot a real manager still skip the
+		// Pod informer per the locked design (the test setup just
+		// passes Client, not APIReader).
+		r.APIReader = mgr.GetAPIReader()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.CacheBackend{}).

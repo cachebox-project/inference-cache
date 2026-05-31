@@ -134,11 +134,12 @@ func main() {
 	)
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Log:      ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder: mgr.GetEventRecorder("cachebackend-controller"),
-		Registry: adapterRegistry,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:  mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader: mgr.GetAPIReader(),
+		Registry:  adapterRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -161,6 +162,19 @@ func main() {
 		PushInterval:    opts.policyPushEvery,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CachePolicy")
+		os.Exit(1)
+	}
+
+	// EnginePodEventsReconciler emits the InjectedByCacheBackend Event on
+	// each engine pod after the mutating webhook stamps it. The webhook
+	// itself can't emit: at admission time the apiserver hasn't assigned
+	// pod.metadata.uid, so a webhook-recorded event would land with
+	// involvedObject.uid="" and be invisible to `kubectl describe pod`.
+	if err := (&controller.EnginePodEventsReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EnginePodEvents")
 		os.Exit(1)
 	}
 

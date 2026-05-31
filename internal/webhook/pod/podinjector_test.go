@@ -959,6 +959,77 @@ func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T)
 	}
 }
 
+func TestHandle_FailOpenClearsForgedInjectedByAnnotation(t *testing.T) {
+	// The AnnotationInjectedBy annotation is user-controllable. Anyone
+	// with pod-create RBAC can set it; the webhook does NOT overwrite
+	// it on fail-open paths. The engine-pod-events controller treats
+	// the annotation as the authoritative "this pod was injected"
+	// signal — so a forged or copy-pasted annotation on a pod that
+	// never goes through real injection would falsely trigger
+	// `InjectedByCacheBackend`. Fix: on fail-open, the webhook strips
+	// the annotation if it was preset. The common steady-state path
+	// (pod has no annotation) stays at zero patches (covered by the
+	// no-forged-annotation test below).
+	const ns = "engines"
+	cases := []struct {
+		name   string
+		seedCB bool
+		labels map[string]string
+	}{
+		{name: "no matching CacheBackend", seedCB: false, labels: map[string]string{"app": "router"}},
+		{name: "selector matches but endpoint not published", seedCB: true, labels: map[string]string{"app": "vllm"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var h *EngineInjector
+			if tc.seedCB {
+				cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+				cb.Status.Endpoint = "" // force the endpoint-not-published fail-open path
+				h = newHandler(t, cb)
+			} else {
+				h = newHandler(t)
+			}
+
+			pod := vllmEnginePod("forger", tc.labels)
+			pod.Annotations = map[string]string{AnnotationInjectedBy: ns + "/totally-not-a-real-cb"}
+			req := newRequest(t, pod, ns)
+
+			resp := h.Handle(context.Background(), req)
+			if !resp.Allowed {
+				t.Fatalf("expected Allowed (fail-open): %+v", resp.Result)
+			}
+			if len(resp.Patches) == 0 {
+				t.Fatalf("expected a clearing JSON patch on the fail-open path; got 0 patches")
+			}
+
+			mutated := applyPatches(t, req.Object.Raw, resp)
+			if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
+				t.Fatalf("forged %s annotation survived fail-open: got %q, want \"\"", AnnotationInjectedBy, got)
+			}
+		})
+	}
+}
+
+func TestHandle_FailOpenZeroPatchesWithoutForgedAnnotation(t *testing.T) {
+	// The steady-state no-match path on a cluster-wide pod (no
+	// engine-related annotations) must remain zero-patches, otherwise
+	// the webhook would generate JSON-patch traffic for every Pod
+	// CREATE in the cluster just to clear an annotation nobody set.
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("unrelated", map[string]string{"app": "router"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("expected zero patches on no-match without forged annotation; got %d", len(resp.Patches))
+	}
+}
+
 // pin the GroupVersionKind so a future api/v1alpha1 split (e.g. moving
 // CacheBackend out of the unversioned core scheme) doesn't silently break
 // the webhook's client.List call.
