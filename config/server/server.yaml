@@ -6,8 +6,43 @@ metadata:
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: server
-# The server does not call the Kubernetes API; don't automount a token.
-automountServiceAccountToken: false
+# The server calls the apiserver's TokenReview API to authenticate the
+# controller's /snapshot scrapes, so it needs a projected SA token.
+automountServiceAccountToken: true
+---
+# Narrow ClusterRole + binding granting ONLY the permission the server
+# actually exercises: creating TokenReview objects to validate /snapshot
+# bearer tokens. The canonical alternative, system:auth-delegator, also
+# grants SubjectAccessReview (for authz delegation), which the server
+# does not call — least-privilege beats convenience here, especially for
+# a security-hardening change.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: inference-cache-server-tokenreview
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+rules:
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: inference-cache-server-tokenreview
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: inference-cache-server-tokenreview
+subjects:
+- kind: ServiceAccount
+  name: inference-cache-server
+  namespace: inference-cache-system
 ---
 apiVersion: v1
 kind: Service
@@ -30,6 +65,13 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+      protocol: TCP
+    # Internal snapshot listener. Restricted by NetworkPolicy to the
+    # controller's pod selector; authentication on the L7 endpoint is
+    # enforced by the server's TokenReview middleware.
+    - name: snapshot
+      port: 8081
+      targetPort: snapshot
       protocol: TCP
 ---
 apiVersion: apps/v1
@@ -60,7 +102,9 @@ spec:
         prometheus.io/port: "8080"
     spec:
       serviceAccountName: inference-cache-server
-      automountServiceAccountToken: false
+      # Mount the projected SA token so the server can call TokenReview to
+      # authenticate the controller's /snapshot scrape.
+      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 10
       securityContext:
         runAsNonRoot: true
@@ -75,12 +119,20 @@ spec:
           args:
             - --grpc-bind-address=:9090
             - --http-bind-address=:8080
+            - --snapshot-bind-address=:8081
+            # Restrict /snapshot to the controller's ServiceAccount. The
+            # NetworkPolicy adds an L3/L4 gate on the same port (config/server/
+            # networkpolicy.yaml); together they form independent gates.
+            - --snapshot-allowed-sa=system:serviceaccount:inference-cache-system:inference-cache-controller-manager
           ports:
             - name: grpc
               containerPort: 9090
               protocol: TCP
             - name: http
               containerPort: 8080
+              protocol: TCP
+            - name: snapshot
+              containerPort: 8081
               protocol: TCP
           livenessProbe:
             httpGet:

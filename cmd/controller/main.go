@@ -58,7 +58,7 @@ func defaultOptions() options {
 		probeAddr:               ":8081",
 		secureMetrics:           false,
 		enableHTTP2:             false,
-		serverSnapshotURL:       "http://inference-cache-server:8080/snapshot",
+		serverSnapshotURL:       "http://inference-cache-server:8081/snapshot",
 		serverPolicyURL:         "http://inference-cache-server:8080/policy",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
