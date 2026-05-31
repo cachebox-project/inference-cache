@@ -184,12 +184,13 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			// down" from "token is just bad" without parsing the error
 			// string, which would be brittle. Trust Authenticated as the
 			// authoritative bit: !Authenticated → 401. Surface the
-			// Status.Error message in the controller's log so the
-			// operator can still see WHY (a webhook authenticator
-			// timeout would show up here distinctly from "invalid bearer
-			// token"). Both still map to 401 on the wire, which is
-			// correct from the client's perspective — the client must
-			// not be admitted either way.
+			// Status.Error message in the SERVER log (this middleware
+			// runs in the policy server's snapshot listener, not the
+			// controller) so the operator can still see WHY — a webhook
+			// authenticator timeout shows up here distinctly from
+			// "invalid bearer token". Both still map to 401 on the wire,
+			// which is correct from the client's perspective: the
+			// client must not be admitted either way.
 			if tr.Status.Error != "" {
 				slog.WarnContext(r.Context(), "snapshot_auth_token_review_unauthenticated",
 					"error", tr.Status.Error)

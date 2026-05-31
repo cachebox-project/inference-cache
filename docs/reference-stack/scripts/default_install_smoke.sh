@@ -293,16 +293,29 @@ done
 probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD" 2>/dev/null || true)"
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
 
-# Acceptable outcomes (either gate sufficient): an HTTP 401 means the L7 auth
-# rejected the request; "curl_failed:*" means the L3/L4 NetworkPolicy dropped
-# the connection before the server saw it. A 200 means the endpoint is
-# unauthenticated — regression.
+# Acceptable outcomes (either gate sufficient):
+#   - HTTP 401: the L7 auth middleware rejected the request (kindnet path
+#     today; the only branch actually exercised under the default CNI).
+#   - "curl_failed:28": curl timed out (`-m 5`), i.e. the L3/L4 NetworkPolicy
+#     dropped the SYN and the kernel never saw a RST. Exit code 28 is the
+#     SHAPE of a real CNI-enforced policy drop.
+# Other curl exit codes are NOT accepted — they would mask a regression:
+#   - 6  (couldn't resolve host) → Service rename or DNS bug
+#   - 7  (failed to connect, e.g. ECONNREFUSED) → server not listening; this
+#        is NOT what an enforcing CNI does (it drops packets silently, it
+#        does not RST), so accepting 7 would let "listener crashed" pass
+#   - 3  (malformed URL) → script regression
+# Restricting the catch-all to 28 keeps the smoke a real regression detector.
+# 200 (unauthenticated) is always a regression.
+# A future ticket will swap kindnet for an enforcing CNI and tighten the
+# accept set to require curl_failed:28 alone (i.e. reject 401), proving
+# the NetworkPolicy is actually doing the work in CI.
 case "$probe_out" in
-  "401"|*"curl_failed:"*)
+  "401"|*"curl_failed:28"*)
     log "unauthenticated /snapshot probe rejected (probe output: $probe_out)"
     ;;
   *)
-    fail "unauthenticated /snapshot probe was not rejected; got: $probe_out"
+    fail "unauthenticated /snapshot probe was not rejected (or curl failed for an unexpected reason); got: $probe_out"
     ;;
 esac
 

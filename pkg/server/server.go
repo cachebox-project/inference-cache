@@ -122,7 +122,16 @@ func New(opts ...Option) *Service {
 	// it to the controller's pod selector without breaking kubelet probes or
 	// Prometheus scrapes on the public listener.
 	snapshotMux := http.NewServeMux()
-	snapshotHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	snapshotHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Tighten the contract to GET-only: the controller poller and any
+		// future scrapers only ever issue GETs, so anything else is either
+		// a bug or a probe — return 405 with an Allow header instead of
+		// silently serving the same body for POST/PUT/DELETE.
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed\n", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(idx.Snapshot()); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

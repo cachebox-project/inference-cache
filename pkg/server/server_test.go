@@ -361,6 +361,35 @@ func TestSnapshotNotServedOnPublicListener(t *testing.T) {
 	}
 }
 
+// TestSnapshotRejectsNonGet confirms the /snapshot handler is GET-only and
+// returns 405 (with an Allow: GET header) for POST / PUT / DELETE. The
+// endpoint is read-only by design — accepting other methods would silently
+// serve the same JSON back, which masks a misconfigured client and weakens
+// the contract the design doc declares. This guard sits on the handler
+// itself (no listener round-trip needed), so it runs without auth wiring.
+func TestSnapshotRejectsNonGet(t *testing.T) {
+	_, _, snapshotURL, stop := startInProcessServerConnFull(t)
+	defer stop()
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		req, err := http.NewRequest(method, snapshotURL+"/snapshot", nil)
+		if err != nil {
+			t.Fatalf("new %s request: %v", method, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s /snapshot: %v", method, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s /snapshot returned %d, want 405", method, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Allow"); got != http.MethodGet {
+			t.Errorf("%s /snapshot Allow header = %q, want %q", method, got, http.MethodGet)
+		}
+	}
+}
+
 // TestSnapshotAuth_RejectsUnauthenticated runs the full Service with the auth
 // middleware wired in (using a fake TokenReviewer) and confirms the snapshot
 // listener responds 401 without a bearer and 200 with the controller SA.
