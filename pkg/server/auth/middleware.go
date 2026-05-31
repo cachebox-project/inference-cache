@@ -211,16 +211,18 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 }
 
 // extractBearer returns the token portion of an "Authorization: Bearer …"
-// header, or ("", false) if the header is missing or malformed.
+// header, or ("", false) if the header is missing or malformed. The scheme
+// comparison is case-insensitive per RFC 7235 §2.1 (auth schemes are
+// case-insensitive tokens) — accepts "Bearer", "bearer", "BEARER", etc.
 func extractBearer(h string) (string, bool) {
-	const prefix = "Bearer "
 	if h == "" {
 		return "", false
 	}
-	if !strings.HasPrefix(h, prefix) {
+	scheme, tok, ok := strings.Cut(h, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return "", false
 	}
-	tok := strings.TrimSpace(h[len(prefix):])
+	tok = strings.TrimSpace(tok)
 	if tok == "" {
 		return "", false
 	}

@@ -165,6 +165,12 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		{"apiserver error", "Bearer boom", http.StatusServiceUnavailable, ResultError, false},
 		{"token review status.error -> 401 (kube-apiserver returns this for plain bad tokens)", "Bearer status-error", http.StatusUnauthorized, ResultUnauth, false},
 		{"nil token review", "Bearer nil-review", http.StatusServiceUnavailable, ResultError, false},
+		// RFC 7235 §2.1: auth schemes are case-insensitive tokens. Real-world
+		// clients overwhelmingly send "Bearer", but the middleware accepts any
+		// case form so a future client that sends "bearer" / "BEARER" isn't
+		// rejected by a strict prefix match.
+		{"lowercase bearer scheme", "bearer good", http.StatusOK, ResultOK, true},
+		{"uppercase bearer scheme", "BEARER good", http.StatusOK, ResultOK, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

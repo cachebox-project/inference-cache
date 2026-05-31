@@ -264,14 +264,22 @@ fi
 # not enforced so the 401 path is the one actually exercised.
 log "asserting unauthenticated /snapshot scrape from a side pod is rejected"
 SIDE_POD="ic-snapshot-probe"
-kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --restart=Never \
+# Clean any leftover probe from an interrupted prior run before creating a
+# fresh one — otherwise `kubectl run` fails with AlreadyExists and the script
+# silently reads stale logs from the previous attempt. --wait gates on the
+# delete actually completing so the create below sees a clean namespace.
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --restart=Never \
   --command -- /bin/sh -c '
     # -w prints the HTTP status; -o /dev/null discards the (error) body so the
     # status is the only line on stdout. Timeout protects against the listener
     # being unreachable (NetworkPolicy drop), in which case curl exits non-zero.
     curl -sS -m 5 -o /dev/null -w "%{http_code}" \
       http://inference-cache-server:8081/snapshot || echo "curl_failed:$?"
-  ' >/dev/null 2>&1 || true
+  ' >/tmp/snapshot-probe-create.log 2>&1; then
+  cat /tmp/snapshot-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD failed; cannot run /snapshot auth assertion"
+fi
 
 # Wait for the probe pod to finish (Succeeded or Failed) — either is fine; we
 # read its logs to learn the outcome.
