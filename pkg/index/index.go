@@ -1032,8 +1032,9 @@ func (i *Index) aggregateLocked() Aggregate {
 // Snapshot is a point-in-time, cluster-wide view of the index for the
 // CacheIndex status surface (consumed by the controller). Metadata only.
 //
-// TotalPrefixes is the total index-entry count (replica×prefix records), and
-// it equals the sum of tenants[].indexEntries — see Aggregate.
+// TotalPrefixes is the number of distinct prefix keys (a prefix held by
+// multiple replicas counts once), and it equals the sum of
+// tenants[].indexEntries — see Aggregate.
 type Snapshot struct {
 	Replicas      []ReplicaSnapshot `json:"replicas"`
 	Tenants       []TenantSnapshot  `json:"tenants"`

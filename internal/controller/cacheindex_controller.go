@@ -169,8 +169,16 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 	var errs []error
 	for i := range tenants.Items {
 		ct := &tenants.Items[i]
-		obs, observed := observedByID[ct.Spec.TenantID]
-		desired := buildCacheTenantStatus(ct, obs, observed)
+		// We only reach here after a SUCCESSFUL scrape, so a tenant missing from
+		// snap.Tenants genuinely holds zero distinct prefixes right now (it has no
+		// activity, was evicted to zero, or has a zero budget) — that is an
+		// observed 0, not "unknown". Synthesize a zero row so status.indexEntries
+		// reflects 0 rather than staying nil.
+		obs, ok := observedByID[ct.Spec.TenantID]
+		if !ok {
+			obs = index.TenantSnapshot{TenantID: ct.Spec.TenantID}
+		}
+		desired := buildCacheTenantStatus(ct, obs)
 		if cacheTenantStatusEqual(ct.Status, desired) {
 			continue
 		}
@@ -534,17 +542,19 @@ const (
 )
 
 // buildCacheTenantStatus projects one snapshot tenant aggregate onto a
-// CacheTenant's status. obs/observed report whether the tenant appeared in the
-// server snapshot (matched by spec.tenantID).
+// CacheTenant's status. It is only called after a successful /snapshot scrape,
+// so obs is always a live reading: the matched snapshot row, or a synthesized
+// zero row when the tenant has no current activity (both are observed values,
+// not "unknown").
 //
-//   - IndexEntries is a pointer left nil when the tenant hasn't been observed
-//     yet ("not computed"), distinct from an observed 0.
-//   - Ready=True once the tenant is observed in a snapshot (its push reached the
-//     server and the server is reporting it back).
-//   - QuotaExceeded reflects the latest observation against the entry budget.
+//   - IndexEntries is the live distinct-prefix count (0 for an idle, drained, or
+//     zero-budget tenant). It stays nil only before the first successful scrape
+//     ever writes status — i.e. nil means "not computed yet", not "zero".
+//   - Ready=True: the controller has a live reading for the tenant.
+//   - QuotaExceeded reflects the latest reading against the entry budget.
 //     Enforcement evicts at ingest, so it normally reads False; it can briefly
 //     flip True between an over-budget ingest and the next scrape.
-func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot, observed bool) cachev1alpha1.CacheTenantStatus {
+func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot) cachev1alpha1.CacheTenantStatus {
 	st := cachev1alpha1.CacheTenantStatus{ObservedGeneration: ct.Generation}
 	// Seed from existing conditions so meta.SetStatusCondition keeps each
 	// condition's LastTransitionTime stable when its Status doesn't flip.
@@ -552,29 +562,22 @@ func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnaps
 		st.Conditions = append([]metav1.Condition(nil), ct.Status.Conditions...)
 	}
 
-	var indexEntries int64
-	if observed {
-		indexEntries = obs.IndexEntries
-		entries := indexEntries
-		st.IndexEntries = &entries
-	}
+	indexEntries := obs.IndexEntries
+	entries := indexEntries
+	st.IndexEntries = &entries
 
-	readyStatus, readyReason, readyMsg := metav1.ConditionFalse, "NotObserved", "tenant not yet observed in a server snapshot"
-	if observed {
-		readyStatus, readyReason, readyMsg = metav1.ConditionTrue, "Observed", "tenant observed in the server snapshot"
-	}
 	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
 		Type:               tenantConditionReady,
-		Status:             readyStatus,
-		Reason:             readyReason,
-		Message:            readyMsg,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Observed",
+		Message:            "tenant observed in the server snapshot",
 		ObservedGeneration: ct.Generation,
 	})
 
 	quotaStatus, quotaReason, quotaMsg := metav1.ConditionFalse, "NoQuota", "no index-entry quota configured"
 	if ct.Spec.Quota != nil && ct.Spec.Quota.MaxIndexEntries != nil {
 		budget := *ct.Spec.Quota.MaxIndexEntries
-		if observed && indexEntries > budget {
+		if indexEntries > budget {
 			quotaStatus = metav1.ConditionTrue
 			quotaReason = "OverEntryBudget"
 			quotaMsg = fmt.Sprintf("index entries %d exceed budget %d", indexEntries, budget)

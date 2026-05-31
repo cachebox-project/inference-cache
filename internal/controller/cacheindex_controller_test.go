@@ -1059,14 +1059,18 @@ func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
 	}
 }
 
-func TestReconcileTenantStatusesNotObservedLeavesEntriesNil(t *testing.T) {
+func TestReconcileTenantStatusesAbsentTenantObservedAsZero(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
 	}
+	maxEntries := int64(5)
 	ct := &cachev1alpha1.CacheTenant{
 		ObjectMeta: metav1.ObjectMeta{Name: "ct", Namespace: "team-a"},
-		Spec:       cachev1alpha1.CacheTenantSpec{TenantID: "team-quiet"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "team-quiet",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &maxEntries},
+		},
 	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1076,7 +1080,8 @@ func TestReconcileTenantStatusesNotObservedLeavesEntriesNil(t *testing.T) {
 	p := &CacheIndexPoller{Client: cl}
 	ctx := context.Background()
 
-	// Snapshot has no entry for team-quiet → not observed.
+	// A successful scrape with no row for team-quiet means it currently holds
+	// zero prefixes — an observed 0, not "unknown".
 	if err := p.reconcileTenantStatuses(ctx, index.Snapshot{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1084,10 +1089,14 @@ func TestReconcileTenantStatusesNotObservedLeavesEntriesNil(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "ct", Namespace: "team-a"}, &got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status.IndexEntries != nil {
-		t.Fatalf("indexEntries = %v, want nil (not yet computed)", got.Status.IndexEntries)
+	if got.Status.IndexEntries == nil || *got.Status.IndexEntries != 0 {
+		t.Fatalf("indexEntries = %v, want 0 (observed zero, not nil)", got.Status.IndexEntries)
 	}
-	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionFalse || c.Reason != "NotObserved" {
-		t.Fatalf("Ready = %+v, want False/NotObserved", c)
+	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True (we have a live reading)", c)
+	}
+	// 0 ≤ budget → not exceeded.
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False", c)
 	}
 }
