@@ -224,10 +224,14 @@ type CacheBackendIntegrationSpec struct {
 // Args replaces by leading flag token or appends, and SuppressArgs removes
 // by leading flag token. Suppress runs before merge, so suppress-then-re-add
 // is a supported pattern for overriding a non-reserved adapter-owned flag
-// value. Entries that overlap the runtime adapter's ReservedArgs() or
-// ReservedEnv() are hard-rejected at admission with a field-scoped error
-// naming the offending token and the adapter, so a misconfiguration fails
-// at kubectl apply rather than as a crashed engine pod later.
+// value. For adapter-backed Spec.Type values (LMCache and the future
+// adapter-backed types), entries that overlap the runtime adapter's
+// ReservedArgs() or ReservedEnv() are hard-rejected at admission with a
+// field-scoped error naming the offending token and the adapter, so a
+// misconfiguration fails at kubectl apply rather than as a crashed engine
+// pod later. Spec.Type=External does not consult an adapter (no canonical
+// injection happens), so the override surface there is structurally
+// meaningless and the reserved-overlap check is skipped.
 //
 // See docs/concepts/cachebackend-engine-overrides.md for the baseline
 // canonical injection (annotated RESERVED / TUNABLE), five worked

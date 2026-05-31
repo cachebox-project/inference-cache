@@ -74,9 +74,12 @@ spec:
     # Pin to a real digest for non-local runs.
     serverImage: lmcache/standalone:latest
 ---
-# Engine Deployment. Either YAML document in this file can be applied
-# standalone. The mutating Pod admission webhook intercepts pods matching
-# the CacheBackend's `engineSelector` and injects the LMCache wiring +
+# Engine Deployment. Apply this alongside the CacheBackend above; the
+# order matters (see the top-of-file comment). Pod injection is
+# CREATE-only, so a pod admitted before the CacheBackend's
+# status.endpoint is published will run unwired until it is recreated.
+# The mutating Pod admission webhook intercepts pods matching the
+# CacheBackend's `engineSelector` and injects the LMCache wiring +
 # (above) the engineOverrides amendments onto the `vllm` container at
 # admission time.
 #

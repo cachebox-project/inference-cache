@@ -268,11 +268,14 @@ yourself wanting to override the wiring itself —
 - disable the v1 engine codepath the LMCache connector targets
   (`VLLM_USE_V1`),
 
-— you probably want a different `CacheBackend` CR, or `spec.type:
-External` (the passthrough backend that wires the engine to an
-already-running cache the controller does not manage). Trying to express
-"switch between integrations" through an override is a hard-reject at
-admission by design.
+— you probably want a different `CacheBackend` CR (e.g. one whose
+reconciler stands up the cache server you actually want the engine to
+talk to). Trying to express "switch between integrations" through an
+override is a hard-reject at admission by design. The `External` backend
+type is intended for the "engine should attach to a pre-existing cache
+the controller does not manage" use case, but the engine-side wiring for
+External is not in the default adapter set today — track its rollout
+before reaching for it.
 
 ## See also
 
