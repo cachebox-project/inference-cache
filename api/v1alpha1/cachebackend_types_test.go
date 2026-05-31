@@ -201,6 +201,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
 	backend.Spec.Template.NodeSelector["pool"] = "general"
 	backend.Spec.Template.Tolerations[0].Key = "general"
+	backend.Status.IndexParticipation.PrefixCount = 99
+	*backend.Status.IndexParticipation.HitRate = "0.99"
 	*backend.Spec.Template.SecurityContext.RunAsNonRoot = false
 	*backend.Spec.Template.RuntimeClassName = "kata"
 	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
