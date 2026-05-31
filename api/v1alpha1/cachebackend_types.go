@@ -109,14 +109,17 @@ type CacheBackendSpec struct {
 	// would silently overwrite a user-supplied value, so admission
 	// surfaces the misconfiguration loudly at write time).
 	//
-	// Allowed shapes for External:
-	//   - bare host[:port] (canonical; the LMCache engine adapter
+	// Allowed shapes for External (both forms require a non-empty
+	// port — the LMCache connector dials TCP, so admission rejects
+	// portless hosts):
+	//   - bare host:port (canonical; the LMCache engine adapter
 	//     prepends the lm:// scheme on injection)
-	//   - lm://host[:port] (operators who prefer to be explicit)
-	// Other schemes (https://, http://, ...) and path/query/fragment
-	// components are rejected at admission — they would produce an
-	// invalid LMCACHE_REMOTE_URL when concatenated with the lm://
-	// prefix at injection time.
+	//   - lm://host:port (operators who prefer to be explicit)
+	// IPv6 literals must be bracketed: [::1]:8200. Other schemes
+	// (https://, http://, ...) and path/query/fragment components
+	// are rejected at admission — they would produce an invalid
+	// LMCACHE_REMOTE_URL when concatenated with the lm:// prefix at
+	// injection time.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 

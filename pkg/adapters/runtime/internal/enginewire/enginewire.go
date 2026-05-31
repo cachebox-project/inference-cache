@@ -62,12 +62,16 @@ const (
 )
 
 // InjectVLLMLMCache adds the LMCache connector arg and LMCACHE_* env to the
-// vLLM container in pod, given endpoint as the cache server's host:port. It
-// merges: existing args/env on the vLLM container are preserved, repeat
-// injections are idempotent, sidecars are left alone. The engine container
-// is identified by [EngineContainerName]; a single-container pod is also
-// accepted (the lone container is treated as the engine); a multi-container
-// pod with no `vllm` container is rejected.
+// vLLM container in pod, given endpoint as the cache server's address.
+// endpoint accepts either a bare `host:port` (canonical) or an already-
+// prefixed `lm://host:port` ([LMCacheRemoteURL] passes the prefix through
+// rather than doubling it); the helper renders both into the same
+// LMCACHE_REMOTE_URL=`lm://host:port`. It merges: existing args/env on
+// the vLLM container are preserved, repeat injections are idempotent,
+// sidecars are left alone. The engine container is identified by
+// [EngineContainerName]; a single-container pod is also accepted (the
+// lone container is treated as the engine); a multi-container pod with
+// no `vllm` container is rejected.
 //
 // Both the in-tree vLLM+LMCache adapter (managed backend) and the External
 // passthrough adapter call this — same wire shape, the only difference is

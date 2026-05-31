@@ -390,7 +390,7 @@ func TestValidator_ExternalEndpoint_PathRejected(t *testing.T) {
 	cb.Spec.Endpoint = "cache.example.com:8200/path"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must be a bare host[:port]")
+		"must be host:port (optionally prefixed lm://)")
 }
 
 func TestValidator_ExternalEndpoint_LMSchemeOnlyRejected(t *testing.T) {
@@ -482,6 +482,22 @@ func TestValidator_ExternalEndpoint_PortlessIPv6Rejected(t *testing.T) {
 		"must be a non-empty host AND port")
 }
 
+func TestValidator_ExternalEndpoint_UnbracketedIPv6Rejected(t *testing.T) {
+	// RFC 3986 requires brackets for IPv6 in URI authority components,
+	// and there is no unambiguous host:port boundary without them. A
+	// naive LastIndex(":") split would treat `2001:db8::1` as host=
+	// "2001:db8:" port="1" — admission would pass and the engine pod
+	// would inject LMCACHE_REMOTE_URL=lm://2001:db8::1, which the
+	// LMCache connector cannot parse. Refuse at write time.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "2001:db8::1"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
 func TestValidator_ExternalEndpoint_IPv6Admitted(t *testing.T) {
 	// IPv6 literals require brackets in host:port form; the validator
 	// must accept them rather than mistaking the inner colons for
@@ -505,7 +521,7 @@ func TestValidator_ExternalEndpoint_LMSchemeWithPathRejected(t *testing.T) {
 	cb.Spec.Endpoint = "lm://cache.example.com:8200/path"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must be a bare host[:port]")
+		"must be host:port (optionally prefixed lm://)")
 }
 
 func TestValidator_AggregatesMultipleViolations(t *testing.T) {

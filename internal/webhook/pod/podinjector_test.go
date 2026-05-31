@@ -325,15 +325,17 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	}
 }
 
-func TestHandle_ExternalBackend_StatusEmpty_FallsBackToSpec(t *testing.T) {
+func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	// Pod admission is CREATE-only — if an engine pod admits before the
 	// controller has mirrored spec.endpoint into status.endpoint, the
 	// webhook would fail-open and leave the pod unwired *forever* (no
 	// re-admission on subsequent status updates). For External CRs the
-	// authoritative source is spec.endpoint, so the webhook falls back
-	// to it. Without this fallback, applying the External CacheBackend
-	// and the engine Deployment in the same kubectl apply silently
-	// produces unwired engine pods.
+	// webhook sources the endpoint from spec.endpoint directly (NOT
+	// "falling back" — effectiveEndpoint type-scopes the source so
+	// External never reads status.endpoint, preventing wiring against a
+	// stale mirror during an endpoint update). Without this, applying
+	// the External CacheBackend and the engine Deployment in the same
+	// kubectl apply silently produces unwired engine pods.
 	const (
 		ns       = "engines"
 		endpoint = "external-cache.example:8200"

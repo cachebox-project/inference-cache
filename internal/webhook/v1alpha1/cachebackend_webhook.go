@@ -701,10 +701,11 @@ func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // at write time instead of leaving the operator to discover it from
 // engine-pod crash logs.
 //
-// Allowed forms:
-//   - bare `host[:port]` (the canonical shape — the helper adds the
+// Allowed forms (both require a non-empty port — see the host-AND-port
+// rule below):
+//   - bare `host:port` (the canonical shape — the helper adds the
 //     `lm://` scheme on injection)
-//   - `lm://host[:port]` (operators who prefer to be explicit)
+//   - `lm://host:port` (operators who prefer to be explicit)
 //
 // Path components are also rejected — LMCache is a TCP-level protocol
 // and a path would be silently dropped by the connector. Empty
@@ -737,12 +738,12 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 				field.Invalid(
 					field.NewPath("spec", "endpoint"),
 					cb.Spec.Endpoint,
-					fmt.Sprintf("spec.endpoint scheme %q is not supported for spec.type=External; use a bare host[:port] (the LMCache adapter adds the lm:// scheme) or an explicit lm:// URL — the vLLM engine wire injects LMCACHE_REMOTE_URL and would otherwise concatenate to an invalid value", scheme),
+					fmt.Sprintf("spec.endpoint scheme %q is not supported for spec.type=External; use a bare host:port (the LMCache adapter adds the lm:// scheme) or an explicit lm://host:port URL — the vLLM engine wire injects LMCACHE_REMOTE_URL and would otherwise concatenate to an invalid value", scheme),
 				),
 			}
 		}
 	}
-	// rest is the host[:port] portion (after stripping the optional
+	// rest is the host:port portion (after stripping the optional
 	// lm:// scheme). Reject path/query/fragment components; LMCache is
 	// a TCP-level protocol and would silently drop them at the
 	// connector.
@@ -751,7 +752,7 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 			field.Invalid(
 				field.NewPath("spec", "endpoint"),
 				cb.Spec.Endpoint,
-				"spec.endpoint must be a bare host[:port] (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped",
+				"spec.endpoint must be host:port (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped",
 			),
 		}
 	}
@@ -778,13 +779,21 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 	return nil
 }
 
-// splitEndpointHostPort parses a host[:port] string into its host and
-// port halves with bracket-aware IPv6 handling. Returns (host, port,
-// hasPort) so callers can tell apart `cache` (no port → hasPort=false)
-// from `cache:` (empty port → hasPort=true, port=""). The contract
-// surface requires hasPort=true with a non-empty port so the LMCache
-// connector dials a known TCP target — see the call site in
-// validateExternalEndpointShape.
+// splitEndpointHostPort parses a host:port string into its host and port
+// halves with bracket-aware IPv6 handling. Returns (host, port, hasPort)
+// so callers can tell apart `cache` (no port → hasPort=false) from
+// `cache:` (empty port → hasPort=true, port=""). The contract surface
+// requires hasPort=true with a non-empty port so the LMCache connector
+// dials a known TCP target — see the call site in
+// rejectInvalidExternalEndpointScheme.
+//
+// IPv6 literals MUST be bracketed (`[::1]:8200`). An unbracketed string
+// containing more than one colon (e.g. `2001:db8::1`, `::1`) is rejected
+// as malformed: with no brackets there is no unambiguous host/port
+// boundary, and a naive `LastIndex(':')` split would treat the trailing
+// `:1` as a port and admit a CR that injects an invalid
+// `LMCACHE_REMOTE_URL=lm://2001:db8::1`. Operators with IPv6 endpoints
+// follow RFC 3986 and wrap the literal in brackets.
 //
 // Recognised shapes:
 //
@@ -795,6 +804,7 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 //	`[::1]:`         → ("::1",   "",     true)
 //	`[::1]`          → ("::1",   "",     false)
 //	`:8200`          → ("",      "8200", true)
+//	`2001:db8::1`    → ("",      "",     false)   // multi-colon, unbracketed
 //	``               → ("",      "",     false)
 func splitEndpointHostPort(s string) (host, port string, hasPort bool) {
 	if s == "" {
@@ -814,6 +824,17 @@ func splitEndpointHostPort(s string) (host, port string, hasPort bool) {
 			return host, tail[1:], true
 		}
 		// Unexpected suffix after the bracketed host (e.g. `[::1]junk`).
+		return "", "", false
+	}
+	// Unbracketed string with more than one colon is unparseable as
+	// host:port — almost certainly an unbracketed IPv6 literal. RFC 3986
+	// requires brackets for IPv6 in URI authority components; without
+	// them the host/port split is ambiguous, and treating the last
+	// colon as the separator would let `2001:db8::1` admit as
+	// host="2001:db8:" port="1". Refuse rather than guess; the
+	// validator surfaces the same "host AND port" error the operator
+	// gets for any other malformed shape.
+	if strings.Count(s, ":") > 1 {
 		return "", "", false
 	}
 	if i := strings.LastIndex(s, ":"); i >= 0 {
