@@ -92,11 +92,11 @@ spec:
 # not through the Deployment name, so the engine Deployment can be named
 # anything that does not collide with the managed pod.
 #
-# CPU vLLM image — verified end-to-end on a kind node (see
-# docs/reference-stack/manifests/cpu-local/deployment.yaml for the same
-# flags + memory-budget caveats). The image is arch-tagged: this manifest
-# pins -arm64, swap to `vllm/vllm-openai-cpu:latest-x86_64` on x86 hosts.
-# Swap to a GPU image and add a `nvidia.com/gpu: 1` limit for production.
+# CPU vLLM image and flags mirror docs/reference-stack/manifests/cpu-local/
+# deployment.yaml (the standalone CPU manifest that has been verified
+# end-to-end). The image is arch-tagged: this manifest pins -arm64, swap
+# to `vllm/vllm-openai-cpu:latest-x86_64` on x86 hosts. Swap to a GPU
+# image and add a `nvidia.com/gpu: 1` limit for production.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
