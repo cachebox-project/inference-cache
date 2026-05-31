@@ -171,8 +171,9 @@ func main() {
 	// pod.metadata.uid, so a webhook-recorded event would land with
 	// involvedObject.uid="" and be invisible to `kubectl describe pod`.
 	if err := (&controller.EnginePodEventsReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EnginePodEvents")
 		os.Exit(1)

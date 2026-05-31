@@ -60,6 +60,19 @@ type EnginePodEventsReconciler struct {
 	client.Client
 	Log      logr.Logger
 	Recorder events.EventRecorder
+	// APIReader is an uncached live client used for the CacheBackend
+	// lookup that backs UID validation. The cached client's informer
+	// can be momentarily stale (especially right at controller startup
+	// or just after a CR's first apply) — a "NotFound" from the cache
+	// could be a real deletion OR a cache miss, and we treat NotFound
+	// as a permanent skip per the conservative contract. Using the
+	// APIReader removes that ambiguity at the cost of one extra
+	// apiserver round-trip per CREATE-time reconcile (negligible at
+	// this controller's throughput). Production wiring passes
+	// mgr.GetAPIReader(); tests that don't exercise the live lookup
+	// can leave it nil — lookupCacheBackend falls back to the embedded
+	// client.Client so existing fake-client tests still work.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -210,8 +223,17 @@ func (r *EnginePodEventsReconciler) lookupCacheBackend(ctx context.Context, ref 
 	if !ok || ns == "" || name == "" {
 		return nil, fmt.Errorf("malformed CacheBackend reference %q", ref)
 	}
+	// Prefer the uncached APIReader so a stale informer cache cannot
+	// surface as a fake NotFound and silently drop the one-shot event.
+	// Fall back to the cached client only when APIReader is unset (test
+	// wiring without a real APIReader); the reconciler still functions,
+	// it just inherits the cache-miss race.
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
 	var cb cachev1alpha1.CacheBackend
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cb); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, err
 		}
@@ -227,6 +249,13 @@ func (r *EnginePodEventsReconciler) lookupCacheBackend(ctx context.Context, ref 
 func (r *EnginePodEventsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("engine-pod-events")
+	}
+	if r.APIReader == nil {
+		// Default to the manager's uncached APIReader so production
+		// wiring doesn't have to thread it explicitly. Envtest
+		// integration tests that boot a real manager pick this up
+		// automatically too.
+		r.APIReader = mgr.GetAPIReader()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("engine-pod-events").

@@ -170,6 +170,67 @@ func TestEnginePodEvents_SkipsWhenInjectedByUIDAnnotationMissing(t *testing.T) {
 	}
 }
 
+func TestEnginePodEvents_UsesAPIReaderForCacheBackendLookup(t *testing.T) {
+	// Pin the structural invariant: the CacheBackend lookup MUST go
+	// through APIReader (uncached live client), not the embedded
+	// Client (cached). The cached client's informer can be momentarily
+	// stale — especially right at controller startup or right after a
+	// CR's first apply — so a NotFound from the cache may be a real
+	// deletion OR a cache miss. NotFound is treated as a permanent
+	// skip per the conservative contract; if we honored cache misses
+	// we would silently drop the one-shot event. Live reads remove
+	// the ambiguity. A regression that flips the lookup back to the
+	// cached client would fail this test because the two clients hold
+	// disjoint objects.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-1"},
+	}
+	pod := injectedPodWithUID("engine-a", ns, ns+"/"+cb.Name, string(cb.UID), nil)
+	// Cached client: knows the POD (which the reconciler Gets first)
+	// but NOT the CacheBackend. If the controller used Client for the
+	// CR lookup, it would see NotFound and skip.
+	cached := newEnginePodEventsClient(t, pod)
+	// APIReader: knows the CacheBackend. The reconciler should consult
+	// it for the lookup and find the CR there.
+	apireader := newEnginePodEventsClient(t, cb)
+	rec := events.NewFakeRecorder(16)
+	r := &EnginePodEventsReconciler{
+		Client:    cached,
+		Log:       logr.Discard(),
+		Recorder:  rec,
+		APIReader: apireader,
+	}
+
+	reconcilePod(t, r, ns, pod.Name)
+
+	got := drainRecorder(rec)
+	want := "Normal " + eventReasonEngineInjected
+	found := false
+	for _, e := range got {
+		if strings.Contains(e, want) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected event from APIReader-backed lookup; got %v", got)
+	}
+}
+
+// newEnginePodEventsClient builds a fresh fake client preloaded with
+// objs, sharing the controller scheme.
+func newEnginePodEventsClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+}
+
 func TestEnginePodEvents_TransientLookupErrorRetries(t *testing.T) {
 	// A non-NotFound CacheBackend Get failure (RBAC blip, transient API
 	// error, informer cache miss) must NOT be swallowed as a skip:
