@@ -501,8 +501,12 @@ if ! kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --re
 fi
 
 # Wait for the probe pod to finish (Succeeded or Failed) — either is fine; we
-# read its logs to learn the outcome.
-for _ in $(seq 1 30); do
+# read its logs to learn the outcome. The 90s budget covers the curlimages/curl
+# image pull on a cold kind node (typical pull is ~15s, but the paired-sample
+# phase that runs earlier can leave the kubelet busy reaping its own
+# Terminating pods, occasionally pushing the new pod's container creation
+# above the previous 30s budget).
+for _ in $(seq 1 90); do
   phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
     break
@@ -510,6 +514,11 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD" 2>/dev/null || true)"
+# If the pod never finished, capture its describe output so the failure
+# message tells operators why (ImagePullBackOff vs ContainerCreating vs ...).
+if [ -z "$probe_out" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$SIDE_POD" >&2 || true
+fi
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
 
 # Acceptable outcomes (either gate sufficient):
