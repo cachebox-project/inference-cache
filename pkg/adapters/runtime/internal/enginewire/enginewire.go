@@ -327,10 +327,21 @@ func splitLMCacheHostPort(s string) (host, port string, hasPort bool) {
 		if tail == "" {
 			return host, "", false
 		}
-		if strings.HasPrefix(tail, ":") {
-			return host, tail[1:], true
+		if !strings.HasPrefix(tail, ":") {
+			// Unexpected suffix after the bracketed host (e.g. `[::1]junk`).
+			return "", "", false
 		}
-		return "", "", false
+		port = tail[1:]
+		// The port half cannot itself contain a colon — `[::1]:8200:bad`
+		// would otherwise pass with port="8200:bad" and inject an
+		// invalid LMCACHE_REMOTE_URL=lm://[::1]:8200:bad. The bracketed
+		// form is the canonical shape precisely because it makes the
+		// host/port boundary unambiguous; reject anything that tries to
+		// smuggle an extra colon past it.
+		if strings.Contains(port, ":") {
+			return "", "", false
+		}
+		return host, port, true
 	}
 	// Unbracketed multi-colon string is almost certainly an unbracketed
 	// IPv6 literal — refuse rather than guess at the host/port split.

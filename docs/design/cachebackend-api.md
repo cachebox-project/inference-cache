@@ -233,6 +233,8 @@ The vLLM+LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) reserves the a
 - `ReservedArgs()`: `--kv-transfer-config` (the LMCache connector wiring).
 - `ReservedEnv()`: `VLLM_USE_V1` (selects the engine codepath the connector targets), `LMCACHE_REMOTE_URL` (the resolved cache endpoint), `INFERENCECACHE_FAIL_OPEN` (mirror of `spec.integration.failOpen` — overriding it would silently desync the pod from the CR contract).
 
+The External adapter (`pkg/adapters/runtime/external/external.go`) reserves the **same** args/env. The injected wire format is identical to the managed-LMCache path (both call `enginewire.InjectVLLMLMCache`), so an override that would un-wire LMCache on a managed CR would un-wire it on an External CR for the same reason. Admission consults the External adapter's reserved set the same way it consults the managed adapter's — operators see a hard reject at write time regardless of which `spec.type` they're using.
+
 `LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. (`spec.backendConfig` already exposes them; `engineOverrides.env` is the engine-agnostic seam future engines without a per-key map will reach for.)
 
 #### Shape rationale (A vs. B)

@@ -529,9 +529,10 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 	// A CR that predates the trim-in-reconciler change could carry a
 	// whitespace-only status.endpoint. The webhook MUST treat that as
 	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
-	// the engine connector would reject at runtime. Defensive trim
-	// applies to both External (spec also whitespace, fallback to
-	// status) and managed (no fallback, just status).
+	// the engine connector would reject at runtime. The defensive trim
+	// applies to whichever field effectiveEndpoint reads for the CR's
+	// type — spec.endpoint for External (which never reads status), and
+	// status.endpoint for managed.
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},

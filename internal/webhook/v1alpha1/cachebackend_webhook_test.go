@@ -525,6 +525,35 @@ func TestValidator_ExternalEndpoint_ControlCharRejected(t *testing.T) {
 		"must not contain whitespace or control characters")
 }
 
+func TestValidator_ExternalEndpoint_BracketedIPv6ExtraColonRejected(t *testing.T) {
+	// The bracketed form `[::1]:8200:bad` would otherwise pass with
+	// host="::1" port="8200:bad" — the bracket strips the IPv6 colons
+	// out of the host/port boundary calculation, but the naive port
+	// half still contains the trailing `:bad`. Reject: the brackets are
+	// the contract that makes the boundary unambiguous; sneaking an
+	// extra colon past them produces an invalid
+	// LMCACHE_REMOTE_URL=lm://[::1]:8200:bad at injection.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "[::1]:8200:bad"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
+func TestValidator_ExternalEndpoint_BracketedIPv6ExtraColonWithSchemeRejected(t *testing.T) {
+	// Same bug surface with the explicit scheme — the scheme strip
+	// shouldn't change the host:port shape check that follows.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://[::1]:8200:bad"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
 func TestValidator_ExternalEndpoint_UnbracketedIPv6Rejected(t *testing.T) {
 	// RFC 3986 requires brackets for IPv6 in URI authority components,
 	// and there is no unambiguous host:port boundary without them. A
