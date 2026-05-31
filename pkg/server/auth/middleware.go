@@ -178,22 +178,33 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if !tr.Status.Authenticated {
-			// kube-apiserver's TokenReview populates Status.Error for any
-			// authenticator error — including ordinary "this isn't a
-			// valid token" cases. We can't distinguish "authenticator
-			// down" from "token is just bad" without parsing the error
-			// string, which would be brittle. Trust Authenticated as the
-			// authoritative bit: !Authenticated → 401. Surface the
-			// Status.Error message in the SERVER log (this middleware
-			// runs in the policy server's snapshot listener, not the
-			// controller) so the operator can still see WHY — a webhook
-			// authenticator timeout shows up here distinctly from
-			// "invalid bearer token". Both still map to 401 on the wire,
-			// which is correct from the client's perspective: the
-			// client must not be admitted either way.
+			// Distinguish "the authenticator chain ran and the token was
+			// just bad" (routine 401) from "the authenticator chain itself
+			// failed to answer the question" (server-side problem the
+			// operator must alert on):
+			//
+			//   - Status.Error EMPTY → kube-apiserver checked the token and
+			//     rejected it (no matching SA, expired, malformed). This is
+			//     a clean negative on the wire. Record result="unauth", 401.
+			//   - Status.Error POPULATED → an authenticator in the chain
+			//     could not even run to completion (webhook timeout, parse
+			//     error, downstream certificate failure, etc.). This is the
+			//     same operational shape as the transport-level
+			//     CreateTokenReview error above and belongs on the same
+			//     alert surface. Record result="error", 503. Surface the
+			//     Status.Error in the SERVER log (this middleware runs in
+			//     the policy-server process, not the controller) so the
+			//     operator chasing the alert can see WHY.
+			//
+			// The on-the-wire status differs (401 vs 503) but both deny;
+			// the difference matters only to the metric label and the log,
+			// which together drive operator response.
 			if tr.Status.Error != "" {
-				slog.WarnContext(r.Context(), "snapshot_auth_token_review_unauthenticated",
+				slog.WarnContext(r.Context(), "snapshot_auth_token_review_status_error",
 					"error", tr.Status.Error)
+				a.record(ResultError)
+				http.Error(w, "token review error\n", http.StatusServiceUnavailable)
+				return
 			}
 			a.record(ResultUnauth)
 			http.Error(w, "unauthorized\n", http.StatusUnauthorized)

@@ -419,12 +419,12 @@ func (p *CacheIndexPoller) logger(ctx context.Context) logr.Logger {
 // file is tmpfs so the read is cheap.
 //
 // Error semantics:
-//   - File missing → (\"\", nil). Treated as "no token configured" so a local
+//   - File missing → ("", nil). Treated as "no token configured" so a local
 //     out-of-cluster run still flows through the same code path; the scrape
 //     goes out unauthenticated and the server rejects 401, which is the
 //     correct posture for that environment.
 //   - File present but unreadable (permissions, IO error, etc.) →
-//     (\"\", wrappedError). Caller surfaces this in the log so the operator
+//     ("", wrappedError). Caller surfaces this in the log so the operator
 //     sees the real cause instead of misattributing the eventual 401 to a
 //     server-side identity mismatch.
 func (p *CacheIndexPoller) bearerToken() (string, error) {

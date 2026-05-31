@@ -125,15 +125,16 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 			return nil, errors.New("apiserver unavailable")
 		case "status-error":
 			// TokenReview returned a non-error HTTP response but with
-			// Status.Error populated. kube-apiserver does this for ANY
-			// authenticator-side error, including "invalid token format"
-			// — so we trust Authenticated as the authoritative bit and
-			// map !Authenticated → 401 (logging the Status.Error for the
-			// operator). This case pins that contract: error string is
-			// set, Authenticated is false, expected outcome is 401, not
-			// 503.
+			// Status.Error populated. kube-apiserver populates this field
+			// when the authenticator chain itself failed to run to
+			// completion (webhook timeout, parse error, downstream cert
+			// failure) — NOT for plain bad tokens, which return
+			// Authenticated=false with Status.Error empty. The middleware
+			// treats Status.Error as a server-side fault: 503 +
+			// result="error" so an apiserver/authenticator hiccup fires
+			// the same operator alert as a transport-level review error.
 			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
-				Error:         "invalid bearer token",
+				Error:         "webhook authenticator timeout",
 				Authenticated: false,
 			}}, nil
 		case "nil-review":
@@ -163,7 +164,13 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		{"wrong identity", "Bearer wrong-sa", http.StatusForbidden, ResultForbidden, false},
 		{"valid token", "Bearer good", http.StatusOK, ResultOK, true},
 		{"apiserver error", "Bearer boom", http.StatusServiceUnavailable, ResultError, false},
-		{"token review status.error -> 401 (kube-apiserver returns this for plain bad tokens)", "Bearer status-error", http.StatusUnauthorized, ResultUnauth, false},
+		// Status.Error populated means the authenticator chain could not
+		// answer — webhook timeout, parse error, downstream cert failure.
+		// That's a server-side fault, not a client auth failure: 503 +
+		// result="error" so it shows up on the same alert surface as a
+		// transport-level apiserver hiccup. Plain bad tokens
+		// (Authenticated=false, Error="") still take the 401 path above.
+		{"token review status.error -> 503 (authenticator-chain fault, not a routine 401)", "Bearer status-error", http.StatusServiceUnavailable, ResultError, false},
 		{"nil token review", "Bearer nil-review", http.StatusServiceUnavailable, ResultError, false},
 		// RFC 7235 §2.1: auth schemes are case-insensitive tokens. Real-world
 		// clients overwhelmingly send "Bearer", but the middleware accepts any
