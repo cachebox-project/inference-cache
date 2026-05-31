@@ -258,12 +258,15 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // specific reason names the gap, and the pod webhook short-circuits on
 // the same check (returns no-injection, fail-open).
 //
-// External backends never enter the KV-event readiness gate, so any
-// firstKVEventObservedAt latch left from a prior managed state is reset and
-// the managed-only Degraded condition is cleared. status.indexParticipation
-// is deliberately NOT touched: it is owned by the CacheIndex poller
-// (write-only-on-change), and an External backend whose engine pods still
-// report KV events legitimately keeps it; the poller converges it on its own.
+// External backends never enter the KV-event readiness gate, so the
+// managed-only Degraded condition is cleared here. Two status fields are
+// deliberately NOT reset: firstKVEventObservedAt (a monotonic write-once
+// "ever observed a KV event" marker — clearing it would be ineffective
+// anyway, since the preserved poller-owned lastEventAt would immediately
+// re-satisfy the gate on a return to the managed path) and
+// status.indexParticipation (owned by the CacheIndex poller, which converges
+// it on its own; an External backend whose engine pods still report KV events
+// legitimately keeps it).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
 		// TrimSpace before every decision. Admission rejects a
@@ -277,10 +280,6 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		// Leaving the managed path: reset the C2-owned KV-event gate latch
-		// (indexParticipation is poller-owned and left to converge — see the
-		// method doc).
-		backend.Status.FirstKVEventObservedAt = nil
 
 		// Decide the Ready reason + message in one place so the
 		// Progressing/Ready conditions stay in lockstep.
@@ -335,8 +334,9 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
 // for a backend this module no longer provisions (unsupported runtime/backend or
-// deferred kind). As in reconcileExternal, only C2-owned gate state is reset;
-// status.indexParticipation is left to the poller (see that method's comment).
+// deferred kind). The managed conditions are removed; firstKVEventObservedAt and
+// status.indexParticipation are left as-is (see reconcileExternal's comment — the
+// latch is a monotonic marker and indexParticipation is poller-owned).
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -346,7 +346,6 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		backend.Status.Health = ""
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		backend.Status.FirstKVEventObservedAt = nil
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
@@ -910,12 +909,14 @@ type kvReadiness struct {
 // Timeout anchor: the clock starts when the managed cache-backend Deployment
 // first reported Available, read from the live Deployment's Available condition
 // LastTransitionTime — authoritative and persisted by the Deployment
-// controller, so no extra CacheBackend status field is needed. A Deployment
-// availability flap restarts the window (a fresh rollout re-waits for an
-// event). If the Available condition is not present (e.g. the no-running-
-// Deployment-controller case in some tests), the anchor falls back to now,
-// which is fail-safe: it can only delay the Degraded flip, never trigger it
-// prematurely.
+// controller, so no extra CacheBackend status field is needed. The anchor only
+// matters BEFORE the first event is observed: once firstKVEventObservedAt is
+// latched the gate stays satisfied (lastKVEventSeen short-circuits), so a later
+// availability flap does NOT re-gate. For a backend that has never seen an
+// event, a flap moves the anchor forward and thus restarts the wait window. If
+// the Available condition is not present (e.g. the no-running-Deployment-
+// controller case in some tests), the anchor falls back to now, which is
+// fail-safe: it can only delay the Degraded flip, never trigger it prematurely.
 func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment, health cachev1alpha1.CacheBackendHealth, readyStatus metav1.ConditionStatus, reason, message string, now time.Time) kvReadiness {
 	// Base verdict mirrors the Deployment-level health; the Degraded
 	// condition tracks Health == Degraded so it is consistent on every path

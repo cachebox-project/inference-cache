@@ -222,6 +222,13 @@ type CacheBackendIntegrationSpec struct {
 	// A zero or negative value is treated as unset and falls back to the 5m
 	// default — the field carries no meaningful "wait forever" or "fail
 	// immediately" semantics.
+	//
+	// The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
+	// schema types it as a string; a malformed value is rejected when
+	// admission decodes the object into this typed field, and if admission is
+	// bypassed the controller's typed read fails loudly (it never silently
+	// mis-parses). This matches how the API treats every metav1.Duration
+	// field; no extra CRD-level format constraint is imposed.
 	// +optional
 	// +kubebuilder:default="5m"
 	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
@@ -431,9 +438,11 @@ type CacheBackendStatus struct {
 	// CacheIndex poller legitimately clears when a backend's replicas drain
 	// (scale-down, prefixes TTL'd), so reading it alone would let a backend
 	// that already passed the gate regress to AwaitingFirstKVEvent. Written
-	// write-once by the controller and never cleared while the backend stays
-	// managed; the gate is a first-event startup probe, not an ongoing
-	// liveness check.
+	// write-once by the controller and never cleared (a monotonic marker; the
+	// gate is a first-event startup probe, not an ongoing liveness check). It
+	// is inert while the backend is not managed (External / unsupported
+	// runtime), and remains set so a return to the managed path stays Ready
+	// without re-gating — consistent with the "ever observed" contract.
 	// +optional
 	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
 
