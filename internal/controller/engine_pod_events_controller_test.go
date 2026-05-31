@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -167,6 +168,55 @@ func TestEnginePodEvents_SkipsWhenInjectedByUIDAnnotationMissing(t *testing.T) {
 	if got := drainRecorder(rec); len(got) != 0 {
 		t.Fatalf("expected no event when injected-by-uid annotation is missing; got %v", got)
 	}
+}
+
+func TestEnginePodEvents_TransientLookupErrorRetries(t *testing.T) {
+	// A non-NotFound CacheBackend Get failure (RBAC blip, transient API
+	// error, informer cache miss) must NOT be swallowed as a skip:
+	// admission is CREATE-only, so a one-shot drop loses the event for
+	// the affected pod permanently. The reconciler must surface the
+	// error so controller-runtime requeues with backoff.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-1"},
+	}
+	pod := injectedPodWithUID("engine-a", ns, ns+"/"+cb.Name, string(cb.UID), nil)
+	r, rec := newEnginePodEventsReconciler(t, cb, pod)
+	wantErr := errors.New("synthetic transient apiserver error")
+	// Wrap the embedded client so the controller's Get on CacheBackends
+	// returns a transient error. We can't use interceptor.Funcs directly
+	// on the builder because the test helper already built the fake;
+	// shadow the Client field with a wrapper instead.
+	r.Client = &transientCBGetClient{Client: r.Client, kind: "CacheBackend", err: wantErr}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: pod.Name, Namespace: ns},
+	})
+	if err == nil {
+		t.Fatalf("expected reconcile error for transient lookup failure; got nil")
+	}
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("expected reconcile error to wrap %q; got %v", wantErr, err)
+	}
+	if got := drainRecorder(rec); len(got) != 0 {
+		t.Fatalf("expected no event on transient lookup failure (it'll fire on the retry); got %v", got)
+	}
+}
+
+// transientCBGetClient injects err into the Get path for CacheBackend
+// objects only; all other reads/writes pass through unchanged. Pod Gets
+// (which the reconciler does first) still work.
+type transientCBGetClient struct {
+	client.Client
+	kind string
+	err  error
+}
+
+func (c *transientCBGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*cachev1alpha1.CacheBackend); ok {
+		return c.err
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func TestEnginePodEvents_SkipsWhenInjectedByUIDDoesNotMatchLiveCR(t *testing.T) {

@@ -702,16 +702,26 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 	if err := k8s.Create(context.Background(), cb); err != nil {
 		t.Fatalf("create CacheBackend: %v", err)
 	}
+	// The apiserver assigns cb.UID on Create. The injected-by-uid
+	// annotation below pins that UID so the events controller's UID
+	// match passes — without it, the controller would skip emission
+	// per the failurePolicy=Ignore forgery guard.
+	if cb.UID == "" {
+		t.Fatalf("apiserver returned empty UID for persisted CacheBackend — envtest invariant broken")
+	}
 
-	// Create a pod with the injected-by annotation. The webhook is NOT
-	// installed in this test — we are exercising the controller's
-	// behavior on a pod that LOOKS like one the webhook would have
-	// stamped.
+	// Create a pod with the injected-by annotations the webhook would
+	// have stamped. The webhook is NOT installed in this test — we are
+	// exercising the controller's behavior on a pod that LOOKS like one
+	// the webhook produced.
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "engine-a",
-			Namespace:   ns,
-			Annotations: map[string]string{"inferencecache.io/injected-by": ns + "/" + cb.Name},
+			Name:      "engine-a",
+			Namespace: ns,
+			Annotations: map[string]string{
+				"inferencecache.io/injected-by":     ns + "/" + cb.Name,
+				"inferencecache.io/injected-by-uid": string(cb.UID),
+			},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{

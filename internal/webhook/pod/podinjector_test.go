@@ -121,9 +121,17 @@ func vllmEnginePod(name string, labels map[string]string) *corev1.Pod {
 
 // readyCacheBackend returns a CacheBackend with status.endpoint published,
 // a vLLM integration, and an EngineSelector keyed on a single label.
+// The metadata.uid is set to a stable fake so the webhook's
+// AnnotationInjectedByUID stamp has a value to compare against in tests
+// that assert the annotation contents (a real apiserver would assign one
+// on Create; the fake client does not, so we set it here).
 func readyCacheBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
+		},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
@@ -190,6 +198,13 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
 	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
 		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
+	}
+	// Pin the webhook-only proof-of-injection annotation against the
+	// matched CR's UID. The engine-pod-events controller skips emission
+	// when this doesn't match; a regression in the success-path stamp
+	// would break the binding signal end-to-end.
+	if got, want := mutated.Annotations[AnnotationInjectedByUID], string(cb.UID); got != want {
+		t.Fatalf("annotation %s: got %q, want %q (matched CR UID)", AnnotationInjectedByUID, got, want)
 	}
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")

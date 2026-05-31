@@ -74,13 +74,25 @@ type EnginePodEventsReconciler struct {
 // restart does not flood the event stream — there is no need for an
 // extra "already emitted" annotation round-trip.
 //
-// Fail-soft: a Get failure other than NotFound surfaces as a normal
-// reconcile error (controller-runtime requeues with backoff). A
-// CacheBackend lookup failure is not surfaced — the event still fires
-// with the annotation value as the cache identity, since the only thing
-// that lookup adds is the CR object as the event's Related reference
-// (informational; the Event's primary signal is the involvedObject and
-// the message).
+// Skip table (each case returns `(ctrl.Result{}, nil)` — admission is
+// CREATE-only, so a skipped reconcile is a permanent drop, but
+// deliberately so for these cases):
+//   - Pod has no `injected-by` annotation. The predicate already filters
+//     this out; defense in depth.
+//   - `injected-by` value does not parse as `<ns>/<name>` (malformed or
+//     stale under an older annotation contract).
+//   - `injected-by-uid` annotation is missing. The webhook always writes
+//     it; absence is the failurePolicy=Ignore forgery shape (user pre-set
+//     `injected-by` while the webhook was unreachable).
+//   - The named CacheBackend is NotFound. Without a live CR we cannot
+//     verify the UID, so we cannot tell "CR deleted between inject and
+//     reconcile" from a forged annotation — conservative skip.
+//   - `injected-by-uid` does not match the live CR's UID (forgery, or
+//     CR was deleted and recreated under the same name).
+//
+// Lookup errors OTHER than NotFound (transient API/RBAC/cache failures)
+// surface as reconcile errors so controller-runtime retries with backoff
+// rather than permanently dropping the event for the affected pod.
 func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := r.Log
 	if logger.GetSink() == nil {
@@ -127,16 +139,27 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 	cb, lookupErr := r.lookupCacheBackend(ctx, cbRef)
-	if lookupErr != nil {
-		// Without a live CR we cannot verify the UID, and without
-		// verification we cannot tell a real "CR deleted between
-		// inject and reconcile" from a forged annotation surviving a
-		// failurePolicy=Ignore admission. Skip emission either way —
+	switch {
+	case lookupErr == nil:
+		// Happy path: CR exists, fall through to UID validation below.
+	case apierrors.IsNotFound(lookupErr):
+		// CR truly absent. Without a live CR we cannot verify the UID,
+		// and without verification we cannot tell a real "CR deleted
+		// between inject and reconcile" from a forged annotation
+		// surviving a failurePolicy=Ignore admission. Skip emission —
 		// the missing event is the conservative tradeoff for keeping
 		// this signal authoritative.
-		logger.V(1).Info("skipping InjectedByCacheBackend event: CacheBackend lookup failed",
-			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef, "error", lookupErr.Error())
+		logger.V(1).Info("skipping InjectedByCacheBackend event: CacheBackend not found",
+			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
 		return ctrl.Result{}, nil
+	default:
+		// Transient API/RBAC/cache error. We MUST NOT swallow this:
+		// admission is CREATE-only, so a one-and-done skip on a
+		// transient hiccup permanently drops the event for this pod.
+		// Surface the error so controller-runtime backs off and
+		// retries — once the transient condition clears, the next
+		// reconcile validates the UID and emits.
+		return ctrl.Result{}, fmt.Errorf("lookup CacheBackend %q: %w", cbRef, lookupErr)
 	}
 	if uidRef != string(cb.UID) {
 		// Annotation UID doesn't match the live CR's UID — either the
@@ -175,9 +198,13 @@ func validCacheBackendRef(ref string) bool {
 }
 
 // lookupCacheBackend parses the "<namespace>/<name>" annotation value and
-// fetches the named CacheBackend. The lookup is best-effort: a missing or
-// malformed reference returns (nil, err) and the caller emits the event
-// without the Related field rather than dropping it.
+// fetches the named CacheBackend. Returns (nil, err) on a malformed
+// reference, NotFound, or any transient Get error; callers MUST
+// distinguish between these to decide whether to skip emission
+// (malformed / NotFound) or surface the error to controller-runtime for
+// retry (transient). The malformed-ref error is preserved for symmetry
+// with the live-API errors but callers typically short-circuit the
+// malformed case earlier via [validCacheBackendRef].
 func (r *EnginePodEventsReconciler) lookupCacheBackend(ctx context.Context, ref string) (*cachev1alpha1.CacheBackend, error) {
 	ns, name, ok := strings.Cut(ref, "/")
 	if !ok || ns == "" || name == "" {
