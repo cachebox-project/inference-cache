@@ -196,9 +196,9 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to
 // status and marks the backend Ready: there is no Service to wait on, so
 // admission acceptance of spec.endpoint is the only readiness signal the
-// controller has. status.health flips to Ready in lock step so the
-// printcolumn surface (kubectl get cb) doesn't show a blank Health column
-// for External CRs that admission has already accepted.
+// controller has. The Ready condition flips to True in lock step so the
+// Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
+// External CRs that admission has already accepted.
 //
 // Three terminal states, each driven by the SAME shape rule the
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
@@ -238,7 +238,6 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			readyStatus = metav1.ConditionFalse
 			readyReason string
 			readyMsg    string
-			health      = cachev1alpha1.CacheBackendHealthPending
 		)
 		switch {
 		case endpoint == "":
@@ -259,10 +258,8 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			readyStatus = metav1.ConditionTrue
 			readyReason = conditionReasonExternalEndpointAccepted
 			readyMsg = "External endpoint accepted; controller does not provision cache pods for External backends"
-			health = cachev1alpha1.CacheBackendHealthReady
 		}
 
-		backend.Status.Health = health
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeProgressing,
 			Status:             metav1.ConditionFalse,
@@ -289,7 +286,6 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	}
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
-		backend.Status.Health = ""
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
@@ -752,15 +748,14 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 // requested PVC size as "provisioned capacity" would mislead operators.
 // Populating it is left to the follow-up that wires storage end-to-end.
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) error {
-	health, readyStatus, reason, message := managedHealth(backend, dep)
-	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(health, reason, message)
+	readyStatus, reason, message := managedReadiness(backend, dep)
+	progressingStatus, progressingReason, progressingMessage := progressingFromReady(readyStatus, reason, message)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
 		publishedGen = backend.Generation
 	}
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
-		backend.Status.Health = health
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = publishedGen
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
@@ -780,10 +775,22 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	})
 }
 
-// managedHealth maps the Deployment's rollout state to a CacheBackend health.
-// Ready requires the Deployment to have observed its current generation and to
-// have enough updated + available replicas, so a stale rollout (e.g. mid image
-// change) is never reported Ready.
+// Ready condition reasons published by managedReadiness. Stable strings so
+// downstream consumers (transition-event predicates, the Progressing
+// derivation, dashboards) can switch on reason instead of regexing the
+// message.
+const (
+	conditionReasonBackendReady        = "BackendReady"
+	conditionReasonScaledToZero        = "ScaledToZero"
+	conditionReasonRolloutInProgress   = "RolloutInProgress"
+	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
+)
+
+// managedReadiness maps the Deployment's rollout state to the Ready
+// condition (status + reason + message). Ready=True requires the Deployment
+// to have observed its current generation and to have enough updated +
+// available replicas, so a stale rollout (e.g. mid image change) is never
+// reported Ready.
 //
 // When the CacheBackend is autoscaled the HPA owns the desired replica count,
 // so the comparison target is the live Deployment's spec.replicas (which the
@@ -791,48 +798,42 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 // in that mode). This keeps Ready accurate when an HPA decides to run more
 // pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
 // happens to be 0 with autoscaling configured.
-func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (cachev1alpha1.CacheBackendHealth, metav1.ConditionStatus, string, string) {
+func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (metav1.ConditionStatus, string, string) {
 	want := desiredReplicas(backend, dep)
 
 	// A backend scaled to zero is not serving; never report it Ready.
 	if want == 0 {
-		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "ScaledToZero",
-			"backend scaled to zero replicas"
+		return metav1.ConditionFalse, conditionReasonScaledToZero, "backend scaled to zero replicas"
 	}
 
 	rolledOut := dep.Status.ObservedGeneration >= dep.Generation
 	switch {
 	case rolledOut && dep.Status.UpdatedReplicas >= want && dep.Status.AvailableReplicas >= want:
-		return cachev1alpha1.CacheBackendHealthReady, metav1.ConditionTrue, "BackendReady",
+		return metav1.ConditionTrue, conditionReasonBackendReady,
 			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
 	case !rolledOut || dep.Status.UpdatedReplicas < want:
-		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "RolloutInProgress",
+		return metav1.ConditionFalse, conditionReasonRolloutInProgress,
 			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
 	default:
-		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
+		return metav1.ConditionFalse, conditionReasonReplicasUnavailable,
 			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
 	}
 }
 
-// progressingFromHealth derives the Progressing condition from the Ready
-// condition's outcome. A Pending backend that's actively converging
-// (RolloutInProgress) flips Progressing=True; a Pending backend that's
-// reached a stable user-chosen state (ScaledToZero) is NOT progressing — no
-// rollout is in motion. A Ready backend has converged (Progressing=False,
-// Reason=Synced); a Degraded backend has finished a rollout but lost
-// replicas (Progressing=False, Reason=Degraded — Ready=False already
-// signals the problem, and the rollout isn't in motion).
-func progressingFromHealth(health cachev1alpha1.CacheBackendHealth, reason, message string) (metav1.ConditionStatus, string, string) {
-	switch health {
-	case cachev1alpha1.CacheBackendHealthReady:
+// progressingFromReady derives the Progressing condition from the Ready
+// condition's outcome. A Ready=True backend has converged (Progressing=False,
+// Reason=Synced). A Ready=False backend that's actively converging
+// (RolloutInProgress) flips Progressing=True; one that has reached a stable
+// terminal state (ScaledToZero) or stable failure (ReplicasUnavailable) is
+// NOT progressing — no rollout is in motion.
+func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message string) (metav1.ConditionStatus, string, string) {
+	if readyStatus == metav1.ConditionTrue {
 		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
-	case cachev1alpha1.CacheBackendHealthPending:
-		// ScaledToZero is a stable terminal state, not a rollout in progress.
-		if reason == "ScaledToZero" {
-			return metav1.ConditionFalse, reason, message
-		}
+	}
+	switch reason {
+	case conditionReasonRolloutInProgress:
 		return metav1.ConditionTrue, reason, message
-	case cachev1alpha1.CacheBackendHealthDegraded:
+	case conditionReasonReplicasUnavailable:
 		return metav1.ConditionFalse, "Degraded", message
 	default:
 		return metav1.ConditionFalse, reason, message
@@ -990,11 +991,14 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 }
 
 // stateSnapshot captures the prior-status fields that drive transition events.
-// Health is the observed phase enum and failOpen is the previously-echoed
-// integration.failOpen (nil ⇒ never observed ⇒ treated as the API default of
-// true, so an initial apply with failOpen=false correctly fires the warning).
+// degraded / ready are derived from the Ready condition (status + reason) so
+// the transition logic doesn't need a separate phase enum on status. failOpen
+// is the previously-echoed integration.failOpen (nil ⇒ never observed ⇒
+// treated as the API default of true, so an initial apply with
+// failOpen=false correctly fires the warning).
 type stateSnapshot struct {
-	health   cachev1alpha1.CacheBackendHealth
+	ready    bool
+	degraded bool
 	failOpen bool
 }
 
@@ -1003,9 +1007,25 @@ type stateSnapshot struct {
 // has a stable baseline to compare the post-reconcile state against.
 func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
 	return stateSnapshot{
-		health:   cb.Status.Health,
+		ready:    isReady(cb),
+		degraded: isDegraded(cb),
 		failOpen: statusFailOpen(cb.Status.FailOpen),
 	}
+}
+
+// isReady reports whether the Ready condition is currently True.
+func isReady(cb *cachev1alpha1.CacheBackend) bool {
+	c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady)
+	return c != nil && c.Status == metav1.ConditionTrue
+}
+
+// isDegraded reports whether the Ready condition is False with the
+// "replicas unavailable" reason — the post-rollout failure shape that the
+// BackendDegraded event narrates. A rollout in progress or a scaled-to-zero
+// backend is not degraded.
+func isDegraded(cb *cachev1alpha1.CacheBackend) bool {
+	c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady)
+	return c != nil && c.Status == metav1.ConditionFalse && c.Reason == conditionReasonReplicasUnavailable
 }
 
 // statusFailOpen treats a missing status.failOpen as the API default (true).
@@ -1032,18 +1052,13 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	if r.Recorder == nil {
 		return
 	}
-	after := stateSnapshot{
-		health:   cb.Status.Health,
-		failOpen: statusFailOpen(cb.Status.FailOpen),
-	}
+	after := snapshotState(cb)
 
-	if before.health != cachev1alpha1.CacheBackendHealthDegraded &&
-		after.health == cachev1alpha1.CacheBackendHealthDegraded {
+	if !before.degraded && after.degraded {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonBackendDegraded, eventReasonBackendDegraded,
 			"cache backend is degraded: %s", degradedMessage(cb))
 	}
-	if before.health == cachev1alpha1.CacheBackendHealthDegraded &&
-		after.health == cachev1alpha1.CacheBackendHealthReady {
+	if before.degraded && after.ready {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonBackendRecovered, eventReasonBackendRecovered,
 			"cache backend recovered to Ready")
 	}

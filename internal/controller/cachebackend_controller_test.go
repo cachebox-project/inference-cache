@@ -153,14 +153,11 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	if updated.Status.Endpoint != wantEndpoint {
 		t.Fatalf("status.endpoint = %q, want %q (engine-agnostic host:port; lm:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
 	}
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-		t.Fatalf("status.health = %q, want Pending (no ready replicas yet)", updated.Status.Health)
-	}
 	if updated.Status.ObservedGeneration != 1 {
 		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
 	}
-	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse {
-		t.Fatalf("Ready condition = %+v, want present and False", cond)
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonRolloutInProgress {
+		t.Fatalf("Ready condition = %+v, want False/RolloutInProgress (no ready replicas yet)", cond)
 	}
 }
 
@@ -285,27 +282,26 @@ func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready", updated.Status.Health)
-	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("Ready condition = %+v, want True", cond)
 	}
 }
 
-func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
+func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(2)
 
 	cases := []struct {
-		name string
-		dep  appsv1.Deployment
-		want cachev1alpha1.CacheBackendHealth
+		name       string
+		dep        appsv1.Deployment
+		wantStatus metav1.ConditionStatus
+		wantReason string
 	}{
 		{
-			name: "fresh create, nothing ready",
-			dep:  appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Generation: 1}},
-			want: cachev1alpha1.CacheBackendHealthPending,
+			name:       "fresh create, nothing ready",
+			dep:        appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Generation: 1}},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonRolloutInProgress,
 		},
 		{
 			name: "stale rollout after image change (old pods still available)",
@@ -313,7 +309,8 @@ func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, UpdatedReplicas: 0, AvailableReplicas: 2, ReadyReplicas: 2},
 			},
-			want: cachev1alpha1.CacheBackendHealthPending,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonRolloutInProgress,
 		},
 		{
 			name: "rolled out and available",
@@ -321,7 +318,8 @@ func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 2, ReadyReplicas: 2},
 			},
-			want: cachev1alpha1.CacheBackendHealthReady,
+			wantStatus: metav1.ConditionTrue,
+			wantReason: conditionReasonBackendReady,
 		},
 		{
 			name: "rolled out but replicas unavailable",
@@ -329,20 +327,21 @@ func TestManagedHealthGatesReadyOnRollout(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 1, ReadyReplicas: 1},
 			},
-			want: cachev1alpha1.CacheBackendHealthDegraded,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonReplicasUnavailable,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _, _, _ := managedHealth(cb, &tc.dep)
-			if got != tc.want {
-				t.Fatalf("managedHealth = %q, want %q", got, tc.want)
+			status, reason, _ := managedReadiness(cb, &tc.dep)
+			if status != tc.wantStatus || reason != tc.wantReason {
+				t.Fatalf("managedReadiness = %v/%q, want %v/%q", status, reason, tc.wantStatus, tc.wantReason)
 			}
 		})
 	}
 }
 
-func TestManagedHealthZeroReplicasNotReady(t *testing.T) {
+func TestManagedReadinessZeroReplicasNotReady(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(0)
 	// Even a fully-observed Deployment with 0/0 replicas must not be Ready.
@@ -350,8 +349,8 @@ func TestManagedHealthZeroReplicasNotReady(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Generation: 1},
 		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
 	}
-	if got, status, _, _ := managedHealth(cb, &dep); got == cachev1alpha1.CacheBackendHealthReady || status == metav1.ConditionTrue {
-		t.Fatalf("managedHealth for 0 replicas = %q/%v, want non-Ready", got, status)
+	if status, reason, _ := managedReadiness(cb, &dep); status == metav1.ConditionTrue {
+		t.Fatalf("managedReadiness for 0 replicas = %v/%q, want non-True", status, reason)
 	}
 }
 
@@ -567,9 +566,6 @@ func TestReconcileExternalSetsReadyTrue(t *testing.T) {
 	reconcile(t, r, "ext", "default")
 
 	got := getBackend(t, r, "ext", "default")
-	if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want %q", got.Status.Health, cachev1alpha1.CacheBackendHealthReady)
-	}
 	ready := findCondition(got.Status.Conditions, "Ready")
 	if ready == nil {
 		t.Fatalf("Ready condition missing; conditions = %v", got.Status.Conditions)
@@ -627,9 +623,6 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 			if ready.Reason != "ExternalEndpointInvalid" {
 				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
 			}
-			if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-				t.Fatalf("status.health = %q, want Pending", got.Status.Health)
-			}
 		})
 	}
 }
@@ -655,9 +648,6 @@ func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	}
 	if ready.Reason != "ExternalEndpointMissing" {
 		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
-	}
-	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
 	}
 	// Progressing reason mirrors Ready's reason on the missing path so
 	// `kubectl describe` shows a coherent pair.
@@ -696,9 +686,6 @@ func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {
 	}
 	if ready.Reason != "ExternalEndpointMissing" {
 		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
-	}
-	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
 	}
 }
 
@@ -1051,11 +1038,8 @@ func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 		t.Fatalf("deployment image = %q, want %q (apply did not converge under conflict)", got, "example.com/lmcache-server:v9")
 	}
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready (CR is stuck despite Deployment being ready)", updated.Status.Health)
-	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready condition = %+v, want True", cond)
+		t.Fatalf("Ready condition = %+v, want True (CR is stuck despite Deployment being ready)", cond)
 	}
 }
 
@@ -1112,11 +1096,8 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready (status must reflect live Deployment regardless of apply error)", updated.Status.Health)
-	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready condition = %+v, want True", cond)
+		t.Fatalf("Ready condition = %+v, want True (status must reflect live Deployment regardless of apply error)", cond)
 	}
 	// Apply for generation 2 failed, so observedGeneration must NOT have
 	// advanced to 2 — it should still report 1 (the last generation we
@@ -1330,9 +1311,6 @@ func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health == cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = Ready, must not be derived from foreign Deployment")
-	}
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond != nil && cond.Status == metav1.ConditionTrue {
 		t.Fatalf("Ready condition True, must not be derived from foreign Deployment")
 	}

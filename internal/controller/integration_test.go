@@ -268,7 +268,7 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("HealthTransitions", func(t *testing.T) {
+	t.Run("ReadyConditionTransitions", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := lmcacheBackend("cache", ns)
 		cb.Spec.Replicas = ptrInt32(2)
@@ -276,11 +276,11 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			t.Fatalf("create: %v", err)
 		}
 		reconcile(t, r, "cache", ns)
-		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthPending {
-			t.Fatalf("fresh health = %q, want Pending", got)
+		if cond := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonRolloutInProgress {
+			t.Fatalf("fresh Ready condition = %+v, want False/RolloutInProgress", cond)
 		}
 
-		// Mid-rollout: generation observed but updated replicas lag -> Pending.
+		// Mid-rollout: generation observed but updated replicas lag -> Ready=False/RolloutInProgress.
 		setDeploymentStatus(t, r, "cache", ns, func(d *appsv1.Deployment) {
 			d.Status.ObservedGeneration = d.Generation
 			d.Status.Replicas = 2
@@ -289,11 +289,11 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			d.Status.ReadyReplicas = 2
 		})
 		reconcile(t, r, "cache", ns)
-		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthPending {
-			t.Fatalf("mid-rollout health = %q, want Pending", got)
+		if cond := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonRolloutInProgress {
+			t.Fatalf("mid-rollout Ready condition = %+v, want False/RolloutInProgress", cond)
 		}
 
-		// Fully rolled out -> Ready.
+		// Fully rolled out -> Ready=True.
 		setDeploymentStatus(t, r, "cache", ns, func(d *appsv1.Deployment) {
 			d.Status.ObservedGeneration = d.Generation
 			d.Status.Replicas = 2
@@ -303,14 +303,11 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		})
 		reconcile(t, r, "cache", ns)
 		cb = getBackend(t, r, "cache", ns)
-		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("rolled-out health = %q, want Ready", cb.Status.Health)
-		}
 		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
 			t.Fatalf("Ready condition = %+v, want True", cond)
 		}
 
-		// Rolled out but replicas unavailable -> Degraded.
+		// Rolled out but replicas unavailable -> Ready=False/ReplicasUnavailable.
 		setDeploymentStatus(t, r, "cache", ns, func(d *appsv1.Deployment) {
 			d.Status.ObservedGeneration = d.Generation
 			d.Status.Replicas = 2
@@ -319,8 +316,8 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			d.Status.ReadyReplicas = 1
 		})
 		reconcile(t, r, "cache", ns)
-		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("unavailable health = %q, want Degraded", got)
+		if cond := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonReplicasUnavailable {
+			t.Fatalf("unavailable Ready condition = %+v, want False/ReplicasUnavailable", cond)
 		}
 	})
 
@@ -337,9 +334,6 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		})
 		reconcile(t, r, "cache", ns)
 		cb = getBackend(t, r, "cache", ns)
-		if cb.Status.Health == cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("zero-replica health = Ready, want non-Ready")
-		}
 		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse {
 			t.Fatalf("Ready condition = %+v, want False for zero replicas", cond)
 		}
@@ -535,9 +529,6 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 		if ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
 			t.Fatalf("Ready condition = %+v, want Status=True Reason=ExternalEndpointAccepted", ready)
-		}
-		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("status.health = %q, want Ready", cb.Status.Health)
 		}
 	})
 

@@ -2,7 +2,7 @@
 #
 # Runs docs/reference-stack/scripts/canary_c2_reconcile.sh: brings up a kind
 # cluster, runs the controller, applies a CPU-profile CacheBackend, and asserts
-# the reconciler stands up a healthy serving backend (status.health=Ready,
+# the reconciler stands up a healthy serving backend (Ready condition True,
 # endpoint published), an engine prefix-cache hit, and owner-ref GC on delete.
 # GPU-free.
 #

@@ -3,7 +3,7 @@
 # healthy, serving backend from a CR on a GPU-free cluster (kind):
 #
 #   kubectl apply CacheBackend(profile=cpu) --> controller --> Deployment + Service
-#     --> CPU vLLM pods become Ready --> status.health=Ready, status.endpoint set
+#     --> CPU vLLM pods become Ready --> Ready condition True, status.endpoint set
 #
 # Optionally drives prefix traffic through the Service and checks an engine
 # prefix-cache hit. Deleting the CR garbage-collects the children via owner refs.
@@ -91,19 +91,19 @@ spec:
 EOF
 
 # --- wait for the reconciler to report Ready --------------------------------
-log "waiting up to ${READY_TIMEOUT}s for status.health=Ready (CPU model load is slow)"
+log "waiting up to ${READY_TIMEOUT}s for the Ready condition to be True (CPU model load is slow)"
 deadline=$(($(date +%s) + READY_TIMEOUT))
-health=""
-until [ "$health" = "Ready" ]; do
-  health="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.health}' 2>/dev/null || true)"
+ready=""
+until [ "$ready" = "True" ]; do
+  ready="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get pods -o wide || true
     kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" describe deployment "$CR_NAME" || true
-    fail "backend did not become Ready within ${READY_TIMEOUT}s (last health='$health')"
+    fail "backend did not become Ready within ${READY_TIMEOUT}s (last Ready status='$ready')"
   fi
   sleep 5
 done
-log "status.health=Ready"
+log "Ready=True"
 
 endpoint="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.endpoint}')"
 [ -n "$endpoint" ] || fail "status.endpoint was not published"

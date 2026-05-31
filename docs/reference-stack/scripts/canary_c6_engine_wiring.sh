@@ -142,7 +142,7 @@ EOF
 
 log "waiting up to ${READY_TIMEOUT}s for the lmcache-server CacheBackend to reach Ready"
 deadline=$(($(date +%s) + READY_TIMEOUT))
-until [ "$(kubectl "${KCTX[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.health}' 2>/dev/null)" = "Ready" ]; do
+until [ "$(kubectl "${KCTX[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl "${KCTX[@]}" -n "$NAMESPACE" get pods -o wide || true
     kubectl "${KCTX[@]}" -n "$NAMESPACE" describe cachebackend "$CR_NAME" || true

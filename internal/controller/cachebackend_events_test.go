@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -139,24 +140,21 @@ func TestReconcileEmitsBackendDegradedOnTransition(t *testing.T) {
 	// is loud enough to deserve an event by design).
 	markDeploymentReady(t, r, "cache", "ns1", 2)
 	reconcile(t, r, "cache", "ns1")
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready before degrading", got)
+	if !isReady(getBackend(t, r, "cache", "ns1")) {
+		t.Fatalf("Ready condition not True before degrading")
 	}
 	if events := drainEvents(rec); len(events) != 0 {
 		t.Fatalf("unexpected events on Ready transition: %v", events)
 	}
 
 	// Backend dies under load: AvailableReplicas drops to 0 with the rollout
-	// already observed → managedHealth reports Degraded.
+	// already observed → managedReadiness reports Ready=False/ReplicasUnavailable.
 	markDeploymentDegraded(t, r, "cache", "ns1", 2)
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
-		t.Fatalf("status.health = %q, want Degraded", updated.Status.Health)
-	}
 	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
-	if cond == nil || cond.Status != "False" || cond.Reason != "ReplicasUnavailable" {
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonReplicasUnavailable {
 		t.Fatalf("Ready condition = %+v, want False/ReplicasUnavailable", cond)
 	}
 	events := drainEvents(rec)
@@ -233,8 +231,8 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 		t.Fatalf("reconcile returned nil, want error (apply was blocked)")
 	}
 
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-		t.Fatalf("status.health = %q, want Degraded (status path runs independently of apply error)", got)
+	if !isDegraded(getBackend(t, r, "cache", "ns1")) {
+		t.Fatalf("Ready condition not False/ReplicasUnavailable (status path runs independently of apply error)")
 	}
 	events := drainEvents(rec)
 	expectEvent(t, events, "Warning "+eventReasonBackendDegraded)
@@ -303,8 +301,8 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	}
 	// The live CR status must still report the pre-transition Ready, since
 	// the patch was rejected.
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready (the failed patch must not be visible)", got)
+	if !isReady(getBackend(t, r, "cache", "ns1")) {
+		t.Fatalf("Ready condition not True (the failed patch must not be visible)")
 	}
 
 	// Unblock and reconcile again. The same transition now lands cleanly and
@@ -316,8 +314,8 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reconcile after unblock: %v", err)
 	}
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-		t.Fatalf("status.health = %q, want Degraded after unblock", got)
+	if !isDegraded(getBackend(t, r, "cache", "ns1")) {
+		t.Fatalf("Ready condition not False/ReplicasUnavailable after unblock")
 	}
 	got := drainEvents(rec)
 	expectEvent(t, got, "Warning "+eventReasonBackendDegraded)
@@ -350,8 +348,8 @@ func TestReconcileEmitsBackendRecoveredOnReadyTransition(t *testing.T) {
 	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready after recovery", got)
+	if !isReady(getBackend(t, r, "cache", "ns1")) {
+		t.Fatalf("Ready condition not True after recovery")
 	}
 	events := drainEvents(rec)
 	expectEvent(t, events, "Normal "+eventReasonBackendRecovered)

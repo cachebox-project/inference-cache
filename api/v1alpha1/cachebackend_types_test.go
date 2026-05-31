@@ -38,10 +38,16 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "failOpen", "conditions"} {
+	for _, field := range []string{"endpoint", "capacity", "indexEntries", "failOpen", "conditions"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
+	}
+	// status.health was removed in favour of the standard
+	// status.conditions[Ready] surface; guard against accidental
+	// re-introduction.
+	if hasProperty(statusSchema, "health") {
+		t.Fatalf("status.health is present in CRD schema; it must be removed in favour of status.conditions[Ready]")
 	}
 
 	requireNoEnum(t, mustProperty(t, specSchema, "type"))
@@ -62,12 +68,6 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	if got, ok := failOpenSchema["default"].(bool); !ok || !got {
 		t.Fatalf("integration.failOpen default = %v, want true", failOpenSchema["default"])
 	}
-	requireEnum(t, mustProperty(t, statusSchema, "health"), []string{
-		"Pending",
-		"Ready",
-		"Degraded",
-		"Failed",
-	})
 	templateSchema := mustProperty(t, specSchema, "template")
 	requireNoPreserveUnknownFields(t, templateSchema)
 	for _, field := range []string{"nodeSelector", "tolerations", "affinity"} {
@@ -169,7 +169,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 		},
 		Status: CacheBackendStatus{
 			Endpoint:     "cache.default.svc:8080",
-			Health:       CacheBackendHealthReady,
 			Capacity:     "10Gi",
 			IndexEntries: &indexEntries,
 			Conditions: []metav1.Condition{{

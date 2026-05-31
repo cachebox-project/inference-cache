@@ -135,7 +135,6 @@ func readyCacheBackend(name, namespace string, selector map[string]string) *cach
 		},
 		Status: cachev1alpha1.CacheBackendStatus{
 			Endpoint: name + ".cache-ns.svc.cluster.local:65432",
-			Health:   cachev1alpha1.CacheBackendHealthReady,
 		},
 	}
 }

@@ -20,8 +20,8 @@ spec:
     - jsonPath: .spec.type
       name: Type
       type: string
-    - jsonPath: .status.health
-      name: Health
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
       type: string
     - jsonPath: .status.endpoint
       name: Endpoint
@@ -1960,14 +1960,6 @@ spec:
                   whether the cache is currently a soft optimization (true) or a
                   serving dependency (false) without re-reading the integration spec.
                 type: boolean
-              health:
-                description: Health summarizes the observed backend health.
-                enum:
-                - Pending
-                - Ready
-                - Degraded
-                - Failed
-                type: string
               indexEntries:
                 description: IndexEntries is the observed number of cache index entries
                   for this backend.
