@@ -21,6 +21,7 @@
 - [ ] `make lint` clean (gofmt + go vet).
 - [ ] `make manifests generate` produces **no drift** (generated code committed).
 - [ ] New/changed behavior has unit tests.
+- [ ] Operator-facing change (CRD columns/fields, `.status`, CLI, gRPC/HTTP, install bundle)? If so, the install-smoke gate asserts it (see CONTRIBUTING.md).
 - [ ] CI is green.
 
 ### Contracts (only if touching CRDs or proto)
