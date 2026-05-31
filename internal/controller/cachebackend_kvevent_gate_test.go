@@ -258,13 +258,21 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		if got.Status.Endpoint != "external.example.svc:6379" {
 			t.Fatalf("endpoint = %q, want mirrored external endpoint", got.Status.Endpoint)
 		}
-		// External never enters the gate: no Ready/Degraded conditions, Health
-		// is not driven by KV events.
+		// External never enters the KV-event gate: readiness comes from
+		// admission accepting the endpoint (reason ExternalEndpointAccepted),
+		// not from a KV event. The gate's reasons and latch must never appear.
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
+			t.Fatalf("Ready = %+v, want True/ExternalEndpointAccepted (endpoint-driven, not gated)", ready)
+		}
+		if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+			t.Fatalf("health = %q, want Ready (endpoint accepted)", got.Status.Health)
+		}
 		if deg := findCondition(got.Status.Conditions, conditionTypeDegraded); deg != nil {
 			t.Fatalf("Degraded = %+v, want absent for External", deg)
 		}
-		if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
-			t.Fatalf("Ready = %+v, want absent for External", ready)
+		if got.Status.FirstKVEventObservedAt != nil {
+			t.Fatalf("firstKVEventObservedAt = %v, want nil (External never enters the gate)", got.Status.FirstKVEventObservedAt)
 		}
 	})
 

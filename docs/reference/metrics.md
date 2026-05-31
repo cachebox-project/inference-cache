@@ -48,6 +48,7 @@ silently.
 | Metric | Labels | Meaning | Notes |
 |---|---|---|---|
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
+| `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — see note below), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses both "kube-apiserver checked the token and rejected it" AND "an authenticator in the chain populated `Status.Error`" because the two are NOT distinguishable from the response shape (verified empirically: kube-apiserver's SA-token authenticator populates `Status.Error` for routine JWT-parse failures of garbage strings, the same field a webhook-authenticator timeout would set). When `Status.Error` is non-empty the middleware logs it at WARN to the server log so the operator can still tell apart "webhook timeout" from "invalid bearer token" via the diagnostic. A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
 
 ### Histograms
 
@@ -86,13 +87,22 @@ with OTEL collectors) without bumping `v1alpha1`.
 
 ## How `/metrics` is served
 
-- HTTP endpoint **`/metrics`** on the server's HTTP listener (default `:8080`,
-  flag `--http-bind-address`). Format: Prometheus exposition.
-- Companion endpoints on the same listener: **`/healthz`** (liveness),
-  **`/readyz`** (readiness → `index.Ready()`). The internal **`/snapshot`**
-  JSON aggregate (scraped by the controller's `CacheIndexPoller` to populate
-  the `CacheIndex` CR status) ships with B6's status half — add it to the
-  companion-endpoints list when that lands.
+- HTTP endpoint **`/metrics`** on the server's public HTTP listener (default
+  `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
+- Companion endpoints on the public listener: **`/healthz`** (liveness),
+  **`/readyz`** (readiness → `index.Ready()`), **`/policy`** (controller →
+  server push of resolved `CachePolicy` snapshots). These are intentionally
+  unauthenticated — kubelet probes and Prometheus scrapes need them open,
+  and the controller is the only writer of `/policy`.
+- Separate **`/snapshot`** listener (default `:8081`, flag
+  `--snapshot-bind-address`) carries the JSON cluster-wide cache aggregate
+  the controller's `CacheIndexPoller` scrapes to populate the `CacheIndex`
+  CR status. The split is intentional: a `NetworkPolicy` restricts L3/L4
+  ingress to the controller's pod selector, and a TokenReview-backed bearer
+  middleware on the listener rejects everything that isn't the configured
+  controller `ServiceAccount` (`--snapshot-allowed-sa`).
+  `inferencecache_snapshot_auth_total` (see the counter table above) is the
+  observability surface for that gate.
 
 ---
 
