@@ -755,41 +755,71 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 			),
 		}
 	}
-	// Require a non-empty host. "lm://" alone, ":port", "lm://:port"
-	// all pass the prior checks but would produce LMCACHE_REMOTE_URL=
-	// lm://[:port] at injection — the exact broken value this
-	// validation exists to prevent. Strip the optional port suffix
-	// (with IPv6 bracket-aware handling) and require what remains.
-	if extractEndpointHost(rest) == "" {
+	// Require BOTH a non-empty host AND a non-empty port. The contract
+	// surface is "bare host:port (LMCache adapter adds lm://) or
+	// lm://host:port" — both forms include a port, because the LMCache
+	// connector dials TCP at the resolved address. Accepting a
+	// portless `cache.example.com` would inject
+	// LMCACHE_REMOTE_URL=lm://cache.example.com, which the connector
+	// then tries to parse — behaviour is undocumented and crashes the
+	// engine. Likewise `lm://`, `:port`, `cache.example.com:` (empty
+	// port) all pass the prior checks but produce invalid injected
+	// URLs.
+	host, port, ok := splitEndpointHostPort(rest)
+	if !ok || host == "" || port == "" {
 		return field.ErrorList{
 			field.Invalid(
 				field.NewPath("spec", "endpoint"),
 				cb.Spec.Endpoint,
-				"spec.endpoint must include a non-empty host (e.g. cache.example.com[:8200] or lm://cache.example.com[:8200]); a scheme or port alone is not a valid LMCache endpoint",
+				"spec.endpoint must be a non-empty host AND port (e.g. cache.example.com:8200 or lm://cache.example.com:8200); a scheme alone, a host with no port, an empty port, or a port with no host is not a valid LMCache endpoint",
 			),
 		}
 	}
 	return nil
 }
 
-// extractEndpointHost returns the host portion of a host[:port] string,
-// stripping the optional :port suffix with bracket-aware IPv6 handling:
-// `[::1]:8200` → `::1`, `[::1]` → `::1`, `cache:8200` → `cache`,
-// `cache` → `cache`, `:8200` → "" (port without host).
-func extractEndpointHost(s string) string {
+// splitEndpointHostPort parses a host[:port] string into its host and
+// port halves with bracket-aware IPv6 handling. Returns (host, port,
+// hasPort) so callers can tell apart `cache` (no port → hasPort=false)
+// from `cache:` (empty port → hasPort=true, port=""). The contract
+// surface requires hasPort=true with a non-empty port so the LMCache
+// connector dials a known TCP target — see the call site in
+// validateExternalEndpointShape.
+//
+// Recognised shapes:
+//
+//	`cache:8200`     → ("cache", "8200", true)
+//	`cache:`         → ("cache", "",     true)
+//	`cache`          → ("cache", "",     false)
+//	`[::1]:8200`     → ("::1",   "8200", true)
+//	`[::1]:`         → ("::1",   "",     true)
+//	`[::1]`          → ("::1",   "",     false)
+//	`:8200`          → ("",      "8200", true)
+//	``               → ("",      "",     false)
+func splitEndpointHostPort(s string) (host, port string, hasPort bool) {
 	if s == "" {
-		return ""
+		return "", "", false
 	}
 	if strings.HasPrefix(s, "[") {
-		if end := strings.Index(s, "]"); end > 1 {
-			return s[1:end]
+		end := strings.Index(s, "]")
+		if end <= 1 {
+			return "", "", false
 		}
-		return ""
+		host = s[1:end]
+		tail := s[end+1:]
+		if tail == "" {
+			return host, "", false
+		}
+		if strings.HasPrefix(tail, ":") {
+			return host, tail[1:], true
+		}
+		// Unexpected suffix after the bracketed host (e.g. `[::1]junk`).
+		return "", "", false
 	}
 	if i := strings.LastIndex(s, ":"); i >= 0 {
-		return s[:i]
+		return s[:i], s[i+1:], true
 	}
-	return s
+	return s, "", false
 }
 
 // rejectPersistentStorageOnMemoryOnly rejects a PVC-backed storage spec on

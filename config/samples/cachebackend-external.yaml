@@ -40,10 +40,10 @@ spec:
   # adapter adds the LMCache `lm://` scheme when it injects
   # LMCACHE_REMOTE_URL onto the engine container, matching the
   # status.endpoint contract used by managed backends (engine-agnostic
-  # host:port; the adapter owns the scheme). Operators who pre-fix the
+  # host:port; the adapter owns the scheme). Operators who prefix the
   # value with `lm://` are accommodated — the helper passes through an
   # already-prefixed endpoint unchanged — but the bare form is the
-  # canonical one.
+  # canonical one. Admission requires a non-empty host AND port.
   endpoint: my-cache.example.com:8200
   integration:
     # Case-insensitive; the engine wire today is LMCache-shaped.

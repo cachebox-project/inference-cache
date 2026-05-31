@@ -127,13 +127,19 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 
 	endpoint := effectiveEndpoint(cache)
 	if endpoint == "" {
-		// The reconciler hasn't published the cache-server's endpoint
-		// yet. Without it the adapter would write LMCACHE_REMOTE_URL=lm://
-		// which a vLLM engine refuses on startup. Fail open so the pod
-		// admits unwired; the next pod admission (after the backend
-		// becomes Ready) will pick it up.
-		log.V(1).Info("fail-open: CacheBackend has no status.endpoint yet")
-		return admission.Allowed("CacheBackend status.endpoint not yet published (fail-open)")
+		// The endpoint source is type-scoped (see effectiveEndpoint):
+		// managed types learn it from status.endpoint, External pulls
+		// from spec.endpoint. Surface the right field name in the
+		// fail-open reason so an operator diagnosing an old or invalid
+		// External CR is sent to spec.endpoint, not the controller-
+		// owned status field.
+		missingField := "status.endpoint"
+		if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+			missingField = "spec.endpoint"
+		}
+		log.V(1).Info("fail-open: CacheBackend endpoint not resolvable",
+			"missingField", missingField, "type", string(cache.Spec.Type))
+		return admission.Allowed(fmt.Sprintf("CacheBackend %s not yet published (fail-open)", missingField))
 	}
 
 	// No env-presence short-circuit here: the adapter is the source of truth

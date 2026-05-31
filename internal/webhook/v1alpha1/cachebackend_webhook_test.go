@@ -316,7 +316,9 @@ func TestValidator_CrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
 	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	cb.Spec.Endpoint = "shared-cache.team-b.svc.cluster.local"
+	// Carry a port — the new shape rule requires host:port; the
+	// cross-namespace assertion below is unaffected by the port suffix.
+	cb.Spec.Endpoint = "shared-cache.team-b.svc.cluster.local:9000"
 	cb.Spec.AllowCrossNamespace = true
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
@@ -402,7 +404,7 @@ func TestValidator_ExternalEndpoint_LMSchemeOnlyRejected(t *testing.T) {
 	cb.Spec.Endpoint = "lm://"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must include a non-empty host")
+		"must be a non-empty host AND port")
 }
 
 func TestValidator_ExternalEndpoint_PortOnlyRejected(t *testing.T) {
@@ -413,7 +415,7 @@ func TestValidator_ExternalEndpoint_PortOnlyRejected(t *testing.T) {
 	cb.Spec.Endpoint = ":8200"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must include a non-empty host")
+		"must be a non-empty host AND port")
 }
 
 func TestValidator_ExternalEndpoint_LMSchemePortOnlyRejected(t *testing.T) {
@@ -424,7 +426,60 @@ func TestValidator_ExternalEndpoint_LMSchemePortOnlyRejected(t *testing.T) {
 	cb.Spec.Endpoint = "lm://:8200"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		"must include a non-empty host")
+		"must be a non-empty host AND port")
+}
+
+func TestValidator_ExternalEndpoint_PortlessHostRejected(t *testing.T) {
+	// Bare host with no port is rejected: the LMCache connector dials a
+	// specific TCP target, so spec.endpoint must carry both halves.
+	// Without this check the CR admits and the engine boots with
+	// LMCACHE_REMOTE_URL=lm://cache.example.com — the connector then
+	// either picks an undocumented default or crashes; either way the
+	// failure surfaces at the engine, not at admission where it belongs.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
+func TestValidator_ExternalEndpoint_EmptyPortRejected(t *testing.T) {
+	// Trailing colon with no port (`host:`) is the failure mode of an
+	// operator who started typing the port and saved. Same broken
+	// LMCACHE_REMOTE_URL=lm://cache.example.com: at injection.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
+func TestValidator_ExternalEndpoint_PortlessLMSchemeRejected(t *testing.T) {
+	// Same rule applies when the scheme is explicit.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "lm://cache.example.com"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
+}
+
+func TestValidator_ExternalEndpoint_PortlessIPv6Rejected(t *testing.T) {
+	// Bracket-only IPv6 (`[::1]`) has no port either — reject for the
+	// same reason. Validates that the bracket-aware path enforces the
+	// port-required rule.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "[2001:db8::1]"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must be a non-empty host AND port")
 }
 
 func TestValidator_ExternalEndpoint_IPv6Admitted(t *testing.T) {

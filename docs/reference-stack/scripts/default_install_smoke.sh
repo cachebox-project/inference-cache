@@ -385,7 +385,15 @@ until [ -n "$injected" ]; do
   fi
   sleep 1
 done
-expected_url="lm://$EXT_SMOKE_ENDPOINT"
+# Form the expected URL the same way the adapter does: preserve an
+# operator-supplied `lm://` prefix (case-insensitive — admission lowers
+# the scheme), otherwise prepend it. Without this an EXT_SMOKE_ENDPOINT
+# of `lm://host:port` (legal per the contract) would compare against
+# `lm://lm://host:port` and the smoke would fail on a valid input.
+case "$(printf '%s' "$EXT_SMOKE_ENDPOINT" | tr '[:upper:]' '[:lower:]')" in
+  lm://*) expected_url="lm://${EXT_SMOKE_ENDPOINT#??://}" ;;
+  *)      expected_url="lm://$EXT_SMOKE_ENDPOINT" ;;
+esac
 if [ "$injected" != "$expected_url" ]; then
   fail "LMCACHE_REMOTE_URL=$injected, want $expected_url (pod webhook should wire to spec.endpoint via the LMCache wire format)"
 fi
@@ -432,7 +440,7 @@ spec:
   integration: { engine: vllm }
 EOF
 )"
-if ! grep -q "must include a non-empty host" <<<"$reject_output"; then
+if ! grep -q "must be a non-empty host AND port" <<<"$reject_output"; then
   fail "admission did not reject External+lm:// (no host) as expected; got: $reject_output"
 fi
 
