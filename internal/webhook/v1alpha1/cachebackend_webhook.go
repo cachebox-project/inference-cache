@@ -21,14 +21,12 @@ import (
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
-// Phase-1 defaults applied by the mutating webhook. Centralised here so the
-// tests pin the same constants the handler uses. `spec.integration.failOpen`
-// is defaulted to true at the CRD layer via a +kubebuilder:default marker
-// (apiserver defaulting runs before mutating admission), so this webhook does
-// not need to stamp it.
-const (
-	defaultReplicas = int32(1)
-)
+// defaultReplicas is the sole Phase-1 default the mutating webhook stamps.
+// Centralised here so the tests pin the same constant the handler uses.
+// `spec.integration.failOpen` is defaulted to true at the CRD layer via a
+// +kubebuilder:default marker (apiserver defaulting runs before mutating
+// admission), so this webhook does not need to stamp it.
+const defaultReplicas = int32(1)
 
 // memoryOnlyBackends classifies the CacheBackendType values that are
 // architecturally in-memory in Phase 1 and therefore cannot accept a PVC.
