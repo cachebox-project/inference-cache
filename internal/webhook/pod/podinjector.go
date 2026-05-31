@@ -38,7 +38,32 @@ const AnnotationSkip = "inferencecache.io/skip-inject"
 // short-circuit relies on the env vars the adapter writes, not this
 // annotation, so a stripped-by-mistake annotation still does not cause a
 // duplicate injection.
+//
+// The annotation also serves as the trigger for the downstream
+// engine-pod-events controller: a watcher on Pod CREATE reads this
+// annotation, looks up the named CacheBackend, and emits a Normal
+// `InjectedByCacheBackend` Event on the now-persisted pod (which has a
+// real UID). Recording the Event from the webhook itself isn't viable:
+// the apiserver assigns metadata.uid AFTER mutating admission, so any
+// event recorded here would land with involvedObject.uid="" and be
+// invisible to `kubectl describe pod`.
 const AnnotationInjectedBy = "inferencecache.io/injected-by"
+
+// AnnotationInjectedByUID is stamped alongside [AnnotationInjectedBy] on every
+// successful injection and carries the matched CacheBackend's metadata.uid as
+// of admission time. It is the webhook-only proof-of-injection: an operator
+// or attacker can copy AnnotationInjectedBy into a fresh pod template, but
+// they cannot forge a value that matches the live CacheBackend's UID without
+// API access to read it first (UIDs are server-assigned and not part of any
+// user-authored spec). The engine-pod-events controller validates the
+// injected-by/UID pair against the live CR's UID before emitting
+// `InjectedByCacheBackend`, which closes the hole the
+// `MutatingWebhookConfiguration.failurePolicy=Ignore` posture would otherwise
+// leave open: if the webhook is unreachable at admission time, a pod can
+// persist with a user-supplied AnnotationInjectedBy, but the UID annotation
+// (which only the webhook writes) is absent or stale, so the controller skips
+// the event.
+const AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
 
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=ignore,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod.inferencecache.io,admissionReviewVersions=v1
 
@@ -107,13 +132,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	if skipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
-		return admission.Allowed("skipped via " + AnnotationSkip)
+		return failOpen(req, &pod, "skipped via "+AnnotationSkip)
 	}
 
 	cache, err := h.selectCacheBackend(ctx, &pod)
 	if err != nil {
 		log.V(1).Info("fail-open: backend lookup failed", "error", err.Error())
-		return admission.Allowed(fmt.Sprintf("backend lookup failed (fail-open): %v", err))
+		return failOpen(req, &pod, fmt.Sprintf("backend lookup failed (fail-open): %v", err))
 	}
 	if cache == nil {
 		// No CacheBackend in the namespace matches this pod. The webhook
@@ -121,7 +146,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// so this is the steady-state path; log only at V(2) so it
 		// doesn't drown reconciler logs.
 		log.V(2).Info("no matching CacheBackend; pass-through")
-		return admission.Allowed("no matching CacheBackend")
+		return failOpen(req, &pod, "no matching CacheBackend")
 	}
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
 
@@ -141,7 +166,11 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		//     un-wired rather than receiving an LMCACHE_REMOTE_URL the
 		//     connector refuses at startup.
 		// Surface the field name (and the shape error when applicable)
-		// so the operator looks at the right place.
+		// so the operator looks at the right place. Route through
+		// failOpen so any pre-supplied injected-by annotations on the
+		// inbound pod get stripped — otherwise the events controller
+		// would falsely emit InjectedByCacheBackend even though the
+		// webhook bailed out without injecting.
 		missingField := "status.endpoint"
 		extra := ""
 		if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
@@ -152,7 +181,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		}
 		log.V(1).Info("fail-open: CacheBackend endpoint not resolvable",
 			"missingField", missingField, "type", string(cache.Spec.Type), "shapeError", extra)
-		return admission.Allowed(fmt.Sprintf("CacheBackend %s not usable%s (fail-open)", missingField, extra))
+		return failOpen(req, &pod, fmt.Sprintf("CacheBackend %s not usable%s (fail-open)", missingField, extra))
 	}
 
 	// No env-presence short-circuit here: the adapter is the source of truth
@@ -180,7 +209,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	if err != nil {
 		log.V(1).Info("fail-open: no runtime adapter",
 			"runtime", string(runtimeID), "backend", string(cache.Spec.Type), "error", err.Error())
-		return admission.Allowed(fmt.Sprintf("no adapter for runtime=%q backend=%q (fail-open): %v",
+		return failOpen(req, &pod, fmt.Sprintf("no adapter for runtime=%q backend=%q (fail-open): %v",
 			runtimeID, cache.Spec.Type, err))
 	}
 
@@ -208,7 +237,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
 		log.V(1).Info("fail-open: adapter rejected pod",
 			"runtime", string(runtimeID), "error", err.Error())
-		return admission.Allowed(fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+		return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
 
 	// Apply spec.integration.engineOverrides scoped to the adapter-owned
@@ -248,6 +277,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		mutated.Annotations = map[string]string{}
 	}
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
+	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -342,6 +372,48 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 		return h.Log
 	}
 	return logf.FromContext(ctx)
+}
+
+// failOpen builds the admission response for any fail-open return path
+// AFTER the pod has been decoded. The webhook's contract is that
+// AnnotationInjectedBy on the persisted pod means "the webhook successfully
+// stamped this pod" — that's what the engine-pod-events controller keys
+// `InjectedByCacheBackend` off of. The annotation is user-controllable
+// (anyone with pod-create RBAC can set it) and the webhook does not
+// overwrite it on fail-open paths, so a copy/paste from an injected pod's
+// metadata, or an attacker forging the annotation, would otherwise trip
+// the controller into emitting "Injected engine config" for a pod the
+// webhook never touched.
+//
+// Fix: on every fail-open return, strip the annotation if it was
+// preset. Steady-state cost stays at zero patches per pod for the common
+// no-match case (the vast majority of pods cluster-wide), because the
+// helper short-circuits to admission.Allowed when the annotation is
+// absent.
+func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
+	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
+	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	if !hasInjectedBy && !hasInjectedByUID {
+		return admission.Allowed(reason)
+	}
+	cleared := pod.DeepCopy()
+	delete(cleared.Annotations, AnnotationInjectedBy)
+	delete(cleared.Annotations, AnnotationInjectedByUID)
+	if len(cleared.Annotations) == 0 {
+		// Avoid emitting an empty-map annotations field; absent is the
+		// canonical "no annotations" shape.
+		cleared.Annotations = nil
+	}
+	raw, err := json.Marshal(cleared)
+	if err != nil {
+		// Marshal failure on a pod we just decoded is extremely unlikely;
+		// fall back to plain Allowed so the pod still admits. The
+		// controller then sees a forged annotation, but that's strictly
+		// no worse than the pre-fix behavior — so this isn't a fail-
+		// closed condition.
+		return admission.Allowed(reason)
+	}
+	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
 }
 
 // effectiveEndpoint returns the address the engine pod should be wired

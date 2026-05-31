@@ -89,7 +89,35 @@ type CacheBackendSpec struct {
 	// +optional
 	Integration *CacheBackendIntegrationSpec `json:"integration,omitempty"`
 
-	// EngineSelector selects engine pods or runtimes this cache backend applies to.
+	// EngineSelector selects which engine pods this CacheBackend claims via
+	// equality-based label matching over the pod's labels: every key/value
+	// in MatchLabels must be present on the pod. The full
+	// metav1.LabelSelector surface (matchExpressions, operator-based
+	// selection) is NOT exposed today — only MatchLabels.
+	// Pods that match get LMCache engine wiring (env vars + CLI args)
+	// injected by the mutating Pod admission webhook at pod CREATE time,
+	// PROVIDED the matched CacheBackend's status.endpoint has been
+	// published by the time admission runs. The webhook fail-opens
+	// (admits the pod unmodified) when status.endpoint is empty — so a
+	// pod that loses the race against the reconciler is admitted
+	// uncached for its whole lifetime. Admission is CREATE-only;
+	// recovery is to recreate the pod (e.g. `kubectl rollout restart`),
+	// not to edit the live pod's labels.
+	//
+	// The kvevent-subscriber observation sidecar is appended in addition
+	// to the engine wiring only when the controller is started with
+	// --kvevent-subscriber-image set (empty by default) AND the matched
+	// CacheBackend has a model id configured. Without those, the engine
+	// is wired but no sidecar is added.
+	//
+	// The match is evaluated once at pod CREATE — pods whose labels change
+	// after creation are not re-evaluated; the wiring is sticky to the
+	// life of the pod. To opt a specific pod out of injection regardless
+	// of label match, set the annotation
+	// `inferencecache.io/skip-inject: "true"` on the pod template.
+	//
+	// See docs/concepts/cachebackend-engine-binding.md for the full
+	// lifecycle, an annotated example, and common failure modes.
 	// +optional
 	EngineSelector *CacheBackendEngineSelector `json:"engineSelector,omitempty"`
 
@@ -235,8 +263,26 @@ type CacheBackendIntegrationSpec struct {
 	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
 }
 
-// EngineInjectionOverrides describes how the operator wants to amend the
-// args / env the pod-mutating webhook injects into the engine container.
+// EngineInjectionOverrides is the in-between knob between "take the
+// adapter's canonical injection" and "skip injection entirely" (the latter
+// owned by the inferencecache.io/skip-inject pod annotation). The four
+// primitives compose: Env upserts by Name and SuppressEnv removes by Name;
+// Args replaces by leading flag token or appends, and SuppressArgs removes
+// by leading flag token. Suppress runs before merge, so suppress-then-re-add
+// is a supported pattern for overriding a non-reserved adapter-owned flag
+// value. For adapter-backed Spec.Type values (LMCache and the future
+// adapter-backed types), entries that overlap the runtime adapter's
+// ReservedArgs() or ReservedEnv() are hard-rejected at admission with a
+// field-scoped error naming the offending token and the adapter, so a
+// misconfiguration fails at kubectl apply rather than as a crashed engine
+// pod later. Spec.Type=External does not consult an adapter (no canonical
+// injection happens), so the override surface there is structurally
+// meaningless and the reserved-overlap check is skipped.
+//
+// See docs/concepts/cachebackend-engine-overrides.md for the baseline
+// canonical injection (annotated RESERVED / TUNABLE), five worked
+// before/after examples, and the "when NOT to use this" guidance.
+//
 // The override surface is SCOPED to entries the runtime adapter itself
 // contributes (added or modified) during InjectEngineConfig — user
 // pod-template args / env that the adapter does not touch are protected,
@@ -383,6 +429,29 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
+	// MatchedEnginePods is the number of pods in this CacheBackend's namespace
+	// whose labels match spec.engineSelector at the last reconcile. The field
+	// is a pointer so nil ("not yet computed") is distinguishable from 0
+	// ("computed and zero current matches"). 0 covers any current
+	// zero-match state — the engine Deployment has not been created
+	// yet, it has been scaled to zero, or the selector and the engine
+	// Deployment's pod labels have drifted apart. (Pods carrying a
+	// `deletionTimestamp` are NOT filtered out today; the count is a
+	// raw List of matching pods.) When engine pods are expected and 0
+	// persists, label drift
+	// is the most likely diagnosis: the mutating Pod webhook silently
+	// no-ops on pods whose labels miss the selector, so the engine
+	// runs uncached.
+	//
+	// This is a snapshot at reconcile time, not a real-time counter: it
+	// is not updated on every pod birth/death. For per-pod real-time
+	// visibility, watch the K8s `InjectedByCacheBackend` Event the
+	// controller emits on the engine pod after the mutating Pod webhook
+	// stamps it (visible in `kubectl describe pod`).
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MatchedEnginePods *int32 `json:"matchedEnginePods,omitempty"`
+
 	// FailOpen mirrors the effective spec.integration.failOpen value the
 	// controller most recently observed. Surfaced so operators can confirm
 	// whether the cache is currently a soft optimization (true) or a
@@ -448,6 +517,7 @@ type CacheBackendIndexParticipation struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=cb
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
+// +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedEnginePods`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.indexParticipation.prefixCount`
 // +kubebuilder:printcolumn:name="LastEvent",type=date,JSONPath=`.status.indexParticipation.lastEventAt`
