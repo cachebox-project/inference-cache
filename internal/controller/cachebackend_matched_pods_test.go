@@ -12,7 +12,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -126,6 +128,65 @@ func TestReconcileMatchedEnginePodsClearsWhenSelectorRemoved(t *testing.T) {
 
 	if got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods; got != nil {
 		t.Fatalf("after clearing selector, status.matchedEnginePods = %v (*=%d), want nil", got, *got)
+	}
+}
+
+// TestReconcileSchedulesRequeueWhenSelectorRemovedButStatusStillSet pins
+// the retry path for the operator-removed-the-selector + clear-patch-failed
+// scenario. Without a scheduled requeue the stale printer-column value would
+// persist forever (no Owned watch covers Pods, and the selector is gone, so
+// no event ever drives the count to a new value). The fix ties the requeue
+// schedule to `status.matchedEnginePods != nil`, not just the spec selector.
+//
+// Simulates the clear-patch-failure by intercepting the matchedEnginePods
+// status patch (discriminated by the merge-patch payload) so the in-memory
+// rollback restores the seeded value — exactly the state Reconcile would
+// see at return-time if the apiserver rejected the clear patch.
+func TestReconcileSchedulesRequeueWhenSelectorRemovedButStatusStillSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackend("cache", "ns1") // no selector configured
+	cb.Status.MatchedEnginePods = ptrInt32(3)
+
+	patchErr := errors.New("synthetic apiserver patch failure")
+	funcs := interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" {
+				if _, ok := obj.(*cachev1alpha1.CacheBackend); ok {
+					data, _ := patch.Data(obj)
+					if strings.Contains(string(data), "matchedEnginePods") {
+						return patchErr
+					}
+				}
+			}
+			return c.Status().Patch(ctx, obj, patch, opts...)
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard()}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected RequeueAfter > 0 to retry the stale-status clear; got %v", res.RequeueAfter)
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods; got == nil {
+		t.Fatalf("expected status.matchedEnginePods to remain non-nil after a failed clear (rollback contract); got nil")
 	}
 }
 

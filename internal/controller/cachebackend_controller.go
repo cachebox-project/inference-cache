@@ -46,15 +46,17 @@ const (
 	defaultHPATargetCPUUtilizationPercent = int32(80)
 )
 
-// matchedEnginePodsRequeueInterval is the steady-state cadence at which a
-// CacheBackend with a configured spec.engineSelector self-requeues, so the
-// `status.matchedEnginePods` snapshot does not stay stale forever between
-// otherwise-unrelated reconcile triggers. The reconciler does not Watch
-// Pods by design (see refreshMatchedEnginePods godoc); without a self-
-// requeue, the count would only refresh when the CR, the owned Deployment,
-// Service, or HPA changed. 30s strikes a balance between operator
-// responsiveness and reconcile pressure on a large fleet.
-const matchedEnginePodsRequeueInterval = 30 * time.Second
+// DefaultMatchedEnginePodsRequeueInterval is the steady-state cadence at
+// which a CacheBackend with a configured spec.engineSelector self-requeues,
+// so the `status.matchedEnginePods` snapshot does not stay stale forever
+// between otherwise-unrelated reconcile triggers. The reconciler does not
+// Watch Pods by design (see refreshMatchedEnginePods godoc); without a
+// self-requeue, the count would only refresh when the CR, the owned
+// Deployment, Service, or HPA changed. 30s strikes a balance between
+// operator responsiveness and reconcile pressure on a large fleet. Tests
+// override via the `MatchedEnginePodsRequeueInterval` reconciler field to
+// avoid baking the 30s delay into the suite.
+const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 
 // Event reasons emitted on a CacheBackend.
 //
@@ -92,6 +94,23 @@ type CacheBackendReconciler struct {
 	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
 	// that need a custom adapter set.
 	Registry *adapterruntime.Registry
+	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
+	// that keeps status.matchedEnginePods fresh between unrelated reconcile
+	// triggers. Zero means "use [DefaultMatchedEnginePodsRequeueInterval]".
+	// Production wiring leaves this zero; envtest suites override to a
+	// shorter value so they don't bake the 30s production delay into
+	// per-test runtime.
+	MatchedEnginePodsRequeueInterval time.Duration
+}
+
+// matchedEnginePodsRequeueInterval returns the effective cadence for this
+// reconciler, honoring the per-reconciler override and falling back to
+// [DefaultMatchedEnginePodsRequeueInterval].
+func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duration {
+	if r.MatchedEnginePodsRequeueInterval > 0 {
+		return r.MatchedEnginePodsRequeueInterval
+	}
+	return DefaultMatchedEnginePodsRequeueInterval
 }
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
@@ -140,16 +159,28 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// transient List/Patch errors so it never escalates a transient
 	// apiserver hiccup into a Reconcile error.
 	r.refreshMatchedEnginePods(ctx, &backend)
-	// When the CR has an EngineSelector, self-requeue so the count tracks
-	// pod birth/death between unrelated reconcile triggers. We deliberately
-	// don't Watch Pods (see refreshMatchedEnginePods godoc); the periodic
-	// self-requeue gives a bounded staleness without the watch's overhead.
+	// Self-requeue when there's matchedEnginePods work to keep doing on
+	// the next tick:
+	//
+	//   - A non-empty engineSelector is configured. The cadence tracks
+	//     pod birth/death between unrelated reconcile triggers. We
+	//     deliberately don't Watch Pods (see refreshMatchedEnginePods
+	//     godoc); the periodic self-requeue gives a bounded staleness
+	//     without the watch's overhead.
+	//   - The selector is gone but status.matchedEnginePods is still
+	//     populated. That's the operator-just-removed-the-selector +
+	//     clear-patch-failed case: without a requeue the stale printer-
+	//     column value would persist forever (no Owned watch, no
+	//     selector to drive the count to a new value). The retry tries
+	//     the clear again on the next tick.
+	//
 	// Don't shorten an already-shorter RequeueAfter dispatch may have set
 	// (none today, but preserve the contract): only fill in the cadence
 	// when no other requeue is pending.
-	if backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0 {
+	if needsRequeue := (backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0) ||
+		backend.Status.MatchedEnginePods != nil; needsRequeue {
 		if result.RequeueAfter == 0 {
-			result.RequeueAfter = matchedEnginePodsRequeueInterval
+			result.RequeueAfter = r.matchedEnginePodsRequeueInterval()
 		}
 	}
 	// Emit transitions whenever dispatch published a status change, even on

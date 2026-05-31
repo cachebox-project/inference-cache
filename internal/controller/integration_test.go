@@ -803,10 +803,16 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	// Inject a short cadence so the test doesn't bake the 30s production
+	// delay into per-test runtime. 250ms is shorter than the controller's
+	// natural reconcile latency on envtest but long enough that the
+	// manager isn't spinning on reconciles for the duration of the test.
+	const testRequeueInterval = 250 * time.Millisecond
 	if err := (&CacheBackendReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    logr.Discard(),
+		Client:                           mgr.GetClient(),
+		Scheme:                           mgr.GetScheme(),
+		Log:                              logr.Discard(),
+		MatchedEnginePodsRequeueInterval: testRequeueInterval,
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
@@ -840,12 +846,10 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 	}
 	waitForCount := func(want int32, what string) {
 		t.Helper()
-		// The cadence is 30s in production; that's too long for a unit
-		// test. The wait is generous because the apiserver's controller
-		// fires the initial reconcile-on-create immediately and we
-		// then need the NEXT requeue to land — which may take up to
-		// matchedEnginePodsRequeueInterval.
-		deadline := time.Now().Add(matchedEnginePodsRequeueInterval + 15*time.Second)
+		// With the injected fast cadence (250ms), the next requeue
+		// after a pod change lands well under a second. Add 5s of
+		// envtest-jitter slack on top.
+		deadline := time.Now().Add(testRequeueInterval + 5*time.Second)
 		for time.Now().Before(deadline) {
 			got := read()
 			if got != nil && *got == want {
