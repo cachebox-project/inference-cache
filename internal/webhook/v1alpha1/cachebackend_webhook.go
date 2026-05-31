@@ -23,9 +23,13 @@ import (
 
 // defaultReplicas is the sole Phase-1 default the mutating webhook stamps.
 // Centralised here so the tests pin the same constant the handler uses.
-// `spec.integration.failOpen` is defaulted to true at the CRD layer via a
-// +kubebuilder:default marker (apiserver defaulting runs before mutating
-// admission), so this webhook does not need to stamp it.
+//
+// `spec.integration.failOpen` is NOT stamped here. Its `+kubebuilder:default=true`
+// marker only persists a stored value when the parent `spec.integration` object
+// is present; when integration is omitted, the field stays absent. The effective
+// "fail open unless explicitly disabled" semantics come from the
+// IntegrationFailOpen reader helper (nil spec / nil field => true), i.e. semantic
+// defaulting at read time, not persisted CRD defaulting.
 const defaultReplicas = int32(1)
 
 // memoryOnlyBackends classifies the CacheBackendType values that are

@@ -42,8 +42,10 @@ func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
 		t.Errorf("replicas = %v, want %d", cb.Spec.Replicas, defaultReplicas)
 	}
 	// The defaulter no longer materialises an integration block: lookup
-	// tuning lives on CachePolicy, and failOpen is defaulted at the CRD
-	// layer. An unset integration spec is left nil.
+	// tuning lives on CachePolicy, and failOpen's effective default is applied
+	// at read time by IntegrationFailOpen (the CRD +kubebuilder:default only
+	// persists when the parent integration object is present). An unset
+	// integration spec is therefore left nil.
 	if cb.Spec.Integration != nil {
 		t.Errorf("integration block = %+v, want nil", cb.Spec.Integration)
 	}
