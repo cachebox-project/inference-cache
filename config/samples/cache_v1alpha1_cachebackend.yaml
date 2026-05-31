@@ -1,3 +1,6 @@
+# Kubebuilder-generated minimum-viable sample: the smallest CacheBackend that
+# applies cleanly against the current schema + admission webhook. Hand-curated,
+# scenario-specific recipes live in the sibling cachebackend-*.yaml files.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -9,16 +12,9 @@ spec:
   type: LMCache
   deploymentKind: StatefulSet
   replicas: 1
-  storage:
-    pvc:
-      size: 10Gi
   integration:
-    engine: SGLang
+    engine: vllm
     role: ReadWrite
-    lookupTimeoutMs: 20
-    minimumPrefixTokens: 32
   engineSelector:
     matchLabels:
       inferencecache.io/cache-enabled: "true"
-  backendConfig:
-    evictionPolicy: LRU

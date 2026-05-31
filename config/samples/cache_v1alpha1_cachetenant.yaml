@@ -1,3 +1,5 @@
+# Kubebuilder-generated minimum-viable sample: the smallest CacheTenant that
+# applies cleanly against the current schema. Only enforceable quota fields are set.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheTenant
 metadata:
@@ -8,5 +10,4 @@ spec:
   tenantID: tenant-a
   isolationMode: Fairness
   quota:
-    maxMemoryBytes: 1073741824
     maxIndexEntries: 100000

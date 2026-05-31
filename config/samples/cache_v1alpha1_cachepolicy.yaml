@@ -1,3 +1,5 @@
+# Kubebuilder-generated minimum-viable sample: the smallest CachePolicy that
+# applies cleanly against the current schema. Only wired fields are populated.
 apiVersion: inferencecache.io/v1alpha1
 kind: CachePolicy
 metadata:
@@ -5,9 +7,6 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachepolicy-sample
 spec:
-  eviction: LRU
   evictionTTL: 30m
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
-  failOpen: true
-  tenantScoped: true
