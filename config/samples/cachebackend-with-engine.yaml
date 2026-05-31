@@ -66,7 +66,7 @@
 # Watch the binding land:
 #
 #   kubectl get cachebackend qwen-demo-cache -w
-#   kubectl describe pod -l app=qwen-demo | grep -A1 Events
+#   kubectl describe pod -l app=qwen-demo | grep -E 'Events|InjectedByCacheBackend'
 #
 # CPU-runnable: the engine image is vLLM's dedicated CPU build, so this
 # pair works on kind without a GPU. Bump the host VM's memory to ~10 GiB

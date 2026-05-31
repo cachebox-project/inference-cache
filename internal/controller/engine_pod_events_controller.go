@@ -101,14 +101,27 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
+	// Refuse to emit on a malformed annotation value. The webhook always
+	// stamps `<namespace>/<name>`; a value that doesn't parse can only
+	// have come from manual tampering or a stale annotation under an
+	// older annotation contract — emitting "Injected engine config" for
+	// that would falsely claim the webhook did work it never did.
+	// Lookup failures (NotFound, transient Get error) are still treated
+	// as best-effort emit: the annotation parsed cleanly, so the webhook
+	// did inject this pod at admission time; the CR may have been
+	// deleted in the interim.
+	if !validCacheBackendRef(cbRef) {
+		logger.V(1).Info("skipping InjectedByCacheBackend event: malformed injected-by annotation",
+			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
+		return ctrl.Result{}, nil
+	}
 	// Try to load the named CacheBackend so the event carries it as the
 	// Related object. Failure is non-fatal: emit the event anyway with
 	// related=nil. The annotation value alone carries the binding
 	// identity in the human-readable message. The lookup error is logged
-	// so RBAC failures, malformed refs, or transient API hiccups are not
-	// silently swallowed — the event still fires, but an operator
-	// inspecting controller logs sees why the Related reference is
-	// missing.
+	// so RBAC failures or transient API hiccups are not silently
+	// swallowed — the event still fires, but an operator inspecting
+	// controller logs sees why the Related reference is missing.
 	cb, lookupErr := r.lookupCacheBackend(ctx, cbRef)
 	if lookupErr != nil {
 		logger.V(1).Info("CacheBackend related-ref lookup failed; emitting event without Related",
@@ -120,6 +133,16 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	logger.V(1).Info("emitted InjectedByCacheBackend event",
 		"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
 	return ctrl.Result{}, nil
+}
+
+// validCacheBackendRef reports whether ref has the `<namespace>/<name>` shape
+// the webhook always writes for the injected-by annotation. The webhook never
+// produces any other shape, so a ref that does not parse cleanly is by
+// definition stale or manually-tampered — callers use this to short-circuit
+// the InjectedByCacheBackend event emission for those pods.
+func validCacheBackendRef(ref string) bool {
+	ns, name, ok := strings.Cut(ref, "/")
+	return ok && ns != "" && name != ""
 }
 
 // lookupCacheBackend parses the "<namespace>/<name>" annotation value and

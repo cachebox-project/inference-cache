@@ -157,27 +157,37 @@ func TestEnginePodEvents_NoEventOnDeletedPod(t *testing.T) {
 	}
 }
 
-func TestEnginePodEvents_MalformedAnnotationStillEmits(t *testing.T) {
-	// A pod with a malformed annotation value (missing "/", empty,
-	// etc.) is still a pod the webhook tagged. The controller emits
-	// the event without the Related reference and surfaces the raw
-	// annotation value in the message, so the operator can spot the
-	// drift between the webhook stamp and any later annotation edits.
+func TestEnginePodEvents_MalformedAnnotationDoesNotEmit(t *testing.T) {
+	// The webhook always stamps `<namespace>/<name>`. A pod whose
+	// injected-by annotation does not parse cleanly therefore can
+	// ONLY be stale or manually-tampered: the webhook didn't write
+	// it in this shape. Emitting a Normal "Injected engine config"
+	// for that would falsely claim the webhook had done work it
+	// never did. The controller skips emission and logs the reason.
 	const ns = "engines"
-	pod := injectedPod("engine-weird", ns, "no-slash-here", nil)
-	r, rec := newEnginePodEventsReconciler(t, pod)
-
-	reconcilePod(t, r, ns, pod.Name)
-
-	got := drainRecorder(rec)
-	found := false
-	for _, e := range got {
-		if strings.Contains(e, eventReasonEngineInjected) && strings.Contains(e, "no-slash-here") {
-			found = true
-		}
+	cases := []struct {
+		name    string
+		annoVal string
+	}{
+		{name: "no slash separator", annoVal: "no-slash-here"},
+		{name: "empty namespace half", annoVal: "/primary"},
+		{name: "empty name half", annoVal: "engines/"},
+		{name: "empty string", annoVal: ""},
 	}
-	if !found {
-		t.Fatalf("expected event preserving the raw annotation value; got %v", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := injectedPod("engine-weird", ns, tc.annoVal, nil)
+			r, rec := newEnginePodEventsReconciler(t, pod)
+
+			reconcilePod(t, r, ns, pod.Name)
+
+			got := drainRecorder(rec)
+			for _, e := range got {
+				if strings.Contains(e, eventReasonEngineInjected) {
+					t.Fatalf("expected no InjectedByCacheBackend event for malformed ref %q; got %q", tc.annoVal, e)
+				}
+			}
+		})
 	}
 }
 
