@@ -14,6 +14,14 @@ type CacheIndexSpec struct{}
 type ReplicaCacheStatus struct {
 	// ID is the replica identifier (the engine/pod that reported the state).
 	ID string `json:"id"`
+	// Tenant is the tenant the replica reports under. The subscriber sidecar
+	// derives it from the engine pod's namespace, so two pods sharing a
+	// metadata.name across namespaces show as the same `id` here; the
+	// `tenant` field disambiguates the source. Optional and informational
+	// only — not part of the map-list key (the v1alpha1 surface keeps
+	// `id` as the sole key for backward compatibility).
+	// +optional
+	Tenant string `json:"tenant,omitempty"`
 	// CacheMemoryBytes is the cache memory the replica reports using.
 	// +optional
 	CacheMemoryBytes int64 `json:"cacheMemoryBytes,omitempty"`
@@ -73,7 +81,15 @@ type PrefixStatus struct {
 // reflects from the server's in-memory index. Metadata only — never KV tensors
 // or prompt text.
 type CacheIndexStatus struct {
-	// Replicas is the per-replica cache health.
+	// Replicas is the per-replica cache health. Map-list keyed on `id`
+	// (the v1alpha1 surface; unchanged for backward compatibility). The
+	// controller only publishes rows for replicas that reported stats —
+	// prefix-only replicas appear in CacheBackend.status.indexParticipation
+	// but not here, so the `id` key remains unique in practice. If two
+	// replicas with the same `id` were ever reported by different
+	// namespaces in a single tick, the controller picks the lexicographically
+	// later tenant deterministically; the `tenant` field on each row
+	// disambiguates the source.
 	// +optional
 	// +listType=map
 	// +listMapKey=id

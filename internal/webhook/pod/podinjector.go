@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -153,10 +154,46 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	mutated := pod.DeepCopy()
+
+	// Snapshot the engine container's pre-injection args/env so the
+	// override merge below can scope itself to the adapter-owned set. The
+	// override surface mutates only what InjectEngineConfig contributes;
+	// user pod-template args/env that the adapter does not touch stay
+	// protected. We snapshot before the adapter call (rather than re-deriving
+	// the canonical set afterwards) so this works for any adapter without
+	// changing the [adapterruntime.KVCacheRuntimeAdapter] contract.
+	overrides := engineOverridesFor(cache)
+	overrideIdx := -1
+	var preArgs []string
+	var preEnv []corev1.EnvVar
+	if overrides != nil {
+		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
+			overrideIdx = idx
+			preArgs = append([]string(nil), mutated.Spec.Containers[idx].Args...)
+			preEnv = append([]corev1.EnvVar(nil), mutated.Spec.Containers[idx].Env...)
+		}
+	}
+
 	if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
 		log.V(1).Info("fail-open: adapter rejected pod",
 			"runtime", string(runtimeID), "error", err.Error())
 		return admission.Allowed(fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+	}
+
+	// Apply spec.integration.engineOverrides scoped to the adapter-owned
+	// args/env derived from the pre/post diff. Admission has already
+	// hard-rejected overrides that overlap the adapter's reserved
+	// declarations, so the entries surviving to this point are safe to
+	// merge. Adapters with no canonical engine container (the reference
+	// adapter) return EngineContainerName() == "" and overrideIdx stays
+	// -1, so the merge is skipped — the override surface is for production
+	// adapters that target a specific engine container.
+	if overrides != nil && overrideIdx >= 0 {
+		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
+			preArgs, mutated.Spec.Containers[overrideIdx].Args,
+			preEnv, mutated.Spec.Containers[overrideIdx].Env,
+			overrides,
+		)
 	}
 
 	// Auto-attach the observation sidecar. The adapter owns the
@@ -201,6 +238,16 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 // selectors overlap is misconfigured, and the handler logs the chosen one
 // so the ambiguity is observable.
 //
+// Iteration order is metadata.name ascending so the "first match" is
+// deterministic across apiserver List cache states and is shared with the
+// CacheIndex poller's annotation-fallback path (see
+// internal/controller/cacheindex_controller.go's attributePod). The two
+// surfaces MUST agree on which backend owns a given engine pod — the
+// webhook stamps `inferencecache.io/injected-by` and the poller relies
+// on it as the authoritative signal, but on overlapping-selector
+// fallback both sides need to pick the same backend or status will
+// disagree with what the engine was wired to.
+//
 // A CacheBackend with no EngineSelector or with an empty MatchLabels map is
 // skipped: a "match everything" selector at admission time would silently
 // claim every pod (including the controller's own and the lmcache-server's),
@@ -211,8 +258,15 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 	if err := h.Reader.List(ctx, &list, client.InNamespace(pod.Namespace)); err != nil {
 		return nil, fmt.Errorf("list CacheBackends in %s: %w", pod.Namespace, err)
 	}
-	podLabels := labels.Set(pod.Labels)
+	idxs := make([]int, 0, len(list.Items))
 	for i := range list.Items {
+		idxs = append(idxs, i)
+	}
+	sort.Slice(idxs, func(a, b int) bool {
+		return list.Items[idxs[a]].Name < list.Items[idxs[b]].Name
+	})
+	podLabels := labels.Set(pod.Labels)
+	for _, i := range idxs {
 		cb := &list.Items[i]
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
 			continue
