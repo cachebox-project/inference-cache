@@ -18,10 +18,38 @@
 # would collide on Create. The label `app: qwen-demo` is what does the
 # binding work, not the resource names.
 #
-# Apply both objects in one shot:
+# Apply order matters because the mutating Pod webhook fail-opens (admits
+# the pod unmodified) when the matched CacheBackend's `status.endpoint`
+# has not been published yet. Admission is CREATE-only, so a pod that
+# loses this race stays uncached for its whole lifetime.
+#
+# Race-free recipe (recommended):
+#
+#   # 1. Create only the CR (first YAML document; the `---` separator
+#   #    marks where the engine Deployment begins).
+#   sed -n '/^---$/q;p' config/samples/cachebackend-with-engine.yaml \
+#     | kubectl apply -f -
+#
+#   # 2. Wait for the controller to publish status.endpoint.
+#   kubectl wait --for=jsonpath='{.status.endpoint}' \
+#     cachebackend/qwen-demo-cache --timeout=60s
+#
+#   # 3. Now apply the engine Deployment.
+#   sed -n '/^---$/,$p' config/samples/cachebackend-with-engine.yaml \
+#     | tail -n +2 | kubectl apply -f -
+#
+# Quick demo (one-shot, may hit the race on a cold cluster):
+#
 #   kubectl apply -f config/samples/cachebackend-with-engine.yaml
 #
-# Then watch the binding land:
+# If you applied in one shot, `kubectl get cachebackend qwen-demo-cache`
+# shows the recovery signal: `MATCHED: 0` after a few seconds means the
+# engine pods raced past admission unwired. Re-run admission with:
+#
+#   kubectl rollout restart deploy/qwen-engine
+#
+# Watch the binding land:
+#
 #   kubectl get cachebackend qwen-demo-cache -w
 #   kubectl describe pod -l app=qwen-demo | grep -A1 Events
 #

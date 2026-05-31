@@ -268,3 +268,52 @@ func TestReconcileMatchedEnginePodsCoexistsWithOtherStatusWriters(t *testing.T) 
 		t.Fatalf("status.failOpen = %v, want true echo preserved across the matchedEnginePods patch", got.Status.FailOpen)
 	}
 }
+
+// TestReconcileMatchedEnginePodsUsesAPIReaderForPods pins the structural
+// invariant the locked design called out: the pod List backing
+// matchedEnginePods MUST go through the manager's APIReader (uncached live
+// client), not the manager's cached Client. Using Client would make
+// controller-runtime register a cluster-wide Pod informer just to maintain
+// this snapshot count — exactly what the "no Pod watch" rule rejects.
+//
+// The test plumbs Client and APIReader to two DIFFERENT fake clients (the
+// Client carries the CB but ZERO pods; the APIReader carries ZERO CBs but
+// the matching pods). A pass means matchedEnginePods reflects the
+// APIReader's pod count. Any future refactor that flips the pod List back
+// to r.Client would fail here.
+func TestReconcileMatchedEnginePodsUsesAPIReaderForPods(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	// Cached client: has the CB, but no pods. If refresh used this
+	// client, matchedEnginePods would be 0.
+	cached := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb).
+		Build()
+	// APIReader: has only the matching pods, no CB. If refresh uses
+	// THIS reader, matchedEnginePods is the pod count.
+	apireader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			engineLikePod("e1", "ns1", matchedSelector),
+			engineLikePod("e2", "ns1", matchedSelector),
+		).
+		Build()
+	r := &CacheBackendReconciler{
+		Client:    cached,
+		Scheme:    scheme,
+		Log:       logr.Discard(),
+		APIReader: apireader,
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods
+	if got == nil {
+		t.Fatalf("status.matchedEnginePods = nil; expected APIReader to be consulted (count from APIReader's 2 pods)")
+	}
+	if *got != 2 {
+		t.Fatalf("status.matchedEnginePods = %d, want 2 (APIReader's pods, not Client's)", *got)
+	}
+}

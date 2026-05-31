@@ -77,6 +77,17 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
+	// APIReader is an uncached live client used for the per-reconcile pod
+	// List that backs status.matchedEnginePods. The cached client would
+	// register a Pod informer with controller-runtime, which the locked
+	// design explicitly rejected (would watch all pods cluster-wide
+	// just to count per-CR; the per-reconcile namespaced live List is
+	// cheaper at the cluster sizes we target). Production wiring passes
+	// mgr.GetAPIReader(); tests that don't exercise the
+	// matchedEnginePods writer can leave it nil (a nil APIReader makes
+	// refreshMatchedEnginePods fall through to the embedded
+	// client.Client so existing fake-client tests still work).
+	APIReader client.Reader
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
 	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
 	// that need a custom adapter set.
@@ -964,7 +975,18 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 	} else {
 		matcher := labels.SelectorFromSet(sel.MatchLabels)
 		var pods corev1.PodList
-		if err := r.List(ctx, &pods,
+		// Pin the pod read to the uncached APIReader so the controller-
+		// runtime cache does NOT register a Pod informer on first use —
+		// otherwise the manager would watch every pod cluster-wide just to
+		// keep this snapshot count fresh, which the locked design
+		// explicitly rejected. Fall back to the cached client only when
+		// APIReader is unset (test wiring without a real APIReader); the
+		// reconciler still functions, it just uses the cache.
+		reader := client.Reader(r.APIReader)
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.List(ctx, &pods,
 			client.InNamespace(backend.Namespace),
 			client.MatchingLabelsSelector{Selector: matcher},
 		); err != nil {
@@ -1073,6 +1095,14 @@ func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
+	}
+	if r.APIReader == nil {
+		// Default to the manager's uncached APIReader so production
+		// wiring doesn't have to thread it explicitly, AND envtest
+		// integration tests that boot a real manager still skip the
+		// Pod informer per the locked design (the test setup just
+		// passes Client, not APIReader).
+		r.APIReader = mgr.GetAPIReader()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.CacheBackend{}).
