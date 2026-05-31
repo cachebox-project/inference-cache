@@ -82,6 +82,18 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 
+	// Retired inert fields must stay absent from the served schema so a
+	// regeneration can't silently reintroduce them. lookupTimeoutMs and
+	// minimumPrefixTokens moved to CachePolicy; indexEntries is superseded by
+	// status.indexParticipation.prefixCount.
+	requireNoProperty(t, integrationSchema, "lookupTimeoutMs")
+	requireNoProperty(t, integrationSchema, "minimumPrefixTokens")
+	requireNoProperty(t, statusSchema, "indexEntries")
+
+	// status.indexParticipation.prefixCount is the authoritative live count
+	// surface that replaced status.indexEntries.
+	requireMinimum(t, mustPath[map[string]any](t, statusSchema, "properties", "indexParticipation", "properties", "prefixCount"), 0)
+
 	// Autoscaling validation surface.
 	autoscalingSchema := mustProperty(t, specSchema, "autoscaling")
 	requireRequired(t, autoscalingSchema, "maxReplicas")

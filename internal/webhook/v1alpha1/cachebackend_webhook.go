@@ -43,8 +43,11 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 }
 
 // CacheBackendDefaulter applies Phase-1 defaults to a CacheBackend at
-// admission time so downstream code never has to nil-check the defaulted
-// fields. It implements [admission.Defaulter] over CacheBackend.
+// admission time. Today it stamps only spec.replicas; spec.integration is
+// left as-is when unset (downstream code nil-checks it), and
+// spec.integration.failOpen is defaulted at the CRD layer via a
+// +kubebuilder:default marker. It implements [admission.Defaulter] over
+// CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
