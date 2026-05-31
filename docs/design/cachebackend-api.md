@@ -37,7 +37,7 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `engineSelector.matchLabels` | map | Labels used to select engine pods or runtimes. |
 | `backendConfig` | map | Backend-specific string settings. |
 | `template` | object | Optional pod-level overrides for managed backend pods. This is a narrow override surface, not a full `PodSpec`; backend containers come from controller defaults. |
-| `endpoint` | string | Optional endpoint for an existing external backend. The controller mirrors this into `status.endpoint`. |
+| `endpoint` | string | Address of a pre-existing cache the operator manages themselves. **Required when `spec.type=External`** and **rejected on every other type** (admission enforces both directions): managed backends learn their endpoint from the controller-rendered Service, so a user-supplied value would be silently overwritten. Accepted as a bare `host:port` or with the LMCache `lm://` scheme; both forms **require a non-empty port** (the LMCache connector dials a specific TCP target). Admission also rejects other schemes (`https://`, `http://`, …), path/query/fragment components, and unbracketed IPv6 literals (`[::1]:8200` is required, not `::1`). The reconciler mirrors the trimmed value into `status.endpoint`. The pod webhook sources the engine-side endpoint from `spec.endpoint` for External and from `status.endpoint` for managed types — see [Mutating Pod webhook](#mutating-pod-webhook-engine-wiring). |
 | `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
 
 ### Template Overrides
@@ -81,7 +81,7 @@ Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod 
 The webhook also injects the flags every vLLM+LMCache engine needs:
 
 - `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"<role>"}'` — `<role>` is derived from `spec.integration.role`: `ReadOnly → kv_consumer`, `WriteOnly → kv_producer`, `ReadWrite → kv_both` (also the default when `integration` is unset).
-- `LMCACHE_REMOTE_URL=lm://<status.endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter (`status.endpoint` itself stays an engine-agnostic `host:port`).
+- `LMCACHE_REMOTE_URL=lm://<endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter. The endpoint **source is type-scoped**: managed backends pull it from `status.endpoint` (the controller builds it from the rendered Service as a bare `host:port`), External backends pull it from the trimmed `spec.endpoint` (operator-authoritative — preferring `spec.endpoint` over `status.endpoint` for External avoids wiring new pods to a stale status during an endpoint update). For External the operator may write either bare `host:port` or explicit `lm://host:port`; the reconciler mirrors the trimmed value into `status.endpoint` (leading/trailing whitespace is stripped; the scheme, if the operator typed one, is preserved as written). The injection helper is lenient: an already-prefixed `lm://` value is preserved rather than doubled. The bare host:port form is the canonical shape, and admission enforces a non-empty port either way.
 - `VLLM_USE_V1=1`.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — mirrors `spec.integration.failOpen` onto the engine pod (defaults to `true` when the field is unset). The LMCache connector is fail-open by default at runtime regardless of this value; surfacing the bit lets the engine layer enforce fail-closed semantics when that work lands, and keeps the adapter aligned with the contract that this flag is plumbed by the engine adapter.
 
@@ -108,16 +108,31 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 
 ### Conditions
 
-Two condition types are published on managed backends:
+Two condition types are published. The semantics differ for managed backends (where the controller renders a Deployment + Service) and for External (where the operator manages the cache out-of-band and the controller only mirrors the endpoint).
+
+**Managed backends**:
 
 | Type | Meaning |
 |---|---|
-| `Ready` | True once the backend Deployment has rolled out its current generation and has enough updated + available replicas to serve traffic. |
+| `Ready` | True once the backend Deployment has rolled out its current generation and has enough updated + available replicas to serve traffic. Reason strings (`Synced`, `Degraded`, etc.) describe the rollout state. |
 | `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply). Transitions to False once the Deployment converges (`Synced`) or stalls (`Degraded`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded". |
 
 When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
-`kubectl get cachebackend` displays the observed `status.endpoint`, `status.indexParticipation.prefixCount` (as `PREFIXES`), and `status.indexParticipation.lastEventAt` (as `LASTEVENT`) so managed backends show endpoint + live participation once reconciliation has created them and the poller has observed a `/snapshot` tick.
+**External backends**:
+
+There is no Deployment to roll out, so admission acceptance of `spec.endpoint` is the only readiness signal the controller has. The controller publishes both conditions immediately on every reconcile:
+
+| Type | Status | Reason | Meaning |
+|---|---|---|---|
+| `Ready` | `True` | `ExternalEndpointAccepted` | `spec.endpoint` is non-empty AND well-formed (passes the shared LMCache shape check — `host:port` or `lm://host:port`, port required, no embedded whitespace, IPv6 bracketed, no path/query/fragment). The controller does not provision pods for External, so admission acceptance of a valid endpoint is the readiness signal. |
+| `Ready` | `False` | `ExternalEndpointMissing` | `spec.endpoint` is empty or whitespace-only. Current admission rejects this at the validating webhook, so this state is reachable only for a CR already in etcd from before the webhook was installed. Status reflects the gap loudly rather than dropping the condition. |
+| `Ready` | `False` | `ExternalEndpointInvalid` | `spec.endpoint` is non-empty but fails the shared shape check (bad scheme, no port, embedded whitespace, unbracketed IPv6, path/query/fragment, …). Current admission rejects all of these at the validating webhook; the reason is reachable only for a CR stored before the relevant shape rule shipped. The `message` carries the shape error verbatim so `kubectl describe` names the offending shape. The pod webhook short-circuits on the same check (no engine injection, fail-open). |
+| `Progressing` | `False` | mirrors Ready's reason | External backends complete admission immediately — there is no rollout the controller is still driving. Always `False` on External; the reason matches Ready (`ExternalEndpointAccepted` / `ExternalEndpointMissing` / `ExternalEndpointInvalid`) so `kubectl describe` shows a coherent pair. |
+
+Reachability of the external endpoint is **not** probed by the controller; trusting the operator is part of the External contract. A future enhancement could degrade `Ready` on a probe failure, but that's deliberately out of scope for the passthrough adapter today (fail-soft, never a serving dependency).
+
+`kubectl get cachebackend` displays the observed `status.endpoint`, `status.indexParticipation.prefixCount` (as `PREFIXES`), and `status.indexParticipation.lastEventAt` (as `LASTEVENT`) so managed backends show endpoint + live participation once reconciliation has created them and the poller has observed a `/snapshot` tick. External backends display the operator-supplied endpoint immediately; `indexParticipation` stays unset because the controller has no subscriber sidecar in an operator-managed cache.
 
 ### Index Participation
 
@@ -163,20 +178,27 @@ Rejects structurally-broken specs that the reconciler cannot do anything useful 
 | Rule | Rejects |
 |---|---|
 | `External` requires `spec.endpoint` | `spec.type=External` with no endpoint — the external backend has no address to mirror to `status.endpoint`. |
+| `spec.endpoint` is only valid on `External` | A non-`External` `spec.type` with a non-empty `spec.endpoint`. The field is meaningful only for the External passthrough adapter; for managed types the controller overwrites `status.endpoint` from the live Service it provisions, so a user-supplied `spec.endpoint` would be silently ignored. Whitespace-only values are treated as empty. |
 | Memory-only backends cannot declare PVC storage | `spec.storage.pvc` set when `spec.type` is in the Phase-1 memory-only set (`AIBrix`, `NIXL`). These backends have no persistent tier; a PVC would never mount. |
 | Cross-namespace endpoint requires opt-in | `spec.endpoint` resolves to a Service in a namespace other than the CacheBackend's, and `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator should acknowledge. Bare hostnames, IPs, and unqualified names pass through (no namespace to compare against). |
 | `spec.integration.engineOverrides` cannot touch reserved args/env | An entry in `engineOverrides.args` / `engineOverrides.suppressArgs` matches a leading flag token the adapter declares as `ReservedArgs()`, or an entry in `engineOverrides.env` / `engineOverrides.suppressEnv` matches a name in `ReservedEnv()`. The rejection names both the offending flag/env and the adapter so the operator can fix the spec rather than wait for the engine to crash. The reserved set is per-adapter (the vLLM+LMCache adapter reserves `--kv-transfer-config`, `VLLM_USE_V1`, `LMCACHE_REMOTE_URL`, `INFERENCECACHE_FAIL_OPEN`). |
-| Runtime/backend pair must be supported by an installed adapter | Effective `(engine, spec.type)` pair has no registered runtime adapter, so the reconciler would fall back to unmanaged. The effective engine is resolved with the same helper the reconciler and pod webhook use: `spec.integration.engine` lower-cased, defaulting to `vllm` when unset (Phase-1 default — the only engine the shipping adapters target). Bypassed for `spec.type=External` (mirrored, not managed) and for an empty `spec.type` (required-field rejection wins). The rejection message names both sides of the offending pair and lists the supported pairs the controller's registered adapters expose, e.g. `no runtime adapter supports the (engine="vllm", backend="Mooncake") pair; supported pairs in this build: vllm/LMCache`. |
+| Runtime/backend pair must be supported by an installed adapter | Effective `(engine, spec.type)` pair has no registered runtime adapter, so the reconciler would fall back to unmanaged AND the pod webhook would fail-open without injecting engine config. The effective engine is resolved with the same helper the reconciler and pod webhook use: `spec.integration.engine` lower-cased, defaulting to `vllm` when unset (Phase-1 default — the only engine the shipping adapters target). Applies to `spec.type=External` too: the External passthrough adapter has its own (vLLM-only) Supports gate, so `External` with `engine: sglang` is rejected at admission instead of silently un-wired downstream. Bypassed only for an empty `spec.type` (required-field rejection wins). The rejection message names both sides of the offending pair and lists the supported pairs the controller's registered adapters expose, e.g. `no runtime adapter supports the (engine="vllm", backend="Mooncake") pair; supported pairs in this build: vllm/LMCache, vllm/External`. |
 
 The structural rules are an ordered, pluggable list (`CacheBackendValidator.Rules`); the runtime/backend compatibility check runs separately because it needs to consult the shared `adapterruntime.Registry` rather than just the spec.
+
+`ValidateUpdate` only rejects violations the update *introduces*: errors that already existed on the previous object are filtered out so an unrelated edit (a label tweak, an annotation) on a CR admitted under a laxer rule set is not suddenly un-updatable. A `kubectl edit` that flips a previously-valid field into an invalid one is still rejected, because the violation is then new to the diff. Errors are compared by `(Type, Field, BadValue, Detail)`, so an operator changing one bad endpoint to a different bad endpoint on the same field counts as a fresh violation — the rule still bites when the operator actively edits the bad field.
 
 ### Migration
 
 The validating rules tighten what `v1alpha1` accepts, so they ship together with the admission webhook itself (a previously-uninstalled webhook). Tightening applies at write time only:
 
 - Existing stored CacheBackends that were applied before the webhook is installed remain in etcd and are unaffected until they are next created or mutated.
-- An operator with a now-invalid CR can read it (`kubectl get`), but a write (create or update) fails until the spec satisfies the new rules.
+- **Create** still applies the full rule set: a previously-stored-but-now-invalid CR cannot be re-created.
+- **Update** only rejects violations the new object *introduces* (the diff-only rule above): an unrelated edit (`kubectl annotate`, a label tweak, an unrelated spec field) on a now-invalid CR is allowed through, so operators aren't locked out of their existing objects. An edit that flips a previously-valid field into an invalid one — or that changes one bad value on a still-invalid field into a different bad value — is still rejected, because the violation is then new to the diff.
+- An operator who wants to bring a stored CR into compliance with the new rules can do so incrementally (clear the offending field, switch type, etc.); the diff-only semantics mean the bring-into-compliance edit doesn't have to atomically fix every existing violation.
 - The cluster-wide rollout knob is the webhook's `failurePolicy`; future tightenings that need a softer rollout can switch to `Ignore` for one release before flipping to `Fail`.
+
+**`spec.endpoint` type-scoping** is a specific tightening worth calling out: the field was always documented as "an existing external backend" but admission did not enforce that scoping in earlier builds. Now `spec.endpoint` is REQUIRED on `External` (admission rejects empty) and REJECTED on every other type (admission rejects non-empty). The locked design contract is that admission is loud about misconfigurations at write time rather than silently overwriting a user-supplied endpoint with the controller-rendered one. The diff-only update semantics above mean existing stored CRs with the legacy `(LMCache, endpoint=foo)` combination remain editable for unrelated changes; only a new CREATE or an edit that introduces (or changes) the offending combination is rejected. Operators bringing a stored CR into compliance clear `spec.endpoint` or switch `spec.type` to `External` — both can be done at update time, no special migration tool required.
 
 ### Engine-injection overrides (`spec.integration.engineOverrides`)
 
@@ -211,6 +233,8 @@ The vLLM+LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) reserves the a
 - `ReservedArgs()`: `--kv-transfer-config` (the LMCache connector wiring).
 - `ReservedEnv()`: `VLLM_USE_V1` (selects the engine codepath the connector targets), `LMCACHE_REMOTE_URL` (the resolved cache endpoint), `INFERENCECACHE_FAIL_OPEN` (mirror of `spec.integration.failOpen` — overriding it would silently desync the pod from the CR contract).
 
+The External adapter (`pkg/adapters/runtime/external/external.go`) reserves the **same** args/env. The injected wire format is identical to the managed-LMCache path (both call `enginewire.InjectVLLMLMCache`), so an override that would un-wire LMCache on a managed CR would un-wire it on an External CR for the same reason. Admission consults the External adapter's reserved set the same way it consults the managed adapter's — operators see a hard reject at write time regardless of which `spec.type` they're using.
+
 `LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. (`spec.backendConfig` already exposes them; `engineOverrides.env` is the engine-agnostic seam future engines without a per-key map will reach for.)
 
 #### Shape rationale (A vs. B)
@@ -232,12 +256,12 @@ A user can still set non-reserved values that break the engine in subtle ways th
 
 ### Mutating Pod webhook (engine wiring)
 
-A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencecache.io`) auto-wires user-supplied inference engine pods to the matching managed `CacheBackend` — operators never have to hand-edit `LMCACHE_*` env vars or the LMCache connector arg onto their pod templates. The handler lives in `internal/webhook/pod` and runs on every Pod CREATE.
+A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencecache.io`) auto-wires user-supplied inference engine pods to the matching `CacheBackend` (managed or External; both are first-class here — the only difference is where the endpoint comes from) — operators never have to hand-edit `LMCACHE_*` env vars or the LMCache connector arg onto their pod templates. The handler lives in `internal/webhook/pod` and runs on every Pod CREATE.
 
 | Aspect | Behavior |
 |---|---|
 | Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. The first matching `CacheBackend` wins; one with a nil or empty `EngineSelector` is skipped (a "match-everything" selector would silently claim every pod in the namespace). |
-| Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)` and calls `adapter.InjectEngineConfig(pod.Spec, cache.Status.Endpoint, cache)`. The adapter merges: existing args/env on the engine container are preserved; repeat injections are idempotent. |
+| Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)` and calls `adapter.InjectEngineConfig(pod.Spec, endpoint, cache)`, where `endpoint` is type-scoped: for `spec.type=External` the source is the trimmed `spec.endpoint` only (operator-authoritative; admission validates the shape; no `status.endpoint` fallback so the webhook agrees with the reconciler that an empty/missing spec means "not ready" — falling back would silently wire new pods to a stale status the reconciler considers unusable). For managed types the source is `status.endpoint` only (the reconciler builds it from the live Service; `spec.endpoint` is admission-rejected on managed types). When the resolved endpoint is empty the webhook fails open without injection. The adapter merges: existing args/env on the engine container are preserved; repeat injections are idempotent. |
 | Annotations | Stamps `inferencecache.io/injected-by: <namespace>/<name>` on every mutated pod for observability (`kubectl describe pod`). Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out — the handler returns Allowed without mutation when set. |
 | Idempotency | The handler calls the adapter unconditionally on every admission and trusts the adapter to converge the full injected contract (env + `--kv-transfer-config` arg). The adapter's merge primitives (`upsertEnv` / `upsertArgPair`) are no-ops when the desired value is already present, so a re-admission of a fully-injected pod produces an empty JSON-patch set and there is no apiserver round-trip cost. Trusting the adapter rather than a handler-side env-presence shortcut avoids the trap where a partially-injected pod (e.g. only `LMCACHE_REMOTE_URL` set by hand) is admitted permanently missing the rest of the contract. |
 | Fail-open | Every error path (decode failure, list error, no matching backend, missing `status.endpoint`, no registered adapter, adapter rejection, re-encode failure) returns `admission.Allowed(...)` with a reason — webhook errors MUST NOT block engine admission. `MutatingWebhookConfiguration.failurePolicy` is also pinned to `Ignore` as a belt-and-suspenders second layer. |
