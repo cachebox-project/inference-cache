@@ -217,8 +217,22 @@ type CacheBackendIntegrationSpec struct {
 	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
 }
 
-// EngineInjectionOverrides describes how the operator wants to amend the
-// args / env the pod-mutating webhook injects into the engine container.
+// EngineInjectionOverrides is the in-between knob between "take the
+// adapter's canonical injection" and "skip injection entirely" (the latter
+// owned by the inferencecache.io/skip-inject pod annotation). The four
+// primitives compose: Env upserts by Name and SuppressEnv removes by Name;
+// Args replaces by leading flag token or appends, and SuppressArgs removes
+// by leading flag token. Suppress runs before merge, so suppress-then-re-add
+// is a supported pattern for overriding a non-reserved adapter-owned flag
+// value. Entries that overlap the runtime adapter's ReservedArgs() or
+// ReservedEnv() are hard-rejected at admission with a field-scoped error
+// naming the offending token and the adapter, so a misconfiguration fails
+// at kubectl apply rather than as a crashed engine pod later.
+//
+// See docs/concepts/cachebackend-engine-overrides.md for the baseline
+// canonical injection (annotated RESERVED / TUNABLE), five worked
+// before/after examples, and the "when NOT to use this" guidance.
+//
 // The override surface is SCOPED to entries the runtime adapter itself
 // contributes (added or modified) during InjectEngineConfig — user
 // pod-template args / env that the adapter does not touch are protected,
