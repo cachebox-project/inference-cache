@@ -198,6 +198,10 @@ type CacheBackendIntegrationSpec struct {
 	// the annotation inferencecache.io/require-kv-events: "false". Backends
 	// of spec.type External are always exempt (we never subscribe to an
 	// external cache, so lastEventAt never populates).
+	//
+	// A zero or negative value is treated as unset and falls back to the 5m
+	// default — the field carries no meaningful "wait forever" or "fail
+	// immediately" semantics.
 	// +optional
 	// +kubebuilder:default="5m"
 	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`

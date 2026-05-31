@@ -68,6 +68,11 @@ const (
 	reasonKVEventsObserved     = "KVEventsObserved"
 	reasonNoKVEventsObserved   = "NoKVEventsObserved"
 
+	// reasonReplicasUnavailable is the deployment-level Degraded reason (rolled
+	// out but not enough available replicas). Named so the event logic can tell
+	// a deployment-caused Degraded apart from the KV-event-caused one.
+	reasonReplicasUnavailable = "ReplicasUnavailable"
+
 	// reasonNotDegraded is the Degraded=False condition reason.
 	reasonNotDegraded = "NotDegraded"
 )
@@ -919,7 +924,7 @@ func managedHealth(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) 
 		return cachev1alpha1.CacheBackendHealthPending, metav1.ConditionFalse, "RolloutInProgress",
 			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
 	default:
-		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, "ReplicasUnavailable",
+		return cachev1alpha1.CacheBackendHealthDegraded, metav1.ConditionFalse, reasonReplicasUnavailable,
 			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
 	}
 }
@@ -1167,9 +1172,16 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 
 	// Generic Deployment-health transitions. The KV-event gate's Degraded and
 	// Ready flavors carry their own, more specific events below, so suppress
-	// the generic event when the new Ready reason is a gate reason — otherwise
-	// a KV-event-timeout Degraded would fire BOTH BackendDegraded and
+	// the generic event when the transition is a gate flavor — otherwise a
+	// KV-event-timeout Degraded would fire BOTH BackendDegraded and
 	// NoKVEventsObserved for one transition.
+	//
+	// Suppression is keyed on the *prior* degraded reason for recovery, not the
+	// new Ready reason: a backend that already saw KV events, then degrades for
+	// ReplicasUnavailable, then recovers, comes back with readyReason
+	// KVEventsObserved — but that is an ordinary deployment recovery
+	// (BackendRecovered), not a first-event observation, so we must not key the
+	// suppression on the new reason.
 	if before.health != cachev1alpha1.CacheBackendHealthDegraded &&
 		after.health == cachev1alpha1.CacheBackendHealthDegraded &&
 		after.readyReason != reasonNoKVEventsObserved {
@@ -1178,24 +1190,32 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	}
 	if before.health == cachev1alpha1.CacheBackendHealthDegraded &&
 		after.health == cachev1alpha1.CacheBackendHealthReady &&
-		after.readyReason != reasonKVEventsObserved {
+		before.readyReason != reasonNoKVEventsObserved {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonBackendRecovered, eventReasonBackendRecovered,
 			"cache backend recovered to Ready")
 	}
 
-	// KV-event readiness gate transitions, keyed on the Ready condition
-	// reason so they fire once on entry into each gate state.
+	// KV-event readiness gate transitions, keyed on the Ready condition reason
+	// so they fire once on entry into each gate state.
 	if before.readyReason != reasonAwaitingFirstKVEvent && after.readyReason == reasonAwaitingFirstKVEvent {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
 			"engine is HTTP-Ready but no KV events observed yet; backend stays Pending until the first event (check the engine --kv-events-config if none arrive)")
 	}
-	if before.readyReason != reasonKVEventsObserved && after.readyReason == reasonKVEventsObserved {
+	// KVEventsObserved fires on the FIRST observation of events for a readiness
+	// episode — entering KVEventsObserved from a still-waiting state
+	// (AwaitingFirstKVEvent / RolloutInProgress / fresh) or after a KV timeout
+	// recovered. It must NOT fire when recovering from a deployment-caused
+	// Degraded (ReplicasUnavailable), where events were already flowing —
+	// that path emits BackendRecovered above instead.
+	if after.readyReason == reasonKVEventsObserved &&
+		before.readyReason != reasonKVEventsObserved &&
+		before.readyReason != reasonReplicasUnavailable {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonKVEventsObserved, reasonKVEventsObserved,
 			"first KV event observed; backend is Ready")
 	}
 	if before.readyReason != reasonNoKVEventsObserved && after.readyReason == reasonNoKVEventsObserved {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, reasonNoKVEventsObserved, reasonNoKVEventsObserved,
-			"no KV events observed within firstEventTimeout; the engine's KV-event publisher is likely mis-configured (--kv-events-config / ZMQ bind)")
+			"no KV events observed within %s of engine HTTP-readiness; the engine's KV-event publisher is likely mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
 	}
 
 	if before.failOpen && !after.failOpen {

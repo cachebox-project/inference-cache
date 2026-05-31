@@ -300,6 +300,97 @@ func TestIntegrationKVEventGateAutoReconcileOnPollerWrite(t *testing.T) {
 	waitForReadyReason(t, k8s, key, metav1.ConditionTrue, reasonKVEventsObserved)
 }
 
+// TestKVEventGateEmitsTransitionEvents asserts the gate's operator-facing
+// Events reach the recorder on each transition: AwaitingFirstKVEvent (Normal),
+// KVEventsObserved (Normal), NoKVEventsObserved (Warning). Uses the fake-client
+// recorder so it runs without envtest.
+func TestKVEventGateEmitsTransitionEvents(t *testing.T) {
+	cb := gatedLMCacheBackend("cache", "ns1")
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	// Cold start: deployment not ready → no gate event yet.
+	reconcile(t, r, "cache", "ns1")
+	drainEvents(rec)
+
+	// HTTP-Ready, no event → AwaitingFirstKVEvent.
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	expectEvent(t, drainEvents(rec), reasonAwaitingFirstKVEvent)
+
+	// First KV event observed → KVEventsObserved, backend Ready.
+	patchLastEventAt(t, r.Client, "cache", "ns1", time.Now())
+	reconcile(t, r, "cache", "ns1")
+	expectEvent(t, drainEvents(rec), reasonKVEventsObserved)
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("health = %q, want Ready", got)
+	}
+}
+
+// TestKVEventGateEmitsNoKVEventsObservedOnTimeout asserts the Warning Event
+// fires when the first-event window elapses with no event.
+func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
+	cb := gatedLMCacheBackend("cache", "ns1")
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		FirstEventTimeout: &metav1.Duration{Duration: time.Second},
+	}
+	r, rec := newReconcilerWithRecorder(t, cb)
+	reconcile(t, r, "cache", "ns1")
+
+	// Ready + Available since well before the 1s window.
+	dep := getDeployment(t, r, "cache", "ns1")
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.AvailableReplicas = 1
+	dep.Status.ReadyReplicas = 1
+	dep.Status.Conditions = []appsv1.DeploymentCondition{{
+		Type:               appsv1.DeploymentAvailable,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-5 * time.Second)),
+	}}
+	if err := r.Status().Update(context.Background(), dep); err != nil {
+		t.Fatalf("update deployment status: %v", err)
+	}
+	drainEvents(rec)
+
+	reconcile(t, r, "cache", "ns1")
+	expectEvent(t, drainEvents(rec), reasonNoKVEventsObserved)
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
+		t.Fatalf("health = %q, want Degraded", got)
+	}
+}
+
+// TestKVEventGateDeploymentRecoveryIsBackendRecovered is the regression guard
+// for the event-suppression fix: a backend that already saw KV events, then
+// degrades for ReplicasUnavailable, then recovers must emit BackendRecovered —
+// NOT a misleading second KVEventsObserved (events never stopped flowing).
+func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
+	cb := gatedLMCacheBackend("cache", "ns1")
+	r, rec := newReconcilerWithRecorder(t, cb)
+	reconcile(t, r, "cache", "ns1")
+
+	// Become Ready with events flowing.
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	patchLastEventAt(t, r.Client, "cache", "ns1", time.Now())
+	reconcile(t, r, "cache", "ns1")
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("setup health = %q, want Ready", got)
+	}
+	drainEvents(rec) // discard the initial KVEventsObserved
+
+	// Lose replicas → Degraded (deployment cause, not KV).
+	markDeploymentDegraded(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	expectEvent(t, drainEvents(rec), eventReasonBackendDegraded)
+
+	// Replicas recover; lastEventAt is still set (events never lost).
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	evs := drainEvents(rec)
+	expectEvent(t, evs, eventReasonBackendRecovered)
+	expectNoEvent(t, evs, reasonKVEventsObserved)
+}
+
 // waitForReadyReason polls until the CacheBackend's Ready condition matches the
 // wanted status+reason, or fails after a bounded deadline.
 func waitForReadyReason(t *testing.T, cl client.Client, key types.NamespacedName, status metav1.ConditionStatus, reason string) {

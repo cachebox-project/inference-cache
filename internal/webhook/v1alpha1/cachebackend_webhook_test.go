@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -50,6 +51,12 @@ func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
 	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
 		t.Errorf("minimumPrefixTokens = %v, want %d", cb.Spec.Integration.MinimumPrefixTokens, defaultMinimumPrefixTokens)
 	}
+	// The CRD-schema default for firstEventTimeout only applies when
+	// spec.integration is present in the submitted object; the common CR that
+	// omits integration entirely relies on the webhook stamping it here.
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
+		t.Errorf("firstEventTimeout = %v, want %s", cb.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
+	}
 }
 
 func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
@@ -59,6 +66,7 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
 		LookupTimeoutMs:     i32p(123),
 		MinimumPrefixTokens: i32p(999),
+		FirstEventTimeout:   &metav1.Duration{Duration: 90 * time.Second},
 	}
 
 	if err := d.Default(context.Background(), cb); err != nil {
@@ -73,6 +81,9 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	}
 	if *cb.Spec.Integration.MinimumPrefixTokens != 999 {
 		t.Errorf("minimumPrefixTokens clobbered: got %d, want 999", *cb.Spec.Integration.MinimumPrefixTokens)
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 90*time.Second {
+		t.Errorf("firstEventTimeout clobbered: got %v, want 90s", cb.Spec.Integration.FirstEventTimeout)
 	}
 }
 

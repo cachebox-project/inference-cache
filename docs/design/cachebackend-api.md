@@ -171,6 +171,7 @@ Stamps Phase-1 defaults onto every admitted CacheBackend, only where the operato
 | `spec.replicas` | `1` |
 | `spec.integration.lookupTimeoutMs` | `50` |
 | `spec.integration.minimumPrefixTokens` | `256` |
+| `spec.integration.firstEventTimeout` | `5m` (CRD-schema default when `spec.integration` is present; the webhook also stamps it when it materializes `spec.integration`) |
 
 ### Validating
 
