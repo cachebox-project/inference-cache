@@ -121,10 +121,7 @@ resolver step before pushing, without any schema change.
 | `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 
-`failOpen` and `tenantScoped` are part of the CRD but not enforced by
-this propagation path: the server is already fail-open by construction
-(no error on the hot path), and `tenantScoped` is reserved for future
-multi-tenant lookup scoping.
+The server is fail-open by construction on the hot path (no error returned to the gateway); a `CachePolicy`-level fail-open knob is not part of the propagated wire format.
 
 ## Failure modes
 

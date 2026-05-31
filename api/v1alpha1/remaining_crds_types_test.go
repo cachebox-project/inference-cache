@@ -21,12 +21,9 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
 	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
-	requireEnum(t, mustProperty(t, policySpec, "eviction"), []string{"LRU", "LFU"})
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
-	requireDefault(t, mustProperty(t, policySpec, "failOpen"), true)
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
-	requireBooleanLike(t, mustProperty(t, policySpec, "tenantScoped"))
 
 	tenantSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
 	requireRequired(t, tenantSchema, "spec")
@@ -74,25 +71,18 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	ttl := metav1.Duration{Duration: time.Minute}
 	minimumPrefixTokens := int32(32)
 	lookupTimeoutMs := int32(20)
-	failOpen := true
 	policy := &CachePolicy{
 		Spec: CachePolicySpec{
-			Eviction:            CachePolicyEvictionAlgorithmLRU,
 			EvictionTTL:         &ttl,
 			MinimumPrefixTokens: &minimumPrefixTokens,
 			LookupTimeoutMs:     &lookupTimeoutMs,
-			FailOpen:            &failOpen,
-			TenantScoped:        &failOpen,
 		},
 		Status: CachePolicyStatus{Conditions: []metav1.Condition{{Type: "Ready", Message: "ok"}}},
 	}
 	policyCopy := policy.DeepCopy()
 	policy.Spec.EvictionTTL.Duration = 2 * time.Minute
-	*policy.Spec.FailOpen = false
-	*policy.Spec.TenantScoped = false
 	policy.Status.Conditions[0].Message = "changed"
-	if policyCopy.Spec.EvictionTTL.Duration != time.Minute || !*policyCopy.Spec.FailOpen ||
-		!*policyCopy.Spec.TenantScoped ||
+	if policyCopy.Spec.EvictionTTL.Duration != time.Minute ||
 		policyCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}
@@ -444,13 +434,6 @@ func requireDurationLike(t *testing.T, schema map[string]any) {
 	}
 	if _, ok := schema["format"]; ok {
 		t.Fatalf("format = %v, want plain string duration schema", schema["format"])
-	}
-}
-
-func requireBooleanLike(t *testing.T, schema map[string]any) {
-	t.Helper()
-	if got := mustPath[string](t, schema, "type"); got != "boolean" {
-		t.Fatalf("type = %q, want boolean", got)
 	}
 }
 

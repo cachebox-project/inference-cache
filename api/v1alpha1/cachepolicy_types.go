@@ -5,22 +5,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// +kubebuilder:validation:Enum=LRU;LFU
-
-// CachePolicyEvictionAlgorithm identifies how cache entries are evicted.
-type CachePolicyEvictionAlgorithm string
-
-const (
-	CachePolicyEvictionAlgorithmLRU CachePolicyEvictionAlgorithm = "LRU"
-	CachePolicyEvictionAlgorithmLFU CachePolicyEvictionAlgorithm = "LFU"
-)
-
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
-	// Eviction is the cache eviction algorithm.
-	// +optional
-	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
-
 	// EvictionTTL is the maximum time a cache entry should remain usable.
 	// +optional
 	EvictionTTL *metav1.Duration `json:"evictionTTL,omitempty"`
@@ -34,15 +20,6 @@ type CachePolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
-
-	// FailOpen keeps inference serving when the cache is unreachable.
-	// +optional
-	// +kubebuilder:default=true
-	FailOpen *bool `json:"failOpen,omitempty"`
-
-	// TenantScoped restricts the policy to tenant-local lookups.
-	// +optional
-	TenantScoped *bool `json:"tenantScoped,omitempty"`
 }
 
 // CachePolicyStatus defines observed policy state.
@@ -61,8 +38,6 @@ type CachePolicyStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=cpol
-// +kubebuilder:printcolumn:name="Eviction",type=string,JSONPath=`.spec.eviction`
-// +kubebuilder:printcolumn:name="FailOpen",type=boolean,JSONPath=`.spec.failOpen`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CachePolicy is the Schema for cache lookup and eviction policy.

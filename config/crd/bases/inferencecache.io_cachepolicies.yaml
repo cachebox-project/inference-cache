@@ -17,12 +17,6 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.eviction
-      name: Eviction
-      type: string
-    - jsonPath: .spec.failOpen
-      name: FailOpen
-      type: boolean
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -51,20 +45,10 @@ spec:
           spec:
             description: CachePolicySpec defines cache lookup and eviction policy.
             properties:
-              eviction:
-                description: Eviction is the cache eviction algorithm.
-                enum:
-                - LRU
-                - LFU
-                type: string
               evictionTTL:
                 description: EvictionTTL is the maximum time a cache entry should
                   remain usable.
                 type: string
-              failOpen:
-                default: true
-                description: FailOpen keeps inference serving when the cache is unreachable.
-                type: boolean
               lookupTimeoutMs:
                 description: LookupTimeoutMs bounds cache lookup latency in milliseconds.
                 format: int32
@@ -76,9 +60,6 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
-              tenantScoped:
-                description: TenantScoped restricts the policy to tenant-local lookups.
-                type: boolean
             type: object
           status:
             description: CachePolicyStatus defines observed policy state.
