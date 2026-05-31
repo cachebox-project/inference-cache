@@ -33,6 +33,7 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `integration.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. Lookup callers must still fail open. |
 | `integration.minimumPrefixTokens` | integer | Minimum prefix token count before attempting cache lookup. Minimum `0`. |
 | `integration.failOpen` | boolean | Default `true`. When `true`, engine pods fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Setting it to `false` is an advanced opt-in to fail-closed serving (the cache becomes a serving dependency); the controller surfaces this as a Warning Kubernetes Event on the owning `CacheBackend`. |
+| `integration.firstEventTimeout` | duration | Default `5m`. How long a managed backend may sit `Ready=False` (`Pending`, reason `AwaitingFirstKVEvent`) after its engine becomes HTTP-Ready before the controller flips it to `Degraded` (reason `NoKVEventsObserved`). See [KV-event readiness gate](#kv-event-readiness-gate). |
 | `integration.engineOverrides` | object | Optional engine-injection overrides applied to the args/env the pod-mutating webhook would otherwise inject into the engine container. See [Engine-injection overrides](#engine-injection-overrides-specintegrationengineoverrides). |
 | `engineSelector.matchLabels` | map | Labels used to select engine pods or runtimes. |
 | `backendConfig` | map | Backend-specific string settings. |
@@ -108,14 +109,29 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 
 ### Conditions
 
-Two condition types are published on managed backends:
+Three condition types are published on managed backends:
 
 | Type | Meaning |
 |---|---|
-| `Ready` | True once the backend Deployment has rolled out its current generation and has enough updated + available replicas to serve traffic. |
-| `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply). Transitions to False once the Deployment converges (`Synced`) or stalls (`Degraded`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded". |
+| `Ready` | True once the backend Deployment has rolled out its current generation, has enough updated + available replicas to serve traffic, **and** — when the [KV-event readiness gate](#kv-event-readiness-gate) applies — at least one KV event has been observed for the backend (reason `KVEventsObserved`). HTTP-Ready but no event yet is `Ready=False`, reason `AwaitingFirstKVEvent`. |
+| `Degraded` | True when the backend is in a terminal unhealthy state: rolled out but replicas unavailable (reason `ReplicasUnavailable`), or HTTP-Ready but no KV event observed within `firstEventTimeout` (reason `NoKVEventsObserved`). Tracks `status.health == Degraded`. |
+| `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply, awaiting first KV event). Transitions to False once the Deployment converges (`Synced`) or stalls (`Degraded`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded". |
 
 When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
+
+### KV-event readiness gate
+
+`Ready` means "the engine is up **and** the cache plane is actually receiving its state" — not merely "the pod's HTTP port answers". The engine's HTTP readiness probe (`GET /health`) proves the inference API is up but says nothing about whether the engine's ZMQ KV-event publisher is publishing. A pod can be HTTP-Ready while its publisher is silent (mis-configured `--kv-events-config`, a ZMQ bind failure, or an in-process publisher crash), in which case `LookupRoute` keeps returning `NO_HINT` for that backend's prefixes while the CR claims everything is fine. The gate makes that silent degradation loud.
+
+The signal source is `status.indexParticipation.lastEventAt` (written by the CacheIndex poller); the reconciler only reads it. Once the engine becomes HTTP-Ready:
+
+- **no event yet, within `firstEventTimeout`** → `Health=Pending`, `Ready=False` (`AwaitingFirstKVEvent`). The timeout clock starts when the engine Deployment first reports `Available`.
+- **at least one event ever observed** → `Health=Ready`, `Ready=True` (`KVEventsObserved`). An event already present on the first reconcile counts — there is no required transition through `Pending`.
+- **no event by `firstEventTimeout`** → `Health=Degraded`, `Degraded=True` (`NoKVEventsObserved`). Once Degraded it stays Degraded until an event arrives, then transitions to Ready.
+
+The gate is **on by default** and opt-out per CR with the annotation `inferencecache.io/require-kv-events: "false"` (alpha soft-rollout knob; an annotation rather than a spec field so it can be retired once the gate is trusted). `spec.type: External` backends are **always exempt** — the control plane never subscribes to an external cache, so `lastEventAt` never populates; their readiness is determined by admission accepting `spec.endpoint`, as before.
+
+**Operator note.** If a backend is stuck at `Pending` / `AwaitingFirstKVEvent` (and then flips to `Degraded` / `NoKVEventsObserved` after `firstEventTimeout`), the engine's KV-event publisher is almost certainly mis-configured — check the engine's `--kv-events-config` and that its ZMQ socket bound. The reason is visible in `kubectl get cachebackend` (the `Health` column) and `kubectl describe` surfaces the `NoKVEventsObserved` Warning Event that names the failure mode.
 
 `kubectl get cachebackend` displays the observed `status.endpoint`, `status.indexParticipation.prefixCount` (as `PREFIXES`), and `status.indexParticipation.lastEventAt` (as `LASTEVENT`) so managed backends show endpoint + live participation once reconciliation has created them and the poller has observed a `/snapshot` tick.
 
@@ -138,7 +154,7 @@ Only ONE CacheBackend ever claims a given replica — overlapping selectors must
 ## Contract Notes
 
 - Lookup paths fail open by default. `spec.integration.failOpen` defaults to `true` and the engine adapter MUST fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Operators may opt into fail-closed serving by setting `failOpen: false`, which is loud and visible: the controller emits a Warning `FailClosedEnabled` Event on the `CacheBackend` to make it explicit that the cache has been promoted to a serving dependency.
-- The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded`, `BackendRecovered` (Normal) on returning to `Ready` from `Degraded`, plus the `FailClosedEnabled` / `FailOpenRestored` pair above. Steady-state reconciles do not emit events.
+- The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded` and `BackendRecovered` (Normal) on returning to `Ready` from `Degraded` (both suppressed for the KV-event-gate flavors, which carry their own events); the `FailClosedEnabled` / `FailOpenRestored` pair above; and the KV-event readiness gate's `AwaitingFirstKVEvent` (Normal), `KVEventsObserved` (Normal), and `NoKVEventsObserved` (Warning). Steady-state reconciles do not emit events.
 - Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook is the exception: it materialises `spec.integration` with the Phase-1 defaults (`lookupTimeoutMs`, `minimumPrefixTokens`) so downstream code does not need to nil-check them. The fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
 - `status.indexEntries` is a pointer in Go so `0` is distinguishable from unset.
 

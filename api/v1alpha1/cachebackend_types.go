@@ -179,6 +179,29 @@ type CacheBackendIntegrationSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	MinimumPrefixTokens *int32 `json:"minimumPrefixTokens,omitempty"`
 
+	// FirstEventTimeout bounds how long a managed backend may sit
+	// Pending with reason AwaitingFirstKVEvent — engine HTTP-Ready but no
+	// KV event observed yet — before the controller flips it to Degraded
+	// with reason NoKVEventsObserved.
+	//
+	// The KV-event readiness gate holds Ready until at least one KV event
+	// has been observed for this backend's replicas
+	// (status.indexParticipation.lastEventAt). That proves the engine's ZMQ
+	// KV-event publisher is actually publishing — not merely that its HTTP
+	// API answers a readiness probe. A pod can be HTTP-Ready while its
+	// publisher is silent (mis-configured --kv-events-config, ZMQ bind
+	// failure, in-process publisher crash), which silently degrades the
+	// cache plane to NO_HINT on every lookup; this gate makes that loud.
+	//
+	// The timeout clock starts when the engine workload first reports
+	// Available. The gate is on by default and opt-out per CacheBackend via
+	// the annotation inferencecache.io/require-kv-events: "false". Backends
+	// of spec.type External are always exempt (we never subscribe to an
+	// external cache, so lastEventAt never populates).
+	// +optional
+	// +kubebuilder:default="5m"
+	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
+
 	// FailOpen controls whether the engine treats cache lookups as a soft
 	// dependency. When true (the default), an unreachable or degraded cache
 	// backend MUST fall back to local prefill and never fail a serving

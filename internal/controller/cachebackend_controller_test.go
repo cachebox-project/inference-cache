@@ -57,10 +57,21 @@ func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) 
 
 func ptrInt32(v int32) *int32 { return &v }
 
+// lmcacheBackend is the shared managed-backend fixture. It opts OUT of the
+// KV-event readiness gate via the inferencecache.io/require-kv-events:
+// "false" annotation so the many tests that assert rollout-driven Ready /
+// Degraded health, HPA behavior, apply-error status, and transition Events
+// keep exercising exactly that — orthogonal to the gate. Tests that exercise
+// the gate itself build backends without this annotation (or override it).
 func lmcacheBackend(name, namespace string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeLMCache},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Generation:  1,
+			Annotations: map[string]string{"inferencecache.io/require-kv-events": "false"},
+		},
+		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeLMCache},
 	}
 }
 
