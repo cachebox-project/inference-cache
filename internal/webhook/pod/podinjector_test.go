@@ -25,6 +25,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 // newScheme returns a scheme with corev1 + the CRD types registered so a
@@ -255,6 +256,368 @@ func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 	if len(second.Patches) != 0 {
 		t.Fatalf("re-admission of fully-injected pod must produce no patches, got %d: %+v", len(second.Patches), second.Patches)
 	}
+}
+
+func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
+	// A pod that matches an External CR's engine selector must come out
+	// of admission wired to the operator-supplied endpoint via the
+	// LMCache engine wire format — the controller doesn't render a
+	// Service for the cache, so the only source of truth for the
+	// address is spec.endpoint (mirrored to status.endpoint by
+	// reconcileExternal).
+	const (
+		ns       = "engines"
+		endpoint = "external-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: endpoint,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	// Mirror what cmd/controller wires: DefaultRegistry + the External
+	// adapter registered on top. Without External in the registry the
+	// webhook would fail-open with "no adapter" and leave the engine
+	// unwired — that's the very gap the External adapter closes.
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// LMCACHE_REMOTE_URL must be the operator-supplied endpoint with the
+	// lm:// scheme prepended, identical to what the managed adapter
+	// would write for the same endpoint.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	// User --model arg survives the merge — the adapter only adds; it
+	// never clobbers user-set args.
+	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("user --model arg was lost; args = %v", mutated.Spec.Containers[0].Args)
+	}
+	// External path attaches no observation sidecar — the controller has
+	// no observability seam into an operator-managed cache.
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
+	}
+	if mutated.Annotations[AnnotationInjectedBy] != ns+"/ext" {
+		t.Fatalf("annotation %s = %q, want %q",
+			AnnotationInjectedBy, mutated.Annotations[AnnotationInjectedBy], ns+"/ext")
+	}
+}
+
+func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
+	// A pre-existing External CR carrying a malformed spec.endpoint
+	// (stored before the shape rule shipped) must not be wired —
+	// injecting LMCACHE_REMOTE_URL=lm://https://... or lm://2001:db8::1
+	// would crash the engine at startup. effectiveEndpoint applies the
+	// same shape check the admission webhook uses and returns "" for
+	// invalid values, so the existing fail-open branch admits the pod
+	// un-wired and the operator sees the shape error in the response
+	// reason instead of an engine-pod crash log.
+	const ns = "engines"
+	for _, tc := range []struct {
+		name, endpoint string
+	}{
+		{"bad-scheme", "https://cache.example.com:443/api"},
+		{"portless-host", "cache.example.com"},
+		{"embedded-whitespace", "cache example:8200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: ns},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Type:     cachev1alpha1.CacheBackendTypeExternal,
+					Endpoint: tc.endpoint,
+					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+						Engine: "vllm",
+						Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+					},
+					EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+						MatchLabels: map[string]string{"app": "vllm"},
+					},
+				},
+			}
+			s := newScheme(t)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+			reg := adapterruntime.DefaultRegistry()
+			reg.Register(externaladapter.NewAdapter())
+			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+			pod := vllmEnginePod("engine", map[string]string{"app": "vllm"})
+			req := newRequest(t, pod, ns)
+			resp := h.Handle(context.Background(), req)
+			if !resp.Allowed {
+				t.Fatalf("expected Allowed (fail-open), got %+v", resp.Result)
+			}
+			// Zero patches — no injection happened.
+			if len(resp.Patches) != 0 {
+				t.Fatalf("expected no patches on invalid endpoint; got %d: %v", len(resp.Patches), resp.Patches)
+			}
+			// Response message must name spec.endpoint, not status.endpoint.
+			if msg := resp.Result.Message; !strings.Contains(msg, "spec.endpoint") {
+				t.Fatalf("fail-open reason should mention spec.endpoint for External; got %q", msg)
+			}
+		})
+	}
+}
+
+func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
+	// Pod admission is CREATE-only — if an engine pod admits before the
+	// controller has mirrored spec.endpoint into status.endpoint, the
+	// webhook would fail-open and leave the pod unwired *forever* (no
+	// re-admission on subsequent status updates). For External CRs the
+	// webhook sources the endpoint from spec.endpoint directly (NOT
+	// "falling back" — effectiveEndpoint type-scopes the source so
+	// External never reads status.endpoint, preventing wiring against a
+	// stale mirror during an endpoint update). Without this, applying
+	// the External CacheBackend and the engine Deployment in the same
+	// kubectl apply silently produces unwired engine pods.
+	const (
+		ns       = "engines"
+		endpoint = "external-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: endpoint,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		// Deliberately no Status: simulates the race where pod admission
+		// fires before reconcileExternal has patched status.endpoint.
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-race", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
+}
+
+func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
+	// When the operator updates spec.endpoint for an External CR but a
+	// new engine pod admits before the reconciler patches status, the
+	// pod must be wired to the NEW spec.endpoint — not the stale
+	// status.endpoint. Pod admission is CREATE-only, so a pod wired to
+	// the old address on admission stays misrouted forever.
+	const (
+		ns          = "engines"
+		freshSpec   = "new-cache.example:8200"
+		staleStatus = "old-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: freshSpec,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: staleStatus},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-stale", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	// Must use spec.endpoint, NOT the stale status.endpoint.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+freshSpec)
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
+			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.endpoint %q", staleStatus, freshSpec)
+		}
+	}
+}
+
+func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
+	// Admission lowercases the scheme during shape validation, so
+	// `LM://cache.example:8200` admits. The pod webhook must then
+	// normalise to lower-case `lm://` at injection — passing the
+	// operator-typed value through verbatim would produce
+	// `LMCACHE_REMOTE_URL=lm://LM://cache.example:8200`, a double-
+	// prefix the engine connector rejects.
+	const (
+		ns            = "engines"
+		operatorTyped = "LM://cache.example.com:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-up", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: operatorTyped,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-up", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	// Must be the canonical lower-case scheme, with the original
+	// host portion preserved verbatim.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://cache.example.com:8200")
+}
+
+func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
+	// A CR that predates the trim-in-reconciler change could carry a
+	// whitespace-only status.endpoint. The webhook MUST treat that as
+	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
+	// the engine connector would reject at runtime. The defensive trim
+	// applies to whichever field effectiveEndpoint reads for the CR's
+	// type — spec.endpoint for External (which never reads status), and
+	// status.endpoint for managed.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "   "},
+	}
+
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-ws", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+			t.Fatalf("whitespace status.endpoint must not become injected env; got %s=%q", e.Name, e.Value)
+		}
+	}
+}
+
+func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
+	// Counterpart to the External fallback: managed backends MUST wait
+	// for status.endpoint (the reconciler builds it from the rendered
+	// Service). spec.endpoint is admission-rejected on managed types,
+	// so there's nothing else to fall back on — the webhook must
+	// fail-open without injecting until status catches up.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		// No Status.Endpoint published yet.
+	}
+
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-managed", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got %+v", resp.Result)
+	}
+	// The pod must NOT have LMCACHE_REMOTE_URL because there's no
+	// endpoint to wire it to — the fallback is External-only.
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if len(mutated.Spec.Containers) == 0 {
+		t.Fatalf("pod has no containers after admission")
+	}
+	for _, e := range mutated.Spec.Containers[0].Env {
+		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+			t.Fatalf("managed CR with no status.endpoint must NOT trigger injection; got %s=%q", e.Name, e.Value)
+		}
+	}
+}
+
+// containsArgPairLocal mirrors the helper in envtest_integration_test.go;
+// the two test files don't share state (envtest skips without
+// KUBEBUILDER_ASSETS) so each file has its own copy.
+func containsArgPairLocal(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {

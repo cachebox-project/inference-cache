@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -57,6 +58,36 @@ const (
 	eventReasonBackendRecovered  = "BackendRecovered"
 	eventReasonFailClosedEnabled = "FailClosedEnabled"
 	eventReasonFailOpenRestored  = "FailOpenRestored"
+)
+
+// Condition reasons published on a CacheBackend's Ready condition. Stable
+// strings so consumers (the CacheIndex poller, the future readiness gate
+// that watches lastEventAt, operator dashboards) can switch on reason
+// instead of regexing the message.
+const (
+	// conditionReasonExternalEndpointAccepted is set when an External
+	// CacheBackend's spec.endpoint is non-empty: admission accepted the
+	// operator-supplied endpoint and we trust it without probing
+	// reachability. A future enhancement could degrade Ready on a
+	// connection-probe failure, but that's out of scope for the
+	// passthrough adapter today (fail-soft, trust the operator).
+	conditionReasonExternalEndpointAccepted = "ExternalEndpointAccepted"
+	// conditionReasonExternalEndpointMissing is set defensively when an
+	// External CacheBackend has spec.endpoint empty. Admission rejects
+	// this at the validating webhook, so reaching this branch means a CR
+	// already in etcd from before the webhook was installed.
+	conditionReasonExternalEndpointMissing = "ExternalEndpointMissing"
+	// conditionReasonExternalEndpointInvalid is set defensively when an
+	// External CacheBackend has a non-empty spec.endpoint that fails the
+	// shared shape check (bad scheme, no port, embedded whitespace,
+	// unbracketed IPv6, …). Current admission rejects all of these at
+	// the validating webhook; the reason is reachable only for a CR
+	// stored before the relevant shape rule shipped. Status reflects
+	// the gap loudly rather than advertising the malformed value as
+	// Ready=True (which would let the pod webhook then inject an
+	// LMCACHE_REMOTE_URL the engine connector refuses at startup —
+	// turning a cache misconfiguration into a serving outage).
+	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
 )
 
 // CacheBackendReconciler reconciles a CacheBackend object.
@@ -162,15 +193,90 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	return r.reconcileManaged(ctx, logger, backend, adapter)
 }
 
-// reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
+// reconcileExternal mirrors a pre-existing backend's configured endpoint to
+// status and marks the backend Ready: there is no Service to wait on, so
+// admission acceptance of spec.endpoint is the only readiness signal the
+// controller has. status.health flips to Ready in lock step so the
+// printcolumn surface (kubectl get cb) doesn't show a blank Health column
+// for External CRs that admission has already accepted.
+//
+// Three terminal states, each driven by the SAME shape rule the
+// validating webhook applies on CREATE/UPDATE — so the reconciler is
+// honest about CRs that were stored under a laxer rule set:
+//
+//   - spec.endpoint empty                  → Ready=False/ExternalEndpointMissing
+//   - spec.endpoint set but malformed      → Ready=False/ExternalEndpointInvalid
+//   - spec.endpoint set and well-formed    → Ready=True/ExternalEndpointAccepted
+//
+// The "invalid" branch matters because admission's shape rule tightened
+// over the life of the CRD (added port-required, bracket-required-IPv6,
+// no-embedded-whitespace, etc. as we learned what the engine connector
+// rejects). A pre-existing stored CR carrying e.g. `https://...` or a
+// portless host would otherwise be marked Ready=True/ExternalEndpointAccepted
+// here; the pod webhook would then read spec.endpoint, prepend `lm://`,
+// and inject a URL the engine can't parse — turning a cache
+// misconfiguration into a serving outage. Publishing Ready=False with a
+// specific reason names the gap, and the pod webhook short-circuits on
+// the same check (returns no-injection, fail-open).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = backend.Spec.Endpoint
-		backend.Status.Health = ""
+		// TrimSpace before every decision. Admission rejects a
+		// whitespace-only endpoint at write time, but a pre-existing
+		// CR in etcd from before admission was installed can still
+		// carry one. Publishing the trimmed value as status.endpoint
+		// means the pod webhook's `endpoint == ""` short-circuit
+		// naturally catches whitespace too without a second TrimSpace
+		// at the consumer.
+		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
+		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
+
+		// Decide the Ready reason + message in one place so the
+		// Progressing/Ready conditions stay in lockstep.
+		var (
+			readyStatus = metav1.ConditionFalse
+			readyReason string
+			readyMsg    string
+			health      = cachev1alpha1.CacheBackendHealthPending
+		)
+		switch {
+		case endpoint == "":
+			readyReason = conditionReasonExternalEndpointMissing
+			readyMsg = "spec.endpoint is empty; set it to the address of the pre-existing backend"
+		default:
+			// Use the same shape validator the admission webhook
+			// uses; surface the helper's message verbatim so an
+			// operator running kubectl describe sees the same
+			// shape complaint they would get on a fresh kubectl
+			// apply. Pass the raw spec.Endpoint so the helper
+			// applies its own TrimSpace consistently.
+			if err := adapterruntime.ValidateLMCacheEndpoint(backend.Spec.Endpoint); err != nil {
+				readyReason = conditionReasonExternalEndpointInvalid
+				readyMsg = "spec." + err.Error()
+				break
+			}
+			readyStatus = metav1.ConditionTrue
+			readyReason = conditionReasonExternalEndpointAccepted
+			readyMsg = "External endpoint accepted; controller does not provision cache pods for External backends"
+			health = cachev1alpha1.CacheBackendHealthReady
+		}
+
+		backend.Status.Health = health
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             readyReason,
+			Message:            "External backends complete admission immediately",
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             readyStatus,
+			Reason:             readyReason,
+			Message:            readyMsg,
+			ObservedGeneration: backend.Generation,
+		})
 	})
 }
 

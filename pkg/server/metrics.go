@@ -6,6 +6,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/cachebox-project/inference-cache/pkg/server/auth"
 )
 
 // metricNamespace is the prefix for this project's own metrics (tech spec
@@ -32,6 +34,7 @@ type serverMetrics struct {
 	lookupCalls     *prometheus.CounterVec
 	lookupLatency   *prometheus.HistogramVec
 	tenantEvictions *prometheus.CounterVec
+	snapshotAuth    *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -60,8 +63,13 @@ func newServerMetrics() *serverMetrics {
 	tenantEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "tenant_evictions_total",
-		Help:      "Index entries evicted to enforce a CacheTenant quota, by tenant and reason.",
+		Help:      "Index prefixes evicted to enforce a CacheTenant quota, by tenant and reason.",
 	}, []string{"tenant_id", "reason"})
+	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "snapshot_auth_total",
+		Help:      "Authentication outcomes for the internal /snapshot endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
@@ -70,6 +78,7 @@ func newServerMetrics() *serverMetrics {
 		lookupCalls,
 		lookupLatency,
 		tenantEvictions,
+		snapshotAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -81,7 +90,14 @@ func newServerMetrics() *serverMetrics {
 		lookupCalls:     lookupCalls,
 		lookupLatency:   lookupLatency,
 		tenantEvictions: tenantEvictions,
+		snapshotAuth:    snapshotAuth,
 	}
+}
+
+// RecordAuthResult is invoked once per /snapshot request by the auth
+// middleware. Satisfies auth.ResultRecorder.
+func (m *serverMetrics) RecordAuthResult(result auth.Result) {
+	m.snapshotAuth.WithLabelValues(string(result)).Inc()
 }
 
 // SetIndexEntries reports the live prefix-entry count for a model. It satisfies

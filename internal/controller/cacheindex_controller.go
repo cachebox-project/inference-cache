@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -31,6 +33,12 @@ import (
 const (
 	DefaultCacheIndexName  = "cluster-default"
 	DefaultRefreshInterval = 30 * time.Second
+
+	// DefaultBearerTokenPath is the standard in-cluster location kubelet
+	// projects the controller's ServiceAccount token to. It is a tmpfs
+	// file kubelet rewrites on rotation; the poller re-reads on every
+	// scrape so a rotated token is picked up immediately.
+	DefaultBearerTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 )
 
 // CacheIndexPoller periodically scrapes the server's internal /snapshot endpoint
@@ -42,10 +50,19 @@ const (
 type CacheIndexPoller struct {
 	Client      client.Client
 	Log         logr.Logger
-	SnapshotURL string        // e.g. http://inference-cache-server:8080/snapshot
+	SnapshotURL string        // e.g. http://inference-cache-server:8081/snapshot
 	Interval    time.Duration // refresh cadence; <=0 → DefaultRefreshInterval
 	HTTPClient  *http.Client  // optional; injected in tests
 	Name        string        // singleton CR name; "" → DefaultCacheIndexName
+	// BearerTokenPath is the file the projected ServiceAccount token is
+	// mounted at. "" → DefaultBearerTokenPath. A path that does not exist is
+	// treated as "no token configured" — the scrape goes out unauthenticated
+	// and the server's 401 surfaces as a normal fail-soft skipped tick.
+	// Local development without a token mounted still works this way. A
+	// present-but-unreadable token (permissions / IO error) is surfaced as
+	// an error in the controller's log so the operator sees the real cause
+	// instead of misattributing the 401 to a server-side identity mismatch.
+	BearerTokenPath string
 }
 
 // The poller reads via the manager's cached client (a Get is backed by an
@@ -112,7 +129,19 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 		return fmt.Errorf("get CacheIndex %q: %w", name, err)
 	}
 
-	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL)
+	// bearerToken errors are surfaced separately from the scrape so a missing
+	// or unreadable projected token shows up in the controller's logs with the
+	// expected path, rather than silently degrading to an unauthenticated
+	// scrape that the server rejects as 401. The token is still treated as
+	// optional (empty token → unauthenticated request, useful for local-dev
+	// runs where the controller isn't pod-scoped) but a real read failure
+	// (e.g. file exists but unreadable) is no longer indistinguishable from
+	// "no token configured."
+	token, tokenErr := p.bearerToken()
+	if tokenErr != nil {
+		p.logger(ctx).Error(tokenErr, "read bearer token; scraping unauthenticated")
+	}
+	snap, err := fetchSnapshot(ctx, p.httpClient(), p.SnapshotURL, token)
 	if err != nil {
 		// Soft-state: a single failed scrape must NOT clear the cluster-wide
 		// CacheIndex status nor the per-backend indexParticipation projection.
@@ -439,11 +468,45 @@ func (p *CacheIndexPoller) logger(ctx context.Context) logr.Logger {
 	return log.FromContext(ctx)
 }
 
-// fetchSnapshot GETs and decodes the server's /snapshot JSON.
-func fetchSnapshot(ctx context.Context, hc *http.Client, url string) (index.Snapshot, error) {
+// bearerToken reads the projected ServiceAccount token. Re-read on every
+// scrape so kubelet rotations are picked up without process restarts; the
+// file is tmpfs so the read is cheap.
+//
+// Error semantics:
+//   - File missing → ("", nil). Treated as "no token configured" so a local
+//     out-of-cluster run still flows through the same code path; the scrape
+//     goes out unauthenticated and the server rejects 401, which is the
+//     correct posture for that environment.
+//   - File present but unreadable (permissions, IO error, etc.) →
+//     ("", wrappedError). Caller surfaces this in the log so the operator
+//     sees the real cause instead of misattributing the eventual 401 to a
+//     server-side identity mismatch.
+func (p *CacheIndexPoller) bearerToken() (string, error) {
+	path := p.BearerTokenPath
+	if path == "" {
+		path = DefaultBearerTokenPath
+	}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Local-dev / out-of-cluster: no token mounted is expected.
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("read bearer token %q: %w", path, err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// fetchSnapshot GETs and decodes the server's /snapshot JSON. When token is
+// non-empty it is sent as an Authorization: Bearer header so the server's
+// auth middleware can validate it via TokenReview.
+func fetchSnapshot(ctx context.Context, hc *http.Client, url, token string) (index.Snapshot, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return index.Snapshot{}, fmt.Errorf("build snapshot request %q: %w", url, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

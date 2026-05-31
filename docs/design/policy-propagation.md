@@ -22,9 +22,14 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` | watch event + tick |
 
-Both sit on the server's HTTP port (`:8080`), alongside `/healthz`,
-`/readyz`, `/metrics`. The endpoints are internal — securing them
-(NetworkPolicy + authn) is tracked separately.
+`/policy` sits on the server's open HTTP port (`:8080`), alongside
+`/healthz`, `/readyz`, `/metrics`. `/snapshot` is on a separate internal
+listener (`:8081`) gated by TokenReview-backed bearer auth and a
+NetworkPolicy that restricts ingress to the controller's pod selector —
+both endpoints are still internal but the snapshot path now has two
+independent gates (L7 authn + L3/L4 isolation), because it leaks
+per-tenant cache metadata under the cluster's trust boundary while
+`/policy` is a push the controller authors anyway.
 
 ## Snapshot semantics
 
@@ -186,5 +191,7 @@ out together and the periodic re-push reconciles any transient skew.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
-- Endpoint hardening (NetworkPolicy, authn) for `/snapshot` and
-  `/policy` — tracked separately.
+- Endpoint hardening for `/policy` — out of scope here; the controller
+  is the only authorized writer and pushes over in-cluster cleartext.
+  `/snapshot` hardening (bearer auth + NetworkPolicy) ships alongside
+  this work (see the snapshot listener at `:8081` above).

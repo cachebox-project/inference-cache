@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -124,7 +125,7 @@ func TestFetchSnapshot(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL)
+	got, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, "")
 	if err != nil {
 		t.Fatalf("fetchSnapshot: %v", err)
 	}
@@ -139,8 +140,91 @@ func TestFetchSnapshotNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL); err == nil {
+	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, ""); err == nil {
 		t.Fatal("expected error on non-200 snapshot response")
+	}
+}
+
+// TestFetchSnapshotSendsBearerToken proves the scrape carries the SA token in
+// the Authorization header — that's what the server's TokenReview middleware
+// looks at. Pins the over-the-wire contract between the poller and the
+// auth-gated /snapshot listener.
+func TestFetchSnapshotSendsBearerToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(index.Snapshot{TotalPrefixes: 1})
+	}))
+	defer srv.Close()
+
+	if _, err := fetchSnapshot(context.Background(), srv.Client(), srv.URL, "test-token"); err != nil {
+		t.Fatalf("fetchSnapshot: %v", err)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer test-token")
+	}
+}
+
+// TestBearerToken_ReadsAndTrimsFile checks that the poller re-reads its
+// projected SA token from disk and trims trailing whitespace — the projected
+// token kubelet writes ends with a newline.
+func TestBearerToken_ReadsAndTrimsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("a-real-token\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	p := &CacheIndexPoller{BearerTokenPath: path}
+	got, err := p.bearerToken()
+	if err != nil {
+		t.Fatalf("bearerToken() unexpected error: %v", err)
+	}
+	if got != "a-real-token" {
+		t.Fatalf("bearerToken() = %q, want %q", got, "a-real-token")
+	}
+
+	// Missing path → ("", nil): treated as "no token configured" so a
+	// local out-of-cluster run still proceeds (server rejects 401, poller
+	// stays running). This must NOT be conflated with a real read error.
+	p.BearerTokenPath = dir + "/does-not-exist"
+	got, err = p.bearerToken()
+	if err != nil {
+		t.Fatalf("bearerToken() on missing file: unexpected error %v", err)
+	}
+	if got != "" {
+		t.Fatalf("bearerToken() on missing file = %q, want \"\"", got)
+	}
+}
+
+// TestBearerToken_UnreadableFileReturnsError pins the should-fix semantics:
+// a real read failure (file present but unreadable) surfaces as an error so
+// the operator's log shows the path + cause, instead of silently degrading
+// to an unauth scrape that the server rejects as a generic 401.
+func TestBearerToken_UnreadableFileReturnsError(t *testing.T) {
+	// chmod-0 is a portable way to make a present file unreadable for the
+	// running user (unless we're root — skip then).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; chmod 0 does not deny read")
+	}
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("ignored"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod token: %v", err)
+	}
+
+	p := &CacheIndexPoller{BearerTokenPath: path}
+	got, err := p.bearerToken()
+	if err == nil {
+		t.Fatalf("bearerToken() on unreadable file: got %q + nil, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("bearerToken() on unreadable file = %q, want \"\"", got)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("bearerToken() error %q does not mention path %q", err, path)
 	}
 }
 

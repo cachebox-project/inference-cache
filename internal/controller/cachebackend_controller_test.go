@@ -548,6 +548,160 @@ func TestReconcileExternalMirrorsEndpointToStatus(t *testing.T) {
 	}
 }
 
+func TestReconcileExternalSetsReadyTrue(t *testing.T) {
+	// External admission accepts spec.endpoint at write time, so the
+	// readiness signal is "operator says this endpoint exists and we
+	// accepted it" — there's no Service to wait on. Consumers (the
+	// future readiness gate, kubectl get cb, the indexParticipation
+	// poller for External) must see Ready=True.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "default", Generation: 3},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "ext.default.svc:8080",
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext", "default")
+
+	got := getBackend(t, r, "ext", "default")
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("status.health = %q, want %q", got.Status.Health, cachev1alpha1.CacheBackendHealthReady)
+	}
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatalf("Ready condition missing; conditions = %v", got.Status.Conditions)
+	}
+	if ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready status = %q, want %q", ready.Status, metav1.ConditionTrue)
+	}
+	if ready.Reason != "ExternalEndpointAccepted" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointAccepted", ready.Reason)
+	}
+	if ready.ObservedGeneration != 3 {
+		t.Fatalf("Ready.observedGeneration = %d, want 3", ready.ObservedGeneration)
+	}
+	progressing := findCondition(got.Status.Conditions, "Progressing")
+	if progressing == nil {
+		t.Fatalf("Progressing condition missing; conditions = %v", got.Status.Conditions)
+	}
+	if progressing.Status != metav1.ConditionFalse {
+		t.Fatalf("Progressing status = %q, want %q", progressing.Status, metav1.ConditionFalse)
+	}
+}
+
+func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
+	// An External CR with a non-empty but malformed spec.endpoint must
+	// be marked Ready=False/ExternalEndpointInvalid — current admission
+	// rejects these at write time, but a CR stored before the shape
+	// rule shipped can still carry e.g. `https://...`. Without this,
+	// the controller would advertise the broken value as Ready=True
+	// and the pod webhook would inject a URL the engine can't parse.
+	scheme := newScheme(t)
+	for _, tc := range []struct {
+		name, endpoint string
+	}{
+		{"bad-scheme", "https://cache.example.com:443/api"},
+		{"portless-host", "cache.example.com"},
+		{"unbracketed-ipv6", "2001:db8::1"},
+		{"embedded-whitespace", "cache example:8200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: "default"},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Type:     cachev1alpha1.CacheBackendTypeExternal,
+					Endpoint: tc.endpoint,
+				},
+			}
+			r := newReconciler(scheme, cb)
+			reconcile(t, r, "ext-bad", "default")
+
+			got := getBackend(t, r, "ext-bad", "default")
+			ready := findCondition(got.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionFalse {
+				t.Fatalf("Ready condition = %+v, want Status=False", ready)
+			}
+			if ready.Reason != "ExternalEndpointInvalid" {
+				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
+			}
+			if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+				t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+			}
+		})
+	}
+}
+
+func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
+	// Admission rejects this case at the webhook, but a CR already in etcd
+	// from before the webhook was installed must still publish a visible
+	// Ready=False so operators can see why the CR isn't usable instead of
+	// finding the condition simply absent.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-no-ep", Namespace: "default"},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext-no-ep", "default")
+
+	got := getBackend(t, r, "ext-no-ep", "default")
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready condition = %+v, want Status=False", ready)
+	}
+	if ready.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
+	}
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+	}
+	// Progressing reason mirrors Ready's reason on the missing path so
+	// `kubectl describe` shows a coherent pair.
+	progressing := findCondition(got.Status.Conditions, "Progressing")
+	if progressing == nil || progressing.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Progressing = %+v, want reason ExternalEndpointMissing", progressing)
+	}
+}
+
+func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {
+	// Admission rejects a whitespace-only spec.endpoint, but a CR already
+	// in etcd from before admission was installed can still carry one.
+	// The reconciler must treat it as missing — publishing a raw
+	// "LMCACHE_REMOTE_URL=lm://   " to the engine env is worse than
+	// publishing nothing, and Ready=True on whitespace would mislead
+	// every downstream consumer.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-ws", Namespace: "default"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "   \t  ",
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "ext-ws", "default")
+
+	got := getBackend(t, r, "ext-ws", "default")
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty (whitespace must be trimmed)", got.Status.Endpoint)
+	}
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready = %+v, want Status=False", ready)
+	}
+	if ready.Reason != "ExternalEndpointMissing" {
+		t.Fatalf("Ready reason = %q, want ExternalEndpointMissing", ready.Reason)
+	}
+	if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+		t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+	}
+}
+
 func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
