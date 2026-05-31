@@ -30,9 +30,9 @@ hard-rejected at admission.
 ## Baseline — what the vLLM + LMCache adapter injects today
 
 For a `CacheBackend` named `qwen-demo` in namespace `default`, with no
-`engineOverrides` block set, the C6 mutating Pod webhook stamps the
-following on every matched engine container (the `vllm` container, or the
-sole container if the pod has only one):
+`engineOverrides` block set, the controller's mutating Pod admission
+webhook stamps the following on every matched engine container (the
+`vllm` container, or the sole container if the pod has only one):
 
 ```yaml
 # vLLM container after webhook mutation — NO engineOverrides
@@ -216,6 +216,11 @@ field-scoped error that names both the offending env and the adapter, so
 the operator gets the failure at `kubectl apply` rather than discovering a
 silently-wrong wiring later.
 
+Concretely, take the paired sample at
+`config/samples/cachebackend-with-override.yaml` and replace the
+`engineOverrides` block on the `qwen-demo` CacheBackend with the
+following:
+
 ```yaml
 spec:
   integration:
@@ -226,9 +231,11 @@ spec:
           value: lm://my-other-cache.default.svc.cluster.local:65432
 ```
 
+Save the edited file as `bad-override.yaml` and apply:
+
 ```text
-$ kubectl apply -f cachebackend-with-override.yaml
-Error from server (Invalid): error when creating "cachebackend-with-override.yaml": admission webhook "vcachebackend.inferencecache.io" denied the request: CacheBackend.inferencecache.io "qwen-demo" is invalid: spec.integration.engineOverrides.env[0].name: Forbidden: env "LMCACHE_REMOTE_URL" is reserved by the "vllm" runtime adapter and cannot be overridden or suppressed via spec.integration.engineOverrides; the adapter strictly requires this env for the integration to function
+$ kubectl apply -f bad-override.yaml
+Error from server (Invalid): error when creating "bad-override.yaml": admission webhook "vcachebackend.inferencecache.io" denied the request: CacheBackend.inferencecache.io "qwen-demo" is invalid: spec.integration.engineOverrides.env[0].name: Forbidden: env "LMCACHE_REMOTE_URL" is reserved by the "vllm" runtime adapter and cannot be overridden or suppressed via spec.integration.engineOverrides; the adapter strictly requires this env for the integration to function
 ```
 
 The same shape applies to `suppressEnv` overlap, `args` overlap (e.g.

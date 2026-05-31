@@ -1,7 +1,7 @@
-# Same shape as cachebackend-with-engine.yaml (the engine-binding paired
-# sample) plus a small `spec.integration.engineOverrides` block showing how
-# to tune chunk size and add a debug env WITHOUT losing the rest of the
-# LMCache integration the C6 webhook injects.
+# Paired CacheBackend + matching engine Deployment that exercises a small
+# `spec.integration.engineOverrides` block. Shows how to tune chunk size
+# and add a debug env WITHOUT losing the rest of the LMCache integration
+# the controller's mutating Pod admission webhook injects.
 #
 # The override block is intentionally small (two env entries) — the goal
 # is to demonstrate the cause -> effect of `engineOverrides`, not to
@@ -10,10 +10,23 @@
 # upsert, env append, suppressEnv, args, suppressArgs) and five worked
 # before/after examples.
 #
-# Apply: kubectl apply -f config/samples/cachebackend-with-override.yaml
+# Applying:
 #
-# After admission + webhook mutation, `kubectl describe pod -l app=qwen-demo`
-# should show the engine container carrying:
+#   kubectl apply -f config/samples/cachebackend-with-override.yaml
+#
+# The pod-mutating webhook fail-opens when CacheBackend.status.endpoint is
+# still empty, so a fresh-cluster apply that races the CacheBackend
+# reconciler can create the first engine pod BEFORE the LMCache server
+# endpoint is published, leaving that first pod unwired. If the engine
+# container env is missing the canonical LMCache_* / VLLM_USE_V1 entries
+# after a first apply, wait for `kubectl get cachebackend qwen-demo -o
+# jsonpath='{.status.endpoint}'` to be non-empty and then
+# `kubectl rollout restart deployment/qwen-demo` so the next pod admits
+# with status.endpoint populated.
+#
+# Once admitted with a non-empty status.endpoint,
+# `kubectl describe pod -l app=qwen-demo` should show the engine
+# container carrying:
 #   LMCACHE_CHUNK_SIZE = "64"     (override replaced the canonical "256")
 #   LMCACHE_LOG_LEVEL  = "DEBUG"  (appended; adapter doesn't inject this)
 # plus the rest of the canonical LMCache wiring (LMCACHE_REMOTE_URL,
@@ -33,10 +46,11 @@ spec:
     # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
     engine: vllm
     role: ReadWrite
-    # Amend the engine container the C6 webhook injects. Reserved entries
-    # (--kv-transfer-config, LMCACHE_REMOTE_URL, VLLM_USE_V1,
-    # INFERENCECACHE_FAIL_OPEN) are HARD-REJECTED at admission with a
-    # field-scoped error; non-reserved entries pass through and merge.
+    # Amend the engine container the mutating Pod webhook injects.
+    # Reserved entries (--kv-transfer-config, LMCACHE_REMOTE_URL,
+    # VLLM_USE_V1, INFERENCECACHE_FAIL_OPEN) are HARD-REJECTED at
+    # admission with a field-scoped error; non-reserved entries pass
+    # through and merge.
     engineOverrides:
       env:
         # Upsert: name matches an adapter-injected env, so the canonical
@@ -60,16 +74,17 @@ spec:
     # Pin to a real digest for non-local runs.
     serverImage: lmcache/standalone:latest
 ---
-# Engine Deployment. Same shape the engine-binding paired sample uses so
-# either file applies standalone. The C6 mutating Pod webhook intercepts
-# pods matching the CacheBackend's `engineSelector` and injects the
-# LMCache wiring + (above) the engineOverrides amendments onto the `vllm`
-# container at admission time.
+# Engine Deployment. Either YAML document in this file can be applied
+# standalone. The mutating Pod admission webhook intercepts pods matching
+# the CacheBackend's `engineSelector` and injects the LMCache wiring +
+# (above) the engineOverrides amendments onto the `vllm` container at
+# admission time.
 #
 # CPU vLLM image — verified end-to-end on a kind node (see
 # docs/reference-stack/manifests/cpu-local/deployment.yaml for the same
-# flags + memory-budget caveats). Swap to a GPU image and add a
-# `nvidia.com/gpu: 1` limit for production.
+# flags + memory-budget caveats). The image is arch-tagged: this manifest
+# pins -arm64, swap to `vllm/vllm-openai-cpu:latest-x86_64` on x86 hosts.
+# Swap to a GPU image and add a `nvidia.com/gpu: 1` limit for production.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
