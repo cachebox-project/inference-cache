@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -15,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +56,8 @@ type CacheIndexPoller struct {
 // scrape (see [refreshCacheBackendParticipation]).
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cacheindices/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachetenants,verbs=get;list;watch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachetenants/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -117,23 +121,74 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 	}
 	desired := buildCacheIndexStatus(snap, p.SnapshotURL, time.Now())
 
-	// Project the same snapshot into each CacheBackend's status.indexParticipation
-	// BEFORE we touch the cluster-wide CacheIndex, so the projection runs even
-	// if the CacheIndex update itself errors (e.g. transient conflict). Errors
-	// during projection are non-fatal — log and continue — to keep parity with
-	// the single failing-replica → single backend-skipped fail-soft model.
+	// Three projections of ONE scrape, so the cluster-wide CacheIndex, the
+	// per-CacheBackend indexParticipation, and the per-CacheTenant statuses can
+	// never disagree with each other.
+
+	// Projection 1 — per-CacheBackend status.indexParticipation. Run it BEFORE
+	// the cluster-wide CacheIndex write so it still happens if that write errors
+	// (e.g. transient conflict). Non-fatal — log and continue (fail-soft per
+	// backend, matching the single failing-replica → single backend-skipped model).
 	if perr := p.refreshCacheBackendParticipation(ctx, snap); perr != nil {
 		p.logger(ctx).Error(perr, "project per-backend index participation")
 	}
 
-	if statusEqual(ci.Status, desired) {
-		return nil
+	// Projection 2 — cluster-wide CacheIndex status, write-only-on-change.
+	if !statusEqual(ci.Status, desired) {
+		ci.Status = desired
+		if err := p.Client.Status().Update(ctx, &ci); err != nil {
+			return fmt.Errorf("update CacheIndex %q status: %w", name, err)
+		}
 	}
-	ci.Status = desired
-	if err := p.Client.Status().Update(ctx, &ci); err != nil {
-		return fmt.Errorf("update CacheIndex %q status: %w", name, err)
+
+	// Projection 3 — per-CacheTenant status.
+	return p.reconcileTenantStatuses(ctx, snap)
+}
+
+// reconcileTenantStatuses writes each CacheTenant's observed status from the
+// snapshot's per-tenant aggregate. Tenants are matched by spec.tenantID — NOT
+// by metadata.name — because tenantID is the identity an ingest carries and the
+// index aggregates by. Status().Patch write-only-on-change keeps steady traffic
+// from churning resourceVersions (the same discipline as the CacheIndex write
+// and the CacheBackend status writers). A patch failure for one tenant does not
+// abort the others.
+func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap index.Snapshot) error {
+	var tenants cachev1alpha1.CacheTenantList
+	if err := p.Client.List(ctx, &tenants); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // CacheTenant CRD not installed — nothing to project.
+		}
+		return fmt.Errorf("list CacheTenants: %w", err)
 	}
-	return nil
+
+	observedByID := make(map[string]index.TenantSnapshot, len(snap.Tenants))
+	for _, t := range snap.Tenants {
+		observedByID[t.TenantID] = t
+	}
+
+	var errs []error
+	for i := range tenants.Items {
+		ct := &tenants.Items[i]
+		// We only reach here after a SUCCESSFUL scrape, so a tenant missing from
+		// snap.Tenants genuinely holds zero distinct prefixes right now (it has no
+		// activity, was evicted to zero, or has a zero budget) — that is an
+		// observed 0, not "unknown". Synthesize a zero row so status.indexEntries
+		// reflects 0 rather than staying nil.
+		obs, ok := observedByID[ct.Spec.TenantID]
+		if !ok {
+			obs = index.TenantSnapshot{TenantID: ct.Spec.TenantID}
+		}
+		desired := buildCacheTenantStatus(ct, obs)
+		if cacheTenantStatusEqual(ct.Status, desired) {
+			continue
+		}
+		patched := ct.DeepCopy()
+		patched.Status = desired
+		if err := p.Client.Status().Patch(ctx, patched, client.MergeFrom(ct)); err != nil {
+			errs = append(errs, fmt.Errorf("patch CacheTenant %q status: %w", ct.Name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // refreshCacheBackendParticipation projects the cluster-wide snapshot into each
@@ -476,6 +531,87 @@ func normalizeForCompare(s cachev1alpha1.CacheIndexStatus) cachev1alpha1.CacheIn
 			replicas[i].LastUpdate = metav1.Time{}
 		}
 		s.Replicas = replicas
+	}
+	return s
+}
+
+// Condition types written onto CacheTenant.status.
+const (
+	tenantConditionReady         = "Ready"
+	tenantConditionQuotaExceeded = "QuotaExceeded"
+)
+
+// buildCacheTenantStatus projects one snapshot tenant aggregate onto a
+// CacheTenant's status. It is only called after a successful /snapshot scrape,
+// so obs is always a live reading: the matched snapshot row, or a synthesized
+// zero row when the tenant has no current activity (both are observed values,
+// not "unknown").
+//
+//   - IndexEntries is the live distinct-prefix count (0 for an idle, drained, or
+//     zero-budget tenant). It stays nil only before the first successful scrape
+//     ever writes status — i.e. nil means "not computed yet", not "zero".
+//   - Ready=True: the controller has a live reading for the tenant.
+//   - QuotaExceeded reflects the latest reading against the entry budget.
+//     Enforcement evicts at ingest, so it normally reads False; it can briefly
+//     flip True between an over-budget ingest and the next scrape.
+func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot) cachev1alpha1.CacheTenantStatus {
+	st := cachev1alpha1.CacheTenantStatus{ObservedGeneration: ct.Generation}
+	// Seed from existing conditions so meta.SetStatusCondition keeps each
+	// condition's LastTransitionTime stable when its Status doesn't flip.
+	if ct.Status.Conditions != nil {
+		st.Conditions = append([]metav1.Condition(nil), ct.Status.Conditions...)
+	}
+
+	indexEntries := obs.IndexEntries
+	entries := indexEntries
+	st.IndexEntries = &entries
+
+	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+		Type:               tenantConditionReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Observed",
+		Message:            "tenant observed in the server snapshot",
+		ObservedGeneration: ct.Generation,
+	})
+
+	quotaStatus, quotaReason, quotaMsg := metav1.ConditionFalse, "NoQuota", "no index-entry quota configured"
+	if ct.Spec.Quota != nil && ct.Spec.Quota.MaxIndexEntries != nil {
+		budget := *ct.Spec.Quota.MaxIndexEntries
+		if indexEntries > budget {
+			quotaStatus = metav1.ConditionTrue
+			quotaReason = "OverEntryBudget"
+			quotaMsg = fmt.Sprintf("index entries %d exceed budget %d", indexEntries, budget)
+		} else {
+			quotaReason = "WithinBudget"
+			quotaMsg = fmt.Sprintf("index entries within budget %d", budget)
+		}
+	}
+	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+		Type:               tenantConditionQuotaExceeded,
+		Status:             quotaStatus,
+		Reason:             quotaReason,
+		Message:            quotaMsg,
+		ObservedGeneration: ct.Generation,
+	})
+
+	return st
+}
+
+// cacheTenantStatusEqual compares two tenant statuses ignoring each condition's
+// LastTransitionTime, so a no-op reconcile (same Status/Reason/Message) doesn't
+// patch and churn resourceVersions.
+func cacheTenantStatusEqual(a, b cachev1alpha1.CacheTenantStatus) bool {
+	return reflect.DeepEqual(normalizeTenantForCompare(a), normalizeTenantForCompare(b))
+}
+
+func normalizeTenantForCompare(s cachev1alpha1.CacheTenantStatus) cachev1alpha1.CacheTenantStatus {
+	if s.Conditions != nil {
+		conds := make([]metav1.Condition, len(s.Conditions))
+		copy(conds, s.Conditions)
+		for i := range conds {
+			conds[i].LastTransitionTime = metav1.Time{}
+		}
+		s.Conditions = conds
 	}
 	return s
 }

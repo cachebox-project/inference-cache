@@ -986,3 +986,117 @@ func TestRefreshCreatesSingletonEvenWhenServerDown(t *testing.T) {
 		t.Fatalf("singleton CacheIndex should exist even when the server is down: %v", err)
 	}
 }
+
+func tenantCond(ct cachev1alpha1.CacheTenant, condType string) (metav1.Condition, bool) {
+	for _, c := range ct.Status.Conditions {
+		if c.Type == condType {
+			return c, true
+		}
+	}
+	return metav1.Condition{}, false
+}
+
+func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	maxEntries := int64(3)
+	ct := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "ct", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "team-vision", // matched by tenantID, NOT metadata.name
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &maxEntries},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(ct).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+	get := func() cachev1alpha1.CacheTenant {
+		var out cachev1alpha1.CacheTenant
+		if err := cl.Get(ctx, types.NamespacedName{Name: "ct", Namespace: "team-a"}, &out); err != nil {
+			t.Fatalf("get CacheTenant: %v", err)
+		}
+		return out
+	}
+
+	// Observed under budget: Ready=True, QuotaExceeded=False, indexEntries=2.
+	under := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 2}}}
+	if err := p.reconcileTenantStatuses(ctx, under); err != nil {
+		t.Fatalf("reconcile (under): %v", err)
+	}
+	got := get()
+	if got.Status.IndexEntries == nil || *got.Status.IndexEntries != 2 {
+		t.Fatalf("indexEntries = %v, want 2", got.Status.IndexEntries)
+	}
+	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True", c)
+	}
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False", c)
+	}
+
+	// Observed over budget: QuotaExceeded flaps True (OverEntryBudget).
+	over := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 5}}}
+	if err := p.reconcileTenantStatuses(ctx, over); err != nil {
+		t.Fatalf("reconcile (over): %v", err)
+	}
+	got = get()
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionTrue || c.Reason != "OverEntryBudget" {
+		t.Fatalf("QuotaExceeded = %+v, want True/OverEntryBudget", c)
+	}
+
+	// Back under budget: QuotaExceeded resets to False.
+	if err := p.reconcileTenantStatuses(ctx, under); err != nil {
+		t.Fatalf("reconcile (recover): %v", err)
+	}
+	if c, _ := tenantCond(get(), tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False after dropping under budget", c)
+	}
+}
+
+func TestReconcileTenantStatusesAbsentTenantObservedAsZero(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	maxEntries := int64(5)
+	ct := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "ct", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "team-quiet",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &maxEntries},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(ct).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+
+	// A successful scrape with no row for team-quiet means it currently holds
+	// zero prefixes — an observed 0, not "unknown".
+	if err := p.reconcileTenantStatuses(ctx, index.Snapshot{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var got cachev1alpha1.CacheTenant
+	if err := cl.Get(ctx, types.NamespacedName{Name: "ct", Namespace: "team-a"}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.IndexEntries == nil || *got.Status.IndexEntries != 0 {
+		t.Fatalf("indexEntries = %v, want 0 (observed zero, not nil)", got.Status.IndexEntries)
+	}
+	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True (we have a live reading)", c)
+	}
+	// 0 ≤ budget → not exceeded.
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False", c)
+	}
+}
