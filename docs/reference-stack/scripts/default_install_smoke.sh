@@ -11,7 +11,10 @@
 #   2. The CacheIndex poller is writing status: `cacheindex/cluster-default`
 #      has a non-empty `.status.observedServer` within ~60s (one or two poll
 #      cycles past the 30s default refresh).
-#   3. The gRPC surface is reachable: a `LookupRoute` for an unknown model
+#   3. The per-CacheTenant status projection works: an applied `CacheTenant`
+#      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
+#      smoke) and a `Ready=True` condition written by the same poller.
+#   4. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
@@ -81,6 +84,8 @@ collect_diagnostics() {
     >"$LOG_DIR/logs-server.txt" 2>&1 || true
   kubectl get cacheindex cluster-default -o yaml \
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
+  kubectl get cachetenants -A -o yaml \
+    >"$LOG_DIR/cachetenants.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
 }
@@ -201,6 +206,38 @@ until [ -n "$observed" ]; do
 done
 log "cacheindex/cluster-default.status.observedServer=$observed"
 
+# --- CacheTenant status projection assertion -------------------------------
+# Apply a CacheTenant and prove the poller's per-tenant projection writes its
+# status. The smoke cluster has no engine pods, so the tenant holds zero
+# prefixes: the projection must report indexEntries=0 (observed-zero, not nil)
+# with Ready=True. This exercises the CacheTenant CRD schema, the combined
+# CachePolicy+CacheTenant push to /policy, and the per-tenant status writer.
+log "applying CacheTenant sample and waiting for its status projection"
+kubectl apply -f config/samples/cache_v1alpha1_cachetenant.yaml
+deadline=$(($(date +%s) + CACHEINDEX_TIMEOUT))
+ct_entries=""
+until [ -n "$ct_entries" ]; do
+  ct_entries="$(kubectl get cachetenant cachetenant-sample \
+    -o jsonpath='{.status.indexEntries}' 2>/dev/null || true)"
+  if [ -n "$ct_entries" ]; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl get cachetenant cachetenant-sample -o yaml || true
+    fail "cachetenant-sample.status.indexEntries was empty after ${CACHEINDEX_TIMEOUT}s"
+  fi
+  sleep 3
+done
+if [ "$ct_entries" != "0" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample.status.indexEntries=0 (no traffic), got: $ct_entries"
+fi
+ct_ready="$(kubectl get cachetenant cachetenant-sample \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+if [ "$ct_ready" != "True" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample Ready=True, got: ${ct_ready:-<unset>}"
+fi
+log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready"
+
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
 mkdir -p "$LOG_DIR"
@@ -252,4 +289,4 @@ if ! grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"NO_HINT"' <<<
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works"
