@@ -329,6 +329,15 @@ func TestEnginePodEvents_MalformedAnnotationDoesNotEmit(t *testing.T) {
 		{name: "empty name half", annoVal: "engines/"},
 		{name: "empty string", annoVal: ""},
 		{name: "extra slash (third segment)", annoVal: "engines/primary/extra"},
+		// Slash-shaped but Kubernetes-invalid refs. Without the
+		// validation check these slip past validCacheBackendRef and
+		// hit the apiserver as a BadRequest, which the controller's
+		// retry-on-non-NotFound branch would hot-loop.
+		{name: "uppercase namespace", annoVal: "ENGINES/primary"},
+		{name: "uppercase name", annoVal: "engines/PRIMARY"},
+		{name: "underscore in namespace", annoVal: "bad_ns/cb"},
+		{name: "leading hyphen in name", annoVal: "engines/-cb"},
+		{name: "dots in namespace (namespaces are DNS labels)", annoVal: "ns.with.dots/cb"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

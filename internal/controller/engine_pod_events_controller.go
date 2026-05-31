@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -199,15 +200,33 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // definition stale or manually-tampered — callers use this to short-circuit
 // the InjectedByCacheBackend event emission for those pods.
 //
-// Reject EXACTLY the cases the webhook never produces: missing slash, empty
-// halves, AND multiple slashes (`ns/name/extra` is not a shape the webhook
-// emits). strings.SplitN with n=3 lets us spot the third segment cheaply.
+// Reject EXACTLY the cases the webhook never produces:
+//   - Missing slash separator, empty namespace half, or empty name half.
+//   - Multiple slashes (`ns/name/extra` is not a shape the webhook emits).
+//   - Either half fails Kubernetes name validation. K8s namespace names are
+//     DNS-1123 labels, resource names are DNS-1123 subdomains; both are
+//     lowercase alphanumeric + hyphens (+ dots for subdomain). A ref like
+//     `ns/UPPER` or `bad_ns/cb` is structurally slash-shaped but cannot
+//     identify any real K8s object — passing it through to the apiserver
+//     Get would surface as a BadRequest, which the caller treats as a
+//     transient error and retries, hot-looping the reconciler on a forged
+//     pod.
 func validCacheBackendRef(ref string) bool {
 	parts := strings.SplitN(ref, "/", 3)
 	if len(parts) != 2 {
 		return false
 	}
-	return parts[0] != "" && parts[1] != ""
+	ns, name := parts[0], parts[1]
+	if ns == "" || name == "" {
+		return false
+	}
+	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+		return false
+	}
+	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return false
+	}
+	return true
 }
 
 // lookupCacheBackend parses the "<namespace>/<name>" annotation value and

@@ -132,8 +132,11 @@ spec:
                 type: string
               engineSelector:
                 description: |-
-                  EngineSelector selects which engine pods this CacheBackend claims, using
-                  standard Kubernetes label-selector semantics over the pod's labels.
+                  EngineSelector selects which engine pods this CacheBackend claims via
+                  equality-based label matching over the pod's labels: every key/value
+                  in MatchLabels must be present on the pod. The full
+                  metav1.LabelSelector surface (matchExpressions, operator-based
+                  selection) is NOT exposed today — only MatchLabels.
                   Pods that match get LMCache engine wiring (env vars + CLI args)
                   injected by the mutating Pod admission webhook at pod CREATE time,
                   PROVIDED the matched CacheBackend's status.endpoint has been
