@@ -38,6 +38,64 @@ func ingestPrefix(idx *Index, tenant, prefix string, ts time.Time) {
 	})
 }
 
+// ingestPrefixReplica ingests one prefix for a tenant under a specific replica,
+// so a single prefix key can be placed on multiple replicas (each call adds one
+// holder) to exercise the distinct-prefix quota unit.
+func ingestPrefixReplica(idx *Index, tenant, replica, prefix string, ts time.Time) {
+	idx.Ingest(Update{
+		ReplicaID:  replica,
+		Model:      "m",
+		Tenant:     tenant,
+		HashScheme: "vllm",
+		Timestamp:  ts,
+		Prefixes:   []PrefixRef{{PrefixHash: hash(prefix), TokenCount: 1}},
+	})
+}
+
+func TestTenantQuotaCountsMultiReplicaPrefixOnce(t *testing.T) {
+	// The quota unit is the distinct prefix key, NOT the replica×prefix entry: a
+	// prefix held by several replicas counts ONCE toward maxIndexEntries, and when
+	// it's evicted it is dropped from ALL its replicas as a single unit. (A naive
+	// per-replica count would over-charge the tenant and evict prematurely.)
+	m := &countingMetrics{}
+	base := time.Unix(11_000_000, 0)
+	clk := &fakeClock{t: base.Add(10 * time.Minute)}
+	idx := New(withClock(clk.now), WithMetrics(m), WithTenantQuotaResolver(fakeQuota{"team": 2}))
+
+	// Prefix "a" on two replicas → still ONE distinct prefix, within budget 2.
+	ingestPrefixReplica(idx, "team", "r1", "a", base.Add(0*time.Minute))
+	ingestPrefixReplica(idx, "team", "r2", "a", base.Add(1*time.Minute))
+	if got := tenantEntries(t, idx, "team"); got != 1 {
+		t.Fatalf("two replicas of one prefix → entries = %d, want 1 (counted once)", got)
+	}
+	// Add "b" → 2 distinct prefixes, exactly at budget, no eviction.
+	ingestPrefixReplica(idx, "team", "r1", "b", base.Add(2*time.Minute))
+	if got := tenantEntries(t, idx, "team"); got != 2 {
+		t.Fatalf("entries = %d, want 2 (at budget, no eviction yet)", got)
+	}
+	// Add "c" → 3 distinct, over budget. "a" is the oldest distinct prefix
+	// (freshest holder at +1m, vs b@+2m, c@+3m) → evicted as one unit.
+	ingestPrefixReplica(idx, "team", "r1", "c", base.Add(3*time.Minute))
+
+	if got := tenantEntries(t, idx, "team"); got != 2 {
+		t.Fatalf("entries = %d, want 2 (capped at budget)", got)
+	}
+	// "a" must be gone from BOTH r1 and r2 (whole-prefix eviction), so Lookup
+	// finds no holder at all.
+	if scores := idx.Lookup(LookupRequest{Model: "m", Tenant: "team", HashScheme: "vllm", PrefixHash: hash("a")}); len(scores) != 0 {
+		t.Fatalf("prefix a should be evicted from all replicas, got %d hits", len(scores))
+	}
+	for _, kept := range []string{"b", "c"} {
+		if scores := idx.Lookup(LookupRequest{Model: "m", Tenant: "team", HashScheme: "vllm", PrefixHash: hash(kept)}); len(scores) != 1 {
+			t.Fatalf("prefix %q should be present, got %d hits", kept, len(scores))
+		}
+	}
+	// Exactly one prefix evicted (a), counted once — not once per replica.
+	if n := m.evictions["team|"+tenantEvictionReasonOverEntries]; n != 1 {
+		t.Fatalf("tenant evictions = %d, want 1 (a evicted as a single prefix)", n)
+	}
+}
+
 func TestTenantQuotaEvictsOldestOverEntryBudget(t *testing.T) {
 	m := &countingMetrics{}
 	base := time.Unix(5_000_000, 0)
