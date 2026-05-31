@@ -1,0 +1,162 @@
+# Paired CacheBackend + matching engine Deployment that exercises a small
+# `spec.integration.engineOverrides` block. Shows how to tune chunk size
+# and add a debug env WITHOUT losing the rest of the LMCache integration
+# the controller's mutating Pod admission webhook injects.
+#
+# The override block is intentionally small (two env entries) — the goal
+# is to demonstrate the cause -> effect of `engineOverrides`, not to
+# exercise all four primitives in one sample. See
+# docs/concepts/cachebackend-engine-overrides.md for the full menu (env
+# upsert, env append, suppressEnv, args, suppressArgs) and five worked
+# before/after examples.
+#
+# Applying:
+#
+#   kubectl apply -f config/samples/cachebackend-with-override.yaml
+#
+# The pod-mutating webhook fail-opens when CacheBackend.status.endpoint is
+# still empty, so a fresh-cluster apply that races the CacheBackend
+# reconciler can create the first engine pod BEFORE the LMCache server
+# endpoint is published, leaving that first pod unwired. If the engine
+# container env is missing the canonical LMCache_* / VLLM_USE_V1 entries
+# after a first apply, wait for `kubectl get cachebackend qwen-demo -o
+# jsonpath='{.status.endpoint}'` to be non-empty and then
+# `kubectl rollout restart deployment/qwen-demo-engine` so the next pod
+# admits with status.endpoint populated.
+#
+# Once admitted with a non-empty status.endpoint,
+# `kubectl describe pod -l app=qwen-demo` should show the engine
+# container carrying:
+#   LMCACHE_CHUNK_SIZE = "64"     (override replaced the canonical "256")
+#   LMCACHE_LOG_LEVEL  = "DEBUG"  (appended; adapter doesn't inject this)
+# plus the rest of the canonical LMCache wiring (LMCACHE_REMOTE_URL,
+# --kv-transfer-config, VLLM_USE_V1, etc.) — see the concept doc's
+# "Baseline" section for the full canonical set.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: qwen-demo
+  labels:
+    app.kubernetes.io/name: inference-cache
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
+    engine: vllm
+    role: ReadWrite
+    # Amend the engine container the mutating Pod webhook injects.
+    # Reserved entries (--kv-transfer-config, LMCACHE_REMOTE_URL,
+    # VLLM_USE_V1, INFERENCECACHE_FAIL_OPEN) are HARD-REJECTED at
+    # admission with a field-scoped error; non-reserved entries pass
+    # through and merge.
+    engineOverrides:
+      env:
+        # Upsert: name matches an adapter-injected env, so the canonical
+        # value ("256") is replaced with "64". Drop chunk size for nodes
+        # where the default eats too much per-replica memory.
+        - name: LMCACHE_CHUNK_SIZE
+          value: "64"
+        # Append: name not in the adapter's canonical set, so it's added
+        # to the engine env unchanged. Useful for triaging cache behavior
+        # against the LMCache log stream.
+        - name: LMCACHE_LOG_LEVEL
+          value: DEBUG
+  engineSelector:
+    matchLabels:
+      app: qwen-demo
+  backendConfig:
+    # Served model identifier the matched engine pods are loaded with.
+    # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
+    # so the index keys per-replica entries by model.
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    # Pin to a real digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+---
+# Engine Deployment. Apply this alongside the CacheBackend above; the
+# order matters (see the top-of-file comment). Pod injection is
+# CREATE-only, so a pod admitted before the CacheBackend's
+# status.endpoint is published will run unwired until it is recreated.
+# The mutating Pod admission webhook intercepts pods matching the
+# CacheBackend's `engineSelector` and injects the LMCache wiring +
+# (above) the engineOverrides amendments onto the `vllm` container at
+# admission time.
+#
+# The Deployment name is `qwen-demo-engine`, distinct from the CacheBackend
+# name (`qwen-demo`), because the CacheBackend reconciler stands up its own
+# Deployment named after the CacheBackend for the managed lmcache-server.
+# Reusing the same name would either collide on apply or get reconciled
+# back to the lmcache-server shape. Binding to the CacheBackend goes
+# through the `app: qwen-demo` label match in `spec.engineSelector` above,
+# not through the Deployment name, so the engine Deployment can be named
+# anything that does not collide with the managed pod.
+#
+# CPU vLLM image — verified end-to-end on a kind node (see
+# docs/reference-stack/manifests/cpu-local/deployment.yaml for the same
+# flags + memory-budget caveats). The image is arch-tagged: this manifest
+# pins -arm64, swap to `vllm/vllm-openai-cpu:latest-x86_64` on x86 hosts.
+# Swap to a GPU image and add a `nvidia.com/gpu: 1` limit for production.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-demo-engine
+  labels:
+    app: qwen-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-demo
+  template:
+    metadata:
+      labels:
+        app: qwen-demo
+    spec:
+      # The image below is arm64-only; pin scheduling to an arm64 node so
+      # an unmodified apply on a mixed-arch cluster does not schedule the
+      # pod onto an x86 node it cannot run on. x86 hosts: swap to
+      # `vllm/vllm-openai-cpu:latest-x86_64` and change the nodeSelector
+      # value to `amd64`.
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:latest-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            # Matches docs/reference-stack/manifests/cpu-local/deployment.yaml
+            # — keeps the memory shape predictable on a kind node sized per
+            # the reference manifest's header.
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            # KV-cache event publisher — the subscriber sidecar dials
+            # tcp://127.0.0.1:5557 to mirror these events to the policy server.
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
