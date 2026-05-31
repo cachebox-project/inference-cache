@@ -106,7 +106,7 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 var DefaultValidationRules = []ValidationRule{
 	requireEndpointForExternal,
 	rejectEndpointOnNonExternal,
-	rejectInvalidExternalEndpointScheme,
+	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 }
@@ -691,32 +691,29 @@ func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList
 	}
 }
 
-// rejectInvalidExternalEndpointScheme rejects an External CacheBackend
-// whose spec.endpoint carries a scheme other than `lm://`. The vLLM
-// External adapter renders the LMCache engine wire (LMCACHE_REMOTE_URL),
-// and the helper that builds the URL prepends `lm://` to any value that
-// doesn't already carry it — so a `https://...` endpoint would become
-// `LMCACHE_REMOTE_URL=lm://https://...` at injection time, which the
-// engine connector rejects at runtime. Catch the misconfiguration loudly
-// at write time instead of leaving the operator to discover it from
-// engine-pod crash logs.
+// rejectInvalidExternalEndpoint rejects an External CacheBackend whose
+// spec.endpoint fails the shared LMCache endpoint shape check —
+// unsupported scheme, missing port, embedded whitespace, unbracketed
+// IPv6, path/query/fragment components, or any other shape that would
+// produce an LMCACHE_REMOTE_URL the engine connector refuses at startup.
+// Catches the misconfiguration loudly at write time instead of leaving
+// the operator to discover it from engine-pod crash logs.
 //
-// Allowed forms (both require a non-empty port — see the host-AND-port
-// rule below):
+// Allowed forms (see [adapterruntime.ValidateLMCacheEndpoint] for the
+// full shape contract — admission, the C2 reconciler, and the pod
+// webhook all call the same helper so the three layers agree):
 //   - bare `host:port` (the canonical shape — the helper adds the
 //     `lm://` scheme on injection)
 //   - `lm://host:port` (operators who prefer to be explicit)
+//   - bracketed IPv6 (`[::1]:8200`)
 //
-// Path components are also rejected — LMCache is a TCP-level protocol
-// and a path would be silently dropped by the connector. Empty
-// endpoint is left to [requireEndpointForExternal]; non-External types
-// are left to [rejectEndpointOnNonExternal].
+// Empty endpoint is left to [requireEndpointForExternal]; non-External
+// types are left to [rejectEndpointOnNonExternal].
 //
 // A future SGLang-shaped External adapter (different engine wire) will
-// have its own scheme rules; this rule narrows on
-// `Type == External` only because the vLLM wire is the only one we
-// ship today.
-func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+// have its own shape rules; this rule narrows on `Type == External`
+// only because the vLLM wire is the only one we ship today.
+func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
 		return nil
 	}
