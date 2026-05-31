@@ -20,6 +20,9 @@
 #      <spec.endpoint>` injected by the pod-mutating webhook. Also exercises
 #      the new admission validation rules (non-External + endpoint and
 #      External + bad scheme are both rejected at write time).
+#   5. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#      pod outside the controller's SA identity gets either an HTTP 401 (L7
+#      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -466,4 +469,71 @@ kubectl delete pod -n "$EXT_SMOKE_NS" "$EXT_SMOKE_POD_NAME" --ignore-not-found -
 kubectl delete cb -n "$EXT_SMOKE_NS" "$EXT_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, External backend end-to-end works"
+# --- /snapshot auth assertion ---------------------------------------------
+# The CacheIndex CR being populated above already proves the controller can
+# scrape /snapshot with its SA token (the bearer path). The complementary
+# half — that an UNAUTHENTICATED caller is rejected — is what this section
+# checks, since it's the failure mode the new auth middleware is meant to
+# prevent. A short-lived curl pod outside the controller's identity tries to
+# GET /snapshot; the server must respond 401, OR the NetworkPolicy must drop
+# the connection at L3/L4 (curl exits non-zero on timeout). Either outcome
+# proves the gate works; under kind's default kindnet CNI, NetworkPolicy is
+# not enforced so the 401 path is the one actually exercised.
+log "asserting unauthenticated /snapshot scrape from a side pod is rejected"
+SIDE_POD="ic-snapshot-probe"
+# Clean any leftover probe from an interrupted prior run before creating a
+# fresh one — otherwise `kubectl run` fails with AlreadyExists and the script
+# silently reads stale logs from the previous attempt. --wait gates on the
+# delete actually completing so the create below sees a clean namespace.
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # -w prints the HTTP status; -o /dev/null discards the (error) body so the
+    # status is the only line on stdout. Timeout protects against the listener
+    # being unreachable (NetworkPolicy drop), in which case curl exits non-zero.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      http://inference-cache-server:8081/snapshot || echo "curl_failed:$?"
+  ' >/tmp/snapshot-probe-create.log 2>&1; then
+  cat /tmp/snapshot-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD failed; cannot run /snapshot auth assertion"
+fi
+
+# Wait for the probe pod to finish (Succeeded or Failed) — either is fine; we
+# read its logs to learn the outcome.
+for _ in $(seq 1 30); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD" 2>/dev/null || true)"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient):
+#   - HTTP 401: the L7 auth middleware rejected the request (kindnet path
+#     today; the only branch actually exercised under the default CNI).
+#   - "curl_failed:28": curl timed out (`-m 5`), i.e. the L3/L4 NetworkPolicy
+#     dropped the SYN and the kernel never saw a RST. Exit code 28 is the
+#     SHAPE of a real CNI-enforced policy drop.
+# Other curl exit codes are NOT accepted — they would mask a regression:
+#   - 6  (couldn't resolve host) → Service rename or DNS bug
+#   - 7  (failed to connect, e.g. ECONNREFUSED) → server not listening; this
+#        is NOT what an enforcing CNI does (it drops packets silently, it
+#        does not RST), so accepting 7 would let "listener crashed" pass
+#   - 3  (malformed URL) → script regression
+# Restricting the catch-all to 28 keeps the smoke a real regression detector.
+# 200 (unauthenticated) is always a regression.
+# A future ticket will swap kindnet for an enforcing CNI and tighten the
+# accept set to require curl_failed:28 alone (i.e. reject 401), proving
+# the NetworkPolicy is actually doing the work in CI.
+case "$probe_out" in
+  "401"|*"curl_failed:28"*)
+    log "unauthenticated /snapshot probe rejected (probe output: $probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /snapshot probe was not rejected (or curl failed for an unexpected reason); got: $probe_out"
+    ;;
+esac
+
+log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, External backend end-to-end works, /snapshot rejects unauth"
