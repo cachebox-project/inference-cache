@@ -178,33 +178,31 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if !tr.Status.Authenticated {
-			// Distinguish "the authenticator chain ran and the token was
-			// just bad" (routine 401) from "the authenticator chain itself
-			// failed to answer the question" (server-side problem the
-			// operator must alert on):
+			// Tempting to split Status.Error populated vs empty onto
+			// different metric buckets (operator alert on "authenticator
+			// chain fault" vs "routine bad token"), but empirically the
+			// two are NOT distinguishable from the TokenReview response
+			// shape alone: kube-apiserver's SA-token authenticator
+			// populates Status.Error for JWT parse failures of routine
+			// bad-token strings (e.g. "not-a-real-token"), the same field
+			// a webhook-authenticator timeout would set. Parsing the error
+			// string to discriminate is brittle and version-specific. So:
+			// trust Authenticated as the authoritative deny bit, map
+			// !Authenticated → 401 / result="unauth", and surface
+			// Status.Error in the SERVER log (this middleware runs in the
+			// policy-server process, not the controller) so the operator
+			// can still tell apart "webhook timeout" from "invalid bearer
+			// token" by reading the diagnostic. Both still deny on the
+			// wire, which is correct from the client's perspective.
 			//
-			//   - Status.Error EMPTY → kube-apiserver checked the token and
-			//     rejected it (no matching SA, expired, malformed). This is
-			//     a clean negative on the wire. Record result="unauth", 401.
-			//   - Status.Error POPULATED → an authenticator in the chain
-			//     could not even run to completion (webhook timeout, parse
-			//     error, downstream certificate failure, etc.). This is the
-			//     same operational shape as the transport-level
-			//     CreateTokenReview error above and belongs on the same
-			//     alert surface. Record result="error", 503. Surface the
-			//     Status.Error in the SERVER log (this middleware runs in
-			//     the policy-server process, not the controller) so the
-			//     operator chasing the alert can see WHY.
-			//
-			// The on-the-wire status differs (401 vs 503) but both deny;
-			// the difference matters only to the metric label and the log,
-			// which together drive operator response.
+			// The Go-level CreateTokenReview err path above (transport
+			// failure, RBAC reject pre-review) still records
+			// result="error" / 503 — that's the only signal that the
+			// review never actually ran, and it remains the right alert
+			// surface for "investigate the apiserver."
 			if tr.Status.Error != "" {
-				slog.WarnContext(r.Context(), "snapshot_auth_token_review_status_error",
+				slog.WarnContext(r.Context(), "snapshot_auth_token_review_unauthenticated",
 					"error", tr.Status.Error)
-				a.record(ResultError)
-				http.Error(w, "token review error\n", http.StatusServiceUnavailable)
-				return
 			}
 			a.record(ResultUnauth)
 			http.Error(w, "unauthorized\n", http.StatusUnauthorized)

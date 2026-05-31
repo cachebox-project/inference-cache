@@ -126,15 +126,22 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		case "status-error":
 			// TokenReview returned a non-error HTTP response but with
 			// Status.Error populated. kube-apiserver populates this field
-			// when the authenticator chain itself failed to run to
-			// completion (webhook timeout, parse error, downstream cert
-			// failure) — NOT for plain bad tokens, which return
-			// Authenticated=false with Status.Error empty. The middleware
-			// treats Status.Error as a server-side fault: 503 +
-			// result="error" so an apiserver/authenticator hiccup fires
-			// the same operator alert as a transport-level review error.
+			// in two unrelated cases that share the same response shape:
+			//   (a) the authenticator chain itself faulted (webhook
+			//       timeout, parse error, downstream cert failure), and
+			//   (b) a routine bad-token case where the SA-token
+			//       authenticator's JWT parser couldn't decode the input
+			//       (verified empirically against a real envtest
+			//       apiserver — "not-a-real-token" → Status.Error
+			//       populated, Authenticated=false).
+			// They're indistinguishable from the response shape, so we
+			// trust Authenticated as the authoritative deny bit and map
+			// !Authenticated → 401 / result="unauth" regardless. The
+			// Status.Error text is logged at WARN so the operator can
+			// still see WHY by reading the server log. This case pins
+			// that contract.
 			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
-				Error:         "webhook authenticator timeout",
+				Error:         "invalid bearer token",
 				Authenticated: false,
 			}}, nil
 		case "nil-review":
@@ -164,13 +171,13 @@ func TestMiddleware_RejectsAndAdmits(t *testing.T) {
 		{"wrong identity", "Bearer wrong-sa", http.StatusForbidden, ResultForbidden, false},
 		{"valid token", "Bearer good", http.StatusOK, ResultOK, true},
 		{"apiserver error", "Bearer boom", http.StatusServiceUnavailable, ResultError, false},
-		// Status.Error populated means the authenticator chain could not
-		// answer — webhook timeout, parse error, downstream cert failure.
-		// That's a server-side fault, not a client auth failure: 503 +
-		// result="error" so it shows up on the same alert surface as a
-		// transport-level apiserver hiccup. Plain bad tokens
-		// (Authenticated=false, Error="") still take the 401 path above.
-		{"token review status.error -> 503 (authenticator-chain fault, not a routine 401)", "Bearer status-error", http.StatusServiceUnavailable, ResultError, false},
+		// Status.Error populated does NOT distinguish "authenticator
+		// chain fault" from "routine bad token" — empirically (envtest
+		// integration in this same package) kube-apiserver populates the
+		// field for "not-a-real-token" too. So !Authenticated regardless
+		// of Status.Error → 401 / result="unauth"; the error string is
+		// surfaced in the server log for diagnostics, not in the metric.
+		{"token review status.error -> 401 (cannot distinguish chain fault from bad JWT)", "Bearer status-error", http.StatusUnauthorized, ResultUnauth, false},
 		{"nil token review", "Bearer nil-review", http.StatusServiceUnavailable, ResultError, false},
 		// RFC 7235 §2.1: auth schemes are case-insensitive tokens. Real-world
 		// clients overwhelmingly send "Bearer", but the middleware accepts any
