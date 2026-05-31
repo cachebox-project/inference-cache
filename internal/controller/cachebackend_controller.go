@@ -39,8 +39,8 @@ const (
 	conditionTypeProgressing = "Progressing"
 	// Degraded is published alongside Ready by the KV-event readiness gate.
 	// It is True only when the backend is in a genuinely degraded terminal
-	// state (rolled out but replicas unavailable, or HTTP-Ready but no KV
-	// events observed within firstEventTimeout); it tracks
+	// state (rolled out but replicas unavailable, or the workload is Available
+	// but no KV events observed within firstEventTimeout); it tracks
 	// status.Health == Degraded. Note: status.Health is being phased out in
 	// favor of Conditions[*] in a follow-up; until then both are written.
 	conditionTypeDegraded = "Degraded"
@@ -202,6 +202,15 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 }
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to status.
+//
+// Only the C2-owned managed-gate state is reset here (Health, conditions, and
+// the firstKVEventObservedAt latch). status.indexParticipation is deliberately
+// left untouched: it is owned by the CacheIndex poller (write-only-on-change),
+// and an External backend whose engine pods still report KV events legitimately
+// keeps real participation data. Having C2 clear it would both fight the poller
+// (resource-version churn between two writers) and erase honest data; the poller
+// converges it on its own — draining to {prefixCount: 0, lastEventAt: nil} when
+// no replicas attribute to the backend.
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = backend.Spec.Endpoint
@@ -217,7 +226,8 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
 // for a backend this module no longer provisions (unsupported runtime/backend or
-// deferred kind).
+// deferred kind). As in reconcileExternal, only C2-owned gate state is reset;
+// status.indexParticipation is left to the poller (see that method's comment).
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -696,7 +706,7 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
 	health, readyStatus, reason, message := managedHealth(backend, dep)
 	// Layer the KV-event readiness gate on top of the Deployment-level health.
-	// Only the engine-HTTP-Ready state is gated; every other Deployment state
+	// Only the workload-Available state is gated; every other Deployment state
 	// passes through unchanged.
 	gate := evaluateKVEventReadiness(backend, dep, health, readyStatus, reason, message, time.Now())
 	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(gate.health, gate.readyReason, gate.readyMessage)
@@ -759,23 +769,27 @@ type kvReadiness struct {
 	requeueAfter    time.Duration
 }
 
-// evaluateKVEventReadiness layers the KV-event readiness gate on top
-// of the Deployment-derived health. The engine's HTTP readiness probe
-// (GET /health) proves the API is up but NOT that its ZMQ KV-event publisher
-// is publishing — a pod can be HTTP-Ready while the cache plane silently
-// degrades to NO_HINT. So Ready is gated on having observed at least one KV
-// event for this backend (status.indexParticipation.lastEventAt, written by
-// the CacheIndex poller).
+// evaluateKVEventReadiness layers the KV-event readiness gate on top of the
+// Deployment-derived health. The signal it adds is whether at least one KV
+// event has been observed for this backend (status.indexParticipation.
+// lastEventAt, written by the CacheIndex poller from engine-pod reports).
 //
-// State machine — only the engine-HTTP-Ready rows are gated; every other
+// Motivation: a backend whose managed workload is up can still be silently
+// useless to the cache plane — the inference engine may be serving HTTP while
+// its ZMQ KV-event publisher is mis-configured or crashed, so nothing flows
+// into the index and LookupRoute keeps returning NO_HINT. The managed
+// Deployment's own readiness cannot see that; the first-KV-event signal can.
+//
+// State machine — the gate only refines the state once the managed
+// cache-backend Deployment is Available (managedHealth == Ready). Every other
 // Deployment state (rollout in progress, scaled to zero, replicas
 // unavailable) passes through unchanged:
 //
-//	HTTP-Ready? | event seen? | within timeout? | Health   | Ready | Degraded | reason
-//	No          | -           | -               | (passthrough deployment health)
-//	Yes         | No          | Yes             | Pending  | False | False    | AwaitingFirstKVEvent
-//	Yes         | Yes         | -               | Ready    | True  | False    | KVEventsObserved
-//	Yes         | No          | No              | Degraded | False | True     | NoKVEventsObserved
+//	Workload Available? | event seen? | within timeout? | Health   | Ready | Degraded | reason
+//	No                  | -           | -               | (passthrough deployment health)
+//	Yes                 | No          | Yes             | Pending  | False | False    | AwaitingFirstKVEvent
+//	Yes                 | Yes         | -               | Ready    | True  | False    | KVEventsObserved
+//	Yes                 | No          | No              | Degraded | False | True     | NoKVEventsObserved
 //
 // "Event seen" is "have we EVER seen an event for this backend" — a non-nil
 // lastEventAt already present on the first reconcile counts (no transition
@@ -784,8 +798,8 @@ type kvReadiness struct {
 // never reach this code path (reconcileExternal short-circuits dispatch), so
 // they are unconditionally exempt.
 //
-// Timeout anchor: the clock starts when the engine workload first reported
-// Available, read from the live Deployment's Available condition
+// Timeout anchor: the clock starts when the managed cache-backend Deployment
+// first reported Available, read from the live Deployment's Available condition
 // LastTransitionTime — authoritative and persisted by the Deployment
 // controller, so no extra CacheBackend status field is needed. A Deployment
 // availability flap restarts the window (a fresh rollout re-waits for an
@@ -796,7 +810,7 @@ type kvReadiness struct {
 func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment, health cachev1alpha1.CacheBackendHealth, readyStatus metav1.ConditionStatus, reason, message string, now time.Time) kvReadiness {
 	// Base verdict mirrors the Deployment-level health; the Degraded
 	// condition tracks Health == Degraded so it is consistent on every path
-	// (including the opt-out and not-yet-HTTP-Ready paths below).
+	// (including the opt-out and not-yet-Available paths below).
 	base := kvReadiness{
 		health:       health,
 		readyStatus:  readyStatus,
@@ -813,12 +827,12 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 		base.degradedMessage = "backend is not in a degraded state"
 	}
 
-	// Opt-out, or a Deployment state that is not yet HTTP-Ready: nothing to gate.
+	// Opt-out, or a Deployment that is not yet Available: nothing to gate.
 	if !kvEventGateEnabled(backend) || health != cachev1alpha1.CacheBackendHealthReady {
 		return base
 	}
 
-	// Engine is HTTP-Ready. Have we ever seen a KV event for this backend?
+	// Workload is Available. Have we ever seen a KV event for this backend?
 	if lastKVEventSeen(backend) {
 		return kvReadiness{
 			health:          cachev1alpha1.CacheBackendHealthReady,
@@ -831,7 +845,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 		}
 	}
 
-	// HTTP-Ready but no event yet — still inside the first-event window?
+	// Available but no event yet — still inside the first-event window?
 	timeout := firstEventTimeout(backend)
 	anchor, ok := deploymentAvailableSince(dep)
 	if !ok {
@@ -842,7 +856,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 			health:          cachev1alpha1.CacheBackendHealthPending,
 			readyStatus:     metav1.ConditionFalse,
 			readyReason:     reasonAwaitingFirstKVEvent,
-			readyMessage:    fmt.Sprintf("engine is HTTP-Ready but no KV events observed yet; waiting up to %s", timeout),
+			readyMessage:    fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout),
 			degradedStatus:  metav1.ConditionFalse,
 			degradedReason:  reasonNotDegraded,
 			degradedMessage: "backend is not in a degraded state",
@@ -856,10 +870,10 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 		health:          cachev1alpha1.CacheBackendHealthDegraded,
 		readyStatus:     metav1.ConditionFalse,
 		readyReason:     reasonNoKVEventsObserved,
-		readyMessage:    fmt.Sprintf("no KV events observed within %s of engine HTTP-readiness; check the engine --kv-events-config / ZMQ publisher", timeout),
+		readyMessage:    fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout),
 		degradedStatus:  metav1.ConditionTrue,
 		degradedReason:  reasonNoKVEventsObserved,
-		degradedMessage: fmt.Sprintf("no KV events observed within %s of engine HTTP-readiness", timeout),
+		degradedMessage: fmt.Sprintf("no KV events observed within %s of the cache-backend workload becoming Available", timeout),
 	}
 }
 
@@ -1227,7 +1241,7 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	// so they fire once on entry into each gate state.
 	if before.readyReason != reasonAwaitingFirstKVEvent && after.readyReason == reasonAwaitingFirstKVEvent {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
-			"engine is HTTP-Ready but no KV events observed yet; backend stays Pending until the first event (check the engine --kv-events-config if none arrive)")
+			"cache-backend workload is Available but no KV events observed yet; backend stays Pending until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
 	}
 	// KVEventsObserved fires on the FIRST observation of events for a readiness
 	// episode — entering KVEventsObserved from a still-waiting state
@@ -1243,7 +1257,7 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	}
 	if before.readyReason != reasonNoKVEventsObserved && after.readyReason == reasonNoKVEventsObserved {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, reasonNoKVEventsObserved, reasonNoKVEventsObserved,
-			"no KV events observed within %s of engine HTTP-readiness; the engine's KV-event publisher is likely mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
+			"no KV events observed within %s of the workload becoming Available; no engine pods are attached, or the engine's KV-event publisher is mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
 	}
 
 	if before.failOpen && !after.failOpen {
