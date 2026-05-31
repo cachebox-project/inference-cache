@@ -325,6 +325,62 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
+	// A pre-existing External CR carrying a malformed spec.endpoint
+	// (stored before the shape rule shipped) must not be wired —
+	// injecting LMCACHE_REMOTE_URL=lm://https://... or lm://2001:db8::1
+	// would crash the engine at startup. effectiveEndpoint applies the
+	// same shape check the admission webhook uses and returns "" for
+	// invalid values, so the existing fail-open branch admits the pod
+	// un-wired and the operator sees the shape error in the response
+	// reason instead of an engine-pod crash log.
+	const ns = "engines"
+	for _, tc := range []struct {
+		name, endpoint string
+	}{
+		{"bad-scheme", "https://cache.example.com:443/api"},
+		{"portless-host", "cache.example.com"},
+		{"embedded-whitespace", "cache example:8200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: ns},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Type:     cachev1alpha1.CacheBackendTypeExternal,
+					Endpoint: tc.endpoint,
+					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+						Engine: "vllm",
+						Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+					},
+					EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+						MatchLabels: map[string]string{"app": "vllm"},
+					},
+				},
+			}
+			s := newScheme(t)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+			reg := adapterruntime.DefaultRegistry()
+			reg.Register(externaladapter.NewAdapter())
+			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+			pod := vllmEnginePod("engine", map[string]string{"app": "vllm"})
+			req := newRequest(t, pod, ns)
+			resp := h.Handle(context.Background(), req)
+			if !resp.Allowed {
+				t.Fatalf("expected Allowed (fail-open), got %+v", resp.Result)
+			}
+			// Zero patches — no injection happened.
+			if len(resp.Patches) != 0 {
+				t.Fatalf("expected no patches on invalid endpoint; got %d: %v", len(resp.Patches), resp.Patches)
+			}
+			// Response message must name spec.endpoint, not status.endpoint.
+			if msg := resp.Result.Message; !strings.Contains(msg, "spec.endpoint") {
+				t.Fatalf("fail-open reason should mention spec.endpoint for External; got %q", msg)
+			}
+		})
+	}
+}
+
 func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	// Pod admission is CREATE-only — if an engine pod admits before the
 	// controller has mirrored spec.endpoint into status.endpoint, the

@@ -376,7 +376,7 @@ func TestValidator_ExternalEndpoint_HTTPSchemeRejected(t *testing.T) {
 	cb.Spec.Endpoint = "https://cache.example.com:443/api"
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	requireInvalidWithCause(t, v, cb, "spec.endpoint",
-		`scheme "https" is not supported for spec.type=External`)
+		`scheme "https" is not supported`)
 }
 
 func TestValidator_ExternalEndpoint_PathRejected(t *testing.T) {

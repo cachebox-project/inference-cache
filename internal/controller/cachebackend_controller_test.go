@@ -592,6 +592,48 @@ func TestReconcileExternalSetsReadyTrue(t *testing.T) {
 	}
 }
 
+func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
+	// An External CR with a non-empty but malformed spec.endpoint must
+	// be marked Ready=False/ExternalEndpointInvalid — current admission
+	// rejects these at write time, but a CR stored before the shape
+	// rule shipped can still carry e.g. `https://...`. Without this,
+	// the controller would advertise the broken value as Ready=True
+	// and the pod webhook would inject a URL the engine can't parse.
+	scheme := newScheme(t)
+	for _, tc := range []struct {
+		name, endpoint string
+	}{
+		{"bad-scheme", "https://cache.example.com:443/api"},
+		{"portless-host", "cache.example.com"},
+		{"unbracketed-ipv6", "2001:db8::1"},
+		{"embedded-whitespace", "cache example:8200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: "default"},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Type:     cachev1alpha1.CacheBackendTypeExternal,
+					Endpoint: tc.endpoint,
+				},
+			}
+			r := newReconciler(scheme, cb)
+			reconcile(t, r, "ext-bad", "default")
+
+			got := getBackend(t, r, "ext-bad", "default")
+			ready := findCondition(got.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionFalse {
+				t.Fatalf("Ready condition = %+v, want Status=False", ready)
+			}
+			if ready.Reason != "ExternalEndpointInvalid" {
+				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
+			}
+			if got.Status.Health != cachev1alpha1.CacheBackendHealthPending {
+				t.Fatalf("status.health = %q, want Pending", got.Status.Health)
+			}
+		})
+	}
+}
+
 func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	// Admission rejects this case at the webhook, but a CR already in etcd
 	// from before the webhook was installed must still publish a visible

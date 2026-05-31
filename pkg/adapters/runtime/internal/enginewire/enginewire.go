@@ -16,6 +16,7 @@ package enginewire
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -246,4 +247,98 @@ func ConfigOr(cfg map[string]string, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ValidateLMCacheEndpoint reports whether s is a usable input to
+// [LMCacheRemoteURL] — i.e. whether the resulting LMCACHE_REMOTE_URL the
+// engine wire would inject is well-formed. Returns nil on success, or an
+// error whose message names the specific shape problem.
+//
+// The contract surface (must match the validating admission webhook and
+// the API/design docs):
+//
+//   - leading/trailing whitespace is trimmed (operator friendliness);
+//   - allowed shapes: bare `host:port` or explicit `lm://host:port`;
+//   - host AND port are both required and both non-empty;
+//   - other URI schemes (`http://`, `https://`, …) are rejected (the
+//     adapter would otherwise concatenate `lm://` onto the leading scheme
+//     and produce an unparseable URL);
+//   - path/query/fragment components are rejected (the LMCache connector
+//     speaks TCP and would silently drop them);
+//   - unbracketed IPv6 literals are rejected (`[::1]:8200` is required —
+//     without brackets the host/port boundary is ambiguous);
+//   - embedded whitespace or control characters inside the trimmed value
+//     are rejected (they would inject a malformed LMCACHE_REMOTE_URL the
+//     engine connector refuses at startup; also defence-in-depth against
+//     control-char injection into anything that might later template the
+//     value).
+//
+// Shared between admission (which wraps the error in a field.Invalid),
+// the C2 reconciler (which degrades Ready=False on invalid stored
+// values), and the pod-mutating webhook (which fails open on invalid
+// stored values so the engine pod admits unwired rather than crashing).
+// Centralising the rule here means a future tightening only needs to
+// touch one place to ripple to all three layers.
+func ValidateLMCacheEndpoint(s string) error {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return fmt.Errorf("endpoint is empty")
+	}
+	if strings.ContainsFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) {
+		return fmt.Errorf("endpoint must not contain whitespace or control characters within the host or port; use host:port or lm://host:port with no embedded spaces")
+	}
+	rest := raw
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme := strings.ToLower(raw[:i])
+		rest = raw[i+3:]
+		if scheme != "lm" {
+			return fmt.Errorf("endpoint scheme %q is not supported; use a bare host:port (the LMCache adapter adds the lm:// scheme) or an explicit lm://host:port URL", scheme)
+		}
+	}
+	if strings.ContainsAny(rest, "/?#") {
+		return fmt.Errorf("endpoint must be host:port (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped")
+	}
+	host, port, ok := splitLMCacheHostPort(rest)
+	if !ok || host == "" || port == "" {
+		return fmt.Errorf("endpoint must be a non-empty host AND port (e.g. cache.example.com:8200 or lm://cache.example.com:8200); a scheme alone, a host with no port, an empty port, or a port with no host is not a valid LMCache endpoint")
+	}
+	return nil
+}
+
+// splitLMCacheHostPort parses a host:port string into its host and port
+// halves with bracket-aware IPv6 handling. Returns (host, port, hasPort)
+// so callers can tell apart `cache` (no port → hasPort=false) from
+// `cache:` (empty port → hasPort=true, port=""). IPv6 literals MUST be
+// bracketed (`[::1]:8200`); an unbracketed multi-colon string is
+// rejected as malformed. See [ValidateLMCacheEndpoint] for the contract.
+func splitLMCacheHostPort(s string) (host, port string, hasPort bool) {
+	if s == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end <= 1 {
+			return "", "", false
+		}
+		host = s[1:end]
+		tail := s[end+1:]
+		if tail == "" {
+			return host, "", false
+		}
+		if strings.HasPrefix(tail, ":") {
+			return host, tail[1:], true
+		}
+		return "", "", false
+	}
+	// Unbracketed multi-colon string is almost certainly an unbracketed
+	// IPv6 literal — refuse rather than guess at the host/port split.
+	if strings.Count(s, ":") > 1 {
+		return "", "", false
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[:i], s[i+1:], true
+	}
+	return s, "", false
 }

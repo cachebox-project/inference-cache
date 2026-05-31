@@ -127,19 +127,32 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 
 	endpoint := effectiveEndpoint(cache)
 	if endpoint == "" {
-		// The endpoint source is type-scoped (see effectiveEndpoint):
-		// managed types learn it from status.endpoint, External pulls
-		// from spec.endpoint. Surface the right field name in the
-		// fail-open reason so an operator diagnosing an old or invalid
-		// External CR is sent to spec.endpoint, not the controller-
-		// owned status field.
+		// The endpoint source is type-scoped (see effectiveEndpoint).
+		// Three reasons we can land here:
+		//   - managed CR: reconciler hasn't published status.endpoint
+		//     yet (steady-state during initial rollout).
+		//   - External CR: spec.endpoint is empty (admission rejects
+		//     this on fresh CRs; only reachable from a pre-existing
+		//     stored value).
+		//   - External CR: spec.endpoint is set but fails the shared
+		//     shape check (also pre-existing-only; current admission
+		//     rejects malformed values). effectiveEndpoint deliberately
+		//     returns "" for this case so the engine pod admits
+		//     un-wired rather than receiving an LMCACHE_REMOTE_URL the
+		//     connector refuses at startup.
+		// Surface the field name (and the shape error when applicable)
+		// so the operator looks at the right place.
 		missingField := "status.endpoint"
+		extra := ""
 		if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 			missingField = "spec.endpoint"
+			if err := adapterruntime.ValidateLMCacheEndpoint(cache.Spec.Endpoint); err != nil {
+				extra = ": " + err.Error()
+			}
 		}
 		log.V(1).Info("fail-open: CacheBackend endpoint not resolvable",
-			"missingField", missingField, "type", string(cache.Spec.Type))
-		return admission.Allowed(fmt.Sprintf("CacheBackend %s not yet published (fail-open)", missingField))
+			"missingField", missingField, "type", string(cache.Spec.Type), "shapeError", extra)
+		return admission.Allowed(fmt.Sprintf("CacheBackend %s not usable%s (fail-open)", missingField, extra))
 	}
 
 	// No env-presence short-circuit here: the adapter is the source of truth
@@ -373,7 +386,26 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 		return ""
 	}
 	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		return strings.TrimSpace(cache.Spec.Endpoint)
+		// For External, re-apply the admission-time shape check on
+		// the stored spec.endpoint. The validating webhook already
+		// rejects malformed values at write time, but a pre-existing
+		// CR in etcd from before the shape rule shipped (or stored
+		// when an earlier, laxer rule set was in effect) can still
+		// carry e.g. `https://...`, a portless host, or embedded
+		// whitespace. Returning the malformed value would let the
+		// adapter prepend `lm://` and inject an URL the engine
+		// connector refuses at startup — turning a cache
+		// misconfiguration into a serving outage. Treat invalid the
+		// same way we treat empty: return "" and let the caller's
+		// existing fail-open branch admit the pod un-wired.
+		ep := strings.TrimSpace(cache.Spec.Endpoint)
+		if ep == "" {
+			return ""
+		}
+		if err := adapterruntime.ValidateLMCacheEndpoint(cache.Spec.Endpoint); err != nil {
+			return ""
+		}
+		return ep
 	}
 	return strings.TrimSpace(cache.Status.Endpoint)
 }

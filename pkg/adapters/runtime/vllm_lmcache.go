@@ -450,6 +450,21 @@ var (
 	upsertArgPair    = enginewire.UpsertArgPair
 )
 
+// ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint]
+// so consumers outside pkg/adapters/runtime — the validating webhook in
+// internal/webhook/v1alpha1, the C2 reconciler in internal/controller,
+// and the pod webhook in internal/webhook/pod — can call the same
+// endpoint-shape check that admission uses. Go's internal-package rule
+// keeps the enginewire subpackage adapter-scoped; this re-export is the
+// public seam those layers reach for. Returns nil when s is a valid
+// LMCache endpoint, otherwise an error whose message describes the
+// shape problem (kubectl admission paths wrap it in field.Invalid;
+// reconciler/pod-webhook paths surface the message in a status reason
+// or fail-open log).
+func ValidateLMCacheEndpoint(s string) error {
+	return enginewire.ValidateLMCacheEndpoint(s)
+}
+
 // serverCommand returns the LMCache server command + args, with a single
 // BackendConfig override hook (cfgKeyServerCommand) for users who want to
 // switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once

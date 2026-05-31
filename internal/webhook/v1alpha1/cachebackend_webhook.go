@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -721,146 +720,23 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
 		return nil
 	}
-	raw := strings.TrimSpace(cb.Spec.Endpoint)
-	if raw == "" {
+	if strings.TrimSpace(cb.Spec.Endpoint) == "" {
 		return nil // requireEndpointForExternal handles this
 	}
-	// Reject any internal whitespace / control char. A leading or
-	// trailing whitespace surrounding the address is operator-friendly
-	// (strings.TrimSpace above handles it); whitespace *inside* the
-	// host or port portion is not — `cache example:8200` or
-	// `cache:82 00` would parse past the host/port shape check and
-	// inject a malformed LMCACHE_REMOTE_URL the engine connector then
-	// refuses. Surface the misconfiguration at admission instead of
-	// at engine startup.
-	if strings.ContainsFunc(raw, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) {
+	if err := adapterruntime.ValidateLMCacheEndpoint(cb.Spec.Endpoint); err != nil {
+		// Wrap the helper's plain error in a field-scoped Invalid so
+		// kubectl prints the field path alongside the message. The
+		// reconciler and pod webhook call the same helper and act on
+		// the raw error (degrade Ready, fail-open).
 		return field.ErrorList{
 			field.Invalid(
 				field.NewPath("spec", "endpoint"),
 				cb.Spec.Endpoint,
-				"spec.endpoint must not contain whitespace or control characters within the host or port (got embedded whitespace/control rune); use host:port or lm://host:port with no embedded spaces",
-			),
-		}
-	}
-	// Parse the optional scheme. We deliberately do NOT use net/url
-	// here: net/url.Parse treats a bare `host:port` as having scheme=
-	// "host" because it parses everything before the first `:` as a
-	// scheme. Hand-roll the scheme check on the leading `://` separator
-	// instead.
-	rest := raw
-	if i := strings.Index(raw, "://"); i >= 0 {
-		scheme := strings.ToLower(raw[:i])
-		rest = raw[i+3:]
-		if scheme != "lm" {
-			return field.ErrorList{
-				field.Invalid(
-					field.NewPath("spec", "endpoint"),
-					cb.Spec.Endpoint,
-					fmt.Sprintf("spec.endpoint scheme %q is not supported for spec.type=External; use a bare host:port (the LMCache adapter adds the lm:// scheme) or an explicit lm://host:port URL — the vLLM engine wire injects LMCACHE_REMOTE_URL and would otherwise concatenate to an invalid value", scheme),
-				),
-			}
-		}
-	}
-	// rest is the host:port portion (after stripping the optional
-	// lm:// scheme). Reject path/query/fragment components; LMCache is
-	// a TCP-level protocol and would silently drop them at the
-	// connector.
-	if strings.ContainsAny(rest, "/?#") {
-		return field.ErrorList{
-			field.Invalid(
-				field.NewPath("spec", "endpoint"),
-				cb.Spec.Endpoint,
-				"spec.endpoint must be host:port (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped",
-			),
-		}
-	}
-	// Require BOTH a non-empty host AND a non-empty port. The contract
-	// surface is "bare host:port (LMCache adapter adds lm://) or
-	// lm://host:port" — both forms include a port, because the LMCache
-	// connector dials TCP at the resolved address. Accepting a
-	// portless `cache.example.com` would inject
-	// LMCACHE_REMOTE_URL=lm://cache.example.com, which the connector
-	// then tries to parse — behaviour is undocumented and crashes the
-	// engine. Likewise `lm://`, `:port`, `cache.example.com:` (empty
-	// port) all pass the prior checks but produce invalid injected
-	// URLs.
-	host, port, ok := splitEndpointHostPort(rest)
-	if !ok || host == "" || port == "" {
-		return field.ErrorList{
-			field.Invalid(
-				field.NewPath("spec", "endpoint"),
-				cb.Spec.Endpoint,
-				"spec.endpoint must be a non-empty host AND port (e.g. cache.example.com:8200 or lm://cache.example.com:8200); a scheme alone, a host with no port, an empty port, or a port with no host is not a valid LMCache endpoint",
+				"spec."+err.Error(),
 			),
 		}
 	}
 	return nil
-}
-
-// splitEndpointHostPort parses a host:port string into its host and port
-// halves with bracket-aware IPv6 handling. Returns (host, port, hasPort)
-// so callers can tell apart `cache` (no port → hasPort=false) from
-// `cache:` (empty port → hasPort=true, port=""). The contract surface
-// requires hasPort=true with a non-empty port so the LMCache connector
-// dials a known TCP target — see the call site in
-// rejectInvalidExternalEndpointScheme.
-//
-// IPv6 literals MUST be bracketed (`[::1]:8200`). An unbracketed string
-// containing more than one colon (e.g. `2001:db8::1`, `::1`) is rejected
-// as malformed: with no brackets there is no unambiguous host/port
-// boundary, and a naive `LastIndex(':')` split would treat the trailing
-// `:1` as a port and admit a CR that injects an invalid
-// `LMCACHE_REMOTE_URL=lm://2001:db8::1`. Operators with IPv6 endpoints
-// follow RFC 3986 and wrap the literal in brackets.
-//
-// Recognised shapes:
-//
-//	`cache:8200`     → ("cache", "8200", true)
-//	`cache:`         → ("cache", "",     true)
-//	`cache`          → ("cache", "",     false)
-//	`[::1]:8200`     → ("::1",   "8200", true)
-//	`[::1]:`         → ("::1",   "",     true)
-//	`[::1]`          → ("::1",   "",     false)
-//	`:8200`          → ("",      "8200", true)
-//	`2001:db8::1`    → ("",      "",     false)   // multi-colon, unbracketed
-//	``               → ("",      "",     false)
-func splitEndpointHostPort(s string) (host, port string, hasPort bool) {
-	if s == "" {
-		return "", "", false
-	}
-	if strings.HasPrefix(s, "[") {
-		end := strings.Index(s, "]")
-		if end <= 1 {
-			return "", "", false
-		}
-		host = s[1:end]
-		tail := s[end+1:]
-		if tail == "" {
-			return host, "", false
-		}
-		if strings.HasPrefix(tail, ":") {
-			return host, tail[1:], true
-		}
-		// Unexpected suffix after the bracketed host (e.g. `[::1]junk`).
-		return "", "", false
-	}
-	// Unbracketed string with more than one colon is unparseable as
-	// host:port — almost certainly an unbracketed IPv6 literal. RFC 3986
-	// requires brackets for IPv6 in URI authority components; without
-	// them the host/port split is ambiguous, and treating the last
-	// colon as the separator would let `2001:db8::1` admit as
-	// host="2001:db8:" port="1". Refuse rather than guess; the
-	// validator surfaces the same "host AND port" error the operator
-	// gets for any other malformed shape.
-	if strings.Count(s, ":") > 1 {
-		return "", "", false
-	}
-	if i := strings.LastIndex(s, ":"); i >= 0 {
-		return s[:i], s[i+1:], true
-	}
-	return s, "", false
 }
 
 // rejectPersistentStorageOnMemoryOnly rejects a PVC-backed storage spec on
