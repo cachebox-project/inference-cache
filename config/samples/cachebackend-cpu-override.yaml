@@ -1,0 +1,57 @@
+# CacheBackend for a CPU-vLLM dev cluster (no GPU) that uses
+# spec.integration.engineOverrides to tune the engine container the pod
+# webhook injects.
+#
+# The override surface is engine-agnostic K8s vocabulary (args + env), so it
+# also extends to future SGLang / Mooncake adapters with no CRD churn.
+#
+# Admission HARD-REJECTS overrides that overlap the adapter's reserved
+# args/env — for the vLLM+LMCache adapter today: `--kv-transfer-config`,
+# `VLLM_USE_V1`, `LMCACHE_REMOTE_URL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing
+# any of those would un-wire the LMCache integration itself; if you don't
+# want LMCache at all, use the per-pod `inferencecache.io/skip-inject`
+# annotation on the engine pod instead of trying to override the canonical
+# wiring out of existence.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-cpu-override
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+    # Per-engine overrides applied AFTER the runtime adapter produces its
+    # canonical injection. Reserved entries (above) cannot be overridden or
+    # suppressed; admission rejects with a field-scoped error that names the
+    # offending flag/env and the adapter.
+    engineOverrides:
+      # Add a CPU-friendly --max-model-len that the canonical injection does
+      # not set. The override surface always appends (not replaces) for
+      # flags the adapter does not declare itself.
+      args:
+        - "--max-model-len"
+        - "8192"
+      # Override LMCACHE_CHUNK_SIZE — a documented tunable (NOT reserved),
+      # so the merge replaces the adapter's default of "256" with this
+      # value. INFERENCECACHE_FAIL_OPEN / VLLM_USE_V1 / LMCACHE_REMOTE_URL
+      # are reserved and would be rejected at admission if listed here.
+      env:
+        - name: LMCACHE_CHUNK_SIZE
+          value: "512"
+        # Free-form engine env the user wants the engine container to see.
+        # The admission rule only fires for reserved Names; FOO is not
+        # reserved, so it's appended verbatim.
+        - name: FOO
+          value: bar
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  backendConfig:
+    # Served model identifier the matched engine pods are loaded with.
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    serverImage: lmcache/standalone:latest

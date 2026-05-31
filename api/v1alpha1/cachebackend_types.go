@@ -207,6 +207,83 @@ type CacheBackendIntegrationSpec struct {
 	// +optional
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`
+
+	// EngineOverrides lets the operator amend the non-reserved args / env
+	// the pod-mutating webhook injects into the engine container, on top
+	// of what the runtime adapter would otherwise inject. Useful for
+	// tuning adapter-injected knobs (e.g. CPU-vLLM running against the
+	// LMCache integration with non-default chunk size / serdes / model
+	// length) and for future engines that surface their own non-reserved
+	// flags through the same adapter interface.
+	//
+	// EngineOverrides does NOT turn the integration off: every reserved
+	// arg/env the adapter declares is hard-rejected at admission, so an
+	// operator who wants to skip injection entirely on a particular pod
+	// should use the inferencecache.io/skip-inject pod annotation instead.
+	//
+	// Admission rejects overrides that overlap the adapter's reserved
+	// args/env (the ones strictly required for the integration to
+	// function); the operator gets a field-scoped error naming the
+	// offending flag/env and the adapter rather than discovering it via a
+	// crashed engine. See the package doc for the rationale.
+	// +optional
+	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
+}
+
+// EngineInjectionOverrides describes how the operator wants to amend the
+// args / env the pod-mutating webhook injects into the engine container.
+// The override surface is SCOPED to entries the runtime adapter itself
+// contributes (added or modified) during InjectEngineConfig — user
+// pod-template args / env that the adapter does not touch are protected,
+// and a Suppress or Override naming them is a silent no-op. This keeps the
+// CR from mutating engine-pod-template state the engine-pod owner did not
+// invite the CacheBackend to touch.
+//
+// Known-fragile: nothing here is type-checked against the engine binary, so
+// an override on an adapter-owned non-reserved value can still break the
+// engine in subtle ways the validator can't catch (e.g. an aggressive
+// `--max-model-len` OOMing the engine). Admission only blocks overrides
+// that overlap the adapter's reserved set — the args/env strictly required
+// for the integration itself to function.
+type EngineInjectionOverrides struct {
+	// Args injected into the engine container, in addition to what the
+	// adapter would inject. Merged by leading flag token (e.g.
+	// "--max-model-len"): an override entry whose leading token matches
+	// an adapter-owned canonical entry replaces it; entries whose token
+	// is in neither the adapter-owned set nor the user pod-template are
+	// appended; entries colliding with a user-template flag the adapter
+	// did not touch are a silent no-op. Order is preserved.
+	//
+	// Admission rejects entries whose leading flag token overlaps
+	// the adapter's ReservedArgs().
+	// +optional
+	Args []string `json:"args,omitempty"`
+
+	// SuppressArgs lists leading flag names (e.g. "--some-tunable-flag")
+	// the adapter MUST NOT inject. Admission rejects entries that overlap
+	// the adapter's ReservedArgs(). A suppressed flag is removed from the
+	// adapter's canonical contribution before Args merges in, so
+	// suppress-then-re-add is a supported pattern for overriding a
+	// non-reserved adapter-owned flag's value. Suppress does NOT touch
+	// user pod-template flags the adapter did not inject.
+	// +optional
+	SuppressArgs []string `json:"suppressArgs,omitempty"`
+
+	// Env upserted into the engine container by Name, scoped to
+	// adapter-owned canonical entries. A Name matching an adapter-owned
+	// entry is replaced; a Name not seen on the user pod-template is
+	// appended; a Name colliding with a user-template env the adapter
+	// did not touch is a silent no-op. Admission rejects entries whose
+	// Name overlaps the adapter's ReservedEnv().
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// SuppressEnv lists env var Names the adapter MUST NOT inject.
+	// Admission rejects entries that overlap the adapter's ReservedEnv().
+	// Suppress does NOT touch user pod-template env the adapter did not
+	// inject.
+	// +optional
+	SuppressEnv []string `json:"suppressEnv,omitempty"`
 }
 
 // IntegrationFailOpen returns the effective fail-open behavior for a
@@ -330,11 +407,52 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// IndexParticipation summarizes this CacheBackend's contribution to the
+	// cluster-wide cache index — populated by the CacheIndex poller (it groups
+	// the server's /snapshot replicas by the owning CacheBackend and projects
+	// the per-backend slice here). nil until the poller has observed at least
+	// one snapshot; absence of data on a single scrape never clears it.
+	// +optional
+	IndexParticipation *CacheBackendIndexParticipation `json:"indexParticipation,omitempty"`
+
 	// Conditions describe the latest observations of the backend.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// CacheBackendIndexParticipation is the per-backend slice of the cluster-wide
+// CacheIndex, projected from the server's /snapshot replicas[]. The poller
+// resolves each replica to its engine pod by (tenant, replica_id) and then
+// attributes it to the owning CacheBackend — either via the engine pod's
+// `inferencecache.io/injected-by` annotation (the authoritative wiring
+// signal stamped by the pod webhook) or, for pods that bypassed the
+// webhook, via a deterministic first-match on `spec.engineSelector.
+// matchLabels`. The poller writes write-only-on-change and never clears
+// it on a single failed scrape (soft state).
+type CacheBackendIndexParticipation struct {
+	// PrefixCount is the sum of distinct prefix entries currently attributed
+	// to this backend's replicas. Zero is a valid observed value — it means
+	// the backend is up but holds no warm prefixes yet.
+	// +kubebuilder:validation:Minimum=0
+	PrefixCount int64 `json:"prefixCount"`
+
+	// LastEventAt is the most recent KV-event timestamp observed for any of
+	// this backend's replicas. nil until the first event arrives; downstream
+	// readiness gates (e.g. "ready once at least one event seen") MUST treat
+	// nil as "not yet observed" rather than zero time.
+	// +optional
+	LastEventAt *metav1.Time `json:"lastEventAt,omitempty"`
+
+	// HitRate is the prefix-count-weighted average cache hit rate across this
+	// backend's replicas, formatted as a decimal string in [0,1] (matching
+	// the cluster-wide CacheIndex.status.replicas[].hitRate convention — see
+	// CRD-codegen note on floats in CRDs). nil until the replica stats
+	// reporter emits per-replica hitRate into the index; do not interpret a
+	// missing value as 0.
+	// +optional
+	HitRate *string `json:"hitRate,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -344,6 +462,8 @@ type CacheBackendStatus struct {
 // +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
 // +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedEnginePods`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.indexParticipation.prefixCount`
+// +kubebuilder:printcolumn:name="LastEvent",type=date,JSONPath=`.status.indexParticipation.lastEventAt`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CacheBackend is the Schema for the cachebackends API.

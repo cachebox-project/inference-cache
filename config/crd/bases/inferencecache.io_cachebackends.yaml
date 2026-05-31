@@ -29,6 +29,12 @@ spec:
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
+    - jsonPath: .status.indexParticipation.prefixCount
+      name: Prefixes
+      type: integer
+    - jsonPath: .status.indexParticipation.lastEventAt
+      name: LastEvent
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -156,6 +162,228 @@ spec:
                     description: Engine identifies the inference engine integration,
                       such as SGLang or vLLM.
                     type: string
+                  engineOverrides:
+                    description: |-
+                      EngineOverrides lets the operator amend the non-reserved args / env
+                      the pod-mutating webhook injects into the engine container, on top
+                      of what the runtime adapter would otherwise inject. Useful for
+                      tuning adapter-injected knobs (e.g. CPU-vLLM running against the
+                      LMCache integration with non-default chunk size / serdes / model
+                      length) and for future engines that surface their own non-reserved
+                      flags through the same adapter interface.
+
+                      EngineOverrides does NOT turn the integration off: every reserved
+                      arg/env the adapter declares is hard-rejected at admission, so an
+                      operator who wants to skip injection entirely on a particular pod
+                      should use the inferencecache.io/skip-inject pod annotation instead.
+
+                      Admission rejects overrides that overlap the adapter's reserved
+                      args/env (the ones strictly required for the integration to
+                      function); the operator gets a field-scoped error naming the
+                      offending flag/env and the adapter rather than discovering it via a
+                      crashed engine. See the package doc for the rationale.
+                    properties:
+                      args:
+                        description: |-
+                          Args injected into the engine container, in addition to what the
+                          adapter would inject. Merged by leading flag token (e.g.
+                          "--max-model-len"): an override entry whose leading token matches
+                          an adapter-owned canonical entry replaces it; entries whose token
+                          is in neither the adapter-owned set nor the user pod-template are
+                          appended; entries colliding with a user-template flag the adapter
+                          did not touch are a silent no-op. Order is preserved.
+
+                          Admission rejects entries whose leading flag token overlaps
+                          the adapter's ReservedArgs().
+                        items:
+                          type: string
+                        type: array
+                      env:
+                        description: |-
+                          Env upserted into the engine container by Name, scoped to
+                          adapter-owned canonical entries. A Name matching an adapter-owned
+                          entry is replaced; a Name not seen on the user pod-template is
+                          appended; a Name colliding with a user-template env the adapter
+                          did not touch is a silent no-op. Admission rejects entries whose
+                          Name overlaps the adapter's ReservedEnv().
+                        items:
+                          description: EnvVar represents an environment variable present
+                            in a Container.
+                          properties:
+                            name:
+                              description: |-
+                                Name of the environment variable.
+                                May consist of any printable ASCII characters except '='.
+                              type: string
+                            value:
+                              description: |-
+                                Variable references $(VAR_NAME) are expanded
+                                using the previously defined environment variables in the container and
+                                any service environment variables. If a variable cannot be resolved,
+                                the reference in the input string will be unchanged. Double $$ are reduced
+                                to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                                "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                                Escaped references will never be expanded, regardless of whether the variable
+                                exists or not.
+                                Defaults to "".
+                              type: string
+                            valueFrom:
+                              description: Source for the environment variable's value.
+                                Cannot be used if value is not empty.
+                              properties:
+                                configMapKeyRef:
+                                  description: Selects a key of a ConfigMap.
+                                  properties:
+                                    key:
+                                      description: The key to select.
+                                      type: string
+                                    name:
+                                      default: ""
+                                      description: |-
+                                        Name of the referent.
+                                        This field is effectively required, but due to backwards compatibility is
+                                        allowed to be empty. Instances of this type with an empty value here are
+                                        almost certainly wrong.
+                                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                      type: string
+                                    optional:
+                                      description: Specify whether the ConfigMap or
+                                        its key must be defined
+                                      type: boolean
+                                  required:
+                                  - key
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                fieldRef:
+                                  description: |-
+                                    Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                                    spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                                  properties:
+                                    apiVersion:
+                                      description: Version of the schema the FieldPath
+                                        is written in terms of, defaults to "v1".
+                                      type: string
+                                    fieldPath:
+                                      description: Path of the field to select in
+                                        the specified API version.
+                                      type: string
+                                  required:
+                                  - fieldPath
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                fileKeyRef:
+                                  description: |-
+                                    FileKeyRef selects a key of the env file.
+                                    Requires the EnvFiles feature gate to be enabled.
+                                  properties:
+                                    key:
+                                      description: |-
+                                        The key within the env file. An invalid key will prevent the pod from starting.
+                                        The keys defined within a source may consist of any printable ASCII characters except '='.
+                                        During Alpha stage of the EnvFiles feature gate, the key size is limited to 128 characters.
+                                      type: string
+                                    optional:
+                                      default: false
+                                      description: |-
+                                        Specify whether the file or its key must be defined. If the file or key
+                                        does not exist, then the env var is not published.
+                                        If optional is set to true and the specified key does not exist,
+                                        the environment variable will not be set in the Pod's containers.
+
+                                        If optional is set to false and the specified key does not exist,
+                                        an error will be returned during Pod creation.
+                                      type: boolean
+                                    path:
+                                      description: |-
+                                        The path within the volume from which to select the file.
+                                        Must be relative and may not contain the '..' path or start with '..'.
+                                      type: string
+                                    volumeName:
+                                      description: The name of the volume mount containing
+                                        the env file.
+                                      type: string
+                                  required:
+                                  - key
+                                  - path
+                                  - volumeName
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                resourceFieldRef:
+                                  description: |-
+                                    Selects a resource of the container: only resources limits and requests
+                                    (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                                  properties:
+                                    containerName:
+                                      description: 'Container name: required for volumes,
+                                        optional for env vars'
+                                      type: string
+                                    divisor:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      description: Specifies the output format of
+                                        the exposed resources, defaults to "1"
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    resource:
+                                      description: 'Required: resource to select'
+                                      type: string
+                                  required:
+                                  - resource
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                secretKeyRef:
+                                  description: Selects a key of a secret in the pod's
+                                    namespace
+                                  properties:
+                                    key:
+                                      description: The key of the secret to select
+                                        from.  Must be a valid secret key.
+                                      type: string
+                                    name:
+                                      default: ""
+                                      description: |-
+                                        Name of the referent.
+                                        This field is effectively required, but due to backwards compatibility is
+                                        allowed to be empty. Instances of this type with an empty value here are
+                                        almost certainly wrong.
+                                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                      type: string
+                                    optional:
+                                      description: Specify whether the Secret or its
+                                        key must be defined
+                                      type: boolean
+                                  required:
+                                  - key
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                              type: object
+                          required:
+                          - name
+                          type: object
+                        type: array
+                      suppressArgs:
+                        description: |-
+                          SuppressArgs lists leading flag names (e.g. "--some-tunable-flag")
+                          the adapter MUST NOT inject. Admission rejects entries that overlap
+                          the adapter's ReservedArgs(). A suppressed flag is removed from the
+                          adapter's canonical contribution before Args merges in, so
+                          suppress-then-re-add is a supported pattern for overriding a
+                          non-reserved adapter-owned flag's value. Suppress does NOT touch
+                          user pod-template flags the adapter did not inject.
+                        items:
+                          type: string
+                        type: array
+                      suppressEnv:
+                        description: |-
+                          SuppressEnv lists env var Names the adapter MUST NOT inject.
+                          Admission rejects entries that overlap the adapter's ReservedEnv().
+                          Suppress does NOT touch user pod-template env the adapter did not
+                          inject.
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   failOpen:
                     default: true
                     description: |-
@@ -1744,6 +1972,42 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              indexParticipation:
+                description: |-
+                  IndexParticipation summarizes this CacheBackend's contribution to the
+                  cluster-wide cache index — populated by the CacheIndex poller (it groups
+                  the server's /snapshot replicas by the owning CacheBackend and projects
+                  the per-backend slice here). nil until the poller has observed at least
+                  one snapshot; absence of data on a single scrape never clears it.
+                properties:
+                  hitRate:
+                    description: |-
+                      HitRate is the prefix-count-weighted average cache hit rate across this
+                      backend's replicas, formatted as a decimal string in [0,1] (matching
+                      the cluster-wide CacheIndex.status.replicas[].hitRate convention — see
+                      CRD-codegen note on floats in CRDs). nil until the replica stats
+                      reporter emits per-replica hitRate into the index; do not interpret a
+                      missing value as 0.
+                    type: string
+                  lastEventAt:
+                    description: |-
+                      LastEventAt is the most recent KV-event timestamp observed for any of
+                      this backend's replicas. nil until the first event arrives; downstream
+                      readiness gates (e.g. "ready once at least one event seen") MUST treat
+                      nil as "not yet observed" rather than zero time.
+                    format: date-time
+                    type: string
+                  prefixCount:
+                    description: |-
+                      PrefixCount is the sum of distinct prefix entries currently attributed
+                      to this backend's replicas. Zero is a valid observed value — it means
+                      the backend is up but holds no warm prefixes yet.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                required:
+                - prefixCount
+                type: object
               matchedEnginePods:
                 description: |-
                   MatchedEnginePods is the number of pods in this CacheBackend's namespace

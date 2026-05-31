@@ -320,6 +320,13 @@ func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 		Backend: cachev1alpha1.CacheBackendTypeLMCache,
 	}}
 }
+func (stubVLLMLMCacheAdapter) ReservedArgs() []string {
+	return []string{"--kv-transfer-config"}
+}
+func (stubVLLMLMCacheAdapter) ReservedEnv() []string {
+	return []string{"VLLM_USE_V1", "LMCACHE_REMOTE_URL", "INFERENCECACHE_FAIL_OPEN"}
+}
+func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 
 // stubRegistry returns a Registry with only the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
@@ -542,6 +549,260 @@ func TestServiceDNSNamespace(t *testing.T) {
 				t.Fatalf("ns = %q, want %q", ns, tc.wantNS)
 			}
 		})
+	}
+}
+
+// withVLLMOverrides returns a fresh stub-LMCache backend whose integration
+// declares vLLM and carries the supplied EngineInjectionOverrides — the
+// admission-test backing for the engine-overrides rule.
+func withVLLMOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine:          "vllm",
+		EngineOverrides: &o,
+	}
+	return cb
+}
+
+func TestValidator_EngineOverrides_NoOverrideAdmitted(t *testing.T) {
+	// Sanity baseline: a CacheBackend whose integration is set but carries
+	// no engineOverrides block must admit unchanged. Locked decision #7
+	// (byte-identical default) hinges on this.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("no-override CR rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_SuppressReservedArgRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	requireInvalidWithCause(t, v,
+		cb,
+		"spec.integration.engineOverrides.suppressArgs[0]",
+		"--kv-transfer-config")
+	// And the rejection MUST name the offending adapter so the operator
+	// can trace the contract back.
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressArgs[0]", "\"vllm\"")
+}
+
+func TestValidator_EngineOverrides_OverrideReservedArgRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	// Two forms: bare flag and equals form. Both must trip the rule, since
+	// both express the same leading flag token.
+	for _, form := range []string{"--kv-transfer-config", "--kv-transfer-config=alt"} {
+		cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+			Args: []string{form},
+		})
+		requireInvalidWithCause(t, v, cb,
+			"spec.integration.engineOverrides.args[0]",
+			"--kv-transfer-config")
+	}
+}
+
+func TestValidator_EngineOverrides_SuppressReservedEnvRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressEnv: []string{"VLLM_USE_V1"},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressEnv[0]",
+		"VLLM_USE_V1")
+}
+
+func TestValidator_EngineOverrides_OverrideReservedEnvRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"INFERENCECACHE_FAIL_OPEN")
+}
+
+func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {
+	// Positive case: a non-reserved arg + env + suppression combination
+	// must pass admission. This is the CPU-vLLM use case — the operator
+	// suppresses a flag the adapter wouldn't inject anyway (no-op) and
+	// adds a perf knob. We pin the happy path here so a future tightening
+	// of the rule doesn't accidentally reject legitimate overrides.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Args:         []string{"--max-model-len", "8192"},
+		SuppressArgs: []string{"--enforce-eager"},
+		Env: []corev1.EnvVar{
+			{Name: "LMCACHE_CHUNK_SIZE", Value: "512"},
+		},
+		SuppressEnv: []string{"VLLM_LOG_LEVEL"},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("non-reserved overrides rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_PositionalArgIgnored(t *testing.T) {
+	// Positionals (no leading "-") cannot overlap a reserved flag name
+	// because the merge classifies them differently. Admission must treat
+	// them the same way and not surface a spurious rejection — the engine
+	// would happily accept the positional, so admission must too.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Args: []string{"some-positional"},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("positional arg rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_RejectsEmptyEnvName(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "", Value: "x"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"must declare a Name")
+}
+
+func TestValidator_EngineOverrides_RejectsInvalidEnvName(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		// "=" is forbidden in K8s env var names.
+		Env: []corev1.EnvVar{{Name: "FOO=BAR", Value: "x"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"invalid env var name")
+}
+
+func TestValidator_EngineOverrides_RejectsValueAndValueFrom(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name:  "BOTH",
+			Value: "literal",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0]",
+		"value OR valueFrom, not both")
+}
+
+func TestValidator_EngineOverrides_RejectsEmptyValueFrom(t *testing.T) {
+	// valueFrom with zero sources fails K8s Pod validation; admission
+	// must catch it before it reaches engine pods.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name:      "BAD",
+			ValueFrom: &corev1.EnvVarSource{},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].valueFrom",
+		"exactly one source")
+}
+
+func TestValidator_EngineOverrides_RejectsMultipleValueFromSources(t *testing.T) {
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name: "BAD",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+					Key:                  "k",
+				},
+			},
+		}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].valueFrom",
+		"multiple set")
+}
+
+func TestEnvVarSourceCount_CountsAllNonNilPointerFields(t *testing.T) {
+	// Pin the reflection-based count's contract: it walks pointer fields
+	// on EnvVarSource and counts non-nil ones. This is the future-proof
+	// path for new source kinds upstream adds (e.g. fileKeyRef) — the
+	// generated CRD already embeds them from the upstream OpenAPI, and the
+	// validator's one-of check needs to stay aligned without a code
+	// change for each new field.
+	cases := []struct {
+		name string
+		src  *corev1.EnvVarSource
+		want int
+	}{
+		{"nil", nil, 0},
+		{"empty", &corev1.EnvVarSource{}, 0},
+		{
+			"one source",
+			&corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+			1,
+		},
+		{
+			"two sources",
+			&corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+					Key:                  "k",
+				},
+			},
+			2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := envVarSourceCount(tc.src)
+			if got != tc.want {
+				t.Fatalf("envVarSourceCount = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
+	// Positive case: a ValueFrom-only entry (no Value) is a valid K8s env
+	// shape and must pass.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		}},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("ValueFrom-only env rejected: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_ExternalBackendSkipsCheck(t *testing.T) {
+	// External backends never reach an adapter — the reconciler routes
+	// them through reconcileExternal — so engineOverrides on an External
+	// CR is structurally meaningless. The check is bypassed; the
+	// structural rules (endpoint required) still fire.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "shared.team-a.svc.cluster.local:9000"
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("External CR with engineOverrides rejected: %v", err)
 	}
 }
 
