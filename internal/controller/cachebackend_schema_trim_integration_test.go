@@ -81,17 +81,20 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		return got
 	}
 
-	// Removed spec fields are pruned on create and never round-trip.
+	// Removed spec fields are pruned on create and never round-trip. obj is a
+	// separate RFC-1123 object name (the field name is mixed-case and cannot be
+	// used as metadata.name).
 	specCases := []struct {
 		name string
+		obj  string
 		path []string
 	}{
-		{"lookupTimeoutMs", []string{"spec", "integration", "lookupTimeoutMs"}},
-		{"minimumPrefixTokens", []string{"spec", "integration", "minimumPrefixTokens"}},
+		{"lookupTimeoutMs", "retired-spec-lookup-timeout", []string{"spec", "integration", "lookupTimeoutMs"}},
+		{"minimumPrefixTokens", "retired-spec-min-prefix-tokens", []string{"spec", "integration", "minimumPrefixTokens"}},
 	}
 	for _, tc := range specCases {
 		t.Run(tc.name, func(t *testing.T) {
-			name := "retired-spec-" + tc.name
+			name := tc.obj
 			u := newManaged(name)
 			if err := unstructured.SetNestedField(u.Object, int64(7), tc.path...); err != nil {
 				t.Fatalf("set %s: %v", tc.name, err)
