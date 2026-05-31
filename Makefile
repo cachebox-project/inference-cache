@@ -23,7 +23,7 @@ LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
 LD_FLAGS += -X '$(version_pkg).GitCommit=$(shell git rev-parse HEAD 2>/dev/null || echo unknown)'
 
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
-GOLANGCI_LINT_VERSION ?= v1.64.8
+GOLANGCI_LINT_VERSION ?= v2.12.2
 PROTOC_GEN_GO_VERSION ?= v1.36.5
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
 SETUP_ENVTEST_VERSION ?= v0.0.0-20241105200929-48ec3b71211f
@@ -58,8 +58,11 @@ controller-gen: $(LOCALBIN) ## Install controller-gen locally.
 	@test -s $(CONTROLLER_GEN) || GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
 
 .PHONY: golangci-lint
-golangci-lint: $(LOCALBIN) ## Install golangci-lint locally.
-	@test -s $(GOLANGCI_LINT) || GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+golangci-lint: $(LOCALBIN) ## Install golangci-lint locally; reinstall when the pinned version drifts.
+	@if ! { [ -x $(GOLANGCI_LINT) ] && $(GOLANGCI_LINT) --version 2>/dev/null | grep -qF "has version $(GOLANGCI_LINT_VERSION:v%=%) "; }; then \
+		rm -f $(GOLANGCI_LINT); \
+		GOTOOLCHAIN=go$(GO_VERSION) GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	fi
 
 .PHONY: protoc-gen-go
 protoc-gen-go: $(LOCALBIN) ## Install protobuf Go generators locally.
