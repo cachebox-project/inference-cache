@@ -81,10 +81,14 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewAuthenticator: %v", err)
 	}
+	// LastUpdate must be non-zero or buildCacheIndexStatus skips the replica
+	// (the controller treats prefix-only replicas with no stats reported as
+	// hidden from the cluster-wide CacheIndex.status surface — see the
+	// per-backend CacheBackend.status.indexParticipation path for those).
 	served := index.Snapshot{
 		TotalPrefixes: 7,
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "r1", CacheMemoryBytes: 200, HitRate: 0.75},
+			{ReplicaID: "r1", CacheMemoryBytes: 200, HitRate: 0.75, LastUpdate: time.Now()},
 		},
 	}
 	mux := http.NewServeMux()
