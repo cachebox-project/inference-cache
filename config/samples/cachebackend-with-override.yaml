@@ -21,8 +21,8 @@
 # container env is missing the canonical LMCache_* / VLLM_USE_V1 entries
 # after a first apply, wait for `kubectl get cachebackend qwen-demo -o
 # jsonpath='{.status.endpoint}'` to be non-empty and then
-# `kubectl rollout restart deployment/qwen-demo` so the next pod admits
-# with status.endpoint populated.
+# `kubectl rollout restart deployment/qwen-demo-engine` so the next pod
+# admits with status.endpoint populated.
 #
 # Once admitted with a non-empty status.endpoint,
 # `kubectl describe pod -l app=qwen-demo` should show the engine
@@ -83,6 +83,15 @@ spec:
 # (above) the engineOverrides amendments onto the `vllm` container at
 # admission time.
 #
+# The Deployment name is `qwen-demo-engine`, distinct from the CacheBackend
+# name (`qwen-demo`), because the CacheBackend reconciler stands up its own
+# Deployment named after the CacheBackend for the managed lmcache-server.
+# Reusing the same name would either collide on apply or get reconciled
+# back to the lmcache-server shape. Binding to the CacheBackend goes
+# through the `app: qwen-demo` label match in `spec.engineSelector` above,
+# not through the Deployment name, so the engine Deployment can be named
+# anything that does not collide with the managed pod.
+#
 # CPU vLLM image — verified end-to-end on a kind node (see
 # docs/reference-stack/manifests/cpu-local/deployment.yaml for the same
 # flags + memory-budget caveats). The image is arch-tagged: this manifest
@@ -91,7 +100,7 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen-demo
+  name: qwen-demo-engine
   labels:
     app: qwen-demo
 spec:
