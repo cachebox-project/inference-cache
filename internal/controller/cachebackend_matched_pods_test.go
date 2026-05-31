@@ -31,8 +31,9 @@ func lmcacheBackendWithSelector(name, namespace string, matchLabels map[string]s
 }
 
 // engineLikePod returns a minimal Pod object usable as a label-bearing fake
-// for the reconciler's pod-count query. It omits container spec because the
-// match is by labels alone.
+// for the reconciler's pod-count query. The container is a placeholder
+// (matching is purely by labels), but the apiserver/fake-client rejects
+// an empty Containers list, so one minimal entry is included.
 func engineLikePod(name, namespace string, labels map[string]string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},

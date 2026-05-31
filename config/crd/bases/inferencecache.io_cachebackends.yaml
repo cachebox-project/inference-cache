@@ -2025,10 +2025,14 @@ spec:
                   MatchedEnginePods is the number of pods in this CacheBackend's namespace
                   whose labels match spec.engineSelector at the last reconcile. The field
                   is a pointer so nil ("not yet computed") is distinguishable from 0
-                  ("computed and zero pods matched"). 0 is the operator-actionable
-                  signal that the selector and the engine Deployment's pod labels
-                  have drifted apart — the mutating Pod webhook then silently no-ops
-                  and the engine runs uncached.
+                  ("computed and zero current matches"). 0 covers any current
+                  zero-match state — the engine Deployment has not been created
+                  yet, it has been scaled to zero, every pod is `Terminating`, or
+                  the selector and the engine Deployment's pod labels have drifted
+                  apart. When engine pods are expected and 0 persists, label drift
+                  is the most likely diagnosis: the mutating Pod webhook silently
+                  no-ops on pods whose labels miss the selector, so the engine
+                  runs uncached.
 
                   This is a snapshot at reconcile time, not a real-time counter: it
                   is not updated on every pod birth/death. For per-pod real-time
