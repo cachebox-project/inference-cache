@@ -36,11 +36,21 @@ make test
 Run the server locally:
 
 ```bash
-bin/server --grpc-bind-address=:9090 --http-bind-address=:8080
+bin/server \
+  --grpc-bind-address=:9090 \
+  --http-bind-address=:8080 \
+  --snapshot-bind-address=:8081 \
+  --insecure-disable-snapshot-auth   # local-dev only; production passes --snapshot-allowed-sa instead
 curl -i http://localhost:8080/healthz   # liveness
 curl -i http://localhost:8080/readyz    # readiness
 curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
+curl -s http://localhost:8081/snapshot  # internal aggregate (auth-gated in production)
 ```
+
+The server fails closed by default: omitting both `--snapshot-allowed-sa` and
+`--insecure-disable-snapshot-auth` causes it to exit 2 with a stderr message.
+That keeps an operator who forgets the flag from accidentally shipping an
+unauthenticated `/snapshot` endpoint on a real cluster.
 
 ## Cluster Prerequisites
 
@@ -66,12 +76,15 @@ The default Kustomize overlay brings up both control-plane components:
 
 - `inference-cache-controller-manager` — the reconciler + admission webhooks.
 - `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
-  HTTP `/healthz`, `/readyz`, `/metrics`, `/snapshot` surface, fronted by a
-  `ClusterIP` Service `inference-cache-server` in the
-  `inference-cache-system` namespace with named ports `grpc:9090` and
-  `http:8080`. The controller's CacheIndex poller scrapes `http://inference-cache-server:8080/snapshot`
-  by default, so once both pods are Ready `kubectl get cacheindex` reports
-  live cluster-wide cache state.
+  HTTP `/healthz`, `/readyz`, `/metrics`, `/policy` surface, plus a dedicated
+  `/snapshot` endpoint on its own listener gated by ServiceAccount bearer
+  auth + a `NetworkPolicy`. Fronted by a `ClusterIP` Service
+  `inference-cache-server` in the `inference-cache-system` namespace with
+  named ports `grpc:9090` (gRPC API), `http:8080` (probes / metrics /
+  policy), and `snapshot:8081` (controller-only snapshot read). The
+  controller's CacheIndex poller scrapes `http://inference-cache-server:8081/snapshot`
+  by default and sends its projected ServiceAccount token; once both pods
+  are Ready `kubectl get cacheindex` reports live cluster-wide cache state.
 
 ```bash
 kubectl apply -k config/default
