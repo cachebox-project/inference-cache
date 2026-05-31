@@ -395,9 +395,11 @@ type CacheBackendStatus struct {
 	// is a pointer so nil ("not yet computed") is distinguishable from 0
 	// ("computed and zero current matches"). 0 covers any current
 	// zero-match state — the engine Deployment has not been created
-	// yet, it has been scaled to zero, every pod is `Terminating`, or
-	// the selector and the engine Deployment's pod labels have drifted
-	// apart. When engine pods are expected and 0 persists, label drift
+	// yet, it has been scaled to zero, or the selector and the engine
+	// Deployment's pod labels have drifted apart. (Pods carrying a
+	// `deletionTimestamp` are NOT filtered out today; the count is a
+	// raw List of matching pods.) When engine pods are expected and 0
+	// persists, label drift
 	// is the most likely diagnosis: the mutating Pod webhook silently
 	// no-ops on pods whose labels miss the selector, so the engine
 	// runs uncached.

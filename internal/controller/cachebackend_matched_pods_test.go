@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -237,6 +238,84 @@ func TestReconcileMatchedEnginePodsFailSoftOnListError(t *testing.T) {
 	}
 	if *got != 5 {
 		t.Fatalf("status.matchedEnginePods = %d after transient list error; want preserved (5)", *got)
+	}
+}
+
+// TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError pins the second
+// half of refreshMatchedEnginePods' fail-soft contract: when the namespaced
+// pod List succeeds but the follow-up Status().Patch to write the new count
+// errors out (transient apiserver hiccup, RBAC blip, status-subresource
+// race), the reconciler must NOT surface the patch failure as a reconcile
+// error AND must roll back the in-memory mutation so the rest of the
+// reconcile sees only what the apiserver actually persisted. The companion
+// list-error test covers the read side; this covers the write side.
+func TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	// Seed an existing observed value so we can distinguish "patch failed +
+	// rollback worked" (stays at 5) from "patch succeeded silently" (moves
+	// to the new count) and from "patch failed and we leaked the in-memory
+	// mutation" (moves but is not durable).
+	cb.Status.MatchedEnginePods = ptrInt32(5)
+
+	// Discriminate the matchedEnginePods patch from the dispatch
+	// patchStatus by inspecting the merge-patch payload — the refresh
+	// is the only writer whose patch carries a "matchedEnginePods"
+	// key (dispatch writes Endpoint/Health/FailOpen/ObservedGeneration
+	// but never touches the count sub-field).
+	patchErr := errors.New("synthetic apiserver patch failure")
+	var patchCalls int32
+	funcs := interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" {
+				if _, ok := obj.(*cachev1alpha1.CacheBackend); ok {
+					data, _ := patch.Data(obj)
+					if strings.Contains(string(data), "matchedEnginePods") {
+						atomic.AddInt32(&patchCalls, 1)
+						return patchErr
+					}
+				}
+			}
+			return c.Status().Patch(ctx, obj, patch, opts...)
+		},
+	}
+	objs := []client.Object{
+		cb,
+		engineLikePod("e1", "ns1", matchedSelector),
+		engineLikePod("e2", "ns1", matchedSelector),
+		engineLikePod("e3", "ns1", matchedSelector),
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard()}
+
+	// reconcile() t.Fatal's on any reconcile error → if we get here, the
+	// reconciler swallowed the patch error as designed.
+	reconcile(t, r, "cache", "ns1")
+
+	if got := atomic.LoadInt32(&patchCalls); got == 0 {
+		t.Fatalf("expected the matchedEnginePods status patch to fire at least once; got 0")
+	}
+
+	// In-memory rollback: the persisted CR still reports the prior
+	// observed 5, NOT the un-persisted new count of 3.
+	got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods
+	if got == nil {
+		t.Fatalf("status.matchedEnginePods = nil after patch error; want rolled-back prior value 5")
+	}
+	if *got != 5 {
+		t.Fatalf("status.matchedEnginePods = %d after patch error; want rolled-back prior value 5", *got)
 	}
 }
 
