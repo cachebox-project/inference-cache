@@ -5,9 +5,13 @@
 # `metadata.labels`. That label match is what binds the CR to the engine
 # pods: the controller's mutating Pod admission webhook intercepts each
 # pod CREATE, finds the matching CacheBackend, and injects the LMCache
-# wiring (env vars + `--kv-transfer-config` arg + kvevent-subscriber
-# sidecar). Drift the labels apart and the webhook silently no-ops, the
-# engine runs uncached, and `kubectl get cachebackend` reports `Matched: 0`.
+# engine wiring (env vars + `--kv-transfer-config` arg). The
+# kvevent-subscriber sidecar is appended in addition only when the
+# controller is started with `--kvevent-subscriber-image` set (empty
+# by default) AND the CR has a model id configured; otherwise the
+# engine is wired without the sidecar. Drift the labels apart and the
+# webhook silently no-ops, the engine runs uncached, and `kubectl get
+# cachebackend` reports `Matched: 0`.
 # See docs/concepts/cachebackend-engine-binding.md for the lifecycle and
 # the failure-mode table.
 #
@@ -42,9 +46,20 @@
 #
 #   kubectl apply -f config/samples/cachebackend-with-engine.yaml
 #
-# If you applied in one shot, `kubectl get cachebackend qwen-demo-cache`
-# shows the recovery signal: `MATCHED: 0` after a few seconds means the
-# engine pods raced past admission unwired. Re-run admission with:
+# Detecting the race after a one-shot apply: `status.matchedEnginePods`
+# counts current label matches at reconcile, not whether the pod was
+# injected at CREATE — a pod that raced past admission still has the
+# right labels and still counts toward `MATCHED`, so the column alone
+# can't tell you the race happened. The reliable race symptom is
+# per-pod: the engine pod is missing the `inferencecache.io/injected-by`
+# annotation and there is no `InjectedByCacheBackend` Event on it:
+#
+#   kubectl get pod -l app=qwen-demo \
+#     -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.metadata.annotations.inferencecache\.io/injected-by}{"\n"}{end}'
+#
+# A row with an empty second column raced. To fix, force admission to
+# re-run by recreating the affected pods (admission is CREATE-only;
+# editing labels on a live pod does NOT re-trigger):
 #
 #   kubectl rollout restart deploy/qwen-engine
 #

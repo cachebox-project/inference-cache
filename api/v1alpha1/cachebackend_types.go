@@ -91,9 +91,13 @@ type CacheBackendSpec struct {
 
 	// EngineSelector selects which engine pods this CacheBackend claims, using
 	// standard Kubernetes label-selector semantics over the pod's labels.
-	// Pods that match get LMCache wiring (env vars, CLI args, and the
-	// kvevent-subscriber observation sidecar) injected by the mutating Pod
-	// admission webhook at pod CREATE time.
+	// Pods that match get LMCache engine wiring (env vars + CLI args)
+	// injected by the mutating Pod admission webhook at pod CREATE time.
+	// The kvevent-subscriber observation sidecar is appended in addition
+	// to the engine wiring only when the controller is started with
+	// --kvevent-subscriber-image set (empty by default) AND the matched
+	// CacheBackend has a model id configured. Without those, the engine
+	// is wired but no sidecar is added.
 	//
 	// The match is evaluated once at pod CREATE — pods whose labels change
 	// after creation are not re-evaluated; the wiring is sticky to the
