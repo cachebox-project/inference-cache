@@ -41,6 +41,12 @@ func (stubAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) 
 	return nil, nil
 }
 
+func (stubAdapter) ReservedArgs() []string { return nil }
+func (stubAdapter) ReservedEnv() []string  { return nil }
+func (stubAdapter) EngineContainerName() string {
+	return ""
+}
+
 func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1alpha1.CacheBackend {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},

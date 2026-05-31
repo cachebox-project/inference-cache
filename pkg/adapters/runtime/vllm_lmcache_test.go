@@ -511,6 +511,57 @@ func TestVLLMLMCacheInjectRouterConfigTrulyNoopsOnBadInput(t *testing.T) {
 	}
 }
 
+// TestVLLMLMCacheReservedArgs pins the reserved-arg list — the args the
+// validating webhook will hard-reject from spec.integration.engineOverrides.
+// Reservation IS the contract: changing what's reserved without also
+// adjusting the documented override surface in docs/design/cachebackend-api.md
+// is a contract change, so this test is intentionally exact.
+func TestVLLMLMCacheReservedArgs(t *testing.T) {
+	got := vllmLMCacheAdapter{}.ReservedArgs()
+	want := []string{defaultEngineKVTransferConfigArg}
+	if !equalStrSlice(got, want) {
+		t.Fatalf("ReservedArgs = %v, want %v", got, want)
+	}
+}
+
+// TestVLLMLMCacheReservedEnv pins the reserved-env list. Three env names
+// are reserved here (the integration strictly requires them): the resolved
+// remote URL, the v1-codepath selector, and the spec.integration.failOpen
+// mirror. Known tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE /
+// LMCACHE_LOCAL_CPU / LMCACHE_MAX_LOCAL_CPU_SIZE) are NOT reserved, and the
+// test also asserts they are absent. (--kv-transfer-config is reserved on
+// the args side, covered by TestVLLMLMCacheReservedArgs.)
+func TestVLLMLMCacheReservedEnv(t *testing.T) {
+	got := vllmLMCacheAdapter{}.ReservedEnv()
+	want := []string{EnvLMCacheRemoteURL, EnvVLLMUseV1, EnvInferenceCacheFailOpen}
+	if !equalStrSlice(got, want) {
+		t.Fatalf("ReservedEnv = %v, want %v", got, want)
+	}
+	// Negative-control: documented tunables MUST NOT appear in the
+	// reserved set, or admission would block legitimate operator overrides
+	// the design explicitly supports.
+	tunable := map[string]bool{
+		EnvLMCacheChunkSize:   true,
+		EnvLMCacheRemoteSerde: true,
+		EnvLMCacheLocalCPU:    true,
+		EnvLMCacheMaxLocalCPU: true,
+	}
+	for _, name := range got {
+		if tunable[name] {
+			t.Errorf("env %q is documented as tunable and MUST NOT be reserved", name)
+		}
+	}
+}
+
+// TestVLLMLMCacheEngineContainerName confirms the adapter exposes its
+// canonical container name to the pod webhook so the override merge lands on
+// the same container [InjectEngineConfig] modified.
+func TestVLLMLMCacheEngineContainerName(t *testing.T) {
+	if got := (vllmLMCacheAdapter{}).EngineContainerName(); got != EngineContainerName {
+		t.Fatalf("EngineContainerName = %q, want %q", got, EngineContainerName)
+	}
+}
+
 func TestDefaultRegistryResolvesVLLMLMCache(t *testing.T) {
 	r := DefaultRegistry()
 	if r.Len() == 0 {
