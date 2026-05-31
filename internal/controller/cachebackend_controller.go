@@ -208,6 +208,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		backend.Status.Health = ""
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
+		backend.Status.FirstKVEventObservedAt = nil
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
@@ -226,6 +227,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		backend.Status.Health = ""
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
+		backend.Status.FirstKVEventObservedAt = nil
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
@@ -707,6 +709,14 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 		backend.Status.Health = gate.health
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = publishedGen
+		// Latch the first KV-event observation write-once. The poller can later
+		// clear indexParticipation.lastEventAt on a drain, so this durable
+		// marker is what keeps lastKVEventSeen true thereafter.
+		if backend.Status.FirstKVEventObservedAt == nil {
+			if at := currentLastEventAt(backend); at != nil {
+				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
+			}
+		}
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
 			Status:             gate.readyStatus,
@@ -859,13 +869,31 @@ func kvEventGateEnabled(backend *cachev1alpha1.CacheBackend) bool {
 	return backend.Annotations[annotationRequireKVEvents] != "false"
 }
 
-// lastKVEventSeen reports whether at least one KV event has ever been observed
-// for this backend, sourced from the CacheIndex poller's
-// status.indexParticipation.lastEventAt. nil participation or nil lastEventAt
-// means "not yet observed".
+// lastKVEventSeen reports whether at least one KV event has EVER been observed
+// for this backend. The gate's contract is "ever observed", but the poller's
+// status.indexParticipation.lastEventAt is only a current-view projection — it
+// legitimately clears to nil when a backend's replicas drain (scale-down,
+// prefixes TTL'd; see the CacheIndex poller's drain handling). Reading that
+// alone would let a backend that already passed the gate regress to
+// AwaitingFirstKVEvent → NoKVEventsObserved on a drain. So the durable
+// status.firstKVEventObservedAt latch (written write-once below) is consulted
+// too: once set it pins the gate satisfied, matching the "first-event startup
+// probe, not a liveness check" scope.
 func lastKVEventSeen(backend *cachev1alpha1.CacheBackend) bool {
+	if backend.Status.FirstKVEventObservedAt != nil {
+		return true
+	}
 	ip := backend.Status.IndexParticipation
 	return ip != nil && ip.LastEventAt != nil
+}
+
+// currentLastEventAt returns the poller's current-view lastEventAt for the
+// backend, or nil. Used to latch firstKVEventObservedAt write-once.
+func currentLastEventAt(backend *cachev1alpha1.CacheBackend) *metav1.Time {
+	if ip := backend.Status.IndexParticipation; ip != nil {
+		return ip.LastEventAt
+	}
+	return nil
 }
 
 // firstEventTimeout resolves the effective first-event timeout, falling back

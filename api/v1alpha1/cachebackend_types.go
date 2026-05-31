@@ -404,6 +404,19 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// FirstKVEventObservedAt latches the first time the KV-event readiness
+	// gate observed status.indexParticipation.lastEventAt populated for this
+	// backend. It is the durable "have we EVER seen a KV event" signal the
+	// gate needs: lastEventAt itself is a current-view projection the
+	// CacheIndex poller legitimately clears when a backend's replicas drain
+	// (scale-down, prefixes TTL'd), so reading it alone would let a backend
+	// that already passed the gate regress to AwaitingFirstKVEvent. Written
+	// write-once by the controller and never cleared while the backend stays
+	// managed; the gate is a first-event startup probe, not an ongoing
+	// liveness check.
+	// +optional
+	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
+
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups
 	// the server's /snapshot replicas by the owning CacheBackend and projects

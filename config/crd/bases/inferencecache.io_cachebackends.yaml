@@ -1969,6 +1969,20 @@ spec:
                   whether the cache is currently a soft optimization (true) or a
                   serving dependency (false) without re-reading the integration spec.
                 type: boolean
+              firstKVEventObservedAt:
+                description: |-
+                  FirstKVEventObservedAt latches the first time the KV-event readiness
+                  gate observed status.indexParticipation.lastEventAt populated for this
+                  backend. It is the durable "have we EVER seen a KV event" signal the
+                  gate needs: lastEventAt itself is a current-view projection the
+                  CacheIndex poller legitimately clears when a backend's replicas drain
+                  (scale-down, prefixes TTL'd), so reading it alone would let a backend
+                  that already passed the gate regress to AwaitingFirstKVEvent. Written
+                  write-once by the controller and never cleared while the backend stays
+                  managed; the gate is a first-event startup probe, not an ongoing
+                  liveness check.
+                format: date-time
+                type: string
               health:
                 description: Health summarizes the observed backend health.
                 enum:

@@ -131,6 +131,46 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		}
 	})
 
+	t.Run("StaysReadyAfterPollerClearsLastEventAtOnDrain", func(t *testing.T) {
+		// Regression: the poller's lastEventAt is a current-view projection it
+		// clears on a replica drain. A backend that already passed the gate
+		// must NOT regress to AwaitingFirstKVEvent — the durable
+		// firstKVEventObservedAt latch keeps it Ready.
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(ctx, gatedLMCacheBackend("cache", ns)); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		patchLastEventAt(t, k8s, "cache", ns, time.Now())
+		reconcile(t, r, "cache", ns)
+
+		cb := getBackend(t, r, "cache", ns)
+		if cb.Status.FirstKVEventObservedAt == nil {
+			t.Fatalf("firstKVEventObservedAt = nil, want latched after first event")
+		}
+		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+			t.Fatalf("pre-drain health = %q, want Ready", cb.Status.Health)
+		}
+
+		// Simulate the poller draining the projection: prefixCount 0, lastEventAt nil.
+		before := cb.DeepCopy()
+		cb.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 0}
+		if err := k8s.Status().Patch(ctx, cb, client.MergeFrom(before)); err != nil {
+			t.Fatalf("patch drained participation: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		got := getBackend(t, r, "cache", ns)
+		if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+			t.Fatalf("post-drain health = %q, want Ready (latched)", got.Status.Health)
+		}
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != reasonKVEventsObserved {
+			t.Fatalf("post-drain Ready = %+v, want True/KVEventsObserved", ready)
+		}
+	})
+
 	t.Run("TimeoutBreachedIsDegradedNoKVEventsObserved", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
