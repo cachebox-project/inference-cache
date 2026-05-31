@@ -112,10 +112,9 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 
 // +kubebuilder:webhook:path=/mutate-inferencecache-io-v1alpha1-cachebackend,mutating=true,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachebackends,verbs=create;update,versions=v1alpha1,name=mcachebackend.inferencecache.io,admissionReviewVersions=v1
 
-// Default implements [admission.Defaulter]. It stamps the Phase-1
-// defaults onto cb only where the operator did not specify a value: a
-// non-nil pointer or a non-zero scalar is treated as an explicit choice
-// and left alone.
+// Default implements [admission.Defaulter]. It stamps spec.replicas (the
+// only Phase-1 default this webhook applies) when the operator left it
+// unset; a non-nil pointer is treated as an explicit choice and left alone.
 func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.CacheBackend) error {
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)

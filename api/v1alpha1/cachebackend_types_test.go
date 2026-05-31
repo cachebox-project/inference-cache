@@ -127,6 +127,7 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	replicas := int32(2)
 	storageClassName := "fast"
+	hitRate := "0.50"
 	runAsNonRoot := true
 	runtimeClassName := "runc"
 	terminationGracePeriodSeconds := int64(30)
@@ -175,6 +176,10 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			Endpoint: "cache.default.svc:8080",
 			Health:   CacheBackendHealthReady,
 			Capacity: "10Gi",
+			IndexParticipation: &CacheBackendIndexParticipation{
+				PrefixCount: 7,
+				HitRate:     &hitRate,
+			},
 			Conditions: []metav1.Condition{{
 				Type:               "Ready",
 				Status:             metav1.ConditionTrue,
@@ -263,6 +268,14 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Spec.Template.TerminationGracePeriodSeconds == nil ||
 		*copied.Spec.Template.TerminationGracePeriodSeconds != 30 {
 		t.Fatalf("template.terminationGracePeriodSeconds was not deep-copied")
+	}
+	if copied.Status.IndexParticipation == nil ||
+		copied.Status.IndexParticipation.PrefixCount != 7 {
+		t.Fatalf("status.indexParticipation.prefixCount was not deep-copied")
+	}
+	if copied.Status.IndexParticipation.HitRate == nil ||
+		*copied.Status.IndexParticipation.HitRate != "0.50" {
+		t.Fatalf("status.indexParticipation.hitRate was not deep-copied")
 	}
 	if copied.Status.Conditions[0].Message != "backend is ready" {
 		t.Fatalf("conditions were not deep-copied")
