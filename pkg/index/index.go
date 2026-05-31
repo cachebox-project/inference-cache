@@ -967,8 +967,70 @@ func (i *Index) CacheState(tenant, model string) (replicas []ReplicaStats, total
 	return replicas, totalPrefixes
 }
 
+// DefaultTenantSentinel is the bucket entries with an empty tenant ID are
+// attributed to in cluster-wide aggregates. Without it, untenanted entries
+// would count toward the grand total but belong to no tenants[] bucket, so
+// Σ tenants[].indexEntries would silently fall short of the total. Bucketing
+// them under a visible, reserved key keeps the aggregate's core invariant —
+// Σ tenants[].indexEntries == totalEntries — true by construction. It is a
+// reserved name: a real CacheTenant.spec.tenantID is non-empty and operators
+// shouldn't use it; it never claims a per-CacheTenant status (that writer keys
+// on real tenant IDs).
+const DefaultTenantSentinel = "_default"
+
+// tenantBucket maps a raw tenant ID to its aggregate bucket: the ID itself, or
+// the sentinel when empty. Used for BOTH the entry walk and the stats walk so
+// the two agree on how an untenanted record is attributed.
+func tenantBucket(tenant string) string {
+	if tenant == "" {
+		return DefaultTenantSentinel
+	}
+	return tenant
+}
+
+// Aggregate is the index's entry-count aggregate: the per-tenant index-entry
+// counts and the grand total, both produced by a SINGLE walk of the prefix map
+// so they cannot disagree. Total == Σ PerTenant by construction — this is the
+// hard invariant the CacheIndex/CacheTenant status surfaces rely on (a tenant's
+// reported indexEntries always sum to the cluster prefix total). An "entry" is
+// one replica's hold on one prefix key — the same unit the global cap and the
+// per-tenant maxIndexEntries quota bound.
+type Aggregate struct {
+	PerTenant map[string]int64
+	Total     int64
+}
+
+// Aggregate returns the entry-count aggregate under a single read-lock + single
+// walk. Exposed so callers/tests can assert the invariant directly.
+func (i *Index) Aggregate() Aggregate {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.aggregateLocked()
+}
+
+// aggregateLocked walks the prefix map exactly once, attributing every
+// (prefix, replica) entry to its tenant bucket and the running total in the same
+// step. Caller holds at least the read lock. Because both numbers come from the
+// one iteration, Total == Σ PerTenant always holds — no second pass, no separate
+// counter that could drift.
+func (i *Index) aggregateLocked() Aggregate {
+	agg := Aggregate{PerTenant: make(map[string]int64)}
+	for key, replicas := range i.prefixes {
+		n := int64(len(replicas))
+		if n == 0 {
+			continue
+		}
+		agg.PerTenant[tenantBucket(key.tenant)] += n
+		agg.Total += n
+	}
+	return agg
+}
+
 // Snapshot is a point-in-time, cluster-wide view of the index for the
 // CacheIndex status surface (consumed by the controller). Metadata only.
+//
+// TotalPrefixes is the total index-entry count (replica×prefix records), and
+// it equals the sum of tenants[].indexEntries — see Aggregate.
 type Snapshot struct {
 	Replicas      []ReplicaSnapshot `json:"replicas"`
 	Tenants       []TenantSnapshot  `json:"tenants"`
@@ -1018,7 +1080,10 @@ func (i *Index) Snapshot() Snapshot {
 		}
 	}
 
-	snap := Snapshot{TotalPrefixes: len(i.prefixes)}
+	// Entry counts (per-tenant + total) come from ONE authoritative walk so the
+	// reported numbers can't drift: TotalPrefixes == Σ tenants[].indexEntries.
+	agg := i.aggregateLocked()
+	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 
 	for id, s := range latestByReplica {
 		snap.Replicas = append(snap.Replicas, ReplicaSnapshot{
@@ -1037,21 +1102,25 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	byTenant := make(map[string]*tenantAgg)
 	for tr, s := range latestByTenantReplica {
-		a := byTenant[tr.tenant]
+		// Bucket the empty tenant the SAME way the entry walk does, so a tenant's
+		// stats and its indexEntries land on the same key.
+		bucket := tenantBucket(tr.tenant)
+		a := byTenant[bucket]
 		if a == nil {
 			a = &tenantAgg{}
-			byTenant[tr.tenant] = a
+			byTenant[bucket] = a
 		}
 		a.mem += s.stats.CacheMemoryBytes
 		a.sumHit += float64(s.stats.HitRate)
 		a.n++
 	}
 	// Union the stats-bearing tenants with the entry-bearing tenants: a tenant
-	// can have index entries but no stats reported yet (the engine reported
-	// prefixes without a stats payload), and the per-tenant status writer must
-	// still see its indexEntries. A tenant present in only one of the two maps
-	// gets zeroes for the other dimension.
-	seen := make(map[string]struct{}, len(byTenant)+len(i.entriesByTenant))
+	// can have index entries but no stats reported yet (prefixes reported without
+	// a stats payload), or stats but no live entries. A tenant in only one map
+	// gets zeroes for the other dimension. Emitting every entry-bearing tenant
+	// (agg.PerTenant) is what makes Σ tenants[].indexEntries == TotalPrefixes:
+	// no entry bucket is ever dropped from tenants[].
+	seen := make(map[string]struct{}, len(byTenant)+len(agg.PerTenant))
 	emit := func(t string) {
 		if _, ok := seen[t]; ok {
 			return
@@ -1070,14 +1139,14 @@ func (i *Index) Snapshot() Snapshot {
 		snap.Tenants = append(snap.Tenants, TenantSnapshot{
 			TenantID:     t,
 			MemoryUsed:   mem,
-			IndexEntries: int64(i.entriesByTenant[t]),
+			IndexEntries: agg.PerTenant[t],
 			HitRate:      hit,
 		})
 	}
 	for t := range byTenant {
 		emit(t)
 	}
-	for t := range i.entriesByTenant {
+	for t := range agg.PerTenant {
 		emit(t)
 	}
 	i.mu.RUnlock()
