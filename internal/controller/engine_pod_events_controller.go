@@ -140,9 +140,16 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // produces any other shape, so a ref that does not parse cleanly is by
 // definition stale or manually-tampered — callers use this to short-circuit
 // the InjectedByCacheBackend event emission for those pods.
+//
+// Reject EXACTLY the cases the webhook never produces: missing slash, empty
+// halves, AND multiple slashes (`ns/name/extra` is not a shape the webhook
+// emits). strings.SplitN with n=3 lets us spot the third segment cheaply.
 func validCacheBackendRef(ref string) bool {
-	ns, name, ok := strings.Cut(ref, "/")
-	return ok && ns != "" && name != ""
+	parts := strings.SplitN(ref, "/", 3)
+	if len(parts) != 2 {
+		return false
+	}
+	return parts[0] != "" && parts[1] != ""
 }
 
 // lookupCacheBackend parses the "<namespace>/<name>" annotation value and

@@ -173,6 +173,7 @@ func TestEnginePodEvents_MalformedAnnotationDoesNotEmit(t *testing.T) {
 		{name: "empty namespace half", annoVal: "/primary"},
 		{name: "empty name half", annoVal: "engines/"},
 		{name: "empty string", annoVal: ""},
+		{name: "extra slash (third segment)", annoVal: "engines/primary/extra"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

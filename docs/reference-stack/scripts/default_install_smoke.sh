@@ -333,8 +333,11 @@ kubectl create namespace "$SAMPLE_NS" --dry-run=client -o yaml \
 
 log "splitting paired sample into CacheBackend doc and engine Deployment doc"
 sample_file="config/samples/cachebackend-with-engine.yaml"
-sample_tmp_cb="$(mktemp)"
-sample_tmp_engine="$(mktemp)"
+# Place the split files under the trapped $tmpdir so an early failure
+# between split and apply (or a SIGINT mid-run) does not leak temp files
+# in /tmp. $tmpdir is created at script init and removed by cleanup().
+sample_tmp_cb="$(mktemp "$tmpdir/sample-cb.XXXXXX")"
+sample_tmp_engine="$(mktemp "$tmpdir/sample-engine.XXXXXX")"
 # The paired sample is a two-doc YAML stream (CacheBackend, ---,
 # Deployment) — guaranteed ordering, so awk on the `---` separator is
 # enough. yq would be cleaner but isn't a guaranteed dependency on the
@@ -373,7 +376,8 @@ log "status.endpoint=$endpoint"
 
 log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
-rm -f "$sample_tmp_cb" "$sample_tmp_engine"
+# Split files live under $tmpdir and are removed by the trap; no
+# explicit rm here so a failure between split and apply still cleans up.
 
 log "waiting up to ${SAMPLE_MATCH_TIMEOUT}s for status.matchedEnginePods=1"
 deadline=$(($(date +%s) + SAMPLE_MATCH_TIMEOUT))
