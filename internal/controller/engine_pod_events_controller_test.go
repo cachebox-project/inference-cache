@@ -170,6 +170,43 @@ func TestEnginePodEvents_SkipsWhenInjectedByUIDAnnotationMissing(t *testing.T) {
 	}
 }
 
+func TestEnginePodEvents_EmitsWhenForgedAnnotationsCarryCurrentLiveUID(t *testing.T) {
+	// Pins the documented LIMIT of the injected-by-uid check: it
+	// reduces the failurePolicy=Ignore forgery surface (catches
+	// copy/paste from a different CR or a stale UID) but does NOT
+	// cryptographically authenticate the webhook. metadata.uid is not
+	// secret; a pod creator with `get` RBAC on CacheBackends can read
+	// the live UID and stamp the pair correctly, and the controller
+	// then emits the InjectedByCacheBackend Event as if the webhook
+	// had actually injected. This test exists so a future "we closed
+	// the hole" claim trips the assertion below and forces a real
+	// authentication mechanism (webhook-authored signature) rather
+	// than a documentation update.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-1"},
+	}
+	// Forger stamps the LIVE UID — exactly what a user with API read
+	// access would do under failurePolicy=Ignore with the webhook
+	// unreachable.
+	pod := injectedPodWithUID("engine-forger", ns, ns+"/"+cb.Name, string(cb.UID), nil)
+	r, rec := newEnginePodEventsReconciler(t, cb, pod)
+
+	reconcilePod(t, r, ns, pod.Name)
+
+	got := drainRecorder(rec)
+	found := false
+	for _, e := range got {
+		if strings.Contains(e, eventReasonEngineInjected) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected InjectedByCacheBackend event when forged annotations carry the live UID (documented limit); got %v", got)
+	}
+}
+
 func TestEnginePodEvents_UsesAPIReaderForCacheBackendLookup(t *testing.T) {
 	// Pin the structural invariant: the CacheBackend lookup MUST go
 	// through APIReader (uncached live client), not the embedded

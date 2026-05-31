@@ -140,12 +140,22 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// The injected-by annotation is user-controllable. The webhook is
 	// failurePolicy=Ignore on the MutatingWebhookConfiguration, so a pod
 	// can persist with a user-supplied injected-by annotation when the
-	// webhook is unreachable at admission time. The webhook-only proof
-	// is the companion `injected-by-uid` annotation: its value is the
-	// matched CacheBackend's metadata.uid, which the webhook reads from
-	// the apiserver at admission time and the user cannot guess or set
-	// without API access to the CR. Require BOTH: a successful CR
-	// lookup AND a UID match against the live CR.
+	// webhook is unreachable at admission time. The `injected-by-uid`
+	// annotation REDUCES (does NOT eliminate) that attack surface: the
+	// value is the matched CacheBackend's metadata.uid, an apiserver-
+	// assigned identifier the casual copy/paste from another pod's
+	// metadata won't match — but it is NOT a secret. A pod creator with
+	// `get` RBAC on CacheBackends can read the live UID and stamp the
+	// pair correctly. The check below catches the common "copy a pod
+	// template across CR boundaries" mistake and the failurePolicy=Ignore
+	// "user template carries stale annotations" case; it does NOT
+	// authenticate the webhook against a determined operator with API
+	// read access. A truly unforgeable proof would require a webhook-
+	// authored signature the apiserver vouches for, which is out of
+	// scope here.
+	//
+	// Require BOTH: a successful CR lookup AND a UID match against the
+	// live CR.
 	uidRef := pod.Annotations[podwebhook.AnnotationInjectedByUID]
 	if uidRef == "" {
 		logger.V(1).Info("skipping InjectedByCacheBackend event: injected-by-uid annotation missing",

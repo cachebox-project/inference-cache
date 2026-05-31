@@ -20,17 +20,17 @@ Three actors participate in the binding:
 +-----------------+    pod CREATE     +------------+-----------+
 | Engine          | -----------+----> | Mutating Pod webhook   |
 | Deployment      |            |      | (matches selector;     |
-| template:       |            |      |  injects engine config |
-|   labels: {...} |            |      |  + subscriber sidecar) |
+| template:       |            |      |  injects engine config;|
+|   labels: {...} |            |      |  +subscriber sidecar*) |
 +-----------------+            |      +------------+-----------+
                                |                   |
                                |                   v
-                               |        +----------+-----------+
-                               |        | Engine pod           |
-                               |        |  env: LMCACHE_*      |
-                               |        |  args: --kv-...      |
-                               |        |  sidecar: subscriber |
-                               |        +----------+-----------+
+                               |        +----------+--------------+
+                               |        | Engine pod              |
+                               |        |  env: LMCACHE_*         |
+                               |        |  args: --kv-...         |
+                               |        |  sidecar: subscriber*   |
+                               |        +----------+--------------+
                                |                   |
                                |                   v subscriber publishes
                                |        +----------+-----------+
@@ -43,11 +43,13 @@ Three actors participate in the binding:
 
 The match is evaluated **once at pod CREATE** by the mutating webhook. The wiring is sticky to the life of the pod — relabeling an existing pod does not re-evaluate it. To opt a pod out regardless of label match, set `inferencecache.io/skip-inject: "true"` on the pod template.
 
+`*` The kvevent-subscriber sidecar is opt-in. It is appended only when the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has `backendConfig.model` configured; otherwise the engine is wired without it. The default install does not auto-attach the sidecar.
+
 ## Lifecycle
 
 1. **Apply the CacheBackend.** `kubectl apply -f cachebackend.yaml`. The reconciler creates the managed lmcache-server Deployment + Service and publishes the resolved address in `status.endpoint`.
 2. **Deploy the engine.** Apply an engine Deployment whose pod template labels include every key/value in `spec.engineSelector.matchLabels`. New pods from that Deployment hit the mutating webhook at admission time.
-3. **The webhook claims matching pods (precondition: status.endpoint published).** When the matched CacheBackend has `status.endpoint` populated by the time admission runs, the webhook injects LMCache env vars, the `--kv-transfer-config` CLI arg, and stamps TWO annotations: `inferencecache.io/injected-by: <ns>/<name>` (operator-readable identity, visible in `kubectl describe pod`) and `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's `metadata.uid` — the operator can't guess this value without API access to read the live CR's metadata, which is what makes it useful as a controller-validated proof-of-injection; the events controller compares it against the live CR's UID before emitting). When the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has a model id configured, the kvevent-subscriber sidecar is also appended; otherwise the engine is wired without the sidecar. A controller watching pods then validates the UID annotation against the live CR's UID and records a `Normal InjectedByCacheBackend` event on the now-persisted pod, visible in `kubectl describe pod`. (The event is emitted from a controller rather than the webhook because the apiserver does not assign `metadata.uid` until after mutating admission — an event recorded from the webhook would have `involvedObject.uid=""` and would not surface under describe. The UID annotation is what lets the controller distinguish a real webhook injection from a user-supplied `injected-by` annotation when the webhook is unreachable under `failurePolicy=Ignore`.) **If the CacheBackend's `status.endpoint` is empty at admission time** (the operator applied the engine Deployment before the reconciler had a chance to publish it), the webhook fail-opens — the pod is admitted unwired, no annotations are stamped, no Event is emitted. Because admission is CREATE-only, this is permanent for that pod; recovery is `kubectl rollout restart deploy/<engine>` so new pods re-enter admission. Note that `status.matchedEnginePods` still counts the unwired pod (the selector matches its labels), so `Matched > 0` does **not** guarantee the pod was injected — the per-pod annotations and Event are the authoritative wiring signals.
+3. **The webhook claims matching pods (precondition: status.endpoint published).** When the matched CacheBackend has `status.endpoint` populated by the time admission runs, the webhook injects LMCache env vars, the `--kv-transfer-config` CLI arg, and stamps TWO annotations: `inferencecache.io/injected-by: <ns>/<name>` (operator-readable identity, visible in `kubectl describe pod`) and `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's `metadata.uid` — an apiserver-assigned identifier that the events controller cross-checks against the live CR's UID before emitting. The check catches casual copy-paste of an injected pod's annotations into a fresh template, but it isn't a security boundary: UIDs are readable metadata, so a pod creator with `get` RBAC on CacheBackends can stamp the pair correctly). When the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has a model id configured, the kvevent-subscriber sidecar is also appended; otherwise the engine is wired without the sidecar. A controller watching pods then validates the UID annotation against the live CR's UID and records a `Normal InjectedByCacheBackend` event on the now-persisted pod, visible in `kubectl describe pod`. (The event is emitted from a controller rather than the webhook because the apiserver does not assign `metadata.uid` until after mutating admission — an event recorded from the webhook would have `involvedObject.uid=""` and would not surface under describe. The UID annotation is what lets the controller distinguish a real webhook injection from a user-supplied `injected-by` annotation when the webhook is unreachable under `failurePolicy=Ignore`.) **If the CacheBackend's `status.endpoint` is empty at admission time** (the operator applied the engine Deployment before the reconciler had a chance to publish it), the webhook fail-opens — the pod is admitted unwired, no annotations are stamped, no Event is emitted. Because admission is CREATE-only, this is permanent for that pod; recovery is `kubectl rollout restart deploy/<engine>` so new pods re-enter admission. Note that `status.matchedEnginePods` still counts the unwired pod (the selector matches its labels), so `Matched > 0` does **not** guarantee the pod was injected — the per-pod annotations and Event are the authoritative wiring signals.
 4. **KV events flow (when the sidecar is configured).** When the subscriber sidecar is present, it streams the engine's KV-cache events to the policy server's index, which surfaces them in `CacheBackend.status` (the index-participation status fields). Without the sidecar, the binding is still observable — `status.matchedEnginePods` and the per-pod annotation/Event still materialize from step 3 — but no KV events flow and the index-participation fields stay unset.
 5. **Observe and debug.** `kubectl get cachebackend` shows the `Matched` column — the snapshot count of pods whose labels currently match. `kubectl describe pod <engine-pod>` shows which CacheBackend (if any) claimed it.
 
