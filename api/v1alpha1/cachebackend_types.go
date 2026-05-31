@@ -92,7 +92,15 @@ type CacheBackendSpec struct {
 	// EngineSelector selects which engine pods this CacheBackend claims, using
 	// standard Kubernetes label-selector semantics over the pod's labels.
 	// Pods that match get LMCache engine wiring (env vars + CLI args)
-	// injected by the mutating Pod admission webhook at pod CREATE time.
+	// injected by the mutating Pod admission webhook at pod CREATE time,
+	// PROVIDED the matched CacheBackend's status.endpoint has been
+	// published by the time admission runs. The webhook fail-opens
+	// (admits the pod unmodified) when status.endpoint is empty — so a
+	// pod that loses the race against the reconciler is admitted
+	// uncached for its whole lifetime. Admission is CREATE-only;
+	// recovery is to recreate the pod (e.g. `kubectl rollout restart`),
+	// not to edit the live pod's labels.
+	//
 	// The kvevent-subscriber observation sidecar is appended in addition
 	// to the engine wiring only when the controller is started with
 	// --kvevent-subscriber-image set (empty by default) AND the matched
