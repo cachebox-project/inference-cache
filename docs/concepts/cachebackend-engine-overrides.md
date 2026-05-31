@@ -18,7 +18,7 @@ hard-rejected at admission.
 |---|---|
 | `env: [{name, value}, ...]` | Upsert by name. An override `name` matching an adapter-injected env replaces it; an override `name` the adapter did not inject is appended. An override `name` matching an env on your pod template that the adapter did NOT touch is a silent no-op (the override surface never mutates pod-template state the adapter did not invite the CR to touch). |
 | `suppressEnv: [name, ...]` | Remove from the adapter's canonical env by name. Scoped to adapter-injected entries; suppressing a name the adapter did not contribute is a silent no-op. |
-| `args: [...]` | For each entry, if its leading flag token (e.g. `--max-model-len`) matches an adapter-injected flag, replace the canonical entry; otherwise append. Collision with a user-template flag the adapter did not inject is a silent no-op. Order is preserved. |
+| `args: [...]` | For each entry, if its leading flag token (e.g. `--max-model-len`) matches an adapter-injected flag, replace the canonical entry; if it matches a user-template flag the adapter did not touch, the override is a silent no-op; if it matches neither, the entry is appended. Order is preserved. |
 | `suppressArgs: [flag, ...]` | Remove from the adapter's canonical args by leading flag token. Scoped to adapter-injected entries. |
 
 > **Mental model.** Canonical injection is what the adapter knows you
@@ -182,8 +182,12 @@ env:
 
 ### 4. Append a vLLM flag the adapter doesn't inject
 
-Extend the engine's context window to 32 768 tokens. The adapter does not
-inject `--max-model-len`, so the override is appended.
+Extend the engine's context window to 32 768 tokens. The adapter does
+not inject `--max-model-len`, so — **assuming the engine pod template
+does not already set `--max-model-len`** — the override is appended.
+(If your pod template already carries the flag, an `args` override for
+the same flag is a silent no-op; edit the pod template instead, since
+`engineOverrides` only mutates adapter-contributed entries by design.)
 
 ```yaml
 spec:
@@ -195,8 +199,9 @@ spec:
         - "32768"
 ```
 
-After webhook mutation (canonical `--kv-transfer-config` preserved, two
-override args appended):
+After webhook mutation against a pod template with no
+`--max-model-len` of its own (canonical `--kv-transfer-config`
+preserved, two override args appended):
 
 ```yaml
 args:
@@ -257,9 +262,10 @@ Two surfaces today:
   reserved.
 
 There is **no CLI surface today** for "show me adapter X's reserved
-list" — the validator only surfaces the list when a rejected CR happens to
-overlap it. That is a real discoverability gap worth a separate ticket;
-this doc names it so operators are not surprised.
+list" — the validator only surfaces the offending entry when a rejected
+CR happens to overlap, never the full list. That is a real discoverability
+gap worth a separate ticket; this doc names it so operators are not
+surprised.
 
 ## When NOT to use it
 
