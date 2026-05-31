@@ -38,7 +38,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "failOpen", "conditions"} {
+	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "matchedEnginePods", "failOpen", "conditions"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -84,6 +84,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 	requireMinimum(t, mustProperty(t, statusSchema, "indexEntries"), 0)
+	requireMinimum(t, mustProperty(t, statusSchema, "matchedEnginePods"), 0)
 
 	// Autoscaling validation surface.
 	autoscalingSchema := mustProperty(t, specSchema, "autoscaling")
@@ -98,21 +99,25 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 	version := loadCacheBackendCRDVersion(t, "v1alpha1")
 	columns := mustPath[[]any](t, version, "additionalPrinterColumns")
 
+	want := map[string]string{
+		"Endpoint": ".status.endpoint",
+		"Matched":  ".status.matchedEnginePods",
+	}
+	seen := map[string]string{}
 	for _, column := range columns {
 		columnSchema, ok := column.(map[string]any)
 		if !ok {
 			t.Fatalf("print column has type %T, want object", column)
 		}
-		if columnSchema["name"] != "Endpoint" {
-			continue
-		}
-		if columnSchema["jsonPath"] != ".status.endpoint" {
-			t.Fatalf("Endpoint print column jsonPath = %v, want .status.endpoint", columnSchema["jsonPath"])
-		}
-		return
+		name, _ := columnSchema["name"].(string)
+		jsonPath, _ := columnSchema["jsonPath"].(string)
+		seen[name] = jsonPath
 	}
-
-	t.Fatalf("CRD does not contain Endpoint print column")
+	for name, jsonPath := range want {
+		if got := seen[name]; got != jsonPath {
+			t.Fatalf("print column %q jsonPath = %q, want %q", name, got, jsonPath)
+		}
+	}
 }
 
 func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
@@ -121,6 +126,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	lookupTimeoutMs := int32(25)
 	minimumPrefixTokens := int32(64)
 	indexEntries := int64(42)
+	matchedEnginePods := int32(7)
 	runAsNonRoot := true
 	runtimeClassName := "runc"
 	terminationGracePeriodSeconds := int64(30)
@@ -168,10 +174,11 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			Endpoint: "external-cache.default.svc:8080",
 		},
 		Status: CacheBackendStatus{
-			Endpoint:     "cache.default.svc:8080",
-			Health:       CacheBackendHealthReady,
-			Capacity:     "10Gi",
-			IndexEntries: &indexEntries,
+			Endpoint:          "cache.default.svc:8080",
+			Health:            CacheBackendHealthReady,
+			Capacity:          "10Gi",
+			IndexEntries:      &indexEntries,
+			MatchedEnginePods: &matchedEnginePods,
 			Conditions: []metav1.Condition{{
 				Type:               "Ready",
 				Status:             metav1.ConditionTrue,
@@ -199,6 +206,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Template.RuntimeClassName = "kata"
 	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
 	*backend.Status.IndexEntries = 100
+	*backend.Status.MatchedEnginePods = 11
 	backend.Status.Conditions[0].Message = "changed"
 
 	if copied.Spec.Replicas == nil || *copied.Spec.Replicas != 2 {
@@ -269,6 +277,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Status.IndexEntries == nil || *copied.Status.IndexEntries != 42 {
 		t.Fatalf("status.indexEntries was not deep-copied")
+	}
+	if copied.Status.MatchedEnginePods == nil || *copied.Status.MatchedEnginePods != 7 {
+		t.Fatalf("status.matchedEnginePods was not deep-copied")
 	}
 	if copied.Status.Conditions[0].Message != "backend is ready" {
 		t.Fatalf("conditions were not deep-copied")

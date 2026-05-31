@@ -23,6 +23,9 @@ spec:
     - jsonPath: .status.health
       name: Health
       type: string
+    - jsonPath: .status.matchedEnginePods
+      name: Matched
+      type: integer
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
@@ -146,8 +149,36 @@ spec:
                   injection time.
                 type: string
               engineSelector:
-                description: EngineSelector selects engine pods or runtimes this cache
-                  backend applies to.
+                description: |-
+                  EngineSelector selects which engine pods this CacheBackend claims via
+                  equality-based label matching over the pod's labels: every key/value
+                  in MatchLabels must be present on the pod. The full
+                  metav1.LabelSelector surface (matchExpressions, operator-based
+                  selection) is NOT exposed today — only MatchLabels.
+                  Pods that match get LMCache engine wiring (env vars + CLI args)
+                  injected by the mutating Pod admission webhook at pod CREATE time,
+                  PROVIDED the matched CacheBackend's status.endpoint has been
+                  published by the time admission runs. The webhook fail-opens
+                  (admits the pod unmodified) when status.endpoint is empty — so a
+                  pod that loses the race against the reconciler is admitted
+                  uncached for its whole lifetime. Admission is CREATE-only;
+                  recovery is to recreate the pod (e.g. `kubectl rollout restart`),
+                  not to edit the live pod's labels.
+
+                  The kvevent-subscriber observation sidecar is appended in addition
+                  to the engine wiring only when the controller is started with
+                  --kvevent-subscriber-image set (empty by default) AND the matched
+                  CacheBackend has a model id configured. Without those, the engine
+                  is wired but no sidecar is added.
+
+                  The match is evaluated once at pod CREATE — pods whose labels change
+                  after creation are not re-evaluated; the wiring is sticky to the
+                  life of the pod. To opt a specific pod out of injection regardless
+                  of label match, set the annotation
+                  `inferencecache.io/skip-inject: "true"` on the pod template.
+
+                  See docs/concepts/cachebackend-engine-binding.md for the full
+                  lifecycle, an annotated example, and common failure modes.
                 properties:
                   matchLabels:
                     additionalProperties:
@@ -2010,6 +2041,30 @@ spec:
                 required:
                 - prefixCount
                 type: object
+              matchedEnginePods:
+                description: |-
+                  MatchedEnginePods is the number of pods in this CacheBackend's namespace
+                  whose labels match spec.engineSelector at the last reconcile. The field
+                  is a pointer so nil ("not yet computed") is distinguishable from 0
+                  ("computed and zero current matches"). 0 covers any current
+                  zero-match state — the engine Deployment has not been created
+                  yet, it has been scaled to zero, or the selector and the engine
+                  Deployment's pod labels have drifted apart. (Pods carrying a
+                  `deletionTimestamp` are NOT filtered out today; the count is a
+                  raw List of matching pods.) When engine pods are expected and 0
+                  persists, label drift
+                  is the most likely diagnosis: the mutating Pod webhook silently
+                  no-ops on pods whose labels miss the selector, so the engine
+                  runs uncached.
+
+                  This is a snapshot at reconcile time, not a real-time counter: it
+                  is not updated on every pod birth/death. For per-pod real-time
+                  visibility, watch the K8s `InjectedByCacheBackend` Event the
+                  controller emits on the engine pod after the mutating Pod webhook
+                  stamps it (visible in `kubectl describe pod`).
+                format: int32
+                minimum: 0
+                type: integer
               observedGeneration:
                 description: ObservedGeneration is the .metadata.generation last reconciled
                   by the controller.
