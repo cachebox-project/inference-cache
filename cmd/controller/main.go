@@ -22,6 +22,7 @@ import (
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -132,6 +133,13 @@ func main() {
 		adapterruntime.WithSubscriberImage(opts.subscriberImage),
 		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
 	)
+	// External backends point at a pre-existing remote cache the operator
+	// manages themselves; the adapter wires engine pods to spec.endpoint
+	// via the LMCache wire format without provisioning a cache server.
+	// Registered here (not inside DefaultRegistry) because the package
+	// lives under pkg/adapters/runtime/external — runtime importing it
+	// would cycle. See pkg/adapters/runtime/external/doc.go.
+	adapterRegistry.Register(externaladapter.NewAdapter())
 
 	if err := (&controller.CacheBackendReconciler{
 		Client:    mgr.GetClient(),

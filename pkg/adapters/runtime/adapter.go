@@ -273,10 +273,16 @@ func WithPolicyServerGRPCAddress(addr string) Option {
 }
 
 // DefaultRegistry returns a Registry pre-populated with the runtime adapters
-// the controller ships with — currently the vLLM+LMCache adapter. The
-// reconciler builds one of these at startup; tests that need a specific
-// adapter set should construct their own [Registry] via [NewRegistry] +
-// [Registry.Register].
+// this package can install without an import cycle — currently the
+// vLLM+LMCache adapter. It deliberately does NOT include the External
+// passthrough adapter under pkg/adapters/runtime/external/: that package
+// imports this one (for the [KVCacheRuntimeAdapter] interface and the
+// [RuntimeID] constants), so registering it here would cycle. The
+// production wiring in cmd/controller and both webhook handlers'
+// nil-Registry fallbacks explicitly add the External adapter on top, so
+// the shipping admission/injection paths agree on the full supported
+// set; only direct uses of DefaultRegistry (e.g. some hermetic unit
+// tests) see the LMCache-only view.
 //
 // Options the controller cares about (subscriber sidecar image, policy-server
 // address) are passed in via the variadic [Option] helpers; the no-arg form

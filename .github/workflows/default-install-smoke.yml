@@ -14,9 +14,15 @@
 #     InjectedByCacheBackend Event lands on the persisted pod's UID; then
 #     scaling the engine to 0 drives status.matchedEnginePods=0 via the
 #     reconciler's RequeueAfter cadence (no CR-side change).
+#   - External CacheBackend end-to-end: type=External renders no
+#     Deployment/Service, status.endpoint mirrors spec.endpoint, Ready=True,
+#     a matching engine pod is admitted with LMCACHE_REMOTE_URL injected
+#     from the operator-supplied endpoint, and admission rejects the
+#     known-bad shapes (non-lm:// scheme, empty host, non-External + endpoint)
 #
 # Lightweight (two distroless ~30 MB images + cert-manager + a busybox
-# stand-in for the engine container), so it runs on every PR. Sister-canaries
+# stand-in for the engine container + a pause-image pod, no real engine
+# pull), so it runs on every PR. Sister-canaries
 # (c2-reconciler-canary, c6-engine-wiring-canary, cpu-substrate-canary)
 # cover real engine pods + cross-pod cache reuse with multi-GB images;
 # they stay schedule-only.
