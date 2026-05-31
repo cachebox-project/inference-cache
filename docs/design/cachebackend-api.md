@@ -81,7 +81,7 @@ Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod 
 The webhook also injects the flags every vLLM+LMCache engine needs:
 
 - `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"<role>"}'` — `<role>` is derived from `spec.integration.role`: `ReadOnly → kv_consumer`, `WriteOnly → kv_producer`, `ReadWrite → kv_both` (also the default when `integration` is unset).
-- `LMCACHE_REMOTE_URL=lm://<endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter. The endpoint **source is type-scoped**: managed backends pull it from `status.endpoint` (the controller builds it from the rendered Service), External backends pull it from the trimmed `spec.endpoint` (operator-authoritative — preferring `spec.endpoint` over `status.endpoint` for External avoids wiring new pods to a stale status during an endpoint update). Both sources are an engine-agnostic `host:port`. The injection helper is lenient: an operator who prefixes `spec.endpoint` with `lm://` for an External CR is accommodated — the prefix is preserved rather than doubled — but the bare host:port form is the documented contract, and admission enforces it.
+- `LMCACHE_REMOTE_URL=lm://<endpoint>` — the resolved cache endpoint, with the `lm://` scheme prefix added by the adapter. The endpoint **source is type-scoped**: managed backends pull it from `status.endpoint` (the controller builds it from the rendered Service as a bare `host:port`), External backends pull it from the trimmed `spec.endpoint` (operator-authoritative — preferring `spec.endpoint` over `status.endpoint` for External avoids wiring new pods to a stale status during an endpoint update). For External the operator may write either bare `host:port` or explicit `lm://host:port`; the reconciler mirrors the value verbatim into `status.endpoint`, and the injection helper is lenient: an already-prefixed `lm://` value is preserved rather than doubled. The bare host:port form is the canonical shape, and admission enforces a non-empty port either way.
 - `VLLM_USE_V1=1`.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — mirrors `spec.integration.failOpen` onto the engine pod (defaults to `true` when the field is unset). The LMCache connector is fail-open by default at runtime regardless of this value; surfacing the bit lets the engine layer enforce fail-closed semantics when that work lands, and keeps the adapter aligned with the contract that this flag is plumbed by the engine adapter.
 
@@ -253,7 +253,7 @@ A user can still set non-reserved values that break the engine in subtle ways th
 
 ### Mutating Pod webhook (engine wiring)
 
-A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencecache.io`) auto-wires user-supplied inference engine pods to the matching managed `CacheBackend` — operators never have to hand-edit `LMCACHE_*` env vars or the LMCache connector arg onto their pod templates. The handler lives in `internal/webhook/pod` and runs on every Pod CREATE.
+A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencecache.io`) auto-wires user-supplied inference engine pods to the matching `CacheBackend` (managed or External; both are first-class here — the only difference is where the endpoint comes from) — operators never have to hand-edit `LMCACHE_*` env vars or the LMCache connector arg onto their pod templates. The handler lives in `internal/webhook/pod` and runs on every Pod CREATE.
 
 | Aspect | Behavior |
 |---|---|

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -723,6 +724,25 @@ func rejectInvalidExternalEndpointScheme(cb *cachev1alpha1.CacheBackend) field.E
 	raw := strings.TrimSpace(cb.Spec.Endpoint)
 	if raw == "" {
 		return nil // requireEndpointForExternal handles this
+	}
+	// Reject any internal whitespace / control char. A leading or
+	// trailing whitespace surrounding the address is operator-friendly
+	// (strings.TrimSpace above handles it); whitespace *inside* the
+	// host or port portion is not — `cache example:8200` or
+	// `cache:82 00` would parse past the host/port shape check and
+	// inject a malformed LMCACHE_REMOTE_URL the engine connector then
+	// refuses. Surface the misconfiguration at admission instead of
+	// at engine startup.
+	if strings.ContainsFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) {
+		return field.ErrorList{
+			field.Invalid(
+				field.NewPath("spec", "endpoint"),
+				cb.Spec.Endpoint,
+				"spec.endpoint must not contain whitespace or control characters within the host or port (got embedded whitespace/control rune); use host:port or lm://host:port with no embedded spaces",
+			),
+		}
 	}
 	// Parse the optional scheme. We deliberately do NOT use net/url
 	// here: net/url.Parse treats a bare `host:port` as having scheme=

@@ -482,6 +482,49 @@ func TestValidator_ExternalEndpoint_PortlessIPv6Rejected(t *testing.T) {
 		"must be a non-empty host AND port")
 }
 
+func TestValidator_ExternalEndpoint_EmbeddedWhitespaceRejected(t *testing.T) {
+	// Leading/trailing whitespace is already trimmed for friendliness;
+	// whitespace *inside* the address is not. `cache example:8200`
+	// would otherwise pass the host:port split (host="cache example",
+	// port="8200") and inject a malformed LMCACHE_REMOTE_URL — the
+	// LMCache connector refuses to dial it at engine startup. Catch
+	// the misconfiguration loudly at write time.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache example.com:8200"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must not contain whitespace or control characters")
+}
+
+func TestValidator_ExternalEndpoint_EmbeddedWhitespaceInPortRejected(t *testing.T) {
+	// Same rule applies to the port half — `cache.example:82 00`
+	// would split host="cache.example", port="82 00" and inject a
+	// broken URL.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example:82 00"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must not contain whitespace or control characters")
+}
+
+func TestValidator_ExternalEndpoint_ControlCharRejected(t *testing.T) {
+	// Embedded control chars (newline, tab, etc.) are rejected even
+	// though they're "whitespace": same broken-URL injection risk,
+	// plus a defence-in-depth against header injection if a future
+	// consumer ever templates the endpoint into a text format.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:8200\nLMCACHE_LOG_LEVEL=debug"
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	requireInvalidWithCause(t, v, cb, "spec.endpoint",
+		"must not contain whitespace or control characters")
+}
+
 func TestValidator_ExternalEndpoint_UnbracketedIPv6Rejected(t *testing.T) {
 	// RFC 3986 requires brackets for IPv6 in URI authority components,
 	// and there is no unambiguous host:port boundary without them. A
