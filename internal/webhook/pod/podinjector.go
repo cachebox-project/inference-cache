@@ -48,6 +48,22 @@ const AnnotationSkip = "inferencecache.io/skip-inject"
 // invisible to `kubectl describe pod`.
 const AnnotationInjectedBy = "inferencecache.io/injected-by"
 
+// AnnotationInjectedByUID is stamped alongside [AnnotationInjectedBy] on every
+// successful injection and carries the matched CacheBackend's metadata.uid as
+// of admission time. It is the webhook-only proof-of-injection: an operator
+// or attacker can copy AnnotationInjectedBy into a fresh pod template, but
+// they cannot forge a value that matches the live CacheBackend's UID without
+// API access to read it first (UIDs are server-assigned and not part of any
+// user-authored spec). The engine-pod-events controller validates the
+// injected-by/UID pair against the live CR's UID before emitting
+// `InjectedByCacheBackend`, which closes the hole the
+// `MutatingWebhookConfiguration.failurePolicy=Ignore` posture would otherwise
+// leave open: if the webhook is unreachable at admission time, a pod can
+// persist with a user-supplied AnnotationInjectedBy, but the UID annotation
+// (which only the webhook writes) is absent or stale, so the controller skips
+// the event.
+const AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
+
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=ignore,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod.inferencecache.io,admissionReviewVersions=v1
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
@@ -226,6 +242,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		mutated.Annotations = map[string]string{}
 	}
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
+	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -339,11 +356,14 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 // helper short-circuits to admission.Allowed when the annotation is
 // absent.
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
-	if pod.Annotations[AnnotationInjectedBy] == "" {
+	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
+	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	if !hasInjectedBy && !hasInjectedByUID {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
+	delete(cleared.Annotations, AnnotationInjectedByUID)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
 		// canonical "no annotations" shape.

@@ -52,6 +52,16 @@ func injectedPod(name, namespace, cbRef string, podLabels map[string]string) *co
 	}
 }
 
+// injectedPodWithUID returns a pod stamped with BOTH the injected-by
+// annotation AND the matching injected-by-uid annotation that the webhook
+// writes on a successful injection. Used by tests that simulate the
+// happy-path "real webhook actually ran" scenario.
+func injectedPodWithUID(name, namespace, cbRef, cbUID string, podLabels map[string]string) *corev1.Pod {
+	p := injectedPod(name, namespace, cbRef, podLabels)
+	p.Annotations[podwebhook.AnnotationInjectedByUID] = cbUID
+	return p
+}
+
 func reconcilePod(t *testing.T, r *EnginePodEventsReconciler, namespace, name string) {
 	t.Helper()
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -76,9 +86,9 @@ func drainRecorder(rec *events.FakeRecorder) []string {
 func TestEnginePodEvents_EmitsInjectedEventOnAnnotatedPod(t *testing.T) {
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-1"},
 	}
-	pod := injectedPod("engine-a", ns, ns+"/"+cb.Name, map[string]string{"app": "vllm"})
+	pod := injectedPodWithUID("engine-a", ns, ns+"/"+cb.Name, string(cb.UID), map[string]string{"app": "vllm"})
 	r, rec := newEnginePodEventsReconciler(t, cb, pod)
 
 	reconcilePod(t, r, ns, pod.Name)
@@ -118,28 +128,62 @@ func TestEnginePodEvents_NoEventOnPodWithoutAnnotation(t *testing.T) {
 	}
 }
 
-func TestEnginePodEvents_EmitsEvenWhenCacheBackendNotFound(t *testing.T) {
-	// The annotation is the source of truth for the binding identity;
-	// the lookup of the named CacheBackend only enriches the event with
-	// the Related reference. A missing CR (e.g. deleted between
-	// admission and our reconcile) must NOT suppress the event — the
-	// pod was wired and that's what the operator needs to know.
+func TestEnginePodEvents_SkipsWhenCacheBackendNotFound(t *testing.T) {
+	// Without a live CR, the controller cannot verify the injected-by-uid
+	// annotation. The pod's injected-by annotation alone is user-
+	// controllable, so an absent CR could mean either "CR was deleted
+	// after the webhook stamped this pod" (real injection) or "user
+	// forged the annotation while the webhook was unreachable"
+	// (failurePolicy=Ignore). Without the UID check we cannot tell
+	// these apart — be conservative and skip the event. The signal
+	// stays authoritative at the cost of missing it in the rare
+	// CR-deleted-mid-reconcile case.
 	const ns = "engines"
-	pod := injectedPod("engine-a", ns, ns+"/missing-cb", nil)
+	pod := injectedPodWithUID("engine-a", ns, ns+"/missing-cb", "doesnt-matter-uid", nil)
 	r, rec := newEnginePodEventsReconciler(t, pod) // no CB seeded
 
 	reconcilePod(t, r, ns, pod.Name)
 
-	got := drainRecorder(rec)
-	want := "Normal " + eventReasonEngineInjected
-	found := false
-	for _, e := range got {
-		if strings.Contains(e, want) && strings.Contains(e, "missing-cb") {
-			found = true
-		}
+	if got := drainRecorder(rec); len(got) != 0 {
+		t.Fatalf("expected no event when CacheBackend is missing; got %v", got)
 	}
-	if !found {
-		t.Fatalf("expected event containing %q and %q; got %v", want, "missing-cb", got)
+}
+
+func TestEnginePodEvents_SkipsWhenInjectedByUIDAnnotationMissing(t *testing.T) {
+	// A pod carrying only the injected-by annotation but NOT the
+	// injected-by-uid companion is the failurePolicy=Ignore forgery
+	// scenario: the user supplied injected-by in the pod template; the
+	// webhook never ran, so the UID annotation is absent. Skip emission.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-1"},
+	}
+	// Use injectedPod (NOT injectedPodWithUID) so the UID annotation is absent.
+	pod := injectedPod("engine-forger", ns, ns+"/"+cb.Name, nil)
+	r, rec := newEnginePodEventsReconciler(t, cb, pod)
+
+	reconcilePod(t, r, ns, pod.Name)
+
+	if got := drainRecorder(rec); len(got) != 0 {
+		t.Fatalf("expected no event when injected-by-uid annotation is missing; got %v", got)
+	}
+}
+
+func TestEnginePodEvents_SkipsWhenInjectedByUIDDoesNotMatchLiveCR(t *testing.T) {
+	// The user-supplied UID could match a previous incarnation of the
+	// CR (recreated under the same name) or be guessed. The check is:
+	// the annotation UID must equal the LIVE CR's UID.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns, UID: "primary-uid-CURRENT"},
+	}
+	pod := injectedPodWithUID("engine-stale-uid", ns, ns+"/"+cb.Name, "primary-uid-OLD", nil)
+	r, rec := newEnginePodEventsReconciler(t, cb, pod)
+
+	reconcilePod(t, r, ns, pod.Name)
+
+	if got := drainRecorder(rec); len(got) != 0 {
+		t.Fatalf("expected no event when injected-by-uid does not match the live CR; got %v", got)
 	}
 }
 

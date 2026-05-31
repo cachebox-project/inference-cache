@@ -106,26 +106,48 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// have come from manual tampering or a stale annotation under an
 	// older annotation contract — emitting "Injected engine config" for
 	// that would falsely claim the webhook did work it never did.
-	// Lookup failures (NotFound, transient Get error) are still treated
-	// as best-effort emit: the annotation parsed cleanly, so the webhook
-	// did inject this pod at admission time; the CR may have been
-	// deleted in the interim.
 	if !validCacheBackendRef(cbRef) {
 		logger.V(1).Info("skipping InjectedByCacheBackend event: malformed injected-by annotation",
 			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
 		return ctrl.Result{}, nil
 	}
-	// Try to load the named CacheBackend so the event carries it as the
-	// Related object. Failure is non-fatal: emit the event anyway with
-	// related=nil. The annotation value alone carries the binding
-	// identity in the human-readable message. The lookup error is logged
-	// so RBAC failures or transient API hiccups are not silently
-	// swallowed — the event still fires, but an operator inspecting
-	// controller logs sees why the Related reference is missing.
+	// The injected-by annotation is user-controllable. The webhook is
+	// failurePolicy=Ignore on the MutatingWebhookConfiguration, so a pod
+	// can persist with a user-supplied injected-by annotation when the
+	// webhook is unreachable at admission time. The webhook-only proof
+	// is the companion `injected-by-uid` annotation: its value is the
+	// matched CacheBackend's metadata.uid, which the webhook reads from
+	// the apiserver at admission time and the user cannot guess or set
+	// without API access to the CR. Require BOTH: a successful CR
+	// lookup AND a UID match against the live CR.
+	uidRef := pod.Annotations[podwebhook.AnnotationInjectedByUID]
+	if uidRef == "" {
+		logger.V(1).Info("skipping InjectedByCacheBackend event: injected-by-uid annotation missing",
+			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
+		return ctrl.Result{}, nil
+	}
 	cb, lookupErr := r.lookupCacheBackend(ctx, cbRef)
 	if lookupErr != nil {
-		logger.V(1).Info("CacheBackend related-ref lookup failed; emitting event without Related",
+		// Without a live CR we cannot verify the UID, and without
+		// verification we cannot tell a real "CR deleted between
+		// inject and reconcile" from a forged annotation surviving a
+		// failurePolicy=Ignore admission. Skip emission either way —
+		// the missing event is the conservative tradeoff for keeping
+		// this signal authoritative.
+		logger.V(1).Info("skipping InjectedByCacheBackend event: CacheBackend lookup failed",
 			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef, "error", lookupErr.Error())
+		return ctrl.Result{}, nil
+	}
+	if uidRef != string(cb.UID) {
+		// Annotation UID doesn't match the live CR's UID — either the
+		// user forged both annotations (and got the UID wrong, e.g.
+		// from a previous incarnation of the CR), or the CR was
+		// deleted and recreated after the webhook stamped the pod.
+		// Skip emission.
+		logger.V(1).Info("skipping InjectedByCacheBackend event: injected-by-uid mismatch",
+			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef,
+			"annotationUID", uidRef, "liveUID", string(cb.UID))
+		return ctrl.Result{}, nil
 	}
 	r.Recorder.Eventf(&pod, cb, corev1.EventTypeNormal,
 		eventReasonEngineInjected, eventReasonEngineInjected,

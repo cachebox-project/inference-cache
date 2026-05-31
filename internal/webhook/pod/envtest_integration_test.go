@@ -185,6 +185,15 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("annotation %s: got %q want %q",
 			AnnotationInjectedBy, got.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name)
 	}
+	// The webhook also writes the injected-by-uid annotation as the
+	// authoritative proof-of-injection for the engine-pod-events
+	// controller (see the failurePolicy=Ignore forgery hole that the
+	// UID match closes). Pin it against the live CR's UID so future
+	// regressions of the success-path stamp surface here.
+	if got.Annotations[AnnotationInjectedByUID] != string(cb.UID) {
+		t.Fatalf("annotation %s: got %q want %q (live CacheBackend UID)",
+			AnnotationInjectedByUID, got.Annotations[AnnotationInjectedByUID], string(cb.UID))
+	}
 	if !containsArgFlag(got.Spec.Containers[0].Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config flag not injected; args = %v", got.Spec.Containers[0].Args)
 	}
