@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
@@ -558,6 +559,63 @@ func TestHandle_EmptyEngineSelector_Skipped(t *testing.T) {
 	if len(resp.Patches) != 0 {
 		t.Fatalf("nil EngineSelector must not match any pod, got %d patches", len(resp.Patches))
 	}
+}
+
+// TestHandle_OverlappingSelectors_FirstNameWins exercises the shared
+// attribution rule between the pod webhook and the CacheIndex poller:
+// when two CacheBackends in the same namespace have overlapping
+// EngineSelectors that both match the engine pod, BOTH surfaces must
+// pick the same backend — the one sorted first by metadata.name —
+// otherwise the engine is wired to one backend's endpoint while
+// status.indexParticipation reports the other as the owner.
+//
+// The matching poller-side assertion lives in
+// TestRefreshOverlappingSelectorsFirstNameWins
+// (internal/controller/cacheindex_controller_test.go).
+func TestHandle_OverlappingSelectors_FirstNameWins(t *testing.T) {
+	const ns = "engines"
+	// Create the backends in non-alphabetical order so a name-sort is
+	// observably different from raw List order.
+	cbZebra := readyCacheBackend("zebra", ns, map[string]string{"app": "vllm"})
+	cbAlpha := readyCacheBackend("alpha", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cbZebra, cbAlpha)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatal("expected injection patches when at least one backend matches")
+	}
+	// The `inferencecache.io/injected-by` annotation records who claimed
+	// the pod. Sorted-by-name "alpha" must win over "zebra".
+	want := ns + "/alpha"
+	var got string
+	for _, p := range resp.Patches {
+		if p.Path == "/metadata/annotations" || p.Path == "/metadata/annotations/"+jsonPatchEscape(AnnotationInjectedBy) {
+			if anno, ok := p.Value.(map[string]any); ok {
+				if v, ok := anno[AnnotationInjectedBy].(string); ok {
+					got = v
+				}
+			} else if s, ok := p.Value.(string); ok {
+				got = s
+			}
+		}
+	}
+	if got != want {
+		t.Fatalf("injected-by annotation = %q, want %q (deterministic name-sort: alpha < zebra)", got, want)
+	}
+}
+
+// jsonPatchEscape is the JSON-Pointer escaping for "/" and "~" in JSON
+// Patch paths (RFC 6901). Used here only to match the annotation path
+// regardless of how the controller-runtime patch emitter renders it.
+func jsonPatchEscape(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+	return s
 }
 
 func TestHandle_ListError_FailOpen(t *testing.T) {

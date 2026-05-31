@@ -101,7 +101,16 @@ spec:
                     type: object
                 type: object
               replicas:
-                description: Replicas is the per-replica cache health.
+                description: |-
+                  Replicas is the per-replica cache health. Map-list keyed on `id`
+                  (the v1alpha1 surface; unchanged for backward compatibility). The
+                  controller only publishes rows for replicas that reported stats —
+                  prefix-only replicas appear in CacheBackend.status.indexParticipation
+                  but not here, so the `id` key remains unique in practice. If two
+                  replicas with the same `id` were ever reported by different
+                  namespaces in a single tick, the controller picks the lexicographically
+                  later tenant deterministically; the `tenant` field on each row
+                  disambiguates the source.
                 items:
                   description: ReplicaCacheStatus is the latest reported cache health
                     for one engine replica.
@@ -134,6 +143,15 @@ spec:
                       description: |-
                         Pressure is the replica's memory-pressure heuristic in [0,1], as a decimal
                         string (e.g. "0.65").
+                      type: string
+                    tenant:
+                      description: |-
+                        Tenant is the tenant the replica reports under. The subscriber sidecar
+                        derives it from the engine pod's namespace, so two pods sharing a
+                        metadata.name across namespaces show as the same `id` here; the
+                        `tenant` field disambiguates the source. Optional and informational
+                        only — not part of the map-list key (the v1alpha1 surface keeps
+                        `id` as the sole key for backward compatibility).
                       type: string
                   required:
                   - id

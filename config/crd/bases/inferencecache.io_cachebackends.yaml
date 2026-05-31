@@ -26,6 +26,12 @@ spec:
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
+    - jsonPath: .status.indexParticipation.prefixCount
+      name: Prefixes
+      type: integer
+    - jsonPath: .status.indexParticipation.lastEventAt
+      name: LastEvent
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -1728,6 +1734,42 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              indexParticipation:
+                description: |-
+                  IndexParticipation summarizes this CacheBackend's contribution to the
+                  cluster-wide cache index — populated by the CacheIndex poller (it groups
+                  the server's /snapshot replicas by the owning CacheBackend and projects
+                  the per-backend slice here). nil until the poller has observed at least
+                  one snapshot; absence of data on a single scrape never clears it.
+                properties:
+                  hitRate:
+                    description: |-
+                      HitRate is the prefix-count-weighted average cache hit rate across this
+                      backend's replicas, formatted as a decimal string in [0,1] (matching
+                      the cluster-wide CacheIndex.status.replicas[].hitRate convention — see
+                      CRD-codegen note on floats in CRDs). nil until the replica stats
+                      reporter emits per-replica hitRate into the index; do not interpret a
+                      missing value as 0.
+                    type: string
+                  lastEventAt:
+                    description: |-
+                      LastEventAt is the most recent KV-event timestamp observed for any of
+                      this backend's replicas. nil until the first event arrives; downstream
+                      readiness gates (e.g. "ready once at least one event seen") MUST treat
+                      nil as "not yet observed" rather than zero time.
+                    format: date-time
+                    type: string
+                  prefixCount:
+                    description: |-
+                      PrefixCount is the sum of distinct prefix entries currently attributed
+                      to this backend's replicas. Zero is a valid observed value — it means
+                      the backend is up but holds no warm prefixes yet.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                required:
+                - prefixCount
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the .metadata.generation last reconciled
                   by the controller.

@@ -101,6 +101,7 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 | `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
+| `indexParticipation` | object | Per-backend slice of the cluster-wide cache index, projected from the server's `/snapshot` by grouping replicas by owning `CacheBackend`. Populated by the CacheIndex poller (status-only). Object is unset until the poller has observed a successful scrape that names the backend's replicas (see [Index Participation](#index-participation)). |
 | `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |
 | `conditions` | array | Kubernetes conditions keyed by `type`. See [Conditions](#conditions). |
 
@@ -115,7 +116,23 @@ Two condition types are published on managed backends:
 
 When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
-`kubectl get cachebackend` displays the observed `status.endpoint` so managed backends show the endpoint once reconciliation has created it.
+`kubectl get cachebackend` displays the observed `status.endpoint`, `status.indexParticipation.prefixCount` (as `PREFIXES`), and `status.indexParticipation.lastEventAt` (as `LASTEVENT`) so managed backends show endpoint + live participation once reconciliation has created them and the poller has observed a `/snapshot` tick.
+
+### Index Participation
+
+| Field | Type | Purpose |
+|---|---|---|
+| `indexParticipation.prefixCount` | integer | Sum of distinct prefix entries currently attributed to this backend's replicas. `0` is a valid observed value (the backend is up but holds no warm prefixes yet); always serialized. |
+| `indexParticipation.lastEventAt` | time | Most recent KV-event timestamp observed for any of this backend's replicas. Unset until the first event arrives; readiness gates must treat the absent value as "not yet observed" rather than epoch. |
+| `indexParticipation.hitRate` | string | Prefix-count-weighted cache hit rate across this backend's replicas, formatted as a decimal in `[0,1]`. Unset until the snapshot carries an explicit per-replica presence bit (planned with the stats-reporter follow-up); a missing value MUST NOT be interpreted as `0`. |
+
+The poller attributes each `/snapshot.replicas[]` entry to a single owning `CacheBackend` by resolving the engine pod it came from. The subscriber sidecar runs inside the engine pod and reports `replica_id = <pod-name>`, `tenant_id = <pod-namespace>`. For each replica the poller:
+
+1. Looks up the engine pod by `(tenant, replicaID)`.
+2. If the pod carries the webhook's `inferencecache.io/injected-by` annotation (stamped as `<namespace>/<name>`), resolves the owning CacheBackend directly. This is the authoritative wiring signal — the engine container was wired to exactly that backend's endpoint.
+3. Otherwise, iterates that namespace's CacheBackends sorted by `metadata.name` and picks the first whose `spec.engineSelector.matchLabels` is non-empty and is a subset of the pod's labels. This mirrors the pod webhook's first-match rule for pods that bypassed the webhook (manual sidecar attachment, opt-out).
+
+Only ONE CacheBackend ever claims a given replica — overlapping selectors must agree on which backend owns the pod, otherwise status would disagree with what the engine was actually wired to. A CacheBackend without an EngineSelector (or with empty `MatchLabels`) is excluded from the selector fallback — otherwise a misconfigured backend would silently claim every replica in its namespace by vacuous truth — but a pod can still be attributed to it via the `injected-by` annotation. A replica whose pod can no longer be found (drained between events and now) is skipped; its data still appears in the cluster-wide `CacheIndex`. A failing scrape preserves existing state (soft-state); a successful scrape that finds no matching replicas resets `prefixCount` to `0` so stale positive values do not survive a drain.
 
 ## Contract Notes
 
