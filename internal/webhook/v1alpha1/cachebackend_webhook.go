@@ -117,10 +117,13 @@ var DefaultValidationRules = []ValidationRule{
 // configurations; do not hand-edit config/webhook/manifests.yaml.
 //
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
-// consults for the (engine, backend) compatibility check; passing nil falls
-// back to [adapterruntime.DefaultRegistry]. cmd/controller threads the same
-// instance the reconciler + pod webhook receive so all three layers agree on
-// what's supported.
+// consults for the (engine, backend) compatibility check AND for the
+// engineOverrides reserved-args/env check; passing nil falls back to
+// [defaultShippingRegistry] (DefaultRegistry plus the External adapter),
+// mirroring cmd/controller's production wiring so a zero-value validator
+// sees the same adapter set the running controller does. cmd/controller
+// threads the same instance the reconciler + pod webhook receive so all
+// three layers agree on what's supported.
 func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterruntime.Registry) error {
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).
@@ -404,7 +407,14 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 	}
 	registry := v.Registry
 	if registry == nil {
-		registry = adapterruntime.DefaultRegistry()
+		// Mirror checkRuntimeAdapter's fallback exactly: a nil-registry
+		// validator must see the same adapter set in BOTH checks, or
+		// External admits in checkRuntimeAdapter (via the External adapter
+		// in defaultShippingRegistry) and then silently skips its
+		// reserved-arg/env enforcement here. That would let an External
+		// CR suppress `--kv-transfer-config` or override
+		// `LMCACHE_REMOTE_URL` and un-wire the cache at the engine pod.
+		registry = defaultShippingRegistry()
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
 	adapter, err := registry.Select(runtimeID, cb)

@@ -1133,6 +1133,30 @@ func TestValidator_EngineOverrides_ExternalBackendChecksReservedSet(t *testing.T
 	}
 }
 
+func TestValidator_EngineOverrides_NilRegistry_FallsBackToShippingSet(t *testing.T) {
+	// A zero-value validator (Registry: nil) must consult the SAME
+	// shipping adapter set in BOTH checkRuntimeAdapter and
+	// checkEngineOverrides — otherwise External admits the (vllm, External)
+	// pair via the External adapter in defaultShippingRegistry but then
+	// silently bypasses its reserved-arg enforcement here, letting an
+	// operator un-wire the cache at the engine pod. Pin both halves of
+	// the contract: nil-registry rejects External + suppressed
+	// --kv-transfer-config with a field-scoped error.
+	v := &CacheBackendValidator{}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "shared.team-a.svc.cluster.local:9000"
+	_, err := v.ValidateCreate(context.Background(), cb)
+	if err == nil {
+		t.Fatalf("nil-registry validator admitted External + suppressed --kv-transfer-config; reserved-arg check must fire via the shipping-set fallback")
+	}
+	if !strings.Contains(err.Error(), "--kv-transfer-config") {
+		t.Fatalf("expected rejection naming the offending flag; got %v", err)
+	}
+}
+
 func TestValidator_EngineOverrides_ExternalBackendAdmittedWhenSafe(t *testing.T) {
 	// An External CR carrying engineOverrides that DON'T touch the
 	// adapter's reserved set must still admit — the surface is engine-
