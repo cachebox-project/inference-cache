@@ -241,6 +241,29 @@ func TestSnapshotAggregates(t *testing.T) {
 	if snap.Replicas[0].CacheMemoryBytes != 100 || snap.Replicas[0].HitRate != 0.8 {
 		t.Fatalf("replica-a stats = %+v", snap.Replicas[0])
 	}
+	// Per-replica prefix counts are aggregated cluster-wide across models /
+	// hash_schemes: replica-a holds two distinct prefixes (one per model),
+	// replica-b holds one.
+	if snap.Replicas[0].PrefixCount != 2 {
+		t.Fatalf("replica-a prefixCount = %d, want 2", snap.Replicas[0].PrefixCount)
+	}
+	if snap.Replicas[1].PrefixCount != 1 {
+		t.Fatalf("replica-b prefixCount = %d, want 1", snap.Replicas[1].PrefixCount)
+	}
+	// LastEventAt is the max replica-entry lastSeen across the replica's
+	// prefixes; here both Ingest calls happened in the same test, so the
+	// field must at least be non-zero.
+	if snap.Replicas[0].LastEventAt.IsZero() || snap.Replicas[1].LastEventAt.IsZero() {
+		t.Fatalf("lastEventAt should be set after Ingest: %+v / %+v",
+			snap.Replicas[0].LastEventAt, snap.Replicas[1].LastEventAt)
+	}
+	// Tenant is the namespace the subscriber sidecar reports; the controller
+	// uses it to scope engine-pod lookups when attributing replicas to
+	// CacheBackends. Must reflect the Ingest's Tenant field.
+	if snap.Replicas[0].Tenant != "tenant-a" || snap.Replicas[1].Tenant != "tenant-b" {
+		t.Fatalf("tenants on replicas = %q / %q, want tenant-a / tenant-b",
+			snap.Replicas[0].Tenant, snap.Replicas[1].Tenant)
+	}
 	// Tenants sorted by id; tenant-a counts replica-a once despite two reports.
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)
@@ -250,6 +273,47 @@ func TestSnapshotAggregates(t *testing.T) {
 	}
 	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].MemoryUsed != 200 {
 		t.Fatalf("tenant-b = %+v, want memoryUsed 200", snap.Tenants[1])
+	}
+}
+
+// TestSnapshotJSONRoundtripPreservesTenantAndPrefixFields guards the wire
+// shape of /snapshot. The controller decodes the JSON into the same
+// Snapshot type, so a silent rename of one of the JSON tags (e.g. someone
+// dropping `Tenant` to `omitempty` and writing a tenant-less replica)
+// would still compile but break per-backend attribution downstream. This
+// test JSON-encodes a snapshot with all the new fields set and asserts
+// they survive the round-trip.
+func TestSnapshotJSONRoundtripPreservesTenantAndPrefixFields(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "vllm-0", Model: "m", Tenant: "ns-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.5, Pressure: 0.2},
+	})
+
+	raw, err := json.Marshal(idx.Snapshot())
+	if err != nil {
+		t.Fatalf("encode snapshot: %v", err)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(decoded.Replicas) != 1 {
+		t.Fatalf("replicas = %d, want 1", len(decoded.Replicas))
+	}
+	r := decoded.Replicas[0]
+	if r.ReplicaID != "vllm-0" || r.Tenant != "ns-a" {
+		t.Fatalf("identity round-trip lost: replicaId=%q tenant=%q", r.ReplicaID, r.Tenant)
+	}
+	if r.PrefixCount != 1 {
+		t.Fatalf("prefixCount round-trip = %d, want 1", r.PrefixCount)
+	}
+	if r.LastEventAt.IsZero() {
+		t.Fatal("lastEventAt round-trip lost (zero)")
+	}
+	if r.CacheMemoryBytes != 100 || r.HitRate != 0.5 || r.Pressure != 0.2 {
+		t.Fatalf("stats round-trip lost: %+v", r)
 	}
 }
 

@@ -28,12 +28,13 @@ Runtime propagation (controller → server `/policy`) is described in [policy-pr
 | Field | Type | Purpose |
 |---|---|---|
 | `spec.tenantID` | string | Required non-empty external tenant identifier used by gateway and engine traffic. |
-| `spec.quota.maxMemoryBytes` | integer | Maximum cache memory attributed to the tenant. Minimum `0`. |
-| `spec.quota.maxIndexEntries` | integer | Maximum index entries attributed to the tenant. Minimum `0`. |
+| `spec.quota.maxIndexEntries` | integer | Maximum distinct index prefixes attributed to the tenant. Minimum `0`. Enforced at ingest (see [policy-propagation.md](policy-propagation.md)). |
 | `spec.isolationMode` | enum | `Fairness` in the current phase. |
 | `spec.crypto` | object | Reserved for future cryptographic isolation settings. |
 
-`status.memoryUsed`, `status.indexEntries`, `status.conditions`, and `status.observedGeneration` expose observed tenant state.
+`status.indexEntries`, `status.conditions`, and `status.observedGeneration` expose observed tenant state.
+
+There is deliberately **no** `spec.quota.maxMemoryBytes` or `status.memoryUsed`. The cache plane only surfaces a `max*` quota for a resource it authoritatively owns — the index entry table. Engine KV memory is a shared, tenant-unaware pool (vLLM/LMCache key by block hash, not tenant), so the control plane can neither enforce a per-tenant byte budget nor honestly attribute bytes per tenant (`ReplicaStats.cache_memory_bytes` is the engine total, double-counted across tenants sharing an engine). Per-tenant byte isolation is an engine/runtime concern (separate engine Deployments + pod memory limits).
 
 ## PromptTemplate
 
@@ -75,3 +76,5 @@ Runtime propagation (controller → server `/policy`) is described in [policy-pr
 - The CRD has no user-configurable spec. For v1alpha1 compatibility, it accepts an omitted spec or the legacy empty `spec: {}` shape, but it does not define writable spec fields.
 - The controller owns the singleton object and writes only the status subresource.
 - Status carries replica, tenant, and prefix summaries. It never stores KV tensors or prompt text.
+- `status.replicas[]` is a map-list keyed on `id` (the v1alpha1 surface; unchanged for backward compatibility). Each row carries an optional `tenant` field for source disambiguation; the controller publishes only replicas that have reported stats, so the `id` key is unique in practice. If two stats-reporting replicas sharing a pod name across namespaces ever collide on `id` in a single tick, the controller picks the lexicographically-later `tenant` deterministically and the `tenant` field on the published row identifies which one was chosen.
+- The status is populated by the controller scraping the server's internal `/snapshot` endpoint. `/snapshot.replicas[]` is keyed internally by `(tenant, replicaId)` (so prefix-only replicas with no stats remain attributable per-namespace) and carries per-replica `prefixCount` and `lastEventAt`, which the controller projects into [`CacheBackend.status.indexParticipation`](cachebackend-api.md#index-participation). Prefix-only replicas are deliberately omitted from `CacheIndex.status.replicas[]` — that surface is for replicas with reported stats only.

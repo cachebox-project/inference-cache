@@ -103,10 +103,11 @@ A `CachePolicy` lives in a namespace; a `LookupRoute` carries a
 `tenant_id`. Phase-1 treats them as equivalent: a policy in namespace
 `team-a` applies to lookups with `tenant_id = "team-a"`.
 
-The forthcoming `CacheTenant` CRD will eventually introduce explicit
-tenant identifiers separate from Kubernetes namespaces; at that point
-the controller can map `CacheTenant.spec.tenantID → namespace` in the
-resolver step before pushing, without any schema change.
+`CacheTenant` introduces explicit tenant identifiers (`spec.tenantID`)
+separate from Kubernetes namespaces. Tenant **quotas** are propagated on
+the same `/policy` snapshot but keyed by `tenantID` (the value an ingest
+carries in `CacheStateUpdate.tenant_id`), a different axis from the
+namespace key `CachePolicy` uses — see the tenant-quota row below.
 
 ## Enforcement (what the server does with each field)
 
@@ -115,11 +116,19 @@ resolver step before pushing, without any schema change.
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
 | `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
+| `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 
 `failOpen` and `tenantScoped` are part of the CRD but not enforced by
 this propagation path: the server is already fail-open by construction
 (no error on the hot path), and `tenantScoped` is reserved for future
 multi-tenant lookup scoping.
+
+The `/policy` snapshot carries both `[]ResolvedPolicy` (keyed by namespace)
+and `[]ResolvedTenant` (keyed by `tenantID`). A single controller reconciler
+watches **both** `CachePolicy` and `CacheTenant` and pushes one combined
+snapshot — two reconcilers would race on the replace-on-write store. A
+`CacheTenant` that disappears between snapshots reverts that tenant to
+unbounded (no enforcement).
 
 ## Failure modes
 
@@ -142,11 +151,19 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
+`version` is `2`: it was bumped from `1` when the `tenants` slice was
+added. The server decodes with `DisallowUnknownFields`, so a stale (v1)
+controller's push is rejected with a clear "unsupported version" error
+rather than silently dropping the tenants; controller and server roll
+out together and the periodic re-push reconciles any transient skew.
+
 ## Out of scope
 
 - Webhook validation of CRD fields (admission) — see the CRD admission
   webhook work.
-- Tenant-quota enforcement — that's the `CacheTenant` propagation path.
+- Per-tenant **memory** budgets — out of scope by design (engine KV
+  memory is tenant-unaware; see [policy-crds.md](policy-crds.md)). Only
+  the index entry-count quota (`maxIndexEntries`) is enforced.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.

@@ -47,16 +47,16 @@ func TestSnapshotEntryInvariant(t *testing.T) {
 			name: "multi-tenant with a multi-replica prefix",
 			build: func() *Index {
 				idx := New()
-				// prefix "a" held by two replicas → two entries for team-a, so the
-				// total (3) exceeds the distinct-prefix count (2) — the case where
-				// an entry-count vs prefix-count confusion would break the invariant.
+				// prefix "a" held by two replicas is still ONE distinct prefix for
+				// team-a — the multi-replica case a naive replica×prefix count would
+				// double, breaking Σ tenants[].indexEntries == len(prefixes).
 				addPrefix(idx, "team-a", "r1", "a", base)
 				addPrefix(idx, "team-a", "r2", "a", base)
 				addPrefix(idx, "team-b", "r3", "c", base)
 				return idx
 			},
-			wantPerTenant: map[string]int64{"team-a": 2, "team-b": 1},
-			wantTotal:     3,
+			wantPerTenant: map[string]int64{"team-a": 1, "team-b": 1},
+			wantTotal:     2,
 		},
 		{
 			name: "default (untenanted) entries present",

@@ -300,11 +300,52 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// IndexParticipation summarizes this CacheBackend's contribution to the
+	// cluster-wide cache index — populated by the CacheIndex poller (it groups
+	// the server's /snapshot replicas by the owning CacheBackend and projects
+	// the per-backend slice here). nil until the poller has observed at least
+	// one snapshot; absence of data on a single scrape never clears it.
+	// +optional
+	IndexParticipation *CacheBackendIndexParticipation `json:"indexParticipation,omitempty"`
+
 	// Conditions describe the latest observations of the backend.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// CacheBackendIndexParticipation is the per-backend slice of the cluster-wide
+// CacheIndex, projected from the server's /snapshot replicas[]. The poller
+// resolves each replica to its engine pod by (tenant, replica_id) and then
+// attributes it to the owning CacheBackend — either via the engine pod's
+// `inferencecache.io/injected-by` annotation (the authoritative wiring
+// signal stamped by the pod webhook) or, for pods that bypassed the
+// webhook, via a deterministic first-match on `spec.engineSelector.
+// matchLabels`. The poller writes write-only-on-change and never clears
+// it on a single failed scrape (soft state).
+type CacheBackendIndexParticipation struct {
+	// PrefixCount is the sum of distinct prefix entries currently attributed
+	// to this backend's replicas. Zero is a valid observed value — it means
+	// the backend is up but holds no warm prefixes yet.
+	// +kubebuilder:validation:Minimum=0
+	PrefixCount int64 `json:"prefixCount"`
+
+	// LastEventAt is the most recent KV-event timestamp observed for any of
+	// this backend's replicas. nil until the first event arrives; downstream
+	// readiness gates (e.g. "ready once at least one event seen") MUST treat
+	// nil as "not yet observed" rather than zero time.
+	// +optional
+	LastEventAt *metav1.Time `json:"lastEventAt,omitempty"`
+
+	// HitRate is the prefix-count-weighted average cache hit rate across this
+	// backend's replicas, formatted as a decimal string in [0,1] (matching
+	// the cluster-wide CacheIndex.status.replicas[].hitRate convention — see
+	// CRD-codegen note on floats in CRDs). nil until the replica stats
+	// reporter emits per-replica hitRate into the index; do not interpret a
+	// missing value as 0.
+	// +optional
+	HitRate *string `json:"hitRate,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -313,6 +354,8 @@ type CacheBackendStatus struct {
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.indexParticipation.prefixCount`
+// +kubebuilder:printcolumn:name="LastEvent",type=date,JSONPath=`.status.indexParticipation.lastEventAt`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CacheBackend is the Schema for the cachebackends API.

@@ -296,11 +296,15 @@ type Index struct {
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
 
-	// entriesByTenant counts replica×prefix entries per tenant, so the per-
-	// tenant quota check at ingest is O(1) instead of scanning i.prefixes.
-	// Maintained in lockstep with totalEntries by upsert/removeReplicaLocked.
-	// It also backs the per-tenant indexEntries figure in Snapshot.
-	entriesByTenant map[string]int
+	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
+	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
+	// hold it), so the per-tenant quota check at ingest is O(1) instead of
+	// scanning i.prefixes. Maintained by upsert/removeReplicaLocked: bumped when a
+	// key is first created for the tenant, dropped when the key's last replica
+	// leaves. This is the unit maxIndexEntries bounds and the unit reported as
+	// tenants[].indexEntries — equal, per tenant, to that tenant's slice of
+	// prefixes.summary.total.
+	prefixesByTenant map[string]int
 
 	// servingByScope counts, for each (tenant, model, hash_scheme), how many
 	// distinct prefix entries each replica currently holds. It exists purely
@@ -365,17 +369,17 @@ func withClock(now func() time.Time) Option { return func(i *Index) { i.now = no
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
 	i := &Index{
-		ttl:             DefaultTTL,
-		sweepInterval:   DefaultSweepInterval,
-		maxEntries:      DefaultMaxEntries,
-		now:             time.Now,
-		ranker:          DefaultRankerConfig(),
-		prefixes:        make(map[prefixKey]map[string]replicaEntry),
-		stats:           make(map[statsKey]statEntry),
-		entriesByTenant: make(map[string]int),
-		servingByScope:  make(map[scopeKey]map[string]int),
-		replicasByModel: make(map[modelKey]map[string]struct{}),
-		reportedModels:  make(map[string]struct{}),
+		ttl:              DefaultTTL,
+		sweepInterval:    DefaultSweepInterval,
+		maxEntries:       DefaultMaxEntries,
+		now:              time.Now,
+		ranker:           DefaultRankerConfig(),
+		prefixes:         make(map[prefixKey]map[string]replicaEntry),
+		stats:            make(map[statsKey]statEntry),
+		prefixesByTenant: make(map[string]int),
+		servingByScope:   make(map[scopeKey]map[string]int),
+		replicasByModel:  make(map[modelKey]map[string]struct{}),
+		reportedModels:   make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -488,19 +492,20 @@ func (i *Index) Ingest(u Update) {
 		}
 		i.statsScopeAddLocked(modelKey{u.Tenant, u.Model}, u.ReplicaID)
 	}
-	// Enforce the tenant's index-entry budget on the freshly-ingested state.
-	// Fairness mode: evict only THIS tenant's own oldest entries down to budget;
-	// other tenants are untouched. Memory budgets are not enforced here (the
-	// engine owns KV memory) — entry count is the only dimension we control.
-	evicted := 0
+	// Enforce the tenant's maxIndexEntries budget on the freshly-ingested state.
+	// Fairness mode: evict only THIS tenant's own oldest distinct prefixes down to
+	// budget; other tenants are untouched. Memory budgets are not enforced here
+	// (the engine owns KV memory) — distinct-prefix count is the only dimension we
+	// control.
+	evictedPrefixes := 0
 	if hasQuota {
-		evicted = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
+		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
 	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
 
-	if evicted > 0 && i.metrics != nil {
-		i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evicted)
+	if evictedPrefixes > 0 && i.metrics != nil {
+		i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evictedPrefixes)
 	}
 	i.reportEntries()
 }
@@ -967,19 +972,19 @@ func (i *Index) CacheState(tenant, model string) (replicas []ReplicaStats, total
 	return replicas, totalPrefixes
 }
 
-// DefaultTenantSentinel is the bucket entries with an empty tenant ID are
-// attributed to in cluster-wide aggregates. Without it, untenanted entries
+// DefaultTenantSentinel is the bucket distinct prefixes with an empty tenant ID
+// are attributed to in cluster-wide aggregates. Without it, untenanted prefixes
 // would count toward the grand total but belong to no tenants[] bucket, so
 // Σ tenants[].indexEntries would silently fall short of the total. Bucketing
 // them under a visible, reserved key keeps the aggregate's core invariant —
-// Σ tenants[].indexEntries == totalEntries — true by construction. It is a
+// Σ tenants[].indexEntries == TotalPrefixes — true by construction. It is a
 // reserved name: a real CacheTenant.spec.tenantID is non-empty and operators
 // shouldn't use it; it never claims a per-CacheTenant status (that writer keys
 // on real tenant IDs).
 const DefaultTenantSentinel = "_default"
 
 // tenantBucket maps a raw tenant ID to its aggregate bucket: the ID itself, or
-// the sentinel when empty. Used for BOTH the entry walk and the stats walk so
+// the sentinel when empty. Used for BOTH the prefix walk and the stats walk so
 // the two agree on how an untenanted record is attributed.
 func tenantBucket(tenant string) string {
 	if tenant == "" {
@@ -988,19 +993,21 @@ func tenantBucket(tenant string) string {
 	return tenant
 }
 
-// Aggregate is the index's entry-count aggregate: the per-tenant index-entry
+// Aggregate is the index's prefix-count aggregate: the per-tenant distinct-prefix
 // counts and the grand total, both produced by a SINGLE walk of the prefix map
 // so they cannot disagree. Total == Σ PerTenant by construction — this is the
 // hard invariant the CacheIndex/CacheTenant status surfaces rely on (a tenant's
-// reported indexEntries always sum to the cluster prefix total). An "entry" is
-// one replica's hold on one prefix key — the same unit the global cap and the
-// per-tenant maxIndexEntries quota bound.
+// reported indexEntries always sum to the cluster prefix total). The counted
+// unit is a distinct prefix key — (tenant, model, hash_scheme, prefix_hash),
+// regardless of how many replicas hold it — which is exactly the unit
+// prefixes.summary.total reports and the per-tenant maxIndexEntries quota bounds.
+// (Tenant is part of the key, so the per-tenant partition is exact.)
 type Aggregate struct {
 	PerTenant map[string]int64
 	Total     int64
 }
 
-// Aggregate returns the entry-count aggregate under a single read-lock + single
+// Aggregate returns the prefix-count aggregate under a single read-lock + single
 // walk. Exposed so callers/tests can assert the invariant directly.
 func (i *Index) Aggregate() Aggregate {
 	i.mu.RLock()
@@ -1008,20 +1015,16 @@ func (i *Index) Aggregate() Aggregate {
 	return i.aggregateLocked()
 }
 
-// aggregateLocked walks the prefix map exactly once, attributing every
-// (prefix, replica) entry to its tenant bucket and the running total in the same
-// step. Caller holds at least the read lock. Because both numbers come from the
-// one iteration, Total == Σ PerTenant always holds — no second pass, no separate
-// counter that could drift.
+// aggregateLocked walks the prefix map exactly once, attributing every distinct
+// prefix key to its tenant bucket and the running total in the same step. Caller
+// holds at least the read lock. Because both numbers come from the one
+// iteration, Total == Σ PerTenant == len(i.prefixes) always holds — no second
+// pass, no separate counter that could drift.
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
-	for key, replicas := range i.prefixes {
-		n := int64(len(replicas))
-		if n == 0 {
-			continue
-		}
-		agg.PerTenant[tenantBucket(key.tenant)] += n
-		agg.Total += n
+	for key := range i.prefixes {
+		agg.PerTenant[tenantBucket(key.tenant)]++
+		agg.Total++
 	}
 	return agg
 }
@@ -1039,20 +1042,36 @@ type Snapshot struct {
 }
 
 // ReplicaSnapshot is the latest reported state for one replica, cluster-wide.
+//
+// PrefixCount and LastEventAt are derived from the prefix map and are the
+// per-replica view consumed by the CacheBackend status projection (see
+// internal/controller/cacheindex_controller.go). LastEventAt is the zero
+// time when the replica holds no prefix entries — interpret a zero value as
+// "no KV event observed yet" rather than "epoch."
+//
+// Tenant is the tenant_id the subscriber reported with the replica. The
+// subscriber sidecar derives it from POD_NAMESPACE, so for the in-cluster
+// path it equals the engine pod's namespace and lets a controller-side
+// consumer scope a pod lookup. Empty when the replica is only known through
+// older code paths that did not carry tenant context.
 type ReplicaSnapshot struct {
 	ReplicaID        string    `json:"replicaId"`
+	Tenant           string    `json:"tenant,omitempty"`
 	CacheMemoryBytes int64     `json:"cacheMemoryBytes"`
 	HitRate          float32   `json:"hitRate"`
 	Pressure         float32   `json:"pressure"`
 	LastUpdate       time.Time `json:"lastUpdate"`
+	PrefixCount      int       `json:"prefixCount"`
+	LastEventAt      time.Time `json:"lastEventAt,omitempty"`
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
 //
 // MemoryUsed is the sum of the tenant's replicas' cache_memory_bytes — a
 // cluster-wide observability figure only (the engine owns this memory; it is
-// not a per-tenant budget). IndexEntries is the tenant's live index entry
-// count, the quantity CacheTenant.spec.quota.maxIndexEntries actually bounds.
+// not a per-tenant budget). IndexEntries is the tenant's live distinct-prefix
+// count, the quantity CacheTenant.spec.quota.maxIndexEntries bounds; across all
+// tenants these sum to Snapshot.TotalPrefixes by construction (see Aggregate).
 type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
 	MemoryUsed   int64   `json:"memoryUsed"`
@@ -1068,31 +1087,79 @@ func (i *Index) Snapshot() Snapshot {
 	i.mu.RLock()
 
 	type tenantReplica struct{ tenant, replica string }
-	latestByReplica := make(map[string]statEntry)
+	// Cluster-wide replica snapshots key on (tenant, replicaID): two pods in
+	// different namespaces can legitimately share a metadata.name (e.g.
+	// "vllm-0"), and merging them into one row would mis-attribute prefixes
+	// across tenancy. We then aggregate ONLY across models / hash_schemes
+	// within the same (tenant, replicaID).
+	latestByReplica := make(map[tenantReplica]statEntry)
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
-		if cur, ok := latestByReplica[sk.replicaID]; !ok || s.lastSeen.After(cur.lastSeen) {
-			latestByReplica[sk.replicaID] = s
-		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
+		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
+			latestByReplica[tr] = s
+		}
 		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByTenantReplica[tr] = s
 		}
 	}
 
-	// Entry counts (per-tenant + total) come from ONE authoritative walk so the
-	// reported numbers can't drift: TotalPrefixes == Σ tenants[].indexEntries.
+	// Per-replica prefix counts + last KV-event timestamps. Keyed on
+	// (tenant, replicaID) for the same reason as latestByReplica — so two
+	// pods in different namespaces with the same name do not merge into a
+	// single row. Derived from the prefix map (not the stats map) so the
+	// projection reflects what the replica actually holds, not just whether
+	// its stats are alive.
+	type replicaPrefixAgg struct {
+		count       int
+		lastEventAt time.Time
+	}
+	prefixByReplica := make(map[tenantReplica]*replicaPrefixAgg)
+	for key, replicas := range i.prefixes {
+		for id, e := range replicas {
+			tr := tenantReplica{key.tenant, id}
+			a := prefixByReplica[tr]
+			if a == nil {
+				a = &replicaPrefixAgg{}
+				prefixByReplica[tr] = a
+			}
+			a.count++
+			if e.lastSeen.After(a.lastEventAt) {
+				a.lastEventAt = e.lastSeen
+			}
+		}
+	}
+
+	// Per-tenant distinct-prefix counts + the grand total come from ONE
+	// authoritative walk (aggregateLocked) so the reported numbers can't drift:
+	// TotalPrefixes == Σ tenants[].indexEntries by construction.
 	agg := i.aggregateLocked()
 	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 
-	for id, s := range latestByReplica {
-		snap.Replicas = append(snap.Replicas, ReplicaSnapshot{
-			ReplicaID:        id,
-			CacheMemoryBytes: s.stats.CacheMemoryBytes,
-			HitRate:          s.stats.HitRate,
-			Pressure:         s.stats.Pressure,
-			LastUpdate:       s.lastSeen,
-		})
+	// Union of (tenant, replicaID) seen in stats AND in prefixes — a replica
+	// may have reported prefixes via Ingest but had its stats entry evicted,
+	// or vice versa; the snapshot surfaces both so per-backend projection is
+	// robust. Each row is a unique (tenant, replicaID).
+	seen := make(map[tenantReplica]struct{}, len(latestByReplica)+len(prefixByReplica))
+	for tr := range latestByReplica {
+		seen[tr] = struct{}{}
+	}
+	for tr := range prefixByReplica {
+		seen[tr] = struct{}{}
+	}
+	for tr := range seen {
+		r := ReplicaSnapshot{ReplicaID: tr.replica, Tenant: tr.tenant}
+		if s, ok := latestByReplica[tr]; ok {
+			r.CacheMemoryBytes = s.stats.CacheMemoryBytes
+			r.HitRate = s.stats.HitRate
+			r.Pressure = s.stats.Pressure
+			r.LastUpdate = s.lastSeen
+		}
+		if a, ok := prefixByReplica[tr]; ok {
+			r.PrefixCount = a.count
+			r.LastEventAt = a.lastEventAt
+		}
+		snap.Replicas = append(snap.Replicas, r)
 	}
 
 	type tenantAgg struct {
@@ -1120,12 +1187,12 @@ func (i *Index) Snapshot() Snapshot {
 	// gets zeroes for the other dimension. Emitting every entry-bearing tenant
 	// (agg.PerTenant) is what makes Σ tenants[].indexEntries == TotalPrefixes:
 	// no entry bucket is ever dropped from tenants[].
-	seen := make(map[string]struct{}, len(byTenant)+len(agg.PerTenant))
+	tenantSeen := make(map[string]struct{}, len(byTenant)+len(agg.PerTenant))
 	emit := func(t string) {
-		if _, ok := seen[t]; ok {
+		if _, ok := tenantSeen[t]; ok {
 			return
 		}
-		seen[t] = struct{}{}
+		tenantSeen[t] = struct{}{}
 		var (
 			mem int64
 			hit float32
@@ -1151,7 +1218,12 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	i.mu.RUnlock()
 
-	sort.Slice(snap.Replicas, func(a, b int) bool { return snap.Replicas[a].ReplicaID < snap.Replicas[b].ReplicaID })
+	sort.Slice(snap.Replicas, func(a, b int) bool {
+		if snap.Replicas[a].Tenant != snap.Replicas[b].Tenant {
+			return snap.Replicas[a].Tenant < snap.Replicas[b].Tenant
+		}
+		return snap.Replicas[a].ReplicaID < snap.Replicas[b].ReplicaID
+	})
 	sort.Slice(snap.Tenants, func(a, b int) bool { return snap.Tenants[a].TenantID < snap.Tenants[b].TenantID })
 	return snap
 }
@@ -1207,10 +1279,12 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 	if replicas == nil {
 		replicas = make(map[string]replicaEntry)
 		i.prefixes[key] = replicas
+		// First replica of a brand-new prefix key → one more distinct prefix
+		// for this tenant (the maxIndexEntries unit).
+		i.prefixesByTenant[key.tenant]++
 	}
 	if _, existed := replicas[replicaID]; !existed {
 		i.totalEntries++
-		i.entriesByTenant[key.tenant]++
 		i.scopeIncLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
 	}
 	replicas[replicaID] = replicaEntry{tokenCount: tokenCount, lastSeen: ts}
@@ -1224,13 +1298,15 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 	}
 	delete(replicas, replicaID)
 	i.totalEntries--
-	if n := i.entriesByTenant[key.tenant] - 1; n <= 0 {
-		delete(i.entriesByTenant, key.tenant)
-	} else {
-		i.entriesByTenant[key.tenant] = n
-	}
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
+		// Last replica gone → the prefix key is removed → one fewer distinct
+		// prefix for this tenant.
+		if n := i.prefixesByTenant[key.tenant] - 1; n <= 0 {
+			delete(i.prefixesByTenant, key.tenant)
+		} else {
+			i.prefixesByTenant[key.tenant] = n
+		}
 	}
 	// Drop the replica from the (tenant, model, hash_scheme) serving count
 	// in lockstep with the prefix removal so TENANT_HOT's O(1) check stays
@@ -1375,52 +1451,62 @@ func (i *Index) tenantQuotaFor(tenant string) (maxEntries int64, ok bool) {
 	return i.quotaResolver.TenantQuota(tenant)
 }
 
-// evictOldestForTenantLocked evicts the tenant's oldest entries (by lastSeen)
-// until its entry count is within maxEntries, returning how many it removed.
-// Caller holds the write lock.
+// evictOldestForTenantLocked evicts the tenant's oldest distinct prefixes until
+// its prefix count is within maxPrefixes, returning how many prefixes it
+// removed. Caller holds the write lock.
 //
 // This is the Fairness-mode primitive: it touches ONLY the named tenant's
-// entries, never another tenant's, so one tenant overrunning its budget can't
-// evict a well-behaved tenant's hints. It reuses the same removeReplicaLocked
-// removal and lastSeen ordering as the global cap backstop (enforceCapLocked),
-// scoped to one tenant. Ties on lastSeen break by (prefix hash, replica id) so
-// eviction order is fully deterministic.
-func (i *Index) evictOldestForTenantLocked(tenant string, maxEntries int64) int {
-	if maxEntries < 0 {
+// prefixes, never another tenant's, so one tenant overrunning its budget can't
+// evict a well-behaved tenant's hints. A prefix's age is its freshest replica's
+// lastSeen (the most recent time any replica refreshed it); the oldest such
+// prefixes go first. Removing a prefix drops ALL its replicas — the quota unit
+// is the distinct prefix key, so a prefix counts once no matter how many
+// replicas hold it. Ties on age break by prefix hash for deterministic order.
+func (i *Index) evictOldestForTenantLocked(tenant string, maxPrefixes int64) int {
+	if maxPrefixes < 0 {
 		return 0
 	}
-	if int64(i.entriesByTenant[tenant]) <= maxEntries {
+	if int64(i.prefixesByTenant[tenant]) <= maxPrefixes {
 		return 0
 	}
 	type ref struct {
-		key      prefixKey
-		replica  string
-		lastSeen time.Time
+		key prefixKey
+		age time.Time // freshest replica lastSeen across the prefix's holders
 	}
-	all := make([]ref, 0, i.entriesByTenant[tenant])
+	all := make([]ref, 0, i.prefixesByTenant[tenant])
 	for key, replicas := range i.prefixes {
 		if key.tenant != tenant {
 			continue
 		}
-		for id, e := range replicas {
-			all = append(all, ref{key, id, e.lastSeen})
+		var newest time.Time
+		for _, e := range replicas {
+			if e.lastSeen.After(newest) {
+				newest = e.lastSeen
+			}
 		}
+		all = append(all, ref{key, newest})
 	}
 	sort.Slice(all, func(a, b int) bool {
-		if !all[a].lastSeen.Equal(all[b].lastSeen) {
-			return all[a].lastSeen.Before(all[b].lastSeen)
+		if !all[a].age.Equal(all[b].age) {
+			return all[a].age.Before(all[b].age)
 		}
-		if all[a].key.prefixHash != all[b].key.prefixHash {
-			return all[a].key.prefixHash < all[b].key.prefixHash
-		}
-		return all[a].replica < all[b].replica
+		return all[a].key.prefixHash < all[b].key.prefixHash
 	})
 	removed := 0
 	for _, r := range all {
-		if int64(i.entriesByTenant[tenant]) <= maxEntries {
+		if int64(i.prefixesByTenant[tenant]) <= maxPrefixes {
 			break
 		}
-		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
+		// Drop the whole prefix: collect replica ids first (removeReplicaLocked
+		// mutates the inner map and deletes the key on the last removal).
+		replicas := i.prefixes[r.key]
+		ids := make([]string, 0, len(replicas))
+		for id := range replicas {
+			ids = append(ids, id)
+		}
+		for _, id := range ids {
+			i.removeReplicaLocked(r.key, i.prefixes[r.key], id)
+		}
 		removed++
 	}
 	return removed
