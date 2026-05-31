@@ -113,6 +113,13 @@ spec:
       labels:
         app: qwen-demo
     spec:
+      # The image below is arm64-only; pin scheduling to an arm64 node so
+      # an unmodified apply on a mixed-arch cluster does not schedule the
+      # pod onto an x86 node it cannot run on. x86 hosts: swap to
+      # `vllm/vllm-openai-cpu:latest-x86_64` and change the nodeSelector
+      # value to `amd64`.
+      nodeSelector:
+        kubernetes.io/arch: arm64
       containers:
         - name: vllm
           image: vllm/vllm-openai-cpu:latest-arm64
@@ -121,6 +128,10 @@ spec:
           args:
             - "--port=8000"
             - "--dtype=bfloat16"
+            # Matches docs/reference-stack/manifests/cpu-local/deployment.yaml
+            # — keeps the memory shape predictable on a kind node sized per
+            # the reference manifest's header.
+            - "--max-model-len=8192"
             - "--enforce-eager"
             - "--enable-prefix-caching"
             # KV-cache event publisher — the subscriber sidecar dials

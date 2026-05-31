@@ -246,8 +246,11 @@ field path, the offending token, and the adapter every time.
 
 Two surfaces today:
 
-- `kubectl explain cachebackend.spec.integration.engineOverrides`
-  documents the four primitives and their merge semantics.
+- `kubectl explain cachebackend.spec.integration.engineOverrides` lists
+  the four primitive subfields; drill in with
+  `kubectl explain cachebackend.spec.integration.engineOverrides.env`
+  (and the other three) to read each primitive's per-field merge
+  semantics.
 - The reserved list for the vLLM + LMCache adapter lives in the adapter
   source: `pkg/adapters/runtime/vllm_lmcache.go`'s `ReservedArgs()` and
   `ReservedEnv()` methods. Each entry is commented with WHY it is
