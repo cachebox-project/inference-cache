@@ -160,6 +160,11 @@ type CacheBackendAutoscalingSpec struct {
 }
 
 // CacheBackendIntegrationSpec describes engine integration behavior.
+//
+// Per-namespace lookup tuning lives on CachePolicy, not here: the lookup
+// deadline and the minimum-prefix-token gate are configured via
+// CachePolicy.spec.lookupTimeoutMs and CachePolicy.spec.minimumPrefixTokens,
+// which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
 	// Engine identifies the inference engine integration, such as SGLang or vLLM.
 	// +optional
@@ -168,16 +173,6 @@ type CacheBackendIntegrationSpec struct {
 	// Role controls whether the engine reads from, writes to, or fully participates in the cache.
 	// +optional
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
-
-	// LookupTimeoutMs bounds cache lookup latency in milliseconds.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
-
-	// MinimumPrefixTokens is the minimum prefix length required before cache lookup is attempted.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MinimumPrefixTokens *int32 `json:"minimumPrefixTokens,omitempty"`
 
 	// FailOpen controls whether the engine treats cache lookups as a soft
 	// dependency. When true (the default), an unreachable or degraded cache
@@ -359,11 +354,6 @@ type CacheBackendStatus struct {
 	// requested size as "provisioned" would mislead operators.
 	// +optional
 	Capacity string `json:"capacity,omitempty"`
-
-	// IndexEntries is the observed number of cache index entries for this backend.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
 	// FailOpen mirrors the effective spec.integration.failOpen value the
 	// controller most recently observed. Surfaced so operators can confirm

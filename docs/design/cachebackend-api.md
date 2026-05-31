@@ -30,8 +30,6 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `autoscaling.targetCPUUtilizationPercent` | integer | Target average per-pod CPU utilization for the HPA. Defaults to `80` when unset. Range `[1, 100]`. |
 | `integration.engine` | string | Engine integration target, such as SGLang or vLLM. |
 | `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. |
-| `integration.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. Lookup callers must still fail open. |
-| `integration.minimumPrefixTokens` | integer | Minimum prefix token count before attempting cache lookup. Minimum `0`. |
 | `integration.failOpen` | boolean | Default `true`. When `true`, engine pods fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Setting it to `false` is an advanced opt-in to fail-closed serving (the cache becomes a serving dependency); the controller surfaces this as a Warning Kubernetes Event on the owning `CacheBackend`. |
 | `integration.engineOverrides` | object | Optional engine-injection overrides applied to the args/env the pod-mutating webhook would otherwise inject into the engine container. See [Engine-injection overrides](#engine-injection-overrides-specintegrationengineoverrides). |
 | `engineSelector.matchLabels` | map | Labels used to select engine pods or runtimes. |
@@ -39,6 +37,12 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `template` | object | Optional pod-level overrides for managed backend pods. This is a narrow override surface, not a full `PodSpec`; backend containers come from controller defaults. |
 | `endpoint` | string | Optional endpoint for an existing external backend. The controller mirrors this into `status.endpoint`. |
 | `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
+
+> **Per-namespace lookup tuning lives on CachePolicy, not CacheBackend.** The
+> lookup latency budget and the minimum-prefix-token gate are configured via
+> `CachePolicy.spec.lookupTimeoutMs` and `CachePolicy.spec.minimumPrefixTokens`,
+> which are the surfaces actually wired into the server's `ResolvedPolicy` and
+> the `LookupRoute` path.
 
 ### Template Overrides
 
@@ -100,7 +104,6 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
 | `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
 | `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
-| `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
 | `indexParticipation` | object | Per-backend slice of the cluster-wide cache index, projected from the server's `/snapshot` by grouping replicas by owning `CacheBackend`. Populated by the CacheIndex poller (status-only). Object is unset until the poller has observed a successful scrape that names the backend's replicas (see [Index Participation](#index-participation)). |
 | `observedGeneration` | integer | The `.metadata.generation` last reconciled by the controller. Lets clients tell whether the observed status reflects the current spec. |
@@ -139,8 +142,7 @@ Only ONE CacheBackend ever claims a given replica — overlapping selectors must
 
 - Lookup paths fail open by default. `spec.integration.failOpen` defaults to `true` and the engine adapter MUST fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Operators may opt into fail-closed serving by setting `failOpen: false`, which is loud and visible: the controller emits a Warning `FailClosedEnabled` Event on the `CacheBackend` to make it explicit that the cache has been promoted to a serving dependency.
 - The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded`, `BackendRecovered` (Normal) on returning to `Ready` from `Degraded`, plus the `FailClosedEnabled` / `FailOpenRestored` pair above. Steady-state reconciles do not emit events.
-- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook is the exception: it materialises `spec.integration` with the Phase-1 defaults (`lookupTimeoutMs`, `minimumPrefixTokens`) so downstream code does not need to nil-check them. The fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
-- `status.indexEntries` is a pointer in Go so `0` is distinguishable from unset.
+- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook leaves `spec.integration` untouched when unset; downstream code nil-checks it before reading. `spec.integration.failOpen` is defaulted to `true` at the CRD layer via a `+kubebuilder:default` marker rather than by the webhook.
 
 ## Admission
 
@@ -153,8 +155,6 @@ Stamps Phase-1 defaults onto every admitted CacheBackend, only where the operato
 | Field | Default |
 |---|---|
 | `spec.replicas` | `1` |
-| `spec.integration.lookupTimeoutMs` | `50` |
-| `spec.integration.minimumPrefixTokens` | `256` |
 
 ### Validating
 

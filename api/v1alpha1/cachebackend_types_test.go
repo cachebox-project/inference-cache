@@ -38,7 +38,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "capacity", "indexEntries", "failOpen", "conditions"} {
+	for _, field := range []string{"endpoint", "health", "capacity", "failOpen", "conditions"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -80,10 +80,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireNotRequired(t, specSchema, "type")
 	requireRequired(t, mustPath[map[string]any](t, specSchema, "properties", "storage", "properties", "pvc"), "size")
 	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
-	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "lookupTimeoutMs"), 0)
-	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
-	requireMinimum(t, mustProperty(t, statusSchema, "indexEntries"), 0)
 
 	// Autoscaling validation surface.
 	autoscalingSchema := mustProperty(t, specSchema, "autoscaling")
@@ -118,9 +115,6 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	replicas := int32(2)
 	storageClassName := "fast"
-	lookupTimeoutMs := int32(25)
-	minimumPrefixTokens := int32(64)
-	indexEntries := int64(42)
 	runAsNonRoot := true
 	runtimeClassName := "runc"
 	terminationGracePeriodSeconds := int64(30)
@@ -144,10 +138,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				TargetCPUUtilizationPercent: &autoscalingTargetCPU,
 			},
 			Integration: &CacheBackendIntegrationSpec{
-				Engine:              "SGLang",
-				Role:                CacheBackendIntegrationRoleReadWrite,
-				LookupTimeoutMs:     &lookupTimeoutMs,
-				MinimumPrefixTokens: &minimumPrefixTokens,
+				Engine: "SGLang",
+				Role:   CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
@@ -168,10 +160,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			Endpoint: "external-cache.default.svc:8080",
 		},
 		Status: CacheBackendStatus{
-			Endpoint:     "cache.default.svc:8080",
-			Health:       CacheBackendHealthReady,
-			Capacity:     "10Gi",
-			IndexEntries: &indexEntries,
+			Endpoint: "cache.default.svc:8080",
+			Health:   CacheBackendHealthReady,
+			Capacity: "10Gi",
 			Conditions: []metav1.Condition{{
 				Type:               "Ready",
 				Status:             metav1.ConditionTrue,
@@ -189,8 +180,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Autoscaling.MinReplicas = 4
 	backend.Spec.Autoscaling.MaxReplicas = 9
 	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
-	*backend.Spec.Integration.LookupTimeoutMs = 50
-	*backend.Spec.Integration.MinimumPrefixTokens = 128
 	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
 	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
 	backend.Spec.Template.NodeSelector["pool"] = "general"
@@ -198,7 +187,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Template.SecurityContext.RunAsNonRoot = false
 	*backend.Spec.Template.RuntimeClassName = "kata"
 	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
-	*backend.Status.IndexEntries = 100
 	backend.Status.Conditions[0].Message = "changed"
 
 	if copied.Spec.Replicas == nil || *copied.Spec.Replicas != 2 {
@@ -231,11 +219,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Spec.Integration == nil {
 		t.Fatalf("integration was not deep-copied")
 	}
-	if copied.Spec.Integration.LookupTimeoutMs == nil || *copied.Spec.Integration.LookupTimeoutMs != 25 {
-		t.Fatalf("integration.lookupTimeoutMs was not deep-copied")
-	}
-	if copied.Spec.Integration.MinimumPrefixTokens == nil || *copied.Spec.Integration.MinimumPrefixTokens != 64 {
-		t.Fatalf("integration.minimumPrefixTokens was not deep-copied")
+	if copied.Spec.Integration.Engine != "SGLang" {
+		t.Fatalf("integration.engine was not deep-copied")
 	}
 	if copied.Spec.BackendConfig["evictionPolicy"] != "LRU" {
 		t.Fatalf("backendConfig was not deep-copied")
@@ -266,9 +251,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Spec.Template.TerminationGracePeriodSeconds == nil ||
 		*copied.Spec.Template.TerminationGracePeriodSeconds != 30 {
 		t.Fatalf("template.terminationGracePeriodSeconds was not deep-copied")
-	}
-	if copied.Status.IndexEntries == nil || *copied.Status.IndexEntries != 42 {
-		t.Fatalf("status.indexEntries was not deep-copied")
 	}
 	if copied.Status.Conditions[0].Message != "backend is ready" {
 		t.Fatalf("conditions were not deep-copied")
@@ -303,19 +285,6 @@ func TestIntegrationFailOpenDefaultsTrue(t *testing.T) {
 				t.Fatalf("IntegrationFailOpen(%+v) = %v, want %v", tc.spec, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestCacheBackendStatusJSONIncludesExplicitZeroIndexEntries(t *testing.T) {
-	indexEntries := int64(0)
-	status := CacheBackendStatus{IndexEntries: &indexEntries}
-
-	data, err := json.Marshal(status)
-	if err != nil {
-		t.Fatalf("marshal status: %v", err)
-	}
-	if string(data) != `{"indexEntries":0}` {
-		t.Fatalf("status JSON = %s, want explicit zero indexEntries", data)
 	}
 }
 

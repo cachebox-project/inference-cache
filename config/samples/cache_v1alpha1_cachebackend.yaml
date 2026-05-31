@@ -15,8 +15,6 @@ spec:
   integration:
     engine: SGLang
     role: ReadWrite
-    lookupTimeoutMs: 20
-    minimumPrefixTokens: 32
   engineSelector:
     matchLabels:
       inferencecache.io/cache-enabled: "true"

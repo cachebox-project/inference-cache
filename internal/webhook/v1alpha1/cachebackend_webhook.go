@@ -22,16 +22,12 @@ import (
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
-// tests pin the same constants the handler uses; the values come from the
-// tech-spec §4.1 example for `CacheBackend.spec.integration`
-// (lookupTimeoutMs=50, minimumPrefixTokens=256). `spec.integration.failOpen`
-// is also defaulted to true, but at the CRD layer via a +kubebuilder:default
-// marker (apiserver defaulting runs before mutating admission), so this
-// webhook does not need to stamp it.
+// tests pin the same constants the handler uses. `spec.integration.failOpen`
+// is defaulted to true at the CRD layer via a +kubebuilder:default marker
+// (apiserver defaulting runs before mutating admission), so this webhook does
+// not need to stamp it.
 const (
-	defaultLookupTimeoutMs     = int32(50)
-	defaultMinimumPrefixTokens = int32(256)
-	defaultReplicas            = int32(1)
+	defaultReplicas = int32(1)
 )
 
 // memoryOnlyBackends classifies the CacheBackendType values that are
@@ -124,18 +120,6 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	if cb.Spec.Replicas == nil {
 		v := defaultReplicas
 		cb.Spec.Replicas = &v
-	}
-
-	if cb.Spec.Integration == nil {
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
-	}
-	if cb.Spec.Integration.LookupTimeoutMs == nil {
-		v := defaultLookupTimeoutMs
-		cb.Spec.Integration.LookupTimeoutMs = &v
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil {
-		v := defaultMinimumPrefixTokens
-		cb.Spec.Integration.MinimumPrefixTokens = &v
 	}
 
 	return nil

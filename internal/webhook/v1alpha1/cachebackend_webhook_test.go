@@ -30,7 +30,7 @@ func newBackend() *cachev1alpha1.CacheBackend {
 
 func i32p(v int32) *int32 { return &v }
 
-func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
+func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 
@@ -41,14 +41,11 @@ func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
 	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != defaultReplicas {
 		t.Errorf("replicas = %v, want %d", cb.Spec.Replicas, defaultReplicas)
 	}
-	if cb.Spec.Integration == nil {
-		t.Fatal("integration block not created")
-	}
-	if cb.Spec.Integration.LookupTimeoutMs == nil || *cb.Spec.Integration.LookupTimeoutMs != defaultLookupTimeoutMs {
-		t.Errorf("lookupTimeoutMs = %v, want %d", cb.Spec.Integration.LookupTimeoutMs, defaultLookupTimeoutMs)
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
-		t.Errorf("minimumPrefixTokens = %v, want %d", cb.Spec.Integration.MinimumPrefixTokens, defaultMinimumPrefixTokens)
+	// The defaulter no longer materialises an integration block: lookup
+	// tuning lives on CachePolicy, and failOpen is defaulted at the CRD
+	// layer. An unset integration spec is left nil.
+	if cb.Spec.Integration != nil {
+		t.Errorf("integration block = %+v, want nil", cb.Spec.Integration)
 	}
 }
 
@@ -56,10 +53,6 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(7)
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		LookupTimeoutMs:     i32p(123),
-		MinimumPrefixTokens: i32p(999),
-	}
 
 	if err := d.Default(context.Background(), cb); err != nil {
 		t.Fatalf("Default returned error: %v", err)
@@ -67,33 +60,6 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 
 	if *cb.Spec.Replicas != 7 {
 		t.Errorf("replicas clobbered: got %d, want 7", *cb.Spec.Replicas)
-	}
-	if *cb.Spec.Integration.LookupTimeoutMs != 123 {
-		t.Errorf("lookupTimeoutMs clobbered: got %d, want 123", *cb.Spec.Integration.LookupTimeoutMs)
-	}
-	if *cb.Spec.Integration.MinimumPrefixTokens != 999 {
-		t.Errorf("minimumPrefixTokens clobbered: got %d, want 999", *cb.Spec.Integration.MinimumPrefixTokens)
-	}
-}
-
-func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
-	// Operator pinned the timeout but left minimumPrefixTokens unset —
-	// defaulter should fill in only the holes.
-	d := &CacheBackendDefaulter{}
-	cb := newBackend()
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		LookupTimeoutMs: i32p(25),
-	}
-
-	if err := d.Default(context.Background(), cb); err != nil {
-		t.Fatalf("Default returned error: %v", err)
-	}
-
-	if *cb.Spec.Integration.LookupTimeoutMs != 25 {
-		t.Errorf("operator timeout clobbered: %d", *cb.Spec.Integration.LookupTimeoutMs)
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
-		t.Errorf("minimumPrefixTokens not defaulted")
 	}
 }
 
