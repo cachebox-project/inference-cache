@@ -82,7 +82,7 @@ func expectNoEvent(t *testing.T, events []string, substr string) {
 	}
 }
 
-// markDeploymentReady mutates the child Deployment's status so managedHealth
+// markDeploymentReady mutates the child Deployment's status so managedReadiness
 // observes it as Ready (rolled out + all replicas available).
 func markDeploymentReady(t *testing.T, r *CacheBackendReconciler, name, namespace string, want int32) {
 	t.Helper()
@@ -98,7 +98,8 @@ func markDeploymentReady(t *testing.T, r *CacheBackendReconciler, name, namespac
 }
 
 // markDeploymentDegraded mutates the child Deployment's status into the
-// post-rollout "replicas unavailable" state managedHealth reports as Degraded.
+// post-rollout "replicas unavailable" state managedReadiness reports as
+// Ready=False/ReplicasUnavailable.
 func markDeploymentDegraded(t *testing.T, r *CacheBackendReconciler, name, namespace string, want int32) {
 	t.Helper()
 	dep := getDeployment(t, r, name, namespace)

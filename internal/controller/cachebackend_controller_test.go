@@ -985,10 +985,10 @@ func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Func
 // TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded
 // regression: a Deployment Update inside applyDeployment races the kube
 // Deployment controller's status writes and returns 409. Without retry, the
-// reconcile aborts and the CR's Health is frozen at whatever the last
-// successful pass observed — typically "pod not yet Ready". With
+// reconcile aborts and the CR's Ready condition is frozen at whatever the
+// last successful pass observed — typically "pod not yet Ready". With
 // RetryOnConflict in place, apply converges within a reconcile pass and the
-// CR reports Ready once the underlying Deployment is healthy.
+// CR reports Ready=True once the underlying Deployment is healthy.
 func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
@@ -1143,8 +1143,8 @@ func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
 	}
 
 	// Deployment is created (only Service apply was blocked), so the status
-	// pass runs and publishes Health. But Status.Endpoint must stay empty
-	// until a live Service backs it.
+	// pass runs and publishes the Ready + Progressing conditions. But
+	// Status.Endpoint must stay empty until a live Service backs it.
 	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err != nil {
 		t.Fatalf("expected deployment to be created (only Service was blocked): %v", err)
 	}
@@ -1263,7 +1263,7 @@ func TestReconcileLMCacheDeploymentLosesOwnershipAfterApply(t *testing.T) {
 // guard on the Deployment status path: if a Deployment with the matching name
 // already exists but is owned by another controller, applyDeployment fails
 // (SetControllerReference returns AlreadyOwned). The reconciler must NOT
-// derive Health from that foreign workload — that would mark the CacheBackend
+// derive Ready from that foreign workload — that would mark the CacheBackend
 // Ready based on someone else's pods.
 func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 	scheme := newScheme(t)

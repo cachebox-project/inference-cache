@@ -194,9 +194,9 @@ func TestReconcileInitialReplicasDefaultsToOneWithAutoscaling(t *testing.T) {
 func TestReconcileDeploymentClampsToRaisedHPAFloor(t *testing.T) {
 	// When the user raises autoscaling.minReplicas above the current live
 	// replica count, the reconciler must NOT preserve the stale lower value —
-	// otherwise managedHealth would report Ready against the old count before
-	// the HPA controller catches up, briefly publishing a Ready that does not
-	// satisfy the new minimum.
+	// otherwise managedReadiness would report Ready against the old count
+	// before the HPA controller catches up, briefly publishing a Ready that
+	// does not satisfy the new minimum.
 	scheme := newScheme(t)
 	cb := autoscalingBackend("cache", "ns1", 1, 5, nil)
 	r := newReconciler(scheme, cb)
@@ -437,7 +437,7 @@ func TestDesiredReplicasFallbackToSpecWhenNoAutoscaling(t *testing.T) {
 	}
 }
 
-func TestManagedHealthIgnoresSpecReplicasUnderHPA(t *testing.T) {
+func TestManagedReadinessIgnoresSpecReplicasUnderHPA(t *testing.T) {
 	// spec.replicas=0 with autoscaling set must NOT trip the ScaledToZero
 	// guard — the HPA owns the count, and minReplicas>=1 is enforced by the
 	// kubebuilder validation on autoscaling.minReplicas.

@@ -98,7 +98,6 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 | Field | Type | Purpose |
 |---|---|---|
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
-| `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
 | `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
 | `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `matchedEnginePods` | integer | Snapshot count, at the last reconcile, of pods in the CacheBackend's namespace whose labels satisfy `spec.engineSelector`. Pointer in Go so nil ("not yet computed") is distinguishable from an observed `0` ("computed and zero pods match"). Refreshed at reconcile cadence — not a real-time per-pod counter. The per-pod signal is the `InjectedByCacheBackend` Event the `engine-pod-events` controller emits after the mutating Pod webhook stamps a pod (see [Mutating Pod webhook](#mutating-pod-webhook-engine-wiring) for why the event is emitted by a controller and not the webhook). The field stays nil when no claim-capable selector is configured — both when `spec.engineSelector` is absent AND when `spec.engineSelector.matchLabels` is present but empty (the webhook treats an empty match map as no-claim by design, so the count is no-claim too). A CR that previously had a non-empty selector and just lost it gets its prior value cleared back to nil so the printer column does not advertise a stale match. |
@@ -113,12 +112,20 @@ Two condition types are published. The semantics differ for managed backends (wh
 
 **Managed backends**:
 
-| Type | Meaning |
-|---|---|
-| `Ready` | True once the backend Deployment has rolled out its current generation and has enough updated + available replicas to serve traffic. Reason strings (`Synced`, `Degraded`, etc.) describe the rollout state. |
-| `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply). Transitions to False once the Deployment converges (`Synced`) or stalls (`Degraded`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded". |
+| Type | Status | Reason | Meaning |
+|---|---|---|---|
+| `Ready` | `True` | `BackendReady` | Deployment has observed its current generation and has enough updated + available replicas to serve traffic. |
+| `Ready` | `False` | `RolloutInProgress` | Deployment generation lags or updated replicas are below the desired count — controller is still driving the live state. |
+| `Ready` | `False` | `ScaledToZero` | The desired replica count is `0` (stable terminal state — no rollout is in motion). |
+| `Ready` | `False` | `ReplicasUnavailable` | Deployment has rolled out but lost availability (post-rollout failure). The `BackendDegraded` Event fires on entry to this state and `BackendRecovered` on the transition back to `Ready=True`. |
+| `Progressing` | `True` | `RolloutInProgress` | The controller is still driving the live state toward the desired state (matches the `Ready=False/RolloutInProgress` shape). |
+| `Progressing` | `False` | `Synced` | `Ready=True` — rendered children match desired state. |
+| `Progressing` | `False` | `Degraded` | `Ready=False/ReplicasUnavailable` — rollout finished but replicas are unavailable; the failure is stable, not in motion. |
+| `Progressing` | `False` | `ScaledToZero` | `Ready=False/ScaledToZero` — stable user-chosen terminal state. |
 
-When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares health against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
+The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded" (or scaled to zero).
+
+When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares the Ready condition against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
 **External backends**:
 
@@ -133,7 +140,7 @@ There is no Deployment to roll out, so admission acceptance of `spec.endpoint` i
 
 Reachability of the external endpoint is **not** probed by the controller; trusting the operator is part of the External contract. A future enhancement could degrade `Ready` on a probe failure, but that's deliberately out of scope for the passthrough adapter today (fail-soft, never a serving dependency).
 
-`kubectl get cachebackend` displays the observed `status.endpoint`, a `Matched` column sourced from `status.matchedEnginePods`, plus `status.indexParticipation.prefixCount` (as `PREFIXES`) and `status.indexParticipation.lastEventAt` (as `LASTEVENT`). Managed backends therefore show the endpoint, the operator-actionable engine-fleet count, and live index participation once reconciliation has populated them and the poller has observed a `/snapshot` tick. An empty `Matched` cell means the count has not yet been computed (e.g. cold start before the first reconcile) or the CR has no `spec.engineSelector` configured. External backends display the operator-supplied endpoint immediately; `indexParticipation` stays unset because the controller has no subscriber sidecar in an operator-managed cache.
+`kubectl get cachebackend` displays a `Ready` column sourced from `status.conditions[?(@.type=="Ready")].status` (the standard K8s pattern — operators read readiness through conditions, not through a custom enum field), the observed `status.endpoint`, a `Matched` column sourced from `status.matchedEnginePods`, plus `status.indexParticipation.prefixCount` (as `PREFIXES`) and `status.indexParticipation.lastEventAt` (as `LASTEVENT`). Managed backends therefore show the endpoint, the operator-actionable engine-fleet count, and live index participation once reconciliation has populated them and the poller has observed a `/snapshot` tick. An empty `Matched` cell means the count has not yet been computed (e.g. cold start before the first reconcile) or the CR has no `spec.engineSelector` configured. External backends display the operator-supplied endpoint immediately; `indexParticipation` stays unset because the controller has no subscriber sidecar in an operator-managed cache.
 
 ### Index Participation
 
@@ -154,7 +161,7 @@ Only ONE CacheBackend ever claims a given replica — overlapping selectors must
 ## Contract Notes
 
 - Lookup paths fail open by default. `spec.integration.failOpen` defaults to `true` and the engine adapter MUST fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Operators may opt into fail-closed serving by setting `failOpen: false`, which is loud and visible: the controller emits a Warning `FailClosedEnabled` Event on the `CacheBackend` to make it explicit that the cache has been promoted to a serving dependency.
-- The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded`, `BackendRecovered` (Normal) on returning to `Ready` from `Degraded`, plus the `FailClosedEnabled` / `FailOpenRestored` pair above. Steady-state reconciles do not emit events.
+- The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Ready=False/ReplicasUnavailable`, `BackendRecovered` (Normal) on the transition back to `Ready=True`, plus the `FailClosedEnabled` / `FailOpenRestored` pair above. Steady-state reconciles do not emit events.
 - A `Normal InjectedByCacheBackend` Event is emitted on engine pods the mutating webhook stamps with both `inferencecache.io/injected-by` AND `inferencecache.io/injected-by-uid`, where the UID annotation matches the live CacheBackend's `metadata.uid` at reconcile time. The controller deliberately skips emission when (a) the named CR cannot be looked up (NotFound), (b) the UID annotation is absent (failurePolicy=Ignore forgery shape), or (c) the UID does not match the live CR (forgery or CR was recreated under the same name). Non-NotFound lookup errors surface as reconcile errors so controller-runtime retries with backoff. The Event is recorded by a Pod-watching controller, not by the webhook itself: at mutating-admission time the apiserver hasn't assigned `metadata.uid` to the pod yet, so an event recorded from the webhook would carry `involvedObject.uid=""` and be invisible to describe (which filters events by UID). Routing the emission through a post-create controller is what guarantees the event reaches the user-visible surface. There is no `NoMatchingCacheBackend` Event in this PR; the no-match signal is `status.matchedEnginePods == 0` on the CR (visible in `kubectl get cachebackend`).
 - Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook is the exception: it materialises `spec.integration` with the Phase-1 defaults (`lookupTimeoutMs`, `minimumPrefixTokens`) so downstream code does not need to nil-check them. The fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
 - `status.indexEntries` is a pointer in Go so `0` is distinguishable from unset.

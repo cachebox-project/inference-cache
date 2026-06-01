@@ -100,6 +100,7 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 	columns := mustPath[[]any](t, version, "additionalPrinterColumns")
 
 	want := map[string]string{
+		"Ready":    `.status.conditions[?(@.type=="Ready")].status`,
 		"Endpoint": ".status.endpoint",
 		"Matched":  ".status.matchedEnginePods",
 	}
@@ -117,6 +118,10 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 		if got := seen[name]; got != jsonPath {
 			t.Fatalf("print column %q jsonPath = %q, want %q", name, got, jsonPath)
 		}
+	}
+	// Guard against the removed Health column reappearing on a future regen.
+	if got, present := seen["Health"]; present {
+		t.Fatalf("print column %q is present (jsonPath=%q); must be removed in favour of Ready", "Health", got)
 	}
 }
 

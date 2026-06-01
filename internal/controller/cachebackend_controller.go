@@ -63,7 +63,7 @@ const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
 // and BackendRecovered narrate transitions of the managed workload's health
-// so operators see backend health changes in `kubectl describe`. The
+// so operators see backend readiness changes in `kubectl describe`. The
 // FailClosedEnabled / FailOpenRestored pair narrates transitions of the
 // spec.integration.failOpen toggle — explicitly fail-closed is loud because
 // the cache then becomes a serving dependency.
@@ -163,12 +163,13 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // resolved endpoint.
 //
 // On every reconcile — including ones that return an apply error — transitions
-// in the observed backend health (entering/leaving Degraded) and in the
-// effective spec.integration.failOpen are emitted as Kubernetes Events. Events
-// fire only on transitions that were actually persisted to the apiserver
-// (patchStatus rolls back the in-memory mutation on patch failure), and never
-// on steady state — so operators see backend outages and fail-closed opt-ins
-// in `kubectl describe` without phantom or duplicate events.
+// in the observed Ready condition (entering/leaving Ready=False/
+// ReplicasUnavailable) and in the effective spec.integration.failOpen are
+// emitted as Kubernetes Events. Events fire only on transitions that were
+// actually persisted to the apiserver (patchStatus rolls back the in-memory
+// mutation on patch failure), and never on steady state — so operators see
+// backend outages and fail-closed opt-ins in `kubectl describe` without
+// phantom or duplicate events.
 func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := r.Log
 	if logger.GetSink() == nil {
@@ -807,7 +808,7 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 	return nil
 }
 
-// updateManagedStatus derives health from the Deployment and patches status only when it changes.
+// updateManagedStatus derives the Ready + Progressing conditions from the Deployment and patches status only when it changes.
 //
 // applyOK is the convergence signal from reconcileManaged: when apply failed,
 // the live Deployment we read may still reflect a *prior* CR generation, so
@@ -1195,12 +1196,13 @@ func statusFailOpen(v *bool) bool {
 }
 
 // emitTransitionEvents emits Kubernetes Events on transitions of the observed
-// backend health or the effective failOpen toggle. By design events fire only
+// Ready condition (entering/leaving the Ready=False/ReplicasUnavailable
+// shape) or the effective failOpen toggle. By design events fire only
 // on transitions — never on steady state — so a Ready backend reconciling
 // every few seconds does not flood the event stream.
 //
-//   - Entering Degraded → Warning BackendDegraded.
-//   - Leaving Degraded for Ready → Normal BackendRecovered.
+//   - Entering Ready=False/ReplicasUnavailable → Warning BackendDegraded.
+//   - Leaving Ready=False/ReplicasUnavailable for Ready=True → Normal BackendRecovered.
 //   - failOpen flipped true → false → Warning FailClosedEnabled (the cache
 //     becomes a serving dependency; advanced opt-in).
 //   - failOpen flipped false → true → Normal FailOpenRestored.
@@ -1230,8 +1232,8 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 }
 
 // degradedMessage surfaces the Ready=False condition's message (set by
-// managedHealth) so the BackendDegraded event names the failure mode (e.g.
-// "1/3 replicas available") instead of just announcing the phase change.
+// managedReadiness) so the BackendDegraded event names the failure mode
+// (e.g. "1/3 replicas available") instead of just announcing the transition.
 func degradedMessage(cb *cachev1alpha1.CacheBackend) string {
 	if c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady); c != nil && c.Message != "" {
 		return c.Message
