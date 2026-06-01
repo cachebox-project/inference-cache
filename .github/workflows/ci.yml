@@ -162,6 +162,42 @@ jobs:
     - name: Build binaries
       run: make build
 
+  lint-test-proto:
+    name: Lint, Test, Proto
+    runs-on: ubuntu-latest
+    needs:
+    - lint-generated-proto
+    - test
+    - vulnerability-scan
+    - build
+    if: always()
+    permissions:
+      contents: read
+    steps:
+    - name: Check split CI jobs
+      env:
+        LINT_GENERATED_PROTO_RESULT: ${{ needs.lint-generated-proto.result }}
+        TEST_RESULT: ${{ needs.test.result }}
+        VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: |
+        failed=0
+        for item in \
+          "lint-generated-proto:$LINT_GENERATED_PROTO_RESULT" \
+          "test:$TEST_RESULT" \
+          "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
+          "build:$BUILD_RESULT"; do
+          name="${item%%:*}"
+          result="${item#*:}"
+          if [ "$result" != "success" ]; then
+            echo "✗ $name finished with result=$result"
+            failed=1
+          else
+            echo "✓ $name passed"
+          fi
+        done
+        exit "$failed"
+
   image-build:
     name: Image Build
     runs-on: ubuntu-latest
