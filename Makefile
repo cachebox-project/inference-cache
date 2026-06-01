@@ -176,6 +176,11 @@ cover-check: ## Fail if logic-package coverage is below COVER_MIN% (excludes gen
 test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
 
+.PHONY: verify-samples
+verify-samples: envtest manifests ## Run every YAML under config/samples/ through admission via envtest + the CacheBackend webhook (server-side dry-run). Honors top-of-file `# verify-samples: skip`.
+	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		$(GO_CMD) run ./hack/verify-samples
+
 .PHONY: image-build
 image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
 
@@ -243,7 +248,7 @@ fmt-check: ## Check Go formatting without modifying files.
 ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
-pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
+pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
 	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
 	if ! git diff --quiet -- $$gen; then \
@@ -252,6 +257,7 @@ pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checkli
 		exit 1; \
 	fi
 	@echo "✓ no generated-code drift"
+	@$(MAKE) --no-print-directory verify-samples
 	@echo ""
 	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
 	@echo "  [ ] Vendor-neutral naming — no oci/oracle in core identity"

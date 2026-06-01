@@ -133,6 +133,13 @@ jobs:
     - name: Coverage gate
       run: make cover-check
 
+    # Runs every YAML under config/samples/ through admission against an
+    # envtest apiserver + the CacheBackend webhook (server-side dry-run).
+    # Catches sample-vs-schema drift before release — a sample that would
+    # be rejected by `kubectl apply` on a real cluster fails the PR.
+    - name: Verify samples
+      run: make verify-samples
+
   vulnerability-scan:
     name: Vulnerability Scan
     runs-on: ubuntu-latest
