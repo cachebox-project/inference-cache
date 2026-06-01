@@ -15,10 +15,11 @@ spec:
   deploymentKind: StatefulSet
   replicas: 1
   integration:
-    # Runtime ID (not adapter name). Canonical values: "vllm" (default if
-    # empty) and "sglang". Case-insensitive on ingest. The (engine, type)
-    # pair selects the adapter; today only (vllm, LMCache) and
-    # (vllm, External) are wired.
+    # Runtime ID (not adapter package name). Recognised values: "vllm"
+    # (default if empty) and "sglang"; case-insensitive on ingest. Today
+    # only (vllm, LMCache) and (vllm, External) have a shipped adapter, so
+    # "vllm" is the only value that pairs with type: LMCache here without
+    # being rejected at admission.
     engine: vllm
     role: ReadWrite
   engineSelector:

@@ -835,7 +835,17 @@ SAMPLE_APPLY_NS="${SAMPLE_APPLY_NS:-ic-sample-apply}"
 kubectl create namespace "$SAMPLE_APPLY_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
 sample_fail=0
-for f in config/samples/cache_v1alpha1_*.yaml config/samples/cachebackend-*.yaml; do
+# Glob every *.yaml so a future file (recipe-*.yaml, etc.) under
+# config/samples/ is automatically covered — the invariant is "every
+# operator-facing sample applies cleanly," not the kubebuilder-default +
+# cachebackend-* basenames the directory carries today.
+shopt -s nullglob
+sample_files=(config/samples/*.yaml)
+shopt -u nullglob
+if [ "${#sample_files[@]}" -eq 0 ]; then
+  fail "no sample manifests found under config/samples/ — script-glob regression"
+fi
+for f in "${sample_files[@]}"; do
   # cacheindex is cluster-scoped; the dry-run namespace flag is a no-op for
   # it but harmless. Everything else is namespace-scoped.
   if ! kubectl apply --dry-run=server -n "$SAMPLE_APPLY_NS" -f "$f" \
@@ -849,6 +859,6 @@ kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/de
 if [ "$sample_fail" -ne 0 ]; then
   fail "one or more config/samples/*.yaml manifests did not apply cleanly against the live install"
 fi
-log "all config/samples/*.yaml applied cleanly (server dry-run)"
+log "all ${#sample_files[@]} config/samples/*.yaml file(s) applied cleanly (server dry-run)"
 
 log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth, every sample manifest applies cleanly"
