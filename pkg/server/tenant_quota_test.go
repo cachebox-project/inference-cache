@@ -86,3 +86,20 @@ func TestReplaceSnapshotDropsEmptyTenantID(t *testing.T) {
 		t.Fatal("an empty tenant ID must not be stored (would shadow empty-tenant lookups)")
 	}
 }
+
+// TestReplaceSnapshotClampsNegativeBudget pins the trust-boundary sanitization:
+// the CRD enforces maxIndexEntries>=0, but a hand-crafted /policy POST could send
+// a negative budget, which the index would read as "no enforcement" (eviction is
+// skipped for a negative cap) — silently turning an attempted cap into unbounded.
+// ReplaceSnapshot must clamp it to the design minimum of 0 (admit nothing).
+func TestReplaceSnapshotClampsNegativeBudget(t *testing.T) {
+	store := NewPolicyStore()
+	store.ReplaceSnapshot(nil, []ResolvedTenant{{TenantID: "team-a", MaxIndexEntries: -1}})
+	max, ok := store.TenantQuota("team-a")
+	if !ok {
+		t.Fatal("a negative budget must still register an (enforced) quota, not fail open")
+	}
+	if max != 0 {
+		t.Fatalf("TenantQuota(team-a) = %d, want 0 (negative clamped to the minimum)", max)
+	}
+}

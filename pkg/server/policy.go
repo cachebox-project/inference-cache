@@ -129,6 +129,16 @@ func (s *PolicyStore) ReplaceSnapshot(policies []ResolvedPolicy, tenants []Resol
 			// tenant. Drop it rather than poison the table.
 			continue
 		}
+		// Sanitize the wire input at the trust boundary: the CRD enforces
+		// maxIndexEntries >= 0, but a hand-crafted /policy POST could carry a
+		// negative budget, which the index reads as "no enforcement" (eviction is
+		// skipped for maxPrefixes < 0). That would silently turn an attempted cap
+		// into unbounded — the opposite of intent. Clamp to the design minimum of
+		// 0 (the strictest valid cap, "admit nothing") so a malformed budget can
+		// never disable enforcement.
+		if t.MaxIndexEntries < 0 {
+			t.MaxIndexEntries = 0
+		}
 		nextTenants[t.TenantID] = t
 	}
 	s.mu.Lock()

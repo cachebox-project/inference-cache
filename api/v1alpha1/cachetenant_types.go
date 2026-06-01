@@ -45,7 +45,11 @@ type CacheTenantSpec struct {
 // bytes per tenant on a shared engine. Per-tenant byte isolation is an
 // engine/runtime concern (separate engine Deployments + pod memory limits).
 type CacheTenantQuotaSpec struct {
-	// MaxIndexEntries is the maximum number of index entries attributed to the tenant.
+	// MaxIndexEntries is the maximum number of distinct prefixes the tenant may
+	// hold in the index. The unit is the distinct prefix key
+	// (tenant, model, hash_scheme, prefix_hash): a prefix held by several replicas
+	// counts once, not once per replica. Over budget, the tenant's oldest prefixes
+	// are evicted (Fairness). 0 is a valid cap (admit nothing).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxIndexEntries *int64 `json:"maxIndexEntries,omitempty"`
@@ -67,8 +71,10 @@ type CacheTenantStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// IndexEntries is the observed tenant index entry count. A nil pointer means
-	// "not yet computed" (no snapshot observed), distinct from an observed 0.
+	// IndexEntries is the observed number of distinct prefixes the tenant holds in
+	// the index (same unit as spec.quota.maxIndexEntries — a multi-replica prefix
+	// counts once). A nil pointer means "not yet computed" (no snapshot observed),
+	// distinct from an observed 0.
 	// +optional
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
