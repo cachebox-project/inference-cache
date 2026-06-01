@@ -12,7 +12,10 @@ metadata:
   name: cachebackend-sample
 spec:
   type: LMCache
-  deploymentKind: StatefulSet
+  # Phase-1 controller manages a Deployment only; StatefulSet is enum-valid
+  # but treated as unmanaged today, so an operator applying a StatefulSet
+  # sample sees no Deployment/Service/status.endpoint materialise.
+  deploymentKind: Deployment
   replicas: 1
   integration:
     # Runtime ID (not adapter package name). Recognised values: "vllm"
