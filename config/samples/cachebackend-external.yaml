@@ -1,0 +1,58 @@
+# An External CacheBackend points the controller at a pre-existing remote
+# cache the operator manages themselves. The controller does NOT provision
+# pods for this backend (no Deployment, no Service, no HPA); it only mirrors
+# spec.endpoint into status.endpoint and marks the CR Ready as soon as
+# admission accepts the spec. The pod-mutating Pod admission webhook then
+# wires engine pods matching spec.engineSelector to that endpoint with the
+# same LMCache engine wire format the managed-LMCache adapter uses (env vars
+# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
+# VLLM_USE_V1 + the LMCache `--kv-transfer-config` arg), so the engine cannot
+# tell whether the cache it talks to was provisioned by the controller or by
+# the operator out-of-band.
+#
+# Use cases:
+#   * customers with a pre-existing LMCache deployment they don't want
+#     re-provisioned;
+#   * multi-cluster / cross-cluster cache sharing;
+#   * testing engine-side wiring against a fixture without spinning up a
+#     backend.
+#
+# Admission rules to be aware of:
+#   * spec.endpoint is REQUIRED when spec.type=External and rejected on any
+#     other type (managed backends learn their endpoint from the controller-
+#     rendered Service);
+#   * a spec.endpoint that resolves into an in-cluster Service in a
+#     different namespace than this CacheBackend requires the explicit
+#     opt-in spec.allowCrossNamespace=true (the rule does NOT fire for
+#     external hostnames / IPs);
+#   * the controller does not probe the endpoint for reachability — it
+#     trusts the operator. The CR goes Ready as soon as admission accepts
+#     spec.endpoint.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-external
+spec:
+  type: External
+  # Address of the pre-existing cache server. Two accepted shapes:
+  #   - bare `host:port` (canonical; the LMCache adapter adds the
+  #     `lm://` scheme on engine injection)
+  #   - `lm://host:port` (operators who prefer to be explicit)
+  # Whichever shape the operator writes, the reconciler mirrors the
+  # trimmed value into status.endpoint — so status carries the same
+  # form the operator typed (bare or lm://-prefixed), distinct from
+  # managed backends where status.endpoint is always engine-agnostic
+  # bare host:port from the rendered Service. The injection helper is
+  # lenient about an already-prefixed `lm://` value (the prefix is
+  # preserved rather than doubled). Admission requires a non-empty
+  # host AND port; IPv6 must be bracketed (`[::1]:8200`).
+  endpoint: my-cache.example.com:8200
+  integration:
+    # Case-insensitive; the engine wire today is LMCache-shaped.
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm

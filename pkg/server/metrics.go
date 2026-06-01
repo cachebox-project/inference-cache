@@ -6,6 +6,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/cachebox-project/inference-cache/pkg/server/auth"
 )
 
 // metricNamespace is the prefix for this project's own metrics (tech spec
@@ -31,6 +33,7 @@ type serverMetrics struct {
 	indexEntries  *prometheus.GaugeVec
 	lookupCalls   *prometheus.CounterVec
 	lookupLatency *prometheus.HistogramVec
+	snapshotAuth  *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -56,6 +59,11 @@ func newServerMetrics() *serverMetrics {
 		// Cache-path lookups target sub-millisecond; bucket from 100µs up.
 		Buckets: []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
 	}, []string{"model"})
+	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "snapshot_auth_total",
+		Help:      "Authentication outcomes for the internal /snapshot endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
@@ -63,6 +71,7 @@ func newServerMetrics() *serverMetrics {
 		indexEntries,
 		lookupCalls,
 		lookupLatency,
+		snapshotAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -73,7 +82,14 @@ func newServerMetrics() *serverMetrics {
 		indexEntries:  indexEntries,
 		lookupCalls:   lookupCalls,
 		lookupLatency: lookupLatency,
+		snapshotAuth:  snapshotAuth,
 	}
+}
+
+// RecordAuthResult is invoked once per /snapshot request by the auth
+// middleware. Satisfies auth.ResultRecorder.
+func (m *serverMetrics) RecordAuthResult(result auth.Result) {
+	m.snapshotAuth.WithLabelValues(string(result)).Inc()
 }
 
 // SetIndexEntries reports the live prefix-entry count for a model. It satisfies

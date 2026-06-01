@@ -525,8 +525,65 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		if cb.Status.Endpoint != "external.example.svc:8080" {
 			t.Fatalf("status.endpoint = %q, want mirrored external endpoint", cb.Status.Endpoint)
 		}
-		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond != nil {
-			t.Fatalf("Ready condition = %+v, want removed for external", cond)
+		// After the switch to External the controller publishes
+		// Ready=True with reason ExternalEndpointAccepted — admission
+		// acceptance of spec.endpoint is the only readiness signal we
+		// have without provisioning a Service to probe.
+		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
+		if ready == nil {
+			t.Fatalf("Ready condition missing after switch to External; conditions = %v", cb.Status.Conditions)
+		}
+		if ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
+			t.Fatalf("Ready condition = %+v, want Status=True Reason=ExternalEndpointAccepted", ready)
+		}
+		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
+			t.Fatalf("status.health = %q, want Ready", cb.Status.Health)
+		}
+	})
+
+	t.Run("ExternalCreateProducesNoWorkloadAndReady", func(t *testing.T) {
+		// A CacheBackend{type: External} reconciled against a real
+		// apiserver must (a) leave the CR's namespace free of any
+		// controller-rendered Deployment or Service, (b) mirror
+		// spec.endpoint into status.endpoint verbatim, and (c) publish
+		// Ready=True with reason ExternalEndpointAccepted so downstream
+		// consumers (the future readiness gate, the indexParticipation
+		// poller) treat the CR as usable.
+		ns := freshNS(t, k8s)
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-fresh", Namespace: ns},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:     cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint: "lm://my-cache.example:8200",
+			},
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "ext-fresh", ns)
+
+		var deps appsv1.DeploymentList
+		if err := k8s.List(ctx, &deps, client.InNamespace(ns)); err != nil {
+			t.Fatalf("list deployments: %v", err)
+		}
+		if len(deps.Items) != 0 {
+			t.Fatalf("deployments = %d, want 0 for External backend", len(deps.Items))
+		}
+		var svcs corev1.ServiceList
+		if err := k8s.List(ctx, &svcs, client.InNamespace(ns)); err != nil {
+			t.Fatalf("list services: %v", err)
+		}
+		if len(svcs.Items) != 0 {
+			t.Fatalf("services = %d, want 0 for External backend", len(svcs.Items))
+		}
+
+		got := getBackend(t, r, "ext-fresh", ns)
+		if got.Status.Endpoint != "lm://my-cache.example:8200" {
+			t.Fatalf("status.endpoint = %q, want lm://my-cache.example:8200", got.Status.Endpoint)
+		}
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
+			t.Fatalf("Ready condition = %+v, want Status=True Reason=ExternalEndpointAccepted", ready)
 		}
 	})
 
@@ -648,6 +705,323 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		ns := freshNS(t, k8s)
 		reconcile(t, r, "does-not-exist", ns)
 	})
+}
+
+// TestIntegrationEnginePodEvents exercises the engine-pod-events controller
+// against a real apiserver. The controller's contract is "emit a Normal
+// InjectedByCacheBackend Event on every pod the mutating webhook stamped
+// with inferencecache.io/injected-by". The user-visible promise is that
+// `kubectl describe pod` surfaces the event, and describe filters events
+// by involvedObject.uid — so this test asserts the recorded events carry
+// the persisted Pod UID, not just the name.
+//
+// (This is the regression the webhook-recorded approach would have
+// broken: at admission time the apiserver hasn't assigned the UID yet,
+// so an event recorded from the webhook lands with involvedObject.uid=""
+// and is invisible under describe.)
+func TestIntegrationEnginePodEvents(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := (&EnginePodEventsReconciler{
+		Client: mgr.GetClient(),
+		Log:    logr.Discard(),
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	ns := freshNS(t, k8s)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+		},
+	}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+	// The apiserver assigns cb.UID on Create. The injected-by-uid
+	// annotation below pins that UID so the events controller's UID
+	// match passes — without it, the controller would skip emission
+	// per the failurePolicy=Ignore forgery guard.
+	if cb.UID == "" {
+		t.Fatalf("apiserver returned empty UID for persisted CacheBackend — envtest invariant broken")
+	}
+
+	// Create a pod with the injected-by annotations the webhook would
+	// have stamped. The webhook is NOT installed in this test — we are
+	// exercising the controller's behavior on a pod that LOOKS like one
+	// the webhook produced.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "engine-a",
+			Namespace: ns,
+			Annotations: map[string]string{
+				"inferencecache.io/injected-by":     ns + "/" + cb.Name,
+				"inferencecache.io/injected-by-uid": string(cb.UID),
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "engine",
+				Image: "registry.example.com/vllm:test",
+			}},
+		},
+	}
+	if err := k8s.Create(context.Background(), pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	if pod.UID == "" {
+		t.Fatalf("apiserver returned empty UID for persisted pod — envtest invariant broken")
+	}
+
+	// An unannotated pod that should NOT generate an event. Pins the
+	// predicate filtering.
+	unrelated := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: ns},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "x", Image: "x"}},
+		},
+	}
+	if err := k8s.Create(context.Background(), unrelated); err != nil {
+		t.Fatalf("create unrelated pod: %v", err)
+	}
+
+	// Poll for the InjectedByCacheBackend event on the persisted pod's
+	// UID. The events.EventRecorder broadcasts asynchronously, so the
+	// event lags pod creation by a few hundred ms.
+	deadline := time.Now().Add(20 * time.Second)
+	var sawInjected bool
+	var sawSpurious bool
+	for time.Now().Before(deadline) && !sawInjected {
+		var list eventsv1.EventList
+		if err := k8s.List(context.Background(), &list, client.InNamespace(ns)); err == nil {
+			for _, ev := range list.Items {
+				if ev.Regarding.Kind != "Pod" {
+					continue
+				}
+				if ev.Regarding.UID == pod.UID && ev.Reason == "InjectedByCacheBackend" {
+					sawInjected = true
+				}
+				if ev.Regarding.UID == unrelated.UID && ev.Reason == "InjectedByCacheBackend" {
+					sawSpurious = true
+				}
+			}
+		}
+		if sawInjected {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !sawInjected {
+		t.Errorf("did not observe InjectedByCacheBackend event with involvedObject.uid=%q within timeout", pod.UID)
+	}
+	if sawSpurious {
+		t.Errorf("controller emitted InjectedByCacheBackend on an unannotated pod (uid=%q) — predicate failed", unrelated.UID)
+	}
+}
+
+// TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence verifies the
+// new self-requeue cadence: a manager-driven reconciler (no Pod watch, no
+// explicit reconcile() calls) must still converge `status.matchedEnginePods`
+// after a pod CREATE because the previous reconcile scheduled a
+// RequeueAfter when the CR's EngineSelector was non-empty. Without that
+// requeue, pod birth/death would only refresh the count when an unrelated
+// CR/owned-workload event fired, leaving the operator-facing column
+// indefinitely stale.
+func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	// Inject a short cadence so the test doesn't bake the 30s production
+	// delay into per-test runtime. 250ms is shorter than the controller's
+	// natural reconcile latency on envtest but long enough that the
+	// manager isn't spinning on reconciles for the duration of the test.
+	const testRequeueInterval = 250 * time.Millisecond
+	if err := (&CacheBackendReconciler{
+		Client:                           mgr.GetClient(),
+		Scheme:                           mgr.GetScheme(),
+		Log:                              logr.Discard(),
+		MatchedEnginePodsRequeueInterval: testRequeueInterval,
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	ns := freshNS(t, k8s)
+	sel := map[string]string{"app": "test-engine"}
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: sel}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	// Helper to read the live count.
+	read := func() *int32 {
+		var live cachev1alpha1.CacheBackend
+		if err := k8s.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: ns}, &live); err != nil {
+			t.Fatalf("get CacheBackend: %v", err)
+		}
+		return live.Status.MatchedEnginePods
+	}
+	waitForCount := func(want int32, what string) {
+		t.Helper()
+		// With the injected fast cadence (250ms), the next requeue
+		// after a pod change lands well under a second. Add 5s of
+		// envtest-jitter slack on top.
+		deadline := time.Now().Add(testRequeueInterval + 5*time.Second)
+		for time.Now().Before(deadline) {
+			got := read()
+			if got != nil && *got == want {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		t.Fatalf("status.matchedEnginePods did not converge to %d (%s) within timeout; last value = %v", want, what, read())
+	}
+
+	// First reconcile (manager-driven; no explicit reconcile() call):
+	// no matching pods → expect 0.
+	waitForCount(0, "no matching pods")
+
+	// Create matching pods AFTER the initial reconcile and verify the
+	// count catches up WITHOUT us forcing a reconcile. The self-
+	// requeue cadence is what makes this work.
+	for i := 0; i < 2; i++ {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("engine-%d", i),
+				Namespace: ns,
+				Labels:    sel,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+			},
+		}
+		if err := k8s.Create(context.Background(), p); err != nil {
+			t.Fatalf("create pod %s: %v", p.Name, err)
+		}
+	}
+	waitForCount(2, "after creating 2 matching pods")
+}
+
+// TestIntegrationCacheBackendMatchedEnginePods exercises the
+// status.matchedEnginePods writer against a real apiserver: the count
+// reflects the live pod inventory in the CR's namespace, ignores pods in
+// other namespaces, and survives pod birth/death between reconciles.
+//
+// The writer counts at reconcile cadence (no Pod watch); the test therefore
+// drives reconcile() explicitly after each pod mutation.
+func TestIntegrationCacheBackendMatchedEnginePods(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, _ := startEnv(t)
+	r := &CacheBackendReconciler{Client: k8s, Scheme: scheme, Log: logr.Discard()}
+	ctx := context.Background()
+
+	createPod := func(t *testing.T, namespace, name string, podLabels map[string]string) {
+		t.Helper()
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: podLabels},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "engine",
+					Image: "registry.example.com/vllm:test",
+				}},
+			},
+		}
+		if err := k8s.Create(ctx, p); err != nil {
+			t.Fatalf("create pod %s/%s: %v", namespace, name, err)
+		}
+	}
+
+	ns := freshNS(t, k8s)
+	other := freshNS(t, k8s)
+	sel := map[string]string{"app": "test-engine"}
+
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: sel}
+	if err := k8s.Create(ctx, cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	// No matching pods yet → after first reconcile the field is an
+	// observed 0 (not nil, which would mean "not yet computed").
+	reconcile(t, r, "cache", ns)
+	if got := getBackend(t, r, "cache", ns).Status.MatchedEnginePods; got == nil || *got != 0 {
+		t.Fatalf("with zero matching pods: matchedEnginePods = %v, want 0", got)
+	}
+
+	// Three matching pods land. A pod with the same labels in a
+	// different namespace and a non-matching pod in this one must not
+	// inflate the count.
+	createPod(t, ns, "engine-1", sel)
+	createPod(t, ns, "engine-2", sel)
+	createPod(t, ns, "engine-3", sel)
+	createPod(t, ns, "router-1", map[string]string{"app": "router"})
+	createPod(t, other, "engine-foreign", sel)
+
+	reconcile(t, r, "cache", ns)
+	if got := getBackend(t, r, "cache", ns).Status.MatchedEnginePods; got == nil || *got != 3 {
+		t.Fatalf("after creating 3 matching pods: matchedEnginePods = %v, want 3", got)
+	}
+
+	// Delete one of the matching pods (force, since envtest has no
+	// kubelet and pods never go past Pending → no graceful delete).
+	zero := int64(0)
+	if err := k8s.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-1", Namespace: ns}},
+		&client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+	// Tight poll: envtest's delete is async; reconcile until the count
+	// catches up (or the deadline fires).
+	deadline := time.Now().Add(10 * time.Second)
+	var last *int32
+	for time.Now().Before(deadline) {
+		reconcile(t, r, "cache", ns)
+		last = getBackend(t, r, "cache", ns).Status.MatchedEnginePods
+		if last != nil && *last == 2 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("after deleting 1 of 3 matching pods: matchedEnginePods = %v, want 2", last)
 }
 
 // TestIntegrationCacheBackendWatch runs a real manager so the Owns(...) watches

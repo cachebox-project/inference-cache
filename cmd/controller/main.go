@@ -22,6 +22,7 @@ import (
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -58,7 +59,7 @@ func defaultOptions() options {
 		probeAddr:               ":8081",
 		secureMetrics:           false,
 		enableHTTP2:             false,
-		serverSnapshotURL:       "http://inference-cache-server:8080/snapshot",
+		serverSnapshotURL:       "http://inference-cache-server:8081/snapshot",
 		serverPolicyURL:         "http://inference-cache-server:8080/policy",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
@@ -132,13 +133,21 @@ func main() {
 		adapterruntime.WithSubscriberImage(opts.subscriberImage),
 		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
 	)
+	// External backends point at a pre-existing remote cache the operator
+	// manages themselves; the adapter wires engine pods to spec.endpoint
+	// via the LMCache wire format without provisioning a cache server.
+	// Registered here (not inside DefaultRegistry) because the package
+	// lives under pkg/adapters/runtime/external — runtime importing it
+	// would cycle. See pkg/adapters/runtime/external/doc.go.
+	adapterRegistry.Register(externaladapter.NewAdapter())
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Log:      ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder: mgr.GetEventRecorder("cachebackend-controller"),
-		Registry: adapterRegistry,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:  mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader: mgr.GetAPIReader(),
+		Registry:  adapterRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -161,6 +170,20 @@ func main() {
 		PushInterval:    opts.policyPushEvery,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CachePolicy")
+		os.Exit(1)
+	}
+
+	// EnginePodEventsReconciler emits the InjectedByCacheBackend Event on
+	// each engine pod after the mutating webhook stamps it. The webhook
+	// itself can't emit: at admission time the apiserver hasn't assigned
+	// pod.metadata.uid, so a webhook-recorded event would land with
+	// involvedObject.uid="" and be invisible to `kubectl describe pod`.
+	if err := (&controller.EnginePodEventsReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EnginePodEvents")
 		os.Exit(1)
 	}
 
