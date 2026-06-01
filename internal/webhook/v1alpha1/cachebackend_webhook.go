@@ -7,9 +7,11 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -33,6 +35,13 @@ const (
 	defaultLookupTimeoutMs     = int32(50)
 	defaultMinimumPrefixTokens = int32(256)
 	defaultReplicas            = int32(1)
+	// defaultFirstEventTimeout mirrors the +kubebuilder:default on
+	// spec.integration.firstEventTimeout. The CRD-schema default only applies
+	// when spec.integration is present in the submitted object; when the
+	// operator omits integration entirely the webhook materialises it here, so
+	// stamping the timeout too keeps the persisted CR consistent (rather than
+	// relying on the controller's runtime fallback).
+	defaultFirstEventTimeout = 5 * time.Minute
 )
 
 // memoryOnlyBackends classifies the CacheBackendType values that are
@@ -156,6 +165,9 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	if cb.Spec.Integration.MinimumPrefixTokens == nil {
 		v := defaultMinimumPrefixTokens
 		cb.Spec.Integration.MinimumPrefixTokens = &v
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil {
+		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
 	}
 
 	return nil

@@ -103,6 +103,11 @@ SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
 # engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
 # terminate round-trip.
 SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
+# KV-event gate: time budget for the managed cache-server Deployment to pull
+# its image and reach Available, then for the gate to publish
+# AwaitingFirstKVEvent. The image pull dominates on a cold node, hence the
+# larger default than the other sample waits.
+SAMPLE_GATE_TIMEOUT="${SAMPLE_GATE_TIMEOUT:-240}"
 # Tiny stand-in for the vLLM image. The webhook injects on pod CREATE; the
 # engine doesn't need to run for the operator-facing signals (Matched,
 # annotation, Event) to materialize. Avoids a multi-GB pull in CI.
@@ -477,6 +482,66 @@ if [ "$matched" != "1" ]; then
   fail "status.matchedEnginePods=$matched, want 1 after ${SAMPLE_MATCH_TIMEOUT}s"
 fi
 log "status.matchedEnginePods=1"
+
+# --- KV-event readiness gate assertion (operator-facing) --------------------
+# The managed backend has an engine pod attached (matchedEnginePods=1), but the
+# smoke's stub engine (busybox) emits no KV events and the controller runs with
+# no kvevent-subscriber sidecar, so NO KV event will ever be observed — the
+# exact demo-day failure mode the gate exists to surface (engine present,
+# KV-event stream silent). We assert the gate's operator-visible surfaces end to
+# end on the real install:
+#   - spec.integration.firstEventTimeout defaulted to 5m (new CRD field +
+#     admission defaulting);
+#   - once the managed cache-server reaches Available, the gate holds the
+#     backend at Ready=False / reason AwaitingFirstKVEvent — the deterministic
+#     condition surface (Ready can never become True here, so without the gate
+#     the backend would have been reported Ready on rollout);
+#   - status.firstKVEventObservedAt stays UNSET — the durable latch is written
+#     the instant a KV event is observed, so its absence is the gate-specific
+#     "nothing observed" signal.
+fet="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.integration.firstEventTimeout}' 2>/dev/null || true)"
+# Accept both "5m" (CRD-schema default, applied when the integration block is
+# present) and "5m0s" (Go Duration.String(), the webhook-materialized form) —
+# both decode to the same 5m duration.
+if [ "$fet" != "5m" ] && [ "$fet" != "5m0s" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "spec.integration.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
+fi
+
+# The gate only evaluates once the managed cache-server Deployment is Available,
+# so wait for that first; then the awaited state is deterministic (no events).
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the managed cache-server Deployment to reach Available"
+if ! kubectl -n "$SAMPLE_NS" wait --for=condition=Available --timeout="${SAMPLE_GATE_TIMEOUT}s" \
+     deployment/qwen-demo-cache >/dev/null 2>&1; then
+  kubectl -n "$SAMPLE_NS" get deployment/qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "managed cache-server Deployment did not reach Available within ${SAMPLE_GATE_TIMEOUT}s; cannot exercise the KV-event gate"
+fi
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the gate to publish Ready=False / AwaitingFirstKVEvent"
+deadline=$(($(date +%s) + SAMPLE_GATE_TIMEOUT))
+gate_status=""
+gate_reason=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  gate_status="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  gate_reason="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  if [ "$gate_status" = "False" ] && [ "$gate_reason" = "AwaitingFirstKVEvent" ]; then break; fi
+  sleep 2
+done
+if [ "$gate_status" != "False" ] || [ "$gate_reason" != "AwaitingFirstKVEvent" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "KV-event gate not engaged: Ready=$gate_status/$gate_reason, want False/AwaitingFirstKVEvent (engine attached, no KV events)"
+fi
+
+gate_latch="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.firstKVEventObservedAt}' 2>/dev/null || true)"
+if [ -n "$gate_latch" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "status.firstKVEventObservedAt=$gate_latch, want unset (no KV event source exists, so the gate latch must never be written)"
+fi
+log "KV-event gate engaged: firstEventTimeout=$fet, Ready=False/AwaitingFirstKVEvent, firstKVEventObservedAt unset"
 
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the

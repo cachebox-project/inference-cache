@@ -21,8 +21,8 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -137,6 +137,11 @@ func (in *CacheBackendIntegrationSpec) DeepCopyInto(out *CacheBackendIntegration
 		*out = new(int32)
 		**out = **in
 	}
+	if in.FirstEventTimeout != nil {
+		in, out := &in.FirstEventTimeout, &out.FirstEventTimeout
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.FailOpen != nil {
 		in, out := &in.FailOpen, &out.FailOpen
 		*out = new(bool)
@@ -224,31 +229,31 @@ func (in *CacheBackendPodSpecOverride) DeepCopyInto(out *CacheBackendPodSpecOver
 	}
 	if in.Affinity != nil {
 		in, out := &in.Affinity, &out.Affinity
-		*out = new(v1.Affinity)
+		*out = new(corev1.Affinity)
 		(*in).DeepCopyInto(*out)
 	}
 	if in.Tolerations != nil {
 		in, out := &in.Tolerations, &out.Tolerations
-		*out = make([]v1.Toleration, len(*in))
+		*out = make([]corev1.Toleration, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
 	if in.TopologySpreadConstraints != nil {
 		in, out := &in.TopologySpreadConstraints, &out.TopologySpreadConstraints
-		*out = make([]v1.TopologySpreadConstraint, len(*in))
+		*out = make([]corev1.TopologySpreadConstraint, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
 	if in.ImagePullSecrets != nil {
 		in, out := &in.ImagePullSecrets, &out.ImagePullSecrets
-		*out = make([]v1.LocalObjectReference, len(*in))
+		*out = make([]corev1.LocalObjectReference, len(*in))
 		copy(*out, *in)
 	}
 	if in.SecurityContext != nil {
 		in, out := &in.SecurityContext, &out.SecurityContext
-		*out = new(v1.PodSecurityContext)
+		*out = new(corev1.PodSecurityContext)
 		(*in).DeepCopyInto(*out)
 	}
 	if in.RuntimeClassName != nil {
@@ -343,6 +348,14 @@ func (in *CacheBackendStatus) DeepCopyInto(out *CacheBackendStatus) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.FirstKVEventObservedAt != nil {
+		in, out := &in.FirstKVEventObservedAt, &out.FirstKVEventObservedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.FirstAvailableAt != nil {
+		in, out := &in.FirstAvailableAt, &out.FirstAvailableAt
+		*out = (*in).DeepCopy()
+	}
 	if in.IndexParticipation != nil {
 		in, out := &in.IndexParticipation, &out.IndexParticipation
 		*out = new(CacheBackendIndexParticipation)
@@ -350,7 +363,7 @@ func (in *CacheBackendStatus) DeepCopyInto(out *CacheBackendStatus) {
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
+		*out = make([]v1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -554,7 +567,7 @@ func (in *CachePolicySpec) DeepCopyInto(out *CachePolicySpec) {
 	*out = *in
 	if in.EvictionTTL != nil {
 		in, out := &in.EvictionTTL, &out.EvictionTTL
-		*out = new(metav1.Duration)
+		*out = new(v1.Duration)
 		**out = **in
 	}
 	if in.MinimumPrefixTokens != nil {
@@ -594,7 +607,7 @@ func (in *CachePolicyStatus) DeepCopyInto(out *CachePolicyStatus) {
 	*out = *in
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
+		*out = make([]v1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -740,7 +753,7 @@ func (in *CacheTenantStatus) DeepCopyInto(out *CacheTenantStatus) {
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
+		*out = make([]v1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -772,7 +785,7 @@ func (in *EngineInjectionOverrides) DeepCopyInto(out *EngineInjectionOverrides) 
 	}
 	if in.Env != nil {
 		in, out := &in.Env, &out.Env
-		*out = make([]v1.EnvVar, len(*in))
+		*out = make([]corev1.EnvVar, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -943,7 +956,7 @@ func (in *PDTopologyStatus) DeepCopyInto(out *PDTopologyStatus) {
 	*out = *in
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
+		*out = make([]v1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -1097,7 +1110,7 @@ func (in *PromptTemplateStatus) DeepCopyInto(out *PromptTemplateStatus) {
 	*out = *in
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
+		*out = make([]v1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
