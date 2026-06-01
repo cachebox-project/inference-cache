@@ -167,7 +167,7 @@ The controller serves two webhooks for CacheBackend, both registered as `failure
 
 ### Defaulting (mutating)
 
-Stamps Phase-1 defaults onto every admitted CacheBackend, only where the operator has not specified a value. Operator-set values are never clobbered.
+Stamps `spec.replicas` (the only Phase-1 default this webhook applies) when the operator has not specified it. Operator-set values are never clobbered.
 
 | Field | Default |
 |---|---|
