@@ -354,7 +354,8 @@ log "cacheindex/cluster-default.status.observedServer=$observed"
 # by the server; keeping the apply here gives the watch-triggered reconcile
 # time to run before the port-forward opens.
 log "resetting CachePolicy smoke namespace $POLICY_SMOKE_NS"
-kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=true >/dev/null
+kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=true --timeout=60s >/dev/null \
+  || fail "timed out waiting for prior CachePolicy smoke namespace $POLICY_SMOKE_NS to delete"
 log "applying CachePolicy sample in namespace $POLICY_SMOKE_NS"
 kubectl create namespace "$POLICY_SMOKE_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
