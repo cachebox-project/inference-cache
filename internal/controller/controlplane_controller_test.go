@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -323,6 +324,41 @@ func TestPushSnapshotSendsBearerToken(t *testing.T) {
 	}
 	if got := rec.lastAuthz(); got != "Bearer test-sa-bearer" {
 		t.Fatalf("Authorization = %q, want %q", got, "Bearer test-sa-bearer")
+	}
+}
+
+// TestPushSnapshotBearerTokenUnreadableFile pins the third bearerToken
+// branch the CacheIndexPoller's symmetric test covers: a token file that
+// EXISTS but cannot be read (permissions / IO error). The reconciler's
+// bearerToken() must surface the underlying error so the operator's log
+// shows the path + cause, instead of silently degrading to an unauth push
+// the server rejects as a generic 401. Mirror of
+// TestBearerToken_UnreadableFileReturnsError on the poller side.
+func TestPushSnapshotBearerTokenUnreadableFile(t *testing.T) {
+	// chmod-0 is a portable way to make a present file unreadable for the
+	// running user (unless we're root — skip then).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; chmod 0 does not deny read")
+	}
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("ignored"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod token: %v", err)
+	}
+
+	r := &CachePolicyReconciler{BearerTokenPath: path}
+	got, err := r.bearerToken()
+	if err == nil {
+		t.Fatalf("bearerToken() on unreadable file: got %q + nil, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("bearerToken() on unreadable file = %q, want \"\"", got)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("bearerToken() error %q does not mention path %q", err, path)
 	}
 }
 

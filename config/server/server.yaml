@@ -7,15 +7,17 @@ metadata:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: server
 # The server calls the apiserver's TokenReview API to authenticate the
-# controller's /snapshot scrapes, so it needs a projected SA token.
+# controller's /snapshot scrapes and /policy pushes, so it needs a
+# projected SA token.
 automountServiceAccountToken: true
 ---
 # Narrow ClusterRole + binding granting ONLY the permission the server
-# actually exercises: creating TokenReview objects to validate /snapshot
-# bearer tokens. The canonical alternative, system:auth-delegator, also
-# grants SubjectAccessReview (for authz delegation), which the server
-# does not call — least-privilege beats convenience here, especially for
-# a security-hardening change.
+# actually exercises: creating TokenReview objects to validate the
+# controller's bearer tokens on /snapshot and /policy. The canonical
+# alternative, system:auth-delegator, also grants SubjectAccessReview
+# (for authz delegation), which the server does not call —
+# least-privilege beats convenience here, especially for a
+# security-hardening change.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -66,9 +68,10 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
-    # Internal snapshot listener. Restricted by NetworkPolicy to the
-    # controller's pod selector; authentication on the L7 endpoint is
-    # enforced by the server's TokenReview middleware.
+    # Internal controller-facing listener (serves /snapshot AND /policy).
+    # Restricted by NetworkPolicy to the controller's pod selector;
+    # authentication on both L7 endpoints is enforced by the server's
+    # TokenReview middleware.
     - name: snapshot
       port: 8081
       targetPort: snapshot
@@ -103,7 +106,7 @@ spec:
     spec:
       serviceAccountName: inference-cache-server
       # Mount the projected SA token so the server can call TokenReview to
-      # authenticate the controller's /snapshot scrape.
+      # authenticate the controller's /snapshot scrape and /policy push.
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 10
       securityContext:

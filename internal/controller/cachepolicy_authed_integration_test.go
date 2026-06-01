@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
 )
 
@@ -68,10 +69,14 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	expectedSA := "system:serviceaccount:" + ns + ":" + controllerSA
 
 	// Wire the authenticator the same shape cmd/server's controller-facing
-	// listener does. The /policy handler we mount behind it is the EXACT same
-	// HTTP handler the production server uses (via NewPolicyHTTPHandler),
-	// guarding against the auth wrap accidentally allowing a different decode
-	// shape than the production path.
+	// listener does, and mount the EXACT same /policy HTTP handler the
+	// production server uses (via NewPolicyHTTPHandler). Stacking both layers
+	// here guards against the auth wrap accidentally allowing a different
+	// decode shape than the production path: the snapshot the reconciler
+	// marshals must round-trip through the real DisallowUnknownFields decoder
+	// and land in a real PolicyStore. A counter wraps the policy handler so
+	// the test can still assert the handler was invoked (or short-circuited)
+	// on each call.
 	authn, err := auth.NewAuthenticator(auth.Options{
 		Reviewer:               auth.FromClientset(clientset),
 		ExpectedServiceAccount: expectedSA,
@@ -79,12 +84,15 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewAuthenticator: %v", err)
 	}
+	store := cacheserver.NewPolicyStore()
+	policyHandler := cacheserver.NewPolicyHTTPHandler(store)
 	calls := 0
-	mux := http.NewServeMux()
-	mux.Handle("/policy", authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	countingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		w.WriteHeader(http.StatusNoContent)
-	})))
+		policyHandler.ServeHTTP(w, r)
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/policy", authn.Middleware(countingHandler))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
