@@ -149,12 +149,13 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 	$(GOVULNCHECK) ./...
 
 # Coverage gate. We measure the hand-written logic packages only: generated
-# code (proto stubs, deepcopy), entrypoints (cmd/), and test helpers are
-# excluded because their (un)covered statements would swamp the real signal.
+# code (proto stubs, deepcopy), entrypoints (cmd/), tooling under hack/, and
+# test helpers are excluded because their (un)covered statements would swamp
+# the real signal.
 COVER_MIN ?= 85
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|pkg/testing/
+COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages).

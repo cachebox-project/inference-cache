@@ -24,7 +24,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -32,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -246,22 +246,23 @@ func hasSkipMarker(data []byte) bool {
 	return false
 }
 
-// waitForWebhookReady polls the manager's serving port over TLS until the
-// listener accepts a TCP connection. envtest installs the webhook
-// configuration before the manager binds the port, so a sample apply that
-// races the binding would otherwise see a transient connection-refused.
+// waitForWebhookReady polls the manager's serving port with a plain TCP
+// dial until the listener accepts a connection. envtest installs the
+// webhook configuration before the manager binds the port, so a sample
+// apply that races the binding would otherwise see a transient
+// connection-refused.
+//
+// A plain TCP dial is intentional: we only need to know the OS has
+// finished bind+listen on the port. The full TLS handshake is exercised
+// by the apiserver when it routes the subsequent CREATE through the
+// webhook — that's where a misconfigured cert would surface, with a
+// proper error attributable to a specific sample.
 func waitForWebhookReady(host string, port int, deadline time.Duration) error {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	end := time.Now().Add(deadline)
+	dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
 	for time.Now().Before(end) {
-		conn, err := tls.DialWithDialer(
-			&net.Dialer{Timeout: 500 * time.Millisecond},
-			"tcp", addr,
-			// Local envtest serving cert, no user data — InsecureSkipVerify
-			// is the right choice here (matches the existing envtest
-			// webhook integration test).
-			&tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		)
+		conn, err := dialer.Dial("tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			return nil
