@@ -131,9 +131,8 @@ cd "$REPO_ROOT"
 # diagnostics helper can reference them even if the smoke aborts before
 # the External section creates the objects.
 EXT_SMOKE_NS="${EXT_SMOKE_NS:-ic-smoke-external}"
-EXT_SMOKE_CB_NAME="${EXT_SMOKE_CB_NAME:-cachebackend-external}"
+EXT_SMOKE_CB_NAME="cachebackend-external"
 EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
-EXT_SMOKE_LABEL="${EXT_SMOKE_LABEL:-app.kubernetes.io/name=vllm}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
@@ -648,9 +647,16 @@ minimum_prefix_tokens="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" 
   -o jsonpath='{.spec.integration.minimumPrefixTokens}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
+external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+  -o go-template='{{range $k, $v := .spec.engineSelector.matchLabels}}{{printf "    %s: %s\n" $k $v}}{{end}}' \
+  2>/dev/null || true)"
 if [ -z "$external_spec_endpoint" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
   fail "External sample did not create spec.endpoint on $EXT_SMOKE_CB_NAME"
+fi
+if [ -z "$external_pod_labels" ]; then
+  kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
+  fail "External sample did not create spec.engineSelector.matchLabels on $EXT_SMOKE_CB_NAME"
 fi
 if [ "$lookup_timeout" != "50" ] || [ "$minimum_prefix_tokens" != "256" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
@@ -735,7 +741,7 @@ metadata:
   name: $EXT_SMOKE_POD_NAME
   namespace: $EXT_SMOKE_NS
   labels:
-    ${EXT_SMOKE_LABEL%%=*}: ${EXT_SMOKE_LABEL##*=}
+$external_pod_labels
 spec:
   containers:
   - name: vllm
