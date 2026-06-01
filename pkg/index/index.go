@@ -46,12 +46,32 @@ const (
 	DefaultTenantHotMaxAge = 5 * time.Minute
 )
 
-// Metrics is the optional sink the index reports live entry counts to. It is
-// satisfied by the server's Prometheus wiring; kept as a tiny interface so the
-// index has no dependency on the metrics/registry implementation.
+// Metrics is the optional sink the index reports to. It is satisfied by the
+// server's Prometheus wiring; kept as a tiny interface so the index has no
+// dependency on the metrics/registry implementation.
 type Metrics interface {
 	SetIndexEntries(model string, entries int)
+	// AddTenantEvictions records n quota-driven entry evictions for a tenant.
+	// reason is the budget that was exceeded (currently only "over_entries").
+	AddTenantEvictions(tenantID, reason string, n int)
 }
+
+// TenantQuotaResolver returns the per-tenant index-entry budget the index
+// enforces at ingest time. ok=false (a nil resolver, or no matching CacheTenant)
+// means "no quota" — the tenant is unbounded (fail open / soft state), matching
+// today's behavior before any CacheTenant exists. A configured budget of 0 is a
+// valid enforceable cap (admit nothing), distinct from "no quota". The index
+// does not import any CRD/policy types; the resolver is satisfied by the
+// server's policy store. Mirrors TTLResolver.
+type TenantQuotaResolver interface {
+	TenantQuota(tenant string) (maxEntries int64, ok bool)
+}
+
+// tenantEvictionReasonOverEntries is the only quota dimension enforced today:
+// the index entry table is the one cache resource the server authoritatively
+// owns. (Per-tenant memory is not enforceable on a shared, tenant-unaware
+// engine — see the CacheTenant CRD docs.)
+const tenantEvictionReasonOverEntries = "over_entries"
 
 // TTLResolver returns the per-tenant eviction TTL applied by the index. A
 // return of <=0 (or a nil resolver) means "use the global default TTL". The
@@ -267,6 +287,7 @@ type Index struct {
 	metrics       Metrics
 	ranker        RankerConfig
 	ttlResolver   TTLResolver
+	quotaResolver TenantQuotaResolver
 
 	ready atomic.Bool
 
@@ -274,6 +295,16 @@ type Index struct {
 	prefixes     map[prefixKey]map[string]replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
+
+	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
+	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
+	// hold it), so the per-tenant quota check at ingest is O(1) instead of
+	// scanning i.prefixes. Maintained by upsert/removeReplicaLocked: bumped when a
+	// key is first created for the tenant, dropped when the key's last replica
+	// leaves. This is the unit maxIndexEntries bounds and the unit reported as
+	// tenants[].indexEntries — equal, per tenant, to that tenant's slice of
+	// prefixes.summary.total.
+	prefixesByTenant map[string]int
 
 	// servingByScope counts, for each (tenant, model, hash_scheme), how many
 	// distinct prefix entries each replica currently holds. It exists purely
@@ -323,22 +354,32 @@ func WithRanker(cfg RankerConfig) Option { return func(i *Index) { i.ranker = cf
 // resolver implementation owns its own concurrency.
 func WithTTLResolver(r TTLResolver) Option { return func(i *Index) { i.ttlResolver = r } }
 
+// WithTenantQuotaResolver wires a per-tenant index-entry quota resolver. A nil
+// resolver, or one that reports no quota for a tenant, disables enforcement for
+// that tenant (unbounded — identical to today's behavior). The index reads it
+// once per Ingest, before taking the write lock; the resolver implementation
+// owns its own concurrency.
+func WithTenantQuotaResolver(r TenantQuotaResolver) Option {
+	return func(i *Index) { i.quotaResolver = r }
+}
+
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
 
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
 	i := &Index{
-		ttl:             DefaultTTL,
-		sweepInterval:   DefaultSweepInterval,
-		maxEntries:      DefaultMaxEntries,
-		now:             time.Now,
-		ranker:          DefaultRankerConfig(),
-		prefixes:        make(map[prefixKey]map[string]replicaEntry),
-		stats:           make(map[statsKey]statEntry),
-		servingByScope:  make(map[scopeKey]map[string]int),
-		replicasByModel: make(map[modelKey]map[string]struct{}),
-		reportedModels:  make(map[string]struct{}),
+		ttl:              DefaultTTL,
+		sweepInterval:    DefaultSweepInterval,
+		maxEntries:       DefaultMaxEntries,
+		now:              time.Now,
+		ranker:           DefaultRankerConfig(),
+		prefixes:         make(map[prefixKey]map[string]replicaEntry),
+		stats:            make(map[statsKey]statEntry),
+		prefixesByTenant: make(map[string]int),
+		servingByScope:   make(map[scopeKey]map[string]int),
+		replicasByModel:  make(map[modelKey]map[string]struct{}),
+		reportedModels:   make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -389,6 +430,11 @@ func (i *Index) Ingest(u Update) {
 	if ts.IsZero() {
 		ts = i.now()
 	}
+
+	// Resolve the tenant's entry budget before locking: the resolver owns its
+	// own lock, and calling it under i.mu would nest the index lock with the
+	// policy-store lock on the hot ingest path. ok=false → no quota → unbounded.
+	maxEntries, hasQuota := i.tenantQuotaFor(u.Tenant)
 
 	i.mu.Lock()
 	// prefix_hash is engine-opaque and only safe within a known hash_scheme; an
@@ -446,9 +492,21 @@ func (i *Index) Ingest(u Update) {
 		}
 		i.statsScopeAddLocked(modelKey{u.Tenant, u.Model}, u.ReplicaID)
 	}
+	// Enforce the tenant's maxIndexEntries budget on the freshly-ingested state.
+	// Fairness mode: evict only THIS tenant's own oldest distinct prefixes down to
+	// budget; other tenants are untouched. Memory budgets are not enforced here
+	// (the engine owns KV memory) — distinct-prefix count is the only dimension we
+	// control.
+	evictedPrefixes := 0
+	if hasQuota {
+		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
+	}
 	i.enforceCapLocked()
 	i.mu.Unlock()
 
+	if evictedPrefixes > 0 && i.metrics != nil {
+		i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evictedPrefixes)
+	}
 	i.reportEntries()
 }
 
@@ -914,8 +972,60 @@ func (i *Index) CacheState(tenant, model string) (replicas []ReplicaStats, total
 	return replicas, totalPrefixes
 }
 
+// DefaultTenantSentinel is the bucket distinct prefixes with no tenant ID are
+// attributed to in cluster-wide aggregates: the empty string itself. Untenanted
+// prefixes count toward the grand total, so they must also appear as a tenants[]
+// bucket or Σ tenants[].indexEntries would silently fall short of the total —
+// they're kept under "" rather than dropped. The empty string is deliberately
+// collision-free: a real CacheTenant.spec.tenantID is MinLength=1, so this bucket
+// can NEVER be claimed by a real tenant's per-CacheTenant status (which keys on
+// the tenant ID). That is why no reserved non-empty name is needed.
+const DefaultTenantSentinel = ""
+
+// Aggregate is the index's prefix-count aggregate: the per-tenant distinct-prefix
+// counts and the grand total, both produced by a SINGLE walk of the prefix map
+// so they cannot disagree. Total == Σ PerTenant by construction — this is the
+// hard invariant the CacheIndex/CacheTenant status surfaces rely on (a tenant's
+// reported indexEntries always sum to the cluster prefix total). The counted
+// unit is a distinct prefix key — (tenant, model, hash_scheme, prefix_hash),
+// regardless of how many replicas hold it — which is exactly the unit
+// prefixes.summary.total reports and the per-tenant maxIndexEntries quota bounds.
+// (Tenant is part of the key, so the per-tenant partition is exact.)
+type Aggregate struct {
+	PerTenant map[string]int64
+	Total     int64
+}
+
+// Aggregate returns the prefix-count aggregate under a single read-lock + single
+// walk. Exposed so callers/tests can assert the invariant directly.
+func (i *Index) Aggregate() Aggregate {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.aggregateLocked()
+}
+
+// aggregateLocked walks the prefix map exactly once, attributing every distinct
+// prefix key to its tenant bucket and the running total in the same step. Caller
+// holds at least the read lock. Because both numbers come from the one
+// iteration, Total == Σ PerTenant == len(i.prefixes) always holds — no second
+// pass, no separate counter that could drift.
+func (i *Index) aggregateLocked() Aggregate {
+	agg := Aggregate{PerTenant: make(map[string]int64)}
+	for key := range i.prefixes {
+		// Untenanted prefixes (key.tenant == "") bucket under "" — collision-free,
+		// since no real CacheTenant tenantID is empty.
+		agg.PerTenant[key.tenant]++
+		agg.Total++
+	}
+	return agg
+}
+
 // Snapshot is a point-in-time, cluster-wide view of the index for the
 // CacheIndex status surface (consumed by the controller). Metadata only.
+//
+// TotalPrefixes is the number of distinct prefix keys (a prefix held by
+// multiple replicas counts once), and it equals the sum of
+// tenants[].indexEntries — see Aggregate.
 type Snapshot struct {
 	Replicas      []ReplicaSnapshot `json:"replicas"`
 	Tenants       []TenantSnapshot  `json:"tenants"`
@@ -948,10 +1058,17 @@ type ReplicaSnapshot struct {
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
+//
+// MemoryUsed is the sum of the tenant's replicas' cache_memory_bytes — a
+// cluster-wide observability figure only (the engine owns this memory; it is
+// not a per-tenant budget). IndexEntries is the tenant's live distinct-prefix
+// count, the quantity CacheTenant.spec.quota.maxIndexEntries bounds; across all
+// tenants these sum to Snapshot.TotalPrefixes by construction (see Aggregate).
 type TenantSnapshot struct {
-	TenantID   string  `json:"tenantId"`
-	MemoryUsed int64   `json:"memoryUsed"`
-	HitRate    float32 `json:"hitRate"`
+	TenantID     string  `json:"tenantId"`
+	MemoryUsed   int64   `json:"memoryUsed"`
+	IndexEntries int64   `json:"indexEntries"`
+	HitRate      float32 `json:"hitRate"`
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest
@@ -1005,7 +1122,11 @@ func (i *Index) Snapshot() Snapshot {
 		}
 	}
 
-	snap := Snapshot{TotalPrefixes: len(i.prefixes)}
+	// Per-tenant distinct-prefix counts + the grand total come from ONE
+	// authoritative walk (aggregateLocked) so the reported numbers can't drift:
+	// TotalPrefixes == Σ tenants[].indexEntries by construction.
+	agg := i.aggregateLocked()
+	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 
 	// Union of (tenant, replicaID) seen in stats AND in prefixes — a replica
 	// may have reported prefixes via Ingest but had its stats entry evicted,
@@ -1040,21 +1161,52 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	byTenant := make(map[string]*tenantAgg)
 	for tr, s := range latestByTenantReplica {
-		a := byTenant[tr.tenant]
+		// Untenanted stats bucket under "" — the same key the entry walk uses, so a
+		// tenant's stats and its indexEntries land together.
+		bucket := tr.tenant
+		a := byTenant[bucket]
 		if a == nil {
 			a = &tenantAgg{}
-			byTenant[tr.tenant] = a
+			byTenant[bucket] = a
 		}
 		a.mem += s.stats.CacheMemoryBytes
 		a.sumHit += float64(s.stats.HitRate)
 		a.n++
 	}
-	for t, a := range byTenant {
-		var hit float32
-		if a.n > 0 {
-			hit = float32(a.sumHit / float64(a.n))
+	// Union the stats-bearing tenants with the entry-bearing tenants: a tenant
+	// can have index entries but no stats reported yet (prefixes reported without
+	// a stats payload), or stats but no live entries. A tenant in only one map
+	// gets zeroes for the other dimension. Emitting every entry-bearing tenant
+	// (agg.PerTenant) is what makes Σ tenants[].indexEntries == TotalPrefixes:
+	// no entry bucket is ever dropped from tenants[].
+	tenantSeen := make(map[string]struct{}, len(byTenant)+len(agg.PerTenant))
+	emit := func(t string) {
+		if _, ok := tenantSeen[t]; ok {
+			return
 		}
-		snap.Tenants = append(snap.Tenants, TenantSnapshot{TenantID: t, MemoryUsed: a.mem, HitRate: hit})
+		tenantSeen[t] = struct{}{}
+		var (
+			mem int64
+			hit float32
+		)
+		if a := byTenant[t]; a != nil {
+			mem = a.mem
+			if a.n > 0 {
+				hit = float32(a.sumHit / float64(a.n))
+			}
+		}
+		snap.Tenants = append(snap.Tenants, TenantSnapshot{
+			TenantID:     t,
+			MemoryUsed:   mem,
+			IndexEntries: agg.PerTenant[t],
+			HitRate:      hit,
+		})
+	}
+	for t := range byTenant {
+		emit(t)
+	}
+	for t := range agg.PerTenant {
+		emit(t)
 	}
 	i.mu.RUnlock()
 
@@ -1119,6 +1271,9 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 	if replicas == nil {
 		replicas = make(map[string]replicaEntry)
 		i.prefixes[key] = replicas
+		// First replica of a brand-new prefix key → one more distinct prefix
+		// for this tenant (the maxIndexEntries unit).
+		i.prefixesByTenant[key.tenant]++
 	}
 	if _, existed := replicas[replicaID]; !existed {
 		i.totalEntries++
@@ -1137,6 +1292,13 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEn
 	i.totalEntries--
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
+		// Last replica gone → the prefix key is removed → one fewer distinct
+		// prefix for this tenant.
+		if n := i.prefixesByTenant[key.tenant] - 1; n <= 0 {
+			delete(i.prefixesByTenant, key.tenant)
+		} else {
+			i.prefixesByTenant[key.tenant] = n
+		}
 	}
 	// Drop the replica from the (tenant, model, hash_scheme) serving count
 	// in lockstep with the prefix removal so TENANT_HOT's O(1) check stays
@@ -1268,6 +1430,78 @@ func (i *Index) enforceCapLocked() {
 		}
 		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
 	}
+}
+
+// tenantQuotaFor returns the tenant's index-entry budget and whether one is
+// configured. A nil resolver (or no matching CacheTenant) reports ok=false →
+// the index leaves the tenant unbounded (fail open), identical to the behavior
+// before any CacheTenant exists. Mirrors ttlFor.
+func (i *Index) tenantQuotaFor(tenant string) (maxEntries int64, ok bool) {
+	if i.quotaResolver == nil {
+		return 0, false
+	}
+	return i.quotaResolver.TenantQuota(tenant)
+}
+
+// evictOldestForTenantLocked evicts the tenant's oldest distinct prefixes until
+// its prefix count is within maxPrefixes, returning how many prefixes it
+// removed. Caller holds the write lock.
+//
+// This is the Fairness-mode primitive: it touches ONLY the named tenant's
+// prefixes, never another tenant's, so one tenant overrunning its budget can't
+// evict a well-behaved tenant's hints. A prefix's age is its freshest replica's
+// lastSeen (the most recent time any replica refreshed it); the oldest such
+// prefixes go first. Removing a prefix drops ALL its replicas — the quota unit
+// is the distinct prefix key, so a prefix counts once no matter how many
+// replicas hold it. Ties on age break by prefix hash for deterministic order.
+func (i *Index) evictOldestForTenantLocked(tenant string, maxPrefixes int64) int {
+	if maxPrefixes < 0 {
+		return 0
+	}
+	if int64(i.prefixesByTenant[tenant]) <= maxPrefixes {
+		return 0
+	}
+	type ref struct {
+		key prefixKey
+		age time.Time // freshest replica lastSeen across the prefix's holders
+	}
+	all := make([]ref, 0, i.prefixesByTenant[tenant])
+	for key, replicas := range i.prefixes {
+		if key.tenant != tenant {
+			continue
+		}
+		var newest time.Time
+		for _, e := range replicas {
+			if e.lastSeen.After(newest) {
+				newest = e.lastSeen
+			}
+		}
+		all = append(all, ref{key, newest})
+	}
+	sort.Slice(all, func(a, b int) bool {
+		if !all[a].age.Equal(all[b].age) {
+			return all[a].age.Before(all[b].age)
+		}
+		return all[a].key.prefixHash < all[b].key.prefixHash
+	})
+	removed := 0
+	for _, r := range all {
+		if int64(i.prefixesByTenant[tenant]) <= maxPrefixes {
+			break
+		}
+		// Drop the whole prefix: collect replica ids first (removeReplicaLocked
+		// mutates the inner map and deletes the key on the last removal).
+		replicas := i.prefixes[r.key]
+		ids := make([]string, 0, len(replicas))
+		for id := range replicas {
+			ids = append(ids, id)
+		}
+		for _, id := range ids {
+			i.removeReplicaLocked(r.key, i.prefixes[r.key], id)
+		}
+		removed++
+	}
+	return removed
 }
 
 // reportEntries pushes live per-model counts to the metrics sink, if wired.

@@ -163,13 +163,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.CachePolicyReconciler{
+	if err := (&controller.ControlPlaneReconciler{
 		Client:          mgr.GetClient(),
-		Log:             ctrl.Log.WithName("controllers").WithName("CachePolicy"),
+		Log:             ctrl.Log.WithName("controllers").WithName("ControlPlane"),
 		ServerPolicyURL: opts.serverPolicyURL,
 		PushInterval:    opts.policyPushEvery,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CachePolicy")
+		setupLog.Error(err, "unable to create controller", "controller", "ControlPlane")
 		os.Exit(1)
 	}
 

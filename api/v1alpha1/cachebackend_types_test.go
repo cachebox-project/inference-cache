@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -38,7 +39,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "capacity", "indexEntries", "matchedEnginePods", "failOpen", "conditions"} {
+	for _, field := range []string{"endpoint", "capacity", "indexEntries", "matchedEnginePods", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -82,6 +83,10 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
 	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "lookupTimeoutMs"), 0)
 	requireMinimum(t, mustPath[map[string]any](t, integrationSchema, "properties", "minimumPrefixTokens"), 0)
+	firstEventTimeoutSchema := mustPath[map[string]any](t, integrationSchema, "properties", "firstEventTimeout")
+	if got, ok := firstEventTimeoutSchema["default"].(string); !ok || got != "5m" {
+		t.Fatalf("integration.firstEventTimeout default = %v, want \"5m\"", firstEventTimeoutSchema["default"])
+	}
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 	requireMinimum(t, mustProperty(t, statusSchema, "indexEntries"), 0)
 	requireMinimum(t, mustProperty(t, statusSchema, "matchedEnginePods"), 0)
@@ -132,6 +137,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	minimumPrefixTokens := int32(64)
 	indexEntries := int64(42)
 	matchedEnginePods := int32(7)
+	firstEventTimeout := metav1.Duration{Duration: 5 * time.Minute}
+	firstKVEventAt := metav1.NewTime(time.Unix(1_700_000_000, 0).UTC())
+	firstAvailableAt := metav1.NewTime(time.Unix(1_700_000_500, 0).UTC())
 	runAsNonRoot := true
 	runtimeClassName := "runc"
 	terminationGracePeriodSeconds := int64(30)
@@ -159,6 +167,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				Role:                CacheBackendIntegrationRoleReadWrite,
 				LookupTimeoutMs:     &lookupTimeoutMs,
 				MinimumPrefixTokens: &minimumPrefixTokens,
+				FirstEventTimeout:   &firstEventTimeout,
 			},
 			EngineSelector: &CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
@@ -179,10 +188,12 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			Endpoint: "external-cache.default.svc:8080",
 		},
 		Status: CacheBackendStatus{
-			Endpoint:          "cache.default.svc:8080",
-			Capacity:          "10Gi",
-			IndexEntries:      &indexEntries,
-			MatchedEnginePods: &matchedEnginePods,
+			Endpoint:               "cache.default.svc:8080",
+			Capacity:               "10Gi",
+			IndexEntries:           &indexEntries,
+			MatchedEnginePods:      &matchedEnginePods,
+			FirstKVEventObservedAt: &firstKVEventAt,
+			FirstAvailableAt:       &firstAvailableAt,
 			Conditions: []metav1.Condition{{
 				Type:               "Ready",
 				Status:             metav1.ConditionTrue,
@@ -202,6 +213,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
 	*backend.Spec.Integration.LookupTimeoutMs = 50
 	*backend.Spec.Integration.MinimumPrefixTokens = 128
+	backend.Spec.Integration.FirstEventTimeout.Duration = time.Hour
 	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
 	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
 	backend.Spec.Template.NodeSelector["pool"] = "general"
@@ -211,6 +223,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
 	*backend.Status.IndexEntries = 100
 	*backend.Status.MatchedEnginePods = 11
+	*backend.Status.FirstKVEventObservedAt = metav1.NewTime(time.Unix(0, 0).UTC())
+	*backend.Status.FirstAvailableAt = metav1.NewTime(time.Unix(0, 0).UTC())
 	backend.Status.Conditions[0].Message = "changed"
 
 	if copied.Spec.Replicas == nil || *copied.Spec.Replicas != 2 {
@@ -284,6 +298,15 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Status.MatchedEnginePods == nil || *copied.Status.MatchedEnginePods != 7 {
 		t.Fatalf("status.matchedEnginePods was not deep-copied")
+	}
+	if copied.Spec.Integration.FirstEventTimeout == nil || copied.Spec.Integration.FirstEventTimeout.Duration != 5*time.Minute {
+		t.Fatalf("integration.firstEventTimeout was not deep-copied")
+	}
+	if copied.Status.FirstKVEventObservedAt == nil || !copied.Status.FirstKVEventObservedAt.Time.Equal(time.Unix(1_700_000_000, 0).UTC()) {
+		t.Fatalf("status.firstKVEventObservedAt was not deep-copied")
+	}
+	if copied.Status.FirstAvailableAt == nil || !copied.Status.FirstAvailableAt.Time.Equal(time.Unix(1_700_000_500, 0).UTC()) {
+		t.Fatalf("status.firstAvailableAt was not deep-copied")
 	}
 	if copied.Status.Conditions[0].Message != "backend is ready" {
 		t.Fatalf("conditions were not deep-copied")

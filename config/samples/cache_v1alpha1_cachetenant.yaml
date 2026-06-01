@@ -8,5 +8,4 @@ spec:
   tenantID: tenant-a
   isolationMode: Fairness
   quota:
-    maxMemoryBytes: 1073741824
     maxIndexEntries: 100000

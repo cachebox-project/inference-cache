@@ -30,15 +30,48 @@ import (
 
 // Status condition types published on a managed CacheBackend.
 //
-// Ready reports whether the managed backend workload is currently serving.
+// Ready reports whether the managed backend workload is currently serving
+// (gated by the KV-event readiness gate — see evaluateKVEventReadiness).
 // Progressing reports whether the controller is still driving the live state
-// toward the desired state (template render, child apply, rollout in flight).
-// The two conditions together let consumers tell a still-converging backend
+// toward the desired state (template render, child apply, rollout in flight,
+// awaiting first KV event). Degraded reports a terminal unhealthy state.
+// Ready + Progressing together tell a still-converging backend
 // (Ready=False, Progressing=True) apart from a stuck/degraded one
-// (Ready=False, Progressing=False).
+// (Ready=False, Progressing=False); Degraded names the specific failure.
 const (
 	conditionTypeReady       = "Ready"
 	conditionTypeProgressing = "Progressing"
+	// Degraded is published alongside Ready. It is True only when the
+	// backend is in a genuinely degraded terminal state (rolled out but
+	// replicas unavailable, or the workload is Available but no KV events
+	// observed within firstEventTimeout).
+	conditionTypeDegraded = "Degraded"
+)
+
+// KV-event readiness gate.
+const (
+	// annotationRequireKVEvents opts a CacheBackend OUT of the KV-event
+	// readiness gate when set exactly to "false". Absent or any other value
+	// leaves the gate enabled (default-on). It is a per-CR annotation rather
+	// than a spec field because it is an alpha soft-rollout knob meant to be
+	// retired once the gate is trusted (a spec field is harder to retract),
+	// and per-CR so one backend can opt out without affecting others.
+	annotationRequireKVEvents = "inferencecache.io/require-kv-events"
+
+	// defaultFirstEventTimeout is the fallback when
+	// spec.integration.firstEventTimeout is unset and the API-server default
+	// ("5m") was not applied (e.g. fake-client unit tests). Mirrors the
+	// +kubebuilder:default on the field.
+	defaultFirstEventTimeout = 5 * time.Minute
+
+	// Ready/Degraded condition reasons set by the gate. These double as the
+	// Event reasons emitted on the corresponding transitions.
+	reasonAwaitingFirstKVEvent = "AwaitingFirstKVEvent"
+	reasonKVEventsObserved     = "KVEventsObserved"
+	reasonNoKVEventsObserved   = "NoKVEventsObserved"
+
+	// reasonNotDegraded is the Degraded=False condition reason.
+	reasonNotDegraded = "NotDegraded"
 )
 
 // Default HPA tuning when the autoscaling spec leaves them unset.
@@ -207,13 +240,20 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	//     selector to drive the count to a new value). The retry tries
 	//     the clear again on the next tick.
 	//
-	// Don't shorten an already-shorter RequeueAfter dispatch may have set
-	// (none today, but preserve the contract): only fill in the cadence
-	// when no other requeue is pending.
+	// Requeue at the SOONER of the matched-pods cadence and any window
+	// dispatch already scheduled. The KV-event gate sets a multi-minute
+	// RequeueAfter while AwaitingFirstKVEvent (up to firstEventTimeout); taking
+	// the min keeps the matched-pods refresh on its cadence instead of letting
+	// the gate window suppress it — otherwise the operator-facing Matched
+	// column would go stale for up to firstEventTimeout during the exact "no
+	// engine pods attached" diagnosis path. The gate recomputes elapsed on
+	// every reconcile, so a shorter requeue only lands its Degraded flip at
+	// most one cadence after the deadline.
 	if needsRequeue := (backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0) ||
 		backend.Status.MatchedEnginePods != nil; needsRequeue {
-		if result.RequeueAfter == 0 {
-			result.RequeueAfter = r.matchedEnginePodsRequeueInterval()
+		cadence := r.matchedEnginePodsRequeueInterval()
+		if result.RequeueAfter == 0 || cadence < result.RequeueAfter {
+			result.RequeueAfter = cadence
 		}
 	}
 	// Emit transitions whenever dispatch published a status change, even on
@@ -296,6 +336,16 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // misconfiguration into a serving outage. Publishing Ready=False with a
 // specific reason names the gap, and the pod webhook short-circuits on
 // the same check (returns no-injection, fail-open).
+//
+// External backends never enter the KV-event readiness gate, so the
+// managed-only Degraded condition is cleared here. Two status fields are
+// deliberately NOT reset: firstKVEventObservedAt (a monotonic write-once
+// "ever observed a KV event" marker — clearing it would be ineffective
+// anyway, since the preserved poller-owned lastEventAt would immediately
+// re-satisfy the gate on a return to the managed path) and
+// status.indexParticipation (owned by the CacheIndex poller, which converges
+// it on its own; an External backend whose engine pods still report KV events
+// legitimately keeps it).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	return r.patchStatus(ctx, backend, func() {
 		// TrimSpace before every decision. Admission rejects a
@@ -352,12 +402,17 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			Message:            readyMsg,
 			ObservedGeneration: backend.Generation,
 		})
+		// Clear any Degraded condition left over from a prior managed state;
+		// External readiness is the endpoint check above, not the KV gate.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
 	})
 }
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
 // for a backend this module no longer provisions (unsupported runtime/backend or
-// deferred kind).
+// deferred kind). The managed conditions are removed; firstKVEventObservedAt and
+// status.indexParticipation are left as-is (see reconcileExternal's comment — the
+// latch is a monotonic marker and indexParticipation is poller-owned).
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -368,6 +423,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
 	})
 }
 
@@ -457,7 +513,8 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		endpoint = serviceEndpoint(&liveSvc)
 	}
 
-	if err := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil); err != nil {
+	requeueAfter, err := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -467,7 +524,11 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 
 	logger.V(1).Info("reconciled managed CacheBackend",
 		"namespace", backend.Namespace, "name", backend.Name, "endpoint", endpoint)
-	return ctrl.Result{}, nil
+	// requeueAfter is non-zero only while the KV-event gate is in the
+	// AwaitingFirstKVEvent window — it schedules the automatic Degraded flip
+	// when firstEventTimeout elapses with no event, without waiting for the
+	// next periodic resync.
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // buildDeployment wraps the adapter-rendered PodSpec into a Deployment the
@@ -825,22 +886,58 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 // data volume the controller can attach a PVC to today, so reporting a
 // requested PVC size as "provisioned capacity" would mislead operators.
 // Populating it is left to the follow-up that wires storage end-to-end.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) error {
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
+	now := time.Now()
 	readyStatus, reason, message := managedReadiness(backend, dep)
-	progressingStatus, progressingReason, progressingMessage := progressingFromReady(readyStatus, reason, message)
+	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
+	// first time the workload is Available — now. Using a latched value (not the
+	// live Deployment Available condition, which resets on a flap) keeps the
+	// firstEventTimeout window monotonic so Degraded stays sticky.
+	anchor := time.Time{}
+	if backend.Status.FirstAvailableAt != nil {
+		anchor = backend.Status.FirstAvailableAt.Time
+	} else if readyStatus == metav1.ConditionTrue {
+		anchor = now
+	}
+	// Layer the KV-event readiness gate on top of the Deployment-level readiness.
+	// Only the workload-Available state is gated; every other Deployment state
+	// passes through unchanged.
+	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now)
+	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
 		publishedGen = backend.Generation
 	}
-	return r.patchStatus(ctx, backend, func() {
+	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = publishedGen
+		// Latch the first KV-event observation write-once. The poller can later
+		// clear indexParticipation.lastEventAt on a drain, so this durable
+		// marker is what keeps lastKVEventSeen true thereafter.
+		if backend.Status.FirstKVEventObservedAt == nil {
+			if at := currentLastEventAt(backend); at != nil {
+				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
+			}
+		}
+		// Latch the first-Available time write-once — the stable, flap-immune
+		// anchor for the firstEventTimeout window (see FirstAvailableAt godoc).
+		if backend.Status.FirstAvailableAt == nil && readyStatus == metav1.ConditionTrue {
+			t := metav1.NewTime(now)
+			backend.Status.FirstAvailableAt = &t
+		}
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
-			Status:             readyStatus,
-			Reason:             reason,
-			Message:            message,
+			Status:             gate.readyStatus,
+			Reason:             gate.readyReason,
+			Message:            gate.readyMessage,
+			ObservedGeneration: publishedGen,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeDegraded,
+			Status:             gate.degradedStatus,
+			Reason:             gate.degradedReason,
+			Message:            gate.degradedMessage,
 			ObservedGeneration: publishedGen,
 		})
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
@@ -851,6 +948,198 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			ObservedGeneration: publishedGen,
 		})
 	})
+	return gate.requeueAfter, err
+}
+
+// kvReadiness is the resolved readiness verdict after layering the KV-event
+// gate on top of the Deployment-level readiness. readyStatus/readyReason/
+// readyMessage drive Conditions[Ready]; degraded* drive Conditions[Degraded];
+// requeueAfter is non-zero only inside the AwaitingFirstKVEvent window, where
+// it schedules the automatic Degraded flip once firstEventTimeout elapses
+// without an event.
+type kvReadiness struct {
+	readyStatus     metav1.ConditionStatus
+	readyReason     string
+	readyMessage    string
+	degradedStatus  metav1.ConditionStatus
+	degradedReason  string
+	degradedMessage string
+	requeueAfter    time.Duration
+}
+
+// evaluateKVEventReadiness layers the KV-event readiness gate on top of the
+// Deployment-derived health. The signal it adds is whether at least one KV
+// event has been observed for this backend (status.indexParticipation.
+// lastEventAt, written by the CacheIndex poller from engine-pod reports).
+//
+// Motivation: a backend whose managed workload is up can still be silently
+// useless to the cache plane — the inference engine may be serving HTTP while
+// its ZMQ KV-event publisher is mis-configured or crashed, so nothing flows
+// into the index and LookupRoute keeps returning NO_HINT. The managed
+// Deployment's own readiness cannot see that; the first-KV-event signal can.
+//
+// State machine — the gate only refines the state once the managed
+// cache-backend Deployment is Available (managedReadiness Ready=True). Every
+// other Deployment state (rollout in progress, scaled to zero, replicas
+// unavailable) passes through unchanged:
+//
+//	Workload Available? | event seen? | within timeout? | Ready | Degraded | reason
+//	No                  | -           | -               | (passthrough deployment readiness)
+//	Yes                 | No          | Yes             | False | False    | AwaitingFirstKVEvent
+//	Yes                 | Yes         | -               | True  | False    | KVEventsObserved
+//	Yes                 | No          | No              | False | True     | NoKVEventsObserved
+//
+// "Event seen" is "have we EVER seen an event for this backend" — a non-nil
+// lastEventAt already present on the first reconcile counts (no transition
+// through Pending is required). The gate is opt-out per CR via the
+// inferencecache.io/require-kv-events: "false" annotation. External backends
+// never reach this code path (reconcileExternal short-circuits dispatch), so
+// they are unconditionally exempt.
+//
+// Timeout anchor: `anchor` is the caller-resolved start of the firstEventTimeout
+// clock — the write-once status.firstAvailableAt latch (the time the workload
+// was first observed Available). It is deliberately NOT the live Deployment's
+// Available condition LastTransitionTime, which resets on an availability flap:
+// a latched anchor keeps the elapsed window monotonic, so once a backend
+// breaches the timeout (Degraded / NoKVEventsObserved) a later flap cannot move
+// it back to AwaitingFirstKVEvent — it stays Degraded until an event arrives.
+// (Once firstKVEventObservedAt is latched the gate is satisfied regardless of
+// the anchor, since lastKVEventSeen short-circuits.)
+func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time) kvReadiness {
+	// Base verdict mirrors the Deployment-level readiness; the Degraded
+	// condition tracks the deployment-level Ready=False/ReplicasUnavailable
+	// shape so it is consistent on every path (including the opt-out and
+	// not-yet-Available paths below).
+	base := kvReadiness{
+		readyStatus:  readyStatus,
+		readyReason:  reason,
+		readyMessage: message,
+	}
+	if readyStatus == metav1.ConditionFalse && reason == conditionReasonReplicasUnavailable {
+		base.degradedStatus = metav1.ConditionTrue
+		base.degradedReason = reason
+		base.degradedMessage = message
+	} else {
+		base.degradedStatus = metav1.ConditionFalse
+		base.degradedReason = reasonNotDegraded
+		base.degradedMessage = "backend is not in a degraded state"
+	}
+
+	// Opt-out, or a Deployment that is not yet Available: nothing to gate.
+	if !kvEventGateEnabled(backend) || readyStatus != metav1.ConditionTrue {
+		return base
+	}
+
+	// Workload is Available. Have we ever seen a KV event for this backend?
+	if lastKVEventSeen(backend) {
+		return kvReadiness{
+			readyStatus:     metav1.ConditionTrue,
+			readyReason:     reasonKVEventsObserved,
+			readyMessage:    "at least one KV event observed; cache is receiving engine state",
+			degradedStatus:  metav1.ConditionFalse,
+			degradedReason:  reasonNotDegraded,
+			degradedMessage: "backend is not in a degraded state",
+		}
+	}
+
+	// Sticky Degraded: once the timeout has been breached
+	// (Conditions[Ready].Reason == NoKVEventsObserved), stay Degraded until an
+	// event arrives — never recompute the window. This guards the case where an
+	// operator INCREASES spec.integration.firstEventTimeout after the window
+	// already elapsed, which would otherwise move the backend back to
+	// AwaitingFirstKVEvent (hiding a known publisher outage for another window),
+	// contradicting the documented "once Degraded, stays Degraded until an
+	// event" contract. (Availability flaps are handled separately by the stable
+	// firstAvailableAt anchor; this persisted-reason check survives a no-flap
+	// timeout change, where the condition is not overwritten.)
+	if readyConditionReason(backend) == reasonNoKVEventsObserved {
+		return kvReadiness{
+			readyStatus:     metav1.ConditionFalse,
+			readyReason:     reasonNoKVEventsObserved,
+			readyMessage:    "no KV events observed before the first-event timeout; staying Degraded until an event arrives",
+			degradedStatus:  metav1.ConditionTrue,
+			degradedReason:  reasonNoKVEventsObserved,
+			degradedMessage: "no KV events observed before the first-event timeout",
+		}
+	}
+
+	// Available but no event yet — still inside the first-event window? The
+	// anchor is the latched first-Available time (now on the very first
+	// Available reconcile, before the latch is persisted); a zero anchor would
+	// only ever delay the Degraded flip, never trigger it prematurely.
+	timeout := firstEventTimeout(backend)
+	if anchor.IsZero() {
+		anchor = now
+	}
+	if elapsed := now.Sub(anchor); elapsed < timeout {
+		return kvReadiness{
+			readyStatus:     metav1.ConditionFalse,
+			readyReason:     reasonAwaitingFirstKVEvent,
+			readyMessage:    fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout),
+			degradedStatus:  metav1.ConditionFalse,
+			degradedReason:  reasonNotDegraded,
+			degradedMessage: "backend is not in a degraded state",
+			// Re-reconcile at the deadline so the Degraded flip fires
+			// automatically without an external event. No padding is added:
+			// RequeueAfter fires no earlier than the requested delay, so the
+			// next reconcile observes elapsed >= timeout and flips Degraded —
+			// honoring firstEventTimeout as the actual bound rather than
+			// overshooting it (which would be visible for small timeouts).
+			requeueAfter: timeout - elapsed,
+		}
+	}
+	return kvReadiness{
+		readyStatus:     metav1.ConditionFalse,
+		readyReason:     reasonNoKVEventsObserved,
+		readyMessage:    fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout),
+		degradedStatus:  metav1.ConditionTrue,
+		degradedReason:  reasonNoKVEventsObserved,
+		degradedMessage: fmt.Sprintf("no KV events observed within %s of the cache-backend workload becoming Available", timeout),
+	}
+}
+
+// kvEventGateEnabled reports whether the KV-event readiness gate applies to
+// this backend. Default-on; only the exact annotation value "false" opts out.
+func kvEventGateEnabled(backend *cachev1alpha1.CacheBackend) bool {
+	return backend.Annotations[annotationRequireKVEvents] != "false"
+}
+
+// lastKVEventSeen reports whether at least one KV event has EVER been observed
+// for this backend. The gate's contract is "ever observed", but the poller's
+// status.indexParticipation.lastEventAt is only a current-view projection — it
+// legitimately clears to nil when a backend's replicas drain (scale-down,
+// prefixes TTL'd; see the CacheIndex poller's drain handling). Reading that
+// alone would let a backend that already passed the gate regress to
+// AwaitingFirstKVEvent → NoKVEventsObserved on a drain. So the durable
+// status.firstKVEventObservedAt latch (written write-once below) is consulted
+// too: once set it pins the gate satisfied, matching the "first-event startup
+// probe, not a liveness check" scope.
+func lastKVEventSeen(backend *cachev1alpha1.CacheBackend) bool {
+	if backend.Status.FirstKVEventObservedAt != nil {
+		return true
+	}
+	ip := backend.Status.IndexParticipation
+	return ip != nil && ip.LastEventAt != nil
+}
+
+// currentLastEventAt returns the poller's current-view lastEventAt for the
+// backend, or nil. Used to latch firstKVEventObservedAt write-once.
+func currentLastEventAt(backend *cachev1alpha1.CacheBackend) *metav1.Time {
+	if ip := backend.Status.IndexParticipation; ip != nil {
+		return ip.LastEventAt
+	}
+	return nil
+}
+
+// firstEventTimeout resolves the effective first-event timeout, falling back
+// to defaultFirstEventTimeout when the spec field is unset or non-positive
+// (the API-server applies the 5m kubebuilder default in production; the
+// fallback covers fake-client tests and defensively rejects a zero value).
+func firstEventTimeout(backend *cachev1alpha1.CacheBackend) time.Duration {
+	if i := backend.Spec.Integration; i != nil && i.FirstEventTimeout != nil && i.FirstEventTimeout.Duration > 0 {
+		return i.FirstEventTimeout.Duration
+	}
+	return defaultFirstEventTimeout
 }
 
 // Ready condition reasons published by managedReadiness. Stable strings so
@@ -1156,9 +1445,28 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 // treated as the API default of true, so an initial apply with
 // failOpen=false correctly fires the warning).
 type stateSnapshot struct {
-	ready    bool
+	// ready is whether Conditions[Ready].Status was True. Pairs with
+	// degraded so emitTransitionEvents can narrate the Degraded → Ready
+	// recovery transition.
+	ready bool
+	// degraded is whether Conditions[Degraded].Status was True (covers both
+	// the deployment-level ReplicasUnavailable shape AND the KV-event-gate
+	// NoKVEventsObserved shape). The readyReason check below splits the two
+	// for suppression purposes.
 	degraded bool
 	failOpen bool
+	// readyReason is the prior Conditions[Ready].Reason. The KV-event gate's
+	// transitions (AwaitingFirstKVEvent / KVEventsObserved / NoKVEventsObserved)
+	// ride on this reason, and the suppression for BackendDegraded /
+	// BackendRecovered uses it to distinguish a deployment-caused Degraded
+	// from a KV-event-caused one (which has its own dedicated Event).
+	readyReason string
+	// firstEventLatched is whether status.firstKVEventObservedAt was set. The
+	// KVEventsObserved Event keys on the nil→set transition of this latch (not
+	// the Ready reason) so it fires exactly once — on the TRUE first event —
+	// rather than re-firing every time a rollout takes an already-event-seen
+	// backend through RolloutInProgress and back to KVEventsObserved.
+	firstEventLatched bool
 }
 
 // snapshotState captures the prior status values that drive transition events.
@@ -1166,9 +1474,11 @@ type stateSnapshot struct {
 // has a stable baseline to compare the post-reconcile state against.
 func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
 	return stateSnapshot{
-		ready:    isReady(cb),
-		degraded: isDegraded(cb),
-		failOpen: statusFailOpen(cb.Status.FailOpen),
+		ready:             isReady(cb),
+		degraded:          isDegraded(cb),
+		failOpen:          statusFailOpen(cb.Status.FailOpen),
+		readyReason:       readyConditionReason(cb),
+		firstEventLatched: cb.Status.FirstKVEventObservedAt != nil,
 	}
 }
 
@@ -1178,13 +1488,23 @@ func isReady(cb *cachev1alpha1.CacheBackend) bool {
 	return c != nil && c.Status == metav1.ConditionTrue
 }
 
-// isDegraded reports whether the Ready condition is False with the
-// "replicas unavailable" reason — the post-rollout failure shape that the
-// BackendDegraded event narrates. A rollout in progress or a scaled-to-zero
-// backend is not degraded.
+// isDegraded reports whether Conditions[Degraded] is True — covering both
+// the deployment-level ReplicasUnavailable shape and the KV-event-gate
+// NoKVEventsObserved shape. BackendDegraded events narrate the former; the
+// gate emits its own NoKVEventsObserved event for the latter, so the
+// generic event is suppressed by the readyReason check below.
 func isDegraded(cb *cachev1alpha1.CacheBackend) bool {
-	c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady)
-	return c != nil && c.Status == metav1.ConditionFalse && c.Reason == conditionReasonReplicasUnavailable
+	c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeDegraded)
+	return c != nil && c.Status == metav1.ConditionTrue
+}
+
+// readyConditionReason returns the current Conditions[Ready].Reason, or "" when
+// the condition is absent.
+func readyConditionReason(cb *cachev1alpha1.CacheBackend) string {
+	if c := meta.FindStatusCondition(cb.Status.Conditions, conditionTypeReady); c != nil {
+		return c.Reason
+	}
+	return ""
 }
 
 // statusFailOpen treats a missing status.failOpen as the API default (true).
@@ -1197,14 +1517,20 @@ func statusFailOpen(v *bool) bool {
 	return *v
 }
 
-// emitTransitionEvents emits Kubernetes Events on transitions of the observed
-// Ready condition (entering/leaving the Ready=False/ReplicasUnavailable
-// shape) or the effective failOpen toggle. By design events fire only
-// on transitions — never on steady state — so a Ready backend reconciling
-// every few seconds does not flood the event stream.
+// Conditions[Ready/Degraded], the KV-event readiness gate state, or the
+// effective failOpen toggle. By design events fire only on transitions —
+// never on steady state — so a Ready backend reconciling every few seconds
+// does not flood the event stream.
 //
-//   - Entering Ready=False/ReplicasUnavailable → Warning BackendDegraded.
-//   - Leaving Ready=False/ReplicasUnavailable for Ready=True → Normal BackendRecovered.
+//   - Entering Conditions[Degraded]=True → Warning BackendDegraded
+//     (suppressed for the KV-event-gate flavor — readyReason=NoKVEventsObserved
+//     — which emits its own NoKVEventsObserved event instead).
+//   - Leaving Conditions[Degraded]=True for Ready=True → Normal
+//     BackendRecovered (suppressed when recovering from the KV-event-gate
+//     Degraded, which emits KVEventsObserved).
+//   - KV-event gate (keyed on the Ready condition reason): Normal
+//     AwaitingFirstKVEvent on first reaching it; Normal KVEventsObserved on the
+//     first event observed; Warning NoKVEventsObserved on the timeout breach.
 //   - failOpen flipped true → false → Warning FailClosedEnabled (the cache
 //     becomes a serving dependency; advanced opt-in).
 //   - failOpen flipped false → true → Normal FailOpenRestored.
@@ -1214,13 +1540,49 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	}
 	after := snapshotState(cb)
 
-	if !before.degraded && after.degraded {
+	// Generic Conditions[Degraded] transitions. The KV-event gate's Degraded
+	// and Ready flavors carry their own, more specific events below, so
+	// suppress the generic event when the transition is a gate flavor —
+	// otherwise a KV-event-timeout Degraded would fire BOTH BackendDegraded
+	// and NoKVEventsObserved for one transition.
+	//
+	// Suppression is keyed on the *prior* readyReason for recovery, not the
+	// new one: a backend that already saw KV events, then degrades for
+	// ReplicasUnavailable, then recovers, comes back with readyReason
+	// KVEventsObserved — but that is an ordinary deployment recovery
+	// (BackendRecovered), not a first-event observation, so we must not key
+	// the suppression on the new reason.
+	if !before.degraded && after.degraded &&
+		after.readyReason != reasonNoKVEventsObserved {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonBackendDegraded, eventReasonBackendDegraded,
 			"cache backend is degraded: %s", degradedMessage(cb))
 	}
-	if before.degraded && after.ready {
+	if before.degraded && after.ready &&
+		before.readyReason != reasonNoKVEventsObserved {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonBackendRecovered, eventReasonBackendRecovered,
 			"cache backend recovered to Ready")
+	}
+
+	// KV-event readiness gate transitions, keyed on the Ready condition reason
+	// so they fire once on entry into each gate state.
+	if before.readyReason != reasonAwaitingFirstKVEvent && after.readyReason == reasonAwaitingFirstKVEvent {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
+			"cache-backend workload is Available but no KV events observed yet; backend stays Pending until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
+	}
+	// KVEventsObserved fires exactly once — on the nil→set transition of the
+	// firstKVEventObservedAt latch, i.e. the TRUE first event. Keying on the
+	// latch (not the Ready reason) means a later rollout that takes an
+	// already-event-seen backend through RolloutInProgress and back to
+	// KVEventsObserved does NOT re-fire "first KV event observed", and a
+	// deployment recovery (ReplicasUnavailable → Ready, events never lost) emits
+	// BackendRecovered above instead of a spurious KVEventsObserved.
+	if !before.firstEventLatched && after.firstEventLatched {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonKVEventsObserved, reasonKVEventsObserved,
+			"first KV event observed; backend is Ready")
+	}
+	if before.readyReason != reasonNoKVEventsObserved && after.readyReason == reasonNoKVEventsObserved {
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, reasonNoKVEventsObserved, reasonNoKVEventsObserved,
+			"no KV events observed within %s of the workload becoming Available; no engine pods are attached, or the engine's KV-event publisher is mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
 	}
 
 	if before.failOpen && !after.failOpen {
@@ -1261,6 +1623,12 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
+		// NOTE: DO NOT add a predicate that filters status-only updates here.
+		// The KV-event readiness gate depends on the CacheIndex poller's
+		// status.indexParticipation patches triggering a reconcile via this
+		// informer (sub-second latency, no explicit cross-controller enqueue).
+		// A predicate that filters status updates would silently break the
+		// AwaitingFirstKVEvent -> Ready transition.
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
