@@ -11,12 +11,16 @@
 #   2. The CacheIndex poller is writing status: `cacheindex/cluster-default`
 #      has a non-empty `.status.observedServer` within ~60s (one or two poll
 #      cycles past the 30s default refresh).
-#   3. The per-CacheTenant status projection works: an applied `CacheTenant`
+#   3. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
+#      operator-facing printer columns, the controller pushes it to the
+#      server's `/policy` endpoint, and `LookupRoute` observes the pushed
+#      minimumPrefixTokens gate without engine pods or inference traffic.
+#   4. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller.
-#   4. The gRPC surface is reachable: a `LookupRoute` for an unknown model
+#   5. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
-#   5. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   6. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -26,7 +30,7 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   6. The External CacheBackend type end-to-end: applying the committed
+#   7. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook defaults (lookupTimeoutMs=50,
 #      minimumPrefixTokens=256), renders NO Deployment/Service in its
@@ -37,10 +41,10 @@
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time).
-#   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#   8. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
-#   8. The /policy endpoint rejects unauthenticated callers: same side-pod
+#   9. The /policy endpoint rejects unauthenticated callers: same side-pod
 #      shape against the write-side endpoint. This is the more dangerous of
 #      the two — /policy is replace-on-write, so a successful unauthenticated
 #      POST would override every namespace's CachePolicy state cluster-wide.
@@ -73,9 +77,10 @@
 #
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
-#           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR, SAMPLE_NS,
-#           SAMPLE_ENDPOINT_TIMEOUT, SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
-#           SAMPLE_ENGINE_IMAGE, SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
+#           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR,
+#           POLICY_SMOKE_NS, SAMPLE_NS, SAMPLE_ENDPOINT_TIMEOUT,
+#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
+#           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT.
 
 set -euo pipefail
@@ -86,6 +91,7 @@ NAMESPACE="${NAMESPACE:-inference-cache-system}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
 READY_TIMEOUT="${READY_TIMEOUT:-120s}"
 CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
+POLICY_PUSH_TIMEOUT="${POLICY_PUSH_TIMEOUT:-90}" # seconds; watch-triggered push + one 30s periodic repair tick
 GRPC_LOCAL_PORT="${GRPC_LOCAL_PORT:-19090}"
 LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 # External-backend gate timeouts. The reconciler patches status on the next
@@ -104,6 +110,7 @@ EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 # in `default`. The script creates the namespace on entry and deletes it on
 # the way out.
 SAMPLE_NS="${SAMPLE_NS:-cb-engine-smoke}"
+POLICY_SMOKE_NS="${POLICY_SMOKE_NS:-ic-smoke-policy}"
 # CacheBackend reconciler publishes status.endpoint once the managed
 # lmcache-server Service is created — typically within ~5s. 60s absorbs
 # cold-start jitter.
@@ -174,6 +181,8 @@ collect_diagnostics() {
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
   kubectl get cachetenants -A -o yaml \
     >"$LOG_DIR/cachetenants.yaml" 2>&1 || true
+  kubectl get cachepolicies -A -o yaml \
+    >"$LOG_DIR/cachepolicies.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
   # Paired-sample state — only populated if the sample-smoke phase ran;
@@ -338,6 +347,36 @@ until [ -n "$observed" ]; do
 done
 log "cacheindex/cluster-default.status.observedServer=$observed"
 
+# --- CachePolicy push + printer-column setup --------------------------------
+# Apply a CachePolicy in a dedicated namespace and verify its operator-facing
+# table columns render. The gRPC side-effect assertion below proves this CR
+# was pushed through the controller's authenticated /policy bridge and adopted
+# by the server; keeping the apply here gives the watch-triggered reconcile
+# time to run before the port-forward opens.
+log "applying CachePolicy sample in namespace $POLICY_SMOKE_NS"
+kubectl create namespace "$POLICY_SMOKE_NS" --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
+kubectl -n "$POLICY_SMOKE_NS" apply -f config/samples/cache_v1alpha1_cachepolicy.yaml >/dev/null
+
+# The printer columns (Eviction / FailOpen) are themselves an operator-facing
+# surface. Verify the header and the row values so a regression to a default
+# NAME/AGE-only table does not pass unnoticed.
+cp_table="$(kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample 2>/dev/null || true)"
+cp_header="$(printf '%s\n' "$cp_table" | sed -n '1p')"
+for column in EVICTION FAILOPEN; do
+  if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$cp_header"; then
+    echo "$cp_table"
+    fail "expected CachePolicy printer column $column in kubectl get output"
+  fi
+done
+if ! grep -Fq "cachepolicy-sample" <<<"$cp_table" || \
+   ! grep -Fq "LRU" <<<"$cp_table" || \
+   ! grep -Fq "true" <<<"$cp_table"; then
+  echo "$cp_table"
+  fail "expected CachePolicy printer row to include name, Eviction=LRU, and FailOpen=true"
+fi
+log "CachePolicy printer columns render Eviction/FailOpen"
+
 # --- CacheTenant status projection assertion -------------------------------
 # Apply a CacheTenant and prove the poller's per-tenant projection writes its
 # status. The smoke cluster has no engine pods, so the tenant holds zero
@@ -397,23 +436,52 @@ done
 
 # Probe twice in priority order: server reflection first (what a real gateway
 # client would do), proto-file second (survives the reflection registration
-# being temporarily reverted or moved). The smoke passes as long as one form
-# returns the fail-open default.
-probe_lookup_route() {
-  local payload='{"modelId":"install-smoke-unknown"}'
+# being temporarily reverted or moved).
+grpcurl_lookup_route() {
+  local payload="$1"
+  local err_file="${2:-$LOG_DIR/grpcurl.err}"
   if grpcurl -plaintext -max-time 5 -d "$payload" \
        "localhost:$GRPC_LOCAL_PORT" \
        inferencecache.v1alpha1.InferenceCache/LookupRoute \
-       2>"$LOG_DIR/grpcurl.err"; then
+       2>"$err_file"; then
     return 0
   fi
-  log "reflection probe failed; falling back to proto-file probe"
+  log "reflection LookupRoute probe failed; falling back to proto-file probe" >&2
   grpcurl -plaintext -max-time 5 \
     -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto \
     -d "$payload" \
     "localhost:$GRPC_LOCAL_PORT" \
     inferencecache.v1alpha1.InferenceCache/LookupRoute \
-    2>>"$LOG_DIR/grpcurl.err"
+    2>>"$err_file"
+}
+
+grpcurl_report_cache_state() {
+  local payload="$1"
+  local err_file="${2:-$LOG_DIR/grpcurl-report-cache-state.err}"
+  if printf '%s\n' "$payload" | grpcurl -plaintext -max-time 5 -d @ \
+       "localhost:$GRPC_LOCAL_PORT" \
+       inferencecache.v1alpha1.InferenceCache/ReportCacheState \
+       2>"$err_file"; then
+    return 0
+  fi
+  log "reflection ReportCacheState probe failed; falling back to proto-file probe" >&2
+  printf '%s\n' "$payload" | grpcurl -plaintext -max-time 5 \
+    -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto \
+    -d @ \
+    "localhost:$GRPC_LOCAL_PORT" \
+    inferencecache.v1alpha1.InferenceCache/ReportCacheState \
+    2>>"$err_file"
+}
+
+has_reason_code() {
+  local resp="$1"
+  local want="$2"
+  grep -Eq "\"(reasonCode|reason_code)\"[[:space:]]*:[[:space:]]*\"$want\"" <<<"$resp"
+}
+
+probe_lookup_route() {
+  local payload='{"modelId":"install-smoke-unknown"}'
+  grpcurl_lookup_route "$payload" "$LOG_DIR/grpcurl.err"
 }
 
 resp="$(probe_lookup_route)" || {
@@ -426,9 +494,62 @@ log "LookupRoute response: $resp"
 # grpcurl's default JSONPB, snake_case reason_code in the .proto). Accept
 # either form; require the value to be NO_HINT (the documented fail-open code
 # for an unknown model).
-if ! grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"NO_HINT"' <<<"$resp"; then
+if ! has_reason_code "$resp" "NO_HINT"; then
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
+
+# --- CachePolicy PUSH adoption assertion -----------------------------------
+# No read-back endpoint exists for /policy, by design. Prove the server adopted
+# the controller-pushed CachePolicy via an existing gRPC side effect instead:
+# seed one synthetic prefix metadata update, then require a lookup above the
+# policy's minimumPrefixTokens to hit while the same exact prefix below the
+# threshold returns NO_HINT. Without the pushed policy, the low-token lookup
+# would also be a PREFIX_MATCH. This avoids engine pods/images, model traffic,
+# and any new transport.
+log "seeding a prefix and asserting CachePolicy minimumPrefixTokens is enforced by LookupRoute"
+policy_model="install-smoke-policy"
+policy_replica="policy-smoke-replica"
+policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix")
+policy_report_payload="$(cat <<EOF
+{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","timestampUs":"1","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
+EOF
+)"
+policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_DIR/grpcurl-policy-report.err")" || {
+  cat "$LOG_DIR/grpcurl-policy-report.err" >&2 || true
+  fail "grpcurl ReportCacheState did not accept the CachePolicy smoke prefix"
+}
+log "ReportCacheState response: $policy_report_resp"
+
+policy_high_payload="$(cat <<EOF
+{"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":64}
+EOF
+)"
+policy_low_payload="$(cat <<EOF
+{"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":1}
+EOF
+)"
+
+deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+policy_high_resp=""
+policy_low_resp=""
+until has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; do
+  policy_high_resp="$(grpcurl_lookup_route "$policy_high_payload" "$LOG_DIR/grpcurl-policy-high.err")" || true
+  policy_low_resp="$(grpcurl_lookup_route "$policy_low_payload" "$LOG_DIR/grpcurl-policy-low.err")" || true
+
+  if has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
+    echo "above-threshold LookupRoute response:" >&2
+    echo "$policy_high_resp" >&2
+    echo "below-threshold LookupRoute response:" >&2
+    echo "$policy_low_resp" >&2
+    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want high-token PREFIX_MATCH and low-token NO_HINT)"
+  fi
+  sleep 2
+done
+log "CachePolicy push adopted: above-threshold lookup hit, below-threshold lookup returned NO_HINT"
 
 # --- paired-sample smoke ---------------------------------------------------
 # Applies config/samples/cachebackend-with-engine.yaml and asserts the
@@ -982,15 +1103,15 @@ case "$probe_out" in
 esac
 
 # --- /policy auth assertion -------------------------------------------------
-# The controller's CachePolicy push above already proves the authenticated
-# write path works (without it the controller would error every reconcile,
-# but its existence does not directly assert on the wire). The complementary
-# half — that an UNAUTHENTICATED POST is rejected — is what this section
-# checks, since /policy is replace-on-write and a successful rogue POST
-# would override cluster-wide policy state with no audit trail. Mirror of
-# the /snapshot probe above. Sends a valid PolicySnapshot body so a 400
-# (bad request) cannot be confused with a 401; the only valid outcomes are
-# 401 (auth) or curl_failed:28 (NetworkPolicy drop under an enforcing CNI).
+# The CachePolicy side-effect assertion above proves the authenticated write
+# path works: the controller pushed the CR through /policy and the server
+# enforced it on LookupRoute. The complementary half — that an
+# UNAUTHENTICATED POST is rejected — is what this section checks, since
+# /policy is replace-on-write and a successful rogue POST would override
+# cluster-wide policy state with no audit trail. Mirror of the /snapshot probe
+# above. Sends a valid PolicySnapshot body so a 400 (bad request) cannot be
+# confused with a 401; the only valid outcomes are 401 (auth) or
+# curl_failed:28 (NetworkPolicy drop under an enforcing CNI).
 log "asserting unauthenticated /policy POST from a side pod is rejected"
 SIDE_POD_POLICY="ic-policy-probe"
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --ignore-not-found --wait=true >/dev/null 2>&1 || true
@@ -1042,4 +1163,4 @@ case "$policy_probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot AND /policy reject unauth"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, and /snapshot + /policy unauth rejection all work"
