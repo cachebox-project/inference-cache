@@ -83,6 +83,9 @@ with OTEL collectors) without bumping `v1alpha1`.
 - **`lookupCalls` + `lookupLatency` writers:** the `LookupRoute` handler in
   [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go)
   calls `metrics.observeLookup(...)` exactly once per request.
+- **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
+  `index.Metrics` interface after a quota-driven eviction at ingest; see
+  [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
 
 ---
 
@@ -92,7 +95,8 @@ with OTEL collectors) without bumping `v1alpha1`.
   `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
 - Companion endpoints on the public listener: **`/healthz`** (liveness),
   **`/readyz`** (readiness → `index.Ready()`), **`/policy`** (controller →
-  server push of resolved `CachePolicy` snapshots). These are intentionally
+  server push of the combined resolved snapshot — `CachePolicy` entries plus
+  `CacheTenant` quota entries). These are intentionally
   unauthenticated — kubelet probes and Prometheus scrapes need them open,
   and the controller is the only writer of `/policy`.
 - Separate **`/snapshot`** listener (default `:8081`, flag

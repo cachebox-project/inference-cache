@@ -62,7 +62,7 @@ func TestSnapshotEntryInvariant(t *testing.T) {
 			name: "default (untenanted) entries present",
 			build: func() *Index {
 				idx := New()
-				addPrefix(idx, "", "r1", "a", base) // empty tenant → _default bucket
+				addPrefix(idx, "", "r1", "a", base) // untenanted → "" bucket (DefaultTenantSentinel)
 				addPrefix(idx, "team", "r2", "b", base)
 				return idx
 			},

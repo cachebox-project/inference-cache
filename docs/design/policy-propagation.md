@@ -97,6 +97,17 @@ intervention.
 - `tenants[].isolationMode` — carried for forward-compat; only `Fairness`
   is implemented.
 
+**Duplicate `tenantID` tie-break.** Two `CacheTenant` CRs may declare the same
+`spec.tenantID`. Only one quota can be enforced per tenant ID, so the reconciler
+deduplicates deterministically: among the quota-bearing CRs for a tenant ID, the
+first by `(namespace, name)` ascending wins and is the single `tenants[]` entry
+emitted; the rest are dropped from the snapshot. The CacheIndex status writer
+resolves the same winner, so a shadowed duplicate's `status` reports
+`Ready=False` / `DuplicateTenantID` (it is not the effective owner) rather than
+advertising a budget that isn't enforced. Operators should keep `tenantID`
+unique across `CacheTenant` CRs; the tie-break only makes the conflict
+deterministic and visible.
+
 The server's `policyHandler` decodes with `DisallowUnknownFields` so an
 unknown field surfaces as HTTP 400 rather than silently dropping. Request
 body is capped at 1 MiB.

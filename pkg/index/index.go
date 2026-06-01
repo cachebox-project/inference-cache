@@ -972,26 +972,15 @@ func (i *Index) CacheState(tenant, model string) (replicas []ReplicaStats, total
 	return replicas, totalPrefixes
 }
 
-// DefaultTenantSentinel is the bucket distinct prefixes with an empty tenant ID
-// are attributed to in cluster-wide aggregates. Without it, untenanted prefixes
-// would count toward the grand total but belong to no tenants[] bucket, so
-// Σ tenants[].indexEntries would silently fall short of the total. Bucketing
-// them under a visible, reserved key keeps the aggregate's core invariant —
-// Σ tenants[].indexEntries == TotalPrefixes — true by construction. It is a
-// reserved name: a real CacheTenant.spec.tenantID is non-empty and operators
-// shouldn't use it; it never claims a per-CacheTenant status (that writer keys
-// on real tenant IDs).
-const DefaultTenantSentinel = "_default"
-
-// tenantBucket maps a raw tenant ID to its aggregate bucket: the ID itself, or
-// the sentinel when empty. Used for BOTH the prefix walk and the stats walk so
-// the two agree on how an untenanted record is attributed.
-func tenantBucket(tenant string) string {
-	if tenant == "" {
-		return DefaultTenantSentinel
-	}
-	return tenant
-}
+// DefaultTenantSentinel is the bucket distinct prefixes with no tenant ID are
+// attributed to in cluster-wide aggregates: the empty string itself. Untenanted
+// prefixes count toward the grand total, so they must also appear as a tenants[]
+// bucket or Σ tenants[].indexEntries would silently fall short of the total —
+// they're kept under "" rather than dropped. The empty string is deliberately
+// collision-free: a real CacheTenant.spec.tenantID is MinLength=1, so this bucket
+// can NEVER be claimed by a real tenant's per-CacheTenant status (which keys on
+// the tenant ID). That is why no reserved non-empty name is needed.
+const DefaultTenantSentinel = ""
 
 // Aggregate is the index's prefix-count aggregate: the per-tenant distinct-prefix
 // counts and the grand total, both produced by a SINGLE walk of the prefix map
@@ -1023,7 +1012,9 @@ func (i *Index) Aggregate() Aggregate {
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
 	for key := range i.prefixes {
-		agg.PerTenant[tenantBucket(key.tenant)]++
+		// Untenanted prefixes (key.tenant == "") bucket under "" — collision-free,
+		// since no real CacheTenant tenantID is empty.
+		agg.PerTenant[key.tenant]++
 		agg.Total++
 	}
 	return agg
@@ -1170,9 +1161,9 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	byTenant := make(map[string]*tenantAgg)
 	for tr, s := range latestByTenantReplica {
-		// Bucket the empty tenant the SAME way the entry walk does, so a tenant's
-		// stats and its indexEntries land on the same key.
-		bucket := tenantBucket(tr.tenant)
+		// Untenanted stats bucket under "" — the same key the entry walk uses, so a
+		// tenant's stats and its indexEntries land together.
+		bucket := tr.tenant
 		a := byTenant[bucket]
 		if a == nil {
 			a = &tenantAgg{}

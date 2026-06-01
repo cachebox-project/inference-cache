@@ -1179,6 +1179,52 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 	}
 }
 
+// TestIntegrationCacheIndexAcceptsUntenantedTenantRow proves the empty-string
+// tenant sentinel survives a real apiserver write. Untenanted prefixes bucket
+// under tenantID "" so the Σ tenants[].indexEntries == totalPrefixes invariant
+// holds; that "" row flows into CacheIndex.status.tenants[], whose listMapKey is
+// `id`. An empty listMapKey value is unusual, so verify the apiserver accepts it
+// (a fake client would not catch a structural-schema rejection).
+func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, _ := startEnv(t)
+	ctx := context.Background()
+
+	served := index.Snapshot{
+		TotalPrefixes: 5,
+		Tenants: []index.TenantSnapshot{
+			{TenantID: "", MemoryUsed: 10, IndexEntries: 2}, // untenanted bucket
+			{TenantID: "team", MemoryUsed: 20, IndexEntries: 3},
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(served)
+	}))
+	defer srv.Close()
+
+	p := &CacheIndexPoller{Client: k8s, SnapshotURL: srv.URL, HTTPClient: srv.Client(), Name: "cluster-default"}
+	if err := p.refresh(ctx); err != nil {
+		t.Fatalf("refresh writing a CacheIndex with an empty-id tenant row: %v", err)
+	}
+
+	var ci cachev1alpha1.CacheIndex
+	if err := k8s.Get(ctx, types.NamespacedName{Name: "cluster-default"}, &ci); err != nil {
+		t.Fatalf("get CacheIndex: %v", err)
+	}
+	var sawUntenanted, sawTeam bool
+	for _, tn := range ci.Status.Tenants {
+		switch tn.ID {
+		case "":
+			sawUntenanted = true
+		case "team":
+			sawTeam = true
+		}
+	}
+	if !sawUntenanted || !sawTeam {
+		t.Fatalf("CacheIndex tenants = %+v, want both \"\" (untenanted) and \"team\"", ci.Status.Tenants)
+	}
+}
+
 // TestIntegrationCacheBackendPrinterColumnsRenderParticipation verifies the
 // operator-facing promise: `kubectl get cachebackend` shows Prefixes and
 // LastEvent columns sourced from status.indexParticipation. We hit the
