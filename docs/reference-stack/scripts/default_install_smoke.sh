@@ -432,6 +432,38 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
+# --- KV-event readiness gate assertion (operator-facing) --------------------
+# The managed backend now has an engine pod attached (matchedEnginePods=1), but
+# the smoke's stub engine (busybox) emits no KV events and the controller runs
+# with no kvevent-subscriber sidecar, so NO KV event will ever be observed.
+# This is exactly the demo-day failure mode the gate exists to surface: engine
+# present, KV-event stream silent. Assert the operator-visible behavior end to
+# end on the real install:
+#   - spec.integration.firstEventTimeout defaulted to 5m (new CRD field +
+#     admission defaulting),
+#   - the gate holds Ready away from True (it is never auto-True on rollout),
+#   - the status.firstKVEventObservedAt latch stays unset (no event seen).
+# These values are stable (no event source exists), so a single read is
+# deterministic — no polling needed.
+fet="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.integration.firstEventTimeout}' 2>/dev/null || true)"
+# Accept both "5m" (CRD-schema default, applied when the integration block is
+# present) and "5m0s" (Go Duration.String(), the webhook-materialized form) —
+# both decode to the same 5m duration.
+if [ "$fet" != "5m" ] && [ "$fet" != "5m0s" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "spec.integration.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
+fi
+gate_ready="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+gate_latch="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.firstKVEventObservedAt}' 2>/dev/null || true)"
+if [ "$gate_ready" = "True" ] || [ -n "$gate_latch" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "KV-event gate not holding: Ready=$gate_ready firstKVEventObservedAt=$gate_latch (want Ready!=True and an empty latch when no KV events are observed)"
+fi
+log "KV-event gate: firstEventTimeout=5m, Ready=$gate_ready (held, no KV events), latch unset"
+
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the
 # Event with this UID, not the empty one a webhook-recorded Event

@@ -88,8 +88,9 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 }
 
 func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
-	// Operator pinned the timeout but left minimumPrefixTokens unset —
-	// defaulter should fill in only the holes.
+	// Operator pinned lookupTimeoutMs but left minimumPrefixTokens and
+	// firstEventTimeout unset — the defaulter should fill in only the holes
+	// and leave the pinned value alone.
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
@@ -101,10 +102,13 @@ func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
 	}
 
 	if *cb.Spec.Integration.LookupTimeoutMs != 25 {
-		t.Errorf("operator timeout clobbered: %d", *cb.Spec.Integration.LookupTimeoutMs)
+		t.Errorf("operator lookupTimeoutMs clobbered: %d", *cb.Spec.Integration.LookupTimeoutMs)
 	}
 	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
 		t.Errorf("minimumPrefixTokens not defaulted")
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
+		t.Errorf("firstEventTimeout not defaulted: got %v", cb.Spec.Integration.FirstEventTimeout)
 	}
 }
 
