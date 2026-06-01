@@ -1,5 +1,5 @@
-# Kubebuilder-generated minimum-viable sample: the smallest CacheTenant that
-# applies cleanly against the current schema. Only the retained quota field is set.
+# Kubebuilder-generated minimum-viable sample: a minimal CacheTenant that
+# applies cleanly against the current schema. Populates maxIndexEntries only.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheTenant
 metadata:

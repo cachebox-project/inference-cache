@@ -1,4 +1,4 @@
-# Kubebuilder-generated minimum-viable sample: the smallest CacheBackend that
+# Kubebuilder-generated minimum-viable sample: a minimal CacheBackend that
 # applies cleanly against the current schema + admission webhook. Hand-curated,
 # scenario-specific recipes live in the sibling cachebackend-*.yaml files.
 apiVersion: inferencecache.io/v1alpha1
