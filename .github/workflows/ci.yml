@@ -79,8 +79,10 @@ jobs:
         make manifests generate
         git diff --exit-code -- config api
 
-    - name: Generate protobufs
-      run: make proto-gen
+    - name: Verify protobufs up to date
+      run: |
+        make proto-gen
+        git diff --exit-code -- proto pkg/server/proto
 
     # Fetch envtest binaries (apiserver + etcd) so the controller integration
     # tests (internal/controller/integration_test.go) run against a real
