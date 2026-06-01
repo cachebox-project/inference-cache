@@ -31,10 +31,8 @@
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
 #   7. The External CacheBackend type end-to-end: applying the committed
-#      config/samples/cachebackend-external.yaml drives the CacheBackend
-#      mutating webhook defaults (lookupTimeoutMs=50,
-#      minimumPrefixTokens=256), renders NO Deployment/Service in its
-#      namespace, status.endpoint mirrors spec.endpoint, observedGeneration
+#      config/samples/cachebackend-external.yaml renders NO Deployment/Service
+#      in its namespace, status.endpoint mirrors spec.endpoint, observedGeneration
 #      is set, the CR goes Ready=True/ExternalEndpointAccepted, and
 #      `kubectl get cb` renders the CacheBackend printer columns. A matching
 #      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
@@ -885,10 +883,6 @@ kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl appl
 kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/dev/null \
   || fail "kubectl apply config/samples/cachebackend-external.yaml failed"
 
-lookup_timeout="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
-  -o jsonpath='{.spec.integration.lookupTimeoutMs}' 2>/dev/null || true)"
-minimum_prefix_tokens="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
-  -o jsonpath='{.spec.integration.minimumPrefixTokens}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
 external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
@@ -902,11 +896,12 @@ if [ -z "$external_pod_labels" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
   fail "External sample did not create spec.engineSelector.matchLabels on $EXT_SMOKE_CB_NAME"
 fi
-if [ "$lookup_timeout" != "50" ] || [ "$minimum_prefix_tokens" != "256" ]; then
-  kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
-  fail "CacheBackend defaulter did not stamp integration defaults: lookupTimeoutMs=$lookup_timeout minimumPrefixTokens=$minimum_prefix_tokens (want 50/256)"
-fi
-log "External CR sample endpoint=$external_spec_endpoint; defaulted integration knobs: lookupTimeoutMs=$lookup_timeout minimumPrefixTokens=$minimum_prefix_tokens"
+# lookupTimeoutMs / minimumPrefixTokens used to be defaulted under
+# spec.integration; PR #57 moved them to CachePolicy, so the defaulter
+# check that used to live here is gone. The CRD trim assertions
+# earlier in the script (around line ~345) already guard against their
+# accidental re-introduction on the CacheBackend surface.
+log "External CR sample endpoint=$external_spec_endpoint"
 
 # Wait for the reconciler to publish status.endpoint + observedGeneration +
 # the Ready=True condition. Sub-second on a quiet cluster; the timeout covers
