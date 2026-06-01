@@ -36,13 +36,20 @@ type CacheTenantSpec struct {
 }
 
 // CacheTenantQuotaSpec defines tenant cache quotas.
+//
+// Only resources the cache plane authoritatively owns get a max* field. The
+// index entry table is ours, so MaxIndexEntries is enforced (over-budget evicts
+// the tenant's oldest entries under Fairness). A per-tenant memory budget is
+// deliberately absent: the engine KV cache is a shared, tenant-unaware LRU pool,
+// so the control plane can neither enforce a byte budget nor honestly attribute
+// bytes per tenant on a shared engine. Per-tenant byte isolation is an
+// engine/runtime concern (separate engine Deployments + pod memory limits).
 type CacheTenantQuotaSpec struct {
-	// MaxMemoryBytes is the maximum cache memory attributed to the tenant.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MaxMemoryBytes *int64 `json:"maxMemoryBytes,omitempty"`
-
-	// MaxIndexEntries is the maximum number of index entries attributed to the tenant.
+	// MaxIndexEntries is the maximum number of distinct prefixes the tenant may
+	// hold in the index. The unit is the distinct prefix key
+	// (tenant, model, hash_scheme, prefix_hash): a prefix held by several replicas
+	// counts once, not once per replica. Over budget, the tenant's oldest prefixes
+	// are evicted (Fairness). 0 is a valid cap (admit nothing).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxIndexEntries *int64 `json:"maxIndexEntries,omitempty"`
@@ -54,16 +61,20 @@ type CacheTenantQuotaSpec struct {
 type CacheTenantCryptoSpec struct{}
 
 // CacheTenantStatus defines observed tenant state.
+//
+// No MemoryUsed field: per-tenant memory is not honestly observable on a shared,
+// tenant-unaware engine (ReplicaStats.cache_memory_bytes is the engine total and
+// would be double-counted across tenants sharing it). Operators who want memory
+// signals read the cluster-wide CacheIndex tenant aggregate / Prometheus.
 type CacheTenantStatus struct {
 	// ObservedGeneration is the latest generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// MemoryUsed is the observed tenant cache memory in bytes.
-	// +optional
-	MemoryUsed *int64 `json:"memoryUsed,omitempty"`
-
-	// IndexEntries is the observed tenant index entry count.
+	// IndexEntries is the observed number of distinct prefixes the tenant holds in
+	// the index (same unit as spec.quota.maxIndexEntries — a multi-replica prefix
+	// counts once). A nil pointer means "not yet computed" (no snapshot observed),
+	// distinct from an observed 0.
 	// +optional
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
 
@@ -77,7 +88,9 @@ type CacheTenantStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=ct
-// +kubebuilder:printcolumn:name="TenantID",type=string,JSONPath=`.spec.tenantID`
+// +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantID`
+// +kubebuilder:printcolumn:name="Entries",type=integer,JSONPath=`.status.indexEntries`
+// +kubebuilder:printcolumn:name="Quota",type=integer,JSONPath=`.spec.quota.maxIndexEntries`
 // +kubebuilder:printcolumn:name="Isolation",type=string,JSONPath=`.spec.isolationMode`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

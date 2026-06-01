@@ -7,9 +7,11 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -22,8 +24,8 @@ import (
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
-// defaultReplicas is the sole Phase-1 default the mutating webhook stamps.
-// Centralised here so the tests pin the same constant the handler uses.
+// Phase-1 defaults applied by the mutating webhook. Centralised here so the
+// tests pin the same constants the handler uses.
 //
 // `spec.integration.failOpen` is NOT stamped here. Its `+kubebuilder:default=true`
 // marker only persists a stored value when the parent `spec.integration` object
@@ -31,7 +33,16 @@ import (
 // "fail open unless explicitly disabled" semantics come from the
 // IntegrationFailOpen reader helper (nil spec / nil field => true), i.e. semantic
 // defaulting at read time, not persisted CRD defaulting.
-const defaultReplicas = int32(1)
+const (
+	defaultReplicas = int32(1)
+	// defaultFirstEventTimeout mirrors the +kubebuilder:default on
+	// spec.integration.firstEventTimeout. The CRD-schema default only applies
+	// when spec.integration is present in the submitted object; when the
+	// operator omits integration entirely the webhook materialises it here, so
+	// stamping the timeout too keeps the persisted CR consistent (rather than
+	// relying on the controller's runtime fallback).
+	defaultFirstEventTimeout = 5 * time.Minute
+)
 
 // memoryOnlyBackends classifies the CacheBackendType values that are
 // architecturally in-memory in Phase 1 and therefore cannot accept a PVC.
@@ -46,11 +57,12 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 }
 
 // CacheBackendDefaulter applies Phase-1 defaults to a CacheBackend at
-// admission time. Today it stamps only spec.replicas; spec.integration is
-// left as-is when unset (downstream code nil-checks it), and
-// spec.integration.failOpen is defaulted at the CRD layer via a
-// +kubebuilder:default marker. It implements [admission.Defaulter] over
-// CacheBackend.
+// admission time. It stamps spec.replicas and materialises spec.integration
+// solely to persist spec.integration.firstEventTimeout (so an omitted
+// integration block still carries the readiness-gate deadline). It does NOT
+// stamp spec.integration.failOpen — that is defaulted semantically at read
+// time via IntegrationFailOpen (nil spec / nil field => true). It implements
+// [admission.Defaulter] over CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
@@ -144,6 +156,13 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	if cb.Spec.Replicas == nil {
 		v := defaultReplicas
 		cb.Spec.Replicas = &v
+	}
+
+	if cb.Spec.Integration == nil {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil {
+		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
 	}
 
 	return nil

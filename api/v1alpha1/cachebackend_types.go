@@ -220,6 +220,42 @@ type CacheBackendIntegrationSpec struct {
 	// +optional
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
 
+	// FirstEventTimeout bounds how long a managed backend may sit
+	// Pending with reason AwaitingFirstKVEvent — the managed cache-backend
+	// workload is Available but no KV event has been observed yet — before
+	// the controller flips it to Degraded with reason NoKVEventsObserved.
+	//
+	// The KV-event readiness gate holds Ready until at least one KV event
+	// has been observed for this backend's replicas
+	// (status.indexParticipation.lastEventAt, projected from engine-pod
+	// reports). That proves the engine's ZMQ KV-event publisher is actually
+	// publishing — not merely that the managed workload rolled out. An engine
+	// can be serving HTTP while its publisher is silent (mis-configured
+	// --kv-events-config, ZMQ bind failure, in-process publisher crash), or no
+	// engine pods may be attached to the backend at all; either way the cache
+	// plane silently degrades to NO_HINT on every lookup, and this gate makes
+	// that loud.
+	//
+	// The timeout clock starts when the managed cache-backend workload first
+	// reports Available. The gate is on by default and opt-out per CacheBackend
+	// via the annotation inferencecache.io/require-kv-events: "false". Backends
+	// of spec.type External are always exempt (their readiness is determined by
+	// admission accepting the endpoint, and they never enter this gate).
+	//
+	// A zero or negative value is treated as unset and falls back to the 5m
+	// default — the field carries no meaningful "wait forever" or "fail
+	// immediately" semantics.
+	//
+	// The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
+	// schema types it as a string; a malformed value is rejected when
+	// admission decodes the object into this typed field, and if admission is
+	// bypassed the controller's typed read fails loudly (it never silently
+	// mis-parses). This matches how the API treats every metav1.Duration
+	// field; no extra CRD-level format constraint is imposed.
+	// +optional
+	// +kubebuilder:default="5m"
+	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
+
 	// FailOpen controls whether the engine treats cache lookups as a soft
 	// dependency. When true (the default), an unreachable or degraded cache
 	// backend MUST fall back to local prefill and never fail a serving
@@ -453,6 +489,39 @@ type CacheBackendStatus struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// FirstKVEventObservedAt latches the first time the KV-event readiness
+	// gate observed status.indexParticipation.lastEventAt populated for this
+	// backend. It is the durable "have we EVER seen a KV event" signal the
+	// gate needs: lastEventAt itself is a current-view projection the
+	// CacheIndex poller legitimately clears when a backend's replicas drain
+	// (scale-down, prefixes TTL'd), so reading it alone would let a backend
+	// that already passed the gate regress to AwaitingFirstKVEvent. Written
+	// write-once by the controller and never cleared (a monotonic marker; the
+	// gate is a first-event startup probe, not an ongoing liveness check). It
+	// is inert while the backend is not managed (External / unsupported
+	// runtime), and remains set so a return to the managed path stays Ready
+	// without re-gating — consistent with the "ever observed" contract.
+	// +optional
+	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
+
+	// FirstAvailableAt latches the first time the managed cache-backend
+	// workload was observed Available — the stable anchor for the
+	// firstEventTimeout clock. It is deliberately a latched timestamp rather
+	// than the live Deployment's Available condition LastTransitionTime: that
+	// condition resets on an availability flap, which would restart the
+	// timeout window and let a backend that already breached the timeout
+	// (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
+	// without any KV event — contradicting the "once Degraded, stays Degraded
+	// until an event arrives" contract. Anchoring on this write-once value
+	// keeps the elapsed window monotonic, so Degraded is sticky. Written
+	// write-once when the workload first reports Available and never cleared
+	// (inert while the backend is not managed). A genuinely recreated managed
+	// Deployment keeps the prior anchor; the gate re-evaluates from it, which
+	// is safe because the engine event source is unchanged by a cache-server
+	// restart.
+	// +optional
+	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
 
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups

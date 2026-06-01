@@ -24,16 +24,19 @@ const metricNamespace = "inferencecache"
 // registers to controller-runtime's registry, and (b) tests can construct
 // multiple Services without "duplicate metrics collector registration" panics.
 //
-// The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
-// owned by the standalone metric-schema work (F3); B5 ships only the endpoint
-// plus the documented liveness gauge `inferencecache_server_up`.
+// The registry exposes the liveness gauge `inferencecache_server_up` plus the
+// metrics wired since B5: `index_entries`, the `lookup_route_*` call/latency
+// series, `snapshot_auth_total`, and `tenant_evictions_total` (see
+// docs/reference/metrics.md). The full §4.3 metric schema is still owned by the
+// standalone metric-schema work (F3); these are the subset shipped so far.
 type serverMetrics struct {
-	registry      *prometheus.Registry
-	up            prometheus.Gauge
-	indexEntries  *prometheus.GaugeVec
-	lookupCalls   *prometheus.CounterVec
-	lookupLatency *prometheus.HistogramVec
-	snapshotAuth  *prometheus.CounterVec
+	registry        *prometheus.Registry
+	up              prometheus.Gauge
+	indexEntries    *prometheus.GaugeVec
+	lookupCalls     *prometheus.CounterVec
+	lookupLatency   *prometheus.HistogramVec
+	tenantEvictions *prometheus.CounterVec
+	snapshotAuth    *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -59,6 +62,11 @@ func newServerMetrics() *serverMetrics {
 		// Cache-path lookups target sub-millisecond; bucket from 100µs up.
 		Buckets: []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
 	}, []string{"model"})
+	tenantEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "tenant_evictions_total",
+		Help:      "Index prefixes evicted to enforce a CacheTenant quota, by tenant and reason.",
+	}, []string{"tenant_id", "reason"})
 	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "snapshot_auth_total",
@@ -71,18 +79,20 @@ func newServerMetrics() *serverMetrics {
 		indexEntries,
 		lookupCalls,
 		lookupLatency,
+		tenantEvictions,
 		snapshotAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
 	return &serverMetrics{
-		registry:      registry,
-		up:            up,
-		indexEntries:  indexEntries,
-		lookupCalls:   lookupCalls,
-		lookupLatency: lookupLatency,
-		snapshotAuth:  snapshotAuth,
+		registry:        registry,
+		up:              up,
+		indexEntries:    indexEntries,
+		lookupCalls:     lookupCalls,
+		lookupLatency:   lookupLatency,
+		tenantEvictions: tenantEvictions,
+		snapshotAuth:    snapshotAuth,
 	}
 }
 
@@ -96,6 +106,12 @@ func (m *serverMetrics) RecordAuthResult(result auth.Result) {
 // index.Metrics so the index can push counts as it mutates.
 func (m *serverMetrics) SetIndexEntries(model string, entries int) {
 	m.indexEntries.WithLabelValues(model).Set(float64(entries))
+}
+
+// AddTenantEvictions records n quota-driven entry evictions for a tenant.
+// Satisfies index.Metrics.
+func (m *serverMetrics) AddTenantEvictions(tenantID, reason string, n int) {
+	m.tenantEvictions.WithLabelValues(tenantID, reason).Add(float64(n))
 }
 
 // observeLookup records one LookupRoute call's outcome and latency.

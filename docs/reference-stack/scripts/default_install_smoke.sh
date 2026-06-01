@@ -11,9 +11,12 @@
 #   2. The CacheIndex poller is writing status: `cacheindex/cluster-default`
 #      has a non-empty `.status.observedServer` within ~60s (one or two poll
 #      cycles past the 30s default refresh).
-#   3. The gRPC surface is reachable: a `LookupRoute` for an unknown model
+#   3. The per-CacheTenant status projection works: an applied `CacheTenant`
+#      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
+#      smoke) and a `Ready=True` condition written by the same poller.
+#   4. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
-#   4. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   5. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -23,14 +26,14 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   5. The External CacheBackend type end-to-end: applying a `type: External`
+#   6. The External CacheBackend type end-to-end: applying a `type: External`
 #      CR renders NO Deployment/Service in its namespace, status.endpoint
 #      mirrors spec.endpoint, the CR goes Ready=True/ExternalEndpointAccepted,
 #      and a matching engine pod is admitted with `LMCACHE_REMOTE_URL=lm://
 #      <spec.endpoint>` injected by the pod-mutating webhook. Also exercises
 #      the new admission validation rules (non-External + endpoint and
 #      External + bad scheme are both rejected at write time).
-#   6. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
 #
@@ -100,6 +103,11 @@ SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
 # engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
 # terminate round-trip.
 SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
+# KV-event gate: time budget for the managed cache-server Deployment to pull
+# its image and reach Available, then for the gate to publish
+# AwaitingFirstKVEvent. The image pull dominates on a cold node, hence the
+# larger default than the other sample waits.
+SAMPLE_GATE_TIMEOUT="${SAMPLE_GATE_TIMEOUT:-240}"
 # Tiny stand-in for the vLLM image. The webhook injects on pod CREATE; the
 # engine doesn't need to run for the operator-facing signals (Matched,
 # annotation, Event) to materialize. Avoids a multi-GB pull in CI.
@@ -149,6 +157,8 @@ collect_diagnostics() {
     >"$LOG_DIR/logs-server.txt" 2>&1 || true
   kubectl get cacheindex cluster-default -o yaml \
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
+  kubectl get cachetenants -A -o yaml \
+    >"$LOG_DIR/cachetenants.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
   # Paired-sample state — only populated if the sample-smoke phase ran;
@@ -318,6 +328,47 @@ until [ -n "$observed" ]; do
 done
 log "cacheindex/cluster-default.status.observedServer=$observed"
 
+# --- CacheTenant status projection assertion -------------------------------
+# Apply a CacheTenant and prove the poller's per-tenant projection writes its
+# status. The smoke cluster has no engine pods, so the tenant holds zero
+# prefixes: the projection must report indexEntries=0 (observed-zero, not nil)
+# with Ready=True. This exercises the CacheTenant CRD schema, the combined
+# CachePolicy+CacheTenant push to /policy, and the per-tenant status writer.
+log "applying CacheTenant sample and waiting for its status projection"
+kubectl apply -f config/samples/cache_v1alpha1_cachetenant.yaml
+deadline=$(($(date +%s) + CACHEINDEX_TIMEOUT))
+ct_entries=""
+until [ -n "$ct_entries" ]; do
+  ct_entries="$(kubectl get cachetenant cachetenant-sample \
+    -o jsonpath='{.status.indexEntries}' 2>/dev/null || true)"
+  if [ -n "$ct_entries" ]; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl get cachetenant cachetenant-sample -o yaml || true
+    fail "cachetenant-sample.status.indexEntries was empty after ${CACHEINDEX_TIMEOUT}s"
+  fi
+  sleep 3
+done
+if [ "$ct_entries" != "0" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample.status.indexEntries=0 (no traffic), got: $ct_entries"
+fi
+ct_ready="$(kubectl get cachetenant cachetenant-sample \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+if [ "$ct_ready" != "True" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample Ready=True, got: ${ct_ready:-<unset>}"
+fi
+
+# The printer columns (Tenant / Entries / Quota) are themselves an operator-
+# facing surface. Verify `kubectl get cachetenants` renders them — a default
+# table with only NAME/AGE would mean the additionalPrinterColumns regressed.
+ct_table="$(kubectl get cachetenant cachetenant-sample 2>/dev/null || true)"
+if ! grep -q 'tenant-a' <<<"$ct_table" || ! grep -q '100000' <<<"$ct_table"; then
+  echo "$ct_table"
+  fail "expected CacheTenant printer columns (Tenant=tenant-a, Quota=100000) in kubectl get output"
+fi
+log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready (printer columns OK)"
+
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
 mkdir -p "$LOG_DIR"
@@ -462,6 +513,66 @@ if [ "$matched" != "1" ]; then
   fail "status.matchedEnginePods=$matched, want 1 after ${SAMPLE_MATCH_TIMEOUT}s"
 fi
 log "status.matchedEnginePods=1"
+
+# --- KV-event readiness gate assertion (operator-facing) --------------------
+# The managed backend has an engine pod attached (matchedEnginePods=1), but the
+# smoke's stub engine (busybox) emits no KV events and the controller runs with
+# no kvevent-subscriber sidecar, so NO KV event will ever be observed — the
+# exact demo-day failure mode the gate exists to surface (engine present,
+# KV-event stream silent). We assert the gate's operator-visible surfaces end to
+# end on the real install:
+#   - spec.integration.firstEventTimeout defaulted to 5m (new CRD field +
+#     admission defaulting);
+#   - once the managed cache-server reaches Available, the gate holds the
+#     backend at Ready=False / reason AwaitingFirstKVEvent — the deterministic
+#     condition surface (Ready can never become True here, so without the gate
+#     the backend would have been reported Ready on rollout);
+#   - status.firstKVEventObservedAt stays UNSET — the durable latch is written
+#     the instant a KV event is observed, so its absence is the gate-specific
+#     "nothing observed" signal.
+fet="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.integration.firstEventTimeout}' 2>/dev/null || true)"
+# Accept both "5m" (CRD-schema default, applied when the integration block is
+# present) and "5m0s" (Go Duration.String(), the webhook-materialized form) —
+# both decode to the same 5m duration.
+if [ "$fet" != "5m" ] && [ "$fet" != "5m0s" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "spec.integration.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
+fi
+
+# The gate only evaluates once the managed cache-server Deployment is Available,
+# so wait for that first; then the awaited state is deterministic (no events).
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the managed cache-server Deployment to reach Available"
+if ! kubectl -n "$SAMPLE_NS" wait --for=condition=Available --timeout="${SAMPLE_GATE_TIMEOUT}s" \
+     deployment/qwen-demo-cache >/dev/null 2>&1; then
+  kubectl -n "$SAMPLE_NS" get deployment/qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "managed cache-server Deployment did not reach Available within ${SAMPLE_GATE_TIMEOUT}s; cannot exercise the KV-event gate"
+fi
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the gate to publish Ready=False / AwaitingFirstKVEvent"
+deadline=$(($(date +%s) + SAMPLE_GATE_TIMEOUT))
+gate_status=""
+gate_reason=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  gate_status="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  gate_reason="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  if [ "$gate_status" = "False" ] && [ "$gate_reason" = "AwaitingFirstKVEvent" ]; then break; fi
+  sleep 2
+done
+if [ "$gate_status" != "False" ] || [ "$gate_reason" != "AwaitingFirstKVEvent" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "KV-event gate not engaged: Ready=$gate_status/$gate_reason, want False/AwaitingFirstKVEvent (engine attached, no KV events)"
+fi
+
+gate_latch="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.firstKVEventObservedAt}' 2>/dev/null || true)"
+if [ -n "$gate_latch" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "status.firstKVEventObservedAt=$gate_latch, want unset (no KV event source exists, so the gate latch must never be written)"
+fi
+log "KV-event gate engaged: firstEventTimeout=$fet, Ready=False/AwaitingFirstKVEvent, firstKVEventObservedAt unset"
 
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the
@@ -795,4 +906,4 @@ case "$probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"

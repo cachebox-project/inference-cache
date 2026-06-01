@@ -172,8 +172,17 @@ spec:
                         string (e.g. "0.82").
                       type: string
                     id:
-                      description: ID is the tenant identifier.
+                      description: |-
+                        ID is the tenant identifier. The empty string is the untenanted bucket
+                        (prefixes ingested with no tenant ID); no real CacheTenant uses it.
                       type: string
+                    indexEntries:
+                      description: |-
+                        IndexEntries is the number of distinct prefixes the tenant holds in the
+                        index. Across all tenant rows these sum to prefixes.summary.total by
+                        construction — the per-tenant breakdown of the cluster prefix count.
+                      format: int64
+                      type: integer
                     memoryUsed:
                       description: |-
                         MemoryUsed is the approximate cache memory attributed to the tenant

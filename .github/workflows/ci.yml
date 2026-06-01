@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-test-proto:
-    name: Lint, Test, Proto
+  lint-generated-proto:
+    name: Lint, Generated Code, Proto
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,16 +32,25 @@ jobs:
         go-version-file: go.mod
         cache: true
 
-    - name: Install protoc
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
-
     - name: Verify vendor-neutral naming
       run: make verify-naming
 
     - name: Verify no internal issue-tracker references
       run: make verify-no-internal-refs
+
+    - name: Install protoc
+      env:
+        PROTOC_VERSION: 34.1
+        PROTOC_SHA256: af27ea66cd26938fe48587804ca7d4817457a08350021a1c6e23a27ccc8c6904
+      run: |
+        set -euo pipefail
+        archive="$RUNNER_TEMP/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        curl -fsSL -o "$archive" "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        echo "${PROTOC_SHA256}  $archive" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/protoc"
+        unzip -q "$archive" -d "$RUNNER_TEMP/protoc"
+        echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/protoc/bin/protoc" --version
 
     - name: Set up buf
       uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99  # v1
@@ -79,8 +88,28 @@ jobs:
         make manifests generate
         git diff --exit-code -- config api
 
-    - name: Generate protobufs
-      run: make proto-gen
+    - name: Verify protobufs up to date
+      run: |
+        make proto-gen
+        if [ -n "$(git status --porcelain -- pkg/server/proto)" ]; then
+          git status --short -- pkg/server/proto
+          exit 1
+        fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
 
     # Fetch envtest binaries (apiserver + etcd) so the controller integration
     # tests (internal/controller/integration_test.go) run against a real
@@ -104,18 +133,88 @@ jobs:
     - name: Coverage gate
       run: make cover-check
 
+  vulnerability-scan:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
     # Blocking: the dependency graph (Go toolchain, x/net, grpc) is clear of
     # called vulnerabilities. A regression here fails CI.
     - name: Vulnerability scan
       run: make vulncheck
 
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
     - name: Build binaries
       run: make build
+
+  lint-test-proto:
+    name: Lint, Test, Proto
+    runs-on: ubuntu-latest
+    needs:
+    - lint-generated-proto
+    - test
+    - vulnerability-scan
+    - build
+    if: always()
+    permissions:
+      contents: read
+    steps:
+    - name: Check split CI jobs
+      env:
+        LINT_GENERATED_PROTO_RESULT: ${{ needs.lint-generated-proto.result }}
+        TEST_RESULT: ${{ needs.test.result }}
+        VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: |
+        failed=0
+        for item in \
+          "lint-generated-proto:$LINT_GENERATED_PROTO_RESULT" \
+          "test:$TEST_RESULT" \
+          "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
+          "build:$BUILD_RESULT"; do
+          name="${item%%:*}"
+          result="${item#*:}"
+          if [ "$result" != "success" ]; then
+            echo "✗ $name finished with result=$result"
+            failed=1
+          else
+            echo "✓ $name passed"
+          fi
+        done
+        exit "$failed"
 
   image-build:
     name: Image Build
     runs-on: ubuntu-latest
-    needs: lint-test-proto
+    needs:
+    - lint-generated-proto
+    - test
+    - vulnerability-scan
+    - build
     permissions:
       contents: read
       # Required for Trivy SARIF upload to the Security tab.

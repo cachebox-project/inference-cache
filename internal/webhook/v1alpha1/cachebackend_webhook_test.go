@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,13 +42,19 @@ func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
 	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != defaultReplicas {
 		t.Errorf("replicas = %v, want %d", cb.Spec.Replicas, defaultReplicas)
 	}
-	// The defaulter no longer materialises an integration block: lookup
-	// tuning lives on CachePolicy, and failOpen's effective default is applied
-	// at read time by IntegrationFailOpen (the CRD +kubebuilder:default only
-	// persists when the parent integration object is present). An unset
-	// integration spec is therefore left nil.
-	if cb.Spec.Integration != nil {
-		t.Errorf("integration block = %+v, want nil", cb.Spec.Integration)
+	// The defaulter materialises spec.integration solely to persist
+	// firstEventTimeout: the CRD-schema default for firstEventTimeout only
+	// applies when spec.integration is present in the submitted object, so the
+	// common CR that omits integration entirely relies on the webhook stamping
+	// it here. (The retired lookupTimeoutMs/minimumPrefixTokens fields are no
+	// longer part of the type — lookup tuning lives on CachePolicy — and
+	// failOpen's effective default is applied at read time by
+	// IntegrationFailOpen, not stamped here.)
+	if cb.Spec.Integration == nil {
+		t.Fatal("integration block not materialised")
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
+		t.Errorf("firstEventTimeout = %v, want %s", cb.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
 	}
 }
 
@@ -55,6 +62,9 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(7)
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		FirstEventTimeout: &metav1.Duration{Duration: 90 * time.Second},
+	}
 
 	if err := d.Default(context.Background(), cb); err != nil {
 		t.Fatalf("Default returned error: %v", err)
@@ -62,6 +72,28 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 
 	if *cb.Spec.Replicas != 7 {
 		t.Errorf("replicas clobbered: got %d, want 7", *cb.Spec.Replicas)
+	}
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 90*time.Second {
+		t.Errorf("firstEventTimeout clobbered: got %v, want 90s", cb.Spec.Integration.FirstEventTimeout)
+	}
+}
+
+func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
+	// Operator pinned firstEventTimeout on an otherwise-empty integration
+	// block — the defaulter should leave the pinned value alone (and there are
+	// no other integration fields left for it to fill in).
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		FirstEventTimeout: &metav1.Duration{Duration: 30 * time.Second},
+	}
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 30*time.Second {
+		t.Errorf("operator firstEventTimeout clobbered: got %v, want 30s", cb.Spec.Integration.FirstEventTimeout)
 	}
 }
 
