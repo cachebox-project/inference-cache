@@ -12,10 +12,13 @@ import (
 // server accepts. Bumped on a breaking schema change so a stale controller
 // can refuse to push (the controller writes the same constant on each PUT).
 //
-// v2 added the Tenants slice (CacheTenant quota propagation). The bump matters
-// because the handler decodes with DisallowUnknownFields: a v1 server would
-// reject a v2 body's tenants field outright, and the explicit version guard
-// turns that into a clear "unsupported version" error instead of a decode error.
+// v2 added the Tenants slice (CacheTenant quota propagation). The version field
+// is the forward-looking guard: a server rejects a body whose version it does
+// not recognize, so a future v3 controller pushing to a v2 server fails loudly
+// with a clear "unsupported version" rather than silently losing fields. (A v1
+// server predates this field and would instead reject a v2 body's unknown
+// `tenants` at decode time under DisallowUnknownFields — also a hard failure,
+// just a less descriptive one.)
 const PolicyPropagationVersion = 2
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:

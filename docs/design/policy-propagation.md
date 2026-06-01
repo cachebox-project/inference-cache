@@ -33,8 +33,9 @@ per-tenant cache metadata under the cluster's trust boundary while
 
 ## Snapshot semantics
 
-The controller always sends a FULL snapshot of one resolved policy per
-namespace (see "Multiple CachePolicies in one namespace" below). The
+The controller always sends a FULL snapshot: one resolved policy per namespace
+(see "Multiple CachePolicies in one namespace" below) PLUS one resolved tenant
+entry per quota-bearing `CacheTenant` (keyed by `tenantID`). The
 server adopts **replace-on-write**: the snapshot becomes the new state,
 and any namespace not present reverts to server defaults. A CR delete
 therefore propagates as "next snapshot omits this namespace."

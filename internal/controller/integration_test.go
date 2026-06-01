@@ -1212,7 +1212,9 @@ func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
 		t.Fatalf("get CacheIndex: %v", err)
 	}
 	var sawUntenanted, sawTeam bool
+	var sum int64
 	for _, tn := range ci.Status.Tenants {
+		sum += tn.IndexEntries
 		switch tn.ID {
 		case "":
 			sawUntenanted = true
@@ -1222,6 +1224,11 @@ func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
 	}
 	if !sawUntenanted || !sawTeam {
 		t.Fatalf("CacheIndex tenants = %+v, want both \"\" (untenanted) and \"team\"", ci.Status.Tenants)
+	}
+	// The invariant is verifiable from the CacheIndex CR: Σ tenants[].indexEntries
+	// == prefixes.summary.total (2 + 3 == 5).
+	if sum != int64(ci.Status.Prefixes.Summary.Total) {
+		t.Fatalf("Σ tenants[].indexEntries = %d, want == prefixes.summary.total %d", sum, ci.Status.Prefixes.Summary.Total)
 	}
 }
 

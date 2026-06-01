@@ -24,9 +24,11 @@ const metricNamespace = "inferencecache"
 // registers to controller-runtime's registry, and (b) tests can construct
 // multiple Services without "duplicate metrics collector registration" panics.
 //
-// The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
-// owned by the standalone metric-schema work (F3); B5 ships only the endpoint
-// plus the documented liveness gauge `inferencecache_server_up`.
+// The registry exposes the liveness gauge `inferencecache_server_up` plus the
+// metrics wired since B5: `index_entries`, the `lookup_route_*` call/latency
+// series, `snapshot_auth_total`, and `tenant_evictions_total` (see
+// docs/reference/metrics.md). The full §4.3 metric schema is still owned by the
+// standalone metric-schema work (F3); these are the subset shipped so far.
 type serverMetrics struct {
 	registry        *prometheus.Registry
 	up              prometheus.Gauge

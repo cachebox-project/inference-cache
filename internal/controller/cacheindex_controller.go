@@ -583,9 +583,10 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 	sort.Slice(st.Replicas, func(a, b int) bool { return st.Replicas[a].ID < st.Replicas[b].ID })
 	for _, t := range snap.Tenants {
 		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
-			ID:         t.TenantID,
-			MemoryUsed: t.MemoryUsed,
-			HitRate:    formatRate(t.HitRate),
+			ID:           t.TenantID,
+			IndexEntries: t.IndexEntries,
+			MemoryUsed:   t.MemoryUsed,
+			HitRate:      formatRate(t.HitRate),
 		})
 	}
 	return st
