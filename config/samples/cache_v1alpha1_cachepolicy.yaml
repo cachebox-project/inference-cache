@@ -7,7 +7,8 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachepolicy-sample
 spec:
-  eviction: LRU
+  # eviction intentionally omitted to exercise the +kubebuilder:default=LRU
+  # marker — the install-smoke asserts the printer column still renders LRU.
   evictionTTL: 30m
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
