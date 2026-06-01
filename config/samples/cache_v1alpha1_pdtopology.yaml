@@ -1,3 +1,7 @@
+# Minimum sample for kind=PDTopology.
+# This is the kubebuilder-generated default; it MUST apply cleanly to the
+# current schema. PDTopology is types-only today (no controller); fields are
+# structural scaffolding only.
 apiVersion: inferencecache.io/v1alpha1
 kind: PDTopology
 metadata:

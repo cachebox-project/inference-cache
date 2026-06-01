@@ -1,3 +1,9 @@
+# Minimum sample for kind=CacheTenant.
+# This is the kubebuilder-generated default; it MUST apply cleanly to the
+# current schema. Only the index-entry quota is enforceable today; per-tenant
+# byte budgets on shared engines are out of scope (engines aren't
+# tenant-aware) — use separate engine Deployments + Pod memory limits per
+# tenant if you need byte isolation.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheTenant
 metadata:

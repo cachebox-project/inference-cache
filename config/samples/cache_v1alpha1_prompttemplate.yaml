@@ -1,3 +1,7 @@
+# Minimum sample for kind=PromptTemplate.
+# This is the kubebuilder-generated default; it MUST apply cleanly to the
+# current schema. PromptTemplate is types-only today (no controller);
+# the render pipeline lands with the mutable-slot wedge.
 apiVersion: inferencecache.io/v1alpha1
 kind: PromptTemplate
 metadata:

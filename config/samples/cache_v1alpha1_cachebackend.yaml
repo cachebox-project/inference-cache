@@ -1,3 +1,8 @@
+# Minimum sample for kind=CacheBackend.
+# This is the kubebuilder-generated default; it MUST apply cleanly to the
+# current schema. For real-world deployment recipes (CPU-runnable, override
+# examples, paired engine Deployments), see the hand-curated samples in this
+# directory (cachebackend-*.yaml).
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -9,16 +14,16 @@ spec:
   type: LMCache
   deploymentKind: StatefulSet
   replicas: 1
-  storage:
-    pvc:
-      size: 10Gi
   integration:
-    engine: SGLang
+    # Runtime ID (not adapter name). Canonical values: "vllm" (default if
+    # empty) and "sglang". Case-insensitive on ingest. The (engine, type)
+    # pair selects the adapter; today only (vllm, LMCache) and
+    # (vllm, External) are wired.
+    engine: vllm
     role: ReadWrite
-    lookupTimeoutMs: 20
-    minimumPrefixTokens: 32
   engineSelector:
     matchLabels:
       inferencecache.io/cache-enabled: "true"
   backendConfig:
-    evictionPolicy: LRU
+    # Tiny ungated model, CPU-runnable per the project's CPU-path docs.
+    model: Qwen/Qwen2.5-0.5B-Instruct

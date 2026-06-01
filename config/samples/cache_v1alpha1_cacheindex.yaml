@@ -1,3 +1,7 @@
+# Minimum sample for kind=CacheIndex.
+# This is the kubebuilder-generated default; it MUST apply cleanly to the
+# current schema. CacheIndex is cluster-scoped and status-only; the
+# controller maintains a single "cluster-default" CR.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheIndex
 metadata:
