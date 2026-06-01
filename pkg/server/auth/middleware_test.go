@@ -325,7 +325,7 @@ func TestNewAuthenticator_RequiredFields(t *testing.T) {
 //     server's identity check, and the only signal would be in production
 //     metric labels.
 //   - When Options.Audience is empty (the legacy / in-process-test posture
-//     exposed via server.WithSnapshotAuth), the field MUST stay nil so the
+//     exposed via server.WithControllerAuth), the field MUST stay nil so the
 //     apiserver doesn't reject every request as a no-audiences-match.
 //
 // Envtest covers the apiserver-enforcement half of this against a real

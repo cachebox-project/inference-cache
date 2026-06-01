@@ -103,7 +103,7 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	// Mint SA tokens via TokenRequest and stage them on disk the way
 	// kubelet projects them — trailing newline, mode 0o600. The poller's
 	// bearerToken() trims the newline before sending. mintTokenFile binds
-	// the snapshot audience to mirror the production projected-volume
+	// the controller audience to mirror the production projected-volume
 	// shape (kubelet bakes audience into the JWT, apiserver enforces it
 	// at TokenReview); mintTokenFileWithAudience supports the wrong-
 	// audience negative case below.
@@ -184,7 +184,7 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 
 	// Wrong-audience: a TokenRequest minted for the CORRECT SA but with a
 	// different audience. The apiserver bakes audience into the JWT and
-	// rejects it under TokenReview.Audiences=[snapshot], so the middleware
+	// rejects it under TokenReview.Audiences=[controller], so the middleware
 	// returns 401 even though the SA identity would otherwise be admitted.
 	// This is the over-the-wire complement to the in-process middleware
 	// envtest in pkg/server/auth and pins the same audience-binding contract

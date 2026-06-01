@@ -5,15 +5,16 @@ import (
 	"testing"
 )
 
-// TestValidateSnapshotAuthFlags pins the operator-facing startup contract for
-// the /snapshot auth flag combinations. Each row is a real shape an operator
-// might wire — including the failure modes the previous validation existed to
-// catch (silent unauth, audience-empty bypass, both knobs on at once).
+// TestValidateControllerAuthFlags pins the operator-facing startup contract for
+// the controller-facing auth flag combinations that gate BOTH /snapshot and
+// /policy. Each row is a real shape an operator might wire — including the
+// failure modes the validation exists to catch (silent unauth,
+// audience-empty bypass, whitespace-bracketed values, both knobs on at once).
 //
 // The diagnostic message is asserted only by substring (the user-visible cue
 // the failure points at) so the wording can evolve without breaking the
 // contract test.
-func TestValidateSnapshotAuthFlags(t *testing.T) {
+func TestValidateControllerAuthFlags(t *testing.T) {
 	const (
 		ctrlSA = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
 		aud    = "inferencecache.io/controller"
