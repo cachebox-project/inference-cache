@@ -214,9 +214,10 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 	_ = drainEvents(rec)
 
-	// Now drive a Ready → Degraded transition while apply errors. Mutating
-	// the CR forces applyDeployment to issue an Update; degrading the live
-	// Deployment status (AvailableReplicas=0) drives the health transition.
+	// Now drive a Ready=True → Ready=False/ReplicasUnavailable transition
+	// while apply errors. Mutating the CR forces applyDeployment to issue
+	// an Update; degrading the live Deployment status (AvailableReplicas=0)
+	// drives the readiness transition.
 	blockUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
 	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}

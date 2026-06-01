@@ -62,8 +62,9 @@ const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 // Event reasons emitted on a CacheBackend.
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
-// and BackendRecovered narrate transitions of the managed workload's health
-// so operators see backend readiness changes in `kubectl describe`. The
+// and BackendRecovered narrate transitions of the managed workload's
+// availability so operators see backend readiness changes in `kubectl
+// describe`. The
 // FailClosedEnabled / FailOpenRestored pair narrates transitions of the
 // spec.integration.failOpen toggle — explicitly fail-closed is loud because
 // the cache then becomes a serving dependency.
@@ -217,12 +218,13 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	// Emit transitions whenever dispatch published a status change, even on
 	// an apply-error reconcile: the status path runs independently of apply
-	// success (so apply churn doesn't freeze user-visible health), and the
-	// next reconcile's snapshot is taken from the *post-patch* CR. Gating
-	// emission on err==nil would mean a Degraded transition observed during
-	// an apply-error pass is permanently lost. emitTransitionEvents only
-	// fires when before != after, so an error path that didn't change status
-	// (e.g. early return before the status patch) emits nothing.
+	// success (so apply churn doesn't freeze the user-visible Ready
+	// condition), and the next reconcile's snapshot is taken from the
+	// *post-patch* CR. Gating emission on err==nil would mean a transition
+	// into Ready=False/ReplicasUnavailable observed during an apply-error
+	// pass is permanently lost. emitTransitionEvents only fires when before
+	// != after, so an error path that didn't change status (e.g. early
+	// return before the status patch) emits nothing.
 	r.emitTransitionEvents(&backend, before)
 	return result, err
 }

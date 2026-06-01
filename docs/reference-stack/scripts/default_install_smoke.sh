@@ -411,6 +411,28 @@ if [ -z "$endpoint" ]; then
 fi
 log "status.endpoint=$endpoint"
 
+# The Ready printer column is driven by .status.conditions[Ready].status —
+# poll the same JSONPath kubebuilder writes into the printcolumn annotation
+# so we exercise the operator-facing column on a real install (a CRD-side
+# JSONPath typo would break the column without breaking any unit test). The
+# Deployment takes a few reconciles to roll out, so this can run after the
+# endpoint check.
+log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for the Ready condition to be True"
+deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
+ready=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  ready=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  if [ "$ready" = "True" ]; then break; fi
+  sleep 2
+done
+if [ "$ready" != "True" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" describe deployment qwen-demo-cache || true
+  fail "CacheBackend Ready condition status=$ready, want True after ${SAMPLE_ENDPOINT_TIMEOUT}s"
+fi
+log "Ready=True"
+
 log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
 # Split files live under $tmpdir and are removed by the trap; no
