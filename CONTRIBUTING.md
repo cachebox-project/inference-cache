@@ -131,6 +131,21 @@ Run `make install-hooks` once per clone. Thereafter:
 
 Emergency override for the push gate: `git push --no-verify` (discouraged).
 
+### Operator-facing changes must extend the install-smoke gate
+
+The per-PR install-smoke gate — [`docs/reference-stack/scripts/default_install_smoke.sh`](docs/reference-stack/scripts/default_install_smoke.sh), wired via `.github/workflows/default-install-smoke.yml` — spins up a kind cluster, installs `config/default`, and asserts the bundle actually comes up. **When your change alters an operator-facing surface, extend that script with an assertion that drives the surface end-to-end in the cluster.** Operator-facing surfaces include:
+
+- CRD fields and `additionalPrinterColumns` (the `kubectl get` output operators read);
+- CR `.status` surfaces;
+- CLI output;
+- gRPC / HTTP behavior;
+- the default-install bundle or its RBAC;
+- sample manifests.
+
+A good assertion drives the surface the way an operator would: apply the relevant CR, wait for the controller to write status, then assert the observable (a `.status` field, a printer column, a gRPC response). The smoke runs with **no engine traffic**, so assert the no-traffic / "observed-zero" steady state — e.g. the cluster `CacheIndex` reports a populated `.status.observedServer` — rather than anything that needs real cache hits.
+
+Worked example: the CacheIndex poller assertion in that script applies nothing exotic but waits for the controller to populate `cacheindex/cluster-default`'s `.status.observedServer` and fails if it stays empty — the same shape every per-feature assertion should follow.
+
 ## Repository layout — where new code goes
 
 See the README's "Repository layout" for the full map. In short:

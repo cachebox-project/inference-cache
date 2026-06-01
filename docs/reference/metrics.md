@@ -49,6 +49,8 @@ silently.
 |---|---|---|---|
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
 | `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — see note below), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses both "kube-apiserver checked the token and rejected it" AND "an authenticator in the chain populated `Status.Error`" because the two are NOT distinguishable from the response shape (verified empirically: kube-apiserver's SA-token authenticator populates `Status.Error` for routine JWT-parse failures of garbage strings, the same field a webhook-authenticator timeout would set). When `Status.Error` is non-empty the middleware logs it at WARN to the server log so the operator can still tell apart "webhook timeout" from "invalid bearer token" via the diagnostic. A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
+| `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error`. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Read- and write-side caches are independent — the same controller token cache-misses once per endpoint per TTL window in the steady state. |
+| `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 
 ### Histograms
 
@@ -82,6 +84,17 @@ with OTEL collectors) without bumping `v1alpha1`.
 - **`lookupCalls` + `lookupLatency` writers:** the `LookupRoute` handler in
   [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go)
   calls `metrics.observeLookup(...)` exactly once per request.
+- **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
+  `index.Metrics` interface after a quota-driven eviction at ingest; see
+  [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
+- **`snapshotAuth` + `policyAuth` writers:** the TokenReview middleware in
+  [`pkg/server/auth/`](../../pkg/server/auth/) reports one outcome per
+  request via the `auth.ResultRecorder` interface. The recorders themselves
+  are returned by `serverMetrics.SnapshotAuthRecorder()` and
+  `serverMetrics.PolicyAuthRecorder()` (in `pkg/server/metrics.go`) and
+  wired into the per-endpoint authenticators in `pkg/server/server.go`.
+  One increment per `/snapshot` or `/policy` request reaching the
+  middleware, labeled by `result`.
 
 ---
 
@@ -90,19 +103,20 @@ with OTEL collectors) without bumping `v1alpha1`.
 - HTTP endpoint **`/metrics`** on the server's public HTTP listener (default
   `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
 - Companion endpoints on the public listener: **`/healthz`** (liveness),
-  **`/readyz`** (readiness → `index.Ready()`), **`/policy`** (controller →
-  server push of resolved `CachePolicy` snapshots). These are intentionally
-  unauthenticated — kubelet probes and Prometheus scrapes need them open,
-  and the controller is the only writer of `/policy`.
-- Separate **`/snapshot`** listener (default `:8081`, flag
-  `--snapshot-bind-address`) carries the JSON cluster-wide cache aggregate
-  the controller's `CacheIndexPoller` scrapes to populate the `CacheIndex`
-  CR status. The split is intentional: a `NetworkPolicy` restricts L3/L4
-  ingress to the controller's pod selector, and a TokenReview-backed bearer
-  middleware on the listener rejects everything that isn't the configured
-  controller `ServiceAccount` (`--snapshot-allowed-sa`).
-  `inferencecache_snapshot_auth_total` (see the counter table above) is the
-  observability surface for that gate.
+  **`/readyz`** (readiness → `index.Ready()`). These stay unauthenticated —
+  kubelet probes and Prometheus scrapes cannot present a SA bearer.
+- Separate **controller-facing** listener (default `:8081`, flag
+  `--snapshot-bind-address`) carries **both** `/snapshot` (controller-read
+  of the cluster-wide cache aggregate; populates the `CacheIndex` CR
+  status) and `/policy` (controller-write of the combined resolved
+  snapshot — `CachePolicy` entries plus `CacheTenant` quota entries;
+  replace-on-write). The split is intentional: a `NetworkPolicy` restricts
+  L3/L4 ingress on this listener to the controller's pod selector, and a
+  TokenReview-backed bearer middleware on both endpoints rejects
+  everything that isn't the configured controller `ServiceAccount`
+  (`--allowed-controller-sa`). `inferencecache_snapshot_auth_total` and
+  `inferencecache_policy_auth_total` (see the counter table above) are the
+  parallel observability surfaces — one per endpoint.
 
 ---
 

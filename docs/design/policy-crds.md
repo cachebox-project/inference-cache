@@ -26,12 +26,13 @@ Runtime propagation (controller → server `/policy`) is described in [policy-pr
 | Field | Type | Purpose |
 |---|---|---|
 | `spec.tenantID` | string | Required non-empty external tenant identifier used by gateway and engine traffic. |
-| `spec.quota.maxMemoryBytes` | integer | Maximum cache memory attributed to the tenant. Minimum `0`. |
-| `spec.quota.maxIndexEntries` | integer | Maximum index entries attributed to the tenant. Minimum `0`. |
+| `spec.quota.maxIndexEntries` | integer | Maximum distinct index prefixes attributed to the tenant. Minimum `0`. Enforced at ingest (see [policy-propagation.md](policy-propagation.md)). |
 | `spec.isolationMode` | enum | `Fairness` in the current phase. |
 | `spec.crypto` | object | Reserved for future cryptographic isolation settings. |
 
-`status.memoryUsed`, `status.indexEntries`, `status.conditions`, and `status.observedGeneration` expose observed tenant state.
+`status.indexEntries`, `status.conditions`, and `status.observedGeneration` expose observed tenant state.
+
+There is deliberately **no** `spec.quota.maxMemoryBytes` or `status.memoryUsed`. The cache plane only surfaces a `max*` quota for a resource it authoritatively owns — the index entry table. Engine KV memory is a shared, tenant-unaware pool (vLLM/LMCache key by block hash, not tenant), so the control plane can neither enforce a per-tenant byte budget nor honestly attribute bytes per tenant (`ReplicaStats.cache_memory_bytes` is the engine total, double-counted across tenants sharing an engine). Per-tenant byte isolation is an engine/runtime concern (separate engine Deployments + pod memory limits).
 
 ## PromptTemplate
 

@@ -60,7 +60,7 @@ func defaultOptions() options {
 		secureMetrics:           false,
 		enableHTTP2:             false,
 		serverSnapshotURL:       "http://inference-cache-server:8081/snapshot",
-		serverPolicyURL:         "http://inference-cache-server:8080/policy",
+		serverPolicyURL:         "http://inference-cache-server:8081/policy",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",
@@ -142,11 +142,12 @@ func main() {
 	adapterRegistry.Register(externaladapter.NewAdapter())
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Log:      ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder: mgr.GetEventRecorder("cachebackend-controller"),
-		Registry: adapterRegistry,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:  mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader: mgr.GetAPIReader(),
+		Registry:  adapterRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -162,13 +163,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.CachePolicyReconciler{
+	if err := (&controller.ControlPlaneReconciler{
 		Client:          mgr.GetClient(),
-		Log:             ctrl.Log.WithName("controllers").WithName("CachePolicy"),
+		Log:             ctrl.Log.WithName("controllers").WithName("ControlPlane"),
 		ServerPolicyURL: opts.serverPolicyURL,
 		PushInterval:    opts.policyPushEvery,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CachePolicy")
+		setupLog.Error(err, "unable to create controller", "controller", "ControlPlane")
+		os.Exit(1)
+	}
+
+	// EnginePodEventsReconciler emits the InjectedByCacheBackend Event on
+	// each engine pod after the mutating webhook stamps it. The webhook
+	// itself can't emit: at admission time the apiserver hasn't assigned
+	// pod.metadata.uid, so a webhook-recorded event would land with
+	// involvedObject.uid="" and be invisible to `kubectl describe pod`.
+	if err := (&controller.EnginePodEventsReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("EnginePodEvents"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EnginePodEvents")
 		os.Exit(1)
 	}
 

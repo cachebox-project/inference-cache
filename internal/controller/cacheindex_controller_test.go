@@ -35,7 +35,7 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
 		},
 		Tenants: []index.TenantSnapshot{
-			{TenantID: "t1", MemoryUsed: 100, HitRate: 0.8},
+			{TenantID: "t1", IndexEntries: 5, MemoryUsed: 100, HitRate: 0.8},
 		},
 	}
 
@@ -50,8 +50,16 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	if len(st.Replicas) != 1 || st.Replicas[0].ID != "r1" || st.Replicas[0].Tenant != "ns-a" || st.Replicas[0].HitRate != "0.8" || st.Replicas[0].Pressure != "0.5" {
 		t.Fatalf("replica = %+v, want id r1 tenant ns-a hitRate 0.8 pressure 0.5", st.Replicas[0])
 	}
-	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].HitRate != "0.8" {
-		t.Fatalf("tenant = %+v", st.Tenants[0])
+	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].IndexEntries != 5 || st.Tenants[0].HitRate != "0.8" {
+		t.Fatalf("tenant = %+v, want id t1 indexEntries 5 hitRate 0.8", st.Tenants[0])
+	}
+	// The per-tenant indexEntries sum to prefixes.summary.total (single tenant here).
+	var sum int64
+	for _, tn := range st.Tenants {
+		sum += tn.IndexEntries
+	}
+	if sum != int64(st.Prefixes.Summary.Total) {
+		t.Fatalf("Σ tenants[].indexEntries = %d, want == prefixes.summary.total %d", sum, st.Prefixes.Summary.Total)
 	}
 }
 
@@ -1068,5 +1076,200 @@ func TestRefreshCreatesSingletonEvenWhenServerDown(t *testing.T) {
 	var ci cachev1alpha1.CacheIndex
 	if err := cl.Get(context.Background(), types.NamespacedName{Name: "cluster-default"}, &ci); err != nil {
 		t.Fatalf("singleton CacheIndex should exist even when the server is down: %v", err)
+	}
+}
+
+func tenantCond(ct cachev1alpha1.CacheTenant, condType string) (metav1.Condition, bool) {
+	for _, c := range ct.Status.Conditions {
+		if c.Type == condType {
+			return c, true
+		}
+	}
+	return metav1.Condition{}, false
+}
+
+// TestReconcileTenantStatusesShadowedDuplicate pins the duplicate-tenantID
+// contract: when two CacheTenants declare the same spec.tenantID, the
+// control-plane reconciler enforces only the first by (namespace, name), so the
+// status writer must mark the OTHER as a shadowed duplicate rather than claim
+// its (non-effective) budget is enforced.
+func TestReconcileTenantStatusesShadowedDuplicate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	effBudget := int64(5)
+	dupBudget := int64(100)
+	// Same tenantID "shared"; alpha < beta by name → alpha is effective.
+	effective := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha", Namespace: "team"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "shared",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &effBudget},
+		},
+	}
+	shadowed := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "beta", Namespace: "team"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "shared",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &dupBudget},
+		},
+	}
+	// A duplicate with NO quota of its own must ALSO be flagged: the tenantID is
+	// enforced by alpha, so reporting Ready=True/NoQuota would mislead.
+	shadowedNoQuota := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "gamma", Namespace: "team"},
+		Spec:       cachev1alpha1.CacheTenantSpec{TenantID: "shared"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(effective, shadowed, shadowedNoQuota).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+
+	// 3 distinct prefixes for "shared": under the effective budget (5).
+	snap := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "shared", IndexEntries: 3}}}
+	if err := p.reconcileTenantStatuses(ctx, snap); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	get := func(name string) cachev1alpha1.CacheTenant {
+		var ct cachev1alpha1.CacheTenant
+		if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: "team"}, &ct); err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		return ct
+	}
+
+	// Effective CR: Ready=True, QuotaExceeded=False against its own budget.
+	eff := get("alpha")
+	if c, ok := tenantCond(eff, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue || c.Reason != "Observed" {
+		t.Fatalf("effective Ready = %+v, want True/Observed", c)
+	}
+	if c, _ := tenantCond(eff, tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse || c.Reason != "WithinBudget" {
+		t.Fatalf("effective QuotaExceeded = %+v, want False/WithinBudget", c)
+	}
+
+	// Shadowed CR: Ready=False/DuplicateTenantID, QuotaExceeded=False/NotEffective —
+	// its 100-entry budget is NOT presented as enforced.
+	dup := get("beta")
+	if c, ok := tenantCond(dup, tenantConditionReady); !ok || c.Status != metav1.ConditionFalse || c.Reason != "DuplicateTenantID" {
+		t.Fatalf("shadowed Ready = %+v, want False/DuplicateTenantID", c)
+	}
+	if c, _ := tenantCond(dup, tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse || c.Reason != "NotEffective" {
+		t.Fatalf("shadowed QuotaExceeded = %+v, want False/NotEffective", c)
+	}
+
+	// No-quota duplicate is shadowed too (not Ready=True/NoQuota).
+	dupNQ := get("gamma")
+	if c, ok := tenantCond(dupNQ, tenantConditionReady); !ok || c.Status != metav1.ConditionFalse || c.Reason != "DuplicateTenantID" {
+		t.Fatalf("no-quota duplicate Ready = %+v, want False/DuplicateTenantID", c)
+	}
+}
+
+func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	maxEntries := int64(3)
+	ct := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "ct", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "team-vision", // matched by tenantID, NOT metadata.name
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &maxEntries},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(ct).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+	get := func() cachev1alpha1.CacheTenant {
+		var out cachev1alpha1.CacheTenant
+		if err := cl.Get(ctx, types.NamespacedName{Name: "ct", Namespace: "team-a"}, &out); err != nil {
+			t.Fatalf("get CacheTenant: %v", err)
+		}
+		return out
+	}
+
+	// Observed under budget: Ready=True, QuotaExceeded=False, indexEntries=2.
+	under := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 2}}}
+	if err := p.reconcileTenantStatuses(ctx, under); err != nil {
+		t.Fatalf("reconcile (under): %v", err)
+	}
+	got := get()
+	if got.Status.IndexEntries == nil || *got.Status.IndexEntries != 2 {
+		t.Fatalf("indexEntries = %v, want 2", got.Status.IndexEntries)
+	}
+	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True", c)
+	}
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False", c)
+	}
+
+	// Observed over budget: QuotaExceeded flaps True (OverEntryBudget).
+	over := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 5}}}
+	if err := p.reconcileTenantStatuses(ctx, over); err != nil {
+		t.Fatalf("reconcile (over): %v", err)
+	}
+	got = get()
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionTrue || c.Reason != "OverEntryBudget" {
+		t.Fatalf("QuotaExceeded = %+v, want True/OverEntryBudget", c)
+	}
+
+	// Back under budget: QuotaExceeded resets to False.
+	if err := p.reconcileTenantStatuses(ctx, under); err != nil {
+		t.Fatalf("reconcile (recover): %v", err)
+	}
+	if c, _ := tenantCond(get(), tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False after dropping under budget", c)
+	}
+}
+
+func TestReconcileTenantStatusesAbsentTenantObservedAsZero(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	maxEntries := int64(5)
+	ct := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "ct", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "team-quiet",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &maxEntries},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(ct).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+
+	// A successful scrape with no row for team-quiet means it currently holds
+	// zero prefixes — an observed 0, not "unknown".
+	if err := p.reconcileTenantStatuses(ctx, index.Snapshot{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var got cachev1alpha1.CacheTenant
+	if err := cl.Get(ctx, types.NamespacedName{Name: "ct", Namespace: "team-a"}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.IndexEntries == nil || *got.Status.IndexEntries != 0 {
+		t.Fatalf("indexEntries = %v, want 0 (observed zero, not nil)", got.Status.IndexEntries)
+	}
+	if c, ok := tenantCond(got, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True (we have a live reading)", c)
+	}
+	// 0 ≤ budget → not exceeded.
+	if c, ok := tenantCond(got, tenantConditionQuotaExceeded); !ok || c.Status != metav1.ConditionFalse {
+		t.Fatalf("QuotaExceeded = %+v, want False", c)
 	}
 }

@@ -10,8 +10,16 @@ import (
 
 // PolicyPropagationVersion identifies the schema of the /policy snapshot the
 // server accepts. Bumped on a breaking schema change so a stale controller
-// can refuse to push (the controller writes the same constant on each PUT).
-const PolicyPropagationVersion = 1
+// can refuse to push (the controller writes the same constant on each push).
+//
+// v2 added the Tenants slice (CacheTenant quota propagation). The version field
+// is the forward-looking guard: a server rejects a body whose version it does
+// not recognize, so a future v3 controller pushing to a v2 server fails loudly
+// with a clear "unsupported version" rather than silently losing fields. (A v1
+// server predates this field and would instead reject a v2 body's unknown
+// `tenants` at decode time under DisallowUnknownFields — also a hard failure,
+// just a less descriptive one.)
+const PolicyPropagationVersion = 2
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -34,47 +42,112 @@ type ResolvedPolicy struct {
 	LookupTimeoutMs     int32         `json:"lookupTimeoutMs,omitempty"`
 }
 
-// PolicySnapshot is the full set of CachePolicies the controller pushes on
-// each reconcile. Pushed via POST to /policy (PUT is accepted too for
-// callers that prefer it). Replace-on-write: the controller is the source
-// of truth, so the server discards its prior state and adopts the new
-// snapshot. A CachePolicy that disappears between snapshots reverts that
-// namespace to the server default.
+// ResolvedTenant is the slice of a CacheTenant the server enforces at ingest
+// time: the tenant's external identity plus its index-entry budget. The CRD
+// types live in api/v1alpha1; the controller flattens them into this shape so
+// pkg/server has no dependency on the CRD package (mirrors ResolvedPolicy).
+//
+// Identity note: TenantID is the CacheTenant's spec.tenantID — the same value
+// a CacheStateUpdate carries in tenant_id — NOT the CR's metadata.name. That is
+// the join key the index matches an ingest against.
+//
+// There is deliberately no memory budget: the engine KV cache is a shared,
+// tenant-unaware pool, so the control plane can neither enforce nor honestly
+// attribute bytes per tenant. Only the index entry table — which the server
+// owns — is enforceable.
+type ResolvedTenant struct {
+	TenantID        string `json:"tenantID"`
+	MaxIndexEntries int64  `json:"maxIndexEntries"`
+	// IsolationMode is carried for forward-compat / observability. Phase-1 only
+	// implements Fairness (evict the tenant's own oldest entries); other modes
+	// are a separate effort.
+	IsolationMode string `json:"isolationMode,omitempty"`
+}
+
+// PolicySnapshot is the full set of CachePolicies + CacheTenants the controller
+// pushes on each reconcile. Pushed via POST to /policy (PUT is accepted too for
+// callers that prefer it). Replace-on-write: the controller is the source of
+// truth, so the server discards its prior state and adopts the new snapshot. A
+// CachePolicy/CacheTenant that disappears between snapshots reverts that
+// namespace/tenant to the server default (no policy / no quota).
 type PolicySnapshot struct {
 	Version  int              `json:"version"`
 	Policies []ResolvedPolicy `json:"policies"`
+	Tenants  []ResolvedTenant `json:"tenants,omitempty"`
 }
 
-// PolicyStore is the server-side cache of resolved policies, indexed by
-// namespace. Reads (TTL/Lookup) take the read lock; PUTs from /policy take
-// the write lock and replace the map atomically. Satisfies index.TTLResolver.
+// PolicyStore is the server-side cache of resolved policies (indexed by
+// namespace) and resolved tenant quotas (indexed by tenant ID). Reads take
+// the read lock; pushes from /policy (POST or PUT) take the write lock and
+// replace the maps atomically. Satisfies index.TTLResolver and
+// index.TenantQuotaResolver.
+//
+// The two indices use different keys on purpose: a CachePolicy is keyed by its
+// namespace (phase-1 tenant boundary for lookups), while a CacheTenant quota is
+// keyed by spec.tenantID (the value an ingest carries). They are separate axes,
+// so they live in separate maps under the same lock.
 type PolicyStore struct {
 	mu       sync.RWMutex
 	policies map[string]ResolvedPolicy
+	tenants  map[string]ResolvedTenant
 }
 
 // NewPolicyStore returns an empty store. Until the controller pushes a
-// snapshot, every Lookup returns the zero ResolvedPolicy (= server defaults).
+// snapshot, every Lookup returns the zero ResolvedPolicy (= server defaults)
+// and every TenantQuota reports "no quota" (= unbounded, fail open).
 func NewPolicyStore() *PolicyStore {
-	return &PolicyStore{policies: make(map[string]ResolvedPolicy)}
+	return &PolicyStore{
+		policies: make(map[string]ResolvedPolicy),
+		tenants:  make(map[string]ResolvedTenant),
+	}
 }
 
-// Replace swaps the in-memory snapshot. Idempotent — pushing the same
-// snapshot twice produces the same observable state.
+// Replace swaps the full snapshot to a policies-only state: it installs the
+// given policies AND clears any tenant quotas, exactly equivalent to
+// ReplaceSnapshot(policies, nil). Retained as a convenience for callers that
+// don't exercise the tenant-quota axis (mostly tests); it delegates so it can
+// never leave a stale tenant table behind. Idempotent.
 func (s *PolicyStore) Replace(policies []ResolvedPolicy) {
-	next := make(map[string]ResolvedPolicy, len(policies))
+	s.ReplaceSnapshot(policies, nil)
+}
+
+// ReplaceSnapshot atomically swaps BOTH the policy and tenant-quota state under
+// a single write lock, so a reader never observes new policies paired with the
+// previous tenant table (or vice versa). This is the path the /policy handler
+// uses; the policies-only Replace delegates here with nil tenants.
+// Replace-on-write: a tenant absent from the new snapshot reverts to "no quota"
+// (unbounded, fail open).
+func (s *PolicyStore) ReplaceSnapshot(policies []ResolvedPolicy, tenants []ResolvedTenant) {
+	nextPolicies := make(map[string]ResolvedPolicy, len(policies))
 	for _, p := range policies {
 		if p.Namespace == "" {
-			// Defensive: a snapshot entry without a namespace can't be
-			// routed by tenant_id, so dropping it is safer than poisoning
-			// the empty-string key (which would silently shadow any
-			// lookup with an empty tenant).
+			continue // see Replace: an unkeyed entry can't be routed.
+		}
+		nextPolicies[p.Namespace] = p
+	}
+	nextTenants := make(map[string]ResolvedTenant, len(tenants))
+	for _, t := range tenants {
+		if t.TenantID == "" {
+			// Defensive: a quota with no tenant ID can't be matched against any
+			// ingest, and the empty key would shadow lookups for an empty
+			// tenant. Drop it rather than poison the table.
 			continue
 		}
-		next[p.Namespace] = p
+		// Sanitize the wire input at the trust boundary: the CRD enforces
+		// maxIndexEntries >= 0, but a hand-crafted /policy POST could carry a
+		// negative budget, which the index reads as "no enforcement" (eviction is
+		// skipped for maxPrefixes < 0). That would silently turn an attempted cap
+		// into unbounded — the opposite of intent. Clamp to the design minimum of
+		// 0 (the strictest valid cap, "admit nothing") so a malformed budget can
+		// never disable enforcement.
+		if t.MaxIndexEntries < 0 {
+			t.MaxIndexEntries = 0
+		}
+		nextTenants[t.TenantID] = t
 	}
 	s.mu.Lock()
-	s.policies = next
+	s.policies = nextPolicies
+	s.tenants = nextTenants
 	s.mu.Unlock()
 }
 
@@ -127,6 +200,34 @@ func (s *PolicyStore) LookupTimeout(tenant string) time.Duration {
 	return 0
 }
 
+// TenantQuota satisfies index.TenantQuotaResolver: returns the tenant's maximum
+// index-entry budget and whether a quota is configured. ok=false (no matching
+// CacheTenant, or the resolver is nil) means no enforcement — the index leaves
+// the tenant unbounded (fail open / soft state). A configured budget of 0 is a
+// valid, enforceable choice (admit nothing) and is distinct from "no quota".
+func (s *PolicyStore) TenantQuota(tenant string) (maxEntries int64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.tenants[tenant]
+	if !ok {
+		return 0, false
+	}
+	return t.MaxIndexEntries, true
+}
+
+// TenantQuotas returns a copy of the current tenant quotas, sorted by tenant ID
+// for deterministic test output.
+func (s *PolicyStore) TenantQuotas() []ResolvedTenant {
+	s.mu.RLock()
+	out := make([]ResolvedTenant, 0, len(s.tenants))
+	for _, t := range s.tenants {
+		out = append(out, t)
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(a, b int) bool { return out[a].TenantID < out[b].TenantID })
+	return out
+}
+
 // NewPolicyHTTPHandler returns the HTTP handler for the /policy endpoint
 // backed by the supplied store. It is exposed so the controller's tests
 // can stand up an in-process server with the *exact same* decode/replace
@@ -140,12 +241,13 @@ func NewPolicyHTTPHandler(store *PolicyStore) http.HandlerFunc {
 // in-memory state. Replace-on-write semantics: any CachePolicy not present in
 // the body is treated as "no policy" → server defaults.
 //
-// The endpoint is intentionally internal and unauthenticated. The controller
-// is the only authorized writer (replace-on-write means a stranger's POST
-// would replace cluster policy with whatever they sent); if that posture
-// changes, the same TokenReview + NetworkPolicy gates that protect
-// /snapshot can be applied here. Limited body size to bound memory if a
-// buggy controller sends a runaway snapshot.
+// The endpoint is intentionally internal. Auth + NetworkPolicy gating live
+// in server.New, where the same TokenReview-backed bearer middleware that
+// protects /snapshot is also applied here — both endpoints share one
+// controller-SA identity. The handler itself stays auth-agnostic so tests
+// (and any future internal caller) can mount it directly. Body size is
+// capped at 1 MiB to bound memory if a buggy controller sends a runaway
+// snapshot.
 func policyHandler(store *PolicyStore) http.HandlerFunc {
 	const maxBytes = 1 << 20 // 1 MiB — comfortably above any realistic snapshot
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +269,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			http.Error(w, "unsupported policy snapshot version\n", http.StatusBadRequest)
 			return
 		}
-		store.Replace(snap.Policies)
+		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

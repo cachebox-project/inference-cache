@@ -361,6 +361,52 @@ func TestSnapshotNotServedOnPublicListener(t *testing.T) {
 	}
 }
 
+// TestPolicyNotServedOnPublicListener is the symmetric guard for /policy:
+// the endpoint must NEVER be exposed on the kubelet/Prometheus :8080
+// listener — that's precisely the regression this hardening exists to
+// close (any pod that could reach :8080 could replace cluster-wide
+// CachePolicy state under replace-on-write). A POST returning 404 here
+// proves the handler is only registered on the auth+NetworkPolicy gated
+// listener.
+func TestPolicyNotServedOnPublicListener(t *testing.T) {
+	_, publicURL, _, stop := startInProcessServerConnFull(t)
+	defer stop()
+
+	code := postPolicy(t, publicURL+"/policy", "", emptyPolicySnapshotBody(t))
+	if code != http.StatusNotFound {
+		t.Fatalf("POST /policy on public listener returned %d, want 404", code)
+	}
+}
+
+// TestPolicyServedOnSnapshotListener confirms the positive path: /policy is
+// reachable on the dedicated controller-facing listener (unauth, since this
+// test boots the server without WithControllerAuth) and the handler accepts
+// a valid snapshot. Pairs with TestPolicyNotServedOnPublicListener — the two
+// together pin the exact split-listener wiring this hardening introduces.
+func TestPolicyServedOnSnapshotListener(t *testing.T) {
+	_, _, snapshotURL, stop := startInProcessServerConnFull(t)
+	defer stop()
+
+	code := postPolicy(t, snapshotURL+"/policy", "", emptyPolicySnapshotBody(t))
+	if code != http.StatusNoContent {
+		t.Fatalf("POST /policy on snapshot listener returned %d, want 204", code)
+	}
+}
+
+// emptyPolicySnapshotBody builds a JSON body whose Version matches the
+// current PolicyPropagationVersion, so the auth/listener tests below don't
+// silently turn into "the version field has drifted" failures whenever the
+// schema is bumped. Reflects no policies and no tenants — the empty
+// replace-on-write payload.
+func emptyPolicySnapshotBody(t *testing.T) string {
+	t.Helper()
+	b, err := json.Marshal(PolicySnapshot{Version: PolicyPropagationVersion})
+	if err != nil {
+		t.Fatalf("marshal empty PolicySnapshot: %v", err)
+	}
+	return string(b)
+}
+
 // TestSnapshotRejectsNonGet confirms the /snapshot handler is GET-only and
 // returns 405 (with an Allow: GET header) for POST / PUT / DELETE. The
 // endpoint is read-only by design — accepting other methods would silently
@@ -390,10 +436,14 @@ func TestSnapshotRejectsNonGet(t *testing.T) {
 	}
 }
 
-// TestSnapshotAuth_RejectsUnauthenticated runs the full Service with the auth
-// middleware wired in (using a fake TokenReviewer) and confirms the snapshot
-// listener responds 401 without a bearer and 200 with the controller SA.
-func TestSnapshotAuth_RejectsUnauthenticated(t *testing.T) {
+// TestControllerAuth_RejectsUnauthenticated runs the full Service with the
+// auth middleware wired in (using a fake TokenReviewer) and confirms BOTH
+// the snapshot listener AND /policy on the same listener respond 401 without
+// a bearer and 2xx with the controller SA. Pins the post-hardening shape:
+// /snapshot + /policy share one auth profile and one listener but emit
+// per-endpoint metrics, so a dashboard can distinguish read-side (info leak)
+// from write-side (active tampering) auth failures.
+func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 	const sa = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
 
 	reviewer := fakeReviewerFunc(func(_ context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
@@ -419,7 +469,7 @@ func TestSnapshotAuth_RejectsUnauthenticated(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	svc := New(WithSnapshotAuth(reviewer, sa))
+	svc := New(WithControllerAuth(reviewer, sa))
 	go func() {
 		errCh <- svc.Serve(ctx, grpcListener, httpListener, snapshotListener)
 	}()
@@ -431,29 +481,124 @@ func TestSnapshotAuth_RejectsUnauthenticated(t *testing.T) {
 	}()
 
 	snapshotURL := "http://" + snapshotListener.Addr().String() + "/snapshot"
+	policyURL := "http://" + snapshotListener.Addr().String() + "/policy"
 
-	code, _ := getString(t, snapshotURL)
-	if code != http.StatusUnauthorized {
+	// /snapshot — unauth 401, then valid SA 200.
+	if code, _ := getString(t, snapshotURL); code != http.StatusUnauthorized {
 		t.Fatalf("unauth /snapshot status = %d, want 401", code)
 	}
-
-	code, _ = getStringWithBearer(t, snapshotURL, "good")
-	if code != http.StatusOK {
+	if code, _ := getStringWithBearer(t, snapshotURL, "good"); code != http.StatusOK {
 		t.Fatalf("authed /snapshot status = %d, want 200", code)
 	}
 
-	// The auth metric must surface both outcomes.
+	// /policy — unauth 401, then valid SA POST 204. The body is a minimal
+	// valid PolicySnapshot so we exercise the auth gate AND the handler.
+	policyBody := emptyPolicySnapshotBody(t)
+	if code := postPolicy(t, policyURL, "", policyBody); code != http.StatusUnauthorized {
+		t.Fatalf("unauth POST /policy status = %d, want 401", code)
+	}
+	if code := postPolicy(t, policyURL, "good", policyBody); code != http.StatusNoContent {
+		t.Fatalf("authed POST /policy status = %d, want 204", code)
+	}
+
+	// Both per-endpoint auth metrics must surface both outcomes.
 	publicURL := "http://" + httpListener.Addr().String()
 	mcode, body := getString(t, publicURL+"/metrics")
 	if mcode != http.StatusOK {
 		t.Fatalf("/metrics status = %d, want 200", mcode)
 	}
-	if !strings.Contains(body, `inferencecache_snapshot_auth_total{result="unauth"} 1`) {
-		t.Fatalf("metrics missing unauth counter; body:\n%s", body)
+	for _, want := range []string{
+		`inferencecache_snapshot_auth_total{result="unauth"} 1`,
+		`inferencecache_snapshot_auth_total{result="ok"} 1`,
+		`inferencecache_policy_auth_total{result="unauth"} 1`,
+		`inferencecache_policy_auth_total{result="ok"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q; body:\n%s", want, body)
+		}
 	}
-	if !strings.Contains(body, `inferencecache_snapshot_auth_total{result="ok"} 1`) {
-		t.Fatalf("metrics missing ok counter; body:\n%s", body)
+}
+
+// TestControllerAuth_PolicyRejectsForbidden confirms a valid but
+// non-controller SA token gets 403 on /policy and increments the
+// `forbidden` bucket of the policy counter — the alarming signal the
+// per-endpoint metric is meant to surface (someone authenticated, but as
+// the wrong identity).
+func TestControllerAuth_PolicyRejectsForbidden(t *testing.T) {
+	const wantSA = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
+	const wrongSA = "system:serviceaccount:other:somebody"
+
+	reviewer := fakeReviewerFunc(func(_ context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		switch tr.Spec.Token {
+		case "good":
+			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+				Authenticated: true,
+				User:          authnv1.UserInfo{Username: wantSA},
+			}}, nil
+		case "wrong-sa":
+			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+				Authenticated: true,
+				User:          authnv1.UserInfo{Username: wrongSA},
+			}}, nil
+		}
+		return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: false}}, nil
+	})
+
+	const bufSize = 1024 * 1024
+	grpcListener := bufconn.Listen(bufSize)
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen public: %v", err)
 	}
+	snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen snapshot: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- New(WithControllerAuth(reviewer, wantSA)).Serve(ctx, grpcListener, httpListener, snapshotListener)
+	}()
+	defer func() {
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Errorf("serve shutdown: %v", err)
+		}
+	}()
+
+	policyURL := "http://" + snapshotListener.Addr().String() + "/policy"
+	if code := postPolicy(t, policyURL, "wrong-sa", emptyPolicySnapshotBody(t)); code != http.StatusForbidden {
+		t.Fatalf("wrong-SA POST /policy status = %d, want 403", code)
+	}
+
+	_, body := getString(t, "http://"+httpListener.Addr().String()+"/metrics")
+	if !strings.Contains(body, `inferencecache_policy_auth_total{result="forbidden"} 1`) {
+		t.Fatalf("metrics missing policy forbidden counter; body:\n%s", body)
+	}
+}
+
+// postPolicy issues a POST to the /policy endpoint with the given body and
+// optional bearer token, returning the HTTP status. Distinct from
+// getStringWithBearer because /policy is POST-only.
+func postPolicy(t *testing.T, url, token, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	httpClient := http.Client{Timeout: 2 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	return resp.StatusCode
 }
 
 // fakeReviewerFunc adapts a plain func to auth.TokenReviewer for server-side

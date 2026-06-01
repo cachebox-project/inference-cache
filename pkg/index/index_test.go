@@ -340,14 +340,25 @@ func TestReadyReflectsStartAndStop(t *testing.T) {
 	}
 }
 
-// countingMetrics records the latest reported entry count per model.
-type countingMetrics struct{ last map[string]int }
+// countingMetrics records the latest reported entry count per model and the
+// running total of tenant evictions per (tenant, reason).
+type countingMetrics struct {
+	last      map[string]int
+	evictions map[string]int // key: tenantID + "|" + reason
+}
 
 func (c *countingMetrics) SetIndexEntries(model string, n int) {
 	if c.last == nil {
 		c.last = map[string]int{}
 	}
 	c.last[model] = n
+}
+
+func (c *countingMetrics) AddTenantEvictions(tenantID, reason string, n int) {
+	if c.evictions == nil {
+		c.evictions = map[string]int{}
+	}
+	c.evictions[tenantID+"|"+reason] += n
 }
 
 func TestMetricsSinkReceivesCounts(t *testing.T) {

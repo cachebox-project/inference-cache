@@ -25,15 +25,24 @@ const metricNamespace = "inferencecache"
 // multiple Services without "duplicate metrics collector registration" panics.
 //
 // The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
-// owned by the standalone metric-schema work (F3); B5 ships only the endpoint
-// plus the documented liveness gauge `inferencecache_server_up`.
+// owned by the standalone metric-schema work (F3). What ships here today: the
+// liveness gauge (`inferencecache_server_up`), the index population gauge
+// (`inferencecache_index_entries`), the lookup counter + latency histogram
+// (`inferencecache_lookup_route_*`), the quota-eviction counter
+// (`inferencecache_tenant_evictions_total`), and the per-endpoint auth
+// counters (`inferencecache_snapshot_auth_total`,
+// `inferencecache_policy_auth_total`). Update this comment when adding a new
+// metric so the ownership note in docs/reference/metrics.md and this struct
+// stay in lockstep.
 type serverMetrics struct {
-	registry      *prometheus.Registry
-	up            prometheus.Gauge
-	indexEntries  *prometheus.GaugeVec
-	lookupCalls   *prometheus.CounterVec
-	lookupLatency *prometheus.HistogramVec
-	snapshotAuth  *prometheus.CounterVec
+	registry        *prometheus.Registry
+	up              prometheus.Gauge
+	indexEntries    *prometheus.GaugeVec
+	lookupCalls     *prometheus.CounterVec
+	lookupLatency   *prometheus.HistogramVec
+	tenantEvictions *prometheus.CounterVec
+	snapshotAuth    *prometheus.CounterVec
+	policyAuth      *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -59,10 +68,20 @@ func newServerMetrics() *serverMetrics {
 		// Cache-path lookups target sub-millisecond; bucket from 100µs up.
 		Buckets: []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
 	}, []string{"model"})
+	tenantEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "tenant_evictions_total",
+		Help:      "Index prefixes evicted to enforce a CacheTenant quota, by tenant and reason.",
+	}, []string{"tenant_id", "reason"})
 	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "snapshot_auth_total",
 		Help:      "Authentication outcomes for the internal /snapshot endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
+	policyAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "policy_auth_total",
+		Help:      "Authentication outcomes for the internal /policy endpoint (ok|unauth|forbidden|error).",
 	}, []string{"result"})
 
 	registry := prometheus.NewRegistry()
@@ -71,31 +90,56 @@ func newServerMetrics() *serverMetrics {
 		indexEntries,
 		lookupCalls,
 		lookupLatency,
+		tenantEvictions,
 		snapshotAuth,
+		policyAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
 	return &serverMetrics{
-		registry:      registry,
-		up:            up,
-		indexEntries:  indexEntries,
-		lookupCalls:   lookupCalls,
-		lookupLatency: lookupLatency,
-		snapshotAuth:  snapshotAuth,
+		registry:        registry,
+		up:              up,
+		indexEntries:    indexEntries,
+		lookupCalls:     lookupCalls,
+		lookupLatency:   lookupLatency,
+		tenantEvictions: tenantEvictions,
+		snapshotAuth:    snapshotAuth,
+		policyAuth:      policyAuth,
 	}
 }
 
-// RecordAuthResult is invoked once per /snapshot request by the auth
-// middleware. Satisfies auth.ResultRecorder.
-func (m *serverMetrics) RecordAuthResult(result auth.Result) {
-	m.snapshotAuth.WithLabelValues(string(result)).Inc()
+// SnapshotAuthRecorder returns an auth.ResultRecorder that increments the
+// /snapshot auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured.
+func (m *serverMetrics) SnapshotAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.snapshotAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// PolicyAuthRecorder returns an auth.ResultRecorder that increments the
+// /policy auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured — /policy joins /snapshot on
+// the auth-required listener under one shared SA identity, but each endpoint
+// emits its own outcome counter so dashboards can distinguish read-side
+// (/snapshot) from write-side (/policy) auth failures.
+func (m *serverMetrics) PolicyAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.policyAuth.WithLabelValues(string(r)).Inc()
+	})
 }
 
 // SetIndexEntries reports the live prefix-entry count for a model. It satisfies
 // index.Metrics so the index can push counts as it mutates.
 func (m *serverMetrics) SetIndexEntries(model string, entries int) {
 	m.indexEntries.WithLabelValues(model).Set(float64(entries))
+}
+
+// AddTenantEvictions records n quota-driven entry evictions for a tenant.
+// Satisfies index.Metrics.
+func (m *serverMetrics) AddTenantEvictions(tenantID, reason string, n int) {
+	m.tenantEvictions.WithLabelValues(tenantID, reason).Add(float64(n))
 }
 
 // observeLookup records one LookupRoute call's outcome and latency.

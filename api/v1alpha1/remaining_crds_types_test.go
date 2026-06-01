@@ -47,7 +47,6 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireEnum(t, mustProperty(t, tenantSpec, "isolationMode"), []string{"Fairness"})
 	requireDefault(t, mustProperty(t, tenantSpec, "isolationMode"), "Fairness")
 	tenantQuota := mustProperty(t, tenantSpec, "quota")
-	requireMinimum(t, mustProperty(t, tenantQuota, "maxMemoryBytes"), 0)
 	requireMinimum(t, mustProperty(t, tenantQuota, "maxIndexEntries"), 0)
 	requireReservedEmptyObject(t, mustProperty(t, tenantSpec, "crypto"))
 
@@ -103,30 +102,28 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}
 
-	maxMemoryBytes := int64(1024)
 	maxIndexEntries := int64(100)
-	memoryUsed := int64(512)
+	indexEntries := int64(512)
 	tenant := &CacheTenant{
 		Spec: CacheTenantSpec{
 			TenantID:      "tenant-a",
 			IsolationMode: CacheTenantIsolationModeFairness,
 			Quota: &CacheTenantQuotaSpec{
-				MaxMemoryBytes:  &maxMemoryBytes,
 				MaxIndexEntries: &maxIndexEntries,
 			},
 			Crypto: &CacheTenantCryptoSpec{},
 		},
 		Status: CacheTenantStatus{
-			MemoryUsed: &memoryUsed,
-			Conditions: []metav1.Condition{{Type: "Ready", Message: "ok"}},
+			IndexEntries: &indexEntries,
+			Conditions:   []metav1.Condition{{Type: "Ready", Message: "ok"}},
 		},
 	}
 	tenantCopy := tenant.DeepCopy()
-	*tenant.Spec.Quota.MaxMemoryBytes = 2048
-	*tenant.Status.MemoryUsed = 256
+	*tenant.Spec.Quota.MaxIndexEntries = 2048
+	*tenant.Status.IndexEntries = 256
 	tenant.Status.Conditions[0].Message = "changed"
-	if *tenantCopy.Spec.Quota.MaxMemoryBytes != 1024 ||
-		*tenantCopy.Status.MemoryUsed != 512 ||
+	if *tenantCopy.Spec.Quota.MaxIndexEntries != 100 ||
+		*tenantCopy.Status.IndexEntries != 512 ||
 		tenantCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CacheTenant was not deep-copied")
 	}

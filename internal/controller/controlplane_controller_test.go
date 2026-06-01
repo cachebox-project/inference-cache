@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +28,7 @@ type pushRecorder struct {
 	mu        sync.Mutex
 	snapshots []cacheserver.PolicySnapshot
 	method    string
+	authz     string // last Authorization header observed
 }
 
 func (p *pushRecorder) handler() http.HandlerFunc {
@@ -43,9 +47,16 @@ func (p *pushRecorder) handler() http.HandlerFunc {
 		p.mu.Lock()
 		p.snapshots = append(p.snapshots, snap)
 		p.method = r.Method
+		p.authz = r.Header.Get("Authorization")
 		p.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+func (p *pushRecorder) lastAuthz() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.authz
 }
 
 func (p *pushRecorder) latest() (cacheserver.PolicySnapshot, bool) {
@@ -68,6 +79,83 @@ func newPolicyTestScheme(t *testing.T) *runtime.Scheme {
 
 func ttlPtr(d time.Duration) *metav1.Duration { x := metav1.Duration{Duration: d}; return &x }
 func i32Ptr(v int32) *int32                   { return &v }
+func i64Ptr(v int64) *int64                   { return &v }
+
+// TestPushSnapshotFlattensPoliciesAndTenants proves the single reconciler emits
+// one combined snapshot from BOTH CR types: policies keyed by namespace, tenant
+// quotas keyed by spec.tenantID. Tenants without an enforceable budget are
+// omitted (fail open); a budget of 0 is kept.
+func TestPushSnapshotFlattensPoliciesAndTenants(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+				Spec:       cachev1alpha1.CachePolicySpec{EvictionTTL: ttlPtr(time.Hour)},
+			},
+			// Enforceable: tenantID team-a, budget 1000.
+			&cachev1alpha1.CacheTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "ct-a", Namespace: "team-a"},
+				Spec: cachev1alpha1.CacheTenantSpec{
+					TenantID:      "team-a",
+					IsolationMode: cachev1alpha1.CacheTenantIsolationModeFairness,
+					Quota:         &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: i64Ptr(1000)},
+				},
+			},
+			// No quota → omitted from the snapshot (server leaves it unbounded).
+			&cachev1alpha1.CacheTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "ct-b", Namespace: "team-b"},
+				Spec:       cachev1alpha1.CacheTenantSpec{TenantID: "team-b"},
+			},
+			// Budget 0 is a valid enforceable cap → kept.
+			&cachev1alpha1.CacheTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "ct-c", Namespace: "team-c"},
+				Spec: cachev1alpha1.CacheTenantSpec{
+					TenantID: "team-c",
+					Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: i64Ptr(0)},
+				},
+			},
+		).
+		Build()
+
+	r := &ControlPlaneReconciler{Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client()}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	snap, ok := rec.latest()
+	if !ok {
+		t.Fatal("expected a push")
+	}
+	if snap.Version != cacheserver.PolicyPropagationVersion {
+		t.Fatalf("version = %d, want %d", snap.Version, cacheserver.PolicyPropagationVersion)
+	}
+	if len(snap.Policies) != 1 || snap.Policies[0].Namespace != "team-a" {
+		t.Fatalf("policies = %+v, want one for team-a", snap.Policies)
+	}
+	if len(snap.Tenants) != 2 {
+		t.Fatalf("tenants = %+v, want 2 (team-a, team-c); team-b omitted", snap.Tenants)
+	}
+	// Sorted by tenantID: team-a then team-c.
+	if snap.Tenants[0].TenantID != "team-a" || snap.Tenants[0].MaxIndexEntries != 1000 {
+		t.Fatalf("tenants[0] = %+v, want team-a/1000", snap.Tenants[0])
+	}
+	if snap.Tenants[0].IsolationMode != "Fairness" {
+		t.Fatalf("tenants[0].IsolationMode = %q, want Fairness", snap.Tenants[0].IsolationMode)
+	}
+	if snap.Tenants[1].TenantID != "team-c" || snap.Tenants[1].MaxIndexEntries != 0 {
+		t.Fatalf("tenants[1] = %+v, want team-c/0", snap.Tenants[1])
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == "team-b" {
+			t.Fatal("team-b has no quota and must be omitted")
+		}
+	}
+}
 
 func TestPushSnapshotIncludesAllPolicies(t *testing.T) {
 	rec := &pushRecorder{}
@@ -92,7 +180,7 @@ func TestPushSnapshotIncludesAllPolicies(t *testing.T) {
 		).
 		Build()
 
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client:          cl,
 		ServerPolicyURL: srv.URL,
 		HTTPClient:      srv.Client(),
@@ -138,7 +226,7 @@ func TestPushSnapshotReflectsDeletions(t *testing.T) {
 		WithScheme(newPolicyTestScheme(t)).
 		WithObjects(cp).
 		Build()
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
 	}
 
@@ -188,7 +276,7 @@ func TestPushSnapshotDeduplicatesByFirstNameWhenMultiplePoliciesShareNamespace(t
 			},
 		).
 		Build()
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
@@ -203,13 +291,117 @@ func TestPushSnapshotDeduplicatesByFirstNameWhenMultiplePoliciesShareNamespace(t
 	}
 }
 
+// TestPushSnapshotSendsBearerToken pins the client-side contract: when
+// BearerTokenPath points at a tmpfile (kubelet-shape), every POST carries
+// `Authorization: Bearer <token>`. Mirror of the CacheIndexPoller's token
+// handling.
+func TestPushSnapshotSendsBearerToken(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "sa-token")
+	// kubelet's projected token has a trailing newline; bearerToken() trims it.
+	if err := os.WriteFile(tokenPath, []byte("test-sa-bearer\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(&cachev1alpha1.CachePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		}).
+		Build()
+	r := &ControlPlaneReconciler{
+		Client:          cl,
+		ServerPolicyURL: srv.URL,
+		HTTPClient:      srv.Client(),
+		BearerTokenPath: tokenPath,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := rec.lastAuthz(); got != "Bearer test-sa-bearer" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer test-sa-bearer")
+	}
+}
+
+// TestPushSnapshotBearerTokenUnreadableFile pins the third bearerToken
+// branch the CacheIndexPoller's symmetric test covers: a token file that
+// EXISTS but cannot be read (permissions / IO error). The reconciler's
+// bearerToken() must surface the underlying error so the operator's log
+// shows the path + cause, instead of silently degrading to an unauth push
+// the server rejects as a generic 401. Mirror of
+// TestBearerToken_UnreadableFileReturnsError on the poller side.
+func TestPushSnapshotBearerTokenUnreadableFile(t *testing.T) {
+	// chmod-0 is a portable way to make a present file unreadable for the
+	// running user (unless we're root — skip then).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; chmod 0 does not deny read")
+	}
+	dir := t.TempDir()
+	path := dir + "/token"
+	if err := os.WriteFile(path, []byte("ignored"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod token: %v", err)
+	}
+
+	r := &ControlPlaneReconciler{BearerTokenPath: path}
+	got, err := r.bearerToken()
+	if err == nil {
+		t.Fatalf("bearerToken() on unreadable file: got %q + nil, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("bearerToken() on unreadable file = %q, want \"\"", got)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("bearerToken() error %q does not mention path %q", err, path)
+	}
+}
+
+// TestPushSnapshotNoBearerWhenTokenFileMissing pins the fail-soft posture
+// the controller inherits from the CacheIndexPoller: a missing token file
+// (local-dev out-of-cluster path) does NOT error out the push — the request
+// goes out unauthenticated and the server's auth posture decides what
+// happens. The server's 401 surfaces as a normal failing tick (covered by
+// TestPushSnapshotPropagatesNon2xxAsError); here we just pin that no
+// Authorization header is sent when the file isn't there.
+func TestPushSnapshotNoBearerWhenTokenFileMissing(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(&cachev1alpha1.CachePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		}).
+		Build()
+	r := &ControlPlaneReconciler{
+		Client:          cl,
+		ServerPolicyURL: srv.URL,
+		HTTPClient:      srv.Client(),
+		BearerTokenPath: filepath.Join(t.TempDir(), "does-not-exist"),
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := rec.lastAuthz(); got != "" {
+		t.Fatalf("expected no Authorization header when token file missing, got %q", got)
+	}
+}
+
 func TestPushSnapshotPropagatesNon2xxAsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client:          fake.NewClientBuilder().WithScheme(newPolicyTestScheme(t)).Build(),
 		ServerPolicyURL: srv.URL,
 		HTTPClient:      srv.Client(),
@@ -253,7 +445,7 @@ func TestPushSnapshotSerializesConcurrentPushes(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
 		}).
 		Build()
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
 	}
 
@@ -297,7 +489,7 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &CachePolicyReconciler{
+	r := &ControlPlaneReconciler{
 		Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client(),
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {

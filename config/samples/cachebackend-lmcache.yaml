@@ -33,8 +33,6 @@ spec:
     # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
     engine: vllm
     role: ReadWrite
-    lookupTimeoutMs: 20
-    minimumPrefixTokens: 32
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
