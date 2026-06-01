@@ -705,7 +705,7 @@ log "External CR status: endpoint=$status_endpoint observedGeneration=$observed_
 # default NAME/AGE-only table.
 cb_table="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" 2>/dev/null || true)"
 cb_header="$(printf '%s\n' "$cb_table" | sed -n '1p')"
-for column in TYPE HEALTH ENDPOINT PREFIXES LASTEVENT; do
+for column in TYPE HEALTH MATCHED ENDPOINT PREFIXES LASTEVENT; do
   if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$cb_header"; then
     echo "$cb_table"
     fail "expected CacheBackend printer column $column in kubectl get cb output"
@@ -718,7 +718,7 @@ if ! grep -Fq "$EXT_SMOKE_CB_NAME" <<<"$cb_table" || \
   echo "$cb_table"
   fail "expected CacheBackend printer row to include name/type/health/endpoint"
 fi
-log "CacheBackend printer columns render Type/Health/Endpoint/Prefixes/LastEvent"
+log "CacheBackend printer columns render Type/Health/Matched/Endpoint/Prefixes/LastEvent"
 
 # No Deployment, no Service should have been rendered for an External CR.
 # A leading API service `kubernetes` doesn't exist in this fresh namespace,
