@@ -68,7 +68,12 @@ const perSampleTimeout = 30 * time.Second
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("verify-samples: %v", err)
+		// Plain stderr + exit(1) keeps the final line consistent with the
+		// rest of the gate's structured output (no log timestamp, no
+		// duplicate "verify-samples:" prefix on errors that already
+		// carry their own context).
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -208,7 +213,14 @@ func run() error {
 			if applyCtx.Err() == context.DeadlineExceeded {
 				fmt.Printf("    apply exceeded per-sample timeout (%s)\n", perSampleTimeout)
 			}
-			fmt.Print(indent(out, "    "))
+			if strings.TrimSpace(out) != "" {
+				fmt.Print(indent(out, "    "))
+			}
+			// Always surface the runErr — kubectl's own diagnostic (exec
+			// permission denied, signal kill, context cancellation) is
+			// otherwise lost if stdout/stderr was empty, leaving an
+			// unattributable bare "FAIL <file>".
+			fmt.Printf("    error: %v\n", runErr)
 			failCount++
 			continue
 		}
@@ -218,7 +230,11 @@ func run() error {
 
 	fmt.Printf("\nverify-samples: %d ok, %d skipped, %d failed\n", okCount, skipCount, failCount)
 	if failCount > 0 {
-		return fmt.Errorf("%d sample(s) rejected by admission — see FAIL lines above", failCount)
+		// "failed" rather than "rejected by admission" — most failures
+		// ARE admission rejections, but a kubectl exec error or
+		// per-sample timeout falls in the same bucket and shouldn't be
+		// mis-labeled.
+		return fmt.Errorf("%d sample(s) failed — see FAIL lines above", failCount)
 	}
 	return nil
 }
