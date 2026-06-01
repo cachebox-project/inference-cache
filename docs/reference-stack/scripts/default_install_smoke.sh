@@ -51,7 +51,7 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
-#   9. The audience binding holds on BOTH /snapshot and /policy: a probe
+#  10. The audience binding holds on BOTH /snapshot and /policy: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
 #      and asserts the audience-bound token admits on both endpoints

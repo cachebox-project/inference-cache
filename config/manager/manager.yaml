@@ -50,7 +50,10 @@ spec:
           capabilities:
             drop:
             - ALL
-        # Audience-bound projected SA token used to scrape /snapshot.
+        # Audience-bound projected SA token used by BOTH the CacheIndex
+        # poller (GET /snapshot) and the CachePolicy push (POST /policy)
+        # — the two endpoints share one auth middleware identity, so one
+        # projected token serves both.
         # Kubelet projects the token (calling TokenRequest on behalf of
         # the pod) with audience "inferencecache.io/controller" baked into
         # the JWT, and rewrites the file on rotation; the audience is
