@@ -353,6 +353,8 @@ log "cacheindex/cluster-default.status.observedServer=$observed"
 # was pushed through the controller's authenticated /policy bridge and adopted
 # by the server; keeping the apply here gives the watch-triggered reconcile
 # time to run before the port-forward opens.
+log "resetting CachePolicy smoke namespace $POLICY_SMOKE_NS"
+kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=true >/dev/null
 log "applying CachePolicy sample in namespace $POLICY_SMOKE_NS"
 kubectl create namespace "$POLICY_SMOKE_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
@@ -511,7 +513,7 @@ policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"
 policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix")
 policy_report_payload="$(cat <<EOF
-{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","timestampUs":"1","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
+{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
 EOF
 )"
 policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_DIR/grpcurl-policy-report.err")" || {
@@ -550,6 +552,7 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$po
   sleep 2
 done
 log "CachePolicy push adopted: above-threshold lookup hit, below-threshold lookup returned NO_HINT"
+kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --- paired-sample smoke ---------------------------------------------------
 # Applies config/samples/cachebackend-with-engine.yaml and asserts the
