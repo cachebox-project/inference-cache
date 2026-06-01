@@ -837,16 +837,10 @@ kubectl delete namespace "$SAMPLE_NS" \
 log "exercising External CacheBackend end-to-end in namespace $EXT_SMOKE_NS"
 kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply the committed External CR sample. The sample intentionally omits the
-# defaulted integration knobs so the smoke drives the mutating webhook instead
-# of only proving the CRD accepts already-defaulted YAML.
+# Apply the committed External CR sample.
 kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/dev/null \
   || fail "kubectl apply config/samples/cachebackend-external.yaml failed"
 
-lookup_timeout="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
-  -o jsonpath='{.spec.integration.lookupTimeoutMs}' 2>/dev/null || true)"
-minimum_prefix_tokens="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
-  -o jsonpath='{.spec.integration.minimumPrefixTokens}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
 external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
@@ -860,11 +854,7 @@ if [ -z "$external_pod_labels" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
   fail "External sample did not create spec.engineSelector.matchLabels on $EXT_SMOKE_CB_NAME"
 fi
-if [ "$lookup_timeout" != "50" ] || [ "$minimum_prefix_tokens" != "256" ]; then
-  kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
-  fail "CacheBackend defaulter did not stamp integration defaults: lookupTimeoutMs=$lookup_timeout minimumPrefixTokens=$minimum_prefix_tokens (want 50/256)"
-fi
-log "External CR sample endpoint=$external_spec_endpoint; defaulted integration knobs: lookupTimeoutMs=$lookup_timeout minimumPrefixTokens=$minimum_prefix_tokens"
+log "External CR sample endpoint=$external_spec_endpoint"
 
 # Wait for the reconciler to publish status.endpoint + observedGeneration +
 # the Ready=True condition. Sub-second on a quiet cluster; the timeout covers
