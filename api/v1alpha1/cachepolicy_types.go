@@ -5,8 +5,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// CachePolicyEvictionAlgorithm identifies how the index evicts cache entries
+// when its bounded-size store is over capacity. The enum is intentionally
+// narrow today (LRU only) and grows as additional algorithms are implemented
+// in pkg/index. Operators can plan around the field as the configuration
+// surface even before additional algorithms ship.
+type CachePolicyEvictionAlgorithm string
+
+const (
+	// CachePolicyEvictionAlgorithmLRU evicts the entry with the oldest
+	// lastSeen timestamp first. This is the implementation today.
+	CachePolicyEvictionAlgorithmLRU CachePolicyEvictionAlgorithm = "LRU"
+)
+
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
+	// Eviction selects the algorithm the index uses to make room when its
+	// entry-count cap is reached. Defaults to LRU. Additional algorithms
+	// extend the enum as their implementations land.
+	// +optional
+	// +kubebuilder:validation:Enum=LRU
+	// +kubebuilder:default=LRU
+	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
+
 	// EvictionTTL is the maximum time a cache entry should remain usable.
 	// +optional
 	EvictionTTL *metav1.Duration `json:"evictionTTL,omitempty"`
@@ -38,6 +59,7 @@ type CachePolicyStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=cpol
+// +kubebuilder:printcolumn:name="Eviction",type=string,JSONPath=`.spec.eviction`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CachePolicy is the Schema for cache lookup and eviction policy.

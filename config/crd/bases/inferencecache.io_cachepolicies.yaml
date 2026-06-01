@@ -17,6 +17,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.eviction
+      name: Eviction
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -45,6 +48,15 @@ spec:
           spec:
             description: CachePolicySpec defines cache lookup and eviction policy.
             properties:
+              eviction:
+                default: LRU
+                description: |-
+                  Eviction selects the algorithm the index uses to make room when its
+                  entry-count cap is reached. Defaults to LRU. Additional algorithms
+                  extend the enum as their implementations land.
+                enum:
+                - LRU
+                type: string
               evictionTTL:
                 description: EvictionTTL is the maximum time a cache entry should
                   remain usable.

@@ -21,12 +21,19 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
 	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
+	// Eviction is the operator's algorithm-selection surface. The enum is
+	// intentionally one-value (LRU) until additional algorithms ship — the
+	// default makes the column meaningful today and the field stops being
+	// inert without committing to multiple algorithms.
+	evictionSchema := mustProperty(t, policySpec, "eviction")
+	requireEnum(t, evictionSchema, []string{"LRU"})
+	requireDefault(t, evictionSchema, "LRU")
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
 	// Fields trimmed at v1alpha1 because they were declarative-only — guard
 	// against accidental re-introduction via a stale regen.
-	for _, removed := range []string{"eviction", "failOpen", "tenantScoped"} {
+	for _, removed := range []string{"failOpen", "tenantScoped"} {
 		requireNoProperty(t, policySpec, removed)
 	}
 
@@ -78,6 +85,7 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	lookupTimeoutMs := int32(20)
 	policy := &CachePolicy{
 		Spec: CachePolicySpec{
+			Eviction:            CachePolicyEvictionAlgorithmLRU,
 			EvictionTTL:         &ttl,
 			MinimumPrefixTokens: &minimumPrefixTokens,
 			LookupTimeoutMs:     &lookupTimeoutMs,
@@ -87,7 +95,8 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	policyCopy := policy.DeepCopy()
 	policy.Spec.EvictionTTL.Duration = 2 * time.Minute
 	policy.Status.Conditions[0].Message = "changed"
-	if policyCopy.Spec.EvictionTTL.Duration != time.Minute ||
+	if policyCopy.Spec.Eviction != CachePolicyEvictionAlgorithmLRU ||
+		policyCopy.Spec.EvictionTTL.Duration != time.Minute ||
 		policyCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}

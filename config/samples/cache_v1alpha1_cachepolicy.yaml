@@ -5,6 +5,7 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachepolicy-sample
 spec:
+  eviction: LRU
   evictionTTL: 30m
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
