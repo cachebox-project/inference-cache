@@ -39,9 +39,18 @@ jobs:
       run: make verify-no-internal-refs
 
     - name: Install protoc
+      env:
+        PROTOC_VERSION: 34.1
+        PROTOC_SHA256: af27ea66cd26938fe48587804ca7d4817457a08350021a1c6e23a27ccc8c6904
       run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        set -euo pipefail
+        archive="$RUNNER_TEMP/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        curl -fsSL -o "$archive" "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        echo "${PROTOC_SHA256}  $archive" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/protoc"
+        unzip -q "$archive" -d "$RUNNER_TEMP/protoc"
+        echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/protoc/bin/protoc" --version
 
     - name: Set up buf
       uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99  # v1
