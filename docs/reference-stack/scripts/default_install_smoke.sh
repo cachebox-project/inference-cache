@@ -36,6 +36,11 @@
 #   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
+#   8. Every sample manifest under config/samples/ applies cleanly against
+#      the running install (CRD structural validation + admission webhook).
+#      Catches the operator first-contact failure where a default sample
+#      drifts from the schema or names a runtime/adapter pair no shipped
+#      adapter supports.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -810,4 +815,40 @@ case "$probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"
+# --- sample-manifest apply-clean assertion ---------------------------------
+# Every YAML under config/samples/ must apply cleanly against the running
+# install. Operators copy these as their first-contact recipe; a sample that
+# rejects at admission (e.g. names a (runtime, type) pair no shipped adapter
+# supports, populates a field the schema no longer accepts) burns trust on
+# first contact. Server-side dry-run exercises both CRD structural validation
+# AND the validating admission webhook — the gate that rejects e.g.
+# integration.engine values with no registered adapter.
+#
+# Run last so the assertion sees a fully-warm install (controller + server
+# + webhooks reconciling). Uses a dedicated namespace so each sample's
+# default ObjectMeta doesn't collide with earlier phases' fixtures. The
+# paired samples (cachebackend-with-engine.yaml, cachebackend-with-override.yaml)
+# carry both a CacheBackend and an engine Deployment in one file; the
+# dry-run validates both docs, which is what we want.
+log "asserting every config/samples/*.yaml applies cleanly against the running install"
+SAMPLE_APPLY_NS="${SAMPLE_APPLY_NS:-ic-sample-apply}"
+kubectl create namespace "$SAMPLE_APPLY_NS" --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
+sample_fail=0
+for f in config/samples/cache_v1alpha1_*.yaml config/samples/cachebackend-*.yaml; do
+  # cacheindex is cluster-scoped; the dry-run namespace flag is a no-op for
+  # it but harmless. Everything else is namespace-scoped.
+  if ! kubectl apply --dry-run=server -n "$SAMPLE_APPLY_NS" -f "$f" \
+       >/tmp/sample-dry-run.log 2>&1; then
+    echo "[install-smoke] sample $f did not apply cleanly:" >&2
+    cat /tmp/sample-dry-run.log >&2
+    sample_fail=1
+  fi
+done
+kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+if [ "$sample_fail" -ne 0 ]; then
+  fail "one or more config/samples/*.yaml manifests did not apply cleanly against the live install"
+fi
+log "all config/samples/*.yaml applied cleanly (server dry-run)"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth, every sample manifest applies cleanly"
