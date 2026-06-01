@@ -63,11 +63,11 @@ const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
 // and BackendRecovered narrate transitions of the managed workload's
-// availability so operators see backend readiness changes in `kubectl
-// describe`. The
-// FailClosedEnabled / FailOpenRestored pair narrates transitions of the
-// spec.integration.failOpen toggle — explicitly fail-closed is loud because
-// the cache then becomes a serving dependency.
+// availability so operators see backend readiness changes in
+// `kubectl describe`. The FailClosedEnabled / FailOpenRestored pair
+// narrates transitions of the spec.integration.failOpen toggle —
+// explicitly fail-closed is loud because the cache then becomes a serving
+// dependency.
 const (
 	eventReasonBackendDegraded   = "BackendDegraded"
 	eventReasonBackendRecovered  = "BackendRecovered"

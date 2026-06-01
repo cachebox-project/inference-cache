@@ -411,31 +411,44 @@ if [ -z "$endpoint" ]; then
 fi
 log "status.endpoint=$endpoint"
 
-# The Ready printer column is driven by .status.conditions[Ready].status —
-# assert the same JSONPath kubebuilder writes into the printcolumn
-# annotation so we exercise the operator-facing column on a real install
-# (a CRD-side JSONPath typo would break the column without breaking any
-# unit test). We assert the value is populated and well-formed
-# (True / False) rather than waiting for Ready=True, because the
-# lmcache-server image pull can dominate the wait window on a cold node
-# and the printer-column wiring is what the smoke needs to validate —
-# pod-Ready latency is already covered by the canary that runs a real
-# CPU engine.
-log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for the Ready condition status to be populated"
+# Exercise the operator-facing Ready printer column on a real install.
+# The column is wired by a +kubebuilder:printcolumn annotation in
+# api/v1alpha1/cachebackend_types.go that codegens into the served CRD's
+# additionalPrinterColumns; `kubectl get cb` defaults to that table layout.
+# Two assertions, both needed:
+#   (1) `kubectl get cb` default output includes a READY column header —
+#       fails if the printcolumn annotation/regen ever drops or renames
+#       the column.
+#   (2) the value under that column is True or False — fails if the
+#       JSONPath in the printcolumn annotation is malformed (kubectl
+#       renders the cell empty when its JSONPath resolves to nothing).
+# We don't wait for Ready=True because the lmcache-server image pull can
+# dominate the wait window on a cold node; the column-wiring is what the
+# smoke needs to validate. Pod-Ready latency is already covered by the
+# canary that runs a real CPU engine.
+log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for the Ready printer column to populate"
 deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
-ready=""
+ready_col=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  ready=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-  if [ "$ready" = "True" ] || [ "$ready" = "False" ]; then break; fi
+  # `kubectl get cb <name>` default output renders the CRD's
+  # additionalPrinterColumns. Header is line 1, the data row is line 2.
+  # Find the "READY" column index in the header and read the same field
+  # from the data row — robust to column-order changes from future CRD
+  # edits and fails if the header is missing the column entirely.
+  ready_col=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache 2>/dev/null | awk '
+    NR==1 { for (i=1;i<=NF;i++) if ($i=="READY") col=i; if (!col) exit 1 }
+    NR==2 { print $col }
+  ' || true)
+  if [ "$ready_col" = "True" ] || [ "$ready_col" = "False" ]; then break; fi
   sleep 2
 done
-if [ "$ready" != "True" ] && [ "$ready" != "False" ]; then
+if [ "$ready_col" != "True" ] && [ "$ready_col" != "False" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache || true
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
   kubectl -n "$SAMPLE_NS" describe deployment qwen-demo-cache || true
-  fail "Ready printer-column JSONPath resolved to '$ready' (want True or False) after ${SAMPLE_ENDPOINT_TIMEOUT}s — printcolumn annotation may be broken"
+  fail "Ready printer column = '$ready_col' (want True or False) after ${SAMPLE_ENDPOINT_TIMEOUT}s — printcolumn annotation missing, renamed, or JSONPath malformed"
 fi
-log "Ready condition status=$ready (printer-column JSONPath resolves)"
+log "Ready printer column = $ready_col"
 
 log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
