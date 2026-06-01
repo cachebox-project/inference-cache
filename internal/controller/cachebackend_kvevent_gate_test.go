@@ -439,6 +439,39 @@ func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	expectNoEvent(t, evs, reasonKVEventsObserved)
 }
 
+// TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh is the regression guard
+// for the gate↔matchedEnginePods requeue interaction: while the gate is
+// AwaitingFirstKVEvent it sets a multi-minute RequeueAfter (firstEventTimeout),
+// but the matched-pods self-requeue cadence must still win so the operator-
+// facing Matched column refreshes during the "no engine pods attached"
+// diagnosis path. The reconcile result must carry the shorter cadence.
+func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
+	cb := gatedLMCacheBackend("cache", "ns1")
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "vllm"},
+	}
+	r, _ := newReconcilerWithRecorder(t, cb)
+	r.MatchedEnginePodsRequeueInterval = 7 * time.Second
+
+	reconcile(t, r, "cache", "ns1")
+	// HTTP-Ready, no KV event → gate is AwaitingFirstKVEvent and schedules a
+	// ~5m RequeueAfter (default firstEventTimeout, anchor falls back to now).
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthPending {
+		t.Fatalf("health = %q, want Pending (AwaitingFirstKVEvent precondition)", got)
+	}
+	if res.RequeueAfter != 7*time.Second {
+		t.Fatalf("RequeueAfter = %s, want 7s (matched-pods cadence must win over the gate's firstEventTimeout window)", res.RequeueAfter)
+	}
+}
+
 // waitForReadyReason polls until the CacheBackend's Ready condition matches the
 // wanted status+reason, or fails after a bounded deadline.
 func waitForReadyReason(t *testing.T, cl client.Client, key types.NamespacedName, status metav1.ConditionStatus, reason string) {

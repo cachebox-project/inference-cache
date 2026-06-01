@@ -30,12 +30,15 @@ import (
 
 // Status condition types published on a managed CacheBackend.
 //
-// Ready reports whether the managed backend workload is currently serving.
+// Ready reports whether the managed backend workload is currently serving
+// (gated by the KV-event readiness gate — see evaluateKVEventReadiness).
 // Progressing reports whether the controller is still driving the live state
-// toward the desired state (template render, child apply, rollout in flight).
-// The two conditions together let consumers tell a still-converging backend
+// toward the desired state (template render, child apply, rollout in flight,
+// awaiting first KV event). Degraded reports a terminal unhealthy state and
+// tracks status.Health == Degraded (see the conditionTypeDegraded comment
+// below). Ready + Progressing together tell a still-converging backend
 // (Ready=False, Progressing=True) apart from a stuck/degraded one
-// (Ready=False, Progressing=False).
+// (Ready=False, Progressing=False); Degraded names the specific failure.
 const (
 	conditionTypeReady       = "Ready"
 	conditionTypeProgressing = "Progressing"
@@ -243,13 +246,20 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	//     selector to drive the count to a new value). The retry tries
 	//     the clear again on the next tick.
 	//
-	// Don't shorten an already-shorter RequeueAfter dispatch may have set
-	// (none today, but preserve the contract): only fill in the cadence
-	// when no other requeue is pending.
+	// Requeue at the SOONER of the matched-pods cadence and any window
+	// dispatch already scheduled. The KV-event gate sets a multi-minute
+	// RequeueAfter while AwaitingFirstKVEvent (up to firstEventTimeout); taking
+	// the min keeps the matched-pods refresh on its cadence instead of letting
+	// the gate window suppress it — otherwise the operator-facing Matched
+	// column would go stale for up to firstEventTimeout during the exact "no
+	// engine pods attached" diagnosis path. The gate recomputes elapsed on
+	// every reconcile, so a shorter requeue only lands its Degraded flip at
+	// most one cadence after the deadline.
 	if needsRequeue := (backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0) ||
 		backend.Status.MatchedEnginePods != nil; needsRequeue {
-		if result.RequeueAfter == 0 {
-			result.RequeueAfter = r.matchedEnginePodsRequeueInterval()
+		cadence := r.matchedEnginePodsRequeueInterval()
+		if result.RequeueAfter == 0 || cadence < result.RequeueAfter {
+			result.RequeueAfter = cadence
 		}
 	}
 	// Emit transitions whenever dispatch published a status change, even on
@@ -1458,12 +1468,18 @@ func statusFailOpen(v *bool) bool {
 }
 
 // emitTransitionEvents emits Kubernetes Events on transitions of the observed
-// backend health or the effective failOpen toggle. By design events fire only
-// on transitions — never on steady state — so a Ready backend reconciling
-// every few seconds does not flood the event stream.
+// backend health, the KV-event readiness gate state, or the effective failOpen
+// toggle. By design events fire only on transitions — never on steady state —
+// so a Ready backend reconciling every few seconds does not flood the event
+// stream.
 //
-//   - Entering Degraded → Warning BackendDegraded.
-//   - Leaving Degraded for Ready → Normal BackendRecovered.
+//   - Entering Degraded → Warning BackendDegraded (suppressed for the
+//     KV-event-gate flavor, which emits NoKVEventsObserved instead).
+//   - Leaving Degraded for Ready → Normal BackendRecovered (suppressed when
+//     recovering from the KV-event-gate Degraded, which emits KVEventsObserved).
+//   - KV-event gate (keyed on the Ready condition reason): Normal
+//     AwaitingFirstKVEvent on first reaching it; Normal KVEventsObserved on the
+//     first event observed; Warning NoKVEventsObserved on the timeout breach.
 //   - failOpen flipped true → false → Warning FailClosedEnabled (the cache
 //     becomes a serving dependency; advanced opt-in).
 //   - failOpen flipped false → true → Normal FailOpenRestored.
