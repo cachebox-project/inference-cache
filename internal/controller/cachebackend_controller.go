@@ -991,7 +991,7 @@ type kvReadiness struct {
 //
 // "Event seen" is "have we EVER seen an event for this backend" — a non-nil
 // lastEventAt already present on the first reconcile counts (no transition
-// through Pending is required). The gate is opt-out per CR via the
+// through AwaitingFirstKVEvent is required). The gate is opt-out per CR via the
 // inferencecache.io/require-kv-events: "false" annotation. External backends
 // never reach this code path (reconcileExternal short-circuits dispatch), so
 // they are unconditionally exempt.
@@ -1569,7 +1569,7 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	// so they fire once on entry into each gate state.
 	if before.readyReason != reasonAwaitingFirstKVEvent && after.readyReason == reasonAwaitingFirstKVEvent {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
-			"cache-backend workload is Available but no KV events observed yet; backend stays Pending until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
+			"cache-backend workload is Available but no KV events observed yet; backend stays Ready=False/AwaitingFirstKVEvent until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
 	}
 	// KVEventsObserved fires exactly once — on the nil→set transition of the
 	// firstKVEventObservedAt latch, i.e. the TRUE first event. Keying on the

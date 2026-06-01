@@ -437,9 +437,10 @@ spec:
                     default: 5m
                     description: |-
                       FirstEventTimeout bounds how long a managed backend may sit
-                      Pending with reason AwaitingFirstKVEvent — the managed cache-backend
+                      Ready=False with reason AwaitingFirstKVEvent — the managed cache-backend
                       workload is Available but no KV event has been observed yet — before
-                      the controller flips it to Degraded with reason NoKVEventsObserved.
+                      the controller flips it to Ready=False/Degraded=True with reason
+                      NoKVEventsObserved.
 
                       The KV-event readiness gate holds Ready until at least one KV event
                       has been observed for this backend's replicas
@@ -469,17 +470,6 @@ spec:
                       mis-parses). This matches how the API treats every metav1.Duration
                       field; no extra CRD-level format constraint is imposed.
                     type: string
-                  lookupTimeoutMs:
-                    description: LookupTimeoutMs bounds cache lookup latency in milliseconds.
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  minimumPrefixTokens:
-                    description: MinimumPrefixTokens is the minimum prefix length
-                      required before cache lookup is attempted.
-                    format: int32
-                    minimum: 0
-                    type: integer
                   role:
                     description: Role controls whether the engine reads from, writes
                       to, or fully participates in the cache.
@@ -2062,12 +2052,6 @@ spec:
                   without re-gating — consistent with the "ever observed" contract.
                 format: date-time
                 type: string
-              indexEntries:
-                description: IndexEntries is the observed number of cache index entries
-                  for this backend.
-                format: int64
-                minimum: 0
-                type: integer
               indexParticipation:
                 description: |-
                   IndexParticipation summarizes this CacheBackend's contribution to the

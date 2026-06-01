@@ -31,7 +31,7 @@ func newBackend() *cachev1alpha1.CacheBackend {
 
 func i32p(v int32) *int32 { return &v }
 
-func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
+func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 
@@ -42,18 +42,17 @@ func TestDefaulter_StampsAllPhase1DefaultsWhenUnset(t *testing.T) {
 	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != defaultReplicas {
 		t.Errorf("replicas = %v, want %d", cb.Spec.Replicas, defaultReplicas)
 	}
+	// The defaulter materialises spec.integration solely to persist
+	// firstEventTimeout: the CRD-schema default for firstEventTimeout only
+	// applies when spec.integration is present in the submitted object, so the
+	// common CR that omits integration entirely relies on the webhook stamping
+	// it here. (The retired lookupTimeoutMs/minimumPrefixTokens fields are no
+	// longer part of the type — lookup tuning lives on CachePolicy — and
+	// failOpen's effective default is applied at read time by
+	// IntegrationFailOpen, not stamped here.)
 	if cb.Spec.Integration == nil {
-		t.Fatal("integration block not created")
+		t.Fatal("integration block not materialised")
 	}
-	if cb.Spec.Integration.LookupTimeoutMs == nil || *cb.Spec.Integration.LookupTimeoutMs != defaultLookupTimeoutMs {
-		t.Errorf("lookupTimeoutMs = %v, want %d", cb.Spec.Integration.LookupTimeoutMs, defaultLookupTimeoutMs)
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
-		t.Errorf("minimumPrefixTokens = %v, want %d", cb.Spec.Integration.MinimumPrefixTokens, defaultMinimumPrefixTokens)
-	}
-	// The CRD-schema default for firstEventTimeout only applies when
-	// spec.integration is present in the submitted object; the common CR that
-	// omits integration entirely relies on the webhook stamping it here.
 	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
 		t.Errorf("firstEventTimeout = %v, want %s", cb.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
 	}
@@ -64,9 +63,7 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(7)
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		LookupTimeoutMs:     i32p(123),
-		MinimumPrefixTokens: i32p(999),
-		FirstEventTimeout:   &metav1.Duration{Duration: 90 * time.Second},
+		FirstEventTimeout: &metav1.Duration{Duration: 90 * time.Second},
 	}
 
 	if err := d.Default(context.Background(), cb); err != nil {
@@ -76,39 +73,27 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 	if *cb.Spec.Replicas != 7 {
 		t.Errorf("replicas clobbered: got %d, want 7", *cb.Spec.Replicas)
 	}
-	if *cb.Spec.Integration.LookupTimeoutMs != 123 {
-		t.Errorf("lookupTimeoutMs clobbered: got %d, want 123", *cb.Spec.Integration.LookupTimeoutMs)
-	}
-	if *cb.Spec.Integration.MinimumPrefixTokens != 999 {
-		t.Errorf("minimumPrefixTokens clobbered: got %d, want 999", *cb.Spec.Integration.MinimumPrefixTokens)
-	}
 	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 90*time.Second {
 		t.Errorf("firstEventTimeout clobbered: got %v, want 90s", cb.Spec.Integration.FirstEventTimeout)
 	}
 }
 
 func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
-	// Operator pinned lookupTimeoutMs but left minimumPrefixTokens and
-	// firstEventTimeout unset — the defaulter should fill in only the holes
-	// and leave the pinned value alone.
+	// Operator pinned firstEventTimeout on an otherwise-empty integration
+	// block — the defaulter should leave the pinned value alone (and there are
+	// no other integration fields left for it to fill in).
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		LookupTimeoutMs: i32p(25),
+		FirstEventTimeout: &metav1.Duration{Duration: 30 * time.Second},
 	}
 
 	if err := d.Default(context.Background(), cb); err != nil {
 		t.Fatalf("Default returned error: %v", err)
 	}
 
-	if *cb.Spec.Integration.LookupTimeoutMs != 25 {
-		t.Errorf("operator lookupTimeoutMs clobbered: %d", *cb.Spec.Integration.LookupTimeoutMs)
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil || *cb.Spec.Integration.MinimumPrefixTokens != defaultMinimumPrefixTokens {
-		t.Errorf("minimumPrefixTokens not defaulted")
-	}
-	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
-		t.Errorf("firstEventTimeout not defaulted: got %v", cb.Spec.Integration.FirstEventTimeout)
+	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 30*time.Second {
+		t.Errorf("operator firstEventTimeout clobbered: got %v, want 30s", cb.Spec.Integration.FirstEventTimeout)
 	}
 }
 

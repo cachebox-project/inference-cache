@@ -1,3 +1,5 @@
+# Kubebuilder-generated minimum-viable sample: a representative PDTopology that
+# applies cleanly against the current schema. Types-only today (no controller yet).
 apiVersion: inferencecache.io/v1alpha1
 kind: PDTopology
 metadata:

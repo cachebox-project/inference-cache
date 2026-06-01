@@ -24,11 +24,16 @@ const metricNamespace = "inferencecache"
 // registers to controller-runtime's registry, and (b) tests can construct
 // multiple Services without "duplicate metrics collector registration" panics.
 //
-// The registry exposes the liveness gauge `inferencecache_server_up` plus the
-// metrics wired since B5: `index_entries`, the `lookup_route_*` call/latency
-// series, `snapshot_auth_total`, and `tenant_evictions_total` (see
-// docs/reference/metrics.md). The full §4.3 metric schema is still owned by the
-// standalone metric-schema work (F3); these are the subset shipped so far.
+// The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
+// owned by the standalone metric-schema work (F3). What ships here today: the
+// liveness gauge (`inferencecache_server_up`), the index population gauge
+// (`inferencecache_index_entries`), the lookup counter + latency histogram
+// (`inferencecache_lookup_route_*`), the quota-eviction counter
+// (`inferencecache_tenant_evictions_total`), and the per-endpoint auth
+// counters (`inferencecache_snapshot_auth_total`,
+// `inferencecache_policy_auth_total`). Update this comment when adding a new
+// metric so the ownership note in docs/reference/metrics.md and this struct
+// stay in lockstep.
 type serverMetrics struct {
 	registry        *prometheus.Registry
 	up              prometheus.Gauge
@@ -37,6 +42,7 @@ type serverMetrics struct {
 	lookupLatency   *prometheus.HistogramVec
 	tenantEvictions *prometheus.CounterVec
 	snapshotAuth    *prometheus.CounterVec
+	policyAuth      *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -72,6 +78,11 @@ func newServerMetrics() *serverMetrics {
 		Name:      "snapshot_auth_total",
 		Help:      "Authentication outcomes for the internal /snapshot endpoint (ok|unauth|forbidden|error).",
 	}, []string{"result"})
+	policyAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "policy_auth_total",
+		Help:      "Authentication outcomes for the internal /policy endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
@@ -81,6 +92,7 @@ func newServerMetrics() *serverMetrics {
 		lookupLatency,
 		tenantEvictions,
 		snapshotAuth,
+		policyAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -93,13 +105,29 @@ func newServerMetrics() *serverMetrics {
 		lookupLatency:   lookupLatency,
 		tenantEvictions: tenantEvictions,
 		snapshotAuth:    snapshotAuth,
+		policyAuth:      policyAuth,
 	}
 }
 
-// RecordAuthResult is invoked once per /snapshot request by the auth
-// middleware. Satisfies auth.ResultRecorder.
-func (m *serverMetrics) RecordAuthResult(result auth.Result) {
-	m.snapshotAuth.WithLabelValues(string(result)).Inc()
+// SnapshotAuthRecorder returns an auth.ResultRecorder that increments the
+// /snapshot auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured.
+func (m *serverMetrics) SnapshotAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.snapshotAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// PolicyAuthRecorder returns an auth.ResultRecorder that increments the
+// /policy auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured — /policy joins /snapshot on
+// the auth-required listener under one shared SA identity, but each endpoint
+// emits its own outcome counter so dashboards can distinguish read-side
+// (/snapshot) from write-side (/policy) auth failures.
+func (m *serverMetrics) PolicyAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.policyAuth.WithLabelValues(string(r)).Inc()
+	})
 }
 
 // SetIndexEntries reports the live prefix-entry count for a model. It satisfies
