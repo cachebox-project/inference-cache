@@ -1,3 +1,5 @@
+# Kubebuilder-generated minimum-viable sample: the cluster-scoped, status-only
+# CacheIndex the controller maintains. Spec is intentionally empty.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheIndex
 metadata:
