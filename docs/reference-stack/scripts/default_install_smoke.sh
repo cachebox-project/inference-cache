@@ -46,10 +46,11 @@
 # at "the default install bundle wires together; gRPC fail-open works; the
 # CacheBackend ↔ engine-pod binding surfaces operators rely on actually
 # wire up end-to-end" -- light enough to run on every PR. The paired-sample
-# phase swaps the engine container's image to busybox before pod CREATE so
-# the smoke does not pay the multi-GB vLLM pull; the signals it asserts
-# (status, annotation, Event) all materialize from pod CREATE, not from the
-# engine actually running.
+# phase swaps the engine container's image to busybox before pod CREATE and
+# uses a tiny locally built lmcache_server stand-in for the managed cache
+# server, so the smoke does not pay multi-GB pulls or depend on mutable
+# upstream image availability; the signals it asserts materialize from pod
+# CREATE and the controller-managed Deployment readiness surface.
 #
 # Designed to catch the class of install regression that surfaced when the
 # default overlay was missing a Namespace resource: `kubectl apply -k` silently
@@ -67,7 +68,7 @@
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
 #           CACHEINDEX_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR, SAMPLE_NS,
 #           SAMPLE_ENDPOINT_TIMEOUT, SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
-#           SAMPLE_ENGINE_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
+#           SAMPLE_ENGINE_IMAGE, SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT.
 
 set -euo pipefail
@@ -116,6 +117,11 @@ SAMPLE_GATE_TIMEOUT="${SAMPLE_GATE_TIMEOUT:-240}"
 # engine doesn't need to run for the operator-facing signals (Matched,
 # annotation, Event) to materialize. Avoids a multi-GB pull in CI.
 SAMPLE_ENGINE_IMAGE="${SAMPLE_ENGINE_IMAGE:-busybox:1.36}"
+# Tiny stand-in for the managed LMCache server image. The controller still
+# renders the canonical lmcache_server command/args and TCP readiness probe; the
+# image only provides a local binary that listens on the requested port so the
+# Deployment can become Available without pulling lmcache/standalone:latest.
+SAMPLE_CACHE_SERVER_IMAGE="${SAMPLE_CACHE_SERVER_IMAGE:-install-smoke-lmcache-server:$TAG}"
 
 # Image refs match the Makefile's REGISTRY/repo defaults so `kustomize edit set
 # image` (or the sed fallback) rewrites the in-tree controller=/server= entries
@@ -214,6 +220,30 @@ trap on_exit EXIT
 for bin in docker kubectl grpcurl "$KIND"; do
   command -v "$bin" >/dev/null 2>&1 || fail "missing required tool on PATH: $bin"
 done
+
+build_sample_cache_server_image() {
+  local context
+  context="$(mktemp -d "$tmpdir/lmcache-server-context.XXXXXX")"
+
+  cat >"$context/lmcache_server" <<'EOF'
+#!/bin/sh
+port="${2:-65432}"
+while true; do
+  nc -l -p "$port" >/dev/null 2>&1 || sleep 1
+done
+EOF
+
+  cat >"$context/Dockerfile" <<'EOF'
+FROM busybox:1.36
+COPY lmcache_server /usr/local/bin/lmcache_server
+RUN chmod +x /usr/local/bin/lmcache_server
+EOF
+
+  log "building lightweight lmcache_server stand-in image=$SAMPLE_CACHE_SERVER_IMAGE"
+  docker build -t "$SAMPLE_CACHE_SERVER_IMAGE" "$context"
+  log "loading $SAMPLE_CACHE_SERVER_IMAGE into the kind node"
+  "$KIND" load docker-image "$SAMPLE_CACHE_SERVER_IMAGE" --name "$KIND_CLUSTER"
+}
 
 # --- cluster ----------------------------------------------------------------
 if "$KIND" get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
@@ -447,6 +477,12 @@ awk -v cb="$sample_tmp_cb" -v engine="$sample_tmp_engine" '
 sed -i.bak "s|vllm/vllm-openai-cpu:latest-x86_64|$SAMPLE_ENGINE_IMAGE|g" \
   "$sample_tmp_engine"
 rm -f "${sample_tmp_engine}.bak"
+
+build_sample_cache_server_image
+escaped_sample_cache_server_image="$(printf '%s' "$SAMPLE_CACHE_SERVER_IMAGE" | sed 's/[&|\\]/\\&/g')"
+sed -i.bak "s|serverImage: lmcache/standalone:latest|serverImage: $escaped_sample_cache_server_image|g" \
+  "$sample_tmp_cb"
+rm -f "${sample_tmp_cb}.bak"
 
 log "applying CacheBackend"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_cb" >/dev/null
