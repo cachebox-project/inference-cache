@@ -98,31 +98,21 @@ func NewPolicyStore() *PolicyStore {
 	}
 }
 
-// Replace swaps the in-memory snapshot. Idempotent — pushing the same
-// snapshot twice produces the same observable state.
+// Replace swaps the full snapshot to a policies-only state: it installs the
+// given policies AND clears any tenant quotas, exactly equivalent to
+// ReplaceSnapshot(policies, nil). Retained as a convenience for callers that
+// don't exercise the tenant-quota axis (mostly tests); it delegates so it can
+// never leave a stale tenant table behind. Idempotent.
 func (s *PolicyStore) Replace(policies []ResolvedPolicy) {
-	next := make(map[string]ResolvedPolicy, len(policies))
-	for _, p := range policies {
-		if p.Namespace == "" {
-			// Defensive: a snapshot entry without a namespace can't be
-			// routed by tenant_id, so dropping it is safer than poisoning
-			// the empty-string key (which would silently shadow any
-			// lookup with an empty tenant).
-			continue
-		}
-		next[p.Namespace] = p
-	}
-	s.mu.Lock()
-	s.policies = next
-	s.mu.Unlock()
+	s.ReplaceSnapshot(policies, nil)
 }
 
 // ReplaceSnapshot atomically swaps BOTH the policy and tenant-quota state under
 // a single write lock, so a reader never observes new policies paired with the
 // previous tenant table (or vice versa). This is the path the /policy handler
-// uses; the policies-only Replace remains for callers (mostly tests) that don't
-// exercise the tenant axis. Replace-on-write: a tenant absent from the new
-// snapshot reverts to "no quota" (unbounded, fail open).
+// uses; the policies-only Replace delegates here with nil tenants.
+// Replace-on-write: a tenant absent from the new snapshot reverts to "no quota"
+// (unbounded, fail open).
 func (s *PolicyStore) ReplaceSnapshot(policies []ResolvedPolicy, tenants []ResolvedTenant) {
 	nextPolicies := make(map[string]ResolvedPolicy, len(policies))
 	for _, p := range policies {

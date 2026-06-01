@@ -194,6 +194,12 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 	for _, t := range snap.Tenants {
 		observedByID[t.TenantID] = t
 	}
+	// Two CacheTenant CRs can declare the same spec.tenantID. The control-plane
+	// reconciler dedups before pushing /policy, so only ONE quota is enforced per
+	// tenantID — the first by (namespace, name). Resolve the same winner here so a
+	// shadowed duplicate doesn't publish status claiming its own (non-effective)
+	// budget is enforced.
+	owners := effectiveTenantOwners(tenants.Items)
 
 	var errs []error
 	for i := range tenants.Items {
@@ -207,7 +213,17 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 		if !ok {
 			obs = index.TenantSnapshot{TenantID: ct.Spec.TenantID}
 		}
-		desired := buildCacheTenantStatus(ct, obs)
+		// A quota-bearing CR whose tenantID is owned by a different CR is a
+		// shadowed duplicate: its budget is NOT the one being enforced.
+		var shadowedBy *types.NamespacedName
+		if tenantHasQuota(ct) {
+			if owner, owned := owners[ct.Spec.TenantID]; owned &&
+				(owner.Namespace != ct.Namespace || owner.Name != ct.Name) {
+				o := owner
+				shadowedBy = &o
+			}
+		}
+		desired := buildCacheTenantStatus(ct, obs, shadowedBy)
 		if cacheTenantStatusEqual(ct.Status, desired) {
 			continue
 		}
@@ -604,6 +620,43 @@ const (
 	tenantConditionQuotaExceeded = "QuotaExceeded"
 )
 
+// tenantHasQuota reports whether a CacheTenant declares an enforceable
+// index-entry budget — the same condition resolveOneTenant uses to decide
+// whether to push it to /policy.
+func tenantHasQuota(ct *cachev1alpha1.CacheTenant) bool {
+	return ct.Spec.TenantID != "" && ct.Spec.Quota != nil && ct.Spec.Quota.MaxIndexEntries != nil
+}
+
+// effectiveTenantOwners returns, per spec.tenantID, the CacheTenant the
+// control-plane reconciler treats as authoritative: the first quota-bearing CR
+// by (namespace, name). This MUST match resolveTenants' dedup tie-break so the
+// status writer and the /policy pusher agree on which CR's budget is enforced.
+// Only quota-bearing CRs participate (a CR with no budget enforces nothing).
+func effectiveTenantOwners(items []cachev1alpha1.CacheTenant) map[string]types.NamespacedName {
+	ordered := make([]int, 0, len(items))
+	for i := range items {
+		if tenantHasQuota(&items[i]) {
+			ordered = append(ordered, i)
+		}
+	}
+	sort.Slice(ordered, func(a, b int) bool {
+		ia, ib := &items[ordered[a]], &items[ordered[b]]
+		if ia.Namespace != ib.Namespace {
+			return ia.Namespace < ib.Namespace
+		}
+		return ia.Name < ib.Name
+	})
+	owners := make(map[string]types.NamespacedName, len(ordered))
+	for _, i := range ordered {
+		ct := &items[i]
+		if _, taken := owners[ct.Spec.TenantID]; taken {
+			continue
+		}
+		owners[ct.Spec.TenantID] = types.NamespacedName{Namespace: ct.Namespace, Name: ct.Name}
+	}
+	return owners
+}
+
 // buildCacheTenantStatus projects one snapshot tenant aggregate onto a
 // CacheTenant's status. It is only called after a successful /snapshot scrape,
 // so obs is always a live reading: the matched snapshot row, or a synthesized
@@ -617,7 +670,12 @@ const (
 //   - QuotaExceeded reflects the latest reading against the entry budget.
 //     Enforcement evicts at ingest, so it normally reads False; it can briefly
 //     flip True between an over-budget ingest and the next scrape.
-func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot) cachev1alpha1.CacheTenantStatus {
+//
+// shadowedBy is non-nil when this CR declares a quota but another CacheTenant
+// owns the same spec.tenantID and is the one actually enforced. Such a duplicate
+// must NOT report its own budget as effective: it goes Ready=False/Duplicate and
+// QuotaExceeded=False/NotEffective so the operator sees it is being ignored.
+func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot, shadowedBy *types.NamespacedName) cachev1alpha1.CacheTenantStatus {
 	st := cachev1alpha1.CacheTenantStatus{ObservedGeneration: ct.Generation}
 	// Seed from existing conditions so meta.SetStatusCondition keeps each
 	// condition's LastTransitionTime stable when its Status doesn't flip.
@@ -629,11 +687,29 @@ func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnaps
 	entries := indexEntries
 	st.IndexEntries = &entries
 
+	if shadowedBy != nil {
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type:               tenantConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "DuplicateTenantID",
+			Message:            fmt.Sprintf("spec.tenantID %q is owned by CacheTenant %s; this duplicate's quota is not enforced", ct.Spec.TenantID, shadowedBy.String()),
+			ObservedGeneration: ct.Generation,
+		})
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type:               tenantConditionQuotaExceeded,
+			Status:             metav1.ConditionFalse,
+			Reason:             "NotEffective",
+			Message:            fmt.Sprintf("quota not enforced: CacheTenant %s owns spec.tenantID %q", shadowedBy.String(), ct.Spec.TenantID),
+			ObservedGeneration: ct.Generation,
+		})
+		return st
+	}
+
 	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
 		Type:               tenantConditionReady,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Observed",
-		Message:            "tenant observed in the server snapshot",
+		Message:            "projected from the latest server snapshot read",
 		ObservedGeneration: ct.Generation,
 	})
 

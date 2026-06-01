@@ -1080,6 +1080,75 @@ func tenantCond(ct cachev1alpha1.CacheTenant, condType string) (metav1.Condition
 	return metav1.Condition{}, false
 }
 
+// TestReconcileTenantStatusesShadowedDuplicate pins the duplicate-tenantID
+// contract: when two CacheTenants declare the same spec.tenantID, the
+// control-plane reconciler enforces only the first by (namespace, name), so the
+// status writer must mark the OTHER as a shadowed duplicate rather than claim
+// its (non-effective) budget is enforced.
+func TestReconcileTenantStatusesShadowedDuplicate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	effBudget := int64(5)
+	dupBudget := int64(100)
+	// Same tenantID "shared"; alpha < beta by name → alpha is effective.
+	effective := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha", Namespace: "team"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "shared",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &effBudget},
+		},
+	}
+	shadowed := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "beta", Namespace: "team"},
+		Spec: cachev1alpha1.CacheTenantSpec{
+			TenantID: "shared",
+			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &dupBudget},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
+		WithObjects(effective, shadowed).
+		Build()
+	p := &CacheIndexPoller{Client: cl}
+	ctx := context.Background()
+
+	// 3 distinct prefixes for "shared": under the effective budget (5).
+	snap := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "shared", IndexEntries: 3}}}
+	if err := p.reconcileTenantStatuses(ctx, snap); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	get := func(name string) cachev1alpha1.CacheTenant {
+		var ct cachev1alpha1.CacheTenant
+		if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: "team"}, &ct); err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		return ct
+	}
+
+	// Effective CR: Ready=True, QuotaExceeded=False against its own budget.
+	eff := get("alpha")
+	if c, ok := tenantCond(eff, tenantConditionReady); !ok || c.Status != metav1.ConditionTrue || c.Reason != "Observed" {
+		t.Fatalf("effective Ready = %+v, want True/Observed", c)
+	}
+	if c, _ := tenantCond(eff, tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse || c.Reason != "WithinBudget" {
+		t.Fatalf("effective QuotaExceeded = %+v, want False/WithinBudget", c)
+	}
+
+	// Shadowed CR: Ready=False/DuplicateTenantID, QuotaExceeded=False/NotEffective —
+	// its 100-entry budget is NOT presented as enforced.
+	dup := get("beta")
+	if c, ok := tenantCond(dup, tenantConditionReady); !ok || c.Status != metav1.ConditionFalse || c.Reason != "DuplicateTenantID" {
+		t.Fatalf("shadowed Ready = %+v, want False/DuplicateTenantID", c)
+	}
+	if c, _ := tenantCond(dup, tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse || c.Reason != "NotEffective" {
+		t.Fatalf("shadowed QuotaExceeded = %+v, want False/NotEffective", c)
+	}
+}
+
 func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {

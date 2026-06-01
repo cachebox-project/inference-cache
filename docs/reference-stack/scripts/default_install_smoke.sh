@@ -16,7 +16,7 @@
 #      smoke) and a `Ready=True` condition written by the same poller.
 #   4. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
-#   4. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   5. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -26,14 +26,14 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   5. The External CacheBackend type end-to-end: applying a `type: External`
+#   6. The External CacheBackend type end-to-end: applying a `type: External`
 #      CR renders NO Deployment/Service in its namespace, status.endpoint
 #      mirrors spec.endpoint, the CR goes Ready=True/ExternalEndpointAccepted,
 #      and a matching engine pod is admitted with `LMCACHE_REMOTE_URL=lm://
 #      <spec.endpoint>` injected by the pod-mutating webhook. Also exercises
 #      the new admission validation rules (non-External + endpoint and
 #      External + bad scheme are both rejected at write time).
-#   6. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
 #
