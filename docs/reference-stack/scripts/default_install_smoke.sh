@@ -547,6 +547,12 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$po
     echo "$policy_high_resp" >&2
     echo "below-threshold LookupRoute response:" >&2
     echo "$policy_low_resp" >&2
+    for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err"; do
+      if [ -s "$err_file" ]; then
+        echo "$(basename "$err_file"):" >&2
+        cat "$err_file" >&2
+      fi
+    done
     fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want high-token PREFIX_MATCH and low-token NO_HINT)"
   fi
   sleep 2
