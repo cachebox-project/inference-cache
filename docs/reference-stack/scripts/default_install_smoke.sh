@@ -31,9 +31,10 @@
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
 #   7. The External CacheBackend type end-to-end: applying the committed
-#      config/samples/cachebackend-external.yaml renders NO
-#      Deployment/Service in its namespace, status.endpoint mirrors
-#      spec.endpoint, observedGeneration
+#      config/samples/cachebackend-external.yaml drives the CacheBackend
+#      mutating webhook default (spec.replicas=1), renders NO Deployment/
+#      Service in its namespace, status.endpoint mirrors spec.endpoint,
+#      observedGeneration
 #      is set, the CR goes Ready=True/ExternalEndpointAccepted, and
 #      `kubectl get cb` renders the CacheBackend printer columns. A matching
 #      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
@@ -846,22 +847,24 @@ kubectl delete namespace "$SAMPLE_NS" \
 
 # --- External CacheBackend end-to-end ---------------------------------------
 # Exercises the committed External passthrough sample on the running cluster:
-# the mutating webhook should default integration lookup knobs, the reconciler
-# should NOT render a Deployment/Service, status.endpoint should mirror
-# spec.endpoint, observedGeneration should advance, Ready should be True with
-# reason ExternalEndpointAccepted, and a matching engine pod should come out of
-# admission with LMCACHE_REMOTE_URL pointing at the operator-supplied endpoint.
-# Also exercises CacheBackend printer columns and the validating webhook's
-# negative path.
+# the mutating webhook should stamp spec.replicas, the reconciler should NOT
+# render a Deployment/Service, status.endpoint should mirror spec.endpoint,
+# observedGeneration should advance, Ready should be True with reason
+# ExternalEndpointAccepted, and a matching engine pod should come out of
+# admission with LMCACHE_REMOTE_URL pointing at the operator-supplied
+# endpoint. Also exercises CacheBackend printer columns and the validating
+# webhook's negative path.
 log "exercising External CacheBackend end-to-end in namespace $EXT_SMOKE_NS"
 kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply the committed External CR sample. The sample intentionally omits the
-# defaulted integration knobs so the smoke drives the mutating webhook instead
-# of only proving the CRD accepts already-defaulted YAML.
+# Apply the committed External CR sample. The sample intentionally omits
+# spec.replicas so the smoke drives the mutating webhook defaulter instead of
+# only proving the CRD accepts already-defaulted YAML.
 kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/dev/null \
   || fail "kubectl apply config/samples/cachebackend-external.yaml failed"
 
+defaulted_replicas="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+  -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
 external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
@@ -875,7 +878,11 @@ if [ -z "$external_pod_labels" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
   fail "External sample did not create spec.engineSelector.matchLabels on $EXT_SMOKE_CB_NAME"
 fi
-log "External CR sample endpoint=$external_spec_endpoint"
+if [ "$defaulted_replicas" != "1" ]; then
+  kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
+  fail "CacheBackend defaulter did not stamp spec.replicas: got=$defaulted_replicas (want 1)"
+fi
+log "External CR sample endpoint=$external_spec_endpoint; defaulted replicas=$defaulted_replicas"
 
 # Wait for the reconciler to publish status.endpoint + observedGeneration +
 # the Ready=True condition. Sub-second on a quiet cluster; the timeout covers
