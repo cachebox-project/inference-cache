@@ -54,8 +54,11 @@ help: ## Display this help.
 ##@ Tools
 
 .PHONY: controller-gen
-controller-gen: $(LOCALBIN) ## Install controller-gen locally.
-	@test -s $(CONTROLLER_GEN) || GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
+controller-gen: $(LOCALBIN) ## Install controller-gen locally; reinstall when the pinned version drifts.
+	@if ! { [ -x $(CONTROLLER_GEN) ] && $(CONTROLLER_GEN) --version 2>/dev/null | grep -qF "Version: $(CONTROLLER_TOOLS_VERSION)"; }; then \
+		rm -f $(CONTROLLER_GEN); \
+		GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION); \
+	fi
 
 .PHONY: golangci-lint
 golangci-lint: $(LOCALBIN) ## Install golangci-lint locally; reinstall when the pinned version drifts.
