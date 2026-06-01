@@ -30,8 +30,6 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `autoscaling.targetCPUUtilizationPercent` | integer | Target average per-pod CPU utilization for the HPA. Defaults to `80` when unset. Range `[1, 100]`. |
 | `integration.engine` | string | Engine integration target, such as SGLang or vLLM. |
 | `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. |
-| `integration.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. Lookup callers must still fail open. |
-| `integration.minimumPrefixTokens` | integer | Minimum prefix token count before attempting cache lookup. Minimum `0`. |
 | `integration.failOpen` | boolean | Default `true`. When `true`, engine pods fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Setting it to `false` is an advanced opt-in to fail-closed serving (the cache becomes a serving dependency); the controller surfaces this as a Warning Kubernetes Event on the owning `CacheBackend`. |
 | `integration.firstEventTimeout` | duration | Default `5m`. How long a managed backend may sit `Ready=False` (`Pending`, reason `AwaitingFirstKVEvent`) after its managed workload becomes `Available` before the controller flips it to `Degraded` (reason `NoKVEventsObserved`). See [KV-event readiness gate](#kv-event-readiness-gate). |
 | `integration.engineOverrides` | object | Optional engine-injection overrides applied to the args/env the pod-mutating webhook would otherwise inject into the engine container. See [Engine-injection overrides](#engine-injection-overrides-specintegrationengineoverrides). |
@@ -40,6 +38,12 @@ The `v1alpha1` contract must remain backward-compatible where possible. New fiel
 | `template` | object | Optional pod-level overrides for managed backend pods. This is a narrow override surface, not a full `PodSpec`; backend containers come from controller defaults. |
 | `endpoint` | string | Address of a pre-existing cache the operator manages themselves. **Required when `spec.type=External`** and **rejected on every other type** (admission enforces both directions): managed backends learn their endpoint from the controller-rendered Service, so a user-supplied value would be silently overwritten. Accepted as a bare `host:port` or with the LMCache `lm://` scheme; both forms **require a non-empty port** (the LMCache connector dials a specific TCP target). Admission also rejects other schemes (`https://`, `http://`, …), path/query/fragment components, and unbracketed IPv6 literals (`[::1]:8200` is required, not `::1`). The reconciler mirrors the trimmed value into `status.endpoint`. The pod webhook sources the engine-side endpoint from `spec.endpoint` for External and from `status.endpoint` for managed types — see [Mutating Pod webhook](#mutating-pod-webhook-engine-wiring). |
 | `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
+
+> **Per-namespace lookup tuning lives on CachePolicy, not CacheBackend.** The
+> lookup latency budget and the minimum-prefix-token gate are configured via
+> `CachePolicy.spec.lookupTimeoutMs` and `CachePolicy.spec.minimumPrefixTokens`,
+> which are the surfaces actually wired into the server's `ResolvedPolicy` and
+> the `LookupRoute` path.
 
 ### Template Overrides
 
@@ -101,7 +105,6 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 | `endpoint` | string | Observed endpoint clients should use. For external backends this is mirrored from `spec.endpoint`; for managed backends it is populated by the controller that creates the serving resource. |
 | `health` | enum | Summary state: `Pending`, `Ready`, `Degraded`, or `Failed`. |
 | `capacity` | string | Human-readable summary of the backend's provisioned capacity. Informational; clients must not parse it. Intentionally left empty today — the runtime adapter doesn't yet declare a data volume the controller can attach a PVC to, so populating capacity from the requested PVC size would mislead operators. Populated by the storage wire-up follow-up. |
-| `indexEntries` | integer | Observed cache index entry count. Represented as a pointer in Go so an explicit `0` is serialized. |
 | `matchedEnginePods` | integer | Snapshot count, at the last reconcile, of pods in the CacheBackend's namespace whose labels satisfy `spec.engineSelector`. Pointer in Go so nil ("not yet computed") is distinguishable from an observed `0` ("computed and zero pods match"). Refreshed at reconcile cadence — not a real-time per-pod counter. The per-pod signal is the `InjectedByCacheBackend` Event the `engine-pod-events` controller emits after the mutating Pod webhook stamps a pod (see [Mutating Pod webhook](#mutating-pod-webhook-engine-wiring) for why the event is emitted by a controller and not the webhook). The field stays nil when no claim-capable selector is configured — both when `spec.engineSelector` is absent AND when `spec.engineSelector.matchLabels` is present but empty (the webhook treats an empty match map as no-claim by design, so the count is no-claim too). A CR that previously had a non-empty selector and just lost it gets its prior value cleared back to nil so the printer column does not advertise a stale match. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
 | `indexParticipation` | object | Per-backend slice of the cluster-wide cache index, projected from the server's `/snapshot` by grouping replicas by owning `CacheBackend`. Populated by the CacheIndex poller (status-only). Object is unset until the poller has observed a successful scrape that names the backend's replicas (see [Index Participation](#index-participation)). |
@@ -174,8 +177,7 @@ Only ONE CacheBackend ever claims a given replica — overlapping selectors must
 - Lookup paths fail open by default. `spec.integration.failOpen` defaults to `true` and the engine adapter MUST fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Operators may opt into fail-closed serving by setting `failOpen: false`, which is loud and visible: the controller emits a Warning `FailClosedEnabled` Event on the `CacheBackend` to make it explicit that the cache has been promoted to a serving dependency.
 - The controller emits transition-only Events on the `CacheBackend`. `BackendDegraded` (Warning) on entering `Degraded` and `BackendRecovered` (Normal) on returning to `Ready` from `Degraded` (both suppressed for the KV-event-gate flavors, which carry their own events); the `FailClosedEnabled` / `FailOpenRestored` pair above; and the KV-event readiness gate's `AwaitingFirstKVEvent` (Normal), `KVEventsObserved` (Normal), and `NoKVEventsObserved` (Warning). Steady-state reconciles do not emit events.
 - A `Normal InjectedByCacheBackend` Event is emitted on engine pods the mutating webhook stamps with both `inferencecache.io/injected-by` AND `inferencecache.io/injected-by-uid`, where the UID annotation matches the live CacheBackend's `metadata.uid` at reconcile time. The controller deliberately skips emission when (a) the named CR cannot be looked up (NotFound), (b) the UID annotation is absent (failurePolicy=Ignore forgery shape), or (c) the UID does not match the live CR (forgery or CR was recreated under the same name). Non-NotFound lookup errors surface as reconcile errors so controller-runtime retries with backoff. The Event is recorded by a Pod-watching controller, not by the webhook itself: at mutating-admission time the apiserver hasn't assigned `metadata.uid` to the pod yet, so an event recorded from the webhook would carry `involvedObject.uid=""` and be invisible to describe (which filters events by UID). Routing the emission through a post-create controller is what guarantees the event reaches the user-visible surface. There is no `NoMatchingCacheBackend` Event in this PR; the no-match signal is `status.matchedEnginePods == 0` on the CR (visible in `kubectl get cachebackend`).
-- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook is the exception: it materialises `spec.integration` with the Phase-1 defaults (`lookupTimeoutMs`, `minimumPrefixTokens`, `firstEventTimeout`) so downstream code does not need to nil-check them. The fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
-- `status.indexEntries` is a pointer in Go so `0` is distinguishable from unset.
+- Optional nested specs are pointer fields in Go so omitted objects stay absent in JSON and server-side apply does not claim empty nested objects. The defaulting webhook materialises `spec.integration` solely to persist `spec.integration.firstEventTimeout` (the CRD-schema `+kubebuilder:default` for that field only applies when the parent `spec.integration` object is present in the submitted object). It does NOT stamp `spec.integration.failOpen`: that field also carries a `+kubebuilder:default=true` marker, but the effective "fail open unless explicitly disabled" behavior comes from the `IntegrationFailOpen` reader helper (nil spec or nil field ⇒ `true`), i.e. semantic defaulting at read time. Webhook-stamped fields are owned by the apiserver field manager, not the operator's SSA apply, so SSA semantics for operator-set fields are unaffected.
 
 ## Admission
 
@@ -183,13 +185,11 @@ The controller serves two webhooks for CacheBackend, both registered as `failure
 
 ### Defaulting (mutating)
 
-Stamps Phase-1 defaults onto every admitted CacheBackend, only where the operator has not specified a value. Operator-set values are never clobbered.
+Stamps `spec.replicas` (the only Phase-1 default this webhook applies) when the operator has not specified it. Operator-set values are never clobbered.
 
 | Field | Default |
 |---|---|
 | `spec.replicas` | `1` |
-| `spec.integration.lookupTimeoutMs` | `50` |
-| `spec.integration.minimumPrefixTokens` | `256` |
 | `spec.integration.firstEventTimeout` | `5m` (CRD-schema default when `spec.integration` is present; the webhook also stamps it when it materializes `spec.integration`) |
 
 ### Validating

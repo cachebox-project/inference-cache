@@ -25,16 +25,16 @@ import (
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
-// tests pin the same constants the handler uses; the values come from the
-// tech-spec §4.1 example for `CacheBackend.spec.integration`
-// (lookupTimeoutMs=50, minimumPrefixTokens=256). `spec.integration.failOpen`
-// is also defaulted to true, but at the CRD layer via a +kubebuilder:default
-// marker (apiserver defaulting runs before mutating admission), so this
-// webhook does not need to stamp it.
+// tests pin the same constants the handler uses.
+//
+// `spec.integration.failOpen` is NOT stamped here. Its `+kubebuilder:default=true`
+// marker only persists a stored value when the parent `spec.integration` object
+// is present; when integration is omitted, the field stays absent. The effective
+// "fail open unless explicitly disabled" semantics come from the
+// IntegrationFailOpen reader helper (nil spec / nil field => true), i.e. semantic
+// defaulting at read time, not persisted CRD defaulting.
 const (
-	defaultLookupTimeoutMs     = int32(50)
-	defaultMinimumPrefixTokens = int32(256)
-	defaultReplicas            = int32(1)
+	defaultReplicas = int32(1)
 	// defaultFirstEventTimeout mirrors the +kubebuilder:default on
 	// spec.integration.firstEventTimeout. The CRD-schema default only applies
 	// when spec.integration is present in the submitted object; when the
@@ -57,8 +57,12 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 }
 
 // CacheBackendDefaulter applies Phase-1 defaults to a CacheBackend at
-// admission time so downstream code never has to nil-check the defaulted
-// fields. It implements [admission.Defaulter] over CacheBackend.
+// admission time. It stamps spec.replicas and materialises spec.integration
+// solely to persist spec.integration.firstEventTimeout (so an omitted
+// integration block still carries the readiness-gate deadline). It does NOT
+// stamp spec.integration.failOpen — that is defaulted semantically at read
+// time via IntegrationFailOpen (nil spec / nil field => true). It implements
+// [admission.Defaulter] over CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
@@ -142,10 +146,9 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 
 // +kubebuilder:webhook:path=/mutate-inferencecache-io-v1alpha1-cachebackend,mutating=true,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachebackends,verbs=create;update,versions=v1alpha1,name=mcachebackend.inferencecache.io,admissionReviewVersions=v1
 
-// Default implements [admission.Defaulter]. It stamps the Phase-1
-// defaults onto cb only where the operator did not specify a value: a
-// non-nil pointer or a non-zero scalar is treated as an explicit choice
-// and left alone.
+// Default implements [admission.Defaulter]. It stamps spec.replicas (the
+// only Phase-1 default this webhook applies) when the operator left it
+// unset; a non-nil pointer is treated as an explicit choice and left alone.
 func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.CacheBackend) error {
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)
@@ -157,14 +160,6 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 
 	if cb.Spec.Integration == nil {
 		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
-	}
-	if cb.Spec.Integration.LookupTimeoutMs == nil {
-		v := defaultLookupTimeoutMs
-		cb.Spec.Integration.LookupTimeoutMs = &v
-	}
-	if cb.Spec.Integration.MinimumPrefixTokens == nil {
-		v := defaultMinimumPrefixTokens
-		cb.Spec.Integration.MinimumPrefixTokens = &v
 	}
 	if cb.Spec.Integration.FirstEventTimeout == nil {
 		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}

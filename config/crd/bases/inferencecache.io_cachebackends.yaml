@@ -469,17 +469,6 @@ spec:
                       mis-parses). This matches how the API treats every metav1.Duration
                       field; no extra CRD-level format constraint is imposed.
                     type: string
-                  lookupTimeoutMs:
-                    description: LookupTimeoutMs bounds cache lookup latency in milliseconds.
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  minimumPrefixTokens:
-                    description: MinimumPrefixTokens is the minimum prefix length
-                      required before cache lookup is attempted.
-                    format: int32
-                    minimum: 0
-                    type: integer
                   role:
                     description: Role controls whether the engine reads from, writes
                       to, or fully participates in the cache.
@@ -2070,12 +2059,6 @@ spec:
                 - Degraded
                 - Failed
                 type: string
-              indexEntries:
-                description: IndexEntries is the observed number of cache index entries
-                  for this backend.
-                format: int64
-                minimum: 0
-                type: integer
               indexParticipation:
                 description: |-
                   IndexParticipation summarizes this CacheBackend's contribution to the
