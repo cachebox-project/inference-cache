@@ -392,24 +392,21 @@ kubectl create namespace "$POLICY_SMOKE_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
 kubectl -n "$POLICY_SMOKE_NS" apply -f config/samples/cache_v1alpha1_cachepolicy.yaml >/dev/null
 
-# The printer columns (Eviction / FailOpen) are themselves an operator-facing
-# surface. Verify the header and the row values so a regression to a default
-# NAME/AGE-only table does not pass unnoticed.
+# The Eviction printer column is the operator-facing surface kept on the
+# CachePolicy CRD. Verify the header and the row values so a regression to a
+# default NAME/AGE-only table does not pass unnoticed.
 cp_table="$(kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample 2>/dev/null || true)"
 cp_header="$(printf '%s\n' "$cp_table" | sed -n '1p')"
-for column in EVICTION FAILOPEN; do
-  if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$cp_header"; then
-    echo "$cp_table"
-    fail "expected CachePolicy printer column $column in kubectl get output"
-  fi
-done
-if ! grep -Fq "cachepolicy-sample" <<<"$cp_table" || \
-   ! grep -Fq "LRU" <<<"$cp_table" || \
-   ! grep -Fq "true" <<<"$cp_table"; then
+if ! grep -Eq "(^|[[:space:]])EVICTION([[:space:]]|$)" <<<"$cp_header"; then
   echo "$cp_table"
-  fail "expected CachePolicy printer row to include name, Eviction=LRU, and FailOpen=true"
+  fail "expected CachePolicy printer column EVICTION in kubectl get output"
 fi
-log "CachePolicy printer columns render Eviction/FailOpen"
+if ! grep -Fq "cachepolicy-sample" <<<"$cp_table" || \
+   ! grep -Fq "LRU" <<<"$cp_table"; then
+  echo "$cp_table"
+  fail "expected CachePolicy printer row to include name and Eviction=LRU"
+fi
+log "CachePolicy printer column renders Eviction"
 
 # --- CacheTenant status projection assertion -------------------------------
 # Apply a CacheTenant and prove the poller's per-tenant projection writes its

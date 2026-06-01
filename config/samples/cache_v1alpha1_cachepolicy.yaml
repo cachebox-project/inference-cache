@@ -9,6 +9,5 @@ metadata:
 spec:
   eviction: LRU
   evictionTTL: 30m
-  failOpen: true
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
