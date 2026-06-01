@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-test-proto:
-    name: Lint, Test, Proto
+  lint-generated-proto:
+    name: Lint, Generated Code, Proto
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,16 +32,16 @@ jobs:
         go-version-file: go.mod
         cache: true
 
-    - name: Install protoc
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
-
     - name: Verify vendor-neutral naming
       run: make verify-naming
 
     - name: Verify no internal issue-tracker references
       run: make verify-no-internal-refs
+
+    - name: Install protoc
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
 
     - name: Set up buf
       uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99  # v1
@@ -82,7 +82,22 @@ jobs:
     - name: Verify protobufs up to date
       run: |
         make proto-gen
-        git diff --exit-code -- proto pkg/server/proto
+        git diff --exit-code -- pkg/server/proto
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
 
     # Fetch envtest binaries (apiserver + etcd) so the controller integration
     # tests (internal/controller/integration_test.go) run against a real
@@ -106,10 +121,40 @@ jobs:
     - name: Coverage gate
       run: make cover-check
 
+  vulnerability-scan:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
     # Blocking: the dependency graph (Go toolchain, x/net, grpc) is clear of
     # called vulnerabilities. A regression here fails CI.
     - name: Vulnerability scan
       run: make vulncheck
+
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
 
     - name: Build binaries
       run: make build
@@ -117,7 +162,11 @@ jobs:
   image-build:
     name: Image Build
     runs-on: ubuntu-latest
-    needs: lint-test-proto
+    needs:
+    - lint-generated-proto
+    - test
+    - vulnerability-scan
+    - build
     permissions:
       contents: read
       # Required for Trivy SARIF upload to the Security tab.
