@@ -87,6 +87,14 @@ with OTEL collectors) without bumping `v1alpha1`.
 - **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
   `index.Metrics` interface after a quota-driven eviction at ingest; see
   [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
+- **`snapshotAuth` + `policyAuth` writers:** the TokenReview middleware in
+  [`pkg/server/auth/`](../../pkg/server/auth/) reports one outcome per
+  request via the `auth.ResultRecorder` interface. The recorders themselves
+  are returned by `serverMetrics.SnapshotAuthRecorder()` and
+  `serverMetrics.PolicyAuthRecorder()` (in `pkg/server/metrics.go`) and
+  wired into the per-endpoint authenticators in `pkg/server/server.go`.
+  One increment per `/snapshot` or `/policy` request reaching the
+  middleware, labeled by `result`.
 
 ---
 

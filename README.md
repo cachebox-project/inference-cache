@@ -45,7 +45,7 @@ curl -i http://localhost:8080/healthz   # liveness
 curl -i http://localhost:8080/readyz    # readiness
 curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
 curl -s http://localhost:8081/snapshot  # internal aggregate (auth-gated in production)
-curl -i -XPOST http://localhost:8081/policy -d '{"version":1,"policies":[]}'  # controller push (auth-gated in production)
+curl -i -XPOST http://localhost:8081/policy -d '{"version":2,"policies":[]}'  # controller push (auth-gated in production)
 ```
 
 The server fails closed by default: omitting both `--allowed-controller-sa` and
