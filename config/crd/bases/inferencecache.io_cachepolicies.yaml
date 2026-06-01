@@ -51,9 +51,11 @@ spec:
               eviction:
                 default: LRU
                 description: |-
-                  Eviction selects the algorithm the index uses to make room when its
-                  entry-count cap is reached. Defaults to LRU. Additional algorithms
-                  extend the enum as their implementations land.
+                  Eviction is the index entry-eviction algorithm. Reserved on
+                  v1alpha1 for forward compatibility; defaults to LRU. Today pkg/index
+                  runs LRU unconditionally and this field is not yet consulted by the
+                  controller. Additional algorithms extend the enum and gain a
+                  ResolvedPolicy propagation path as their implementations land.
                 enum:
                 - LRU
                 type: string

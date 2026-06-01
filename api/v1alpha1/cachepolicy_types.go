@@ -5,11 +5,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// CachePolicyEvictionAlgorithm identifies how the index evicts cache entries
-// when its bounded-size store is over capacity. The enum is intentionally
-// narrow today (LRU only) and grows as additional algorithms are implemented
-// in pkg/index. Operators can plan around the field as the configuration
-// surface even before additional algorithms ship.
+// CachePolicyEvictionAlgorithm identifies an index entry-eviction algorithm.
+// The enum is intentionally narrow today (LRU only) and grows as additional
+// algorithms are implemented in pkg/index. The field is reserved on the
+// v1alpha1 surface so the schema is forward-compatible; pkg/index currently
+// runs LRU-by-`lastSeen` unconditionally and the controller does not yet
+// propagate this field into ResolvedPolicy.
 type CachePolicyEvictionAlgorithm string
 
 const (
@@ -20,9 +21,11 @@ const (
 
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
-	// Eviction selects the algorithm the index uses to make room when its
-	// entry-count cap is reached. Defaults to LRU. Additional algorithms
-	// extend the enum as their implementations land.
+	// Eviction is the index entry-eviction algorithm. Reserved on
+	// v1alpha1 for forward compatibility; defaults to LRU. Today pkg/index
+	// runs LRU unconditionally and this field is not yet consulted by the
+	// controller. Additional algorithms extend the enum and gain a
+	// ResolvedPolicy propagation path as their implementations land.
 	// +optional
 	// +kubebuilder:validation:Enum=LRU
 	// +kubebuilder:default=LRU

@@ -21,10 +21,12 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
 	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
-	// Eviction is the operator's algorithm-selection surface. The enum is
-	// intentionally one-value (LRU) until additional algorithms ship — the
-	// default makes the column meaningful today and the field stops being
-	// inert without committing to multiple algorithms.
+	// Eviction is kept on v1alpha1 as a forward-compat configuration surface.
+	// pkg/index implements LRU-by-`lastSeen` unconditionally today; the
+	// controller does not yet propagate this field into ResolvedPolicy. The
+	// enum is intentionally a single value so the only acceptable input is
+	// the algorithm we actually run — the field is honest-by-narrow-enum
+	// rather than wired.
 	evictionSchema := mustProperty(t, policySpec, "eviction")
 	requireEnum(t, evictionSchema, []string{"LRU"})
 	requireDefault(t, evictionSchema, "LRU")

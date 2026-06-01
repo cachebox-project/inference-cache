@@ -10,14 +10,14 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.eviction` | enum | Eviction algorithm. Currently `LRU` only (default); additional algorithms extend the enum as their implementations land. |
+| `spec.eviction` | enum | Reserved configuration surface for the index eviction algorithm. Currently `LRU` only (default); `pkg/index` runs LRU-by-`lastSeen` unconditionally and does not yet read this field. Kept on v1alpha1 for forward compatibility; additional algorithms extend the enum and gain a `ResolvedPolicy` propagation path as their implementations land. |
 | `spec.evictionTTL` | duration | Maximum usable lifetime for cache entries. |
 | `spec.minimumPrefixTokens` | integer | Minimum prefix token count before lookup. Minimum `0`. |
 | `spec.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. |
 
 `status.conditions` and `status.observedGeneration` are reserved for controller observations.
 
-Runtime propagation (controller → server `/policy`) is described in [policy-propagation.md](policy-propagation.md): `evictionTTL` drives per-tenant index eviction, `minimumPrefixTokens` and `lookupTimeoutMs` are enforced on the `LookupRoute` path. `spec.eviction` is the operator's algorithm-selection surface; only `LRU` is honored by `pkg/index` today, and the field's propagation path through `ResolvedPolicy` will be wired alongside the second algorithm.
+Runtime propagation (controller → server `/policy`) is described in [policy-propagation.md](policy-propagation.md): `evictionTTL` drives per-tenant index eviction, `minimumPrefixTokens` and `lookupTimeoutMs` are enforced on the `LookupRoute` path. `spec.eviction` is reserved on v1alpha1 for forward compatibility; today the index runs LRU unconditionally and the field is not yet read by the controller or surfaced on `ResolvedPolicy`. The propagation path lands alongside the first non-LRU implementation.
 
 ## CacheTenant
 
