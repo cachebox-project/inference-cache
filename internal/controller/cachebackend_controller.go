@@ -1054,10 +1054,13 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 			degradedStatus:  metav1.ConditionFalse,
 			degradedReason:  reasonNotDegraded,
 			degradedMessage: "backend is not in a degraded state",
-			// Re-reconcile just past the deadline so the Degraded flip fires
-			// automatically without an external event. +1s avoids firing
-			// fractionally early.
-			requeueAfter: timeout - elapsed + time.Second,
+			// Re-reconcile at the deadline so the Degraded flip fires
+			// automatically without an external event. No padding is added:
+			// RequeueAfter fires no earlier than the requested delay, so the
+			// next reconcile observes elapsed >= timeout and flips Degraded —
+			// honoring firstEventTimeout as the actual bound rather than
+			// overshooting it (which would be visible for small timeouts).
+			requeueAfter: timeout - elapsed,
 		}
 	}
 	return kvReadiness{
