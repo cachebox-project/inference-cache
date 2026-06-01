@@ -10,7 +10,7 @@ import (
 
 // PolicyPropagationVersion identifies the schema of the /policy snapshot the
 // server accepts. Bumped on a breaking schema change so a stale controller
-// can refuse to push (the controller writes the same constant on each PUT).
+// can refuse to push (the controller writes the same constant on each push).
 //
 // v2 added the Tenants slice (CacheTenant quota propagation). The version field
 // is the forward-looking guard: a server rejects a body whose version it does
@@ -77,9 +77,10 @@ type PolicySnapshot struct {
 }
 
 // PolicyStore is the server-side cache of resolved policies (indexed by
-// namespace) and resolved tenant quotas (indexed by tenant ID). Reads take the
-// read lock; PUTs from /policy take the write lock and replace the maps
-// atomically. Satisfies index.TTLResolver and index.TenantQuotaResolver.
+// namespace) and resolved tenant quotas (indexed by tenant ID). Reads take
+// the read lock; pushes from /policy (POST or PUT) take the write lock and
+// replace the maps atomically. Satisfies index.TTLResolver and
+// index.TenantQuotaResolver.
 //
 // The two indices use different keys on purpose: a CachePolicy is keyed by its
 // namespace (phase-1 tenant boundary for lookups), while a CacheTenant quota is

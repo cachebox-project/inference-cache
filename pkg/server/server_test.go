@@ -372,7 +372,7 @@ func TestPolicyNotServedOnPublicListener(t *testing.T) {
 	_, publicURL, _, stop := startInProcessServerConnFull(t)
 	defer stop()
 
-	code := postPolicy(t, publicURL+"/policy", "", `{"version":1,"policies":[]}`)
+	code := postPolicy(t, publicURL+"/policy", "", emptyPolicySnapshotBody(t))
 	if code != http.StatusNotFound {
 		t.Fatalf("POST /policy on public listener returned %d, want 404", code)
 	}
@@ -387,10 +387,24 @@ func TestPolicyServedOnSnapshotListener(t *testing.T) {
 	_, _, snapshotURL, stop := startInProcessServerConnFull(t)
 	defer stop()
 
-	code := postPolicy(t, snapshotURL+"/policy", "", `{"version":1,"policies":[]}`)
+	code := postPolicy(t, snapshotURL+"/policy", "", emptyPolicySnapshotBody(t))
 	if code != http.StatusNoContent {
 		t.Fatalf("POST /policy on snapshot listener returned %d, want 204", code)
 	}
+}
+
+// emptyPolicySnapshotBody builds a JSON body whose Version matches the
+// current PolicyPropagationVersion, so the auth/listener tests below don't
+// silently turn into "the version field has drifted" failures whenever the
+// schema is bumped. Reflects no policies and no tenants — the empty
+// replace-on-write payload.
+func emptyPolicySnapshotBody(t *testing.T) string {
+	t.Helper()
+	b, err := json.Marshal(PolicySnapshot{Version: PolicyPropagationVersion})
+	if err != nil {
+		t.Fatalf("marshal empty PolicySnapshot: %v", err)
+	}
+	return string(b)
 }
 
 // TestSnapshotRejectsNonGet confirms the /snapshot handler is GET-only and
@@ -479,7 +493,7 @@ func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 
 	// /policy — unauth 401, then valid SA POST 204. The body is a minimal
 	// valid PolicySnapshot so we exercise the auth gate AND the handler.
-	policyBody := `{"version":1,"policies":[]}`
+	policyBody := emptyPolicySnapshotBody(t)
 	if code := postPolicy(t, policyURL, "", policyBody); code != http.StatusUnauthorized {
 		t.Fatalf("unauth POST /policy status = %d, want 401", code)
 	}
@@ -554,7 +568,7 @@ func TestControllerAuth_PolicyRejectsForbidden(t *testing.T) {
 	}()
 
 	policyURL := "http://" + snapshotListener.Addr().String() + "/policy"
-	if code := postPolicy(t, policyURL, "wrong-sa", `{"version":1,"policies":[]}`); code != http.StatusForbidden {
+	if code := postPolicy(t, policyURL, "wrong-sa", emptyPolicySnapshotBody(t)); code != http.StatusForbidden {
 		t.Fatalf("wrong-SA POST /policy status = %d, want 403", code)
 	}
 

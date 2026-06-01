@@ -837,7 +837,7 @@ if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_POLICY" --image=curlimages/curl:8.10
     # implies POST.
     curl -sS -m 5 -o /dev/null -w "%{http_code}" \
       -H "Content-Type: application/json" \
-      -d "{\"version\":1,\"policies\":[]}" \
+      -d "{\"version\":2,\"policies\":[]}" \
       http://inference-cache-server:8081/policy || echo "curl_failed:$?"
   ' >/tmp/policy-probe-create.log 2>&1; then
   cat /tmp/policy-probe-create.log >&2 || true

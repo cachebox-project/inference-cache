@@ -349,7 +349,7 @@ func TestPushSnapshotBearerTokenUnreadableFile(t *testing.T) {
 		t.Fatalf("chmod token: %v", err)
 	}
 
-	r := &CachePolicyReconciler{BearerTokenPath: path}
+	r := &ControlPlaneReconciler{BearerTokenPath: path}
 	got, err := r.bearerToken()
 	if err == nil {
 		t.Fatalf("bearerToken() on unreadable file: got %q + nil, want error", got)

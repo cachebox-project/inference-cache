@@ -20,7 +20,7 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 | Channel | Direction | Endpoint | Trigger |
 |---|---|---|---|
 | `/snapshot` | controller ← server | `GET` | controller tick |
-| `/policy`   | controller → server | `POST` | watch event + tick |
+| `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
 
 Both `/snapshot` and `/policy` sit on the server's internal `:8081`
 listener, gated by TokenReview-backed bearer auth and a NetworkPolicy
