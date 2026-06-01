@@ -31,10 +31,11 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 	skipWithoutEnvtest(t)
 	c, _, _ := startEnv(t)
 	ctx := context.Background()
+	ns := freshNS(t, c)
 
 	// The trimmed shape applies cleanly.
 	trimmed := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "trimmed", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "trimmed", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
@@ -61,7 +62,7 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		u := &unstructured.Unstructured{}
 		u.SetAPIVersion("inferencecache.io/v1alpha1")
 		u.SetKind("CacheBackend")
-		u.SetNamespace("default")
+		u.SetNamespace(ns)
 		u.SetName(name)
 		if err := unstructured.SetNestedField(u.Object, "LMCache", "spec", "type"); err != nil {
 			t.Fatalf("set spec.type: %v", err)
@@ -75,7 +76,7 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 	get := func(name string) *unstructured.Unstructured {
 		got := &unstructured.Unstructured{}
 		got.SetGroupVersionKind(gvk)
-		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: name}, got); err != nil {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, got); err != nil {
 			t.Fatalf("get %s: %v", name, err)
 		}
 		return got
