@@ -32,10 +32,10 @@
 #      cadence guarantees.
 #   7. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
-#      mutating webhook default (spec.replicas=1), renders NO Deployment/
-#      Service in its namespace, status.endpoint mirrors spec.endpoint,
-#      observedGeneration
-#      is set, the CR goes Ready=True/ExternalEndpointAccepted, and
+#      mutating webhook default (spec.replicas=1), renders NO
+#      Deployment/Service in its namespace, status.endpoint mirrors
+#      spec.endpoint, observedGeneration is set, the CR goes
+#      Ready=True/ExternalEndpointAccepted, and
 #      `kubectl get cb` renders the CacheBackend printer columns. A matching
 #      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
 #      injected by the pod-mutating webhook. Also exercises admission
