@@ -515,6 +515,24 @@ type CacheBackendStatus struct {
 	// +optional
 	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
 
+	// FirstAvailableAt latches the first time the managed cache-backend
+	// workload was observed Available — the stable anchor for the
+	// firstEventTimeout clock. It is deliberately a latched timestamp rather
+	// than the live Deployment's Available condition LastTransitionTime: that
+	// condition resets on an availability flap, which would restart the
+	// timeout window and let a backend that already breached the timeout
+	// (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
+	// without any KV event — contradicting the "once Degraded, stays Degraded
+	// until an event arrives" contract. Anchoring on this write-once value
+	// keeps the elapsed window monotonic, so Degraded is sticky. Written
+	// write-once when the workload first reports Available and never cleared
+	// (inert while the backend is not managed). A genuinely recreated managed
+	// Deployment keeps the prior anchor; the gate re-evaluates from it, which
+	// is safe because the engine event source is unchanged by a cache-server
+	// restart.
+	// +optional
+	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
+
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups
 	// the server's /snapshot replicas by the owning CacheBackend and projects

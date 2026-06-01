@@ -896,11 +896,22 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 // requested PVC size as "provisioned capacity" would mislead operators.
 // Populating it is left to the follow-up that wires storage end-to-end.
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
+	now := time.Now()
 	health, readyStatus, reason, message := managedHealth(backend, dep)
+	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
+	// first time the workload is Available — now. Using a latched value (not the
+	// live Deployment Available condition, which resets on a flap) keeps the
+	// firstEventTimeout window monotonic so Degraded stays sticky.
+	anchor := time.Time{}
+	if backend.Status.FirstAvailableAt != nil {
+		anchor = backend.Status.FirstAvailableAt.Time
+	} else if health == cachev1alpha1.CacheBackendHealthReady {
+		anchor = now
+	}
 	// Layer the KV-event readiness gate on top of the Deployment-level health.
 	// Only the workload-Available state is gated; every other Deployment state
 	// passes through unchanged.
-	gate := evaluateKVEventReadiness(backend, dep, health, readyStatus, reason, message, time.Now())
+	gate := evaluateKVEventReadiness(backend, health, readyStatus, reason, message, anchor, now)
 	progressingStatus, progressingReason, progressingMessage := progressingFromHealth(gate.health, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
@@ -918,6 +929,12 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			if at := currentLastEventAt(backend); at != nil {
 				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
 			}
+		}
+		// Latch the first-Available time write-once — the stable, flap-immune
+		// anchor for the firstEventTimeout window (see FirstAvailableAt godoc).
+		if backend.Status.FirstAvailableAt == nil && health == cachev1alpha1.CacheBackendHealthReady {
+			t := metav1.NewTime(now)
+			backend.Status.FirstAvailableAt = &t
 		}
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
@@ -990,18 +1007,16 @@ type kvReadiness struct {
 // never reach this code path (reconcileExternal short-circuits dispatch), so
 // they are unconditionally exempt.
 //
-// Timeout anchor: the clock starts when the managed cache-backend Deployment
-// first reported Available, read from the live Deployment's Available condition
-// LastTransitionTime — authoritative and persisted by the Deployment
-// controller, so no extra CacheBackend status field is needed. The anchor only
-// matters BEFORE the first event is observed: once firstKVEventObservedAt is
-// latched the gate stays satisfied (lastKVEventSeen short-circuits), so a later
-// availability flap does NOT re-gate. For a backend that has never seen an
-// event, a flap moves the anchor forward and thus restarts the wait window. If
-// the Available condition is not present (e.g. the no-running-Deployment-
-// controller case in some tests), the anchor falls back to now, which is
-// fail-safe: it can only delay the Degraded flip, never trigger it prematurely.
-func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment, health cachev1alpha1.CacheBackendHealth, readyStatus metav1.ConditionStatus, reason, message string, now time.Time) kvReadiness {
+// Timeout anchor: `anchor` is the caller-resolved start of the firstEventTimeout
+// clock — the write-once status.firstAvailableAt latch (the time the workload
+// was first observed Available). It is deliberately NOT the live Deployment's
+// Available condition LastTransitionTime, which resets on an availability flap:
+// a latched anchor keeps the elapsed window monotonic, so once a backend
+// breaches the timeout (Degraded / NoKVEventsObserved) a later flap cannot move
+// it back to AwaitingFirstKVEvent — it stays Degraded until an event arrives.
+// (Once firstKVEventObservedAt is latched the gate is satisfied regardless of
+// the anchor, since lastKVEventSeen short-circuits.)
+func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, health cachev1alpha1.CacheBackendHealth, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time) kvReadiness {
 	// Base verdict mirrors the Deployment-level health; the Degraded
 	// condition tracks Health == Degraded so it is consistent on every path
 	// (including the opt-out and not-yet-Available paths below).
@@ -1039,10 +1054,12 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.D
 		}
 	}
 
-	// Available but no event yet — still inside the first-event window?
+	// Available but no event yet — still inside the first-event window? The
+	// anchor is the latched first-Available time (now on the very first
+	// Available reconcile, before the latch is persisted); a zero anchor would
+	// only ever delay the Degraded flip, never trigger it prematurely.
 	timeout := firstEventTimeout(backend)
-	anchor, ok := deploymentAvailableSince(dep)
-	if !ok {
+	if anchor.IsZero() {
 		anchor = now
 	}
 	if elapsed := now.Sub(anchor); elapsed < timeout {
@@ -1116,22 +1133,6 @@ func firstEventTimeout(backend *cachev1alpha1.CacheBackend) time.Duration {
 		return i.FirstEventTimeout.Duration
 	}
 	return defaultFirstEventTimeout
-}
-
-// deploymentAvailableSince returns when the Deployment's Available condition
-// last became True — the firstEventTimeout anchor. ok is false when the
-// condition is absent or not currently True.
-func deploymentAvailableSince(dep *appsv1.Deployment) (time.Time, bool) {
-	for i := range dep.Status.Conditions {
-		c := dep.Status.Conditions[i]
-		if c.Type == appsv1.DeploymentAvailable {
-			if c.Status == corev1.ConditionTrue {
-				return c.LastTransitionTime.Time, true
-			}
-			return time.Time{}, false
-		}
-	}
-	return time.Time{}, false
 }
 
 // managedHealth maps the Deployment's rollout state to a CacheBackend health.

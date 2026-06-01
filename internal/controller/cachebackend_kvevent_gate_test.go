@@ -31,10 +31,30 @@ func gatedLMCacheBackend(name, ns string) *cachev1alpha1.CacheBackend {
 	}
 }
 
+// setFirstAvailableAt patches the backend's write-once timeout anchor
+// (status.firstAvailableAt) to a chosen time, so timeout-path tests can place
+// the first-Available moment in the past without sleeping. The reconciler only
+// stamps this field when it is nil, so a value set here is preserved.
+func setFirstAvailableAt(t *testing.T, cl client.Client, name, ns string, at time.Time) {
+	t.Helper()
+	var cb cachev1alpha1.CacheBackend
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, &cb); err != nil {
+		t.Fatalf("get CacheBackend %s/%s: %v", ns, name, err)
+	}
+	before := cb.DeepCopy()
+	tm := metav1.NewTime(at)
+	cb.Status.FirstAvailableAt = &tm
+	if err := cl.Status().Patch(context.Background(), &cb, client.MergeFrom(before)); err != nil {
+		t.Fatalf("patch firstAvailableAt %s/%s: %v", ns, name, err)
+	}
+}
+
 // setDeploymentHTTPReady drives a managed backend's Deployment to the
 // engine-HTTP-Ready state managedHealth keys on (rolled out + all replicas
-// available) and stamps the Available condition LastTransitionTime — the gate's
-// firstEventTimeout anchor — to availableSince.
+// available). It also stamps the Available condition LastTransitionTime to
+// availableSince — used only to simulate availability flaps; the gate's
+// firstEventTimeout anchor is the latched status.firstAvailableAt, not this
+// condition.
 func setDeploymentHTTPReady(t *testing.T, cl client.Client, name, ns string, availableSince time.Time) {
 	t.Helper()
 	var dep appsv1.Deployment
@@ -181,8 +201,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 			t.Fatalf("create: %v", err)
 		}
 		reconcile(t, r, "cache", ns)
-		// Engine became HTTP-Ready well before the 1s timeout window.
-		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		// Anchor the first-Available moment well before the 1s window.
+		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
@@ -196,6 +217,43 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		deg := findCondition(got.Status.Conditions, conditionTypeDegraded)
 		if deg == nil || deg.Status != metav1.ConditionTrue || deg.Reason != reasonNoKVEventsObserved {
 			t.Fatalf("Degraded = %+v, want True/NoKVEventsObserved", deg)
+		}
+	})
+
+	t.Run("StaysDegradedAcrossAvailabilityFlap", func(t *testing.T) {
+		// Regression: once the timeout is breached (Degraded/NoKVEventsObserved),
+		// a Deployment availability flap must NOT reset the window and bounce the
+		// backend back to AwaitingFirstKVEvent. The latched firstAvailableAt
+		// anchor (not the flappable live Available condition) guarantees this.
+		ns := freshNS(t, k8s)
+		cb := gatedLMCacheBackend("cache", ns)
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+			FirstEventTimeout: &metav1.Duration{Duration: time.Second},
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
+		reconcile(t, r, "cache", ns)
+		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
+			t.Fatalf("pre-flap health = %q, want Degraded", got)
+		}
+
+		// Simulate a flap: the live Deployment Available condition resets to now
+		// (this is exactly what would re-anchor the OLD implementation). The
+		// latched firstAvailableAt is untouched.
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		reconcile(t, r, "cache", ns)
+
+		got := getBackend(t, r, "cache", ns)
+		if got.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
+			t.Fatalf("post-flap health = %q, want Degraded (sticky, not AwaitingFirstKVEvent)", got.Status.Health)
+		}
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Reason != reasonNoKVEventsObserved {
+			t.Fatalf("post-flap Ready = %+v, want reason NoKVEventsObserved (degraded state held)", ready)
 		}
 	})
 
@@ -384,21 +442,10 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	r, rec := newReconcilerWithRecorder(t, cb)
 	reconcile(t, r, "cache", "ns1")
 
-	// Ready + Available since well before the 1s window.
-	dep := getDeployment(t, r, "cache", "ns1")
-	dep.Status.ObservedGeneration = dep.Generation
-	dep.Status.Replicas = 1
-	dep.Status.UpdatedReplicas = 1
-	dep.Status.AvailableReplicas = 1
-	dep.Status.ReadyReplicas = 1
-	dep.Status.Conditions = []appsv1.DeploymentCondition{{
-		Type:               appsv1.DeploymentAvailable,
-		Status:             corev1.ConditionTrue,
-		LastTransitionTime: metav1.NewTime(time.Now().Add(-5 * time.Second)),
-	}}
-	if err := r.Status().Update(context.Background(), dep); err != nil {
-		t.Fatalf("update deployment status: %v", err)
-	}
+	// Deployment Ready (managedHealth keys on replica counts), and the latched
+	// first-Available anchor placed before the 1s window.
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	setFirstAvailableAt(t, r.Client, "cache", "ns1", time.Now().Add(-5*time.Second))
 	drainEvents(rec)
 
 	reconcile(t, r, "cache", "ns1")

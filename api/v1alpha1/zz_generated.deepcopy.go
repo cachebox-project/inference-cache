@@ -352,6 +352,10 @@ func (in *CacheBackendStatus) DeepCopyInto(out *CacheBackendStatus) {
 		in, out := &in.FirstKVEventObservedAt, &out.FirstKVEventObservedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.FirstAvailableAt != nil {
+		in, out := &in.FirstAvailableAt, &out.FirstAvailableAt
+		*out = (*in).DeepCopy()
+	}
 	if in.IndexParticipation != nil {
 		in, out := &in.IndexParticipation, &out.IndexParticipation
 		*out = new(CacheBackendIndexParticipation)
