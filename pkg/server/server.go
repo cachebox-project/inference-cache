@@ -24,10 +24,14 @@ import (
 // Config controls the cache server listeners.
 //
 // The public HTTP listener (HTTPAddr) carries kubelet- and Prometheus-facing
-// endpoints (/healthz, /readyz, /metrics) plus the controller-only /policy
-// push. The snapshot listener (SnapshotAddr) carries only /snapshot, gated
-// by ServiceAccount bearer auth — a NetworkPolicy further restricts L3/L4
-// access to the controller's pod selector (see config/server).
+// endpoints (/healthz, /readyz, /metrics). The snapshot listener
+// (SnapshotAddr) carries both /snapshot (controller-read) and /policy
+// (controller-write), each gated by ServiceAccount bearer auth — a
+// NetworkPolicy further restricts L3/L4 access to the controller's pod
+// selector (see config/server). The split exists so kubelet probes and
+// Prometheus scrapes — which can't carry a bearer — stay on an open port
+// while every controller↔server mutation/observation surface lives behind
+// the same auth profile.
 type Config struct {
 	GRPCAddr     string
 	HTTPAddr     string
@@ -46,35 +50,38 @@ func DefaultConfig() Config {
 // Option mutates a Service after New constructs the base wiring.
 type Option func(*Service)
 
-// snapshotAuthConfig holds the parts of auth.Options that callers can
+// controllerAuthConfig holds the parts of auth.Options that callers can
 // configure from outside the package. Service.New constructs the actual
-// Authenticator so the recorder stays an internal detail.
-type snapshotAuthConfig struct {
+// Authenticator instances so the per-endpoint recorders stay an internal
+// detail.
+type controllerAuthConfig struct {
 	reviewer auth.TokenReviewer
 	saName   string
 }
 
-// WithSnapshotAuth wires bearer-token authentication onto the /snapshot
-// listener. When unset, /snapshot is served without authentication; the
-// production binary always sets it. expectedSA is the canonical
+// WithControllerAuth wires bearer-token authentication onto the controller-
+// facing endpoints (/snapshot and /policy), which share the snapshot
+// listener. When unset both endpoints are served without authentication;
+// the production binary always sets it. expectedSA is the canonical
 // ServiceAccount username, e.g.
 // "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
-func WithSnapshotAuth(reviewer auth.TokenReviewer, expectedSA string) Option {
+func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA string) Option {
 	return func(s *Service) {
-		s.snapshotAuthCfg = &snapshotAuthConfig{reviewer: reviewer, saName: expectedSA}
+		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA}
 	}
 }
 
 // Service hosts the gRPC API and the HTTP health/metrics endpoints.
 type Service struct {
-	grpcServer       *grpc.Server
-	publicHTTPServer *http.Server
-	snapshotServer   *http.Server
-	snapshotHandler  http.Handler
-	snapshotAuthCfg  *snapshotAuthConfig
-	metrics          *serverMetrics
-	index            *index.Index
-	policies         *PolicyStore
+	grpcServer        *grpc.Server
+	publicHTTPServer  *http.Server
+	snapshotServer    *http.Server
+	snapshotHandler   http.Handler
+	policyHandler     http.Handler
+	controllerAuthCfg *controllerAuthConfig
+	metrics           *serverMetrics
+	index             *index.Index
+	policies          *PolicyStore
 }
 
 // New constructs a cache service.
@@ -114,14 +121,15 @@ func New(opts ...Option) *Service {
 	})
 	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
 	publicMux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
-	// /policy — internal endpoint the controller PUSHES resolved CachePolicy
-	// snapshots to. Replace-on-write; the controller owns the source of truth
-	// and re-pushes on its tick, so a server restart self-heals.
-	publicMux.HandleFunc("/policy", policyHandler(policies))
 
-	// /snapshot is served from its own listener so a NetworkPolicy can restrict
-	// it to the controller's pod selector without breaking kubelet probes or
-	// Prometheus scrapes on the public listener.
+	// /snapshot AND /policy are served from a dedicated listener so a
+	// NetworkPolicy can restrict ingress to the controller's pod selector
+	// without breaking kubelet probes or Prometheus scrapes on the public
+	// listener. Both endpoints are controller-to-server: /snapshot is a
+	// read (controller polls cache aggregate) and /policy is a write
+	// (controller pushes the resolved CachePolicy snapshot, replace-on-
+	// write). They share one auth profile because they share one caller
+	// identity.
 	snapshotMux := http.NewServeMux()
 	snapshotHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Tighten the contract to GET-only: the controller poller and any
@@ -138,7 +146,12 @@ func New(opts ...Option) *Service {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
+	// /policy — internal endpoint the controller PUSHES resolved CachePolicy
+	// snapshots to. Replace-on-write; the controller owns the source of truth
+	// and re-pushes on its tick, so a server restart self-heals.
+	policyHTTPHandler := http.Handler(policyHandler(policies))
 	snapshotMux.Handle("/snapshot", snapshotHandler)
+	snapshotMux.Handle("/policy", policyHTTPHandler)
 
 	s := &Service{
 		grpcServer: grpcServer,
@@ -151,6 +164,7 @@ func New(opts ...Option) *Service {
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 		snapshotHandler: snapshotHandler,
+		policyHandler:   policyHTTPHandler,
 		metrics:         metrics,
 		index:           idx,
 		policies:        policies,
@@ -158,14 +172,20 @@ func New(opts ...Option) *Service {
 	for _, opt := range opts {
 		opt(s)
 	}
-	// If auth is configured, wrap /snapshot in the TokenReview middleware.
-	// The middleware reports per-result outcomes to serverMetrics so a
-	// scrape of /metrics shows inferencecache_snapshot_auth_total{result=…}.
-	if s.snapshotAuthCfg != nil {
-		authenticator, err := auth.NewAuthenticator(auth.Options{
-			Reviewer:               s.snapshotAuthCfg.reviewer,
-			ExpectedServiceAccount: s.snapshotAuthCfg.saName,
-			Recorder:               s.metrics,
+	// If auth is configured, wrap /snapshot and /policy in the TokenReview
+	// middleware. Two Authenticator instances share the same Reviewer and
+	// ExpectedSA but emit per-endpoint metrics
+	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total)
+	// so a dashboard can distinguish a read-side auth failure (info leak
+	// attempt) from a write-side one (active tampering attempt). The two
+	// caches are independent — one extra TokenReview per endpoint per TTL
+	// window in the steady state, negligible vs the apiserver's own auth
+	// cost.
+	if s.controllerAuthCfg != nil {
+		snapshotAuthn, err := auth.NewAuthenticator(auth.Options{
+			Reviewer:               s.controllerAuthCfg.reviewer,
+			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Recorder:               s.metrics.SnapshotAuthRecorder(),
 		})
 		if err != nil {
 			// New is used by both binaries and tests; a misconfigured auth
@@ -173,9 +193,17 @@ func New(opts ...Option) *Service {
 			// runtime condition the caller can recover from.
 			panic(fmt.Sprintf("server: snapshot auth: %v", err))
 		}
-		gated := authenticator.Middleware(snapshotHandler)
+		policyAuthn, err := auth.NewAuthenticator(auth.Options{
+			Reviewer:               s.controllerAuthCfg.reviewer,
+			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Recorder:               s.metrics.PolicyAuthRecorder(),
+		})
+		if err != nil {
+			panic(fmt.Sprintf("server: policy auth: %v", err))
+		}
 		gatedMux := http.NewServeMux()
-		gatedMux.Handle("/snapshot", gated)
+		gatedMux.Handle("/snapshot", snapshotAuthn.Middleware(snapshotHandler))
+		gatedMux.Handle("/policy", policyAuthn.Middleware(policyHTTPHandler))
 		s.snapshotServer.Handler = gatedMux
 	}
 	return s
