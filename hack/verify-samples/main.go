@@ -59,6 +59,13 @@ const skipMarker = "# verify-samples: skip"
 // the existing envtest webhook integration test and is generous on CI.
 const webhookReadyTimeout = 20 * time.Second
 
+// perSampleTimeout bounds each `kubectl apply --dry-run=server` invocation
+// so a hung kubectl, apiserver, or webhook fails the gate with a clear
+// per-file diagnostic instead of waiting for the outer CI job timeout.
+// 30s is generous against the local envtest apiserver (real applies take
+// <100ms) but tight enough that a deadlock surfaces quickly.
+const perSampleTimeout = 30 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("verify-samples: %v", err)
@@ -190,9 +197,17 @@ func run() error {
 			skipCount++
 			continue
 		}
-		out, runErr := runKubectl(ctx, kubectl, kubeconfigPath, f)
+		// Bound each apply so a hung kubectl / apiserver / webhook fails
+		// the offending file with a clear diagnostic instead of stalling
+		// the whole gate.
+		applyCtx, applyCancel := context.WithTimeout(ctx, perSampleTimeout)
+		out, runErr := runKubectl(applyCtx, kubectl, kubeconfigPath, f)
+		applyCancel()
 		if runErr != nil {
 			fmt.Printf("  FAIL %s\n", rel)
+			if applyCtx.Err() == context.DeadlineExceeded {
+				fmt.Printf("    apply exceeded per-sample timeout (%s)\n", perSampleTimeout)
+			}
 			fmt.Print(indent(out, "    "))
 			failCount++
 			continue
