@@ -55,7 +55,7 @@ help: ## Display this help.
 
 .PHONY: controller-gen
 controller-gen: $(LOCALBIN) ## Install controller-gen locally; reinstall when the pinned version drifts.
-	@if ! { [ -x $(CONTROLLER_GEN) ] && $(CONTROLLER_GEN) --version 2>/dev/null | grep -qF "Version: $(CONTROLLER_TOOLS_VERSION)"; }; then \
+	@if ! { [ -x $(CONTROLLER_GEN) ] && $(CONTROLLER_GEN) --version 2>/dev/null | grep -qxF "Version: $(CONTROLLER_TOOLS_VERSION)"; }; then \
 		rm -f $(CONTROLLER_GEN); \
 		GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION); \
 	fi
