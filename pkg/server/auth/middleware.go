@@ -201,7 +201,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			// review never actually ran, and it remains the right alert
 			// surface for "investigate the apiserver."
 			if tr.Status.Error != "" {
-				slog.WarnContext(r.Context(), "snapshot_auth_token_review_unauthenticated",
+				slog.WarnContext(r.Context(), "auth_token_review_unauthenticated",
 					"error", tr.Status.Error)
 			}
 			a.record(ResultUnauth)

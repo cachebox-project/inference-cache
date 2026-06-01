@@ -120,10 +120,11 @@ spec:
             - --grpc-bind-address=:9090
             - --http-bind-address=:8080
             - --snapshot-bind-address=:8081
-            # Restrict /snapshot to the controller's ServiceAccount. The
-            # NetworkPolicy adds an L3/L4 gate on the same port (config/server/
-            # networkpolicy.yaml); together they form independent gates.
-            - --snapshot-allowed-sa=system:serviceaccount:inference-cache-system:inference-cache-controller-manager
+            # Restrict /snapshot AND /policy to the controller's ServiceAccount.
+            # Both endpoints share this listener (and the NetworkPolicy on
+            # :8081); together the L7 auth and the L3/L4 pod-selector gate form
+            # independent defences. See config/server/networkpolicy.yaml.
+            - --allowed-controller-sa=system:serviceaccount:inference-cache-system:inference-cache-controller-manager
           ports:
             - name: grpc
               containerPort: 9090

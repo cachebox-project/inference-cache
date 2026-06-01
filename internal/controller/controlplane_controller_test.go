@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +27,7 @@ type pushRecorder struct {
 	mu        sync.Mutex
 	snapshots []cacheserver.PolicySnapshot
 	method    string
+	authz     string // last Authorization header observed
 }
 
 func (p *pushRecorder) handler() http.HandlerFunc {
@@ -43,9 +46,16 @@ func (p *pushRecorder) handler() http.HandlerFunc {
 		p.mu.Lock()
 		p.snapshots = append(p.snapshots, snap)
 		p.method = r.Method
+		p.authz = r.Header.Get("Authorization")
 		p.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+func (p *pushRecorder) lastAuthz() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.authz
 }
 
 func (p *pushRecorder) latest() (cacheserver.PolicySnapshot, bool) {
@@ -277,6 +287,75 @@ func TestPushSnapshotDeduplicatesByFirstNameWhenMultiplePoliciesShareNamespace(t
 	}
 	if snap.Policies[0].MinimumPrefixTokens != 16 {
 		t.Fatalf("dedup picked the wrong CR: %+v (expected the a-pol value 16)", snap.Policies[0])
+	}
+}
+
+// TestPushSnapshotSendsBearerToken pins the client-side contract: when
+// BearerTokenPath points at a tmpfile (kubelet-shape), every POST carries
+// `Authorization: Bearer <token>`. Mirror of the CacheIndexPoller's token
+// handling.
+func TestPushSnapshotSendsBearerToken(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "sa-token")
+	// kubelet's projected token has a trailing newline; bearerToken() trims it.
+	if err := os.WriteFile(tokenPath, []byte("test-sa-bearer\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(&cachev1alpha1.CachePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		}).
+		Build()
+	r := &ControlPlaneReconciler{
+		Client:          cl,
+		ServerPolicyURL: srv.URL,
+		HTTPClient:      srv.Client(),
+		BearerTokenPath: tokenPath,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := rec.lastAuthz(); got != "Bearer test-sa-bearer" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer test-sa-bearer")
+	}
+}
+
+// TestPushSnapshotNoBearerWhenTokenFileMissing pins the fail-soft posture
+// the controller inherits from the CacheIndexPoller: a missing token file
+// (local-dev out-of-cluster path) does NOT error out the push — the request
+// goes out unauthenticated and the server's auth posture decides what
+// happens. The server's 401 surfaces as a normal failing tick (covered by
+// TestPushSnapshotPropagatesNon2xxAsError); here we just pin that no
+// Authorization header is sent when the file isn't there.
+func TestPushSnapshotNoBearerWhenTokenFileMissing(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(&cachev1alpha1.CachePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		}).
+		Build()
+	r := &ControlPlaneReconciler{
+		Client:          cl,
+		ServerPolicyURL: srv.URL,
+		HTTPClient:      srv.Client(),
+		BearerTokenPath: filepath.Join(t.TempDir(), "does-not-exist"),
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := rec.lastAuthz(); got != "" {
+		t.Fatalf("expected no Authorization header when token file missing, got %q", got)
 	}
 }
 

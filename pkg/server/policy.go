@@ -240,12 +240,13 @@ func NewPolicyHTTPHandler(store *PolicyStore) http.HandlerFunc {
 // in-memory state. Replace-on-write semantics: any CachePolicy not present in
 // the body is treated as "no policy" → server defaults.
 //
-// The endpoint is intentionally internal and unauthenticated. The controller
-// is the only authorized writer (replace-on-write means a stranger's POST
-// would replace cluster policy with whatever they sent); if that posture
-// changes, the same TokenReview + NetworkPolicy gates that protect
-// /snapshot can be applied here. Limited body size to bound memory if a
-// buggy controller sends a runaway snapshot.
+// The endpoint is intentionally internal. Auth + NetworkPolicy gating live
+// in server.New, where the same TokenReview-backed bearer middleware that
+// protects /snapshot is also applied here — both endpoints share one
+// controller-SA identity. The handler itself stays auth-agnostic so tests
+// (and any future internal caller) can mount it directly. Body size is
+// capped at 1 MiB to bound memory if a buggy controller sends a runaway
+// snapshot.
 func policyHandler(store *PolicyStore) http.HandlerFunc {
 	const maxBytes = 1 << 20 // 1 MiB — comfortably above any realistic snapshot
 	return func(w http.ResponseWriter, r *http.Request) {

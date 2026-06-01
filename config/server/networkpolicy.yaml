@@ -1,35 +1,41 @@
-# Restrict ingress to the cache server's internal :8081 snapshot listener
-# while leaving the unauthenticated probe/metrics/policy port (:8080) and the
-# gRPC port (:9090) open to any in-cluster client.
+# Restrict ingress to the cache server's internal :8081 controller-facing
+# listener (which serves /snapshot AND /policy) while leaving the
+# unauthenticated probe/metrics port (:8080) and the gRPC port (:9090) open
+# to any in-cluster client.
 #
-# Defence in depth for /snapshot — paired with the server-side TokenReview
-# middleware that requires a controller ServiceAccount bearer token on
-# /snapshot. The L7 auth blocks any pod that lacks a valid SA token; this
-# L3/L4 gate stops a peer from ever reaching the listener (and from
-# harvesting metadata via a cleartext network capture).
+# Defence in depth for /snapshot AND /policy — paired with the server-side
+# TokenReview middleware that requires a controller ServiceAccount bearer
+# token on both endpoints. The L7 auth blocks any pod that lacks a valid SA
+# token; this L3/L4 gate stops a peer from ever reaching the listener (and
+# from harvesting metadata via a cleartext network capture, or POSTing a
+# rogue ResolvedPolicy snapshot that would replace cluster-wide policy
+# state under replace-on-write).
 #
 # IMPORTANT: a NetworkPolicy that selects a pod makes that pod isolated for
 # the listed policyTypes — under an enforcing CNI (Calico, Cilium), ANY
 # ingress to the selected pods is denied except for what the policy
 # explicitly allows. That means without the open-to-all rule below, gRPC
-# (:9090), the controller's /policy push (:8080), and Prometheus scrapes
-# (:8080) would all be silently dropped in production clusters. kind's
-# default kindnet does not enforce NetworkPolicy, so the install-smoke gate
-# would still pass — making this an easy footgun if the policy isn't
-# written explicitly.
+# (:9090) and Prometheus scrapes (:8080) would be silently dropped in
+# production clusters. kind's default kindnet does not enforce
+# NetworkPolicy, so the install-smoke gate would still pass — making this
+# an easy footgun if the policy isn't written explicitly.
 #
 # Scope:
 #   - podSelector matches the inference-cache server pods.
 #   - policyTypes: [Ingress] — outbound traffic from the server is unrestricted.
-#   - Rule 1: TCP 8080 (HTTP: healthz/readyz/metrics/policy) and TCP 9090
-#     (gRPC API + grpc.health.v1) from any source in the cluster. These are
-#     the same access surfaces in effect before this NetworkPolicy was
-#     added; the rule preserves that posture explicitly.
-#   - Rule 2: TCP 8081 (/snapshot) only from pods carrying the controller's
-#     labels — the only authorized caller of the bearer-gated endpoint.
+#   - Rule 1: TCP 8080 (HTTP: healthz/readyz/metrics) and TCP 9090
+#     (gRPC API + grpc.health.v1) from any source in the cluster. Kubelet
+#     probes and Prometheus scrapes cannot present a SA bearer, so these
+#     surfaces stay open.
+#   - Rule 2: TCP 8081 (/snapshot + /policy) only from pods carrying the
+#     controller's labels — the only authorized caller of the bearer-gated
+#     endpoints.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  # Name retained from when this gate covered /snapshot only so upgrades
+  # don't orphan a renamed object. The policy now covers both /snapshot and
+  # /policy on :8081 — see the rule comments below.
   name: inference-cache-server-snapshot
   namespace: inference-cache-system
   labels:
@@ -43,18 +49,20 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Open: HTTP probes/metrics/policy (:8080) and gRPC (:9090). No `from:`
-    # filter — preserves the pre-policy "any in-cluster client can reach
-    # these ports" posture so kubelet probes, Prometheus scrapes, the
-    # controller's CachePolicy push, and gateway gRPC traffic keep working.
+    # Open: HTTP probes/metrics (:8080) and gRPC (:9090). No `from:` filter —
+    # preserves the pre-policy "any in-cluster client can reach these ports"
+    # posture so kubelet probes, Prometheus scrapes, and gateway gRPC traffic
+    # keep working.
     - ports:
         - protocol: TCP
           port: 8080
         - protocol: TCP
           port: 9090
-    # Restricted: only the controller may reach /snapshot (:8081). Combined
-    # with the TokenReview-backed bearer auth on the listener, this is the
-    # defence-in-depth gate the rest of the policy exists for.
+    # Restricted: only the controller may reach /snapshot AND /policy on
+    # :8081. Combined with the TokenReview-backed bearer auth on the
+    # listener, this is the defence-in-depth gate the rest of the policy
+    # exists for. /snapshot is the read side (CacheIndex poll) and /policy is
+    # the write side (CachePolicy push); both originate from the same SA.
     - from:
         - podSelector:
             matchLabels:

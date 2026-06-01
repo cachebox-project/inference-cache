@@ -60,7 +60,7 @@ func defaultOptions() options {
 		secureMetrics:           false,
 		enableHTTP2:             false,
 		serverSnapshotURL:       "http://inference-cache-server:8081/snapshot",
-		serverPolicyURL:         "http://inference-cache-server:8080/policy",
+		serverPolicyURL:         "http://inference-cache-server:8081/policy",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",

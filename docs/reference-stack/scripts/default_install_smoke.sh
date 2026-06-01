@@ -36,6 +36,13 @@
 #   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
+#   8. The /policy endpoint rejects unauthenticated callers: same side-pod
+#      shape against the write-side endpoint. This is the more dangerous of
+#      the two — /policy is replace-on-write, so a successful unauthenticated
+#      POST would override every namespace's CachePolicy state cluster-wide.
+#      The probe POSTs a valid snapshot body so the rejection cannot be
+#      misattributed to a 400; the only valid outcome is 401 (auth
+#      middleware) or a curl timeout (NetworkPolicy drop).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -810,4 +817,55 @@ case "$probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"
+# --- /policy auth assertion -------------------------------------------------
+# The controller's CachePolicy push above already proves the authenticated
+# write path works (without it the controller would error every reconcile,
+# but its existence does not directly assert on the wire). The complementary
+# half — that an UNAUTHENTICATED POST is rejected — is what this section
+# checks, since /policy is replace-on-write and a successful rogue POST
+# would override cluster-wide policy state with no audit trail. Mirror of
+# the /snapshot probe above. Sends a valid PolicySnapshot body so a 400
+# (bad request) cannot be confused with a 401; the only valid outcomes are
+# 401 (auth) or curl_failed:28 (NetworkPolicy drop under an enforcing CNI).
+log "asserting unauthenticated /policy POST from a side pod is rejected"
+SIDE_POD_POLICY="ic-policy-probe"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_POLICY" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # POST a minimal valid PolicySnapshot so any non-2xx response must be
+    # an auth rejection, not a body-parse rejection. -d sets the body and
+    # implies POST.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      -H "Content-Type: application/json" \
+      -d "{\"version\":1,\"policies\":[]}" \
+      http://inference-cache-server:8081/policy || echo "curl_failed:$?"
+  ' >/tmp/policy-probe-create.log 2>&1; then
+  cat /tmp/policy-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD_POLICY failed; cannot run /policy auth assertion"
+fi
+
+for _ in $(seq 1 30); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD_POLICY" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+policy_probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD_POLICY" 2>/dev/null || true)"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
+# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
+# CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass). 204 (write succeeded unauthenticated) is the regression this
+# whole ticket exists to prevent.
+case "$policy_probe_out" in
+  "401"|*"curl_failed:28"*)
+    log "unauthenticated /policy probe rejected (probe output: $policy_probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /policy probe was not rejected (or curl failed for an unexpected reason); got: $policy_probe_out"
+    ;;
+esac
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot AND /policy reject unauth"

@@ -22,14 +22,19 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` | watch event + tick |
 
-`/policy` sits on the server's open HTTP port (`:8080`), alongside
-`/healthz`, `/readyz`, `/metrics`. `/snapshot` is on a separate internal
-listener (`:8081`) gated by TokenReview-backed bearer auth and a
-NetworkPolicy that restricts ingress to the controller's pod selector —
-both endpoints are still internal but the snapshot path now has two
-independent gates (L7 authn + L3/L4 isolation), because it leaks
-per-tenant cache metadata under the cluster's trust boundary while
-`/policy` is a push the controller authors anyway.
+Both `/snapshot` and `/policy` sit on the server's internal `:8081`
+listener, gated by TokenReview-backed bearer auth and a NetworkPolicy
+that restricts ingress to the controller's pod selector. `/healthz`,
+`/readyz`, and `/metrics` stay on the open `:8080` listener — kubelet
+probes and Prometheus scrapes can't present a SA bearer. The two
+internal endpoints share one auth profile because they share one caller
+identity (the controller SA). `/snapshot` is the *read* side (CacheIndex
+poll, info leak if exposed) and `/policy` is the *write* side
+(CachePolicy push, active tampering if exposed) — write is more
+dangerous because replace-on-write semantics mean a rogue POST overrides
+every namespace's policy state cluster-wide with no audit trail. The
+read-side hardening landed first; the write side joined it on the same
+gate.
 
 ## Snapshot semantics
 
@@ -203,7 +208,10 @@ out together and the periodic re-push reconciles any transient skew.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
-- Endpoint hardening for `/policy` — out of scope here; the controller
-  is the only authorized writer and pushes over in-cluster cleartext.
-  `/snapshot` hardening (bearer auth + NetworkPolicy) ships alongside
-  this work (see the snapshot listener at `:8081` above).
+- mTLS for `/policy` and `/snapshot` — the current shape ships
+  TokenReview-backed bearer auth + a NetworkPolicy gate; mTLS is a
+  separate hardening step tracked under the gRPC TLS posture decision.
+- Audience-binding the projected SA token — extends the bearer the
+  controller sends so it is only accepted by this server's audience,
+  defeating cross-service token reuse if the same identity ever fronts
+  another in-cluster service.

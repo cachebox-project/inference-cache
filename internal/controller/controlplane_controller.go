@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,12 +58,21 @@ type ControlPlaneReconciler struct {
 	Log    logr.Logger
 
 	// ServerPolicyURL is the URL the snapshot is POSTed to (e.g.
-	// http://inference-cache-server:8080/policy). Required.
+	// http://inference-cache-server:8081/policy). Required.
 	ServerPolicyURL string
 	// HTTPClient is the client used for the push. Nil → a 5s-timeout default.
 	HTTPClient *http.Client
 	// PushInterval is the self-healing tick cadence. <=0 → DefaultPolicyPushInterval.
 	PushInterval time.Duration
+
+	// BearerTokenPath is the file the projected ServiceAccount token is
+	// mounted at, sent as Authorization: Bearer on every push so the server's
+	// TokenReview middleware can authenticate the controller.
+	// "" → DefaultBearerTokenPath. A path that does not exist is treated as
+	// "no token configured" — the POST goes out unauthenticated and the
+	// server's 401 surfaces as a normal failing tick (returning a retryable
+	// error to controller-runtime). Mirrors the CacheIndexPoller's posture.
+	BearerTokenPath string
 
 	// pushMu serializes pushSnapshot calls. Without it the watch-driven
 	// reconciler and the periodic ticker can race: tick T1 lists the world
@@ -192,6 +205,21 @@ func (r *ControlPlaneReconciler) pushSnapshot(ctx context.Context) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Send the projected SA token so the server's TokenReview middleware can
+	// admit this push. bearerToken errors are surfaced separately so a
+	// missing or unreadable token shows up in the controller's log with the
+	// expected path, rather than silently degrading to an unauthenticated
+	// push that the server rejects as 401. An absent token file (local-dev
+	// out-of-cluster) is NOT an error — the POST goes out unauthenticated
+	// and the server's auth posture decides what happens next.
+	token, tokenErr := r.bearerToken()
+	if tokenErr != nil {
+		r.logger(ctx).Error(tokenErr, "read bearer token; pushing unauthenticated")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	resp, err := r.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("push policies to %s: %w", r.ServerPolicyURL, err)
@@ -201,6 +229,26 @@ func (r *ControlPlaneReconciler) pushSnapshot(ctx context.Context) error {
 		return fmt.Errorf("push policies to %s: unexpected status %d", r.ServerPolicyURL, resp.StatusCode)
 	}
 	return nil
+}
+
+// bearerToken reads the projected ServiceAccount token. Re-read on every
+// push so kubelet rotations are picked up without process restarts; the
+// file is tmpfs so the read is cheap. Error semantics mirror
+// CacheIndexPoller.bearerToken — file missing → ("", nil); present but
+// unreadable → ("", wrappedError) so the operator can diagnose.
+func (r *ControlPlaneReconciler) bearerToken() (string, error) {
+	path := r.BearerTokenPath
+	if path == "" {
+		path = DefaultBearerTokenPath
+	}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("read bearer token %q: %w", path, err)
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 // resolvePolicies flattens CachePolicy CRs into the server-side shape with a
