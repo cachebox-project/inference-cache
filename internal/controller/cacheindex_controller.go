@@ -34,11 +34,19 @@ const (
 	DefaultCacheIndexName  = "cluster-default"
 	DefaultRefreshInterval = 30 * time.Second
 
-	// DefaultBearerTokenPath is the standard in-cluster location kubelet
-	// projects the controller's ServiceAccount token to. It is a tmpfs
-	// file kubelet rewrites on rotation; the poller re-reads on every
-	// scrape so a rotated token is picked up immediately.
-	DefaultBearerTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	// DefaultBearerTokenPath is the in-cluster location of the audience-bound
+	// projected ServiceAccount token the controller uses to scrape /snapshot.
+	// The default install (config/manager/manager.yaml) projects a token with
+	// audience auth.ControllerAudience here; the kubelet rewrites the file on
+	// rotation, and the poller re-reads it on every scrape so a rotated token
+	// is picked up immediately.
+	//
+	// This is intentionally NOT the default automount path
+	// (/var/run/secrets/kubernetes.io/serviceaccount/token), which carries
+	// the apiserver-bound token used by the controller-runtime client. Two
+	// distinct tokens, two distinct paths, two distinct audiences: a leak
+	// of one is useless on the other surface.
+	DefaultBearerTokenPath = "/var/run/secrets/inferencecache.io/controller-token/token"
 )
 
 // CacheIndexPoller periodically scrapes the server's internal /snapshot endpoint

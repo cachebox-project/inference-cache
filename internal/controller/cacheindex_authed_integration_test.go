@@ -77,6 +77,7 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	authn, err := auth.NewAuthenticator(auth.Options{
 		Reviewer:               auth.FromClientset(clientset),
 		ExpectedServiceAccount: expectedSA,
+		Audience:               auth.ControllerAudience,
 	})
 	if err != nil {
 		t.Fatalf("auth.NewAuthenticator: %v", err)
@@ -101,21 +102,31 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 
 	// Mint SA tokens via TokenRequest and stage them on disk the way
 	// kubelet projects them — trailing newline, mode 0o600. The poller's
-	// bearerToken() trims the newline before sending.
-	mintTokenFile := func(saName string) string {
+	// bearerToken() trims the newline before sending. mintTokenFile binds
+	// the snapshot audience to mirror the production projected-volume
+	// shape (kubelet bakes audience into the JWT, apiserver enforces it
+	// at TokenReview); mintTokenFileWithAudience supports the wrong-
+	// audience negative case below.
+	mintTokenFileWithAudience := func(saName, audience string) string {
 		t.Helper()
 		exp := int64(3600)
 		tr, err := clientset.CoreV1().ServiceAccounts(ns).CreateToken(ctx, saName, &authnv1.TokenRequest{
-			Spec: authnv1.TokenRequestSpec{ExpirationSeconds: &exp},
+			Spec: authnv1.TokenRequestSpec{
+				Audiences:         []string{audience},
+				ExpirationSeconds: &exp,
+			},
 		}, metav1.CreateOptions{})
 		if err != nil {
-			t.Fatalf("CreateToken(%s): %v", saName, err)
+			t.Fatalf("CreateToken(%s, audience=%s): %v", saName, audience, err)
 		}
 		path := filepath.Join(t.TempDir(), saName+"-token")
 		if err := os.WriteFile(path, []byte(tr.Status.Token+"\n"), 0o600); err != nil {
 			t.Fatalf("write token file: %v", err)
 		}
 		return path
+	}
+	mintTokenFile := func(saName string) string {
+		return mintTokenFileWithAudience(saName, auth.ControllerAudience)
 	}
 	controllerTokenFile := mintTokenFile(controllerSA)
 	otherTokenFile := mintTokenFile(otherSA)
@@ -169,6 +180,27 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	}
 	if ci.ResourceVersion != happyRV {
 		t.Fatalf("403 path wrote a new status revision: rv %s -> %s", happyRV, ci.ResourceVersion)
+	}
+
+	// Wrong-audience: a TokenRequest minted for the CORRECT SA but with a
+	// different audience. The apiserver bakes audience into the JWT and
+	// rejects it under TokenReview.Audiences=[snapshot], so the middleware
+	// returns 401 even though the SA identity would otherwise be admitted.
+	// This is the over-the-wire complement to the in-process middleware
+	// envtest in pkg/server/auth and pins the same audience-binding contract
+	// against the controller's actual poller code path. Fail-soft expectation
+	// matches the wrong-SA / no-token branches above.
+	wrongAudienceTokenFile := mintTokenFileWithAudience(controllerSA, "https://kubernetes.default.svc")
+	poller.BearerTokenPath = wrongAudienceTokenFile
+	if err := poller.refresh(ctx); err == nil {
+		t.Fatal("refresh with wrong-audience token: expected non-nil error (401), got nil")
+	}
+	if err := k8s.Get(ctx, types.NamespacedName{Name: ciName}, &ci); err != nil {
+		t.Fatalf("get CacheIndex after wrong-audience 401 refresh: %v", err)
+	}
+	if ci.Status.Prefixes.Summary.Total != 7 || ci.ResourceVersion != happyRV {
+		t.Fatalf("wrong-audience 401 mutated status; total=%d (want 7), rv=%s (want %s)",
+			ci.Status.Prefixes.Summary.Total, ci.ResourceVersion, happyRV)
 	}
 
 	// No-token: an empty file → bearerToken() returns ("", nil), so

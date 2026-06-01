@@ -79,6 +79,7 @@ func FromClientset(client kubernetes.Interface) TokenReviewer {
 type Authenticator struct {
 	reviewer   TokenReviewer
 	expectedSA string // "system:serviceaccount:<ns>:<sa>"
+	audience   string // bound on TokenReviewSpec.Audiences; "" → no audience constraint
 	recorder   ResultRecorder
 	cacheTTL   time.Duration
 	cacheMax   int
@@ -98,6 +99,15 @@ type Options struct {
 	// ExpectedServiceAccount is the canonical SA username the controller
 	// authenticates with, e.g. "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
 	ExpectedServiceAccount string
+	// Audience is the value passed to TokenReviewSpec.Audiences. The
+	// apiserver then admits the token ONLY if it was minted with this
+	// audience (kubelet's projected token minting binds the audience into
+	// the JWT; a default-audience apiserver token rejects here). Pair with
+	// a `projected` SA volume on the controller pod that mints with the
+	// same value. Empty string disables audience binding entirely — used
+	// only in legacy callers and in unit tests that don't exercise the
+	// audience path. See ControllerAudience for the production default.
+	Audience string
 	// Recorder receives one Result per request. Optional; nil disables metrics.
 	Recorder ResultRecorder
 	// CacheTTL controls how long a successful TokenReview is reused. <=0 → DefaultCacheTTL.
@@ -132,6 +142,7 @@ func NewAuthenticator(opts Options) (*Authenticator, error) {
 	return &Authenticator{
 		reviewer:   opts.Reviewer,
 		expectedSA: opts.ExpectedServiceAccount,
+		audience:   opts.Audience,
 		recorder:   opts.Recorder,
 		cacheTTL:   ttl,
 		cacheMax:   cap,
@@ -158,9 +169,16 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		tr, err := a.reviewer.CreateTokenReview(r.Context(), &authnv1.TokenReview{
-			Spec: authnv1.TokenReviewSpec{Token: token},
-		})
+		// Pass Audiences when configured so the apiserver enforces
+		// audience binding: a default-audience token from the controller's
+		// general API client comes back !Authenticated even though the SA
+		// identity would otherwise match. Empty audience → no constraint
+		// (legacy/test path); the production code path always sets one.
+		spec := authnv1.TokenReviewSpec{Token: token}
+		if a.audience != "" {
+			spec.Audiences = []string{a.audience}
+		}
+		tr, err := a.reviewer.CreateTokenReview(r.Context(), &authnv1.TokenReview{Spec: spec})
 		if err != nil {
 			// Fail-closed: don't admit on apiserver flakes (transport
 			// error, timeout, RBAC reject before the review was even

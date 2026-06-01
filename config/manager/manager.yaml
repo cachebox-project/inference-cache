@@ -50,7 +50,53 @@ spec:
           capabilities:
             drop:
             - ALL
+        # Audience-bound projected SA token used to scrape /snapshot.
+        # Kubelet projects the token (calling TokenRequest on behalf of
+        # the pod) with audience "inferencecache.io/controller" baked into
+        # the JWT, and rewrites the file on rotation; the audience is
+        # *enforced* later by kube-apiserver / TokenReview when the server
+        # validates a bearer (operators chasing a mismatch will see the
+        # diagnostic from the apiserver, not from the kubelet). Mounted
+        # alongside, NOT instead of, the default automounted apiserver-
+        # bound token (which the controller-runtime client uses for CRD
+        # watches + status patches). Two tokens, two paths, two distinct
+        # audiences — under the default apiserver audience configuration
+        # a leak of one is useless on the other surface; the cross-surface
+        # property only holds while the apiserver is not configured to
+        # also accept inferencecache.io/controller as an apiserver audience.
+        # Audience here MUST agree with auth.ControllerAudience and the
+        # server's --controller-audience flag (default = same constant).
+        # Drift between this manifest, the flag, and the constant is
+        # caught by the EARLIER assertion in the default-install smoke
+        # (docs/reference-stack/scripts/default_install_smoke.sh): the
+        # cacheindex/cluster-default.status.observedServer field
+        # populates only when the REAL controller's poller — driven by
+        # THIS volume + path + audience — successfully scrapes the
+        # server's /snapshot. The script's separate audience-binding
+        # probe pod does NOT catch this kind of drift; it intentionally
+        # uses its own inline projected-volume duplicate so it can
+        # still verify the SERVER's audience enforcement even if this
+        # manifest is broken. The envtests in pkg/server/auth and
+        # internal/controller cover the apiserver- and over-the-wire-
+        # enforcement halves of the contract respectively.
+        volumeMounts:
+        - name: controller-token
+          mountPath: /var/run/secrets/inferencecache.io/controller-token
+          readOnly: true
       securityContext:
         runAsNonRoot: true
       serviceAccountName: inference-cache-controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+      - name: controller-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              # The audience kubelet binds into the JWT before writing
+              # the file. Must match the server's --controller-audience.
+              audience: inferencecache.io/controller
+              # ~1 hour. Kubelet rotates well before expiry; the poller
+              # re-reads the file on every scrape so rotation is picked
+              # up immediately without process restart.
+              expirationSeconds: 3600

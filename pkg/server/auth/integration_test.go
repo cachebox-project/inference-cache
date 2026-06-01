@@ -69,6 +69,7 @@ func TestAuthMiddleware_AgainstEnvtestAPIServer(t *testing.T) {
 	a, err := auth.NewAuthenticator(auth.Options{
 		Reviewer:               auth.FromClientset(clientset),
 		ExpectedServiceAccount: wantUsername,
+		Audience:               auth.ControllerAudience,
 	})
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
@@ -80,15 +81,12 @@ func TestAuthMiddleware_AgainstEnvtestAPIServer(t *testing.T) {
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
 
+	// mintToken issues a TokenRequest bound to the snapshot audience —
+	// matches the production posture where the controller's projected SA
+	// volume mints tokens with the same audience. Any callsite wanting to
+	// exercise the wrong-audience path uses mintTokenWithAudience.
 	mintToken := func(saName string) string {
-		t.Helper()
-		tr, err := clientset.CoreV1().ServiceAccounts(ns).CreateToken(ctx, saName, &authnv1.TokenRequest{
-			Spec: authnv1.TokenRequestSpec{ExpirationSeconds: ptrInt64(3600)},
-		}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("CreateToken(%s): %v", saName, err)
-		}
-		return tr.Status.Token
+		return mintTokenWithAudience(t, ctx, clientset, ns, saName, auth.ControllerAudience)
 	}
 
 	do := func(authHeader string) int {
@@ -132,6 +130,36 @@ func TestAuthMiddleware_AgainstEnvtestAPIServer(t *testing.T) {
 			t.Fatalf("status = %d, want 200", code)
 		}
 	})
+
+	// Audience binding: a token minted for the SAME SA but with a
+	// different audience must NOT authenticate, even though the SA
+	// identity check would otherwise admit it. Proves the middleware
+	// is actually passing TokenReviewSpec.Audiences AND the apiserver
+	// is enforcing it.
+	t.Run("controller SA but wrong audience -> 401", func(t *testing.T) {
+		wrong := mintTokenWithAudience(t, ctx, clientset, ns, wantSA, "https://kubernetes.default.svc")
+		if code := do("Bearer " + wrong); code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 (wrong-audience token must not authenticate)", code)
+		}
+	})
+}
+
+// mintTokenWithAudience asks the apiserver to issue a TokenRequest for
+// saName with the supplied audience. The audience is baked into the JWT
+// at mint time and is enforced by the apiserver when the server calls
+// TokenReview with Spec.Audiences set.
+func mintTokenWithAudience(t *testing.T, ctx context.Context, clientset *kubernetes.Clientset, ns, saName, audience string) string {
+	t.Helper()
+	tr, err := clientset.CoreV1().ServiceAccounts(ns).CreateToken(ctx, saName, &authnv1.TokenRequest{
+		Spec: authnv1.TokenRequestSpec{
+			Audiences:         []string{audience},
+			ExpirationSeconds: ptrInt64(3600),
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("CreateToken(%s, audience=%s): %v", saName, audience, err)
+	}
+	return tr.Status.Token
 }
 
 func ptrInt64(v int64) *int64 { return &v }

@@ -51,6 +51,23 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
+#   9. The audience binding holds on BOTH /snapshot and /policy: a probe
+#      pod with the controller's SA + labels reads two mounted tokens
+#      (audience-bound projected + default-audience apiserver automount)
+#      and asserts the audience-bound token admits on both endpoints
+#      while the default-audience token of the SAME SA is rejected on
+#      both. The two endpoints share one middleware identity (one
+#      controller SA, one audience), so any drift would surface on both
+#      simultaneously. Catches a regression in the SERVER's audience-
+#      enforcement half of the contract — `--controller-audience` flag
+#      drift, the middleware forgetting to populate
+#      `TokenReviewSpec.Audiences`, or the apiserver mis-enforcing
+#      audience. Does NOT catch drift in the controller's production
+#      projected-volume manifest (the probe deliberately uses its own
+#      inline volume spec so it still runs when that manifest is broken);
+#      that drift is caught by item 2 above — observedServer populates
+#      only when the REAL controller's poller successfully scrapes
+#      /snapshot.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -1204,4 +1221,142 @@ case "$policy_probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, and /snapshot + /policy unauth rejection all work"
+# --- Audience-binding assertion (BOTH /snapshot and /policy) --------------
+# Audience-binding follow-up to the bearer-token gate. The controller pod
+# in production mounts TWO ServiceAccount tokens:
+#   1. The default automount at /var/run/secrets/kubernetes.io/serviceaccount/token
+#      — audience = the apiserver. Used by the controller-runtime client.
+#   2. A projected volume at /var/run/secrets/inferencecache.io/controller-token/token
+#      — audience = "inferencecache.io/controller". Used by the CacheIndex
+#      poller AND the CachePolicy push side — they share the projected
+#      token because /snapshot and /policy share one auth middleware.
+# The server passes TokenReviewSpec.Audiences=["inferencecache.io/controller"]
+# on every review for BOTH endpoints, so a default-audience token MUST
+# come back 401 on BOTH even though the SA identity (controller-manager)
+# would otherwise be admitted.
+#
+# Why a single probe pod with FOUR scrapes (audience-bound × {snapshot,
+# policy} ∪ default-audience × {snapshot, policy}): the two endpoints share
+# one middleware identity, so audience drift would surface on both
+# simultaneously — but a regression in JUST ONE direction (e.g. the policy
+# handler skipping the auth wrapper) would show up here too. Four small
+# checks, one pod, one assertion: "all four outcomes match the contract."
+#
+# Scoping — what each smoke gate actually catches (the assertions are
+# complementary, not redundant):
+#   - The CacheIndex assertion earlier (cacheindex/cluster-default.status
+#     .observedServer populates within ~60s) is what proves the REAL
+#     controller's projected-volume manifest, the controller binary's
+#     BearerTokenPath, the server's flag, and the middleware all agree
+#     end-to-end. If config/manager/manager.yaml drifts (audience renamed,
+#     mount path moved, expirationSeconds zeroed), the real poller's
+#     scrape returns 401 and the CR's observedServer stays empty, failing
+#     that earlier gate.
+#   - THIS probe asserts only server-side behavior: that an audience-bound
+#     token admits and a default-audience token of the same SA is rejected,
+#     on BOTH endpoints. It uses an inline duplicate volume spec so it can
+#     run even if the controller's manifest is broken (which would
+#     otherwise mask the server-side check). It does NOT catch drift in
+#     config/manager/manager.yaml; that's the earlier gate's job.
+log "asserting audience binding on both /snapshot and /policy"
+PROBE_POD="ic-audience-probe"
+kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+probe_yaml=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PROBE_POD
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: controller
+spec:
+  serviceAccountName: inference-cache-controller-manager
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: curlimages/curl:8.10.1
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      # The probe pod IS in the NetworkPolicy allowlist (component=controller
+      # label), so we expect no L3/L4 drop — but a short -m timeout + explicit
+      # curl-exit capture keeps a regression (DNS, Service rename, allowlist
+      # drift) from looking like a silent bad outcome. If curl fails on any
+      # of the four scrapes, we emit "K=curl_failed:N" so the case statement
+      # below surfaces the exit code, not the empty-status default.
+      controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
+      default_token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
+      if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
+      if [ -z "\$default_token" ]; then echo "default_token_missing"; exit 0; fi
+      # GET /snapshot — controller-audience must 200, default-audience must 401.
+      sa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
+      sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
+      # POST /policy — controller-audience must 204, default-audience must 401.
+      # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def"
+    volumeMounts:
+    - name: controller-token
+      mountPath: /var/run/secrets/inferencecache.io/controller-token
+      readOnly: true
+  volumes:
+  - name: controller-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: inferencecache.io/controller
+          expirationSeconds: 3600
+EOF
+)
+if ! echo "$probe_yaml" | kubectl apply -f - >/tmp/audience-probe-create.log 2>&1; then
+  cat /tmp/audience-probe-create.log >&2 || true
+  fail "kubectl apply for $PROBE_POD failed; cannot run audience-binding assertion"
+fi
+
+# Wait for the probe pod to finish; 90s budget + describe-pod fallback
+# matches the unauth probes above for the same kubelet-busy-reaping reason.
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$PROBE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+audience_probe="$(kubectl -n "$NAMESPACE" logs "$PROBE_POD" 2>/dev/null || true)"
+if [ -z "$audience_probe" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$PROBE_POD" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+
+log "audience probe output: $audience_probe"
+# Expected outcome line, in order:
+#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401
+# Anything else is a regression. curl_failed:28 splits out so an operator
+# triaging a red smoke knows whether to look at NetworkPolicy (timeout) vs
+# Service/listener (other curl exit).
+case "$audience_probe" in
+  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401")
+    log "audience binding verified on both endpoints — controller-audience token admitted, default-audience token rejected on /snapshot and /policy"
+    ;;
+  *controller_token_missing*)
+    fail "probe pod is missing /var/run/secrets/inferencecache.io/controller-token/token — the projected volume did not mount; check the probe-pod manifest above (and config/manager/manager.yaml for the production analog)"
+    ;;
+  *default_token_missing*)
+    fail "probe pod is missing the default automount; cannot run the audience-binding negative case"
+    ;;
+  *"curl_failed:28"*)
+    fail "audience-binding probe timed out reaching :8081 (curl -m 5 fired). Likely NetworkPolicy regression — does the probe pod still match the controller's component=controller selector? Probe output: $audience_probe"
+    ;;
+  *"curl_failed:"*)
+    fail "audience-binding probe could not connect to the controller-facing listener (curl exited non-zero). Check Service name 'inference-cache-server', port 8081, and that the listener is up. Probe output: $audience_probe"
+    ;;
+  *)
+    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401')"
+    ;;
+esac
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, and audience binding on both endpoints all work"
