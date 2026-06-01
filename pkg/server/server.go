@@ -84,6 +84,7 @@ func New(opts ...Option) *Service {
 	idx := index.New(
 		index.WithMetrics(metrics),
 		index.WithTTLResolver(policies),
+		index.WithTenantQuotaResolver(policies),
 	)
 
 	grpcServer := grpc.NewServer()

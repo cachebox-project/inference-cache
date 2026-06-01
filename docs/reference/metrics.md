@@ -49,6 +49,7 @@ silently.
 |---|---|---|---|
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
 | `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — see note below), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses both "kube-apiserver checked the token and rejected it" AND "an authenticator in the chain populated `Status.Error`" because the two are NOT distinguishable from the response shape (verified empirically: kube-apiserver's SA-token authenticator populates `Status.Error` for routine JWT-parse failures of garbage strings, the same field a webhook-authenticator timeout would set). When `Status.Error` is non-empty the middleware logs it at WARN to the server log so the operator can still tell apart "webhook timeout" from "invalid bearer token" via the diagnostic. A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
+| `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 
 ### Histograms
 
@@ -82,6 +83,9 @@ with OTEL collectors) without bumping `v1alpha1`.
 - **`lookupCalls` + `lookupLatency` writers:** the `LookupRoute` handler in
   [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go)
   calls `metrics.observeLookup(...)` exactly once per request.
+- **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
+  `index.Metrics` interface after a quota-driven eviction at ingest; see
+  [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
 
 ---
 
@@ -91,7 +95,8 @@ with OTEL collectors) without bumping `v1alpha1`.
   `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
 - Companion endpoints on the public listener: **`/healthz`** (liveness),
   **`/readyz`** (readiness → `index.Ready()`), **`/policy`** (controller →
-  server push of resolved `CachePolicy` snapshots). These are intentionally
+  server push of the combined resolved snapshot — `CachePolicy` entries plus
+  `CacheTenant` quota entries). These are intentionally
   unauthenticated — kubelet probes and Prometheus scrapes need them open,
   and the controller is the only writer of `/policy`.
 - Separate **`/snapshot`** listener (default `:8081`, flag

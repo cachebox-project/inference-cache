@@ -11,9 +11,12 @@
 #   2. The CacheIndex poller is writing status: `cacheindex/cluster-default`
 #      has a non-empty `.status.observedServer` within ~60s (one or two poll
 #      cycles past the 30s default refresh).
-#   3. The gRPC surface is reachable: a `LookupRoute` for an unknown model
+#   3. The per-CacheTenant status projection works: an applied `CacheTenant`
+#      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
+#      smoke) and a `Ready=True` condition written by the same poller.
+#   4. The gRPC surface is reachable: a `LookupRoute` for an unknown model
 #      returns the fail-open default (`reason_code: NO_HINT`).
-#   4. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   5. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -23,14 +26,14 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   5. The External CacheBackend type end-to-end: applying a `type: External`
+#   6. The External CacheBackend type end-to-end: applying a `type: External`
 #      CR renders NO Deployment/Service in its namespace, status.endpoint
 #      mirrors spec.endpoint, the CR goes Ready=True/ExternalEndpointAccepted,
 #      and a matching engine pod is admitted with `LMCACHE_REMOTE_URL=lm://
 #      <spec.endpoint>` injected by the pod-mutating webhook. Also exercises
 #      the new admission validation rules (non-External + endpoint and
 #      External + bad scheme are both rejected at write time).
-#   6. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#   7. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
 #
@@ -149,6 +152,8 @@ collect_diagnostics() {
     >"$LOG_DIR/logs-server.txt" 2>&1 || true
   kubectl get cacheindex cluster-default -o yaml \
     >"$LOG_DIR/cacheindex.yaml" 2>&1 || true
+  kubectl get cachetenants -A -o yaml \
+    >"$LOG_DIR/cachetenants.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
   # Paired-sample state — only populated if the sample-smoke phase ran;
@@ -286,6 +291,47 @@ until [ -n "$observed" ]; do
   sleep 3
 done
 log "cacheindex/cluster-default.status.observedServer=$observed"
+
+# --- CacheTenant status projection assertion -------------------------------
+# Apply a CacheTenant and prove the poller's per-tenant projection writes its
+# status. The smoke cluster has no engine pods, so the tenant holds zero
+# prefixes: the projection must report indexEntries=0 (observed-zero, not nil)
+# with Ready=True. This exercises the CacheTenant CRD schema, the combined
+# CachePolicy+CacheTenant push to /policy, and the per-tenant status writer.
+log "applying CacheTenant sample and waiting for its status projection"
+kubectl apply -f config/samples/cache_v1alpha1_cachetenant.yaml
+deadline=$(($(date +%s) + CACHEINDEX_TIMEOUT))
+ct_entries=""
+until [ -n "$ct_entries" ]; do
+  ct_entries="$(kubectl get cachetenant cachetenant-sample \
+    -o jsonpath='{.status.indexEntries}' 2>/dev/null || true)"
+  if [ -n "$ct_entries" ]; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl get cachetenant cachetenant-sample -o yaml || true
+    fail "cachetenant-sample.status.indexEntries was empty after ${CACHEINDEX_TIMEOUT}s"
+  fi
+  sleep 3
+done
+if [ "$ct_entries" != "0" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample.status.indexEntries=0 (no traffic), got: $ct_entries"
+fi
+ct_ready="$(kubectl get cachetenant cachetenant-sample \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+if [ "$ct_ready" != "True" ]; then
+  kubectl get cachetenant cachetenant-sample -o yaml || true
+  fail "expected cachetenant-sample Ready=True, got: ${ct_ready:-<unset>}"
+fi
+
+# The printer columns (Tenant / Entries / Quota) are themselves an operator-
+# facing surface. Verify `kubectl get cachetenants` renders them — a default
+# table with only NAME/AGE would mean the additionalPrinterColumns regressed.
+ct_table="$(kubectl get cachetenant cachetenant-sample 2>/dev/null || true)"
+if ! grep -q 'tenant-a' <<<"$ct_table" || ! grep -q '100000' <<<"$ct_table"; then
+  echo "$ct_table"
+  fail "expected CacheTenant printer columns (Tenant=tenant-a, Quota=100000) in kubectl get output"
+fi
+log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready (printer columns OK)"
 
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
@@ -764,4 +810,4 @@ case "$probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex poller is writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, gRPC fail-open works, CacheBackend ↔ engine-pod binding signals wire up + drift cadence converges, External backend end-to-end works, /snapshot rejects unauth"

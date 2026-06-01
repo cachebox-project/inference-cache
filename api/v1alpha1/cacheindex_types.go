@@ -45,8 +45,14 @@ type ReplicaCacheStatus struct {
 
 // TenantCacheStatus is the aggregate cache footprint for one tenant.
 type TenantCacheStatus struct {
-	// ID is the tenant identifier.
+	// ID is the tenant identifier. The empty string is the untenanted bucket
+	// (prefixes ingested with no tenant ID); no real CacheTenant uses it.
 	ID string `json:"id"`
+	// IndexEntries is the number of distinct prefixes the tenant holds in the
+	// index. Across all tenant rows these sum to prefixes.summary.total by
+	// construction — the per-tenant breakdown of the cluster prefix count.
+	// +optional
+	IndexEntries int64 `json:"indexEntries,omitempty"`
 	// MemoryUsed is the approximate cache memory attributed to the tenant
 	// (summed over the tenant's distinct replicas).
 	// +optional
