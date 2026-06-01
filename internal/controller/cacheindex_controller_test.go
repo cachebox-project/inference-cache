@@ -1107,10 +1107,16 @@ func TestReconcileTenantStatusesShadowedDuplicate(t *testing.T) {
 			Quota:    &cachev1alpha1.CacheTenantQuotaSpec{MaxIndexEntries: &dupBudget},
 		},
 	}
+	// A duplicate with NO quota of its own must ALSO be flagged: the tenantID is
+	// enforced by alpha, so reporting Ready=True/NoQuota would mislead.
+	shadowedNoQuota := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "gamma", Namespace: "team"},
+		Spec:       cachev1alpha1.CacheTenantSpec{TenantID: "shared"},
+	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&cachev1alpha1.CacheTenant{}).
-		WithObjects(effective, shadowed).
+		WithObjects(effective, shadowed, shadowedNoQuota).
 		Build()
 	p := &CacheIndexPoller{Client: cl}
 	ctx := context.Background()
@@ -1146,6 +1152,12 @@ func TestReconcileTenantStatusesShadowedDuplicate(t *testing.T) {
 	}
 	if c, _ := tenantCond(dup, tenantConditionQuotaExceeded); c.Status != metav1.ConditionFalse || c.Reason != "NotEffective" {
 		t.Fatalf("shadowed QuotaExceeded = %+v, want False/NotEffective", c)
+	}
+
+	// No-quota duplicate is shadowed too (not Ready=True/NoQuota).
+	dupNQ := get("gamma")
+	if c, ok := tenantCond(dupNQ, tenantConditionReady); !ok || c.Status != metav1.ConditionFalse || c.Reason != "DuplicateTenantID" {
+		t.Fatalf("no-quota duplicate Ready = %+v, want False/DuplicateTenantID", c)
 	}
 }
 

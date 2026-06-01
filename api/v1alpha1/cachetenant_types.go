@@ -17,8 +17,14 @@ const (
 // CacheTenantSpec defines tenant identity and quota.
 type CacheTenantSpec struct {
 	// TenantID is the external tenant identifier used by gateway and engine traffic.
+	// "_default" is reserved: the cluster-wide index aggregate buckets untenanted
+	// traffic under that name (index.DefaultTenantSentinel), so allowing it as a
+	// real tenantID would let a CacheTenant's status reflect untenanted traffic
+	// while its quota enforces the literal "_default" string — two different
+	// populations. Rejected at admission to keep status and enforcement aligned.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:XValidation:rule="self != '_default'",message="'_default' is reserved for untenanted traffic and cannot be used as a tenantID"
 	TenantID string `json:"tenantID"`
 
 	// Quota bounds this tenant's cache footprint.

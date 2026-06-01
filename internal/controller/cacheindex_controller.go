@@ -213,15 +213,16 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 		if !ok {
 			obs = index.TenantSnapshot{TenantID: ct.Spec.TenantID}
 		}
-		// A quota-bearing CR whose tenantID is owned by a different CR is a
-		// shadowed duplicate: its budget is NOT the one being enforced.
+		// Any CR whose tenantID is owned by a DIFFERENT CacheTenant is a shadowed
+		// duplicate — whether or not it declares a quota of its own. A no-quota
+		// duplicate that reported Ready=True/NoQuota would imply the tenant is
+		// unenforced, when in fact the owning CR enforces a budget for that same
+		// tenantID; flag it so the operator sees the conflict.
 		var shadowedBy *types.NamespacedName
-		if tenantHasQuota(ct) {
-			if owner, owned := owners[ct.Spec.TenantID]; owned &&
-				(owner.Namespace != ct.Namespace || owner.Name != ct.Name) {
-				o := owner
-				shadowedBy = &o
-			}
+		if owner, owned := owners[ct.Spec.TenantID]; owned &&
+			(owner.Namespace != ct.Namespace || owner.Name != ct.Name) {
+			o := owner
+			shadowedBy = &o
 		}
 		desired := buildCacheTenantStatus(ct, obs, shadowedBy)
 		if cacheTenantStatusEqual(ct.Status, desired) {
@@ -230,7 +231,7 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 		patched := ct.DeepCopy()
 		patched.Status = desired
 		if err := p.Client.Status().Patch(ctx, patched, client.MergeFrom(ct)); err != nil {
-			errs = append(errs, fmt.Errorf("patch CacheTenant %q status: %w", ct.Name, err))
+			errs = append(errs, fmt.Errorf("patch CacheTenant %q status: %w", client.ObjectKeyFromObject(ct), err))
 		}
 	}
 	return errors.Join(errs...)
@@ -692,14 +693,14 @@ func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnaps
 			Type:               tenantConditionReady,
 			Status:             metav1.ConditionFalse,
 			Reason:             "DuplicateTenantID",
-			Message:            fmt.Sprintf("spec.tenantID %q is owned by CacheTenant %s; this duplicate's quota is not enforced", ct.Spec.TenantID, shadowedBy.String()),
+			Message:            fmt.Sprintf("spec.tenantID %q is also declared by CacheTenant %s, which is the effective owner; this CacheTenant is ignored", ct.Spec.TenantID, shadowedBy.String()),
 			ObservedGeneration: ct.Generation,
 		})
 		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
 			Type:               tenantConditionQuotaExceeded,
 			Status:             metav1.ConditionFalse,
 			Reason:             "NotEffective",
-			Message:            fmt.Sprintf("quota not enforced: CacheTenant %s owns spec.tenantID %q", shadowedBy.String(), ct.Spec.TenantID),
+			Message:            fmt.Sprintf("not the effective owner of tenantID %q (CacheTenant %s is)", ct.Spec.TenantID, shadowedBy.String()),
 			ObservedGeneration: ct.Generation,
 		})
 		return st

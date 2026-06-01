@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,29 @@ func TestIntegrationCacheTenantBackwardCompat(t *testing.T) {
 }
 
 func i64IntegrationPtr(v int64) *int64 { return &v }
+
+// TestIntegrationCacheTenantRejectsReservedTenantID pins the CEL admission rule
+// against a real apiserver (the fake client skips x-kubernetes-validations):
+// "_default" is reserved for the cluster-wide untenanted-traffic bucket, so a
+// CacheTenant may not claim it as a tenantID.
+func TestIntegrationCacheTenantRejectsReservedTenantID(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, _, _ := startEnv(t)
+	ctx := context.Background()
+	ns := freshNS(t, k8s)
+
+	ct := &cachev1alpha1.CacheTenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "reserved", Namespace: ns},
+		Spec:       cachev1alpha1.CacheTenantSpec{TenantID: index.DefaultTenantSentinel},
+	}
+	err := k8s.Create(ctx, ct)
+	if err == nil {
+		t.Fatalf("creating a CacheTenant with the reserved tenantID %q must be rejected", index.DefaultTenantSentinel)
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("rejection error = %v, want it to cite the reserved-tenantID rule", err)
+	}
+}
 
 // ingestTenantPrefixes ingests distinct prefixes [from,to) for a tenant, each at
 // a strictly increasing timestamp so "oldest" is well-defined for eviction.
