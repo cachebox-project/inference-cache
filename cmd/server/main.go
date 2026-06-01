@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,14 @@ func main() {
 	// in the controller's projected SA token volume (see
 	// config/manager/manager.yaml).
 	controllerAudience := flag.String("controller-audience", auth.ControllerAudience, "Audience the apiserver enforces on /snapshot and /policy bearer tokens (TokenReviewSpec.Audiences). Must match the controller's projected SA token volume. REQUIRED non-empty when --allowed-controller-sa is set.")
+	// gRPC transport posture. Both set → the :9090 policy port
+	// terminates Service TLS in-process; both empty → plaintext (the default —
+	// config/default serves :9090 plaintext; TLS is the opt-in
+	// config/overlays/server-tls overlay); exactly one set → refuse to start.
+	// mTLS (client-cert verification) is a Phase 2 feature flag, not
+	// implemented here. See docs/design/grpc-tls.md.
+	tlsCertFile := flag.String("tls-cert-file", "", "Path to the PEM server certificate for the gRPC port (:9090). Set together with --tls-key-file to enable TLS; leave both empty for plaintext (dev/CI).")
+	tlsKeyFile := flag.String("tls-key-file", "", "Path to the PEM private key for the gRPC port (:9090). Set together with --tls-cert-file to enable TLS; leave both empty for plaintext (dev/CI).")
 	flag.Parse()
 
 	format, err := server.ParseLogFormat(*logFormat)
@@ -87,10 +96,28 @@ func main() {
 			"reason", "--insecure-disable-auth was set; /snapshot and /policy are unauthenticated. This must NEVER be used in production.")
 	}
 
+	// Resolve the gRPC transport posture before serving. LoadGRPCTLSCredentials
+	// owns the both-or-neither rule: exactly one of the cert/key paths set is a
+	// startup error (exit 2, like the auth-flag validation above); a path pair
+	// that won't load is a runtime error (exit 1).
+	grpcCreds, err := server.LoadGRPCTLSCredentials(*tlsCertFile, *tlsKeyFile)
+	if err != nil {
+		if errors.Is(err, server.ErrTLSPartialConfig) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		slog.ErrorContext(ctx, "grpc_tls_load", "err", err)
+		os.Exit(1)
+	}
+	if grpcCreds != nil {
+		opts = append(opts, server.WithGRPCTLS(grpcCreds))
+	}
+
 	slog.InfoContext(ctx, "startup",
 		"version", version.GitVersion,
 		"commit", version.GitCommit,
 		"grpc_addr", cfg.GRPCAddr,
+		"grpc_tls", grpcCreds != nil,
 		"http_addr", cfg.HTTPAddr,
 		"snapshot_addr", cfg.SnapshotAddr,
 	)

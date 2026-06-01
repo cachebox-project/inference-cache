@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -81,6 +82,7 @@ func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string
 // Service hosts the gRPC API and the HTTP health/metrics endpoints.
 type Service struct {
 	grpcServer        *grpc.Server
+	grpcCreds         credentials.TransportCredentials
 	publicHTTPServer  *http.Server
 	snapshotServer    *http.Server
 	snapshotHandler   http.Handler
@@ -100,18 +102,6 @@ func New(opts ...Option) *Service {
 		index.WithTTLResolver(policies),
 		index.WithTenantQuotaResolver(policies),
 	)
-
-	grpcServer := grpc.NewServer()
-	healthServer := health.NewServer()
-	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	icpb.RegisterInferenceCacheServer(grpcServer, newInferenceCacheService(idx, metrics, policies))
-	// Register gRPC server reflection so operators can use grpcurl
-	// (list / describe / generic call) and similar schema-aware debug tooling
-	// without shipping the .proto. Reflection exposes only the service schema,
-	// never KV or prompt data. grpc_health_probe is unrelated — it speaks the
-	// standard grpc.health.v1 service and does not need reflection.
-	reflection.Register(grpcServer)
 
 	publicMux := http.NewServeMux()
 	// /healthz — liveness: the process is up.
@@ -161,7 +151,6 @@ func New(opts ...Option) *Service {
 	snapshotMux.Handle("/policy", policyHTTPHandler)
 
 	s := &Service{
-		grpcServer: grpcServer,
 		publicHTTPServer: &http.Server{
 			Handler:           publicMux,
 			ReadHeaderTimeout: 5 * time.Second,
@@ -179,6 +168,39 @@ func New(opts ...Option) *Service {
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	// Build the gRPC server AFTER options so the transport posture (set by
+	// WithGRPCTLS) is known. credentials.NewTLS-backed creds terminate TLS
+	// in-process on :9090; with no creds the listener is plaintext (the
+	// default — TLS is the opt-in config/overlays/server-tls overlay). The
+	// grpc.health.v1 service and reflection are registered on the same server,
+	// so the kubelet/grpcurl health surface speaks whatever transport the
+	// listener does. See docs/design/grpc-tls.md.
+	var grpcOpts []grpc.ServerOption
+	tlsEnabled := s.grpcCreds != nil
+	if tlsEnabled {
+		grpcOpts = append(grpcOpts, grpc.Creds(s.grpcCreds))
+	}
+	s.grpcServer = grpc.NewServer(grpcOpts...)
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(s.grpcServer, healthServer)
+	icpb.RegisterInferenceCacheServer(s.grpcServer, newInferenceCacheService(idx, metrics, policies))
+	// Register gRPC server reflection so operators can use grpcurl
+	// (list / describe / generic call) and similar schema-aware debug tooling
+	// without shipping the .proto. Reflection exposes only the service schema,
+	// never KV or prompt data. grpc_health_probe is unrelated — it speaks the
+	// standard grpc.health.v1 service and does not need reflection.
+	reflection.Register(s.grpcServer)
+	// Publish the wire posture so operators can confirm it from Prometheus. The
+	// human-facing startup log lives in cmd/server (the "startup" line carries
+	// grpc_tls) rather than here, so constructing a Service in tests stays quiet.
+	if tlsEnabled {
+		s.metrics.grpcTLSEnabled.Set(1)
+	} else {
+		s.metrics.grpcTLSEnabled.Set(0)
+	}
+
 	// If auth is configured, wrap /snapshot and /policy in the TokenReview
 	// middleware. Two Authenticator instances share the same Reviewer,
 	// ExpectedSA, and Audience but emit per-endpoint metrics

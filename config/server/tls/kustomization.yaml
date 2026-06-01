@@ -1,0 +1,27 @@
+# Opt-in gRPC Service TLS for the policy server, packaged as a kustomize
+# Component so an overlay can layer it on top of config/default without the
+# default install paying for TLS. It (1) adds the cert-manager Issuer +
+# Certificate (certificate.yaml) and (2) patches the server Deployment to point
+# --tls-cert-file / --tls-key-file at the mounted Secret (patch.yaml).
+#
+# Enable it from an overlay with:
+#   components:
+#     - ../../server/tls
+# See config/overlays/server-tls for a ready-to-apply example, and
+# docs/design/grpc-tls.md for the posture rationale.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - certificate.yaml
+
+patches:
+  # JSON6902: append the --tls-* args (preserves any base args added later).
+  - path: patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: inference-cache-server
+  # Strategic merge: add the Secret volume + mount, merged by name (additive).
+  - path: patch-volumes.yaml

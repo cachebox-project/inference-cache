@@ -1,0 +1,61 @@
+# Opt-in gRPC Service TLS for the policy server (:9090).
+#
+# This is NOT part of the default install — config/default serves :9090
+# plaintext. Enabling TLS means adding the config/server/tls component to an
+# overlay (see config/overlays/server-tls), which applies this Issuer +
+# Certificate AND patches the server Deployment with the --tls-cert-file /
+# --tls-key-file flags + the Secret-mounted volume (patch.yaml).
+#
+# Phase 1 posture: one-sided (server-only) TLS, terminated in-process by the
+# server binary. mTLS (client-cert verification) is a Phase 2 feature flag and
+# is NOT wired here. See docs/design/grpc-tls.md.
+#
+# Why a DEDICATED Issuer rather than reusing the webhook's selfsigned-issuer
+# (config/certmanager): the webhook's Issuer is a namespaced `Issuer` in the
+# same namespace, so this Certificate COULD reference it directly — but a
+# dedicated self-signed Issuer keeps the server's TLS wiring self-contained and
+# decoupled from the webhook's cert bundle (touches nothing in the admission
+# webhook's setup), at no extra cost beyond cert-manager itself.
+#
+# NOTE: a direct selfSigned Issuer mints the serving cert as its OWN root, so
+# the Secret's ca.crt equals the leaf and rotates with it on renewal. That is
+# fine for kind/dev (short-lived, never renews), but clients pinning a copied
+# ca.crt would break after renewal. For production use a STABLE trust anchor:
+# point issuerRef at a real/org (Cluster)Issuer, or a cert-manager CA-Issuer
+# chain (long-lived isCA CA cert -> CA Issuer -> rotating leaf). See
+# docs/design/grpc-tls.md "Client trust anchor + distribution".
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+  name: inference-cache-server-selfsigned-issuer
+  namespace: inference-cache-system
+spec:
+  selfSigned: {}
+---
+# Serving certificate for the gRPC port. The DNS names are the policy Service's
+# in-cluster FQDNs (the `.svc` and `.svc.cluster.local` forms) so a verifying
+# gRPC client (the kvevent-subscriber producer, the external Java gateway
+# client) can match the ServerName it dials. (The controller is NOT a gRPC
+# client — it uses the HTTP /snapshot + /policy bridge.) The server Service
+# name/namespace are fixed across the bundle
+# (inference-cache-server / inference-cache-system), so the names are written
+# out directly rather than via a kustomize replacement.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: server
+  name: inference-cache-server-serving-cert
+  namespace: inference-cache-system
+spec:
+  dnsNames:
+    - inference-cache-server.inference-cache-system.svc
+    - inference-cache-server.inference-cache-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: inference-cache-server-selfsigned-issuer
+  secretName: inference-cache-server-tls

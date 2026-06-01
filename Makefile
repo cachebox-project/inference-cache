@@ -212,7 +212,7 @@ install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooks
 .PHONY: verify-naming
 verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
 	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
-		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/samples config/server config/webhook config/certmanager internal PROJECT go.mod 2>/dev/null || true); \
+		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/samples config/server config/webhook config/certmanager config/overlays internal PROJECT go.mod 2>/dev/null || true); \
 	if [ -n "$$bad" ]; then \
 		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
 		echo "$$bad" | sed 's/^/    /'; \
