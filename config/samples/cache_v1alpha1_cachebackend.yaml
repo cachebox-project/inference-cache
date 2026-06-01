@@ -10,7 +10,7 @@ metadata:
   name: cachebackend-sample
 spec:
   type: LMCache
-  deploymentKind: StatefulSet
+  deploymentKind: Deployment
   replicas: 1
   integration:
     engine: vllm
