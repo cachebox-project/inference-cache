@@ -80,6 +80,12 @@ kind: CacheBackend
 metadata:
   name: $CR_NAME
   namespace: $NAMESPACE
+  annotations:
+    # Opt OUT of the KV-event readiness gate: this canary exercises the C2
+    # reconciler's Deployment-rollout path and the operator-managed cache
+    # server has no engine pods wired in, so the gate would deadlock on the
+    # default-on AwaitingFirstKVEvent state. A separate canary covers the gate.
+    inferencecache.io/require-kv-events: "false"
 spec:
   type: LMCache
   deploymentKind: Deployment

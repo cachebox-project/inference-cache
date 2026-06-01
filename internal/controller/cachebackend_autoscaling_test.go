@@ -402,6 +402,13 @@ func TestProgressingFromReadyExhaustive(t *testing.T) {
 		{"Pending-rollout", metav1.ConditionFalse, conditionReasonRolloutInProgress, metav1.ConditionTrue, conditionReasonRolloutInProgress},
 		{"Pending-scaled-to-zero", metav1.ConditionFalse, conditionReasonScaledToZero, metav1.ConditionFalse, conditionReasonScaledToZero},
 		{"Degraded", metav1.ConditionFalse, conditionReasonReplicasUnavailable, metav1.ConditionFalse, "Degraded"},
+		// The KV-event gate's AwaitingFirstKVEvent is still-converging; without
+		// this case the controller would advertise a non-degraded wait window
+		// as stuck (Progressing=False), contradicting the documented contract.
+		{"Awaiting-first-kv-event", metav1.ConditionFalse, reasonAwaitingFirstKVEvent, metav1.ConditionTrue, reasonAwaitingFirstKVEvent},
+		// The gate's NoKVEventsObserved is a stable failure (Degraded);
+		// already not progressing — same shape as ReplicasUnavailable.
+		{"No-kv-events-observed", metav1.ConditionFalse, reasonNoKVEventsObserved, metav1.ConditionFalse, reasonNoKVEventsObserved},
 		{"Unknown-reason-passthrough", metav1.ConditionFalse, "WedgedExternalEndpoint", metav1.ConditionFalse, "WedgedExternalEndpoint"},
 	}
 	for _, tc := range cases {

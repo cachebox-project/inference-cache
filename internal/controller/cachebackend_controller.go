@@ -1190,15 +1190,17 @@ func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deploymen
 // progressingFromReady derives the Progressing condition from the Ready
 // condition's outcome. A Ready=True backend has converged (Progressing=False,
 // Reason=Synced). A Ready=False backend that's actively converging
-// (RolloutInProgress) flips Progressing=True; one that has reached a stable
-// terminal state (ScaledToZero) or stable failure (ReplicasUnavailable) is
-// NOT progressing — no rollout is in motion.
+// (RolloutInProgress, or the KV-event gate's AwaitingFirstKVEvent — the
+// controller is still driving toward the Ready=True endpoint in both)
+// flips Progressing=True; one that has reached a stable terminal state
+// (ScaledToZero) or stable failure (ReplicasUnavailable / NoKVEventsObserved)
+// is NOT progressing — no rollout is in motion.
 func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message string) (metav1.ConditionStatus, string, string) {
 	if readyStatus == metav1.ConditionTrue {
 		return metav1.ConditionFalse, "Synced", "rendered children match desired state"
 	}
 	switch reason {
-	case conditionReasonRolloutInProgress:
+	case conditionReasonRolloutInProgress, reasonAwaitingFirstKVEvent:
 		return metav1.ConditionTrue, reason, message
 	case conditionReasonReplicasUnavailable:
 		return metav1.ConditionFalse, "Degraded", message

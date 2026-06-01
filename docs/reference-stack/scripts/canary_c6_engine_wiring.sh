@@ -128,6 +128,13 @@ kind: CacheBackend
 metadata:
   name: $CR_NAME
   namespace: $NAMESPACE
+  annotations:
+    # Opt OUT of the KV-event readiness gate: this canary applies the CR and
+    # waits for the cache-server to be Ready BEFORE creating the engine pods
+    # that would produce KV events. With the default-on gate, that ordering
+    # would deadlock at AwaitingFirstKVEvent. The gate is exercised by a
+    # dedicated canary; here Ready is workload-availability driven.
+    inferencecache.io/require-kv-events: "false"
 spec:
   type: LMCache
   deploymentKind: Deployment
