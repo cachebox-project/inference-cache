@@ -24,6 +24,11 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
+	// Fields trimmed at v1alpha1 because they were declarative-only — guard
+	// against accidental re-introduction via a stale regen.
+	for _, removed := range []string{"eviction", "failOpen", "tenantScoped"} {
+		requireNoProperty(t, policySpec, removed)
+	}
 
 	tenantSchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachetenants.yaml")
 	requireRequired(t, tenantSchema, "spec")
