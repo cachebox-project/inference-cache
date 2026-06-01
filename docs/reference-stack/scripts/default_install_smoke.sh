@@ -31,15 +31,14 @@
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
 #   7. The External CacheBackend type end-to-end: applying the committed
-#      config/samples/cachebackend-external.yaml drives the CacheBackend
-#      mutating webhook defaults (lookupTimeoutMs=50,
-#      minimumPrefixTokens=256), renders NO Deployment/Service in its
-#      namespace, status.endpoint mirrors spec.endpoint, observedGeneration
-#      is set, the CR goes Ready=True/ExternalEndpointAccepted, and
-#      `kubectl get cb` renders the CacheBackend printer columns. A matching
-#      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
-#      injected by the pod-mutating webhook. Also exercises admission
-#      validation rules (External with no endpoint, External with bad
+#      config/samples/cachebackend-external.yaml renders NO
+#      Deployment/Service in its namespace, status.endpoint mirrors
+#      spec.endpoint, observedGeneration is set, the CR goes
+#      Ready=True/ExternalEndpointAccepted, and `kubectl get cb` renders the
+#      CacheBackend printer columns. A matching engine pod is admitted with
+#      `LMCACHE_REMOTE_URL=lm://<spec.endpoint>` injected by the pod-mutating
+#      webhook. Also exercises admission validation rules (External with no
+#      endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time).
 #   8. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
