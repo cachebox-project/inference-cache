@@ -257,6 +257,44 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		}
 	})
 
+	t.Run("StaysDegradedWhenTimeoutIncreasedAfterBreach", func(t *testing.T) {
+		// Regression: increasing firstEventTimeout after the window already
+		// elapsed must NOT move the backend back to AwaitingFirstKVEvent — once
+		// Degraded it stays Degraded until an event arrives.
+		ns := freshNS(t, k8s)
+		cb := gatedLMCacheBackend("cache", ns)
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+			FirstEventTimeout: &metav1.Duration{Duration: time.Second},
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
+		reconcile(t, r, "cache", ns)
+		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
+			t.Fatalf("pre-bump health = %q, want Degraded", got)
+		}
+
+		// Operator increases the timeout to well beyond the elapsed window.
+		live := getBackend(t, r, "cache", ns)
+		live.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: time.Hour}
+		if err := k8s.Update(ctx, live); err != nil {
+			t.Fatalf("update firstEventTimeout: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		got := getBackend(t, r, "cache", ns)
+		if got.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
+			t.Fatalf("post-bump health = %q, want Degraded (sticky despite timeout increase)", got.Status.Health)
+		}
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Reason != reasonNoKVEventsObserved {
+			t.Fatalf("post-bump Ready = %+v, want reason NoKVEventsObserved", ready)
+		}
+	})
+
 	t.Run("AnnotationOptOutGoesReadyWithoutEvent", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
@@ -452,6 +490,45 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	expectEvent(t, drainEvents(rec), reasonNoKVEventsObserved)
 	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
 		t.Fatalf("health = %q, want Degraded", got)
+	}
+}
+
+// TestKVEventGateKVEventsObservedFiresOnceAcrossRollout is the regression guard
+// for the once-only KVEventsObserved Event: after the first event is latched, a
+// later rollout that takes the backend through RolloutInProgress and back to
+// Ready must NOT re-emit "first KV event observed".
+func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
+	cb := gatedLMCacheBackend("cache", "ns1")
+	r, rec := newReconcilerWithRecorder(t, cb)
+	reconcile(t, r, "cache", "ns1")
+
+	// First event → KVEventsObserved fires once.
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	patchLastEventAt(t, r.Client, "cache", "ns1", time.Now())
+	reconcile(t, r, "cache", "ns1")
+	expectEvent(t, drainEvents(rec), reasonKVEventsObserved)
+
+	// A rollout: rolled out generation but updated replicas lag → RolloutInProgress.
+	dep := getDeployment(t, r, "cache", "ns1")
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 0
+	dep.Status.AvailableReplicas = 1
+	dep.Status.ReadyReplicas = 1
+	if err := r.Status().Update(context.Background(), dep); err != nil {
+		t.Fatalf("update deployment status: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	drainEvents(rec) // discard rollout-phase events
+
+	// Rollout completes → back to Ready/KVEventsObserved; the latch is already
+	// set, so no second "first KV event observed".
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	evs := drainEvents(rec)
+	expectNoEvent(t, evs, reasonKVEventsObserved)
+	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
+		t.Fatalf("health = %q, want Ready", got)
 	}
 }
 

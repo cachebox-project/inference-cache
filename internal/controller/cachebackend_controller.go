@@ -1054,6 +1054,28 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, health cachev
 		}
 	}
 
+	// Sticky Degraded: once the timeout has been breached
+	// (Conditions[Ready].Reason == NoKVEventsObserved), stay Degraded until an
+	// event arrives — never recompute the window. This guards the case where an
+	// operator INCREASES spec.integration.firstEventTimeout after the window
+	// already elapsed, which would otherwise move the backend back to
+	// AwaitingFirstKVEvent (hiding a known publisher outage for another window),
+	// contradicting the documented "once Degraded, stays Degraded until an
+	// event" contract. (Availability flaps are handled separately by the stable
+	// firstAvailableAt anchor; this persisted-reason check survives a no-flap
+	// timeout change, where the condition is not overwritten.)
+	if readyConditionReason(backend) == reasonNoKVEventsObserved {
+		return kvReadiness{
+			health:          cachev1alpha1.CacheBackendHealthDegraded,
+			readyStatus:     metav1.ConditionFalse,
+			readyReason:     reasonNoKVEventsObserved,
+			readyMessage:    "no KV events observed before the first-event timeout; staying Degraded until an event arrives",
+			degradedStatus:  metav1.ConditionTrue,
+			degradedReason:  reasonNoKVEventsObserved,
+			degradedMessage: "no KV events observed before the first-event timeout",
+		}
+	}
+
 	// Available but no event yet — still inside the first-event window? The
 	// anchor is the latched first-Available time (now on the very first
 	// Available reconcile, before the latch is persisted); a zero anchor would
@@ -1439,6 +1461,12 @@ type stateSnapshot struct {
 	// Ready/Degraded enum transitions don't distinguish KV-event causes from
 	// Deployment-rollout causes.
 	readyReason string
+	// firstEventLatched is whether status.firstKVEventObservedAt was set. The
+	// KVEventsObserved Event keys on the nil→set transition of this latch (not
+	// the Ready reason) so it fires exactly once — on the TRUE first event —
+	// rather than re-firing every time a rollout takes an already-event-seen
+	// backend through RolloutInProgress and back to KVEventsObserved.
+	firstEventLatched bool
 }
 
 // snapshotState captures the prior status values that drive transition events.
@@ -1446,9 +1474,10 @@ type stateSnapshot struct {
 // has a stable baseline to compare the post-reconcile state against.
 func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
 	return stateSnapshot{
-		health:      cb.Status.Health,
-		failOpen:    statusFailOpen(cb.Status.FailOpen),
-		readyReason: readyConditionReason(cb),
+		health:            cb.Status.Health,
+		failOpen:          statusFailOpen(cb.Status.FailOpen),
+		readyReason:       readyConditionReason(cb),
+		firstEventLatched: cb.Status.FirstKVEventObservedAt != nil,
 	}
 }
 
@@ -1492,9 +1521,10 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		return
 	}
 	after := stateSnapshot{
-		health:      cb.Status.Health,
-		failOpen:    statusFailOpen(cb.Status.FailOpen),
-		readyReason: readyConditionReason(cb),
+		health:            cb.Status.Health,
+		failOpen:          statusFailOpen(cb.Status.FailOpen),
+		readyReason:       readyConditionReason(cb),
+		firstEventLatched: cb.Status.FirstKVEventObservedAt != nil,
 	}
 
 	// Generic Deployment-health transitions. The KV-event gate's Degraded and
@@ -1528,15 +1558,14 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
 			"cache-backend workload is Available but no KV events observed yet; backend stays Pending until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
 	}
-	// KVEventsObserved fires on the FIRST observation of events for a readiness
-	// episode — entering KVEventsObserved from a still-waiting state
-	// (AwaitingFirstKVEvent / RolloutInProgress / fresh) or after a KV timeout
-	// recovered. It must NOT fire when recovering from a deployment-caused
-	// Degraded (ReplicasUnavailable), where events were already flowing —
-	// that path emits BackendRecovered above instead.
-	if after.readyReason == reasonKVEventsObserved &&
-		before.readyReason != reasonKVEventsObserved &&
-		before.readyReason != reasonReplicasUnavailable {
+	// KVEventsObserved fires exactly once — on the nil→set transition of the
+	// firstKVEventObservedAt latch, i.e. the TRUE first event. Keying on the
+	// latch (not the Ready reason) means a later rollout that takes an
+	// already-event-seen backend through RolloutInProgress and back to
+	// KVEventsObserved does NOT re-fire "first KV event observed", and a
+	// deployment recovery (ReplicasUnavailable → Ready, events never lost) emits
+	// BackendRecovered above instead of a spurious KVEventsObserved.
+	if !before.firstEventLatched && after.firstEventLatched {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonKVEventsObserved, reasonKVEventsObserved,
 			"first KV event observed; backend is Ready")
 	}
