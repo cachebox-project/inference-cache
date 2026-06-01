@@ -82,7 +82,10 @@ jobs:
     - name: Verify protobufs up to date
       run: |
         make proto-gen
-        git diff --exit-code -- pkg/server/proto
+        if [ -n "$(git status --porcelain -- pkg/server/proto)" ]; then
+          git status --short -- pkg/server/proto
+          exit 1
+        fi
 
   test:
     name: Test
