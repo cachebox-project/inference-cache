@@ -268,13 +268,14 @@ kubectl -n "$NAMESPACE" wait --for=condition=Available --timeout="$READY_TIMEOUT
   || fail "controller and/or server did not reach Available within $READY_TIMEOUT"
 
 # --- CacheBackend CRD schema-trim assertion --------------------------------
-# The installed CRD must reflect the inert-field trim: the three
-# removed fields are absent from the served v1alpha1 schema, and the
-# replacement status surface (matchedEnginePods) is present. Probing the live
-# CRD in the cluster (not just the repo manifest) proves the trimmed schema is
-# what actually got installed by `kubectl apply -k`. Each probe asks for a
-# field's `.type`: absent fields yield empty output, present fields yield their
-# OpenAPI type — unambiguous and free of map-formatting quirks.
+# The installed CRD must reflect the inert-field trim: the three removed fields
+# are absent from the served v1alpha1 schema, and the field that replaced the
+# removed status.indexEntries — status.indexParticipation.prefixCount — is
+# present. Probing the live CRD in the cluster (not just the repo manifest)
+# proves the trimmed schema is what actually got installed by `kubectl apply
+# -k`. Each probe asks for a field's `.type`: absent fields yield empty output,
+# present fields yield their OpenAPI type — unambiguous and free of
+# map-formatting quirks.
 crd_field_type() {
   # $1 = jsonpath under the v1alpha1 openAPIV3Schema.properties root
   kubectl get crd cachebackends.inferencecache.io \
@@ -290,10 +291,12 @@ fi
 if [ -n "$(crd_field_type 'status.properties.indexEntries')" ]; then
   fail "CRD still serves removed status.indexEntries (schema trim not installed)"
 fi
-if [ -z "$(crd_field_type 'status.properties.matchedEnginePods')" ]; then
-  fail "CRD is missing status.matchedEnginePods (expected on the merged schema)"
+# status.indexParticipation.prefixCount is the authoritative count surface that
+# replaced the removed status.indexEntries — assert the replacement is served.
+if [ -z "$(crd_field_type 'status.properties.indexParticipation.properties.prefixCount')" ]; then
+  fail "CRD is missing status.indexParticipation.prefixCount (the replacement for status.indexEntries)"
 fi
-log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; matchedEnginePods present)"
+log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; indexParticipation.prefixCount present)"
 
 # --- CacheIndex poller assertion -------------------------------------------
 # The controller's CacheIndex poller is leader-elected and refreshes on a 30s
