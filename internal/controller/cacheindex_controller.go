@@ -35,11 +35,16 @@ const (
 	DefaultRefreshInterval = 30 * time.Second
 
 	// DefaultBearerTokenPath is the in-cluster location of the audience-bound
-	// projected ServiceAccount token the controller uses to scrape /snapshot.
-	// The default install (config/manager/manager.yaml) projects a token with
-	// audience auth.ControllerAudience here; the kubelet rewrites the file on
-	// rotation, and the poller re-reads it on every scrape so a rotated token
-	// is picked up immediately.
+	// projected ServiceAccount token the controller uses on its two HTTP
+	// channels to the policy server:
+	//   - the CacheIndexPoller scraping GET /snapshot (in this file), and
+	//   - the ControlPlaneReconciler pushing POST /policy (controlplane_controller.go).
+	// Both consumers point BearerTokenPath at this constant by default. The
+	// two endpoints share one auth middleware identity, so one projected
+	// token covers both. The default install (config/manager/manager.yaml)
+	// projects a token with audience auth.ControllerAudience here; the
+	// kubelet rewrites the file on rotation, and both callers re-read it on
+	// every request so a rotated token is picked up immediately.
 	//
 	// This is intentionally NOT the default automount path
 	// (/var/run/secrets/kubernetes.io/serviceaccount/token), which carries
