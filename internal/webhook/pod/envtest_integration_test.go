@@ -184,6 +184,15 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("annotation %s: got %q want %q",
 			AnnotationInjectedBy, got.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name)
 	}
+	// The webhook also writes the injected-by-uid annotation as the
+	// authoritative proof-of-injection for the engine-pod-events
+	// controller (see the failurePolicy=Ignore forgery hole that the
+	// UID match closes). Pin it against the live CR's UID so future
+	// regressions of the success-path stamp surface here.
+	if got.Annotations[AnnotationInjectedByUID] != string(cb.UID) {
+		t.Fatalf("annotation %s: got %q want %q (live CacheBackend UID)",
+			AnnotationInjectedByUID, got.Annotations[AnnotationInjectedByUID], string(cb.UID))
+	}
 	if !containsArgFlag(got.Spec.Containers[0].Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config flag not injected; args = %v", got.Spec.Containers[0].Args)
 	}
@@ -211,6 +220,14 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	pod2 := pod.DeepCopy()
 	pod2.Name = "vllm-engine-2"
 	pod2.ResourceVersion = ""
+	// The first Create reads the post-admission persisted object back
+	// into `pod` (including both injected-by annotations the webhook
+	// just stamped). A naive DeepCopy would carry them into pod2 and
+	// confuse the "fresh injection" intent of the second admission.
+	// Strip both so pod2 enters admission as a brand-new pod the way
+	// the apiserver would actually see it.
+	delete(pod2.Annotations, AnnotationInjectedBy)
+	delete(pod2.Annotations, AnnotationInjectedByUID)
 	if err := mgr.GetClient().Create(ctx, pod2); err != nil {
 		t.Fatalf("create second Pod: %v", err)
 	}
