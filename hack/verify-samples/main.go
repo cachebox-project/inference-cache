@@ -181,7 +181,11 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", rel, err)
 		}
-		if hasSkipMarker(data) {
+		skip, err := hasSkipMarker(data)
+		if err != nil {
+			return fmt.Errorf("scan %s: %w", rel, err)
+		}
+		if skip {
 			fmt.Printf("  SKIP %s (opt-out: %q)\n", rel, skipMarker)
 			skipCount++
 			continue
@@ -229,7 +233,13 @@ func listSamples(dir string) ([]string, error) {
 // Only leading blank and `#`-prefixed lines are inspected — once any non-
 // comment line appears (typically `apiVersion:`), scanning stops. The
 // marker must match exactly so authors can't accidentally trigger it.
-func hasSkipMarker(data []byte) bool {
+//
+// Returns a parse error on bufio.Scanner failures (e.g. a leading line
+// larger than the default 64KB scanner buffer). We intentionally surface
+// these instead of silently treating the file as "not skipped" — a
+// scanner error means we couldn't decide, and the gate should fail
+// loudly rather than guess.
+func hasSkipMarker(data []byte) (bool, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -237,13 +247,16 @@ func hasSkipMarker(data []byte) bool {
 			continue
 		}
 		if !strings.HasPrefix(line, "#") {
-			return false
+			return false, nil
 		}
 		if line == skipMarker {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("scan top-of-file comments: %w", err)
+	}
+	return false, nil
 }
 
 // waitForWebhookReady polls the manager's serving port with a plain TCP
@@ -303,20 +316,22 @@ func writeKubeconfig(cfg *rest.Config) (string, error) {
 	return f.Name(), nil
 }
 
-// findKubectl prefers the kubectl shipped in the envtest assets directory
-// (so the gate's CLI surface matches the locked decision: kubectl apply
-// --dry-run=server) and falls back to $PATH.
+// findKubectl returns the kubectl shipped in the envtest assets directory.
+// We deliberately do NOT fall back to $PATH: a kubectl shipped with a
+// different client version could parse / serialize manifests differently
+// from the one envtest provisions alongside the apiserver, which would
+// make the gate's verdict dependent on the developer's local toolchain.
+// Tying kubectl to KUBEBUILDER_ASSETS keeps the gate hermetic.
 func findKubectl() (string, error) {
-	if assets := os.Getenv("KUBEBUILDER_ASSETS"); assets != "" {
-		cand := filepath.Join(assets, "kubectl")
-		if _, err := os.Stat(cand); err == nil {
-			return cand, nil
-		}
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		return "", fmt.Errorf("KUBEBUILDER_ASSETS unset")
 	}
-	if p, err := exec.LookPath("kubectl"); err == nil {
-		return p, nil
+	cand := filepath.Join(assets, "kubectl")
+	if _, err := os.Stat(cand); err != nil {
+		return "", fmt.Errorf("kubectl not found at %s (envtest assets dir is missing the binary): %w", cand, err)
 	}
-	return "", fmt.Errorf("kubectl not found in KUBEBUILDER_ASSETS and not on $PATH")
+	return cand, nil
 }
 
 // runKubectl invokes `kubectl --kubeconfig=… apply --dry-run=server -f file`

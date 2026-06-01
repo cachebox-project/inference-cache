@@ -32,8 +32,11 @@ fails the PR. This is the same admission validation a real cluster runs
 on `kubectl apply`, so it doubles as a fast-feedback check that the
 samples teach operator-correct semantics.
 
-The gate is wired into `make pre-pr` (local) and the `test` CI job
-(headless, no real cluster), so it runs both before push and on every PR.
+The gate is wired into `make pre-pr` (the local gate contributors run
+before opening a PR) and the `test` CI job (headless, no real cluster),
+so it runs both before `gh pr create` locally and on every PR in CI.
+It is **not** part of `make ci` or the `pre-push` hook — running envtest
+on every push would slow down the inner loop more than it's worth.
 
 ### Adding a new sample
 
