@@ -269,11 +269,13 @@ func (a *Authenticator) cacheHit(hash string) bool {
 // cachePut stores hash with the configured TTL. If the cache is at capacity,
 // expired entries are pruned first; if still full, the entry expiring SOONEST
 // is evicted. This is bounded TTL eviction, not LRU — there is no recency
-// tracking on cacheHit, only an expiry check. The poller is the only
-// authorized caller and rotates through 1-2 distinct tokens at most under
-// kubelet's projected-token rotation, so the cache size effectively never
-// matters in practice; the bound exists to prevent unbounded growth from a
-// pathological reuse pattern or a misconfigured caller.
+// tracking on cacheHit, only an expiry check. The controller's CacheIndex
+// poller and CachePolicy reconciler are the only authorized callers (each
+// hits its own Authenticator instance, so each cache sees just one identity)
+// and rotate through 1-2 distinct tokens at most under kubelet's projected-
+// token rotation, so the cache size effectively never matters in practice;
+// the bound exists to prevent unbounded growth from a pathological reuse
+// pattern or a misconfigured caller.
 func (a *Authenticator) cachePut(hash string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -844,7 +844,12 @@ if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_POLICY" --image=curlimages/curl:8.10
   fail "kubectl run $SIDE_POD_POLICY failed; cannot run /policy auth assertion"
 fi
 
-for _ in $(seq 1 30); do
+# 90s budget + describe-pod fallback matches the /snapshot probe above —
+# the External-backend phase that runs earlier can leave the kubelet busy
+# reaping its own Terminating pods, occasionally pushing the new pod's
+# container creation above a 30s budget; without the diagnostics dump,
+# a timeout would surface as an empty-log failure with no breadcrumb.
+for _ in $(seq 1 90); do
   phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD_POLICY" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
     break
@@ -852,6 +857,11 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 policy_probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD_POLICY" 2>/dev/null || true)"
+# If the pod never finished, capture its describe output so the failure
+# message tells operators why (ImagePullBackOff vs ContainerCreating vs ...).
+if [ -z "$policy_probe_out" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$SIDE_POD_POLICY" >&2 || true
+fi
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --grace-period=0 --force >/dev/null 2>&1 || true
 
 # Acceptable outcomes (either gate sufficient) — see /snapshot probe above
