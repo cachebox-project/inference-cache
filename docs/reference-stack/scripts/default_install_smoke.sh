@@ -68,6 +68,15 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
+#  11. Every sample manifest under config/samples/ applies cleanly against
+#      the live install: a server-side dry-run apply of each *.yaml exercises
+#      CRD structural validation + the validating admission webhook on the
+#      real cluster. Complements `make verify-samples` (which runs the same
+#      assertion at envtest level) by catching real-cluster-only failures —
+#      webhook cert injection, NetworkPolicy on the authed /policy+/snapshot
+#      endpoints, RBAC for status writes. Honors the `# verify-samples: skip`
+#      opt-out so both gates stay in lockstep. Admission-level only — no
+#      engine pods, no traffic.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -98,7 +107,7 @@
 #           POLICY_SMOKE_NS, SAMPLE_NS, SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT.
+#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
 
 set -euo pipefail
 
@@ -1363,4 +1372,95 @@ case "$audience_probe" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, and audience binding on both endpoints all work"
+# --- sample-manifest apply-clean backstop ----------------------------------
+# Every YAML under config/samples/ must apply cleanly against the running
+# install. Operators copy these as their first-contact recipe; a sample that
+# rejects at admission (names a (runtime, type) pair no shipped adapter
+# supports, populates a field the schema no longer accepts) burns trust on
+# first contact.
+#
+# Envtest-level sample validation already lives in `make verify-samples`
+# (it runs every sample through admission against an in-process apiserver +
+# the CacheBackend webhook). This phase is the live-kind-cluster complement:
+# it exercises the SAME samples against the real default install, so it
+# additionally catches failures that pass envtest but fail on a real
+# cluster — webhook cert injection (the cert-manager-issued caBundle wiring),
+# NetworkPolicy interactions with the authed /policy + /snapshot endpoints,
+# and RBAC for status writes. Belt-and-suspenders against sample drift in the
+# actually-deployed scenario.
+#
+# Runs LAST: the per-CRD phases above (External backend, CachePolicy push,
+# binding signals) assert behavioral regressions first; this generic
+# apply-clean loop is the catch-all backstop. Server-side dry-run exercises
+# CRD structural validation AND the validating admission webhook without
+# persisting CRs (no cleanup, no namespace pollution) and spins up no engine
+# pods (admission-level only, no traffic).
+#
+# Honors the same opt-out as `make verify-samples`: a sample whose top-of-file
+# comment block contains a line equal to `# verify-samples: skip` is reported
+# as SKIP and not applied. Keeping the two gates' sample sets in lockstep
+# means a sample intentionally excluded from one is excluded from both.
+log "asserting every config/samples/*.yaml applies cleanly against the live install (server dry-run)"
+SAMPLE_APPLY_NS="${SAMPLE_APPLY_NS:-ic-sample-apply}"
+kubectl create namespace "$SAMPLE_APPLY_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# sample_skip_marker / has_skip_marker mirror hack/verify-samples'
+# hasSkipMarker: scan only the leading comment block (blank + '#'-prefixed
+# lines), stop at the first non-comment line, and match the marker exactly
+# after trimming surrounding whitespace. Defined here (not at the top) to keep
+# the backstop self-contained.
+sample_skip_marker="# verify-samples: skip"
+has_skip_marker() {
+  local f="$1" line trimmed
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"        # ltrim
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"  # rtrim
+    [ -z "$trimmed" ] && continue
+    case "$trimmed" in
+      "#"*) [ "$trimmed" = "$sample_skip_marker" ] && return 0 ;;
+      *) return 1 ;;  # first non-comment line: marker can no longer appear
+    esac
+  done < "$f"
+  return 1
+}
+
+sample_ok=0
+sample_skip=0
+sample_fail=0
+for f in config/samples/*.yaml; do
+  [ -e "$f" ] || continue  # no-match guard: unexpanded glob is a literal string
+  if has_skip_marker "$f"; then
+    log "  SKIP $f (opt-out: $sample_skip_marker)"
+    sample_skip=$((sample_skip + 1))
+    continue
+  fi
+  # cacheindex is cluster-scoped; -n is a harmless no-op for it. Everything
+  # else under config/samples is namespace-scoped, so a dedicated namespace
+  # keeps each sample's default ObjectMeta from colliding with earlier phases'
+  # fixtures. --dry-run=server persists nothing, so no teardown is needed.
+  if kubectl apply --dry-run=server -n "$SAMPLE_APPLY_NS" -f "$f" \
+       >/tmp/sample-dry-run.log 2>&1; then
+    log "  OK   $f"
+    sample_ok=$((sample_ok + 1))
+  else
+    echo "[install-smoke] sample $f did not apply cleanly:" >&2
+    cat /tmp/sample-dry-run.log >&2
+    sample_fail=$((sample_fail + 1))
+  fi
+done
+kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+# Guard against the backstop silently becoming a no-op if the sample layout
+# moves out from under the flat config/samples/*.yaml glob (subdirs, .yml).
+# `make verify-samples` walks recursively and is the authoritative gate; this
+# phase mirrors the flat layout deliberately, so a zero-match here means the
+# layout drifted and this assertion needs updating.
+if [ "$((sample_ok + sample_skip + sample_fail))" -eq 0 ]; then
+  fail "no config/samples/*.yaml manifests matched — the apply-clean backstop covered nothing (did the sample layout change? \`make verify-samples\` walks recursively and stays authoritative)"
+fi
+if [ "$sample_fail" -ne 0 ]; then
+  fail "$sample_fail config/samples/*.yaml manifest(s) did not apply cleanly against the live install — see the rejection output above"
+fi
+log "all config/samples/*.yaml applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, and every config/samples/*.yaml applies cleanly — all work"
