@@ -1437,11 +1437,13 @@ has_skip_marker() {
   return 1
 }
 
-# Iterate the SAME sample set as `make verify-samples` (hack/verify-samples'
-# listSamples): every *.yaml / *.yml under config/samples, recursively, sorted
-# for deterministic output. Matching its file selection exactly is what keeps
-# the two gates in lockstep — a future .yml or subdirectory sample can't be
-# covered by the envtest gate yet silently skipped by this live-cluster one.
+# Iterate the same sample set as `make verify-samples` (hack/verify-samples'
+# listSamples): every regular *.yaml / *.yml under config/samples, recursively,
+# sorted for deterministic output. Tracking its selection keeps the two gates
+# in lockstep — a future .yml or subdirectory sample can't be covered by the
+# envtest gate yet silently skipped by this live-cluster one. (config/samples
+# holds only regular files; symlinked samples — which `find -type f` skips and
+# Go's filepath.Walk would include — are not used here, so the sets match.)
 # Process substitution (not a pipe) runs the loop body in the current shell so
 # the counters survive.
 sample_ok=0
@@ -1457,7 +1459,11 @@ while IFS= read -r f; do
   # else under config/samples is namespace-scoped, so a dedicated namespace
   # keeps each sample's default ObjectMeta from colliding with earlier phases'
   # fixtures. --dry-run=server persists nothing, so no teardown is needed.
-  if kubectl apply --dry-run=server -n "$SAMPLE_APPLY_NS" -f "$f" \
+  # --request-timeout bounds a hung apply (mirrors verify-samples'
+  # perSampleTimeout) so a stuck apiserver/admission webhook fails THIS sample
+  # fast — surfacing its filename via the rejection branch below — instead of
+  # stalling CI until the workflow timeout with no in-flight breadcrumb.
+  if kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$f" \
        >/tmp/sample-dry-run.log 2>&1; then
     log "  OK   $f"
     sample_ok=$((sample_ok + 1))
