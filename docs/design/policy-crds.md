@@ -10,7 +10,7 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.eviction` | enum | Index eviction algorithm applied when the index exceeds its entry cap. `LRU` (default) evicts the oldest-by-`lastSeen` entry first; `LFU` evicts the lowest-access-count entry first, breaking ties on the oldest `lastSeen`. Access counts do not age — the `evictionTTL` sweep removes stale entries regardless of algorithm, so `LFU` does not pin hot-but-stale entries. The controller lower-cases this and propagates it on `ResolvedPolicy`; the index consults it only on the cap-based sweep. |
+| `spec.eviction` | enum | Index eviction algorithm applied when the index exceeds its entry cap. `LRU` (default) evicts the oldest-by-`lastSeen` entry first; `LFU` evicts the lowest-access-count entry first, breaking ties on the oldest `lastSeen`. Access counts do not age — the `evictionTTL` sweep removes stale entries regardless of algorithm, so `LFU` does not pin hot-but-stale entries. The controller lower-cases this and propagates it on `ResolvedPolicy`. The index reads it on the cap-based sweep (to order victims) and, in `LFU` namespaces, on the lookup path (to record which entries a *delivered* `LookupRoute` hint credits — a timed-out lookup credits nothing); it never changes a lookup result, and the TTL sweep is algorithm-independent. |
 | `spec.evictionTTL` | duration | Maximum usable lifetime for cache entries. |
 | `spec.minimumPrefixTokens` | integer | Minimum prefix token count before lookup. Minimum `0`. |
 | `spec.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. |

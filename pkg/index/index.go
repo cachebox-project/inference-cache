@@ -224,6 +224,26 @@ const (
 type LookupResult struct {
 	Scores   []ReplicaScore
 	Strategy Strategy
+	// hits are the entries that contributed matched tokens to Scores, captured
+	// (LFU namespaces only) during the lookup but NOT yet counted. The caller
+	// credits them via CreditHits ONLY when it actually delivers this result —
+	// so a lookup the gRPC handler discards as TIMEOUT never bumps an LFU
+	// counter. Unexported: *replicaEntry is an index-internal type.
+	hits []*replicaEntry
+}
+
+// CreditHits records one LFU access for each entry that contributed matched
+// tokens to a DELIVERED LookupRoute response. The gRPC handler calls it from
+// buildLookupResponse, which runs only on the paths that return real scores —
+// never on the TIMEOUT/early-deadline paths — so the counter reflects hints the
+// caller actually received. Lock-free (each accessCount is an atomic), so it is
+// safe to call after the index read lock has been released; a concurrently
+// evicted entry's bump is harmless (soft state). A no-op for LRU namespaces and
+// for NO_HINT/TENANT_HOT results (hits is empty).
+func (r LookupResult) CreditHits() {
+	for _, e := range r.hits {
+		e.accessCount.Add(1)
+	}
 }
 
 // RankerConfig tunes the pressure / SLO / tenant-hot strategies layered on
@@ -296,14 +316,15 @@ type scopeKey struct {
 type replicaEntry struct {
 	tokenCount int32
 	lastSeen   time.Time
-	// accessCount is the LFU access counter, bumped lock-free on every lookup
-	// HIT where this entry contributes matched tokens to the returned hint set
-	// — but only while the entry's namespace runs the LFU algorithm (LRU
-	// namespaces skip the bump entirely). It never ages: the TTL sweep handles
-	// staleness regardless of algorithm, so the counter only governs cap-based
-	// eviction. Entries are held by pointer (map[string]*replicaEntry) so this
-	// atomic is never copied — bumping reads the stable pointer under RLock and
-	// the cap sweep reads the count under the write lock.
+	// accessCount is the LFU access counter. The lookup path CAPTURES the
+	// entries that contribute matched tokens (LFU namespaces only) but does not
+	// bump — the gRPC handler credits them lock-free via LookupResult.CreditHits
+	// only when it actually delivers the response, so a TIMEOUT'd lookup never
+	// counts. It never ages: the TTL sweep handles staleness regardless of
+	// algorithm, so the counter only governs cap-based eviction. Entries are
+	// held by pointer (map[string]*replicaEntry) so this atomic is never copied;
+	// CreditHits runs lock-free (outside i.mu) and the cap sweep reads the count
+	// under the write lock.
 	accessCount atomic.Int64
 }
 
@@ -644,14 +665,25 @@ func (i *Index) ApplyEvent(ev Event) {
 // drops the entry — "a wrong hint is worse than a stale one"). When neither
 // chain field is set, the legacy exact-match path on PrefixHash is used.
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
+	scores, _ := i.lookupWithHits(req)
+	return scores
+}
+
+// lookupWithHits runs the lookup and ALSO returns the entries that contributed
+// matched tokens to the result (LFU namespaces only; nil otherwise). The lookup
+// itself is side-effect-free — it never bumps the LFU counter. The public Lookup
+// discards the hits; LookupRoute carries them on its LookupResult so the gRPC
+// handler can credit them via LookupResult.CreditHits once — and only if — it
+// actually delivers the response (not on a TIMEOUT/early-deadline path).
+func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
 	// Without a known hash_scheme, opaque hash bytes cannot be matched
 	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
-		return nil
+		return nil, nil
 	}
 	if len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0 {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
-			return nil
+			return nil, nil
 		}
 		return i.lookupChain(req)
 	}
@@ -660,33 +692,34 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 
 // lookupExact is the legacy single-blob exact-match path. Preserved
 // unchanged so existing callers (no block-hash chain) keep their behavior.
-func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
+func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	ttl := i.ttlFor(req.Tenant)
 	// Resolve the algorithm once, outside the lock (the resolver owns its own
-	// concurrency, same as ttlFor): only LFU namespaces bump the access counter,
-	// so LRU lookups skip the atomic Add entirely.
+	// concurrency, same as ttlFor): only LFU namespaces collect hit entries, so
+	// LRU lookups allocate nothing and never touch the counter.
 	lfu := i.evictionFor(req.Tenant) == EvictionLFU
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
 	scores := make([]ReplicaScore, 0, len(replicas))
+	var hits []*replicaEntry
 	for id, e := range replicas {
 		fresh := freshnessAt(now, e.lastSeen, ttl)
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
-		// LFU counter bump: this entry is about to contribute matched tokens to
-		// the returned hint set (a lookup HIT, per the locked definition), so
-		// count it as "used". Only entries that contribute a non-zero
-		// MatchedTokens are counted — bumping merely-considered entries would
-		// inflate counters with cold data. Lock-free Add under RLock is safe:
-		// the atomic is independent of i.mu and the entry pointer is stable.
+		// LFU hit capture: this entry is about to contribute matched tokens to
+		// the result, so record it as a candidate "use". Only entries that
+		// contribute a non-zero MatchedTokens are captured — counting
+		// merely-considered entries would inflate the counter with cold data.
+		// The counter is bumped later (LookupResult.CreditHits) and only if the
+		// handler actually delivers this result, never under the read lock.
 		if lfu && e.tokenCount > 0 {
-			e.accessCount.Add(1)
+			hits = append(hits, e)
 		}
 		// Only fold in pressure when the replica's stats *payload* is still
 		// fresh under the global TTL. statsReported reflects when the stat
@@ -712,7 +745,7 @@ func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 	i.mu.RUnlock()
 
 	sortScoresDescByScoreThenID(scores)
-	return scores
+	return scores, hits
 }
 
 // lookupChain implements longest-common-prefix matching against the
@@ -726,14 +759,15 @@ func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 // The pressure and SLO factors from lookupExact compose unchanged: the chain
 // walk only changes how matched_tokens is derived; the score formula
 // (matched_tokens × freshness × pressureFactor × sloBias) is the same.
-func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
+func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
 		// entries are the block entries forming this replica's matched run,
 		// collected ONLY when the namespace runs LFU (nil otherwise, so the LRU
-		// hot path allocates nothing). Bumped once the run is confirmed to
-		// contribute to the returned hint set.
+		// hot path allocates nothing). Captured into the returned hits once the
+		// run is confirmed to contribute to the result; credited later by the
+		// handler, never under the read lock.
 		entries []*replicaEntry
 	}
 	now := i.now()
@@ -792,6 +826,7 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	}
 
 	scores := make([]ReplicaScore, 0, len(finalized))
+	var hits []*replicaEntry
 	for id, st := range finalized {
 		if st.matchedTokens <= 0 {
 			continue
@@ -800,13 +835,12 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 		if fresh <= 0 {
 			continue
 		}
-		// LFU counter bump: this run contributes a non-zero MatchedTokens to the
-		// returned hint set, so every block entry in the matched run counts as
-		// "used". (st.entries is non-nil only under LFU.)
+		// LFU hit capture: this run contributes a non-zero MatchedTokens to the
+		// result, so every block entry in the matched run is a candidate "use".
+		// Captured here, credited later (only on a delivered response).
+		// (st.entries is non-nil only under LFU.)
 		if lfu {
-			for _, e := range st.entries {
-				e.accessCount.Add(1)
-			}
+			hits = append(hits, st.entries...)
 		}
 		// Pressure / SLO compose exactly as in lookupExact: same source of
 		// truth (statsReported within TTL), same factor formulas. The chain
@@ -830,7 +864,7 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	i.mu.RUnlock()
 
 	sortScoresDescByScoreThenID(scores)
-	return scores
+	return scores, hits
 }
 
 // sortScoresDescByScoreThenID gives both lookup paths the same deterministic
@@ -874,15 +908,17 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return LookupResult{Strategy: StrategyNone}
 		}
-		if scores := i.Lookup(req); len(scores) > 0 {
-			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}
+		if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
+			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
 		}
 		return LookupResult{Strategy: StrategyNone}
 	}
-	if scores := i.Lookup(req); len(scores) > 0 {
-		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch}
+	if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
+		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
 	}
 	if hot := i.tenantHotCandidates(req); len(hot) > 0 {
+		// TENANT_HOT carries MatchedTokens=0, so no hits to credit — it is a
+		// softer locality nudge, not a prefix HIT.
 		return LookupResult{Scores: hot, Strategy: StrategyTenantHot}
 	}
 	return LookupResult{Strategy: StrategyNone}
@@ -1131,7 +1167,7 @@ type Snapshot struct {
 	Replicas      []ReplicaSnapshot `json:"replicas"`
 	Tenants       []TenantSnapshot  `json:"tenants"`
 	TotalPrefixes int               `json:"totalPrefixes"`
-	HotPrefixes   int               `json:"hotPrefixes"` // 0 until access-counting exists
+	HotPrefixes   int               `json:"hotPrefixes"` // always 0: intentionally unwired. The per-entry LFU access counter exists but governs cap eviction only; it is not aggregated into a cluster-wide "hot prefix" count.
 }
 
 // ReplicaSnapshot is the latest reported state for one replica, cluster-wide.

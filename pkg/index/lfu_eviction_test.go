@@ -12,11 +12,12 @@ type staticEviction map[string]string
 
 func (s staticEviction) Eviction(tenant string) string { return s[tenant] }
 
-// lookupExactN performs n exact-match lookups of a prefix. Each lookup that
-// returns a hit bumps the LFU access counter once (in an LFU namespace).
+// lookupExactN performs n exact-match LookupRoute calls for a prefix and credits
+// each delivered hit — modeling the gRPC handler crediting a delivered response.
+// Each credited hit bumps the LFU access counter once (in an LFU namespace).
 func lookupExactN(idx *Index, tenant, model, scheme, prefix string, n int) {
 	for i := 0; i < n; i++ {
-		idx.Lookup(LookupRequest{Tenant: tenant, Model: model, HashScheme: scheme, PrefixHash: hash(prefix)})
+		idx.LookupRoute(LookupRequest{Tenant: tenant, Model: model, HashScheme: scheme, PrefixHash: hash(prefix)}).CreditHits()
 	}
 }
 
@@ -234,10 +235,12 @@ func TestLFUCounterBumpsEveryBlockInAChainHit(t *testing.T) {
 
 	reqHashes, reqCounts := chain("b1", "b2", "b3")
 	for i := 0; i < 2; i++ {
-		if got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
-			BlockHashes: reqHashes, BlockTokenCounts: reqCounts}); len(got) != 1 {
-			t.Fatalf("chain lookup should hit replica r, got %d scores", len(got))
+		res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+			BlockHashes: reqHashes, BlockTokenCounts: reqCounts})
+		if len(res.Scores) != 1 {
+			t.Fatalf("chain lookup should hit replica r, got %d scores", len(res.Scores))
 		}
+		res.CreditHits() // credit the delivered hit
 	}
 
 	// Each of the 3 matched blocks was bumped once per lookup → 2.

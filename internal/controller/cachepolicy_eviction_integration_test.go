@@ -76,7 +76,9 @@ func TestIntegrationCachePolicyEvictionAlgorithm(t *testing.T) {
 	}
 	lookupN := func(idx *index.Index, tenant, prefix string, n int) {
 		for i := 0; i < n; i++ {
-			idx.Lookup(index.LookupRequest{Tenant: tenant, Model: "m", HashScheme: "vllm", PrefixHash: []byte(prefix)})
+			// LookupRoute + CreditHits models the gRPC handler crediting a
+			// delivered hit (the only path that bumps the LFU counter).
+			idx.LookupRoute(index.LookupRequest{Tenant: tenant, Model: "m", HashScheme: "vllm", PrefixHash: []byte(prefix)}).CreditHits()
 		}
 	}
 	present := func(idx *index.Index, tenant, prefix string) bool {
