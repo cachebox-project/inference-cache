@@ -149,12 +149,13 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 	$(GOVULNCHECK) ./...
 
 # Coverage gate. We measure the hand-written logic packages only: generated
-# code (proto stubs, deepcopy), entrypoints (cmd/), and test helpers are
-# excluded because their (un)covered statements would swamp the real signal.
+# code (proto stubs, deepcopy), entrypoints (cmd/), tooling under hack/, and
+# test helpers are excluded because their (un)covered statements would swamp
+# the real signal.
 COVER_MIN ?= 85
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|pkg/testing/
+COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages).
@@ -175,6 +176,16 @@ cover-check: ## Fail if logic-package coverage is below COVER_MIN% (excludes gen
 .PHONY: test-env
 test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
+
+# Validates against the COMMITTED config/crd/bases +
+# config/webhook/manifests.yaml — NOT a freshly regenerated tree. CRD drift
+# is enforced separately by `make pre-pr` (gen-drift check) and the
+# lint-generated-proto CI job, so this target staying behind committed
+# manifests keeps it strictly checking the shipping shape.
+.PHONY: verify-samples
+verify-samples: envtest ## Run every YAML under config/samples/ through admission via envtest + the CacheBackend webhook (server-side dry-run). Honors top-of-file `# verify-samples: skip`.
+	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		$(GO_CMD) run ./hack/verify-samples
 
 .PHONY: image-build
 image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
@@ -243,7 +254,7 @@ fmt-check: ## Check Go formatting without modifying files.
 ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
-pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checklist.
+pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
 	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
 	if ! git diff --quiet -- $$gen; then \
@@ -252,6 +263,7 @@ pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + review checkli
 		exit 1; \
 	fi
 	@echo "✓ no generated-code drift"
+	@$(MAKE) --no-print-directory verify-samples
 	@echo ""
 	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
 	@echo "  [ ] Vendor-neutral naming — no oci/oracle in core identity"
