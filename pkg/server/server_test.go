@@ -1057,10 +1057,19 @@ func TestLookupRouteBoundsWallTimeWhenLookupBlocks(t *testing.T) {
 
 func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
 	svc := newTestService()
-	// Tiny budget; lookup itself is sub-µs on an empty index but the
-	// pre-lookup ctx.Err() check is what we exercise here.
+	// Generous budget (1s) so the assertion is about the *budget mechanism*,
+	// not wall-clock racing. The in-memory lookup is ~tens of µs, but it runs
+	// on the bounded path (goroutine + select) once a policy budget is set; a
+	// sub-millisecond budget would race goroutine-scheduling jitter against the
+	// ctx deadline and intermittently TIMEOUT on a loaded CI runner even though
+	// the lookup did no slow work. A 1s budget can't be tripped by scheduling
+	// jitter, so the "fast lookup stays under budget" invariant is deterministic.
+	// The negative direction (a too-small budget DOES TIMEOUT) is covered
+	// deterministically by TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline
+	// and TestLookupRouteBoundsWallTimeWhenLookupBlocks, which inject a lookup
+	// that overruns the budget by a large, jitter-proof margin.
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", LookupTimeoutMs: 1},
+		{Namespace: "team-a", LookupTimeoutMs: 1000},
 	})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "team-a", HashScheme: "vllm",
@@ -1075,7 +1084,7 @@ func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() == "TIMEOUT" {
-		t.Fatalf("a sub-millisecond in-memory lookup should not breach a 1ms budget; got %+v", resp)
+		t.Fatalf("a sub-millisecond in-memory lookup should not breach a 1s budget; got %+v", resp)
 	}
 }
 
