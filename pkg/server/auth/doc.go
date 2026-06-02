@@ -19,8 +19,17 @@
 // write, so a successful rogue POST would override every namespace's
 // CachePolicy state cluster-wide).
 //
-// Defence in depth: this middleware is one of two independent gates around
-// the controller-facing listener. The other is a namespace-scoped
-// NetworkPolicy that restricts L3/L4 ingress to the controller's pod
-// selector. See config/server/.
+// Defence in depth: this middleware is one of THREE independent gates
+// around the controller-facing listener.
+//   - L3/L4: a namespace-scoped NetworkPolicy restricts ingress to the
+//     controller's pod selector (config/server/).
+//   - L7 identity: this middleware's TokenReview-backed bearer check
+//     rejects every request whose token does not resolve to the
+//     configured controller ServiceAccount username.
+//   - L7 audience: when Options.Audience is set, the middleware passes
+//     TokenReviewSpec.Audiences so the apiserver rejects any bearer
+//     whose JWT audience doesn't match — closing the cross-surface
+//     replay vector (a leaked apiserver-bound token cannot scrape
+//     /snapshot or push /policy, and vice versa). See audience.go for
+//     the ControllerAudience constant.
 package auth

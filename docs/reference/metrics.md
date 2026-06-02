@@ -48,8 +48,8 @@ silently.
 | Metric | Labels | Meaning | Notes |
 |---|---|---|---|
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
-| `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — see note below), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses both "kube-apiserver checked the token and rejected it" AND "an authenticator in the chain populated `Status.Error`" because the two are NOT distinguishable from the response shape (verified empirically: kube-apiserver's SA-token authenticator populates `Status.Error` for routine JWT-parse failures of garbage strings, the same field a webhook-authenticator timeout would set). When `Status.Error` is non-empty the middleware logs it at WARN to the server log so the operator can still tell apart "webhook timeout" from "invalid bearer token" via the diagnostic. A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
-| `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error`. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Read- and write-side caches are independent — the same controller token cache-misses once per endpoint per TTL window in the steady state. |
+| `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — this includes the **wrong-audience** case: a token whose JWT audience does not match the server's `--controller-audience` is reported by the apiserver as not authenticated, surfaced here in the same bucket), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses several apiserver-reported denials (plain bad token, `Status.Error` populated by the SA-token authenticator's JWT parser, wrong audience) because they're not distinguishable from the response shape; the middleware logs the apiserver's diagnostic at WARN to the server log so the operator can still tell them apart (e.g. `token audiences [...] is invalid for the target audiences [...]` clearly signals an audience mismatch — usually a manifest/flag drift between controller projection and server `--controller-audience`). A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / audience / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
+| `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat: a wrong-audience controller token shows up in `unauth`, with the apiserver's `token audiences [...] is invalid` diagnostic at WARN. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Read- and write-side caches are independent — the same controller token cache-misses once per endpoint per TTL window in the steady state. |
 | `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 
 ### Histograms
@@ -110,13 +110,37 @@ with OTEL collectors) without bumping `v1alpha1`.
   of the cluster-wide cache aggregate; populates the `CacheIndex` CR
   status) and `/policy` (controller-write of the combined resolved
   snapshot — `CachePolicy` entries plus `CacheTenant` quota entries;
-  replace-on-write). The split is intentional: a `NetworkPolicy` restricts
-  L3/L4 ingress on this listener to the controller's pod selector, and a
-  TokenReview-backed bearer middleware on both endpoints rejects
-  everything that isn't the configured controller `ServiceAccount`
-  (`--allowed-controller-sa`). `inferencecache_snapshot_auth_total` and
-  `inferencecache_policy_auth_total` (see the counter table above) are the
-  parallel observability surfaces — one per endpoint.
+  replace-on-write). The gate has **THREE independent layers**, each
+  meant to catch a failure mode the others can't, and the same gate
+  applies to BOTH endpoints uniformly (one middleware identity):
+  - **L3/L4:** a `NetworkPolicy` restricts ingress to the controller's
+    pod selector.
+  - **L7 identity:** TokenReview-backed bearer middleware rejects every
+    request whose token does not resolve to the configured controller
+    `ServiceAccount` (`--allowed-controller-sa`).
+  - **L7 audience:** the controller mounts an audience-bound projected
+    SA token (audience `inferencecache.io/controller` by default, mounted
+    at `/var/run/secrets/inferencecache.io/controller-token/token`); the
+    server passes `TokenReviewSpec.Audiences=[--controller-audience]` so
+    a default-audience apiserver token from the same controller SA is
+    rejected on either endpoint. Under the default apiserver audience
+    configuration, a leaked controller-audience token is useless against
+    the apiserver and vice versa; the cross-surface property holds only
+    while the apiserver is not configured to also accept
+    `inferencecache.io/controller` as an apiserver audience (keep the
+    two distinct).
+
+  `inferencecache_snapshot_auth_total` and
+  `inferencecache_policy_auth_total` (see the counter table above) are
+  the parallel observability surfaces — one per endpoint — for the
+  **two L7 layers (identity + audience)**. NetworkPolicy drops happen
+  at the CNI before the listener and cannot increment either counter
+  — observe those via kube state metrics on the policy resource + the
+  CNI's flow logs (Calico / Cilium / etc.), separately from the auth
+  counters. Audience-mismatch denials land in `result="unauth"` with
+  the apiserver's diagnostic in the server WARN log — operators
+  chasing a binding regression should grep for
+  `token audiences [...] is invalid for the target audiences`.
 
 ---
 

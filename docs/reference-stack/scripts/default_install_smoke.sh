@@ -31,9 +31,11 @@
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
 #   7. The External CacheBackend type end-to-end: applying the committed
-#      config/samples/cachebackend-external.yaml renders NO Deployment/Service
-#      in its namespace, status.endpoint mirrors spec.endpoint, observedGeneration
-#      is set, the CR goes Ready=True/ExternalEndpointAccepted, and
+#      config/samples/cachebackend-external.yaml drives the CacheBackend
+#      mutating webhook default (spec.replicas=1), renders NO
+#      Deployment/Service in its namespace, status.endpoint mirrors
+#      spec.endpoint, observedGeneration is set, the CR goes
+#      Ready=True/ExternalEndpointAccepted, and
 #      `kubectl get cb` renders the CacheBackend printer columns. A matching
 #      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
 #      injected by the pod-mutating webhook. Also exercises admission
@@ -49,6 +51,23 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
+#  10. The audience binding holds on BOTH /snapshot and /policy: a probe
+#      pod with the controller's SA + labels reads two mounted tokens
+#      (audience-bound projected + default-audience apiserver automount)
+#      and asserts the audience-bound token admits on both endpoints
+#      while the default-audience token of the SAME SA is rejected on
+#      both. The two endpoints share one middleware identity (one
+#      controller SA, one audience), so any drift would surface on both
+#      simultaneously. Catches a regression in the SERVER's audience-
+#      enforcement half of the contract — `--controller-audience` flag
+#      drift, the middleware forgetting to populate
+#      `TokenReviewSpec.Audiences`, or the apiserver mis-enforcing
+#      audience. Does NOT catch drift in the controller's production
+#      projected-volume manifest (the probe deliberately uses its own
+#      inline volume spec so it still runs when that manifest is broken);
+#      that drift is caught by item 2 above — observedServer populates
+#      only when the REAL controller's poller successfully scrapes
+#      /snapshot.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -669,45 +688,6 @@ if [ -z "$endpoint" ]; then
 fi
 log "status.endpoint=$endpoint"
 
-# Exercise the operator-facing Ready printer column on a real install.
-# The column is wired by a +kubebuilder:printcolumn annotation in
-# api/v1alpha1/cachebackend_types.go that codegens into the served CRD's
-# additionalPrinterColumns; `kubectl get cb` defaults to that table layout.
-# Two assertions, both needed:
-#   (1) `kubectl get cb` default output includes a READY column header —
-#       fails if the printcolumn annotation/regen ever drops or renames
-#       the column.
-#   (2) the value under that column is True or False — fails if the
-#       JSONPath in the printcolumn annotation is malformed (kubectl
-#       renders the cell empty when its JSONPath resolves to nothing).
-# We don't wait for Ready=True because the lmcache-server image pull can
-# dominate the wait window on a cold node; the column-wiring is what the
-# smoke needs to validate. Pod-Ready latency is already covered by the
-# canary that runs a real CPU engine.
-log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for the Ready printer column to populate"
-deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
-ready_col=""
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  # `kubectl get cb <name>` default output renders the CRD's
-  # additionalPrinterColumns. Header is line 1, the data row is line 2.
-  # Find the "READY" column index in the header and read the same field
-  # from the data row — robust to column-order changes from future CRD
-  # edits and fails if the header is missing the column entirely.
-  ready_col=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache 2>/dev/null | awk '
-    NR==1 { for (i=1;i<=NF;i++) if ($i=="READY") col=i; if (!col) exit 1 }
-    NR==2 { print $col }
-  ' || true)
-  if [ "$ready_col" = "True" ] || [ "$ready_col" = "False" ]; then break; fi
-  sleep 2
-done
-if [ "$ready_col" != "True" ] && [ "$ready_col" != "False" ]; then
-  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache || true
-  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  kubectl -n "$SAMPLE_NS" describe deployment qwen-demo-cache || true
-  fail "Ready printer column = '$ready_col' (want True or False) after ${SAMPLE_ENDPOINT_TIMEOUT}s — printcolumn annotation missing, renamed, or JSONPath malformed"
-fi
-log "Ready printer column = $ready_col"
-
 log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
 # Split files live under $tmpdir and are removed by the trap; no
@@ -867,19 +847,24 @@ kubectl delete namespace "$SAMPLE_NS" \
 
 # --- External CacheBackend end-to-end ---------------------------------------
 # Exercises the committed External passthrough sample on the running cluster:
-# the reconciler should NOT render a Deployment/Service, status.endpoint should
-# mirror spec.endpoint, observedGeneration should advance, Ready should be True
-# with reason ExternalEndpointAccepted, and a matching engine pod should come
-# out of admission with LMCACHE_REMOTE_URL pointing at the operator-supplied
+# the mutating webhook should stamp spec.replicas, the reconciler should NOT
+# render a Deployment/Service, status.endpoint should mirror spec.endpoint,
+# observedGeneration should advance, Ready should be True with reason
+# ExternalEndpointAccepted, and a matching engine pod should come out of
+# admission with LMCACHE_REMOTE_URL pointing at the operator-supplied
 # endpoint. Also exercises CacheBackend printer columns and the validating
 # webhook's negative path.
 log "exercising External CacheBackend end-to-end in namespace $EXT_SMOKE_NS"
 kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply the committed External CR sample.
+# Apply the committed External CR sample. The sample intentionally omits
+# spec.replicas so the smoke drives the mutating webhook defaulter instead of
+# only proving the CRD accepts already-defaulted YAML.
 kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/dev/null \
   || fail "kubectl apply config/samples/cachebackend-external.yaml failed"
 
+defaulted_replicas="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
+  -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
 external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
@@ -893,12 +878,11 @@ if [ -z "$external_pod_labels" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
   fail "External sample did not create spec.engineSelector.matchLabels on $EXT_SMOKE_CB_NAME"
 fi
-# lookupTimeoutMs / minimumPrefixTokens used to be defaulted under
-# spec.integration; PR #57 moved them to CachePolicy, so the defaulter
-# check that used to live here is gone. The CRD trim assertions
-# earlier in the script (around line ~345) already guard against their
-# accidental re-introduction on the CacheBackend surface.
-log "External CR sample endpoint=$external_spec_endpoint"
+if [ "$defaulted_replicas" != "1" ]; then
+  kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
+  fail "CacheBackend defaulter did not stamp spec.replicas: got=$defaulted_replicas (want 1)"
+fi
+log "External CR sample endpoint=$external_spec_endpoint; defaulted replicas=$defaulted_replicas"
 
 # Wait for the reconciler to publish status.endpoint + observedGeneration +
 # the Ready=True condition. Sub-second on a quiet cluster; the timeout covers
@@ -941,10 +925,7 @@ log "External CR status: endpoint=$status_endpoint observedGeneration=$observed_
 # default NAME/AGE-only table.
 cb_table="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" 2>/dev/null || true)"
 cb_header="$(printf '%s\n' "$cb_table" | sed -n '1p')"
-# HEALTH was retired in favour of the Ready condition printer column (see
-# this PR's design-doc carve-out); the row value is the condition's True
-# string rather than the old enum value.
-for column in TYPE READY MATCHED ENDPOINT PREFIXES LASTEVENT; do
+for column in TYPE HEALTH MATCHED ENDPOINT PREFIXES LASTEVENT; do
   if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$cb_header"; then
     echo "$cb_table"
     fail "expected CacheBackend printer column $column in kubectl get cb output"
@@ -952,12 +933,12 @@ for column in TYPE READY MATCHED ENDPOINT PREFIXES LASTEVENT; do
 done
 if ! grep -Fq "$EXT_SMOKE_CB_NAME" <<<"$cb_table" || \
    ! grep -Fq "External" <<<"$cb_table" || \
-   ! grep -Fq "True" <<<"$cb_table" || \
+   ! grep -Fq "Ready" <<<"$cb_table" || \
    ! grep -Fq "$external_spec_endpoint" <<<"$cb_table"; then
   echo "$cb_table"
-  fail "expected CacheBackend printer row to include name/type/Ready=True/endpoint"
+  fail "expected CacheBackend printer row to include name/type/health/endpoint"
 fi
-log "CacheBackend printer columns render Type/Ready/Matched/Endpoint/Prefixes/LastEvent"
+log "CacheBackend printer columns render Type/Health/Matched/Endpoint/Prefixes/LastEvent"
 
 # No Deployment, no Service should have been rendered for an External CR.
 # A leading API service `kubernetes` doesn't exist in this fresh namespace,
@@ -1238,4 +1219,142 @@ case "$policy_probe_out" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, and /snapshot + /policy unauth rejection all work"
+# --- Audience-binding assertion (BOTH /snapshot and /policy) --------------
+# Audience-binding follow-up to the bearer-token gate. The controller pod
+# in production mounts TWO ServiceAccount tokens:
+#   1. The default automount at /var/run/secrets/kubernetes.io/serviceaccount/token
+#      — audience = the apiserver. Used by the controller-runtime client.
+#   2. A projected volume at /var/run/secrets/inferencecache.io/controller-token/token
+#      — audience = "inferencecache.io/controller". Used by the CacheIndex
+#      poller AND the CachePolicy push side — they share the projected
+#      token because /snapshot and /policy share one auth middleware.
+# The server passes TokenReviewSpec.Audiences=["inferencecache.io/controller"]
+# on every review for BOTH endpoints, so a default-audience token MUST
+# come back 401 on BOTH even though the SA identity (controller-manager)
+# would otherwise be admitted.
+#
+# Why a single probe pod with FOUR scrapes (audience-bound × {snapshot,
+# policy} ∪ default-audience × {snapshot, policy}): the two endpoints share
+# one middleware identity, so audience drift would surface on both
+# simultaneously — but a regression in JUST ONE direction (e.g. the policy
+# handler skipping the auth wrapper) would show up here too. Four small
+# checks, one pod, one assertion: "all four outcomes match the contract."
+#
+# Scoping — what each smoke gate actually catches (the assertions are
+# complementary, not redundant):
+#   - The CacheIndex assertion earlier (cacheindex/cluster-default.status
+#     .observedServer populates within ~60s) is what proves the REAL
+#     controller's projected-volume manifest, the controller binary's
+#     BearerTokenPath, the server's flag, and the middleware all agree
+#     end-to-end. If config/manager/manager.yaml drifts (audience renamed,
+#     mount path moved, expirationSeconds zeroed), the real poller's
+#     scrape returns 401 and the CR's observedServer stays empty, failing
+#     that earlier gate.
+#   - THIS probe asserts only server-side behavior: that an audience-bound
+#     token admits and a default-audience token of the same SA is rejected,
+#     on BOTH endpoints. It uses an inline duplicate volume spec so it can
+#     run even if the controller's manifest is broken (which would
+#     otherwise mask the server-side check). It does NOT catch drift in
+#     config/manager/manager.yaml; that's the earlier gate's job.
+log "asserting audience binding on both /snapshot and /policy"
+PROBE_POD="ic-audience-probe"
+kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+probe_yaml=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PROBE_POD
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: controller
+spec:
+  serviceAccountName: inference-cache-controller-manager
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: curlimages/curl:8.10.1
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      # The probe pod IS in the NetworkPolicy allowlist (component=controller
+      # label), so we expect no L3/L4 drop — but a short -m timeout + explicit
+      # curl-exit capture keeps a regression (DNS, Service rename, allowlist
+      # drift) from looking like a silent bad outcome. If curl fails on any
+      # of the four scrapes, we emit "K=curl_failed:N" so the case statement
+      # below surfaces the exit code, not the empty-status default.
+      controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
+      default_token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
+      if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
+      if [ -z "\$default_token" ]; then echo "default_token_missing"; exit 0; fi
+      # GET /snapshot — controller-audience must 200, default-audience must 401.
+      sa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
+      sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
+      # POST /policy — controller-audience must 204, default-audience must 401.
+      # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def"
+    volumeMounts:
+    - name: controller-token
+      mountPath: /var/run/secrets/inferencecache.io/controller-token
+      readOnly: true
+  volumes:
+  - name: controller-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: inferencecache.io/controller
+          expirationSeconds: 3600
+EOF
+)
+if ! echo "$probe_yaml" | kubectl apply -f - >/tmp/audience-probe-create.log 2>&1; then
+  cat /tmp/audience-probe-create.log >&2 || true
+  fail "kubectl apply for $PROBE_POD failed; cannot run audience-binding assertion"
+fi
+
+# Wait for the probe pod to finish; 90s budget + describe-pod fallback
+# matches the unauth probes above for the same kubelet-busy-reaping reason.
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$PROBE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+audience_probe="$(kubectl -n "$NAMESPACE" logs "$PROBE_POD" 2>/dev/null || true)"
+if [ -z "$audience_probe" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$PROBE_POD" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+
+log "audience probe output: $audience_probe"
+# Expected outcome line, in order:
+#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401
+# Anything else is a regression. curl_failed:28 splits out so an operator
+# triaging a red smoke knows whether to look at NetworkPolicy (timeout) vs
+# Service/listener (other curl exit).
+case "$audience_probe" in
+  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401")
+    log "audience binding verified on both endpoints — controller-audience token admitted, default-audience token rejected on /snapshot and /policy"
+    ;;
+  *controller_token_missing*)
+    fail "probe pod is missing /var/run/secrets/inferencecache.io/controller-token/token — the projected volume did not mount; check the probe-pod manifest above (and config/manager/manager.yaml for the production analog)"
+    ;;
+  *default_token_missing*)
+    fail "probe pod is missing the default automount; cannot run the audience-binding negative case"
+    ;;
+  *"curl_failed:28"*)
+    fail "audience-binding probe timed out reaching :8081 (curl -m 5 fired). Likely NetworkPolicy regression — does the probe pod still match the controller's component=controller selector? Probe output: $audience_probe"
+    ;;
+  *"curl_failed:"*)
+    fail "audience-binding probe could not connect to the controller-facing listener (curl exited non-zero). Check Service name 'inference-cache-server', port 8081, and that the listener is up. Probe output: $audience_probe"
+    ;;
+  *)
+    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401')"
+    ;;
+esac
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, and audience binding on both endpoints all work"

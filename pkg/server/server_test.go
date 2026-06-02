@@ -469,7 +469,13 @@ func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	svc := New(WithControllerAuth(reviewer, sa))
+	// Audience left empty here — this test exercises the auth middleware's
+	// expectedSA / cache / 401-on-missing-bearer matrix end-to-end against
+	// real listeners for BOTH /snapshot AND /policy. The audience-binding
+	// path is covered by the envtest integration in pkg/server/auth (real
+	// apiserver mints audience-bound tokens); a fake reviewer can't
+	// faithfully model audience enforcement.
+	svc := New(WithControllerAuth(reviewer, sa, ""))
 	go func() {
 		errCh <- svc.Serve(ctx, grpcListener, httpListener, snapshotListener)
 	}()
@@ -558,7 +564,7 @@ func TestControllerAuth_PolicyRejectsForbidden(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- New(WithControllerAuth(reviewer, wantSA)).Serve(ctx, grpcListener, httpListener, snapshotListener)
+		errCh <- New(WithControllerAuth(reviewer, wantSA, "")).Serve(ctx, grpcListener, httpListener, snapshotListener)
 	}()
 	defer func() {
 		cancel()
