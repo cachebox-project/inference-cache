@@ -69,14 +69,17 @@
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
 #  11. Every sample manifest under config/samples/ applies cleanly against
-#      the live install: a server-side dry-run apply of each *.yaml exercises
-#      CRD structural validation + the validating admission webhook on the
-#      real cluster. Complements `make verify-samples` (which runs the same
-#      assertion at envtest level) by catching real-cluster-only failures —
-#      webhook cert injection, NetworkPolicy on the authed /policy+/snapshot
-#      endpoints, RBAC for status writes. Honors the `# verify-samples: skip`
-#      opt-out so both gates stay in lockstep. Admission-level only — no
-#      engine pods, no traffic.
+#      the live install: a server-side dry-run apply of each *.yaml/*.yml
+#      exercises CRD structural validation + the validating admission webhook
+#      on the real cluster. Complements `make verify-samples` (which runs the
+#      same assertion at envtest level) by catching admission-wiring failures
+#      envtest masks — the webhook being unreachable/mis-wired on a real
+#      cluster (cert-manager caBundle injection) and the CRDs as actually
+#      installed by config/default. Mirrors verify-samples' sample set and
+#      honors its `# verify-samples: skip` opt-out so the two gates stay in
+#      lockstep. Admission-level only — does NOT create CRs, write status, or
+#      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
+#      phases above cover those). No engine pods, no traffic.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -1382,12 +1385,20 @@ esac
 # Envtest-level sample validation already lives in `make verify-samples`
 # (it runs every sample through admission against an in-process apiserver +
 # the CacheBackend webhook). This phase is the live-kind-cluster complement:
-# it exercises the SAME samples against the real default install, so it
-# additionally catches failures that pass envtest but fail on a real
-# cluster — webhook cert injection (the cert-manager-issued caBundle wiring),
-# NetworkPolicy interactions with the authed /policy + /snapshot endpoints,
-# and RBAC for status writes. Belt-and-suspenders against sample drift in the
-# actually-deployed scenario.
+# it exercises the SAME samples against the real default install via
+# server-side dry-run, so it additionally catches admission-path failures
+# that envtest's self-managed apiserver + webhook certs mask — the CacheBackend
+# validating webhook being unreachable or mis-wired on a real cluster
+# (cert-manager-injected caBundle, Service routing, failurePolicy), and the
+# CRDs as actually installed by `kubectl apply -k config/default` rather than
+# from envtest's CRDDirectoryPaths. Belt-and-suspenders against sample drift
+# in the actually-deployed scenario.
+#
+# Scope note: --dry-run=server stops at apiserver admission. It does NOT
+# create CRs, drive controllers, write status, or hit the /policy + /snapshot
+# HTTP endpoints — so it exercises no NetworkPolicy or status-write RBAC (the
+# earlier per-CRD behavioral phases cover those). This is a CRD + admission-
+# wiring backstop, nothing more.
 #
 # Runs LAST: the per-CRD phases above (External backend, CachePolicy push,
 # binding signals) assert behavioral regressions first; this generic
@@ -1400,7 +1411,7 @@ esac
 # comment block contains a line equal to `# verify-samples: skip` is reported
 # as SKIP and not applied. Keeping the two gates' sample sets in lockstep
 # means a sample intentionally excluded from one is excluded from both.
-log "asserting every config/samples/*.yaml applies cleanly against the live install (server dry-run)"
+log "asserting every config/samples/ manifest applies cleanly against the live install (server dry-run)"
 SAMPLE_APPLY_NS="${SAMPLE_APPLY_NS:-ic-sample-apply}"
 kubectl create namespace "$SAMPLE_APPLY_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -1424,11 +1435,17 @@ has_skip_marker() {
   return 1
 }
 
+# Iterate the SAME sample set as `make verify-samples` (hack/verify-samples'
+# listSamples): every *.yaml / *.yml under config/samples, recursively, sorted
+# for deterministic output. Matching its file selection exactly is what keeps
+# the two gates in lockstep — a future .yml or subdirectory sample can't be
+# covered by the envtest gate yet silently skipped by this live-cluster one.
+# Process substitution (not a pipe) runs the loop body in the current shell so
+# the counters survive.
 sample_ok=0
 sample_skip=0
 sample_fail=0
-for f in config/samples/*.yaml; do
-  [ -e "$f" ] || continue  # no-match guard: unexpanded glob is a literal string
+while IFS= read -r f; do
   if has_skip_marker "$f"; then
     log "  SKIP $f (opt-out: $sample_skip_marker)"
     sample_skip=$((sample_skip + 1))
@@ -1447,20 +1464,19 @@ for f in config/samples/*.yaml; do
     cat /tmp/sample-dry-run.log >&2
     sample_fail=$((sample_fail + 1))
   fi
-done
+done < <(find config/samples -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-# Guard against the backstop silently becoming a no-op if the sample layout
-# moves out from under the flat config/samples/*.yaml glob (subdirs, .yml).
-# `make verify-samples` walks recursively and is the authoritative gate; this
-# phase mirrors the flat layout deliberately, so a zero-match here means the
-# layout drifted and this assertion needs updating.
+# Guard against the backstop silently becoming a no-op if config/samples ends
+# up empty or unreadable. The recursive find above tracks `make verify-samples`,
+# so layout changes (subdirs, .yml) stay covered; this only catches the
+# degenerate "no samples at all" case.
 if [ "$((sample_ok + sample_skip + sample_fail))" -eq 0 ]; then
-  fail "no config/samples/*.yaml manifests matched — the apply-clean backstop covered nothing (did the sample layout change? \`make verify-samples\` walks recursively and stays authoritative)"
+  fail "no *.yaml/*.yml manifests found under config/samples — the apply-clean backstop covered nothing (is the sample directory missing or empty?)"
 fi
 if [ "$sample_fail" -ne 0 ]; then
-  fail "$sample_fail config/samples/*.yaml manifest(s) did not apply cleanly against the live install — see the rejection output above"
+  fail "$sample_fail config/samples/ manifest(s) did not apply cleanly against the live install — see the rejection output above"
 fi
-log "all config/samples/*.yaml applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
+log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, and every config/samples/*.yaml applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, and every config/samples/ manifest applies cleanly — all work"
