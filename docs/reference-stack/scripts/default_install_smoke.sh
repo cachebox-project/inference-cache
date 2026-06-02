@@ -1562,19 +1562,28 @@ has_skip_marker() {
   return 1
 }
 
-# Iterate the same sample set as `make verify-samples` (hack/verify-samples'
+# Enumerate the same sample set as `make verify-samples` (hack/verify-samples'
 # listSamples): every regular *.yaml / *.yml under config/samples, recursively,
 # sorted for deterministic output. Tracking its selection keeps the two gates
 # in lockstep — a future .yml or subdirectory sample can't be covered by the
 # envtest gate yet silently skipped by this live-cluster one. (config/samples
 # holds only regular files; symlinked samples — which `find -type f` skips and
 # Go's filepath.Walk would include — are not used here, so the sets match.)
-# Process substitution (not a pipe) runs the loop body in the current shell so
-# the counters survive.
+#
+# Materialize the list FIRST, with an explicit error check, rather than piping
+# find straight into the loop via process substitution: a process
+# substitution's exit status is discarded, so `set -o pipefail` can't observe a
+# find failure, and a traversal that errored after emitting some files would
+# slip past the zero-match guard below as partial coverage. Failing here means
+# the coverage gate never silently passes on a partial walk. (pipefail is set
+# at the top of the script, so the command substitution sees find's status.)
+sample_list="$(find config/samples -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)" \
+  || fail "could not enumerate config/samples manifests (find failed) — refusing to report partial sample coverage"
 sample_ok=0
 sample_skip=0
 sample_fail=0
 while IFS= read -r f; do
+  [ -n "$f" ] || continue  # skip the lone empty line an empty here-string yields
   if has_skip_marker "$f"; then
     log "  SKIP $f (opt-out: $sample_skip_marker)"
     sample_skip=$((sample_skip + 1))
@@ -1597,7 +1606,7 @@ while IFS= read -r f; do
     cat /tmp/sample-dry-run.log >&2
     sample_fail=$((sample_fail + 1))
   fi
-done < <(find config/samples -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)
+done <<< "$sample_list"
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # Guard against the backstop silently becoming a no-op if config/samples ends
