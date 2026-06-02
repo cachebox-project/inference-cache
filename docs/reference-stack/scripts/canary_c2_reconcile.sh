@@ -31,7 +31,15 @@ KIND_CLUSTER="${KIND_CLUSTER:-ic-c2-canary}"
 NAMESPACE="${NAMESPACE:-c2-canary}"
 CR_NAME="${CR_NAME:-canary}"
 READY_TIMEOUT="${READY_TIMEOUT:-900}" # seconds for the CPU model to load + become Ready
-SKIP_TRAFFIC="${SKIP_TRAFFIC:-0}"
+# The traffic block port-forwards `svc/$CR_NAME` to a `:8000` vLLM HTTP
+# surface and asserts a prefix-cache hit via the vllm:prefix_cache_hits_total
+# metric — a holdover from the retired colocated-rendering profile that
+# bundled vLLM into the cache-server pod. The modern split layout exposes
+# only the LMCache server on `:65432` (TCP lm://), with no vLLM and no
+# HTTP /metrics on the cache-server Service, so the traffic path cannot
+# succeed without a separately wired engine. Default the toggle OFF —
+# operators who run an engine alongside the canary set SKIP_TRAFFIC=0.
+SKIP_TRAFFIC="${SKIP_TRAFFIC:-1}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"

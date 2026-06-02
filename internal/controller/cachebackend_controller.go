@@ -1519,6 +1519,7 @@ func statusFailOpen(v *bool) bool {
 	return *v
 }
 
+// emitTransitionEvents emits Kubernetes Events on transitions of
 // Conditions[Ready/Degraded], the KV-event readiness gate state, or the
 // effective failOpen toggle. By design events fire only on transitions —
 // never on steady state — so a Ready backend reconciling every few seconds
