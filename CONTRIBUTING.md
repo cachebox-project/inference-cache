@@ -29,9 +29,8 @@ pre-push gate and CI use; `make test` is the faster, non-race variant for quick
 local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 85%)
 over the hand-written logic packages — generated code, `cmd/` entrypoints,
 tooling under `hack/`, and test helpers are excluded; `make cover` prints the
-per-function report. The
-floor is a ratchet: raise it as coverage improves. `make ci-lint` runs the
-golangci-lint configuration used by CI.
+per-function report. The floor is a ratchet: raise it as coverage improves.
+`make ci-lint` runs the golangci-lint configuration used by CI.
 `make proto-lint` lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 
