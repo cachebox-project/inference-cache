@@ -56,6 +56,15 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 		ErrorIfCRDPathMissing: true,
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
 			Paths: []string{filepath.Join(rootDir, "config", "webhook", "manifests.yaml")},
+			// LocalServingPort intentionally left at 0 (the zero
+			// value). envtest's generateHostPort (controller-runtime
+			// pkg/envtest/webhook.go:121-127) calls addr.Suggest on
+			// a zero port, which picks a FREE OS port and stores it
+			// back in wopts.LocalServingPort. The webhook server
+			// below consumes that allocated port — so two test
+			// binaries (e.g. this package and internal/webhook/pod)
+			// running in parallel under `go test ./...` each get a
+			// distinct listener. No fixed-port collision.
 		},
 	}
 	cfg, err := env.Start()

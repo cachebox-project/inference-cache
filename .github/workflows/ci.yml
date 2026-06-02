@@ -111,10 +111,12 @@ jobs:
         go-version-file: go.mod
         cache: true
 
-    # Fetch envtest binaries (apiserver + etcd) so the controller integration
-    # tests (internal/controller/integration_test.go) run against a real
-    # apiserver instead of skipping. The test skip guard checks $KUBEBUILDER_ASSETS,
-    # so exporting it via $GITHUB_ENV is enough to flip them on.
+    # Fetch envtest binaries (apiserver + etcd + kubectl) so the controller
+    # integration tests (internal/controller/integration_test.go) run against
+    # a real apiserver instead of skipping AND so the "Verify samples" step
+    # below has the envtest apiserver + the kubectl that `make verify-samples`
+    # shells out to. The test skip guard checks $KUBEBUILDER_ASSETS, so
+    # exporting it via $GITHUB_ENV is enough to flip them on.
     # The script fails fast if the path is empty or missing, so a `make test-env`
     # failure can't silently skip the integration suite and let CI go green.
     - name: Install envtest binaries
