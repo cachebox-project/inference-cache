@@ -152,7 +152,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 # code (proto stubs, deepcopy), entrypoints (cmd/), tooling under hack/, and
 # test helpers are excluded because their (un)covered statements would swamp
 # the real signal.
-COVER_MIN ?= 85
+COVER_MIN ?= 86
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
 COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/

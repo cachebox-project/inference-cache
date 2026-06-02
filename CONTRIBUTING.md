@@ -20,13 +20,13 @@ make proto-lint
 make lint
 make test-race
 make build
-make cover-check # fail if logic-package coverage drops below COVER_MIN (85%)
+make cover-check # fail if logic-package coverage drops below COVER_MIN (86%)
 make vulncheck   # vulnerability scan (needs network); blocking in CI
 ```
 
 `make test-race` runs the unit tests under the race detector — it's what the
 pre-push gate and CI use; `make test` is the faster, non-race variant for quick
-local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 85%)
+local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 86%)
 over the hand-written logic packages — generated code, `cmd/` entrypoints,
 tooling under `hack/`, and test helpers are excluded; `make cover` prints the
 per-function report. The floor is a ratchet: raise it as coverage improves.
