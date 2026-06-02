@@ -1613,7 +1613,7 @@ log "opt-in TLS overlay OK: plaintext rejected; cert-manager CA verifies the ser
 
 # Backward-compatibility: the EXISTING call pattern must work UNCHANGED over
 # TLS. Re-run the same LookupRoute(unknown model) the plaintext phase ran (phase
-# 5) and assert the identical fail-open result (reason_code=NO_HINT) — proving
+# 6) and assert the identical fail-open result (reason_code=NO_HINT) — proving
 # TLS is a pure transport wrapper that does not alter the gRPC contract or
 # handler behavior, so a client only swaps plaintext creds for TLS creds.
 # Reflection first, proto-file fallback (same priority order as the plaintext
