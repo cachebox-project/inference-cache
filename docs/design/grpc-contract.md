@@ -4,6 +4,8 @@ Status: implemented · Implements: B4 (contract + fail-open stubs), B6 (index-ba
 
 This is the public API gateways and engines integrate against — the load-bearing contract that unblocks the cache index (B6), engine KV-event hook (C1), and gateway clients (E1). Get the signature right early; the bytes behind it are filled in by later modules.
 
+**Transport:** the policy server serves `:9090` **plaintext by default** — including in `config/default` — because today's gRPC clients (the in-cluster `kvevent-subscriber` producer and the external gateway client) are not yet TLS-ready. One-sided **Service TLS via cert-manager is an opt-in overlay** (`config/overlays/server-tls`) that flips the server on; see [`grpc-tls.md`](grpc-tls.md). When enabled, a verifying client dials the server's Service FQDN and the server presents a cert-manager-minted cert for that name. mTLS (client-cert verification) is deferred to Phase 2.
+
 ## Identity
 
 | | Value |

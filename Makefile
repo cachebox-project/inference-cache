@@ -152,20 +152,27 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 # code (proto stubs, deepcopy), entrypoints (cmd/), tooling under hack/, and
 # test helpers are excluded because their (un)covered statements would swamp
 # the real signal.
-COVER_MIN ?= 85
+#
+# We pass -coverpkg=./... so a function exercised by tests in a DIFFERENT
+# package (e.g. enginewire helpers tested through vllm_lmcache_test.go)
+# counts as covered. Without it, Go reports only same-package "own" coverage,
+# which silently understated real coverage for adapter helpers tested
+# through their consumers and produced misleading per-package figures
+# (e.g. enginewire 37% own vs ~95% via callers).
+COVER_MIN ?= 90
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
 COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
-cover: ## Run tests with coverage and print the per-function report (logic packages).
-	$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE)
+cover: ## Run tests with coverage and print the per-function report (logic packages, cross-package counted).
+	$(GO_CMD) test ./... -covermode=atomic -coverpkg=./... -coverprofile=$(COVER_PROFILE)
 	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
 	@$(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC)
 
 .PHONY: cover-check
-cover-check: ## Fail if logic-package coverage is below COVER_MIN% (excludes generated/cmd/test-helper code).
-	@$(GO_CMD) test ./... -covermode=atomic -coverprofile=$(COVER_PROFILE) >/dev/null
+cover-check: ## Fail if logic-package coverage is below COVER_MIN% (cross-package counted; excludes generated/cmd/test-helper code).
+	@$(GO_CMD) test ./... -covermode=atomic -coverpkg=./... -coverprofile=$(COVER_PROFILE) >/dev/null
 	@grep -vE '$(COVER_EXCLUDE)' $(COVER_PROFILE) > $(COVER_PROFILE_LOGIC)
 	@total=$$($(GO_CMD) tool cover -func=$(COVER_PROFILE_LOGIC) | awk '/^total:/ {gsub(/%/,"",$$3); print $$3}'); \
 	if [ -z "$$total" ]; then echo "✗ no coverage data"; exit 1; fi; \
@@ -223,7 +230,7 @@ install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooks
 .PHONY: verify-naming
 verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
 	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
-		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/samples config/server config/webhook config/certmanager internal PROJECT go.mod 2>/dev/null || true); \
+		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/samples config/server config/webhook config/certmanager config/overlays internal PROJECT go.mod 2>/dev/null || true); \
 	if [ -n "$$bad" ]; then \
 		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
 		echo "$$bad" | sed 's/^/    /'; \

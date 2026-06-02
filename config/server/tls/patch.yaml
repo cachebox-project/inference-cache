@@ -1,0 +1,12 @@
+# JSON6902 patch: append the gRPC TLS flags to the server's args. Append
+# (`args/-`) rather than a list-replacing merge, so a server flag added to the
+# base Deployment later is preserved. The Secret volume + mount are added by
+# patch-volumes.yaml (a name-keyed strategic merge, also additive). Together
+# they flip the :9090 port from plaintext to Service TLS. (The server container
+# is the sole container, index 0.)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --tls-cert-file=/var/run/secrets/tls/tls.crt
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --tls-key-file=/var/run/secrets/tls/tls.key
