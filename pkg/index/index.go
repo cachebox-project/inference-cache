@@ -104,11 +104,13 @@ const (
 	EvictionLFU = "lfu"
 )
 
-// EvictionResolver returns the per-tenant (namespace) cap-based eviction
-// algorithm. An empty string, an unrecognized value, or a nil resolver all mean
-// LRU — the default and the pre-LFU behavior. Only cap-based eviction consults
-// it; the TTL sweep runs identically regardless. The index imports no
-// CRD/policy types; the server's policy store satisfies it. Mirrors TTLResolver.
+// EvictionResolver returns the per-tenant (namespace) eviction algorithm. An
+// empty string, an unrecognized value, or a nil resolver all mean LRU — the
+// default and the pre-LFU behavior. The index consults it in two places: the
+// cap-based sweep (to order victims) and, in LFU namespaces, the lookup path
+// (to decide whether to capture which entries a delivered hint credits). The TTL
+// sweep runs identically regardless. The index imports no CRD/policy types; the
+// server's policy store satisfies it. Mirrors TTLResolver.
 type EvictionResolver interface {
 	Eviction(tenant string) string
 }
@@ -407,7 +409,9 @@ func WithSweepInterval(d time.Duration) Option { return func(i *Index) { i.sweep
 // WithMaxEntries caps total replica×prefix entries (0 = unbounded).
 func WithMaxEntries(n int) Option { return func(i *Index) { i.maxEntries = n } }
 
-// WithMetrics wires a metrics sink for inferencecache_index_entries.
+// WithMetrics wires the metrics sink the index reports to: the per-model entry
+// gauge (inferencecache_index_entries) plus the eviction counters
+// (inferencecache_tenant_evictions_total, inferencecache_index_evictions_total).
 func WithMetrics(m Metrics) Option { return func(i *Index) { i.metrics = m } }
 
 // WithRanker overrides the ranking-v2 knobs. The default (set in New) is

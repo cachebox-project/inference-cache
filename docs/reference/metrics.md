@@ -88,6 +88,10 @@ with OTEL collectors) without bumping `v1alpha1`.
 - **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
   `index.Metrics` interface after a quota-driven eviction at ingest; see
   [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
+- **`indexEvictions` writer:** the index calls `AddIndexEvictions(algorithm, reason, n)`
+  via the `index.Metrics` interface after the cap sweep (`reason="cap"`, on ingest)
+  and the TTL sweep (`reason="ttl"`); see [`pkg/index/`](../../pkg/index/). The
+  per-algorithm tally is emitted after the index lock is released.
 - **`snapshotAuth` + `policyAuth` writers:** the TokenReview middleware in
   [`pkg/server/auth/`](../../pkg/server/auth/) reports one outcome per
   request via the `auth.ResultRecorder` interface. The recorders themselves

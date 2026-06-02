@@ -41,10 +41,12 @@ type ResolvedPolicy struct {
 	EvictionTTL         time.Duration `json:"evictionTTL,omitempty"`
 	MinimumPrefixTokens int32         `json:"minimumPrefixTokens,omitempty"`
 	LookupTimeoutMs     int32         `json:"lookupTimeoutMs,omitempty"`
-	// Eviction is the cap-based eviction algorithm in lower-case canonical form
+	// Eviction is the eviction algorithm in lower-case canonical form
 	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
-	// flattening. Empty means the server default (LRU). Only the index's
-	// cap-based sweep consults it; the TTL sweep is algorithm-independent.
+	// flattening. Empty means the server default (LRU). The index consults it on
+	// the cap-based sweep (to order victims) and, for LFU, on the lookup path (to
+	// capture which entries a delivered hint credits); the TTL sweep is
+	// algorithm-independent.
 	Eviction string `json:"eviction,omitempty"`
 }
 
