@@ -11,23 +11,27 @@
 #   2. The CacheIndex poller is writing status: `cacheindex/cluster-default`
 #      has a non-empty `.status.observedServer` within ~60s (one or two poll
 #      cycles past the 30s default refresh).
-#   3. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
+#   3. The server's operator HTTP surface is wired on the installed Service:
+#      `/readyz` returns 200, `/metrics` exposes `inferencecache_server_up 1`,
+#      and `kubectl get ci` renders the CacheIndex Prefixes/Changed printer
+#      columns.
+#   4. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
 #      server's `/policy` endpoint, and `LookupRoute` observes the pushed
 #      minimumPrefixTokens gate without engine pods or inference traffic. The
 #      installed validating webhook also rejects a SECOND CachePolicy in the
 #      namespace (one-per-namespace), proving the bundle's webhook Service +
 #      cert-manager CA-injection path — not just envtest handler logic.
-#   4. The per-CacheTenant status projection works: an applied `CacheTenant`
+#   5. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller. The
 #      installed validating webhook also rejects a SECOND CacheTenant reusing
 #      an existing tenantID in the namespace (tenantID-uniqueness).
-#   5. The gRPC surface is reachable and PLAINTEXT by default: config/default
-#      serves :9090 plaintext (TLS is opt-in — phase 11), so a plaintext client
+#   6. The gRPC surface is reachable and PLAINTEXT by default: config/default
+#      serves :9090 plaintext (TLS is opt-in — phase 12), so a plaintext client
 #      lists services and a `LookupRoute` for an unknown model returns the
 #      fail-open default (`reason_code: NO_HINT`).
-#   6. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   7. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -37,7 +41,7 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   7. The External CacheBackend type end-to-end: applying the committed
+#   8. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
 #      Deployment/Service in its namespace, status.endpoint mirrors
@@ -48,17 +52,17 @@
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time).
-#   8. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#   9. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
-#   9. The /policy endpoint rejects unauthenticated callers: same side-pod
+#  10. The /policy endpoint rejects unauthenticated callers: same side-pod
 #      shape against the write-side endpoint. This is the more dangerous of
 #      the two — /policy is replace-on-write, so a successful unauthenticated
 #      POST would override every namespace's CachePolicy state cluster-wide.
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
-#  10. The audience binding holds on BOTH /snapshot and /policy: a probe
+#  11. The audience binding holds on BOTH /snapshot and /policy: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
 #      and asserts the audience-bound token admits on both endpoints
@@ -75,7 +79,7 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
-#  11. The opt-in gRPC TLS path works: applying config/overlays/server-tls
+#  12. The opt-in gRPC TLS path works: applying config/overlays/server-tls
 #      (config/default + the config/server/tls component) rolls the server with
 #      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
 #      a plaintext client is rejected and the cert-manager-issued chain +
@@ -83,10 +87,10 @@
 #      (`grpcurl -cacert` with -authority <FQDN>; a wrong authority is
 #      rejected) — proving server authentication, not just encryption, for the
 #      overlay operators actually enable. Finally re-runs the SAME
-#      LookupRoute(unknown model) the plaintext phase (5) ran and asserts the
+#      LookupRoute(unknown model) the plaintext phase (6) ran and asserts the
 #      identical fail-open NO_HINT, proving the existing call pattern is
 #      unchanged over TLS (pure transport wrapper, no contract/behavior change).
-#  12. Every sample manifest under config/samples/ applies cleanly against
+#  13. Every sample manifest under config/samples/ applies cleanly against
 #      the live install: a server-side dry-run apply of each *.yaml/*.yml
 #      exercises CRD structural validation + the validating admission webhook
 #      on the real cluster. Complements `make verify-samples` (which runs the
@@ -119,13 +123,15 @@
 #   - docker          (for `make image-build` and `kind load docker-image`)
 #   - kind            (./bin/kind picked up if present, else `kind` on PATH)
 #   - kubectl
+#   - curl            (probes the installed HTTP surface)
 #   - grpcurl         (probes the gRPC surface)
 #   - kustomize       (optional; sed fallback handles the image rewrite if absent)
 #
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
-#           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, GRPC_LOCAL_PORT, LOG_DIR,
-#           POLICY_SMOKE_NS, SAMPLE_NS, SAMPLE_ENDPOINT_TIMEOUT,
+#           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
+#           GRPC_LOCAL_PORT, LOG_DIR, POLICY_SMOKE_NS, SAMPLE_NS,
+#           SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
@@ -139,6 +145,7 @@ CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
 READY_TIMEOUT="${READY_TIMEOUT:-120s}"
 CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
 POLICY_PUSH_TIMEOUT="${POLICY_PUSH_TIMEOUT:-90}" # seconds; watch-triggered push + one 30s periodic repair tick
+HTTP_LOCAL_PORT="${HTTP_LOCAL_PORT:-18080}"
 GRPC_LOCAL_PORT="${GRPC_LOCAL_PORT:-19090}"
 LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 # External-backend gate timeouts. The reconciler patches status on the next
@@ -203,6 +210,7 @@ EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
+http_pf_pid=""
 tmpdir=""
 
 log() { echo "[install-smoke] $*"; }
@@ -256,6 +264,7 @@ collect_diagnostics() {
 
 cleanup() {
   [ -n "$pf_pid" ] && kill "$pf_pid" 2>/dev/null || true
+  [ -n "$http_pf_pid" ] && kill "$http_pf_pid" 2>/dev/null || true
   [ -n "$tmpdir" ] && rm -rf "$tmpdir"
   # Only tear the cluster down if we created it (lets local devs pre-create a
   # cluster and re-run the smoke without paying the create cost each time).
@@ -280,7 +289,7 @@ on_exit() {
 trap on_exit EXIT
 
 # --- prereq checks ----------------------------------------------------------
-for bin in docker kubectl grpcurl "$KIND"; do
+for bin in docker kubectl curl grpcurl "$KIND"; do
   command -v "$bin" >/dev/null 2>&1 || fail "missing required tool on PATH: $bin"
 done
 
@@ -424,6 +433,35 @@ until [ -n "$observed" ]; do
   sleep 3
 done
 log "cacheindex/cluster-default.status.observedServer=$observed"
+
+# The CacheIndex table is the operator-facing view for the status poller. Check
+# the installed CRD renders the Prefixes/Changed columns and that their JSONPath
+# targets actually populate cells in the row instead of falling back to a
+# header-only/default NAME/AGE table.
+ci_table="$(kubectl get ci cluster-default 2>/dev/null || true)"
+ci_header="$(printf '%s\n' "$ci_table" | sed -n '1p')"
+ci_row="$(printf '%s\n' "$ci_table" | sed -n '2p')"
+for column in PREFIXES CHANGED; do
+  if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$ci_header"; then
+    echo "$ci_table"
+    fail "expected CacheIndex printer column ${column} in kubectl get output"
+  fi
+done
+if ! grep -Fq "cluster-default" <<<"$ci_row"; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer row to include cluster-default"
+fi
+ci_prefixes="$(awk 'NR==2 {print $2}' <<<"$ci_table")"
+ci_changed="$(awk 'NR==2 {print $3}' <<<"$ci_table")"
+if [ "$ci_prefixes" != "0" ]; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer column Prefixes=0 in kubectl get output, got: ${ci_prefixes:-<empty>}"
+fi
+if [ -z "$ci_changed" ] || [ "$ci_changed" = "<none>" ] || [ "$ci_changed" = "<unknown>" ]; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer column Changed to be populated in kubectl get output"
+fi
+log "CacheIndex printer columns render Prefixes=$ci_prefixes Changed=$ci_changed"
 
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing
@@ -575,6 +613,42 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
+
+# --- server HTTP surface assertion -----------------------------------------
+# The installed Service also exposes the operator/observability HTTP surface on
+# :8080. Probe it through kubectl port-forward so this covers Service wiring,
+# the real process listeners, readiness, and Prometheus registration together.
+log "port-forwarding svc/inference-cache-server :8080 -> localhost:$HTTP_LOCAL_PORT"
+kubectl -n "$NAMESPACE" port-forward svc/inference-cache-server "$HTTP_LOCAL_PORT:8080" \
+  >"$LOG_DIR/port-forward-http.log" 2>&1 &
+http_pf_pid=$!
+
+http_ready=0
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 2 "http://localhost:$HTTP_LOCAL_PORT/readyz" \
+       >"$LOG_DIR/readyz.out" 2>"$LOG_DIR/readyz.err"; then
+    http_ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$http_ready" != "1" ]; then
+  cat "$LOG_DIR/port-forward-http.log" >&2 || true
+  cat "$LOG_DIR/readyz.err" >&2 || true
+  fail "server /readyz did not return 200 on :8080 within 30s"
+fi
+
+if ! curl -fsS --max-time 5 "http://localhost:$HTTP_LOCAL_PORT/metrics" \
+      >"$LOG_DIR/metrics.out" 2>"$LOG_DIR/metrics.err"; then
+  cat "$LOG_DIR/port-forward-http.log" >&2 || true
+  cat "$LOG_DIR/metrics.err" >&2 || true
+  fail "server /metrics did not return 200 on :8080"
+fi
+if ! grep -Eq '^inferencecache_server_up[[:space:]]+1([[:space:]]|$)' "$LOG_DIR/metrics.out"; then
+  grep -n 'inferencecache_server_up' "$LOG_DIR/metrics.out" >&2 || true
+  fail "server /metrics did not expose inferencecache_server_up 1"
+fi
+log "server HTTP surface OK: /readyz returned 200 and /metrics exposes inferencecache_server_up 1"
 
 # --- gRPC default posture assertion (plaintext) ----------------------------
 # config/default serves :9090 plaintext. Assert a plaintext client can list the
@@ -1539,7 +1613,7 @@ log "opt-in TLS overlay OK: plaintext rejected; cert-manager CA verifies the ser
 
 # Backward-compatibility: the EXISTING call pattern must work UNCHANGED over
 # TLS. Re-run the same LookupRoute(unknown model) the plaintext phase ran (phase
-# 5) and assert the identical fail-open result (reason_code=NO_HINT) — proving
+# 6) and assert the identical fail-open result (reason_code=NO_HINT) — proving
 # TLS is a pure transport wrapper that does not alter the gRPC contract or
 # handler behavior, so a client only swaps plaintext creds for TLS creds.
 # Reflection first, proto-file fallback (same priority order as the plaintext
@@ -1558,7 +1632,6 @@ if ! has_reason_code "$tls_lookup_resp" "NO_HINT"; then
   fail "LookupRoute over TLS did not return the fail-open NO_HINT the plaintext path returns (TLS altered handler behavior): $tls_lookup_resp"
 fi
 log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HINT, identical to the plaintext phase"
-
 
 # --- sample-manifest apply-clean backstop ----------------------------------
 # Every YAML under config/samples/ must apply cleanly against the running
@@ -1681,4 +1754,4 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
