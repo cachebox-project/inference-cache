@@ -80,6 +80,11 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	authn, err := auth.NewAuthenticator(auth.Options{
 		Reviewer:               auth.FromClientset(clientset),
 		ExpectedServiceAccount: expectedSA,
+		// /policy shares the controller-audience gate with /snapshot; this
+		// envtest pins the over-the-wire enforcement on the write side. The
+		// wrong-audience case below proves the apiserver actually rejects a
+		// token whose JWT audience doesn't match TokenReviewSpec.Audiences.
+		Audience: auth.ControllerAudience,
 	})
 	if err != nil {
 		t.Fatalf("auth.NewAuthenticator: %v", err)
@@ -98,15 +103,22 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 
 	// Stage SA tokens via TokenRequest, write each to a tmpfile in the
 	// kubelet shape (trailing newline, mode 0o600). bearerToken() trims the
-	// newline before sending.
-	mintTokenFile := func(saName string) string {
+	// newline before sending. The audience parameter is what the apiserver
+	// bakes into the JWT's `aud` claim — keeping it overridable lets the
+	// wrong-audience negative case mint a same-SA token with a deliberately
+	// non-matching audience.
+	mintTokenFile := func(saName, audience string) string {
 		t.Helper()
 		exp := int64(3600)
+		spec := authnv1.TokenRequestSpec{ExpirationSeconds: &exp}
+		if audience != "" {
+			spec.Audiences = []string{audience}
+		}
 		tr, err := clientset.CoreV1().ServiceAccounts(ns).CreateToken(ctx, saName, &authnv1.TokenRequest{
-			Spec: authnv1.TokenRequestSpec{ExpirationSeconds: &exp},
+			Spec: spec,
 		}, metav1.CreateOptions{})
 		if err != nil {
-			t.Fatalf("CreateToken(%s): %v", saName, err)
+			t.Fatalf("CreateToken(%s, audience=%q): %v", saName, audience, err)
 		}
 		path := filepath.Join(t.TempDir(), saName+"-token")
 		if err := os.WriteFile(path, []byte(tr.Status.Token+"\n"), 0o600); err != nil {
@@ -114,8 +126,9 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 		}
 		return path
 	}
-	controllerTokenFile := mintTokenFile(controllerSA)
-	otherTokenFile := mintTokenFile(otherSA)
+	controllerTokenFile := mintTokenFile(controllerSA, auth.ControllerAudience)
+	otherTokenFile := mintTokenFile(otherSA, auth.ControllerAudience)
+	wrongAudienceTokenFile := mintTokenFile(controllerSA, "wrong-audience")
 	emptyTokenFile := filepath.Join(t.TempDir(), "empty-token")
 	if err := os.WriteFile(emptyTokenFile, []byte(""), 0o600); err != nil {
 		t.Fatalf("write empty token file: %v", err)
@@ -158,6 +171,22 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("handler invoked %d times after 401, want 1", calls)
+	}
+
+	// Wrong audience: same controller SA, valid token shape, but the JWT
+	// audience does NOT match the middleware's TokenReviewSpec.Audiences.
+	// The apiserver rejects on audience grounds → TokenReview returns
+	// !Authenticated → middleware 401. Pins that audience binding is
+	// actually enforced over the wire on the /policy path (not just on
+	// /snapshot), and that flipping the audience without flipping the
+	// projection at the same time would correctly fail-closed instead of
+	// silently admitting.
+	r.BearerTokenPath = wrongAudienceTokenFile
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
+		t.Fatal("Reconcile with wrong-audience controller-SA token: expected non-nil error (401), got nil")
+	}
+	if calls != 1 {
+		t.Fatalf("handler invoked %d times after wrong-audience 401, want 1", calls)
 	}
 
 	// Recovery: re-pointing at the controller token converges again — proves

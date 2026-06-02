@@ -23,18 +23,45 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 | `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
 
 Both `/snapshot` and `/policy` sit on the server's internal `:8081`
-listener, gated by TokenReview-backed bearer auth and a NetworkPolicy
-that restricts ingress to the controller's pod selector. `/healthz`,
-`/readyz`, and `/metrics` stay on the open `:8080` listener — kubelet
-probes and Prometheus scrapes can't present a SA bearer. The two
-internal endpoints share one auth profile because they share one caller
-identity (the controller SA). `/snapshot` is the *read* side (CacheIndex
-poll, info leak if exposed) and `/policy` is the *write* side
-(CachePolicy push, active tampering if exposed) — write is more
-dangerous because replace-on-write semantics mean a rogue POST overrides
-every namespace's policy state cluster-wide with no audit trail. The
-read-side hardening landed first; the write side joined it on the same
-gate.
+listener with **three independent gates**, each meant to catch a failure
+mode the others can't. `/healthz`, `/readyz`, and `/metrics` stay on
+the open `:8080` listener — kubelet probes and Prometheus scrapes can't
+present a SA bearer.
+
+1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
+   controller's selector.
+2. **L7 identity** — TokenReview-backed bearer middleware rejects every
+   request whose token does not resolve to the configured controller
+   `ServiceAccount` (`--allowed-controller-sa`).
+3. **L7 audience** — the controller mounts an audience-bound projected
+   SA token (audience `inferencecache.io/controller`); the server passes
+   `TokenReviewSpec.Audiences=[--controller-audience]` so a leaked
+   default-audience apiserver token from the same SA is rejected, and a
+   leaked controller-audience token is useless against the apiserver
+   **under the default apiserver audience configuration**. If the
+   cluster has been explicitly configured to also accept
+   `inferencecache.io/controller` as an apiserver audience the
+   cross-surface defense degrades; keep this audience distinct from
+   any audience the apiserver accepts.
+
+The two internal endpoints share one auth profile because they share
+one caller identity (the controller SA). `/snapshot` is the *read* side
+(CacheIndex poll, info leak if exposed) and `/policy` is the *write*
+side (CachePolicy push, active tampering if exposed) — write is more
+dangerous because replace-on-write semantics mean a rogue POST
+overrides every namespace's policy state cluster-wide with no audit
+trail. The read-side hardening landed first; the write side joined it
+on the same gate, with the audience layer hardening both endpoints
+uniformly.
+
+`inferencecache_snapshot_auth_total` and `inferencecache_policy_auth_total`
+are the per-endpoint observability surfaces for the two L7 layers
+(identity + audience); audience-mismatch denials surface in the
+`unauth` bucket of each counter, with the apiserver's diagnostic
+visible at WARN in the server log (e.g. `token audiences [...] is
+invalid for the target audiences [...]`). NetworkPolicy drops happen
+at the CNI before the listener and are observed via kube state metrics
++ CNI flow logs, not these counters.
 
 ## Snapshot semantics
 
@@ -208,9 +235,6 @@ out together and the periodic re-push reconciles any transient skew.
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
 - mTLS for `/policy` and `/snapshot` — the current shape ships
-  TokenReview-backed bearer auth + a NetworkPolicy gate; mTLS is a
-  separate hardening step tracked under the gRPC TLS posture decision.
-- Audience-binding the projected SA token — extends the bearer the
-  controller sends so it is only accepted by this server's audience,
-  defeating cross-service token reuse if the same identity ever fronts
-  another in-cluster service.
+  TokenReview-backed bearer auth + audience binding + a NetworkPolicy
+  gate; mTLS is a separate hardening step tracked under the gRPC TLS
+  posture decision.

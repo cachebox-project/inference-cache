@@ -57,6 +57,7 @@ type Option func(*Service)
 type controllerAuthConfig struct {
 	reviewer auth.TokenReviewer
 	saName   string
+	audience string
 }
 
 // WithControllerAuth wires bearer-token authentication onto the controller-
@@ -65,9 +66,15 @@ type controllerAuthConfig struct {
 // the production binary always sets it. expectedSA is the canonical
 // ServiceAccount username, e.g.
 // "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
-func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA string) Option {
+// audience is the value passed to TokenReviewSpec.Audiences (audience
+// binding); pass an empty string to disable audience binding (legacy
+// posture). The production binary defaults audience to
+// auth.ControllerAudience and must keep it aligned with the controller's
+// projected SA token volume. The same audience gates BOTH endpoints because
+// they share one middleware identity (the controller SA).
+func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string) Option {
 	return func(s *Service) {
-		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA}
+		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA, audience: audience}
 	}
 }
 
@@ -173,18 +180,21 @@ func New(opts ...Option) *Service {
 		opt(s)
 	}
 	// If auth is configured, wrap /snapshot and /policy in the TokenReview
-	// middleware. Two Authenticator instances share the same Reviewer and
-	// ExpectedSA but emit per-endpoint metrics
+	// middleware. Two Authenticator instances share the same Reviewer,
+	// ExpectedSA, and Audience but emit per-endpoint metrics
 	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total)
 	// so a dashboard can distinguish a read-side auth failure (info leak
 	// attempt) from a write-side one (active tampering attempt). The two
 	// caches are independent — one extra TokenReview per endpoint per TTL
 	// window in the steady state, negligible vs the apiserver's own auth
-	// cost.
+	// cost. The shared Audience means the projected SA token at the
+	// controller's volume mount admits to both endpoints uniformly; there's
+	// one trust boundary, not two.
 	if s.controllerAuthCfg != nil {
 		snapshotAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,
 			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Audience:               s.controllerAuthCfg.audience,
 			Recorder:               s.metrics.SnapshotAuthRecorder(),
 		})
 		if err != nil {
@@ -196,6 +206,7 @@ func New(opts ...Option) *Service {
 		policyAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,
 			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Audience:               s.controllerAuthCfg.audience,
 			Recorder:               s.metrics.PolicyAuthRecorder(),
 		})
 		if err != nil {
