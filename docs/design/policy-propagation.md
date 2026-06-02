@@ -186,10 +186,9 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 
-`failOpen` and `tenantScoped` are part of the CRD but not enforced by
-this propagation path: the server is already fail-open by construction
-(no error on the hot path), and `tenantScoped` is reserved for future
-multi-tenant lookup scoping.
+The server is fail-open by construction on the hot path (no error
+returned to the gateway); a `CachePolicy`-level fail-open knob is not
+part of the propagated wire format.
 
 The `/policy` snapshot carries both `[]ResolvedPolicy` (keyed by namespace)
 and `[]ResolvedTenant` (keyed by `tenantID`). A single controller reconciler

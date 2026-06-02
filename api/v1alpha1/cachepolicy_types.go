@@ -5,20 +5,30 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// +kubebuilder:validation:Enum=LRU;LFU
-
-// CachePolicyEvictionAlgorithm identifies how cache entries are evicted.
+// CachePolicyEvictionAlgorithm identifies an index entry-eviction algorithm.
+// The enum is intentionally narrow today (LRU only) and grows as additional
+// algorithms are implemented in pkg/index. The field is reserved on the
+// v1alpha1 surface so the schema is forward-compatible; pkg/index currently
+// runs LRU-by-`lastSeen` unconditionally and the controller does not yet
+// propagate this field into ResolvedPolicy.
 type CachePolicyEvictionAlgorithm string
 
 const (
+	// CachePolicyEvictionAlgorithmLRU evicts the entry with the oldest
+	// lastSeen timestamp first. This is the implementation today.
 	CachePolicyEvictionAlgorithmLRU CachePolicyEvictionAlgorithm = "LRU"
-	CachePolicyEvictionAlgorithmLFU CachePolicyEvictionAlgorithm = "LFU"
 )
 
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
-	// Eviction is the cache eviction algorithm.
+	// Eviction is the index entry-eviction algorithm. Reserved on
+	// v1alpha1 for forward compatibility; defaults to LRU. Today pkg/index
+	// runs LRU unconditionally and this field is not yet consulted by the
+	// controller. Additional algorithms extend the enum and gain a
+	// ResolvedPolicy propagation path as their implementations land.
 	// +optional
+	// +kubebuilder:validation:Enum=LRU
+	// +kubebuilder:default=LRU
 	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
 
 	// EvictionTTL is the maximum time a cache entry should remain usable.
@@ -34,15 +44,6 @@ type CachePolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
-
-	// FailOpen keeps inference serving when the cache is unreachable.
-	// +optional
-	// +kubebuilder:default=true
-	FailOpen *bool `json:"failOpen,omitempty"`
-
-	// TenantScoped restricts the policy to tenant-local lookups.
-	// +optional
-	TenantScoped *bool `json:"tenantScoped,omitempty"`
 }
 
 // CachePolicyStatus defines observed policy state.
@@ -62,7 +63,6 @@ type CachePolicyStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=cpol
 // +kubebuilder:printcolumn:name="Eviction",type=string,JSONPath=`.spec.eviction`
-// +kubebuilder:printcolumn:name="FailOpen",type=boolean,JSONPath=`.spec.failOpen`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CachePolicy is the Schema for cache lookup and eviction policy.
