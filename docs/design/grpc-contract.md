@@ -19,7 +19,9 @@ Versioned `v1alpha1` → `v1beta1` → `v1`. No vendor tokens in the package or 
 
 ```protobuf
 service InferenceCache {
-  // Consumer side (gateways) — side-effect-free, fail-open.
+  // Consumer side (gateways) — fail-open; side-effect-free apart from metrics
+  // (and the narrow LFU access-counter credit on delivered LookupRoute hits —
+  // see Contract guarantees).
   rpc RenderTemplate (RenderTemplateRequest) returns (RenderTemplateResponse);
   rpc LookupRoute    (LookupRouteRequest)    returns (LookupRouteResponse);
   rpc LookupPDRoute  (LookupPDRouteRequest)  returns (LookupPDRouteResponse);

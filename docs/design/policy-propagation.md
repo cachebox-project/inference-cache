@@ -3,8 +3,9 @@
 Status: implemented · Owners: controller (push) + server (apply)
 
 `CachePolicy` is a namespaced CRD reconciled by the controller, but its
-enforcement (eviction TTL, lookup threshold, lookup deadline) lives in the
-policy server. This document describes how the controller PROPAGATES the
+enforcement (eviction TTL, eviction algorithm, lookup threshold, lookup
+deadline) lives in the policy server. This document describes how the controller
+PROPAGATES the
 declarative CRs into the server's runtime so the configuration surface
 actually changes server behavior.
 
@@ -107,7 +108,7 @@ intervention.
 
 - `version` — schema version. Bumped on a breaking change. The server
   rejects any value it does not recognize (HTTP 400). Currently `3`
-  (bumped from `1` when `tenants` was added, then to `3` when
+  (bumped from `1` to `2` when `tenants` was added, then to `3` when
   `policies[].eviction` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
