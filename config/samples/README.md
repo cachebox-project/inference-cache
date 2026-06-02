@@ -11,9 +11,10 @@ This directory holds two flavors of `inferencecache.io/v1alpha1` sample CRs:
 
 ## Apply-clean is enforced
 
-Every sample under this directory MUST apply cleanly against a cluster
-running the current CRD schema and the CacheBackend admission webhook. CI
-enforces this via:
+Every non-skipped sample under this directory MUST apply cleanly
+against a cluster running the current CRD schema and the CacheBackend
+admission webhook. (See the opt-out section below for the narrow
+escape hatch.) CI enforces this via:
 
 ```bash
 make verify-samples
@@ -49,12 +50,17 @@ on every push would slow down the inner loop more than it's worth.
 
 If a sample is intentionally illustrative and is expected to be rejected
 by the current schema (rare — almost always a sign the sample should be
-fixed instead), add this exact line as a top-of-file comment, **before**
-any non-comment line:
+fixed instead), add this line as a top-of-file comment, **before** any
+non-comment line:
 
 ```yaml
 # verify-samples: skip
 ```
+
+The parser trims surrounding whitespace, so leading/trailing spaces on
+the comment line are tolerated; everything else (extra punctuation,
+trailing tokens, a different prefix) is NOT a match and the sample will
+still be applied.
 
 The gate reports such files as `SKIP` and does not apply them. Use this
 sparingly — every skipped sample is a class of drift that no longer has
