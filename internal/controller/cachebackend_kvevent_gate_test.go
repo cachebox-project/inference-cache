@@ -50,7 +50,7 @@ func setFirstAvailableAt(t *testing.T, cl client.Client, name, ns string, at tim
 }
 
 // setDeploymentHTTPReady drives a managed backend's Deployment to the
-// engine-HTTP-Ready state managedHealth keys on (rolled out + all replicas
+// engine-HTTP-Ready state managedReadiness keys on (rolled out + all replicas
 // available). It also stamps the Available condition LastTransitionTime to
 // availableSince — used only to simulate availability flaps; the gate's
 // firstEventTimeout anchor is the latched status.firstAvailableAt, not this
@@ -116,9 +116,6 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		cb := getBackend(t, r, "cache", ns)
-		if cb.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-			t.Fatalf("health = %q, want Pending", cb.Status.Health)
-		}
 		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
 			t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent", ready)
@@ -139,9 +136,6 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		cb := getBackend(t, r, "cache", ns)
-		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("health = %q, want Ready", cb.Status.Health)
-		}
 		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != reasonKVEventsObserved {
 			t.Fatalf("Ready = %+v, want True/KVEventsObserved", ready)
@@ -169,8 +163,8 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		if cb.Status.FirstKVEventObservedAt == nil {
 			t.Fatalf("firstKVEventObservedAt = nil, want latched after first event")
 		}
-		if cb.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("pre-drain health = %q, want Ready", cb.Status.Health)
+		if r := findCondition(cb.Status.Conditions, conditionTypeReady); r == nil || r.Status != metav1.ConditionTrue {
+			t.Fatalf("pre-drain Ready = %+v, want True", r)
 		}
 
 		// Simulate the poller draining the projection: prefixCount 0, lastEventAt nil.
@@ -182,12 +176,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("post-drain health = %q, want Ready (latched)", got.Status.Health)
-		}
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != reasonKVEventsObserved {
-			t.Fatalf("post-drain Ready = %+v, want True/KVEventsObserved", ready)
+			t.Fatalf("post-drain Ready = %+v, want True/KVEventsObserved (latched)", ready)
 		}
 	})
 
@@ -207,9 +198,6 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("health = %q, want Degraded", got.Status.Health)
-		}
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonNoKVEventsObserved {
 			t.Fatalf("Ready = %+v, want False/NoKVEventsObserved", ready)
@@ -237,8 +225,8 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
 		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
 		reconcile(t, r, "cache", ns)
-		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("pre-flap health = %q, want Degraded", got)
+		if deg := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeDegraded); deg == nil || deg.Status != metav1.ConditionTrue {
+			t.Fatalf("pre-flap Degraded = %+v, want True", deg)
 		}
 
 		// Simulate a flap: the live Deployment Available condition resets to now
@@ -248,12 +236,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("post-flap health = %q, want Degraded (sticky, not AwaitingFirstKVEvent)", got.Status.Health)
-		}
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Reason != reasonNoKVEventsObserved {
-			t.Fatalf("post-flap Ready = %+v, want reason NoKVEventsObserved (degraded state held)", ready)
+			t.Fatalf("post-flap Ready = %+v, want reason NoKVEventsObserved (degraded state held, not AwaitingFirstKVEvent)", ready)
 		}
 	})
 
@@ -273,8 +258,8 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
 		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
 		reconcile(t, r, "cache", ns)
-		if got := getBackend(t, r, "cache", ns).Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("pre-bump health = %q, want Degraded", got)
+		if deg := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeDegraded); deg == nil || deg.Status != metav1.ConditionTrue {
+			t.Fatalf("pre-bump Degraded = %+v, want True", deg)
 		}
 
 		// Operator increases the timeout to well beyond the elapsed window.
@@ -286,12 +271,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
-			t.Fatalf("post-bump health = %q, want Degraded (sticky despite timeout increase)", got.Status.Health)
-		}
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Reason != reasonNoKVEventsObserved {
-			t.Fatalf("post-bump Ready = %+v, want reason NoKVEventsObserved", ready)
+			t.Fatalf("post-bump Ready = %+v, want reason NoKVEventsObserved (sticky despite timeout increase)", ready)
 		}
 	})
 
@@ -307,12 +289,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("opted-out health = %q, want Ready without any KV event", got.Status.Health)
-		}
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason == reasonKVEventsObserved {
-			t.Fatalf("Ready = %+v, want True via the Deployment-rollout reason (not the gate)", ready)
+			t.Fatalf("opted-out Ready = %+v, want True via the Deployment-rollout reason (not the gate)", ready)
 		}
 	})
 
@@ -360,9 +339,6 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
 		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
 			t.Fatalf("Ready = %+v, want True/ExternalEndpointAccepted (endpoint-driven, not gated)", ready)
-		}
-		if got.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-			t.Fatalf("health = %q, want Ready (endpoint accepted)", got.Status.Health)
 		}
 		if deg := findCondition(got.Status.Conditions, conditionTypeDegraded); deg != nil {
 			t.Fatalf("Degraded = %+v, want absent for External", deg)
@@ -465,8 +441,8 @@ func TestKVEventGateEmitsTransitionEvents(t *testing.T) {
 	patchLastEventAt(t, r.Client, "cache", "ns1", time.Now())
 	reconcile(t, r, "cache", "ns1")
 	expectEvent(t, drainEvents(rec), reasonKVEventsObserved)
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("health = %q, want Ready", got)
+	if r := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); r == nil || r.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True", r)
 	}
 }
 
@@ -480,7 +456,7 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	r, rec := newReconcilerWithRecorder(t, cb)
 	reconcile(t, r, "cache", "ns1")
 
-	// Deployment Ready (managedHealth keys on replica counts), and the latched
+	// Deployment Ready (managedReadiness keys on replica counts), and the latched
 	// first-Available anchor placed before the 1s window.
 	markDeploymentReady(t, r, "cache", "ns1", 1)
 	setFirstAvailableAt(t, r.Client, "cache", "ns1", time.Now().Add(-5*time.Second))
@@ -488,8 +464,8 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 
 	reconcile(t, r, "cache", "ns1")
 	expectEvent(t, drainEvents(rec), reasonNoKVEventsObserved)
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthDegraded {
-		t.Fatalf("health = %q, want Degraded", got)
+	if deg := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeDegraded); deg == nil || deg.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded = %+v, want True", deg)
 	}
 }
 
@@ -527,8 +503,8 @@ func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 	evs := drainEvents(rec)
 	expectNoEvent(t, evs, reasonKVEventsObserved)
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("health = %q, want Ready", got)
+	if r := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); r == nil || r.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True", r)
 	}
 }
 
@@ -545,8 +521,8 @@ func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	markDeploymentReady(t, r, "cache", "ns1", 1)
 	patchLastEventAt(t, r.Client, "cache", "ns1", time.Now())
 	reconcile(t, r, "cache", "ns1")
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("setup health = %q, want Ready", got)
+	if r := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); r == nil || r.Status != metav1.ConditionTrue {
+		t.Fatalf("setup Ready = %+v, want True", r)
 	}
 	drainEvents(rec) // discard the initial KVEventsObserved
 
@@ -588,8 +564,8 @@ func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if got := getBackend(t, r, "cache", "ns1").Status.Health; got != cachev1alpha1.CacheBackendHealthPending {
-		t.Fatalf("health = %q, want Pending (AwaitingFirstKVEvent precondition)", got)
+	if rd := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); rd == nil || rd.Status != metav1.ConditionFalse || rd.Reason != reasonAwaitingFirstKVEvent {
+		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (precondition)", rd)
 	}
 	if res.RequeueAfter != 7*time.Second {
 		t.Fatalf("RequeueAfter = %s, want 7s (matched-pods cadence must win over the gate's firstEventTimeout window)", res.RequeueAfter)

@@ -3,10 +3,16 @@
 # healthy, serving backend from a CR on a GPU-free cluster (kind):
 #
 #   kubectl apply CacheBackend(profile=cpu) --> controller --> Deployment + Service
-#     --> CPU vLLM pods become Ready --> status.health=Ready, status.endpoint set
+#     --> cache-server Deployment becomes Available --> Ready condition True,
+#         status.endpoint set
 #
-# Optionally drives prefix traffic through the Service and checks an engine
-# prefix-cache hit. Deleting the CR garbage-collects the children via owner refs.
+# Optionally drives prefix traffic and checks an engine prefix-cache hit — but
+# this is opt-in (SKIP_TRAFFIC=0). The traffic block expects a vLLM HTTP surface
+# on a port-forward target the script does NOT set up by default (the cache-
+# server Service exposes only the LMCache TCP lm:// port). Operators wiring a
+# vLLM engine alongside the canary need to also point the port-forward at the
+# engine Service before flipping the toggle. Deleting the CR garbage-collects
+# the children via owner refs.
 #
 # This exercises the reconciler end to end against real pods — the gap envtest
 # can't cover. It uses the CPU profile (no GPU, no LMCache offload); real LMCache
@@ -31,7 +37,16 @@ KIND_CLUSTER="${KIND_CLUSTER:-ic-c2-canary}"
 NAMESPACE="${NAMESPACE:-c2-canary}"
 CR_NAME="${CR_NAME:-canary}"
 READY_TIMEOUT="${READY_TIMEOUT:-900}" # seconds for the CPU model to load + become Ready
-SKIP_TRAFFIC="${SKIP_TRAFFIC:-0}"
+# The traffic block port-forwards `svc/$CR_NAME` to a `:8000` vLLM HTTP
+# surface and asserts a prefix-cache hit via the vllm:prefix_cache_hits_total
+# metric — a holdover from the retired colocated-rendering profile that
+# bundled vLLM into the cache-server pod. The modern split layout exposes
+# only the LMCache server on `:65432` (TCP lm://), with no vLLM and no
+# HTTP /metrics on the cache-server Service, so the traffic path cannot
+# succeed unless the operator wires a separate engine Service AND repoints
+# the port-forward below at it. Default the toggle OFF; operators who set up
+# both pieces flip SKIP_TRAFFIC=0 to opt back in.
+SKIP_TRAFFIC="${SKIP_TRAFFIC:-1}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
@@ -80,6 +95,12 @@ kind: CacheBackend
 metadata:
   name: $CR_NAME
   namespace: $NAMESPACE
+  annotations:
+    # Opt OUT of the KV-event readiness gate: this canary exercises the C2
+    # reconciler's Deployment-rollout path and the operator-managed cache
+    # server has no engine pods wired in, so the gate would deadlock on the
+    # default-on AwaitingFirstKVEvent state. A separate canary covers the gate.
+    inferencecache.io/require-kv-events: "false"
 spec:
   type: LMCache
   deploymentKind: Deployment
@@ -91,19 +112,19 @@ spec:
 EOF
 
 # --- wait for the reconciler to report Ready --------------------------------
-log "waiting up to ${READY_TIMEOUT}s for status.health=Ready (CPU model load is slow)"
+log "waiting up to ${READY_TIMEOUT}s for the Ready condition to be True (CPU model load is slow)"
 deadline=$(($(date +%s) + READY_TIMEOUT))
-health=""
-until [ "$health" = "Ready" ]; do
-  health="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.health}' 2>/dev/null || true)"
+ready=""
+until [ "$ready" = "True" ]; do
+  ready="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get pods -o wide || true
     kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" describe deployment "$CR_NAME" || true
-    fail "backend did not become Ready within ${READY_TIMEOUT}s (last health='$health')"
+    fail "backend did not become Ready within ${READY_TIMEOUT}s (last Ready status='$ready')"
   fi
   sleep 5
 done
-log "status.health=Ready"
+log "Ready=True"
 
 endpoint="$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.endpoint}')"
 [ -n "$endpoint" ] || fail "status.endpoint was not published"

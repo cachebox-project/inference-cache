@@ -128,6 +128,13 @@ kind: CacheBackend
 metadata:
   name: $CR_NAME
   namespace: $NAMESPACE
+  annotations:
+    # Opt OUT of the KV-event readiness gate: this canary applies the CR and
+    # waits for the cache-server to be Ready BEFORE creating the engine pods
+    # that would produce KV events. With the default-on gate, that ordering
+    # would deadlock at AwaitingFirstKVEvent. The gate is exercised by a
+    # dedicated canary; here Ready is workload-availability driven.
+    inferencecache.io/require-kv-events: "false"
 spec:
   type: LMCache
   deploymentKind: Deployment
@@ -142,7 +149,7 @@ EOF
 
 log "waiting up to ${READY_TIMEOUT}s for the lmcache-server CacheBackend to reach Ready"
 deadline=$(($(date +%s) + READY_TIMEOUT))
-until [ "$(kubectl "${KCTX[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.health}' 2>/dev/null)" = "Ready" ]; do
+until [ "$(kubectl "${KCTX[@]}" -n "$NAMESPACE" get cachebackend "$CR_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl "${KCTX[@]}" -n "$NAMESPACE" get pods -o wide || true
     kubectl "${KCTX[@]}" -n "$NAMESPACE" describe cachebackend "$CR_NAME" || true

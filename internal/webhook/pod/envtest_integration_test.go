@@ -151,7 +151,6 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("create CacheBackend: %v", err)
 	}
 	cb.Status.Endpoint = "envtest-cb.default.svc.cluster.local:65432"
-	cb.Status.Health = cachev1alpha1.CacheBackendHealthReady
 	if err := mgr.GetClient().Status().Update(ctx, cb); err != nil {
 		t.Fatalf("set CacheBackend status: %v", err)
 	}

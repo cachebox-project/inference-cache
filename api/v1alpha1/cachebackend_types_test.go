@@ -39,10 +39,18 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		}
 	}
 
-	for _, field := range []string{"endpoint", "health", "capacity", "matchedEnginePods", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
+	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
+	// health was removed in this PR. Both are guarded by requireNoProperty checks below.
+	for _, field := range []string{"endpoint", "capacity", "matchedEnginePods", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
+	}
+	// status.health was removed in favour of the standard
+	// status.conditions[Ready] surface; guard against accidental
+	// re-introduction.
+	if hasProperty(statusSchema, "health") {
+		t.Fatalf("status.health is present in CRD schema; it must be removed in favour of status.conditions[Ready]")
 	}
 
 	requireNoEnum(t, mustProperty(t, specSchema, "type"))
@@ -63,12 +71,6 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	if got, ok := failOpenSchema["default"].(bool); !ok || !got {
 		t.Fatalf("integration.failOpen default = %v, want true", failOpenSchema["default"])
 	}
-	requireEnum(t, mustProperty(t, statusSchema, "health"), []string{
-		"Pending",
-		"Ready",
-		"Degraded",
-		"Failed",
-	})
 	templateSchema := mustProperty(t, specSchema, "template")
 	requireNoPreserveUnknownFields(t, templateSchema)
 	for _, field := range []string{"nodeSelector", "tolerations", "affinity"} {
@@ -114,6 +116,7 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 	columns := mustPath[[]any](t, version, "additionalPrinterColumns")
 
 	want := map[string]string{
+		"Ready":    `.status.conditions[?(@.type=="Ready")].status`,
 		"Endpoint": ".status.endpoint",
 		"Matched":  ".status.matchedEnginePods",
 	}
@@ -131,6 +134,10 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 		if got := seen[name]; got != jsonPath {
 			t.Fatalf("print column %q jsonPath = %q, want %q", name, got, jsonPath)
 		}
+	}
+	// Guard against the removed Health column reappearing on a future regen.
+	if got, present := seen["Health"]; present {
+		t.Fatalf("print column %q is present (jsonPath=%q); must be removed in favour of Ready", "Health", got)
 	}
 }
 
@@ -189,7 +196,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 		},
 		Status: CacheBackendStatus{
 			Endpoint: "cache.default.svc:8080",
-			Health:   CacheBackendHealthReady,
 			Capacity: "10Gi",
 			IndexParticipation: &CacheBackendIndexParticipation{
 				PrefixCount: 7,

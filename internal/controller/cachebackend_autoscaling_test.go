@@ -194,9 +194,9 @@ func TestReconcileInitialReplicasDefaultsToOneWithAutoscaling(t *testing.T) {
 func TestReconcileDeploymentClampsToRaisedHPAFloor(t *testing.T) {
 	// When the user raises autoscaling.minReplicas above the current live
 	// replica count, the reconciler must NOT preserve the stale lower value —
-	// otherwise managedHealth would report Ready against the old count before
-	// the HPA controller catches up, briefly publishing a Ready that does not
-	// satisfy the new minimum.
+	// otherwise managedReadiness would report Ready against the old count
+	// before the HPA controller catches up, briefly publishing a Ready that
+	// does not satisfy the new minimum.
 	scheme := newScheme(t)
 	cb := autoscalingBackend("cache", "ns1", 1, 5, nil)
 	r := newReconciler(scheme, cb)
@@ -257,8 +257,9 @@ func TestStatusProgressingTrueWhilePending(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthPending {
-		t.Fatalf("status.health = %q, want Pending right after create", updated.Status.Health)
+	ready := findCondition(updated.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonRolloutInProgress {
+		t.Fatalf("Ready condition = %+v, want False/RolloutInProgress right after create", ready)
 	}
 	prog := findCondition(updated.Status.Conditions, conditionTypeProgressing)
 	if prog == nil || prog.Status != metav1.ConditionTrue {
@@ -286,8 +287,9 @@ func TestStatusProgressingFalseOnceReady(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthReady {
-		t.Fatalf("status.health = %q, want Ready", updated.Status.Health)
+	ready := findCondition(updated.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", ready)
 	}
 	prog := findCondition(updated.Status.Conditions, conditionTypeProgressing)
 	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "Synced" {
@@ -318,8 +320,9 @@ func TestStatusProgressingFalseWhenDegraded(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if updated.Status.Health != cachev1alpha1.CacheBackendHealthDegraded {
-		t.Fatalf("status.health = %q, want Degraded", updated.Status.Health)
+	ready := findCondition(updated.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonReplicasUnavailable {
+		t.Fatalf("Ready condition = %+v, want False/ReplicasUnavailable", ready)
 	}
 	prog := findCondition(updated.Status.Conditions, conditionTypeProgressing)
 	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "Degraded" {
@@ -387,23 +390,30 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 
 // ---- Pure-function coverage -------------------------------------------------
 
-func TestProgressingFromHealthExhaustive(t *testing.T) {
+func TestProgressingFromReadyExhaustive(t *testing.T) {
 	cases := []struct {
-		name       string
-		health     cachev1alpha1.CacheBackendHealth
-		reason     string
-		wantStatus metav1.ConditionStatus
-		wantReason string
+		name        string
+		readyStatus metav1.ConditionStatus
+		reason      string
+		wantStatus  metav1.ConditionStatus
+		wantReason  string
 	}{
-		{"Ready", cachev1alpha1.CacheBackendHealthReady, "BackendReady", metav1.ConditionFalse, "Synced"},
-		{"Pending-rollout", cachev1alpha1.CacheBackendHealthPending, "RolloutInProgress", metav1.ConditionTrue, "RolloutInProgress"},
-		{"Pending-scaled-to-zero", cachev1alpha1.CacheBackendHealthPending, "ScaledToZero", metav1.ConditionFalse, "ScaledToZero"},
-		{"Degraded", cachev1alpha1.CacheBackendHealthDegraded, "ReplicasUnavailable", metav1.ConditionFalse, "Degraded"},
-		{"Failed-passthrough", cachev1alpha1.CacheBackendHealthFailed, "RolloutInProgress", metav1.ConditionFalse, "RolloutInProgress"},
+		{"Ready", metav1.ConditionTrue, conditionReasonBackendReady, metav1.ConditionFalse, "Synced"},
+		{"Pending-rollout", metav1.ConditionFalse, conditionReasonRolloutInProgress, metav1.ConditionTrue, conditionReasonRolloutInProgress},
+		{"Pending-scaled-to-zero", metav1.ConditionFalse, conditionReasonScaledToZero, metav1.ConditionFalse, conditionReasonScaledToZero},
+		{"Degraded", metav1.ConditionFalse, conditionReasonReplicasUnavailable, metav1.ConditionFalse, "Degraded"},
+		// The KV-event gate's AwaitingFirstKVEvent is still-converging; without
+		// this case the controller would advertise a non-degraded wait window
+		// as stuck (Progressing=False), contradicting the documented contract.
+		{"Awaiting-first-kv-event", metav1.ConditionFalse, reasonAwaitingFirstKVEvent, metav1.ConditionTrue, reasonAwaitingFirstKVEvent},
+		// The gate's NoKVEventsObserved is a stable failure (Degraded);
+		// already not progressing — same shape as ReplicasUnavailable.
+		{"No-kv-events-observed", metav1.ConditionFalse, reasonNoKVEventsObserved, metav1.ConditionFalse, reasonNoKVEventsObserved},
+		{"Unknown-reason-passthrough", metav1.ConditionFalse, "WedgedExternalEndpoint", metav1.ConditionFalse, "WedgedExternalEndpoint"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, reason, _ := progressingFromHealth(tc.health, tc.reason, "msg")
+			status, reason, _ := progressingFromReady(tc.readyStatus, tc.reason, "msg")
 			if status != tc.wantStatus {
 				t.Fatalf("status = %v, want %v", status, tc.wantStatus)
 			}
@@ -434,7 +444,7 @@ func TestDesiredReplicasFallbackToSpecWhenNoAutoscaling(t *testing.T) {
 	}
 }
 
-func TestManagedHealthIgnoresSpecReplicasUnderHPA(t *testing.T) {
+func TestManagedReadinessIgnoresSpecReplicasUnderHPA(t *testing.T) {
 	// spec.replicas=0 with autoscaling set must NOT trip the ScaledToZero
 	// guard — the HPA owns the count, and minReplicas>=1 is enforced by the
 	// kubebuilder validation on autoscaling.minReplicas.
@@ -445,9 +455,9 @@ func TestManagedHealthIgnoresSpecReplicasUnderHPA(t *testing.T) {
 	dep.Status.UpdatedReplicas = 2
 	dep.Status.AvailableReplicas = 2
 
-	health, status, _, _ := managedHealth(cb, dep)
-	if health != cachev1alpha1.CacheBackendHealthReady || status != metav1.ConditionTrue {
-		t.Fatalf("managedHealth = %q/%v, want Ready/True under HPA with 2/2 replicas", health, status)
+	status, reason, _ := managedReadiness(cb, dep)
+	if status != metav1.ConditionTrue || reason != conditionReasonBackendReady {
+		t.Fatalf("managedReadiness = %v/%q, want True/BackendReady under HPA with 2/2 replicas", status, reason)
 	}
 }
 

@@ -926,10 +926,12 @@ log "External CR status: endpoint=$status_endpoint observedGeneration=$observed_
 
 # The CacheBackend printer columns are an operator-facing surface. Verify the
 # table exposes the expected columns and row values instead of regressing to a
-# default NAME/AGE-only table.
+# default NAME/AGE-only table. HEALTH was retired in favour of the Ready
+# condition printer column (see this PR's design-doc carve-out); the row
+# value is the condition's True string rather than the old enum value.
 cb_table="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" 2>/dev/null || true)"
 cb_header="$(printf '%s\n' "$cb_table" | sed -n '1p')"
-for column in TYPE HEALTH MATCHED ENDPOINT PREFIXES LASTEVENT; do
+for column in TYPE READY MATCHED ENDPOINT PREFIXES LASTEVENT; do
   if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$cb_header"; then
     echo "$cb_table"
     fail "expected CacheBackend printer column $column in kubectl get cb output"
@@ -937,12 +939,12 @@ for column in TYPE HEALTH MATCHED ENDPOINT PREFIXES LASTEVENT; do
 done
 if ! grep -Fq "$EXT_SMOKE_CB_NAME" <<<"$cb_table" || \
    ! grep -Fq "External" <<<"$cb_table" || \
-   ! grep -Fq "Ready" <<<"$cb_table" || \
+   ! grep -Fq "True" <<<"$cb_table" || \
    ! grep -Fq "$external_spec_endpoint" <<<"$cb_table"; then
   echo "$cb_table"
-  fail "expected CacheBackend printer row to include name/type/health/endpoint"
+  fail "expected CacheBackend printer row to include name/type/Ready=True/endpoint"
 fi
-log "CacheBackend printer columns render Type/Health/Matched/Endpoint/Prefixes/LastEvent"
+log "CacheBackend printer columns render Type/Ready/Matched/Endpoint/Prefixes/LastEvent"
 
 # No Deployment, no Service should have been rendered for an External CR.
 # A leading API service `kubernetes` doesn't exist in this fresh namespace,

@@ -40,18 +40,6 @@ const (
 	CacheBackendIntegrationRoleReadWrite CacheBackendIntegrationRole = "ReadWrite"
 )
 
-// +kubebuilder:validation:Enum=Pending;Ready;Degraded;Failed
-
-// CacheBackendHealth summarizes the observed backend health.
-type CacheBackendHealth string
-
-const (
-	CacheBackendHealthPending  CacheBackendHealth = "Pending"
-	CacheBackendHealthReady    CacheBackendHealth = "Ready"
-	CacheBackendHealthDegraded CacheBackendHealth = "Degraded"
-	CacheBackendHealthFailed   CacheBackendHealth = "Failed"
-)
-
 // CacheBackendSpec defines the desired state of a cache backend.
 //
 // Persistent storage (spec.storage.pvc) and the autoscaling spec
@@ -221,9 +209,10 @@ type CacheBackendIntegrationSpec struct {
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
 
 	// FirstEventTimeout bounds how long a managed backend may sit
-	// Pending with reason AwaitingFirstKVEvent — the managed cache-backend
+	// Ready=False with reason AwaitingFirstKVEvent — the managed cache-backend
 	// workload is Available but no KV event has been observed yet — before
-	// the controller flips it to Degraded with reason NoKVEventsObserved.
+	// the controller flips it to Ready=False/Degraded=True with reason
+	// NoKVEventsObserved.
 	//
 	// The KV-event readiness gate holds Ready until at least one KV event
 	// has been observed for this backend's replicas
@@ -441,10 +430,6 @@ type CacheBackendStatus struct {
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
-	// Health summarizes the observed backend health.
-	// +optional
-	Health CacheBackendHealth `json:"health,omitempty"`
-
 	// Capacity is a human-readable summary of the backend's provisioned
 	// capacity (e.g. the requested PVC size when persistent storage is
 	// actually wired through to the cache server). It is informational;
@@ -575,7 +560,7 @@ type CacheBackendIndexParticipation struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=cb
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
-// +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedEnginePods`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.indexParticipation.prefixCount`

@@ -207,7 +207,7 @@ func TestReconcileMatchedEnginePodsWriteOnlyOnChange(t *testing.T) {
 
 	// Count only the SubResourcePatch calls that touch the CacheBackend
 	// status — those are the writes the refresher would issue when the
-	// count drifts. Other status patches (Endpoint, Health, ...) flow
+	// count drifts. Other status patches (Endpoint, Conditions, ...) flow
 	// through the same SubResourcePatch interceptor so we filter by
 	// MergePatch payload; the simplest pin is the resource type +
 	// sub-resource name, with the patch contents inspected only in the
@@ -234,7 +234,7 @@ func TestReconcileMatchedEnginePodsWriteOnlyOnChange(t *testing.T) {
 		Build()
 	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
 
-	// First reconcile establishes status (Endpoint, Health, FailOpen) AND
+	// First reconcile establishes status (Endpoint, Conditions, FailOpen) AND
 	// the matchedEnginePods count — both go through SubResourcePatch.
 	reconcile(t, r, "cache", "ns1")
 	firstPasses := atomic.LoadInt32(&cbStatusPatches)
@@ -329,7 +329,7 @@ func TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError(t *testing.T) {
 	// Discriminate the matchedEnginePods patch from the dispatch
 	// patchStatus by inspecting the merge-patch payload — the refresh
 	// is the only writer whose patch carries a "matchedEnginePods"
-	// key (dispatch writes Endpoint/Health/FailOpen/ObservedGeneration
+	// key (dispatch writes Endpoint/Conditions/FailOpen/ObservedGeneration
 	// but never touches the count sub-field).
 	patchErr := errors.New("synthetic apiserver patch failure")
 	var patchCalls int32
@@ -382,7 +382,7 @@ func TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError(t *testing.T) {
 
 // TestReconcileMatchedEnginePodsCoexistsWithOtherStatusWriters confirms the
 // matchedEnginePods writer does not stomp on the other status writers in the
-// same Reconcile (Endpoint, Health, FailOpen, ObservedGeneration) — both run
+// same Reconcile (Endpoint, Conditions, FailOpen, ObservedGeneration) — both run
 // in the same pass and must read each other's writes via the merge patch.
 // Pins the coexistence invariant any future status writer must also satisfy.
 func TestReconcileMatchedEnginePodsCoexistsWithOtherStatusWriters(t *testing.T) {

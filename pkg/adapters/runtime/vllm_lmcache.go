@@ -248,7 +248,7 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			{Name: defaultLMCacheServerPortName, ContainerPort: defaultLMCacheServerPort, Protocol: corev1.ProtocolTCP},
 		},
 		// A TCP-socket readiness probe on the lm:// port gates AvailableReplicas
-		// (and therefore the CacheBackend's Ready condition, via managedHealth)
+		// (and therefore the CacheBackend's Ready condition, via managedReadiness)
 		// on the LMCache server actually accepting connections — otherwise
 		// status could flip Ready before the server is reachable.
 		ReadinessProbe: &corev1.Probe{

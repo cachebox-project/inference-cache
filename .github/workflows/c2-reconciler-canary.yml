@@ -2,8 +2,10 @@
 #
 # Runs docs/reference-stack/scripts/canary_c2_reconcile.sh: brings up a kind
 # cluster, runs the controller, applies a CPU-profile CacheBackend, and asserts
-# the reconciler stands up a healthy serving backend (status.health=Ready,
-# endpoint published), an engine prefix-cache hit, and owner-ref GC on delete.
+# the reconciler stands up a healthy serving backend (Ready condition True,
+# endpoint published) and owner-ref GC on delete. The optional traffic block
+# (engine prefix-cache hit through a port-forwarded Service) is opt-in via
+# SKIP_TRAFFIC=0 — see the script header for what an engine-paired run needs.
 # GPU-free.
 #
 # This is NOT a per-PR gate (it pulls a multi-GB image, needs Docker + kind, and
