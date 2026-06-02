@@ -86,6 +86,18 @@
 #      LookupRoute(unknown model) the plaintext phase (5) ran and asserts the
 #      identical fail-open NO_HINT, proving the existing call pattern is
 #      unchanged over TLS (pure transport wrapper, no contract/behavior change).
+#  12. Every sample manifest under config/samples/ applies cleanly against
+#      the live install: a server-side dry-run apply of each *.yaml/*.yml
+#      exercises CRD structural validation + the validating admission webhook
+#      on the real cluster. Complements `make verify-samples` (which runs the
+#      same assertion at envtest level) by catching admission-wiring failures
+#      envtest masks — the webhook being unreachable/mis-wired on a real
+#      cluster (cert-manager caBundle injection) and the CRDs as actually
+#      installed by config/default. Mirrors verify-samples' sample set and
+#      honors its `# verify-samples: skip` opt-out so the two gates stay in
+#      lockstep. Admission-level only — does NOT create CRs, write status, or
+#      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
+#      phases above cover those). No engine pods, no traffic.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -116,7 +128,7 @@
 #           POLICY_SMOKE_NS, SAMPLE_NS, SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT.
+#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
 
 set -euo pipefail
 
@@ -1547,4 +1559,126 @@ if ! has_reason_code "$tls_lookup_resp" "NO_HINT"; then
 fi
 log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HINT, identical to the plaintext phase"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, and the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS) all work"
+
+# --- sample-manifest apply-clean backstop ----------------------------------
+# Every YAML under config/samples/ must apply cleanly against the running
+# install. Operators copy these as their first-contact recipe; a sample that
+# rejects at admission (names a (runtime, type) pair no shipped adapter
+# supports, populates a field the schema no longer accepts) burns trust on
+# first contact.
+#
+# Envtest-level sample validation already lives in `make verify-samples`
+# (it runs every sample through admission against an in-process apiserver +
+# the CacheBackend webhook). This phase is the live-kind-cluster complement:
+# it exercises the SAME samples against the real default install via
+# server-side dry-run, so it additionally catches admission-path failures
+# that envtest's self-managed apiserver + webhook certs mask — the CacheBackend
+# validating webhook being unreachable or mis-wired on a real cluster
+# (cert-manager-injected caBundle, Service routing, failurePolicy), and the
+# CRDs as actually installed by `kubectl apply -k config/default` rather than
+# from envtest's CRDDirectoryPaths. Belt-and-suspenders against sample drift
+# in the actually-deployed scenario.
+#
+# Scope note: --dry-run=server stops at apiserver admission. It does NOT
+# create CRs, drive controllers, write status, or hit the /policy + /snapshot
+# HTTP endpoints — so it exercises no NetworkPolicy or status-write RBAC (the
+# earlier per-CRD behavioral phases cover those). This is a CRD + admission-
+# wiring backstop, nothing more.
+#
+# Runs LAST: the per-CRD phases above (External backend, CachePolicy push,
+# binding signals) assert behavioral regressions first; this generic
+# apply-clean loop is the catch-all backstop. Server-side dry-run exercises
+# CRD structural validation AND the validating admission webhook without
+# persisting any CRs (nothing to clean up afterwards); the only cluster side
+# effect is one transient namespace, created below and deleted at the end so
+# namespaced samples have a target. Spins up no engine pods (admission-level
+# only, no traffic).
+#
+# Honors the same opt-out as `make verify-samples`: a sample whose top-of-file
+# comment block contains a line equal to `# verify-samples: skip` is reported
+# as SKIP and not applied. Keeping the two gates' sample sets in lockstep
+# means a sample intentionally excluded from one is excluded from both.
+log "asserting every config/samples/ manifest applies cleanly against the live install (server dry-run)"
+SAMPLE_APPLY_NS="${SAMPLE_APPLY_NS:-ic-sample-apply}"
+kubectl create namespace "$SAMPLE_APPLY_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# sample_skip_marker / has_skip_marker mirror hack/verify-samples'
+# hasSkipMarker: scan only the leading comment block (blank + '#'-prefixed
+# lines), stop at the first non-comment line, and match the marker exactly
+# after trimming surrounding whitespace. Defined here (not at the top) to keep
+# the backstop self-contained.
+sample_skip_marker="# verify-samples: skip"
+has_skip_marker() {
+  local f="$1" line trimmed
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"        # ltrim
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"  # rtrim
+    [ -z "$trimmed" ] && continue
+    case "$trimmed" in
+      "#"*) [ "$trimmed" = "$sample_skip_marker" ] && return 0 ;;
+      *) return 1 ;;  # first non-comment line: marker can no longer appear
+    esac
+  done < "$f"
+  return 1
+}
+
+# Enumerate the same sample set as `make verify-samples` (hack/verify-samples'
+# listSamples): every regular *.yaml / *.yml under config/samples, recursively,
+# sorted for deterministic output. Tracking its selection keeps the two gates
+# in lockstep — a future .yml or subdirectory sample can't be covered by the
+# envtest gate yet silently skipped by this live-cluster one. (config/samples
+# holds only regular files; symlinked samples — which `find -type f` skips and
+# Go's filepath.Walk would include — are not used here, so the sets match.)
+#
+# Materialize the list FIRST, with an explicit error check, rather than piping
+# find straight into the loop via process substitution: a process
+# substitution's exit status is discarded, so `set -o pipefail` can't observe a
+# find failure, and a traversal that errored after emitting some files would
+# slip past the zero-match guard below as partial coverage. Failing here means
+# the coverage gate never silently passes on a partial walk. (pipefail is set
+# at the top of the script, so the command substitution sees find's status.)
+sample_list="$(find config/samples -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)" \
+  || fail "could not enumerate config/samples manifests (find failed) — refusing to report partial sample coverage"
+sample_ok=0
+sample_skip=0
+sample_fail=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue  # skip the lone empty line an empty here-string yields
+  if has_skip_marker "$f"; then
+    log "  SKIP $f (opt-out: $sample_skip_marker)"
+    sample_skip=$((sample_skip + 1))
+    continue
+  fi
+  # cacheindex is cluster-scoped; -n is a harmless no-op for it. Everything
+  # else under config/samples is namespace-scoped, so a dedicated namespace
+  # keeps each sample's default ObjectMeta from colliding with earlier phases'
+  # fixtures. --dry-run=server persists nothing, so no teardown is needed.
+  # --request-timeout bounds a hung apply (mirrors verify-samples'
+  # perSampleTimeout) so a stuck apiserver/admission webhook fails THIS sample
+  # fast — surfacing its filename via the rejection branch below — instead of
+  # stalling CI until the workflow timeout with no in-flight breadcrumb.
+  if kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$f" \
+       >/tmp/sample-dry-run.log 2>&1; then
+    log "  OK   $f"
+    sample_ok=$((sample_ok + 1))
+  else
+    echo "[install-smoke] sample $f did not apply cleanly:" >&2
+    cat /tmp/sample-dry-run.log >&2
+    sample_fail=$((sample_fail + 1))
+  fi
+done <<< "$sample_list"
+kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+# Guard against the backstop silently becoming a no-op if config/samples ends
+# up empty or unreadable. The recursive find above tracks `make verify-samples`,
+# so layout changes (subdirs, .yml) stay covered; this only catches the
+# degenerate "no samples at all" case.
+if [ "$((sample_ok + sample_skip + sample_fail))" -eq 0 ]; then
+  fail "no *.yaml/*.yml manifests found under config/samples — the apply-clean backstop covered nothing (is the sample directory missing or empty?)"
+fi
+if [ "$sample_fail" -ne 0 ]; then
+  fail "$sample_fail config/samples/ manifest(s) did not apply cleanly against the live install — see the rejection output above"
+fi
+log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
