@@ -148,9 +148,12 @@ run it after changing the subscriber.
 on-demand canary for the **C2 reconciler**: it brings up a kind cluster, runs the
 controller, applies a `CacheBackend` with `backendConfig.profile: cpu`, and asserts
 the controller stands up a healthy serving backend (Ready condition True, endpoint
-published), an engine prefix-cache hit through the Service, and owner-ref garbage
-collection when the CR is deleted. It exercises the reconciler against real pods —
-the gap the envtest unit tests can't cover.
+published) and owner-ref garbage collection when the CR is deleted. It exercises
+the reconciler against real pods — the gap the envtest unit tests can't cover.
+An optional traffic block drives prefix traffic through the Service and asserts
+an engine prefix-cache hit, but it is opt-in (`SKIP_TRAFFIC=0`) and requires a
+separately wired engine — see the script for the port-forward target and
+metric source.
 
 ```bash
 docs/reference-stack/scripts/canary_c2_reconcile.sh

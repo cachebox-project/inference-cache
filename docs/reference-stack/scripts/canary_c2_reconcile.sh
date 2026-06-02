@@ -3,10 +3,16 @@
 # healthy, serving backend from a CR on a GPU-free cluster (kind):
 #
 #   kubectl apply CacheBackend(profile=cpu) --> controller --> Deployment + Service
-#     --> CPU vLLM pods become Ready --> Ready condition True, status.endpoint set
+#     --> cache-server Deployment becomes Available --> Ready condition True,
+#         status.endpoint set
 #
-# Optionally drives prefix traffic through the Service and checks an engine
-# prefix-cache hit. Deleting the CR garbage-collects the children via owner refs.
+# Optionally drives prefix traffic and checks an engine prefix-cache hit — but
+# this is opt-in (SKIP_TRAFFIC=0). The traffic block expects a vLLM HTTP surface
+# on a port-forward target the script does NOT set up by default (the cache-
+# server Service exposes only the LMCache TCP lm:// port). Operators wiring a
+# vLLM engine alongside the canary need to also point the port-forward at the
+# engine Service before flipping the toggle. Deleting the CR garbage-collects
+# the children via owner refs.
 #
 # This exercises the reconciler end to end against real pods — the gap envtest
 # can't cover. It uses the CPU profile (no GPU, no LMCache offload); real LMCache
@@ -37,8 +43,9 @@ READY_TIMEOUT="${READY_TIMEOUT:-900}" # seconds for the CPU model to load + beco
 # bundled vLLM into the cache-server pod. The modern split layout exposes
 # only the LMCache server on `:65432` (TCP lm://), with no vLLM and no
 # HTTP /metrics on the cache-server Service, so the traffic path cannot
-# succeed without a separately wired engine. Default the toggle OFF —
-# operators who run an engine alongside the canary set SKIP_TRAFFIC=0.
+# succeed unless the operator wires a separate engine Service AND repoints
+# the port-forward below at it. Default the toggle OFF; operators who set up
+# both pieces flip SKIP_TRAFFIC=0 to opt back in.
 SKIP_TRAFFIC="${SKIP_TRAFFIC:-1}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
