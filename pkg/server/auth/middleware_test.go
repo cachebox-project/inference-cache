@@ -20,15 +20,21 @@ const (
 
 // fakeReviewer is a hand-rolled TokenReviewer so the unit tests don't pull in
 // the full fake clientset machinery. Behaviour per token comes from `respond`.
+// The last Spec received is captured so individual tests can assert that the
+// middleware actually populated TokenReviewSpec.Audiences from its Options
+// (cheap fake-reviewer-level guard against an option-propagation regression
+// without needing envtest).
 type fakeReviewer struct {
-	mu      sync.Mutex
-	calls   int
-	respond func(token string) (*authnv1.TokenReview, error)
+	mu       sync.Mutex
+	calls    int
+	lastSpec authnv1.TokenReviewSpec
+	respond  func(token string) (*authnv1.TokenReview, error)
 }
 
 func (f *fakeReviewer) CreateTokenReview(_ context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
 	f.mu.Lock()
 	f.calls++
+	f.lastSpec = tr.Spec
 	f.mu.Unlock()
 	return f.respond(tr.Spec.Token)
 }
@@ -37,6 +43,14 @@ func (f *fakeReviewer) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// LastSpec returns the TokenReviewSpec the middleware sent on the most recent
+// CreateTokenReview call. Used by audience-propagation tests.
+func (f *fakeReviewer) LastSpec() authnv1.TokenReviewSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastSpec
 }
 
 type recordingRecorder struct {
@@ -298,4 +312,79 @@ func TestNewAuthenticator_RequiredFields(t *testing.T) {
 	if _, err := NewAuthenticator(Options{Reviewer: r}); err == nil {
 		t.Fatalf("expected error when ExpectedServiceAccount is empty")
 	}
+}
+
+// TestMiddleware_AudiencePropagation covers the wire-shape contract for the
+// audience-binding option:
+//
+//   - When Options.Audience is configured, the middleware MUST pass it on
+//     TokenReviewSpec.Audiences so kube-apiserver enforces the binding. A
+//     regression here (e.g. the field being dropped on a future refactor)
+//     would silently disable defense-in-depth — both the controller's
+//     audience-bound token AND a default-audience token would land at the
+//     server's identity check, and the only signal would be in production
+//     metric labels.
+//   - When Options.Audience is empty (the legacy / in-process-test posture
+//     exposed via server.WithControllerAuth), the field MUST stay nil so the
+//     apiserver doesn't reject every request as a no-audiences-match.
+//
+// Envtest covers the apiserver-enforcement half of this against a real
+// authenticator chain; this unit-level guard catches option propagation
+// regressions in environments where envtest assets aren't available.
+func TestMiddleware_AudiencePropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+		want []string // nil = audiences field must be nil/empty
+	}{
+		{
+			name: "audience set: middleware passes it to TokenReview",
+			opts: Options{Audience: ControllerAudience},
+			want: []string{ControllerAudience},
+		},
+		{
+			name: "audience empty: legacy posture, audiences must stay nil",
+			opts: Options{Audience: ""},
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakeReviewer{respond: func(string) (*authnv1.TokenReview, error) {
+				return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+					Authenticated: true,
+					User:          authnv1.UserInfo{Username: expectedSA},
+				}}, nil
+			}}
+			a, err := NewAuthenticator(Options{
+				Reviewer:               reviewer,
+				ExpectedServiceAccount: expectedSA,
+				Audience:               tc.opts.Audience,
+			})
+			if err != nil {
+				t.Fatalf("NewAuthenticator: %v", err)
+			}
+			h := a.Middleware(&okHandler{})
+
+			if code := doRequest(t, h, "Bearer some-token"); code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", code)
+			}
+
+			got := reviewer.LastSpec().Audiences
+			if !equalStringSlice(got, tc.want) {
+				t.Fatalf("TokenReviewSpec.Audiences = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
