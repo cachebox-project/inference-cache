@@ -435,17 +435,33 @@ done
 log "cacheindex/cluster-default.status.observedServer=$observed"
 
 # The CacheIndex table is the operator-facing view for the status poller. Check
-# the installed CRD renders the Prefixes/Changed columns instead of falling
-# back to the default NAME/AGE-only table.
+# the installed CRD renders the Prefixes/Changed columns and that their JSONPath
+# targets actually populate cells in the row instead of falling back to a
+# header-only/default NAME/AGE table.
 ci_table="$(kubectl get ci cluster-default 2>/dev/null || true)"
 ci_header="$(printf '%s\n' "$ci_table" | sed -n '1p')"
+ci_row="$(printf '%s\n' "$ci_table" | sed -n '2p')"
 for column in PREFIXES CHANGED; do
   if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$ci_header"; then
     echo "$ci_table"
     fail "expected CacheIndex printer column ${column} in kubectl get output"
   fi
 done
-log "CacheIndex printer columns render Prefixes/Changed"
+if ! grep -Fq "cluster-default" <<<"$ci_row"; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer row to include cluster-default"
+fi
+ci_prefixes="$(awk 'NR==2 {print $2}' <<<"$ci_table")"
+ci_changed="$(awk 'NR==2 {print $3}' <<<"$ci_table")"
+if [ "$ci_prefixes" != "0" ]; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer column Prefixes=0 in kubectl get output, got: ${ci_prefixes:-<empty>}"
+fi
+if [ -z "$ci_changed" ] || [ "$ci_changed" = "<none>" ] || [ "$ci_changed" = "<unknown>" ]; then
+  echo "$ci_table"
+  fail "expected CacheIndex printer column Changed to be populated in kubectl get output"
+fi
+log "CacheIndex printer columns render Prefixes=$ci_prefixes Changed=$ci_changed"
 
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing
