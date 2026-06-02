@@ -8,12 +8,13 @@ import (
 	"testing"
 )
 
-// TestPolicyPropagationVersionIsV2 pins the wire-format version. The bump from
-// v1 → v2 accompanied the Tenants slice; a stale controller writing v1 is then
-// rejected with a clear "unsupported version" rather than a decode error.
-func TestPolicyPropagationVersionIsV2(t *testing.T) {
-	if PolicyPropagationVersion != 2 {
-		t.Fatalf("PolicyPropagationVersion = %d, want 2", PolicyPropagationVersion)
+// TestPolicyPropagationVersionIsV3 pins the wire-format version. v2 accompanied
+// the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
+// cap-eviction algorithm). A controller/server version mismatch is rejected with
+// a clear "unsupported version" rather than a decode error.
+func TestPolicyPropagationVersionIsV3(t *testing.T) {
+	if PolicyPropagationVersion != 3 {
+		t.Fatalf("PolicyPropagationVersion = %d, want 3", PolicyPropagationVersion)
 	}
 }
 

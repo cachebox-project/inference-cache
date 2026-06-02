@@ -143,6 +143,51 @@ func TestPolicyHandlerReplacesSnapshot(t *testing.T) {
 	}
 }
 
+// TestPolicySnapshotRoundTripCarriesEviction posts a snapshot through the exact
+// /policy decode path the binary mounts and asserts the per-namespace eviction
+// algorithm survives the round-trip and is readable via the EvictionResolver.
+func TestPolicySnapshotRoundTripCarriesEviction(t *testing.T) {
+	s := NewPolicyStore()
+	srv := httptest.NewServer(policyHandler(s))
+	defer srv.Close()
+
+	body, _ := json.Marshal(PolicySnapshot{
+		Version: PolicyPropagationVersion,
+		Policies: []ResolvedPolicy{
+			{Namespace: "team-lfu", Eviction: "lfu"},
+			{Namespace: "team-lru", Eviction: "lru"},
+			{Namespace: "team-default"}, // no eviction set
+		},
+	})
+	resp, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	if p, ok := s.Lookup("team-lfu"); !ok || p.Eviction != "lfu" {
+		t.Fatalf("team-lfu eviction not applied: ok=%v p=%+v", ok, p)
+	}
+	// The EvictionResolver view (what the index consumes) must agree.
+	if got := s.Eviction("team-lfu"); got != "lfu" {
+		t.Fatalf("Eviction(team-lfu) = %q, want lfu", got)
+	}
+	if got := s.Eviction("team-lru"); got != "lru" {
+		t.Fatalf("Eviction(team-lru) = %q, want lru", got)
+	}
+	// Unset → empty string (the index defaults that to LRU).
+	if got := s.Eviction("team-default"); got != "" {
+		t.Fatalf("Eviction(team-default) = %q, want \"\"", got)
+	}
+	// Absent namespace → empty string (no policy).
+	if got := s.Eviction("missing"); got != "" {
+		t.Fatalf("Eviction(missing) = %q, want \"\"", got)
+	}
+}
+
 func TestPolicyHandlerRejectsBadVersion(t *testing.T) {
 	srv := httptest.NewServer(policyHandler(NewPolicyStore()))
 	defer srv.Close()

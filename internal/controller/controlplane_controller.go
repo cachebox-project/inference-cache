@@ -298,6 +298,15 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}
+	// Flatten the eviction algorithm to its lower-case canonical form. The CRD
+	// enum is upper-case (K8s convention) and defaults to LRU; an empty value
+	// (CR predating apiserver defaulting, or constructed without it) also maps
+	// to LRU so the server never sees an ambiguous algorithm.
+	rp.Eviction = string(cachev1alpha1.CachePolicyEvictionAlgorithmLRU)
+	if cp.Spec.Eviction != "" {
+		rp.Eviction = string(cp.Spec.Eviction)
+	}
+	rp.Eviction = strings.ToLower(rp.Eviction)
 	return rp
 }
 

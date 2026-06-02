@@ -6,28 +6,32 @@ import (
 )
 
 // CachePolicyEvictionAlgorithm identifies an index entry-eviction algorithm.
-// The enum is intentionally narrow today (LRU only) and grows as additional
-// algorithms are implemented in pkg/index. The field is reserved on the
-// v1alpha1 surface so the schema is forward-compatible; pkg/index currently
-// runs LRU-by-`lastSeen` unconditionally and the controller does not yet
-// propagate this field into ResolvedPolicy.
+// Each value has a corresponding implementation in pkg/index; the enum grows
+// as new algorithms land. The choice is per-namespace: the controller flattens
+// it (lower-cased) into ResolvedPolicy.Eviction and the index consults it when
+// the entry cap is exceeded. The TTL sweep runs regardless of algorithm.
 type CachePolicyEvictionAlgorithm string
 
 const (
 	// CachePolicyEvictionAlgorithmLRU evicts the entry with the oldest
-	// lastSeen timestamp first. This is the implementation today.
+	// lastSeen timestamp first (least recently seen). This is the default.
 	CachePolicyEvictionAlgorithmLRU CachePolicyEvictionAlgorithm = "LRU"
+	// CachePolicyEvictionAlgorithmLFU evicts the entry with the lowest access
+	// count first (least frequently used), breaking ties on the oldest
+	// lastSeen. Access counts do not age — the TTL sweep handles staleness
+	// regardless of algorithm, so LFU only governs cap-based eviction.
+	CachePolicyEvictionAlgorithmLFU CachePolicyEvictionAlgorithm = "LFU"
 )
 
 // CachePolicySpec defines cache lookup and eviction policy.
 type CachePolicySpec struct {
-	// Eviction is the index entry-eviction algorithm. Reserved on
-	// v1alpha1 for forward compatibility; defaults to LRU. Today pkg/index
-	// runs LRU unconditionally and this field is not yet consulted by the
-	// controller. Additional algorithms extend the enum and gain a
-	// ResolvedPolicy propagation path as their implementations land.
+	// Eviction is the index entry-eviction algorithm applied when the index
+	// exceeds its entry cap. LRU evicts the oldest-by-lastSeen entry first;
+	// LFU evicts the lowest-access-count entry first (ties broken on oldest
+	// lastSeen). The TTL sweep removes stale entries regardless of this
+	// choice, so LFU does not pin hot-but-stale entries. Defaults to LRU.
 	// +optional
-	// +kubebuilder:validation:Enum=LRU
+	// +kubebuilder:validation:Enum=LRU;LFU
 	// +kubebuilder:default=LRU
 	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
 

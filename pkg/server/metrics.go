@@ -29,11 +29,11 @@ const metricNamespace = "inferencecache"
 // liveness gauge (`inferencecache_server_up`), the index population gauge
 // (`inferencecache_index_entries`), the lookup counter + latency histogram
 // (`inferencecache_lookup_route_*`), the quota-eviction counter
-// (`inferencecache_tenant_evictions_total`), and the per-endpoint auth
-// counters (`inferencecache_snapshot_auth_total`,
-// `inferencecache_policy_auth_total`). Update this comment when adding a new
-// metric so the ownership note in docs/reference/metrics.md and this struct
-// stay in lockstep.
+// (`inferencecache_tenant_evictions_total`), the cap/TTL eviction counter
+// (`inferencecache_index_evictions_total`), and the per-endpoint auth counters
+// (`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`).
+// Update this comment when adding a new metric so the ownership note in
+// docs/reference/metrics.md and this struct stay in lockstep.
 type serverMetrics struct {
 	registry        *prometheus.Registry
 	up              prometheus.Gauge
@@ -41,6 +41,7 @@ type serverMetrics struct {
 	lookupCalls     *prometheus.CounterVec
 	lookupLatency   *prometheus.HistogramVec
 	tenantEvictions *prometheus.CounterVec
+	indexEvictions  *prometheus.CounterVec
 	snapshotAuth    *prometheus.CounterVec
 	policyAuth      *prometheus.CounterVec
 }
@@ -73,6 +74,11 @@ func newServerMetrics() *serverMetrics {
 		Name:      "tenant_evictions_total",
 		Help:      "Index prefixes evicted to enforce a CacheTenant quota, by tenant and reason.",
 	}, []string{"tenant_id", "reason"})
+	indexEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "index_evictions_total",
+		Help:      "Index entries evicted by the cap or TTL sweep, by algorithm (lru|lfu) and reason (cap|ttl).",
+	}, []string{"algorithm", "reason"})
 	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "snapshot_auth_total",
@@ -91,6 +97,7 @@ func newServerMetrics() *serverMetrics {
 		lookupCalls,
 		lookupLatency,
 		tenantEvictions,
+		indexEvictions,
 		snapshotAuth,
 		policyAuth,
 		collectors.NewGoCollector(),
@@ -104,6 +111,7 @@ func newServerMetrics() *serverMetrics {
 		lookupCalls:     lookupCalls,
 		lookupLatency:   lookupLatency,
 		tenantEvictions: tenantEvictions,
+		indexEvictions:  indexEvictions,
 		snapshotAuth:    snapshotAuth,
 		policyAuth:      policyAuth,
 	}
@@ -140,6 +148,12 @@ func (m *serverMetrics) SetIndexEntries(model string, entries int) {
 // Satisfies index.Metrics.
 func (m *serverMetrics) AddTenantEvictions(tenantID, reason string, n int) {
 	m.tenantEvictions.WithLabelValues(tenantID, reason).Add(float64(n))
+}
+
+// AddIndexEvictions records n cap/TTL-driven index-entry evictions for an
+// algorithm. Satisfies index.Metrics.
+func (m *serverMetrics) AddIndexEvictions(algorithm, reason string, n int) {
+	m.indexEvictions.WithLabelValues(algorithm, reason).Add(float64(n))
 }
 
 // observeLookup records one LookupRoute call's outcome and latency.

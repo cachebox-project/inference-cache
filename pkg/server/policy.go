@@ -12,14 +12,14 @@ import (
 // server accepts. Bumped on a breaking schema change so a stale controller
 // can refuse to push (the controller writes the same constant on each push).
 //
-// v2 added the Tenants slice (CacheTenant quota propagation). The version field
-// is the forward-looking guard: a server rejects a body whose version it does
-// not recognize, so a future v3 controller pushing to a v2 server fails loudly
-// with a clear "unsupported version" rather than silently losing fields. (A v1
-// server predates this field and would instead reject a v2 body's unknown
-// `tenants` at decode time under DisallowUnknownFields — also a hard failure,
-// just a less descriptive one.)
-const PolicyPropagationVersion = 2
+// v2 added the Tenants slice (CacheTenant quota propagation). v3 added
+// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). The version
+// field is the forward-looking guard: a server rejects a body whose version it
+// does not recognize, so a mismatched controller/server pair fails loudly with a
+// clear "unsupported version" rather than silently losing fields. (An older
+// server would instead reject a newer body's unknown field at decode time under
+// DisallowUnknownFields — also a hard failure, just a less descriptive one.)
+const PolicyPropagationVersion = 3
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -31,6 +31,7 @@ const PolicyPropagationVersion = 2
 //     WithTTL the binary configured).
 //   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
+//   - Eviction == ""         → LRU (the index default and the kubebuilder default).
 type ResolvedPolicy struct {
 	// Namespace identifies the CachePolicy's namespace, which in phase-1 is
 	// the tenant boundary: a LookupRoute carrying tenant_id="foo" resolves
@@ -40,6 +41,11 @@ type ResolvedPolicy struct {
 	EvictionTTL         time.Duration `json:"evictionTTL,omitempty"`
 	MinimumPrefixTokens int32         `json:"minimumPrefixTokens,omitempty"`
 	LookupTimeoutMs     int32         `json:"lookupTimeoutMs,omitempty"`
+	// Eviction is the cap-based eviction algorithm in lower-case canonical form
+	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
+	// flattening. Empty means the server default (LRU). Only the index's
+	// cap-based sweep consults it; the TTL sweep is algorithm-independent.
+	Eviction string `json:"eviction,omitempty"`
 }
 
 // ResolvedTenant is the slice of a CacheTenant the server enforces at ingest
@@ -79,8 +85,8 @@ type PolicySnapshot struct {
 // PolicyStore is the server-side cache of resolved policies (indexed by
 // namespace) and resolved tenant quotas (indexed by tenant ID). Reads take
 // the read lock; pushes from /policy (POST or PUT) take the write lock and
-// replace the maps atomically. Satisfies index.TTLResolver and
-// index.TenantQuotaResolver.
+// replace the maps atomically. Satisfies index.TTLResolver,
+// index.TenantQuotaResolver, and index.EvictionResolver.
 //
 // The two indices use different keys on purpose: a CachePolicy is keyed by its
 // namespace (phase-1 tenant boundary for lookups), while a CacheTenant quota is
@@ -180,6 +186,18 @@ func (s *PolicyStore) TTL(tenant string) time.Duration {
 		return p.EvictionTTL
 	}
 	return 0
+}
+
+// Eviction satisfies index.EvictionResolver: returns the per-namespace
+// cap-eviction algorithm in lower-case canonical form ("lru" / "lfu"), or ""
+// when no policy is configured (the index then defaults to LRU). The index
+// normalizes the value, so an unexpected string degrades to LRU rather than
+// erroring.
+func (s *PolicyStore) Eviction(tenant string) string {
+	if p, ok := s.Lookup(tenant); ok {
+		return p.Eviction
+	}
+	return ""
 }
 
 // MinimumPrefixTokens returns the per-namespace minimum matched-token

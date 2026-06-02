@@ -11,6 +11,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,10 @@ type Metrics interface {
 	// AddTenantEvictions records n quota-driven entry evictions for a tenant.
 	// reason is the budget that was exceeded (currently only "over_entries").
 	AddTenantEvictions(tenantID, reason string, n int)
+	// AddIndexEvictions records n entries evicted by the cap or TTL sweep.
+	// algorithm is the namespace's resolved algorithm ("lru"/"lfu"); reason is
+	// "cap" (entry cap exceeded) or "ttl" (freshness sweep).
+	AddIndexEvictions(algorithm, reason string, n int)
 }
 
 // TenantQuotaResolver returns the per-tenant index-entry budget the index
@@ -73,12 +78,39 @@ type TenantQuotaResolver interface {
 // engine — see the CacheTenant CRD docs.)
 const tenantEvictionReasonOverEntries = "over_entries"
 
+// Reason labels for inferencecache_index_evictions_total. "cap" = the global
+// entry cap (maxEntries) was exceeded; "ttl" = the freshness sweep removed a
+// stale entry. Distinct from the quota path's tenant_evictions_total.
+const (
+	indexEvictionReasonCap = "cap"
+	indexEvictionReasonTTL = "ttl"
+)
+
 // TTLResolver returns the per-tenant eviction TTL applied by the index. A
 // return of <=0 (or a nil resolver) means "use the global default TTL". The
 // index does not import any CRD/policy types; the resolver is satisfied by the
 // server's policy store. Kept tiny on purpose, matching the Metrics interface.
 type TTLResolver interface {
 	TTL(tenant string) time.Duration
+}
+
+// Eviction algorithm identifiers. The wire form is lower-case ("lru"/"lfu") to
+// match the casing of ResolvedPolicy.Eviction and reason_code; the CRD enum is
+// upper-case per K8s convention and the controller lower-cases when flattening.
+// These are also the values carried by the index_evictions_total `algorithm`
+// label.
+const (
+	EvictionLRU = "lru"
+	EvictionLFU = "lfu"
+)
+
+// EvictionResolver returns the per-tenant (namespace) cap-based eviction
+// algorithm. An empty string, an unrecognized value, or a nil resolver all mean
+// LRU — the default and the pre-LFU behavior. Only cap-based eviction consults
+// it; the TTL sweep runs identically regardless. The index imports no
+// CRD/policy types; the server's policy store satisfies it. Mirrors TTLResolver.
+type EvictionResolver interface {
+	Eviction(tenant string) string
 }
 
 // ReplicaStats is the per-replica cache health reported alongside an update.
@@ -264,6 +296,15 @@ type scopeKey struct {
 type replicaEntry struct {
 	tokenCount int32
 	lastSeen   time.Time
+	// accessCount is the LFU access counter, bumped lock-free on every lookup
+	// HIT where this entry contributes matched tokens to the returned hint set
+	// — but only while the entry's namespace runs the LFU algorithm (LRU
+	// namespaces skip the bump entirely). It never ages: the TTL sweep handles
+	// staleness regardless of algorithm, so the counter only governs cap-based
+	// eviction. Entries are held by pointer (map[string]*replicaEntry) so this
+	// atomic is never copied — bumping reads the stable pointer under RLock and
+	// the cap sweep reads the count under the write lock.
+	accessCount atomic.Int64
 }
 
 type statEntry struct {
@@ -280,19 +321,25 @@ type statEntry struct {
 
 // Index is the in-memory, concurrent-safe, soft-state cache-state aggregator.
 type Index struct {
-	ttl           time.Duration
-	sweepInterval time.Duration
-	maxEntries    int
-	now           func() time.Time
-	metrics       Metrics
-	ranker        RankerConfig
-	ttlResolver   TTLResolver
-	quotaResolver TenantQuotaResolver
+	ttl              time.Duration
+	sweepInterval    time.Duration
+	maxEntries       int
+	now              func() time.Time
+	metrics          Metrics
+	ranker           RankerConfig
+	ttlResolver      TTLResolver
+	quotaResolver    TenantQuotaResolver
+	evictionResolver EvictionResolver
 
 	ready atomic.Bool
 
-	mu           sync.RWMutex
-	prefixes     map[prefixKey]map[string]replicaEntry // prefix → replicaID → entry
+	mu sync.RWMutex
+	// prefixes holds entries by POINTER (not value) because replicaEntry carries
+	// an atomic.Int64 (the LFU counter) that must never be copied — a value map
+	// would copy the atomic on every read/write (vet copylocks) and its values
+	// aren't addressable for the counter bump. i.stats stays a value map: its
+	// statEntry has no atomic and the same migration there is out of scope.
+	prefixes     map[prefixKey]map[string]*replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
 
@@ -363,6 +410,15 @@ func WithTenantQuotaResolver(r TenantQuotaResolver) Option {
 	return func(i *Index) { i.quotaResolver = r }
 }
 
+// WithEvictionResolver wires a per-tenant cap-eviction-algorithm resolver. A nil
+// resolver, or one returning "" / an unrecognized value, leaves the tenant on
+// LRU (the default). The index reads it at sort time during a cap sweep and on
+// each lookup HIT (to decide whether to bump the LFU counter); the resolver
+// implementation owns its own concurrency. Mirrors WithTTLResolver.
+func WithEvictionResolver(r EvictionResolver) Option {
+	return func(i *Index) { i.evictionResolver = r }
+}
+
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
 
@@ -374,7 +430,7 @@ func New(opts ...Option) *Index {
 		maxEntries:       DefaultMaxEntries,
 		now:              time.Now,
 		ranker:           DefaultRankerConfig(),
-		prefixes:         make(map[prefixKey]map[string]replicaEntry),
+		prefixes:         make(map[prefixKey]map[string]*replicaEntry),
 		stats:            make(map[statsKey]statEntry),
 		prefixesByTenant: make(map[string]int),
 		servingByScope:   make(map[scopeKey]map[string]int),
@@ -501,11 +557,18 @@ func (i *Index) Ingest(u Update) {
 	if hasQuota {
 		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
 	}
-	i.enforceCapLocked()
+	capEvicted := i.enforceCapLocked()
 	i.mu.Unlock()
 
-	if evictedPrefixes > 0 && i.metrics != nil {
-		i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evictedPrefixes)
+	if i.metrics != nil {
+		if evictedPrefixes > 0 {
+			i.metrics.AddTenantEvictions(u.Tenant, tenantEvictionReasonOverEntries, evictedPrefixes)
+		}
+		// Cap evictions are tallied per resolved algorithm so dashboards can tell
+		// LRU from LFU pressure. Emitted after the lock, mirroring AddTenantEvictions.
+		for algo, n := range capEvicted {
+			i.metrics.AddIndexEvictions(algo, indexEvictionReasonCap, n)
+		}
 	}
 	i.reportEntries()
 }
@@ -603,6 +666,10 @@ func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
 	ttl := i.ttlFor(req.Tenant)
+	// Resolve the algorithm once, outside the lock (the resolver owns its own
+	// concurrency, same as ttlFor): only LFU namespaces bump the access counter,
+	// so LRU lookups skip the atomic Add entirely.
+	lfu := i.evictionFor(req.Tenant) == EvictionLFU
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
@@ -611,6 +678,15 @@ func (i *Index) lookupExact(req LookupRequest) []ReplicaScore {
 		fresh := freshnessAt(now, e.lastSeen, ttl)
 		if fresh <= 0 {
 			continue // stale; will be swept
+		}
+		// LFU counter bump: this entry is about to contribute matched tokens to
+		// the returned hint set (a lookup HIT, per the locked definition), so
+		// count it as "used". Only entries that contribute a non-zero
+		// MatchedTokens are counted — bumping merely-considered entries would
+		// inflate counters with cold data. Lock-free Add under RLock is safe:
+		// the atomic is independent of i.mu and the entry pointer is stable.
+		if lfu && e.tokenCount > 0 {
+			e.accessCount.Add(1)
 		}
 		// Only fold in pressure when the replica's stats *payload* is still
 		// fresh under the global TTL. statsReported reflects when the stat
@@ -654,10 +730,19 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
+		// entries are the block entries forming this replica's matched run,
+		// collected ONLY when the namespace runs LFU (nil otherwise, so the LRU
+		// hot path allocates nothing). Bumped once the run is confirmed to
+		// contribute to the returned hint set.
+		entries []*replicaEntry
 	}
 	now := i.now()
 	ttl := i.ttlFor(req.Tenant)
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
+	// Resolve the algorithm once, outside the lock (see lookupExact): LFU
+	// tracks the per-block entry pointers so each contributing block's counter
+	// can be bumped; LRU skips both the tracking and the bump.
+	lfu := i.evictionFor(req.Tenant) == EvictionLFU
 
 	i.mu.RLock()
 	current := map[string]running{}
@@ -671,7 +756,11 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 				if freshnessAt(now, e.lastSeen, ttl) <= 0 {
 					continue // stale; will be swept
 				}
-				current[id] = running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen}
+				r := running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen}
+				if lfu {
+					r.entries = []*replicaEntry{e}
+				}
+				current[id] = r
 			}
 		} else {
 			next := make(map[string]running, len(current))
@@ -685,7 +774,11 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 				if e.lastSeen.Before(oldest) {
 					oldest = e.lastSeen
 				}
-				next[id] = running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest}
+				nr := running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest, entries: st.entries}
+				if lfu {
+					nr.entries = append(nr.entries, e)
+				}
+				next[id] = nr
 			}
 			current = next
 		}
@@ -706,6 +799,14 @@ func (i *Index) lookupChain(req LookupRequest) []ReplicaScore {
 		fresh := freshnessAt(now, st.oldestLastSeen, ttl)
 		if fresh <= 0 {
 			continue
+		}
+		// LFU counter bump: this run contributes a non-zero MatchedTokens to the
+		// returned hint set, so every block entry in the matched run counts as
+		// "used". (st.entries is non-nil only under LFU.)
+		if lfu {
+			for _, e := range st.entries {
+				e.accessCount.Add(1)
+			}
 		}
 		// Pressure / SLO compose exactly as in lookupExact: same source of
 		// truth (statsReported within TTL), same factor formulas. The chain
@@ -1244,6 +1345,19 @@ func (i *Index) ttlFor(tenant string) time.Duration {
 	return i.ttl
 }
 
+// evictionFor returns the normalized cap-eviction algorithm for a tenant:
+// EvictionLFU only when the resolver explicitly says so, otherwise EvictionLRU
+// (a nil resolver, an empty string, or any unrecognized value all fall back to
+// LRU — the default and the pre-LFU behavior). Mirrors ttlFor.
+func (i *Index) evictionFor(tenant string) string {
+	if i.evictionResolver != nil {
+		if strings.ToLower(i.evictionResolver.Eviction(tenant)) == EvictionLFU {
+			return EvictionLFU
+		}
+	}
+	return EvictionLRU
+}
+
 // freshnessAt decays linearly from 1 (just seen) to 0 (>= ttl old). Pure
 // function so the index can compute it under per-tenant TTL without taking
 // the resolver lock inside the per-entry loop.
@@ -1269,22 +1383,30 @@ func freshnessAt(now, lastSeen time.Time, ttl time.Duration) float32 {
 func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount int32, ts time.Time) {
 	replicas := i.prefixes[key]
 	if replicas == nil {
-		replicas = make(map[string]replicaEntry)
+		replicas = make(map[string]*replicaEntry)
 		i.prefixes[key] = replicas
 		// First replica of a brand-new prefix key → one more distinct prefix
 		// for this tenant (the maxIndexEntries unit).
 		i.prefixesByTenant[key.tenant]++
 	}
-	if _, existed := replicas[replicaID]; !existed {
+	e, existed := replicas[replicaID]
+	if !existed {
+		// First sight of this (prefix, replica): allocate a fresh entry whose
+		// accessCount starts at zero. A refresh below mutates this SAME pointer
+		// in place, so re-ingesting an existing entry never resets its LFU
+		// counter (the counter tracks lookup usefulness, not ingest recency).
+		e = &replicaEntry{}
+		replicas[replicaID] = e
 		i.totalEntries++
 		i.scopeIncLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
 	}
-	replicas[replicaID] = replicaEntry{tokenCount: tokenCount, lastSeen: ts}
+	e.tokenCount = tokenCount
+	e.lastSeen = ts
 }
 
 // removeReplicaLocked drops a replica from a prefix, deleting the prefix if it
 // becomes empty. Caller holds the write lock.
-func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]replicaEntry, replicaID string) {
+func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]*replicaEntry, replicaID string) {
 	if _, ok := replicas[replicaID]; !ok {
 		return
 	}
@@ -1382,6 +1504,18 @@ func (i *Index) evictExpired() {
 		ttlCache[tenant] = d
 		return d
 	}
+	// Resolve each tenant's algorithm once per sweep, only for the eviction
+	// metric label — TTL eviction itself is algorithm-independent.
+	algoCache := make(map[string]string)
+	algoOf := func(tenant string) string {
+		if a, ok := algoCache[tenant]; ok {
+			return a
+		}
+		a := i.evictionFor(tenant)
+		algoCache[tenant] = a
+		return a
+	}
+	var ttlEvicted map[string]int
 
 	i.mu.Lock()
 	for key, replicas := range i.prefixes {
@@ -1389,6 +1523,10 @@ func (i *Index) evictExpired() {
 		for id, e := range replicas {
 			if ttl > 0 && now.Sub(e.lastSeen) >= ttl {
 				i.removeReplicaLocked(key, replicas, id)
+				if ttlEvicted == nil {
+					ttlEvicted = make(map[string]int, 2)
+				}
+				ttlEvicted[algoOf(key.tenant)]++
 			}
 		}
 	}
@@ -1401,35 +1539,100 @@ func (i *Index) evictExpired() {
 	}
 	i.mu.Unlock()
 
+	if i.metrics != nil {
+		for algo, n := range ttlEvicted {
+			i.metrics.AddIndexEvictions(algo, indexEvictionReasonTTL, n)
+		}
+	}
 	i.reportEntries()
 }
 
-// enforceCapLocked evicts oldest entries until within maxEntries. Caller holds
-// the write lock. maxEntries == 0 means unbounded. The sort is O(n log n); it
-// only runs while over the cap, which for soft state is an acceptable
-// backstop — a smarter incremental scheme can replace it if profiling demands.
-func (i *Index) enforceCapLocked() {
+// enforceCapLocked evicts entries until totalEntries is within maxEntries,
+// choosing victims by each entry's per-namespace algorithm under a single global
+// cap. Victims are ordered by a unified key — effectiveCount ASC, then lastSeen
+// ASC — where effectiveCount is the entry's LFU access count in an LFU namespace
+// and 0 in an LRU namespace. So an all-LRU cap degenerates to pure
+// oldest-by-lastSeen (the historical behavior), an all-LFU cap to
+// lowest-count-first with an oldest-lastSeen tie-break, and mixed namespaces
+// interleave LRU and low-count LFU entries by recency. The algorithm is resolved
+// at sort time and never stored on the entry, so a policy switch takes effect on
+// the next sweep with no counter migration. A final stable tie-break on the
+// entry's identity keeps the victim set deterministic on full (count, lastSeen)
+// ties regardless of map iteration order.
+//
+// Returns the count of entries evicted per algorithm ("lru"/"lfu") so the caller
+// can emit the eviction metric AFTER releasing the lock (nil when nothing was
+// over cap). Caller holds the write lock. maxEntries == 0 means unbounded. The
+// sort is O(n log n); it only runs while over the cap.
+func (i *Index) enforceCapLocked() map[string]int {
 	if i.maxEntries <= 0 || i.totalEntries <= i.maxEntries {
-		return
+		return nil
+	}
+	// Resolve each tenant's algorithm once per sweep (the resolver takes the
+	// policy-store lock; evictExpired already nests it under i.mu the same way).
+	algoCache := make(map[string]string)
+	algoOf := func(tenant string) string {
+		if a, ok := algoCache[tenant]; ok {
+			return a
+		}
+		a := i.evictionFor(tenant)
+		algoCache[tenant] = a
+		return a
 	}
 	type ref struct {
-		key      prefixKey
-		replica  string
-		lastSeen time.Time
+		key            prefixKey
+		replica        string
+		algo           string
+		effectiveCount int64
+		lastSeen       time.Time
 	}
 	all := make([]ref, 0, i.totalEntries)
 	for key, replicas := range i.prefixes {
+		algo := algoOf(key.tenant)
 		for id, e := range replicas {
-			all = append(all, ref{key, id, e.lastSeen})
+			var eff int64
+			if algo == EvictionLFU {
+				eff = e.accessCount.Load()
+			}
+			all = append(all, ref{key, id, algo, eff, e.lastSeen})
 		}
 	}
-	sort.Slice(all, func(a, b int) bool { return all[a].lastSeen.Before(all[b].lastSeen) })
+	sort.Slice(all, func(a, b int) bool {
+		x, y := all[a], all[b]
+		if x.effectiveCount != y.effectiveCount {
+			return x.effectiveCount < y.effectiveCount
+		}
+		if !x.lastSeen.Equal(y.lastSeen) {
+			return x.lastSeen.Before(y.lastSeen)
+		}
+		// Deterministic full-tie order (locked decision): break on the entry's
+		// stable identity so the victim set never depends on map iteration order.
+		if x.key != y.key {
+			if x.key.tenant != y.key.tenant {
+				return x.key.tenant < y.key.tenant
+			}
+			if x.key.model != y.key.model {
+				return x.key.model < y.key.model
+			}
+			if x.key.hashScheme != y.key.hashScheme {
+				return x.key.hashScheme < y.key.hashScheme
+			}
+			return x.key.prefixHash < y.key.prefixHash
+		}
+		return x.replica < y.replica
+	})
+	var evicted map[string]int
 	for _, r := range all {
 		if i.totalEntries <= i.maxEntries {
 			break
 		}
 		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
+		if evicted == nil {
+			evicted = make(map[string]int, 2)
+		}
+		evicted[r.algo]++
 	}
+	return evicted
 }
 
 // tenantQuotaFor returns the tenant's index-entry budget and whether one is

@@ -77,17 +77,18 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v2)
+## Wire schema (v3)
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "policies": [
     {
       "namespace": "team-a",
       "evictionTTL": 900000000000,
       "minimumPrefixTokens": 32,
-      "lookupTimeoutMs": 25
+      "lookupTimeoutMs": 25,
+      "eviction": "lfu"
     },
     {
       "namespace": "team-b",
@@ -105,8 +106,9 @@ intervention.
 ```
 
 - `version` — schema version. Bumped on a breaking change. The server
-  rejects any value it does not recognize (HTTP 400). Currently `2`
-  (bumped from `1` when `tenants` was added).
+  rejects any value it does not recognize (HTTP 400). Currently `3`
+  (bumped from `1` when `tenants` was added, then to `3` when
+  `policies[].eviction` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -118,6 +120,10 @@ intervention.
   threshold".
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒
   "no deadline".
+- `policies[].eviction` — lower-cased cap-eviction algorithm (`"lru"` /
+  `"lfu"`). Optional. `""` ⇒ "use server default" (`LRU`). The controller
+  lower-cases the CRD's upper-case enum; the index normalizes any
+  unrecognized value back to `LRU`.
 - `tenants[]` — full snapshot of the `CacheTenant` CRs that carry an
   enforceable quota, keyed by `tenantID` (a different axis from the
   namespace-keyed `policies[]`). A `CacheTenant` without
@@ -182,6 +188,7 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 | Field | Where it lands |
 |---|---|
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
+| `eviction` | `pkg/index` `EvictionResolver` — selects the per-namespace cap-based eviction algorithm. `lru` evicts oldest-by-`lastSeen`; `lfu` evicts the lowest per-entry access count (bumped on each contributing lookup HIT), tie-broken on oldest `lastSeen`. Consulted only when the index exceeds `MaxEntries`; the TTL sweep above is algorithm-independent. Emitted as `inferencecache_index_evictions_total{algorithm,reason}`. |
 | `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |

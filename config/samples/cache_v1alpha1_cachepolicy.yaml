@@ -9,6 +9,9 @@ metadata:
 spec:
   # eviction intentionally omitted to exercise the +kubebuilder:default=LRU
   # marker — the install-smoke asserts the printer column still renders LRU.
+  # Valid values are LRU (default, oldest-by-lastSeen) and LFU (lowest access
+  # count); set `eviction: LFU` to evict the least-frequently-used entries when
+  # the index is over its cap.
   evictionTTL: 30m
   minimumPrefixTokens: 32
   lookupTimeoutMs: 20
