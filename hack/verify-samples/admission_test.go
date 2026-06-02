@@ -22,10 +22,11 @@ import (
 )
 
 // TestVerifySamplesAdmissionEndToEnd exercises the same admission path
-// the gate drives — envtest apiserver + the CacheBackend webhook
-// installed from config/webhook/manifests.yaml and registered with the
-// shipping adapter registry — and asserts the path both ACCEPTS a known-
-// good CacheBackend and REJECTS a known-bad one with an actionable error.
+// the gate drives — envtest apiserver + the CRD webhooks (CacheBackend,
+// CachePolicy, CacheTenant) installed from config/webhook/manifests.yaml
+// and registered in-process (CacheBackend with the shipping adapter
+// registry) — and asserts the path both ACCEPTS a known-good CacheBackend
+// and REJECTS a known-bad one with an actionable error.
 //
 // This is the regression backstop the helper-only unit tests don't
 // provide: if a future refactor silently stopped invoking admission
@@ -96,6 +97,12 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 	}
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
 		t.Fatalf("register CacheBackend webhook: %v", err)
+	}
+	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {
+		t.Fatalf("register CachePolicy webhook: %v", err)
+	}
+	if err := cachewebhookv1alpha1.SetupCacheTenantWebhookWithManager(mgr); err != nil {
+		t.Fatalf("register CacheTenant webhook: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

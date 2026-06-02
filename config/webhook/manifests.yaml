@@ -43,6 +43,46 @@ webhooks:
     resources:
     - cachebackends
   sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-inferencecache-io-v1alpha1-cachepolicy
+  failurePolicy: Fail
+  name: mcachepolicy.inferencecache.io
+  rules:
+  - apiGroups:
+    - inferencecache.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - cachepolicies
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-inferencecache-io-v1alpha1-cachetenant
+  failurePolicy: Fail
+  name: mcachetenant.inferencecache.io
+  rules:
+  - apiGroups:
+    - inferencecache.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - cachetenants
+  sideEffects: None
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -68,4 +108,44 @@ webhooks:
     - UPDATE
     resources:
     - cachebackends
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-inferencecache-io-v1alpha1-cachepolicy
+  failurePolicy: Fail
+  name: vcachepolicy.inferencecache.io
+  rules:
+  - apiGroups:
+    - inferencecache.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - cachepolicies
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-inferencecache-io-v1alpha1-cachetenant
+  failurePolicy: Fail
+  name: vcachetenant.inferencecache.io
+  rules:
+  - apiGroups:
+    - inferencecache.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - cachetenants
   sideEffects: None

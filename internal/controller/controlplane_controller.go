@@ -254,13 +254,15 @@ func (r *ControlPlaneReconciler) bearerToken() (string, error) {
 // resolvePolicies flattens CachePolicy CRs into the server-side shape with a
 // deterministic outcome even when multiple CachePolicies share a namespace.
 //
-// The CRD does not enforce a singleton per namespace, so the controller may
-// see multiple CRs in the same namespace. The server's PolicyStore is keyed
-// by namespace, so something has to pick. We sort by (namespace, name) and
-// emit the FIRST entry per namespace — i.e. the alphabetically smallest
-// name wins, deterministically, regardless of Kubernetes list order. This
-// avoids "the effective policy depends on the apiserver's list ordering"
-// without bolting on a singleton constraint (admission webhook scope).
+// A validating webhook now rejects a second CachePolicy per namespace at
+// admission, but that check is best-effort (it can be raced by concurrent
+// CREATEs, and CRs created before the webhook shipped may already coexist), so
+// the controller must still pick deterministically when it does see multiple
+// CRs in one namespace. The server's PolicyStore is keyed by namespace, so
+// something has to pick. We sort by (namespace, name) and emit the FIRST entry
+// per namespace — i.e. the alphabetically smallest name wins, deterministically,
+// regardless of Kubernetes list order. This remains the authoritative tie-break;
+// the webhook is fast operator feedback layered on top, not a replacement.
 func resolvePolicies(items []cachev1alpha1.CachePolicy) []cacheserver.ResolvedPolicy {
 	if len(items) == 0 {
 		return []cacheserver.ResolvedPolicy{}
@@ -309,6 +311,13 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 // the first one (sorted by namespace, name) that carries a budget wins,
 // deterministically regardless of apiserver list ordering — mirroring
 // resolvePolicies' dedup.
+//
+// A validating webhook rejects same-namespace tenantID duplicates at admission,
+// but tenantID identity is namespace-blind here, so duplicates ACROSS
+// namespaces still reach this dedup (the webhook intentionally permits them).
+// This deterministic pick is the authoritative resolution for that case; the
+// shadowed CR is surfaced via Ready=False/DuplicateTenantID status (see the
+// CacheIndex status writer's effectiveTenantOwners).
 //
 // Identity: the emitted key is spec.tenantID (the value an ingest carries in
 // CacheStateUpdate.tenant_id), NOT the CR's metadata.name. That is the join the

@@ -192,6 +192,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// CachePolicy + CacheTenant validating/defaulting webhooks. Both
+	// validators read sibling CRs (one-CachePolicy-per-namespace,
+	// tenantID-uniqueness) via the manager's live APIReader, which
+	// SetupCache*WebhookWithManager wires internally.
+	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to register webhook", "webhook", "CachePolicy")
+		os.Exit(1)
+	}
+	if err := cachewebhookv1alpha1.SetupCacheTenantWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to register webhook", "webhook", "CacheTenant")
+		os.Exit(1)
+	}
+
 	// The Pod admission handler uses the manager's APIReader (uncached
 	// live client) instead of the cached client: pod CREATE is a
 	// one-shot opportunity to inject, so a stale informer view of the

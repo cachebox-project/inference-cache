@@ -1,7 +1,7 @@
 // Package main is the verify-samples CI helper. It runs every YAML file under
 // config/samples/ through admission against an in-process envtest apiserver
-// plus the CacheBackend admission webhook, using `kubectl apply
-// --dry-run=server`.
+// plus the CRD admission webhooks (CacheBackend, CachePolicy, CacheTenant),
+// using `kubectl apply --dry-run=server`.
 //
 // It catches sample-vs-schema drift before release: if a sample would be
 // rejected by a real cluster (unknown engine value, removed CRD field,
@@ -14,10 +14,12 @@
 // reject (rare).
 //
 // Driven by `make verify-samples`, which sets KUBEBUILDER_ASSETS and runs
-// `go run ./hack/verify-samples`. The CacheBackend webhook is registered
-// in-process with the same shipping adapter registry the controller uses
-// in production, so the gate exercises the validator an operator would
-// hit on `kubectl apply` against a real cluster.
+// `go run ./hack/verify-samples`. The CacheBackend, CachePolicy, and
+// CacheTenant webhooks are all registered in-process (CacheBackend with the
+// same shipping adapter registry the controller uses in production) so the
+// gate exercises the validators an operator would hit on `kubectl apply`
+// against a real cluster — every CRD webhook in the shipped manifests has a
+// live handler, so no sample CREATE 404s against an unregistered path.
 package main
 
 import (
@@ -150,6 +152,16 @@ func run() error {
 	// would just bypass it; CacheBackend is what we need to exercise.
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
 		return fmt.Errorf("register CacheBackend webhook: %w", err)
+	}
+	// The CachePolicy + CacheTenant webhooks are now part of the shipped
+	// manifests.yaml the apiserver routes to, so their handlers must be
+	// registered or every cachepolicy/cachetenant sample CREATE would 404
+	// against an unregistered path.
+	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("register CachePolicy webhook: %w", err)
+	}
+	if err := cachewebhookv1alpha1.SetupCacheTenantWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("register CacheTenant webhook: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
