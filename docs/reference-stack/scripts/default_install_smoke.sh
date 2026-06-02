@@ -1404,8 +1404,10 @@ esac
 # binding signals) assert behavioral regressions first; this generic
 # apply-clean loop is the catch-all backstop. Server-side dry-run exercises
 # CRD structural validation AND the validating admission webhook without
-# persisting CRs (no cleanup, no namespace pollution) and spins up no engine
-# pods (admission-level only, no traffic).
+# persisting any CRs (nothing to clean up afterwards); the only cluster side
+# effect is one transient namespace, created below and deleted at the end so
+# namespaced samples have a target. Spins up no engine pods (admission-level
+# only, no traffic).
 #
 # Honors the same opt-out as `make verify-samples`: a sample whose top-of-file
 # comment block contains a line equal to `# verify-samples: skip` is reported
