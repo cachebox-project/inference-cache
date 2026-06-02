@@ -1,0 +1,20 @@
+# Example overlay: the default install WITH opt-in gRPC Service TLS on :9090.
+#
+# config/default serves the policy gRPC port plaintext (the in-cluster
+# kvevent-subscriber producer and the external gateway client are not TLS-ready
+# yet — see docs/design/grpc-tls.md). This overlay layers the config/server/tls
+# component on top, which adds the cert-manager Issuer + Certificate and points
+# the server's --tls-cert-file / --tls-key-file at the mounted Secret.
+#
+# Apply with:  kubectl apply -k config/overlays/server-tls
+# (cert-manager must be installed; the same prerequisite as the admission
+# webhook.) For production, repoint the Issuer at a real CA — see the Certificate
+# comments and docs/design/grpc-tls.md "Client trust anchor + distribution".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../default
+
+components:
+  - ../../server/tls

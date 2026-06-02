@@ -26,7 +26,8 @@ const metricNamespace = "inferencecache"
 //
 // The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
 // owned by the standalone metric-schema work (F3). What ships here today: the
-// liveness gauge (`inferencecache_server_up`), the index population gauge
+// liveness gauge (`inferencecache_server_up`), the gRPC transport-posture
+// gauge (`inferencecache_server_grpc_tls_enabled`), the index population gauge
 // (`inferencecache_index_entries`), the lookup counter + latency histogram
 // (`inferencecache_lookup_route_*`), the quota-eviction counter
 // (`inferencecache_tenant_evictions_total`), and the per-endpoint auth
@@ -37,6 +38,7 @@ const metricNamespace = "inferencecache"
 type serverMetrics struct {
 	registry        *prometheus.Registry
 	up              prometheus.Gauge
+	grpcTLSEnabled  prometheus.Gauge
 	indexEntries    *prometheus.GaugeVec
 	lookupCalls     *prometheus.CounterVec
 	lookupLatency   *prometheus.HistogramVec
@@ -50,6 +52,15 @@ func newServerMetrics() *serverMetrics {
 		Namespace: metricNamespace,
 		Name:      "server_up",
 		Help:      "1 if the cache policy server is serving requests, 0 otherwise.",
+	})
+	// gRPC transport posture so operators can confirm from Prometheus whether
+	// the policy port (:9090) is terminating TLS in-process (1) or running
+	// plaintext (0, the default; TLS is the opt-in config/overlays/server-tls
+	// overlay). See docs/design/grpc-tls.md.
+	grpcTLSEnabled := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "server_grpc_tls_enabled",
+		Help:      "1 if the gRPC server is terminating TLS, 0 if serving plaintext.",
 	})
 	indexEntries := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricNamespace,
@@ -87,6 +98,7 @@ func newServerMetrics() *serverMetrics {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
 		up,
+		grpcTLSEnabled,
 		indexEntries,
 		lookupCalls,
 		lookupLatency,
@@ -100,6 +112,7 @@ func newServerMetrics() *serverMetrics {
 	return &serverMetrics{
 		registry:        registry,
 		up:              up,
+		grpcTLSEnabled:  grpcTLSEnabled,
 		indexEntries:    indexEntries,
 		lookupCalls:     lookupCalls,
 		lookupLatency:   lookupLatency,

@@ -18,8 +18,10 @@
 #   4. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller.
-#   5. The gRPC surface is reachable: a `LookupRoute` for an unknown model
-#      returns the fail-open default (`reason_code: NO_HINT`).
+#   5. The gRPC surface is reachable and PLAINTEXT by default: config/default
+#      serves :9090 plaintext (TLS is opt-in — phase 11), so a plaintext client
+#      lists services and a `LookupRoute` for an unknown model returns the
+#      fail-open default (`reason_code: NO_HINT`).
 #   6. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
@@ -68,6 +70,17 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
+#  11. The opt-in gRPC TLS path works: applying config/overlays/server-tls
+#      (config/default + the config/server/tls component) rolls the server with
+#      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
+#      a plaintext client is rejected and the cert-manager-issued chain +
+#      Service-FQDN SAN VERIFY against the CA published in the serving Secret
+#      (`grpcurl -cacert` with -authority <FQDN>; a wrong authority is
+#      rejected) — proving server authentication, not just encryption, for the
+#      overlay operators actually enable. Finally re-runs the SAME
+#      LookupRoute(unknown model) the plaintext phase (5) ran and asserts the
+#      identical fail-open NO_HINT, proving the existing call pattern is
+#      unchanged over TLS (pure transport wrapper, no contract/behavior change).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -480,8 +493,10 @@ kubectl -n "$NAMESPACE" port-forward svc/inference-cache-server "$GRPC_LOCAL_POR
   >"$LOG_DIR/port-forward.log" 2>&1 &
 pf_pid=$!
 
-# Wait for the local port to actually accept connections; grpcurl errors out
-# loudly if the forward isn't up yet, and we'd misattribute that to the server.
+# Wait for the local port to accept connections. config/default serves :9090
+# PLAINTEXT (TLS is opt-in — exercised separately against the
+# config/overlays/server-tls overlay near the end of this smoke), so probe with
+# -plaintext.
 for _ in $(seq 1 30); do
   if grpcurl -plaintext -max-time 2 "localhost:$GRPC_LOCAL_PORT" list >/dev/null 2>&1; then
     break
@@ -489,9 +504,25 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+# --- gRPC default posture assertion (plaintext) ----------------------------
+# config/default serves :9090 plaintext. Assert a plaintext client can list the
+# services. (We deliberately do NOT probe with a TLS client here: a TLS
+# ClientHello against the plaintext HTTP/2 listener destabilizes the shared
+# kubectl port-forward and breaks the probes that follow. The TLS-rejected-on-
+# plaintext direction is covered by the unit tests; the opt-in TLS phase near
+# the end proves the inverse — plaintext rejected once TLS is enabled.)
+log "asserting gRPC default posture on :9090 (plaintext serving)"
+if ! grpcurl -plaintext -max-time 5 "localhost:$GRPC_LOCAL_PORT" list \
+     >"$LOG_DIR/grpcurl-plaintext-list.out" 2>&1; then
+  cat "$LOG_DIR/grpcurl-plaintext-list.out" >&2 || true
+  fail "expected plaintext 'grpcurl -plaintext list' to succeed against the default (plaintext) install"
+fi
+log "gRPC default posture OK: plaintext serving"
+
 # Probe twice in priority order: server reflection first (what a real gateway
 # client would do), proto-file second (survives the reflection registration
-# being temporarily reverted or moved).
+# being temporarily reverted or moved). The default install is plaintext, so
+# these functional probes use -plaintext; TLS is verified in the opt-in phase.
 grpcurl_lookup_route() {
   local payload="$1"
   local err_file="${2:-$LOG_DIR/grpcurl.err}"
@@ -513,6 +544,7 @@ grpcurl_lookup_route() {
 grpcurl_report_cache_state() {
   local payload="$1"
   local err_file="${2:-$LOG_DIR/grpcurl-report-cache-state.err}"
+  # Default install is plaintext (see grpcurl_lookup_route).
   if printf '%s\n' "$payload" | grpcurl -plaintext -max-time 5 -d @ \
        "localhost:$GRPC_LOCAL_PORT" \
        inferencecache.v1alpha1.InferenceCache/ReportCacheState \
@@ -1363,4 +1395,96 @@ case "$audience_probe" in
     ;;
 esac
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open, CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, and audience binding on both endpoints all work"
+# --- opt-in gRPC TLS overlay verification ----------------------------------
+# config/default is plaintext; Service TLS is an opt-in overlay
+# (config/overlays/server-tls = config/default + the config/server/tls
+# component). Apply it on top of the running install, which patches the server
+# Deployment with --tls-cert-file/--tls-key-file + the cert-manager Secret
+# volume and ships the Issuer + Certificate. After the rollout, verify the
+# cert-manager-issued chain + Service-FQDN SAN actually authenticate the server
+# (not just encrypt): pull ca.crt from the serving Secret and run
+# `grpcurl -cacert <ca.crt> -authority <Service FQDN>` (grpcurl uses -authority
+# as the verification name even though the port-forward terminates at
+# localhost). A wrong authority must fail, and plaintext must be rejected.
+log "verifying opt-in TLS overlay (config/overlays/server-tls)"
+kubectl apply -k "$tmpdir/config/overlays/server-tls" >/dev/null \
+  || fail "kubectl apply -k config/overlays/server-tls failed"
+# The patched pod stays Pending until cert-manager mints the Secret from the
+# Certificate the overlay just applied; rollout status blocks until it's served.
+if ! kubectl -n "$NAMESPACE" rollout status deploy/inference-cache-server --timeout=150s; then
+  kubectl -n "$NAMESPACE" get pod -l app.kubernetes.io/component=server -o wide || true
+  kubectl -n "$NAMESPACE" describe certificate inference-cache-server-serving-cert || true
+  fail "server Deployment did not roll out with TLS within 150s (cert-manager Secret not minted?)"
+fi
+
+# Re-establish the port-forward against the freshly rolled (TLS) pod; the old
+# forward pointed at the now-terminated plaintext pod.
+kill "$pf_pid" 2>/dev/null || true
+TLS_LOCAL_PORT="$((GRPC_LOCAL_PORT + 1))"
+kubectl -n "$NAMESPACE" port-forward svc/inference-cache-server "$TLS_LOCAL_PORT:9090" \
+  >"$LOG_DIR/port-forward-tls.log" 2>&1 &
+pf_pid=$!
+tls_ready=0
+for _ in $(seq 1 30); do
+  if grpcurl -insecure -max-time 2 "localhost:$TLS_LOCAL_PORT" list >/dev/null 2>&1; then
+    tls_ready=1
+    break
+  fi
+  sleep 1
+done
+# Assert the TLS port-forward actually came up before the real checks run — an
+# explicit failure here points at the forward / TLS listener rather than letting
+# the -cacert assertion below fail with a murkier "connection refused".
+if [ "$tls_ready" != "1" ]; then
+  cat "$LOG_DIR/port-forward-tls.log" >&2 || true
+  fail "TLS port-forward to :9090 never accepted a connection (grpcurl -insecure failed for 30s after the overlay rollout)"
+fi
+
+if grpcurl -plaintext -max-time 5 "localhost:$TLS_LOCAL_PORT" list \
+     >"$LOG_DIR/grpcurl-tls-plaintext.out" 2>&1; then
+  cat "$LOG_DIR/grpcurl-tls-plaintext.out" >&2 || true
+  fail "expected plaintext to be REJECTED once the TLS overlay is applied"
+fi
+ca_file="$LOG_DIR/server-ca.crt"
+kubectl -n "$NAMESPACE" get secret inference-cache-server-tls \
+  -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d > "$ca_file" || true
+if [ ! -s "$ca_file" ]; then
+  kubectl -n "$NAMESPACE" get secret inference-cache-server-tls -o yaml || true
+  fail "serving Secret inference-cache-server-tls has no usable ca.crt — clients could not authenticate the server (encryption only)"
+fi
+server_fqdn="inference-cache-server.${NAMESPACE}.svc.cluster.local"
+if ! grpcurl -cacert "$ca_file" -authority "$server_fqdn" -max-time 5 \
+     "localhost:$TLS_LOCAL_PORT" list >"$LOG_DIR/grpcurl-cacert-list.out" 2>&1; then
+  cat "$LOG_DIR/grpcurl-cacert-list.out" >&2 || true
+  fail "expected TLS verification with the cert-manager CA against $server_fqdn to succeed"
+fi
+if grpcurl -cacert "$ca_file" -authority "wrong.example.invalid" -max-time 5 \
+     "localhost:$TLS_LOCAL_PORT" list >"$LOG_DIR/grpcurl-cacert-badname.out" 2>&1; then
+  cat "$LOG_DIR/grpcurl-cacert-badname.out" >&2 || true
+  fail "expected TLS verification with a wrong authority to FAIL (the Service-FQDN SAN must be enforced)"
+fi
+log "opt-in TLS overlay OK: plaintext rejected; cert-manager CA verifies the server cert for $server_fqdn (wrong name rejected)"
+
+# Backward-compatibility: the EXISTING call pattern must work UNCHANGED over
+# TLS. Re-run the same LookupRoute(unknown model) the plaintext phase ran (phase
+# 5) and assert the identical fail-open result (reason_code=NO_HINT) — proving
+# TLS is a pure transport wrapper that does not alter the gRPC contract or
+# handler behavior, so a client only swaps plaintext creds for TLS creds.
+# Reflection first, proto-file fallback (same priority order as the plaintext
+# probe in grpcurl_lookup_route).
+tls_lookup_payload='{"modelId":"install-smoke-unknown"}'
+tls_lookup_resp="$(grpcurl -cacert "$ca_file" -authority "$server_fqdn" -max-time 5 -d "$tls_lookup_payload" \
+    "localhost:$TLS_LOCAL_PORT" inferencecache.v1alpha1.InferenceCache/LookupRoute 2>"$LOG_DIR/grpcurl-tls-lookup.err" \
+  || grpcurl -cacert "$ca_file" -authority "$server_fqdn" -max-time 5 \
+       -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto -d "$tls_lookup_payload" \
+       "localhost:$TLS_LOCAL_PORT" inferencecache.v1alpha1.InferenceCache/LookupRoute 2>>"$LOG_DIR/grpcurl-tls-lookup.err")"
+if [ -z "$tls_lookup_resp" ]; then
+  cat "$LOG_DIR/grpcurl-tls-lookup.err" >&2 || true
+  fail "LookupRoute over TLS returned no response — the existing call pattern broke once TLS was enabled"
+fi
+if ! has_reason_code "$tls_lookup_resp" "NO_HINT"; then
+  fail "LookupRoute over TLS did not return the fail-open NO_HINT the plaintext path returns (TLS altered handler behavior): $tls_lookup_resp"
+fi
+log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HINT, identical to the plaintext phase"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, and the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS) all work"

@@ -24,6 +24,10 @@ profile.cov
 bin/
 dist/
 .cache/
+# Root-level binaries from `go build ./cmd/<x>` run without -o (Makefile uses bin/).
+/server
+/controller
+/kvevent-subscriber
 
 # Go workspace file
 go.work

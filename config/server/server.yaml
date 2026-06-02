@@ -128,6 +128,15 @@ spec:
             # :8081); together the L7 auth and the L3/L4 pod-selector gate form
             # independent defences. See config/server/networkpolicy.yaml.
             - --allowed-controller-sa=system:serviceaccount:inference-cache-system:inference-cache-controller-manager
+            # gRPC :9090 is PLAINTEXT in the default install. Service TLS is an
+            # opt-in overlay (config/overlays/server-tls, via the
+            # config/server/tls component) that adds --tls-cert-file /
+            # --tls-key-file + the cert-manager Secret volume. The default stays
+            # plaintext until the gRPC CLIENTS are TLS-ready — the in-cluster
+            # kvevent-subscriber producer (dials :9090 for ReportCacheState) and
+            # the external gateway client (E1) both speak plaintext today, so
+            # flipping TLS on by default would break ingestion. See
+            # docs/design/grpc-tls.md.
           ports:
             - name: grpc
               containerPort: 9090
