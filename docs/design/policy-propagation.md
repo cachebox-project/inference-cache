@@ -114,6 +114,11 @@ intervention.
   tenant key (see *Tenant mapping* below).
 - `policies[].evictionTTL` — Go `time.Duration` (nanoseconds, JSON
   number). Optional. `<=0` ⇒ "use server default" (`DefaultTTL = 30m`).
+  Note: the CachePolicy validating webhook now rejects a non-positive
+  `spec.evictionTTL` *at admission* when the field is set, so a conformant CR
+  never emits `<=0` here. The wire-level `<=0` fallback is retained as a
+  defensive default for an unset field and for any legacy/raced data that
+  predates the webhook.
 - `policies[].minimumPrefixTokens` — int32. Optional. `<=0` ⇒ "no
   threshold".
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒

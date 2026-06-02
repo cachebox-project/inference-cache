@@ -27,10 +27,14 @@ import (
 )
 
 // TestCachePolicyCacheTenantWebhooks_OnEnvtest boots a real apiserver via
-// envtest, installs ONLY the CachePolicy + CacheTenant webhook configurations,
-// starts a manager with both webhooks registered, and exercises the cross-CR
+// envtest, installs the shipped config/webhook/manifests.yaml (which also
+// guards the generated CachePolicy/CacheTenant webhook wiring against drift),
+// registers the CachePolicy + CacheTenant handlers, and exercises the cross-CR
 // admission rules end-to-end (the apiserver routes each CREATE/UPDATE through
-// the webhook over the local serving cert):
+// the webhook over the local serving cert). The manifest also carries the pod
+// and CacheBackend webhooks, but this test only creates Namespaces,
+// CachePolicies, and CacheTenants — none of which those match — so their
+// unregistered handler paths are never hit:
 //
 //   - a first CachePolicy in a namespace is admitted; a SECOND is rejected
 //     with an error naming the existing policy; a policy in another namespace

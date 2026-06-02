@@ -14,10 +14,15 @@
 #   3. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
 #      server's `/policy` endpoint, and `LookupRoute` observes the pushed
-#      minimumPrefixTokens gate without engine pods or inference traffic.
+#      minimumPrefixTokens gate without engine pods or inference traffic. The
+#      installed validating webhook also rejects a SECOND CachePolicy in the
+#      namespace (one-per-namespace), proving the bundle's webhook Service +
+#      cert-manager CA-injection path — not just envtest handler logic.
 #   4. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
-#      smoke) and a `Ready=True` condition written by the same poller.
+#      smoke) and a `Ready=True` condition written by the same poller. The
+#      installed validating webhook also rejects a SECOND CacheTenant reusing
+#      an existing tenantID in the namespace (tenantID-uniqueness).
 #   5. The gRPC surface is reachable and PLAINTEXT by default: config/default
 #      serves :9090 plaintext (TLS is opt-in — phase 11), so a plaintext client
 #      lists services and a `LookupRoute` for an unknown model returns the
@@ -445,6 +450,35 @@ if ! grep -Fq "cachepolicy-sample" <<<"$cp_table" || \
 fi
 log "CachePolicy default eviction=LRU stamped, printer column renders Eviction"
 
+# --- CachePolicy admission rejection (one-per-namespace webhook) ------------
+# The installed validating webhook — served through the bundle's webhook
+# Service with the cert-manager-injected CA bundle — must reject a SECOND
+# CachePolicy in the namespace. Proving it on the real install (not just
+# envtest) exercises the Service + cert + CA-injection path an operator's
+# `kubectl apply` actually traverses: a broken cainjection annotation, a wrong
+# Service selector, or a missing cert would fail here while envtest still
+# passed. cachepolicy-sample already occupies $POLICY_SMOKE_NS, so this apply
+# must be denied.
+log "asserting a second CachePolicy in $POLICY_SMOKE_NS is rejected at admission"
+second_cp_yaml="$(cat <<EOF
+apiVersion: inferencecache.io/v1alpha1
+kind: CachePolicy
+metadata:
+  name: cachepolicy-sample-2
+  namespace: $POLICY_SMOKE_NS
+spec: {}
+EOF
+)"
+if cp_reject_out="$(printf '%s\n' "$second_cp_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$cp_reject_out"
+  fail "second CachePolicy in $POLICY_SMOKE_NS was admitted; the one-per-namespace webhook did not fire on the real install"
+fi
+if ! grep -q "already has CachePolicy" <<<"$cp_reject_out"; then
+  echo "$cp_reject_out"
+  fail "second CachePolicy was rejected, but not by the expected webhook rule (missing 'already has CachePolicy' message)"
+fi
+log "second CachePolicy rejected at admission by the installed validating webhook"
+
 # --- CacheTenant status projection assertion -------------------------------
 # Apply a CacheTenant and prove the poller's per-tenant projection writes its
 # status. The smoke cluster has no engine pods, so the tenant holds zero
@@ -485,6 +519,32 @@ if ! grep -q 'tenant-a' <<<"$ct_table" || ! grep -q '100000' <<<"$ct_table"; the
   fail "expected CacheTenant printer columns (Tenant=tenant-a, Quota=100000) in kubectl get output"
 fi
 log "cachetenant-sample.status: indexEntries=$ct_entries Ready=$ct_ready (printer columns OK)"
+
+# --- CacheTenant admission rejection (tenantID-uniqueness webhook) ----------
+# The installed validating webhook must reject a SECOND CacheTenant claiming an
+# already-used tenantID in the same namespace. cachetenant-sample (tenantID
+# tenant-a) was applied to the default namespace above, so a second tenant
+# reusing tenant-a there must be denied — proving the in-cluster
+# Service/cert/CA-injection path for this webhook too.
+log "asserting a duplicate-tenantID CacheTenant in the default namespace is rejected at admission"
+second_ct_yaml="$(cat <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: cachetenant-sample-2
+spec:
+  tenantID: tenant-a
+EOF
+)"
+if ct_reject_out="$(printf '%s\n' "$second_ct_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$ct_reject_out"
+  fail "second CacheTenant reusing tenantID tenant-a was admitted; the uniqueness webhook did not fire on the real install"
+fi
+if ! grep -q "already claimed by CacheTenant" <<<"$ct_reject_out"; then
+  echo "$ct_reject_out"
+  fail "duplicate CacheTenant was rejected, but not by the expected webhook rule (missing 'already claimed by CacheTenant' message)"
+fi
+log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
 
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
