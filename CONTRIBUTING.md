@@ -20,16 +20,20 @@ make proto-lint
 make lint
 make test-race
 make build
-make cover-check # fail if logic-package coverage drops below COVER_MIN (85%)
+make cover-check # fail if logic-package coverage drops below COVER_MIN (90%)
 make vulncheck   # vulnerability scan (needs network); blocking in CI
 ```
 
 `make test-race` runs the unit tests under the race detector — it's what the
 pre-push gate and CI use; `make test` is the faster, non-race variant for quick
-local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 85%)
+local iteration. `make cover-check` enforces a coverage floor (`COVER_MIN`, 90%)
 over the hand-written logic packages — generated code, `cmd/` entrypoints,
 tooling under `hack/`, and test helpers are excluded; `make cover` prints the
-per-function report. The floor is a ratchet: raise it as coverage improves.
+per-function report. Coverage is measured with `-coverpkg=./...` so a helper
+exercised by tests in a CONSUMING package counts as covered — this matches
+how integration coverage actually exists in this repo (adapter helpers tested
+through the adapter, predicates tested through the controller). The floor is
+a ratchet: raise it as coverage improves.
 `make ci-lint` runs the golangci-lint configuration used by CI.
 `make proto-lint` lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
