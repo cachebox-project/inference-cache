@@ -31,9 +31,23 @@ type CacheTenantDefaulter struct{}
 // point of mistake. The cross-CR check is why the validator holds a
 // [client.Reader]. It implements [admission.Validator] over CacheTenant.
 //
-// Uniqueness is scoped to the namespace by design: tenantID is the operator's
-// identity for the tenant, not a global UID, so two different namespaces may
-// reuse the same tenantID intentionally.
+// Uniqueness is scoped to the namespace by design. The index keys tenants by
+// the bare tenantID string (no namespace), so two CacheTenants in DIFFERENT
+// namespaces that share a tenantID do resolve to the same index/quota slot —
+// but the controller already handles that case deliberately and visibly: the
+// CacheIndex status writer picks a deterministic owner (effectiveTenantOwners,
+// first by (namespace, name)) and stamps Ready=False/DuplicateTenantID +
+// QuotaExceeded=False/NotEffective on the shadowed CR. Cross-namespace reuse is
+// therefore left to that runtime signal (it can be intentional, e.g. a
+// migration), while the same-namespace collision — an unambiguous operator
+// mistake with no legitimate reading — is hard-rejected here for immediate
+// feedback. See docs/design/policy-propagation.md ("Duplicate tenantID
+// tie-break").
+//
+// Like the CachePolicy single-per-namespace check, this is BEST-EFFORT: it
+// lists then admits, so concurrent CREATEs can race. The controller's
+// deterministic resolveTenants dedup is the authoritative backstop; the webhook
+// is fast feedback on the common sequential mistake, not a hard guarantee.
 type CacheTenantValidator struct {
 	// Reader lists sibling CacheTenants for the tenantID-uniqueness check.
 	// It MUST be a live (uncached) reader — production wiring passes

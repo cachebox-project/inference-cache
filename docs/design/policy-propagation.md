@@ -131,15 +131,20 @@ intervention.
   is implemented.
 
 **Duplicate `tenantID` tie-break.** Two `CacheTenant` CRs may declare the same
-`spec.tenantID`. Only one quota can be enforced per tenant ID, so the reconciler
-deduplicates deterministically: among the quota-bearing CRs for a tenant ID, the
-first by `(namespace, name)` ascending wins and is the single `tenants[]` entry
-emitted; the rest are dropped from the snapshot. The CacheIndex status writer
-resolves the same winner, so a shadowed duplicate's `status` reports
-`Ready=False` / `DuplicateTenantID` (it is not the effective owner) rather than
-advertising a budget that isn't enforced. Operators should keep `tenantID`
-unique across `CacheTenant` CRs; the tie-break only makes the conflict
-deterministic and visible.
+`spec.tenantID`. A validating webhook hard-rejects this **within a namespace**
+at CREATE (an unambiguous operator mistake), but `tenantID` identity is
+namespace-blind — the index keys tenants by the bare `tenantID` string — so the
+webhook intentionally **permits** the same `tenantID` across DIFFERENT
+namespaces (it can be deliberate, e.g. a migration). Those cross-namespace
+duplicates still reach the reconciler, which deduplicates deterministically:
+among the quota-bearing CRs for a tenant ID, the first by `(namespace, name)`
+ascending wins and is the single `tenants[]` entry emitted; the rest are dropped
+from the snapshot. The CacheIndex status writer resolves the same winner, so a
+shadowed duplicate's `status` reports `Ready=False` / `DuplicateTenantID` (it is
+not the effective owner) rather than advertising a budget that isn't enforced.
+The within-namespace admission check is best-effort (it can be raced by
+concurrent CREATEs); the deterministic tie-break remains the authoritative
+resolution that makes any surviving conflict deterministic and visible.
 
 The server's `policyHandler` decodes with `DisallowUnknownFields` so an
 unknown field surfaces as HTTP 400 rather than silently dropping. Request
@@ -149,21 +154,27 @@ Successful PUSH returns `HTTP 204 No Content` with an empty body.
 
 ## Multiple CachePolicies in one namespace
 
-The `CachePolicy` CRD does **not** enforce a singleton per namespace.
-When the controller observes more than one CachePolicy in a single
-namespace it deduplicates deterministically: the entries are sorted by
-`(namespace, name)` ascending and the FIRST entry per namespace wins
-(i.e. the lexicographically smallest `metadata.name`). The losing
-policies do not appear in the wire snapshot.
+A validating admission webhook rejects a **second** `CachePolicy` in a
+namespace at CREATE (UPDATE on the single CR is unaffected), so the common
+case never reaches the controller with more than one CR. That check is
+**best-effort**, not a hard guarantee: it lists-then-admits, so two concurrent
+CREATEs can both observe an empty namespace before either persists, and CRs
+created before the webhook shipped may already coexist.
 
-This rule:
+Because of that, the controller still resolves multiple CRs deterministically
+as the **authoritative** backstop: when it observes more than one CachePolicy
+in a single namespace it sorts by `(namespace, name)` ascending and the FIRST
+entry per namespace wins (i.e. the lexicographically smallest `metadata.name`).
+The losing policies do not appear in the wire snapshot.
 
-- Keeps the effective policy independent of apiserver list ordering.
-- Is observable from `kubectl get cachepolicies`, so an operator can
-  always predict which CR is in effect.
-- Is enforced by the controller, not the CRD: an admission webhook
-  enforcing one policy per namespace (singleton) would let us drop this
-  rule, and is a candidate for a future webhook addition.
+This split:
+
+- Gives operators immediate `kubectl apply` feedback on the ordinary mistake
+  (admission), instead of a silently-dropped policy.
+- Keeps the effective policy independent of apiserver list ordering even when
+  the best-effort admission check is bypassed (controller dedup).
+- Stays observable from `kubectl get cachepolicies`, so an operator can always
+  predict which CR is in effect.
 
 ## Tenant mapping (phase-1)
 

@@ -37,6 +37,15 @@ type CachePolicyDefaulter struct{}
 // when several CRs exist; operators have no signal which one won. Rejecting
 // the second CR at CREATE makes the "one policy, one namespace" contract
 // explicit at the point of mistake instead of silently dropping intent.
+//
+// This admission check is BEST-EFFORT, not a hard guarantee: it lists then
+// admits, so two concurrent CREATEs can both observe an empty namespace before
+// either persists and both slip through. The AUTHORITATIVE backstop remains
+// the controller's deterministic dedup (resolvePolicies sorts by
+// (namespace, name) and the first entry wins regardless of apiserver ordering)
+// — the webhook turns the common, sequential mistake into immediate kubectl
+// feedback rather than replacing that backstop. See docs/design/
+// policy-propagation.md ("Multiple CachePolicies in one namespace").
 type CachePolicyValidator struct {
 	// Reader lists sibling CachePolicies for the one-per-namespace check.
 	// It MUST be a live (uncached) reader — production wiring passes

@@ -22,10 +22,11 @@ import (
 )
 
 // TestVerifySamplesAdmissionEndToEnd exercises the same admission path
-// the gate drives — envtest apiserver + the CacheBackend webhook
-// installed from config/webhook/manifests.yaml and registered with the
-// shipping adapter registry — and asserts the path both ACCEPTS a known-
-// good CacheBackend and REJECTS a known-bad one with an actionable error.
+// the gate drives — envtest apiserver + the CRD webhooks (CacheBackend,
+// CachePolicy, CacheTenant) installed from config/webhook/manifests.yaml
+// and registered in-process (CacheBackend with the shipping adapter
+// registry) — and asserts the path both ACCEPTS a known-good CacheBackend
+// and REJECTS a known-bad one with an actionable error.
 //
 // This is the regression backstop the helper-only unit tests don't
 // provide: if a future refactor silently stopped invoking admission
