@@ -131,8 +131,10 @@ intervention.
   is implemented.
 
 **Duplicate `tenantID` tie-break.** Two `CacheTenant` CRs may declare the same
-`spec.tenantID`. A validating webhook hard-rejects this **within a namespace**
-at CREATE (an unambiguous operator mistake), but `tenantID` identity is
+`spec.tenantID`. A validating webhook hard-rejects this **within a namespace** —
+at CREATE, and at UPDATE when a tenant's `tenantID` is changed onto a
+same-namespace sibling's value (an unambiguous operator mistake) — but
+`tenantID` identity is
 namespace-blind — the index keys tenants by the bare `tenantID` string — so the
 webhook intentionally **permits** the same `tenantID` across DIFFERENT
 namespaces (it can be deliberate, e.g. a migration). Those cross-namespace
@@ -237,8 +239,11 @@ out together and the periodic re-push reconciles any transient skew.
 
 ## Out of scope
 
-- Webhook validation of CRD fields (admission) — see the CRD admission
-  webhook work.
+- General CRD **field-level** validation (structural / enum / range markers
+  and the CacheBackend admission rules) — covered by the CRD admission webhook
+  work, not here. The cross-CR admission rules that bear directly on
+  propagation — one `CachePolicy` per namespace and same-namespace `tenantID`
+  uniqueness — ARE documented above, since they shape what reaches the snapshot.
 - Per-tenant **memory** budgets — out of scope by design (engine KV
   memory is tenant-unaware; see [policy-crds.md](policy-crds.md)). Only
   the index entry-count quota (`maxIndexEntries`) is enforced.

@@ -101,10 +101,31 @@ func TestCacheTenantValidateCreate_TenantIDUniqueness(t *testing.T) {
 	}
 }
 
-func TestCacheTenantValidateCreate_NilReaderSkips(t *testing.T) {
+func TestCacheTenantValidateCreate_NilReaderFailsClosed(t *testing.T) {
 	v := &CacheTenantValidator{}
-	if _, err := v.ValidateCreate(context.Background(), tenant("t1", "team-a", "team-vision")); err != nil {
-		t.Fatalf("expected admission with nil reader, got %v", err)
+	_, err := v.ValidateCreate(context.Background(), tenant("t1", "team-a", "team-vision"))
+	if err == nil {
+		t.Fatalf("expected fail-closed error with nil Reader, got nil")
+	}
+	if apierrors.IsInvalid(err) {
+		t.Errorf("nil-Reader misconfiguration should be a plain error, not Invalid: %v", err)
+	}
+}
+
+func TestCacheTenantValidateCreate_NamesSmallestConflictDeterministically(t *testing.T) {
+	// Two siblings already hold the tenantID (a pre-webhook state). The
+	// rejection must name the lexicographically smallest by name, regardless of
+	// list order.
+	v := &CacheTenantValidator{Reader: fakeReaderWith(t,
+		tenant("zeta", "team-a", "team-vision"),
+		tenant("alpha", "team-a", "team-vision"),
+	)}
+	_, err := v.ValidateCreate(context.Background(), tenant("new", "team-a", "team-vision"))
+	if err == nil {
+		t.Fatalf("expected rejection")
+	}
+	if !strings.Contains(err.Error(), "\"alpha\"") {
+		t.Errorf("error should name the smallest sibling 'alpha', got: %v", err)
 	}
 }
 

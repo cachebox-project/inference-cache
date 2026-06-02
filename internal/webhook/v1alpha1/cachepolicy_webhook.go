@@ -181,14 +181,21 @@ func collectCachePolicySpecErrors(rules []CachePolicyValidationRule, cp *cachev1
 // checkSinglePolicyPerNamespace rejects a CachePolicy when another already
 // exists in the same namespace. It lists siblings through the live Reader and
 // excludes the object itself by name (so a re-admitted CR — e.g. a dry-run
-// followed by the real CREATE — doesn't collide with its own record). The
-// returned error names the existing policy so the operator knows what to edit
-// instead. A nil Reader means the namespace check is unconfigured and is
-// skipped (spec-only rules still run) rather than panicking — defensive for
-// any caller that builds a bare validator.
+// followed by the real CREATE — doesn't collide with its own record).
+//
+// A nil Reader FAILS CLOSED (returns an error): a validator wired without a
+// Reader cannot enforce a hard-reject invariant, and silently admitting would
+// disable the rule on a future miswiring. Production always wires
+// mgr.GetAPIReader() via SetupCachePolicyWebhookWithManager.
+//
+// When several siblings exist (e.g. CRs that predate this webhook), the error
+// names the lexicographically smallest by metadata.name — which is also the CR
+// the controller's resolvePolicies picks as effective — so the message is
+// deterministic regardless of apiserver list order AND points at the policy
+// actually in force.
 func (v *CachePolicyValidator) checkSinglePolicyPerNamespace(ctx context.Context, cp *cachev1alpha1.CachePolicy) (field.ErrorList, error) {
 	if v.Reader == nil {
-		return nil, nil
+		return nil, fmt.Errorf("CachePolicy validator misconfigured: nil Reader, cannot enforce one-policy-per-namespace")
 	}
 	var existing cachev1alpha1.CachePolicyList
 	if err := v.Reader.List(ctx, &existing, client.InNamespace(cp.Namespace)); err != nil {
@@ -197,20 +204,26 @@ func (v *CachePolicyValidator) checkSinglePolicyPerNamespace(ctx context.Context
 		// instead of silently admitting a second policy.
 		return nil, fmt.Errorf("listing existing CachePolicies in namespace %q: %w", cp.Namespace, err)
 	}
+	conflict := ""
 	for i := range existing.Items {
-		other := &existing.Items[i]
-		if other.Name == cp.Name {
+		other := existing.Items[i].Name
+		if other == cp.Name {
 			continue
 		}
-		return field.ErrorList{
-			field.Forbidden(
-				field.NewPath("metadata", "name"),
-				fmt.Sprintf("namespace %q already has CachePolicy %q; at most one CachePolicy is allowed per namespace. Edit the existing policy instead of creating a second one.",
-					cp.Namespace, other.Name),
-			),
-		}, nil
+		if conflict == "" || other < conflict {
+			conflict = other
+		}
 	}
-	return nil, nil
+	if conflict == "" {
+		return nil, nil
+	}
+	return field.ErrorList{
+		field.Forbidden(
+			field.NewPath("metadata", "name"),
+			fmt.Sprintf("namespace %q already has CachePolicy %q; at most one CachePolicy is allowed per namespace. Edit the existing policy instead of creating a second one.",
+				cp.Namespace, conflict),
+		),
+	}, nil
 }
 
 // rejectNonPositiveEvictionTTL enforces the "evictionTTL > 0 when set"

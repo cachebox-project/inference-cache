@@ -50,11 +50,15 @@ func TestCachePolicyCacheTenantWebhooks_OnEnvtest(t *testing.T) {
 		t.Skip("KUBEBUILDER_ASSETS unset; skipping webhook envtest")
 	}
 
-	// Install only the CachePolicy + CacheTenant webhook configurations. The
-	// shipped config/webhook/manifests.yaml also carries the pod and
-	// CacheBackend webhooks whose handlers this test does not register;
-	// installing them would route unrelated CREATEs to non-existent paths.
-	webhookManifest := writeCachePolicyTenantWebhookManifest(t)
+	// Install the SHIPPED config/webhook/manifests.yaml — not a hand-written
+	// copy — so this test also guards the generated webhook wiring (path,
+	// resource, operations) for cachepolicies/cachetenants: if `make manifests`
+	// ever drops or misconfigures those entries, the rejections below stop
+	// firing and the test fails. The manifest also carries the pod and
+	// CacheBackend webhooks, but this test only creates Namespaces,
+	// CachePolicies, and CacheTenants — none of which those other webhooks
+	// match — so their unregistered handler paths are never hit.
+	webhookManifest := filepath.Join("..", "..", "..", "config", "webhook", "manifests.yaml")
 
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
@@ -184,89 +188,6 @@ func mkNamespace(t *testing.T, ctx context.Context, k8s client.Client, name stri
 	if err := k8s.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil {
 		t.Fatalf("create namespace %s: %v", name, err)
 	}
-}
-
-// writeCachePolicyTenantWebhookManifest writes a temp webhook manifest
-// carrying only the CachePolicy + CacheTenant defaulting/validating
-// configurations. envtest's WebhookInstallOptions rewrites each clientConfig
-// to point at the manager's local serving port and injects the serving CA.
-func writeCachePolicyTenantWebhookManifest(t *testing.T) string {
-	t.Helper()
-	const manifest = `---
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: cachepolicy-cachetenant-mutating
-webhooks:
-- admissionReviewVersions: [v1]
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /mutate-inferencecache-io-v1alpha1-cachepolicy
-  failurePolicy: Fail
-  name: mcachepolicy.inferencecache.io
-  rules:
-  - apiGroups: [inferencecache.io]
-    apiVersions: [v1alpha1]
-    operations: [CREATE, UPDATE]
-    resources: [cachepolicies]
-  sideEffects: None
-- admissionReviewVersions: [v1]
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /mutate-inferencecache-io-v1alpha1-cachetenant
-  failurePolicy: Fail
-  name: mcachetenant.inferencecache.io
-  rules:
-  - apiGroups: [inferencecache.io]
-    apiVersions: [v1alpha1]
-    operations: [CREATE, UPDATE]
-    resources: [cachetenants]
-  sideEffects: None
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: cachepolicy-cachetenant-validating
-webhooks:
-- admissionReviewVersions: [v1]
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /validate-inferencecache-io-v1alpha1-cachepolicy
-  failurePolicy: Fail
-  name: vcachepolicy.inferencecache.io
-  rules:
-  - apiGroups: [inferencecache.io]
-    apiVersions: [v1alpha1]
-    operations: [CREATE, UPDATE]
-    resources: [cachepolicies]
-  sideEffects: None
-- admissionReviewVersions: [v1]
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /validate-inferencecache-io-v1alpha1-cachetenant
-  failurePolicy: Fail
-  name: vcachetenant.inferencecache.io
-  rules:
-  - apiGroups: [inferencecache.io]
-    apiVersions: [v1alpha1]
-    operations: [CREATE, UPDATE]
-    resources: [cachetenants]
-  sideEffects: None
-`
-	dir := t.TempDir()
-	path := filepath.Join(dir, "cachepolicy-cachetenant-webhook.yaml")
-	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
-		t.Fatalf("write temp webhook manifest: %v", err)
-	}
-	return path
 }
 
 // waitForWebhookPort polls the manager's TLS serving port until it accepts a

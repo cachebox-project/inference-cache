@@ -183,11 +183,18 @@ func collectCacheTenantSpecErrors(rules []CacheTenantValidationRule, ct *cachev1
 // claimed by another CacheTenant in the same namespace. It lists siblings
 // through the live Reader and excludes the object itself by name. The returned
 // error names the conflicting tenant and the contested tenantID so the
-// operator knows exactly what collides. A nil Reader skips the check (spec
-// rules still run) rather than panicking.
+// operator knows exactly what collides.
+//
+// A nil Reader FAILS CLOSED (returns an error) rather than skipping: this is a
+// hard-reject invariant, so a miswired validator must surface loudly instead of
+// silently admitting duplicates. Production always wires mgr.GetAPIReader().
+//
+// When more than one sibling already holds the tenantID, the error names the
+// lexicographically smallest by metadata.name so the message is deterministic
+// regardless of apiserver list order.
 func (v *CacheTenantValidator) checkTenantIDUniqueness(ctx context.Context, ct *cachev1alpha1.CacheTenant) (field.ErrorList, error) {
 	if v.Reader == nil {
-		return nil, nil
+		return nil, fmt.Errorf("CacheTenant validator misconfigured: nil Reader, cannot enforce tenantID uniqueness")
 	}
 	var existing cachev1alpha1.CacheTenantList
 	if err := v.Reader.List(ctx, &existing, client.InNamespace(ct.Namespace)); err != nil {
@@ -195,24 +202,28 @@ func (v *CacheTenantValidator) checkTenantIDUniqueness(ctx context.Context, ct *
 		// apiserver problem, not license to admit a possible duplicate.
 		return nil, fmt.Errorf("listing existing CacheTenants in namespace %q: %w", ct.Namespace, err)
 	}
+	conflict := ""
 	for i := range existing.Items {
 		other := &existing.Items[i]
 		if other.Name == ct.Name {
 			continue
 		}
-		if other.Spec.TenantID == ct.Spec.TenantID {
-			// field.Invalid (not field.Duplicate) so the detail — which names
-			// the conflicting tenant — renders verbatim; Duplicate %q-escapes
-			// its value and would mangle the embedded CR name.
-			return field.ErrorList{
-				field.Invalid(
-					field.NewPath("spec", "tenantID"),
-					ct.Spec.TenantID,
-					fmt.Sprintf("tenantID is already claimed by CacheTenant %q in namespace %q; pick a unique tenantID or edit the existing tenant.",
-						other.Name, ct.Namespace),
-				),
-			}, nil
+		if other.Spec.TenantID == ct.Spec.TenantID && (conflict == "" || other.Name < conflict) {
+			conflict = other.Name
 		}
 	}
-	return nil, nil
+	if conflict == "" {
+		return nil, nil
+	}
+	// field.Invalid (not field.Duplicate) so the detail — which names the
+	// conflicting tenant — renders verbatim; Duplicate %q-escapes its value and
+	// would mangle the embedded CR name.
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "tenantID"),
+			ct.Spec.TenantID,
+			fmt.Sprintf("tenantID is already claimed by CacheTenant %q in namespace %q; pick a unique tenantID or edit the existing tenant.",
+				conflict, ct.Namespace),
+		),
+	}, nil
 }

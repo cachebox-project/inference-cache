@@ -180,19 +180,31 @@ func TestCachePolicyValidateCreate_AggregatesSpecAndSibling(t *testing.T) {
 	}
 }
 
-func TestCachePolicyValidateCreate_NilReaderSkipsSiblingCheck(t *testing.T) {
-	// A bare validator (nil Reader) must not panic: the spec rules still run,
-	// the sibling check is skipped.
+func TestCachePolicyValidateCreate_NilReaderFailsClosed(t *testing.T) {
+	// A miswired validator (nil Reader) cannot enforce the one-per-namespace
+	// invariant, so it must fail closed with a plain error rather than silently
+	// admit — never a false-clean admission.
 	v := &CachePolicyValidator{}
-	cp := policy("p1", "team-a")
-	cp.Spec.EvictionTTL = durp(-time.Second)
-	_, err := v.ValidateCreate(context.Background(), cp)
-	if err == nil || !apierrors.IsInvalid(err) {
-		t.Fatalf("expected Invalid from the spec rule, got %v", err)
+	_, err := v.ValidateCreate(context.Background(), policy("p1", "team-a"))
+	if err == nil {
+		t.Fatalf("expected fail-closed error with nil Reader, got nil")
 	}
-	// And with a clean spec it admits (sibling check skipped).
-	if _, err := v.ValidateCreate(context.Background(), policy("p1", "team-a")); err != nil {
-		t.Fatalf("expected admission with nil reader + clean spec, got %v", err)
+	if apierrors.IsInvalid(err) {
+		t.Errorf("nil-Reader misconfiguration should be a plain error, not an Invalid admission verdict: %v", err)
+	}
+}
+
+func TestCachePolicyValidateCreate_NamesSmallestConflictDeterministically(t *testing.T) {
+	// Two policies already coexist (a pre-webhook state). The rejection must
+	// name the lexicographically smallest by name — the one resolvePolicies
+	// treats as effective — regardless of list order.
+	v := &CachePolicyValidator{Reader: fakeReaderWith(t, policy("zeta", "team-a"), policy("alpha", "team-a"))}
+	_, err := v.ValidateCreate(context.Background(), policy("new", "team-a"))
+	if err == nil {
+		t.Fatalf("expected rejection")
+	}
+	if !strings.Contains(err.Error(), "\"alpha\"") {
+		t.Errorf("error should name the smallest existing policy 'alpha', got: %v", err)
 	}
 }
 
