@@ -97,6 +97,12 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
 		t.Fatalf("register CacheBackend webhook: %v", err)
 	}
+	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {
+		t.Fatalf("register CachePolicy webhook: %v", err)
+	}
+	if err := cachewebhookv1alpha1.SetupCacheTenantWebhookWithManager(mgr); err != nil {
+		t.Fatalf("register CacheTenant webhook: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	mgrErr := make(chan error, 1)

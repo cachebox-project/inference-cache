@@ -151,6 +151,16 @@ func run() error {
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
 		return fmt.Errorf("register CacheBackend webhook: %w", err)
 	}
+	// The CachePolicy + CacheTenant webhooks are now part of the shipped
+	// manifests.yaml the apiserver routes to, so their handlers must be
+	// registered or every cachepolicy/cachetenant sample CREATE would 404
+	// against an unregistered path.
+	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("register CachePolicy webhook: %w", err)
+	}
+	if err := cachewebhookv1alpha1.SetupCacheTenantWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("register CacheTenant webhook: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
