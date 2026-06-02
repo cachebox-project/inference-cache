@@ -178,7 +178,8 @@ test-env: envtest ## Print envtest assets path for local integration tests.
 	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
 
 .PHONY: verify-samples
-verify-samples: envtest manifests ## Run every YAML under config/samples/ through admission via envtest + the CacheBackend webhook (server-side dry-run). Honors top-of-file `# verify-samples: skip`.
+verify-samples: envtest ## Run every YAML under config/samples/ through admission via envtest + the CacheBackend webhook (server-side dry-run). Honors top-of-file `# verify-samples: skip`.
+	@# Validates against the COMMITTED config/crd/bases + config/webhook/manifests.yaml — NOT a freshly regenerated tree. CRD drift is enforced separately by `make pre-pr` (gen-drift check) and the lint-generated-proto CI job, so this target staying behind committed manifests keeps it strictly checking the shipping shape.
 	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		$(GO_CMD) run ./hack/verify-samples
 
