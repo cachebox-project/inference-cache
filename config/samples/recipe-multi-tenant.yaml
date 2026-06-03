@@ -1,0 +1,237 @@
+# verify-samples: skip
+#
+# Why skipped: this recipe creates Namespaces and namespaced objects in one
+# file. `kubectl apply -f` orders namespace creation ahead of namespaced
+# objects, so on a REAL cluster it is intended to apply in one pass — but the
+# verify-samples gate uses server-side dry-run, which never persists the
+# dry-run-created namespaces, so the namespaced objects fail with "namespaces
+# 'team-a' not found". This is a dry-run limitation, not a schema problem;
+# CacheTenant admission is still gate-covered by cache_v1alpha1_cachetenant.yaml.
+# Validate this recipe manually against a kind cluster.
+#
+# Recipe: Multi-tenant — two tenants with isolated cache identity + entry quotas.
+#
+# Scenario: two teams (team-a, team-b) share the cluster. You want each team's
+# cache hints kept separate and each team's index footprint bounded.
+#
+# TENANT IDENTITY IS THE POD NAMESPACE. The injected kvevent-subscriber sidecar
+# reports cache state with `--tenant-id=$(POD_NAMESPACE)`, so a tenant boundary
+# is a Kubernetes namespace boundary. To get two tenants you deploy into two
+# namespaces, and each CacheTenant's `spec.tenantID` must equal its namespace
+# name so the declared quota matches the tenant identity actually reported. This
+# recipe therefore creates namespaces `team-a` and `team-b` and places each
+# team's CacheTenant + CacheBackend + engine in its own namespace.
+#
+# WHAT IS ENFORCED vs WHAT IS NOT (read before relying on isolation):
+#   * Identity isolation is REAL and structural. The index keys entries by
+#     (tenant, model, hash_scheme, prefix_hash), so team-a's hints can never
+#     collide with or leak into team-b's lookups.
+#   * Entry-count quota is REAL. CacheTenant.spec.quota.maxIndexEntries bounds
+#     how many distinct prefixes a tenant holds; over budget the tenant's oldest
+#     entries are evicted (Fairness) — eviction, never request rejection.
+#   * Engine KV MEMORY is NOT partitioned. vLLM's KV cache is a single shared,
+#     tenant-unaware LRU pool. If two tenants shared one engine their KV blocks
+#     would compete in the same eviction policy, and the control plane could
+#     neither enforce nor honestly attribute per-tenant bytes — which is why
+#     CacheTenant has no maxMemoryBytes / memoryUsed field. The pattern below
+#     gives each team its OWN engine Deployment, so a per-pod memory limit
+#     (cgroup) is the byte-isolation lever.
+#
+# PREREQUISITE for quotas/identity to actually populate: the entry-count quota
+# and per-tenant index state only get reported when the kvevent-subscriber
+# sidecar is auto-attached, which requires the controller to run with
+# --kvevent-subscriber-image set (empty by default). Without it the engines are
+# wired to their caches but report no KV events, so status.indexEntries stays
+# unset. CPU shape — runs without a GPU.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+---
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: team-a
+  namespace: team-a
+spec:
+  tenantID: team-a          # must equal the namespace (tenant id = POD_NAMESPACE)
+  isolationMode: Fairness
+  quota:
+    # Cap distinct prefixes for team-a. Over budget evicts team-a's oldest.
+    maxIndexEntries: 50000
+---
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: team-b
+  namespace: team-b
+spec:
+  tenantID: team-b          # must equal the namespace
+  isolationMode: Fairness
+  quota:
+    maxIndexEntries: 100000
+---
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: team-a-cache
+  namespace: team-a
+spec:
+  type: LMCache
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: tenant-engine
+  backendConfig:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: team-b-cache
+  namespace: team-b
+spec:
+  type: LMCache
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: tenant-engine
+  backendConfig:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: team-a-engine
+  namespace: team-a
+  labels:
+    app: tenant-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tenant-engine
+  template:
+    metadata:
+      labels:
+        app: tenant-engine
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:latest-x86_64   # `:latest-arm64` on Apple Silicon
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+            # Pod memory limit is the per-tenant byte isolation lever — the
+            # cgroup caps team-a's engine independently of team-b's.
+            limits:
+              memory: "8Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: team-b-engine
+  namespace: team-b
+  labels:
+    app: tenant-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tenant-engine
+  template:
+    metadata:
+      labels:
+        app: tenant-engine
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:latest-x86_64   # `:latest-arm64` on Apple Silicon
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+            limits:
+              memory: "8Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

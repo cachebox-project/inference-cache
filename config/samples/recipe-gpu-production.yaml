@@ -1,0 +1,140 @@
+# Recipe: GPU production — a production deployment SHAPE TEMPLATE (not a
+# drop-in). It shows the structure of a prod deployment; replace the placeholder
+# images (digest-pin them) and tune the model / resources / quotas for your
+# cluster before applying.
+#
+# Scenario: a real model on GPU engine pods, a managed LMCache backend that
+# autoscales under load, and a per-namespace CachePolicy with production-grade
+# TTLs. This file carries three objects: the CacheBackend (with an autoscaling
+# block), a CachePolicy for the namespace, and the GPU engine Deployment.
+#
+# Differences from the CPU dev recipe:
+#   * The engine Deployment requests a GPU (`nvidia.com/gpu: 1`) and uses the
+#     CUDA vLLM image — schedule it onto GPU nodes.
+#   * `spec.autoscaling` is set, so the controller reconciles a
+#     HorizontalPodAutoscaler that drives the MANAGED lmcache-server workload's
+#     replica count (it overrides spec.replicas while active). This autoscales
+#     the cache server, not the engine — scale the engine via its own HPA.
+#   * A CachePolicy tunes eviction for the namespace (see the CachePolicy doc
+#     pointer in config/samples/README.md).
+#
+# Binding works exactly as in recipe-cpu-dev.yaml: the `app: prod-llm` label on
+# the engine pod template matches `spec.engineSelector.matchLabels`. Same
+# fail-open-on-empty-endpoint apply race applies — wait for status.endpoint and
+# `kubectl rollout restart deploy/prod-llm-engine` if the first pod comes up
+# unwired. See docs/concepts/cachebackend-engine-binding.md.
+#
+# IMAGES ARE PLACEHOLDERS — replace before production. Both the managed
+# cache-server image and the engine image below use moving `:latest` tags so the
+# recipe stays self-contained; pin each to an immutable digest for a real
+# deployment.
+#
+# READY/OBSERVABILITY PREREQUISITE: the backend reaches Ready=True and reports
+# index entries only once the kvevent-subscriber sidecar is auto-attached, which
+# requires the controller to run with --kvevent-subscriber-image set (empty by
+# default). Without it the engine is wired to the cache (KV reuse works) but no
+# KV events are reported, so the backend holds at Ready=False /
+# AwaitingFirstKVEvent and, after the firstEventTimeout window (default 5m),
+# degrades to Ready=False / NoKVEventsObserved with Degraded=True. See
+# docs/quickstart.md.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: prod-llm-cache
+spec:
+  type: LMCache
+  # Baseline replica count for the managed lmcache-server. The autoscaling
+  # block below takes over once the HPA is reconciled.
+  replicas: 2
+  autoscaling:
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercent: 70
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: prod-llm
+  backendConfig:
+    # Real, ungated model (Apache-2.0) — no auth token required.
+    model: Qwen/Qwen2.5-7B-Instruct
+    # PLACEHOLDER — replace with a digest-pinned reference before production.
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: inferencecache.io/v1alpha1
+kind: CachePolicy
+metadata:
+  name: prod-llm-policy
+spec:
+  # Production eviction shape. LFU keeps hot prefixes resident under cap
+  # pressure; the TTL sweep still removes stale entries regardless of algorithm.
+  eviction: LFU
+  # Entries remain usable for an hour from last-seen. evictionTTL is measured
+  # from lastSeen and lookups do NOT refresh it — a hot-but-unreported prefix
+  # still ages out. At most one CachePolicy is allowed per namespace.
+  evictionTTL: 1h
+  # Skip lookups for very short prompts where a prefix hit saves little.
+  minimumPrefixTokens: 256
+  # Lookup deadline. A timed-out lookup fails open — it returns reason_code
+  # TIMEOUT with empty scores and never fails the serving request. NOTE: 0 means
+  # UNBOUNDED, not "instant"; keep a real budget here in production.
+  lookupTimeoutMs: 50
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prod-llm-engine
+  labels:
+    app: prod-llm
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: prod-llm
+  template:
+    metadata:
+      labels:
+        app: prod-llm
+    spec:
+      containers:
+        - name: vllm
+          # CUDA vLLM image. PLACEHOLDER — pin to a digest before production.
+          # (No imagePullPolicy set: once you pin a digest the default Always
+          # pull is unnecessary; set it to suit your registry.)
+          image: vllm/vllm-openai:latest
+          command: ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--enable-prefix-caching"
+            # KV-cache event publisher — required for the backend to observe
+            # KV events and transition Ready=True.
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            limits:
+              # One GPU per engine replica. Scheduling onto GPU nodes happens
+              # at runtime; this manifest validates without GPU nodes present.
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

@@ -1,0 +1,109 @@
+# Recipe: Tuning — CPU dev shape plus a meaningful engineOverrides block.
+#
+# Scenario: the canonical LMCache injection works, but you want to tune an
+# adapter-injected knob (chunk size) and turn up LMCache logging for triage —
+# WITHOUT losing the rest of the integration the pod webhook injects.
+#
+# `spec.integration.engineOverrides` amends the engine container on top of the
+# adapter's canonical injection. Two primitives are shown here:
+#   * UPSERT — `LMCACHE_CHUNK_SIZE` matches an adapter-owned env, so the override
+#     value (128) REPLACES the canonical default. Drop chunk size on nodes where
+#     the default eats too much per-replica memory.
+#   * APPEND — `LMCACHE_LOG_LEVEL` is not in the adapter's canonical set, so it
+#     is added unchanged. Useful for reading the LMCache log stream during triage.
+#
+# IMPORTANT: overrides that overlap the adapter's RESERVED args/env
+# (--kv-transfer-config, LMCACHE_REMOTE_URL, VLLM_USE_V1, INFERENCECACHE_FAIL_OPEN)
+# are HARD-REJECTED at admission with a field-scoped error — they are required
+# for the integration to function. engineOverrides tunes; it does not disable.
+# To skip injection entirely on a pod, use the `inferencecache.io/skip-inject`
+# pod annotation instead. The four primitives (args, suppressArgs, env,
+# suppressEnv) and five worked before/after examples are in
+# docs/concepts/cachebackend-engine-overrides.md.
+#
+# READY/OBSERVABILITY PREREQUISITE: as with the CPU dev recipe, the backend
+# reaches Ready=True and reports index entries only when the kvevent-subscriber
+# sidecar is auto-attached — that requires the controller to run with
+# --kvevent-subscriber-image set (empty by default). See docs/quickstart.md.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: tuning-cache
+spec:
+  type: LMCache
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+    engineOverrides:
+      env:
+        # Upsert: replaces the adapter's canonical chunk-size value.
+        - name: LMCACHE_CHUNK_SIZE
+          value: "128"
+        # Append: adapter doesn't inject this, so it's added unchanged.
+        - name: LMCACHE_LOG_LEVEL
+          value: DEBUG
+  engineSelector:
+    matchLabels:
+      app: tuning-demo
+  backendConfig:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tuning-demo-engine
+  labels:
+    app: tuning-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tuning-demo
+  template:
+    metadata:
+      labels:
+        app: tuning-demo
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:latest-x86_64   # `:latest-arm64` on Apple Silicon
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
