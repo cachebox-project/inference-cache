@@ -1,6 +1,6 @@
 # CacheIndex — the cluster cache "world map"
 
-`CacheIndex` is a cluster-scoped, **status-only** CR (shortName `ci`) that reflects what the cache plane actually knows right now: how many distinct prefixes are indexed, broken down per tenant and per engine replica. It is the operator's first stop when chasing "is tenant X getting cache hits?" or "is replica Y reporting state?" — a read-only mirror, **not** a routing substrate. It is metadata-only: it never stores KV tensors or prompt text.
+`CacheIndex` is a cluster-scoped, **status-only** CR (shortName `ci`) that reflects what the cache plane actually knows right now: how many distinct prefixes are indexed (cluster-wide and per tenant), plus cache-health stats per engine replica. (Per-replica *prefix* counts are not on this surface — they live on `CacheBackend.status.indexParticipation`; see the three-counts table below.) It is the operator's first stop when chasing "is tenant X getting cache hits?" or "is replica Y reporting state?" — a read-only mirror, **not** a routing substrate. It is metadata-only: it never stores KV tensors or prompt text.
 
 There is exactly one object, a controller-maintained singleton named `cluster-default`. The spec is intentionally empty — there is nothing to configure. You observe it; you never `kubectl apply` data into it.
 
@@ -10,7 +10,7 @@ CacheIndex is the mirror image of the CachePolicy **push**. Where the CachePolic
 
 | Direction | Surface | Mechanism |
 |---|---|---|
-| PULL (this doc) | `CacheIndex.status` | Controller polls the server's internal `GET /snapshot` (on the `:8081` listener) roughly every ~30s and writes the status **write-only-on-change**. |
+| PULL (this doc) | `CacheIndex.status` | Controller polls the server's internal `GET /snapshot` (on the `:8081` listener) every ~30s and writes the status **write-only-on-change**. |
 | PUSH (contrast) | server policy state | CachePolicy reconciler posts resolved policy to the server. |
 
 Because the write happens **only when the data changes**, a steady-state poll that sees no change does **not** advance `status.lastUpdated`. So `lastUpdated` marks the last *data* change, not the last poll. Poller liveness lives in controller metrics, not in this field — do not read a stale `lastUpdated` as "the poller died." See [`docs/design/policy-propagation.md`](../design/policy-propagation.md) for the bridge in full.
@@ -47,7 +47,7 @@ cluster-default   1428       30s       6d
 
 Start wide, then drill in:
 
-1. **Headline count.** `kubectl get cacheindex cluster-default` — the `PREFIXES` column is the whole-cluster distinct-prefix total at a glance, and `CHANGED` tells you how fresh that number is.
+1. **Headline count.** `kubectl get cacheindex cluster-default` — the `PREFIXES` column is the whole-cluster distinct-prefix total at a glance, and `CHANGED` tells you when that number last changed (not when it was last polled).
 2. **Per-tenant / per-replica breakdown.** `kubectl get cacheindex cluster-default -o yaml` — read `status.tenants[]` to answer "why is tenant X not getting cache hits?" (low `indexEntries` or `hitRate` for that tenant), and `status.replicas[]` to answer "is replica Y reporting state?" — **presence of its `id` row** is the signal that it has reported stats. Do **not** read `lastUpdate` as a liveness clock: it is write-only-on-change, so a replica reporting identical stats keeps a steady `lastUpdate` while still being perfectly alive. For reporter liveness, use the server's `/metrics`, not this field.
 3. **Per-backend detail.** For one CacheBackend's participation, read `CacheBackend.status.indexParticipation` instead — that surface includes prefix-only replicas that never reported stats and so are absent from `CacheIndex.status.replicas[]`.
 

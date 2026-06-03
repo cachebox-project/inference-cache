@@ -28,7 +28,7 @@ A prefix held warm on several replicas counts **once**, not once per replica.
 | Status field | Meaning |
 |---|---|
 | `indexEntries` | Observed distinct-prefix count for this tenant. A `nil` pointer means "not yet computed" (no snapshot observed), distinct from an observed `0`. |
-| `observedGeneration` | Latest spec generation the controller has reconciled. |
+| `observedGeneration` | The `spec` generation the **status projection** has seen — this status is written by the CacheIndex snapshot poller, so `observedGeneration` advancing means the poller observed this generation, **not** that the tenant's quota intent was pushed to or enforced by the server. That propagation runs on the separate `/policy` path. |
 | `conditions` | Standard condition list (e.g. the duplicate-`tenantID` signal below). |
 
 ```text
