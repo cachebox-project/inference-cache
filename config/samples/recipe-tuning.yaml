@@ -20,6 +20,11 @@
 # pod annotation instead. The four primitives (args, suppressArgs, env,
 # suppressEnv) and five worked before/after examples are in
 # docs/concepts/cachebackend-engine-overrides.md.
+#
+# READY/OBSERVABILITY PREREQUISITE: as with the CPU dev recipe, the backend
+# reaches Ready=True and reports index entries only when the kvevent-subscriber
+# sidecar is auto-attached — that requires the controller to run with
+# --kvevent-subscriber-image set (empty by default). See docs/quickstart.md.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

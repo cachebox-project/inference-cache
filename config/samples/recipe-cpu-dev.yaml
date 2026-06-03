@@ -2,7 +2,14 @@
 #
 # Scenario: you want to see cache-aware routing end-to-end with no GPU. This
 # pairs a managed LMCache backend with a tiny vLLM engine running on vLLM's
-# dedicated CPU build. A single `kubectl apply -f` gets you a working setup.
+# dedicated CPU build. A single `kubectl apply -f` wires the engine to the cache.
+#
+# READY/OBSERVABILITY PREREQUISITE: for the backend to reach Ready=True and
+# report index entries, the kvevent-subscriber sidecar must be auto-attached —
+# that requires the controller to run with --kvevent-subscriber-image set (it is
+# empty by default). Without it the engine is still wired to the cache (KV reuse
+# works), but no KV events are reported and `kubectl get cachebackend` holds at
+# Ready=False / AwaitingFirstKVEvent with PREFIXES 0. See docs/quickstart.md.
 #
 # What binds the two objects: the label `app: cpu-dev` appears in BOTH
 # `CacheBackend.spec.engineSelector.matchLabels` AND the engine Deployment's
@@ -76,10 +83,11 @@ spec:
             - "--max-model-len=8192"
             - "--enforce-eager"
             - "--enable-prefix-caching"
-            # KV-cache event publisher — the injected subscriber sidecar dials
+            # KV-cache event publisher — when the kvevent-subscriber sidecar is
+            # auto-attached (see the prerequisite note in the header), it dials
             # this to mirror BlockStored/BlockRemoved events to the policy
-            # server. Without it the backend never sees a KV event and stays
-            # Ready=False (AwaitingFirstKVEvent).
+            # server. Without the publisher the backend can never see a KV event
+            # and stays Ready=False (AwaitingFirstKVEvent).
             - "--kv-events-config"
             - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
           env:

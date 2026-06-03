@@ -49,10 +49,18 @@ kubectl apply -f config/samples/recipe-cpu-dev.yaml
 ```
 
 That single file ships the CacheBackend above plus a matching tiny-model vLLM
-engine Deployment, fully wired. (On a cold cluster the first engine pod can
-race ahead of the cache server's endpoint being published; if so, wait for the
-endpoint and `kubectl rollout restart` the engine — see the comment at the top
-of the recipe.)
+engine Deployment, with the engine wired to the cache. (On a cold cluster the
+first engine pod can race ahead of the cache server's endpoint being published;
+if so, wait for the endpoint and `kubectl rollout restart` the engine — see the
+comment at the top of the recipe.)
+
+> **One install-time prerequisite for observability.** The piece that publishes
+> KV events — the `kvevent-subscriber` sidecar — is only auto-attached when the
+> controller runs with `--kvevent-subscriber-image` set, which is **empty by
+> default**. Engine↔cache wiring (KV reuse) works without it, but until it is
+> set no KV events are reported, so the backend stays `Ready=False`
+> (`AwaitingFirstKVEvent`) and `PREFIXES` stays `0`. Set that flag on the
+> controller to get the Ready/observability surface below.
 
 ## What you get
 

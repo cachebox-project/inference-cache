@@ -2,10 +2,10 @@
 
 This directory holds three flavors of `inferencecache.io/v1alpha1` sample CRs:
 
-- **`recipe-*.yaml`** — the curated **recipe catalog**: full-runnable, named
-  end-to-end scenarios (cache backend + engine + policy/tenant as needed). Pick
-  the one that matches your situation and `kubectl apply -f` it. Start here.
-  See [the catalog](#recipe-catalog) below and the
+- **`recipe-*.yaml`** — the curated **recipe catalog**: named scenarios (cache
+  backend + engine + policy/tenant as needed), each a single `kubectl apply -f`
+  that wires the engine to the cache. Pick the one that matches your situation.
+  Start here. See [the catalog](#recipe-catalog) below and the
   [quickstart](../../docs/quickstart.md).
 - **`cache_v1alpha1_*.yaml`** — kubebuilder-generated minimum-viable samples,
   one per CRD kind. Useful as a starting point or for the first
@@ -24,10 +24,20 @@ run without a GPU.
 | [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Fastest path on a laptop / kind — tiny ungated model, no GPU, single replica, no quotas. |
 | [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Typical production — real model on GPU engine pods, managed-backend autoscaling, a CachePolicy with production TTLs. |
 | [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | `type: External` — point the operator at a cache server you manage yourself; the controller provisions nothing. |
-| [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
+| [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
 
-A cache-aware-routing recipe (full gateway integration) is deferred until the
+**Observability prerequisite.** Each recipe's `kubectl apply` wires the engine
+to its cache (KV reuse works immediately), but a backend only reaches
+`Ready=True` and reports index entries once the `kvevent-subscriber` sidecar is
+auto-attached — which requires the controller to run with
+`--kvevent-subscriber-image` set (empty by default). See the
+[quickstart](../../docs/quickstart.md).
+
+`recipe-multi-tenant.yaml` spans two namespaces, so it carries a
+`# verify-samples: skip` marker (server-side dry-run can't create the
+namespaces it depends on); it applies cleanly on a real cluster. A
+cache-aware-routing recipe (full gateway integration) is deferred until the
 gateway-side client ships.
 
 ## Apply-clean is enforced

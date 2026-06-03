@@ -1,4 +1,4 @@
-# Recipe: External cache — point the operator at a cache it manages itself.
+# Recipe: External cache — point the operator at a cache you manage yourself.
 #
 # Scenario: you already run an lmcache-server (or share one across clusters)
 # and don't want the controller to provision a new one. `spec.type: External`
@@ -20,6 +20,12 @@
 #
 # This recipe ships only the CacheBackend + a matching engine Deployment; the
 # cache server itself is assumed to already exist at the endpoint below.
+#
+# OBSERVABILITY PREREQUISITE: per-replica index entries are reported only when
+# the kvevent-subscriber sidecar is auto-attached, which (as for managed
+# backends) requires the controller to run with --kvevent-subscriber-image set
+# (empty by default). Without it the engine is wired to the external cache (KV
+# reuse works) but no KV events / index entries are reported. See docs/quickstart.md.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -36,7 +42,8 @@ spec:
     matchLabels:
       app: external-demo
   backendConfig:
-    # Model the engine pods load — keys per-replica index entries.
+    # Model the engine pods load — keys per-replica index entries when the
+    # subscriber sidecar is attached (see the prerequisite note above).
     model: Qwen/Qwen2.5-0.5B-Instruct
 ---
 apiVersion: apps/v1

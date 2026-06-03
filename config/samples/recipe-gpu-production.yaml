@@ -20,6 +20,18 @@
 # fail-open-on-empty-endpoint apply race applies — wait for status.endpoint and
 # `kubectl rollout restart deploy/prod-llm-engine` if the first pod comes up
 # unwired. See docs/concepts/cachebackend-engine-binding.md.
+#
+# IMAGES ARE PLACEHOLDERS — replace before production. Both the managed
+# cache-server image and the engine image below use moving `:latest` tags so the
+# recipe stays self-contained; pin each to an immutable digest for a real
+# deployment.
+#
+# READY/OBSERVABILITY PREREQUISITE: the backend reaches Ready=True and reports
+# index entries only once the kvevent-subscriber sidecar is auto-attached, which
+# requires the controller to run with --kvevent-subscriber-image set (empty by
+# default). Without it the engine is wired to the cache (KV reuse works) but no
+# KV events are reported, so the backend holds at Ready=False /
+# AwaitingFirstKVEvent. See docs/quickstart.md.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -42,7 +54,7 @@ spec:
   backendConfig:
     # Real, ungated model (Apache-2.0) — no auth token required.
     model: Qwen/Qwen2.5-7B-Instruct
-    # Pin to an immutable digest in production rather than a moving tag.
+    # PLACEHOLDER — replace with a digest-pinned reference before production.
     serverImage: lmcache/standalone:latest
 ---
 apiVersion: inferencecache.io/v1alpha1
@@ -59,9 +71,9 @@ spec:
   evictionTTL: 1h
   # Skip lookups for very short prompts where a prefix hit saves little.
   minimumPrefixTokens: 256
-  # Lookup deadline. A timed-out lookup returns NO_HINT (fail-open) — it never
-  # fails the serving request. NOTE: 0 means UNBOUNDED, not "instant"; keep a
-  # real budget here in production.
+  # Lookup deadline. A timed-out lookup fails open — it returns reason_code
+  # TIMEOUT with empty scores and never fails the serving request. NOTE: 0 means
+  # UNBOUNDED, not "instant"; keep a real budget here in production.
   lookupTimeoutMs: 50
 ---
 apiVersion: apps/v1
@@ -82,7 +94,7 @@ spec:
     spec:
       containers:
         - name: vllm
-          # CUDA vLLM image. Pin to a digest in production.
+          # CUDA vLLM image. PLACEHOLDER — pin to a digest before production.
           image: vllm/vllm-openai:latest
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct"]
