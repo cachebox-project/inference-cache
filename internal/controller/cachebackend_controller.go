@@ -285,6 +285,18 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // shed any previously managed workload; LMCache (Phase 1) templates a
 // Deployment + Service.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	// Adopt-and-keep visibility: if spec.storage.pvc is absent but we still own a
+	// data PVC from a prior persistent generation, warn (once). Done here, before
+	// the type/kind routing, so the warning fires regardless of how a now
+	// storage-less backend is dispatched — External, StatefulSet/unmanaged, an
+	// unsupported (runtime, type) pair, or managed-ephemeral all otherwise bypass
+	// the per-path provisioning logic. The PVC itself is retained by its owner
+	// reference (reclaimed only on CR delete); warnRetainedPVC no-ops when no
+	// owned PVC exists, so this is a cheap cached Get on the common path.
+	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
+		r.warnRetainedPVC(ctx, backend)
+	}
+
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		// A backend switched from a managed type to External must shed its workload.
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
@@ -487,15 +499,11 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		// needed.
 		mountDataVolume(podSpec, resolved.DataVolume, pvc.Name)
 		capacity = boundCapacity(pvc)
-	} else {
-		// Adopt-and-keep: spec.storage.pvc is absent but we may still own a PVC
-		// from a prior persistent generation. Destroying persistent storage in
-		// response to a spec edit is irreversible data loss, so the PVC stays
-		// (owner-referenced; GC'd only when the CacheBackend itself is deleted).
-		// Warn so the retention is visible. The rendered pod carries no PVC
-		// volume here, so the workload reverts to ephemeral on the next rollout.
-		r.warnRetainedPVC(ctx, backend)
 	}
+	// (When spec.storage.pvc is absent the rendered pod carries no PVC volume, so
+	// the workload reverts to ephemeral on the next rollout. The adopt-and-keep
+	// Warning for a removed spec.storage.pvc is emitted in dispatch — it covers
+	// every routing outcome, not just this managed path.)
 
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)

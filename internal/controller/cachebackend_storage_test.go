@@ -281,6 +281,35 @@ func TestReconcileMultiReplicaViaAutoscalingGated(t *testing.T) {
 	expectEvent(t, drainEvents(rec), conditionReasonInvalidStorageConfiguration)
 }
 
+func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1") // provisions the PVC on the managed path
+	getPVC(t, r, "cache-data", "ns1")
+	drainEvents(rec)
+
+	// Operator removes storage AND switches to StatefulSet, which dispatch routes
+	// to the unmanaged path — bypassing reconcileManaged entirely. The adopt-and-
+	// keep warning must still fire (it lives in dispatch), and the PVC must stay.
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Spec.Storage = nil
+	fresh.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); err != nil {
+		t.Fatalf("PVC must be retained across the kind switch (adopt-and-keep); get err=%v", err)
+	}
+	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
+		t.Fatalf("OrphanedPVCRetained on the unmanaged/bypass path = %d, want 1", n)
+	}
+}
+
 func TestReconcilePersistentSingleToMultiReplicaShedsWorkloadAndEndpoint(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)
