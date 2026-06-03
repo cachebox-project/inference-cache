@@ -27,14 +27,25 @@ import (
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
 // tests pin the same constants the handler uses.
 //
-// `spec.integration.failOpen` is NOT stamped here. Its `+kubebuilder:default=true`
-// marker only persists a stored value when the parent `spec.integration` object
-// is present; when integration is omitted, the field stays absent. The effective
-// "fail open unless explicitly disabled" semantics come from the
-// IntegrationFailOpen reader helper (nil spec / nil field => true), i.e. semantic
-// defaulting at read time, not persisted CRD defaulting.
+// Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
+// spec.replicas=1, spec.integration.engine=vllm, spec.integration.role=
+// ReadWrite, spec.integration.failOpen=true) are expressed via
+// `+kubebuilder:default=` markers on the API types and stamped by the
+// apiserver before this webhook runs. The webhook only handles defaults
+// the schema cannot express:
+//
+//   - spec.integration.firstEventTimeout: the CRD-schema default only fires
+//     when spec.integration is present in the submitted object; when the
+//     operator omits integration entirely the webhook materialises it here
+//     so the persisted CR carries the readiness-gate deadline rather than
+//     relying on the controller's runtime fallback.
+//   - spec.autoscaling.minReplicas: cluster-context default computed from
+//     spec.replicas at admission so the HPA's floor matches the operator's
+//     baseline declaration rather than a hard-coded constant.
+//
+// Per-field rationale lives in the godoc on each spec field; this comment
+// is the index for the webhook-stamped defaults specifically.
 const (
-	defaultReplicas = int32(1)
 	// defaultFirstEventTimeout mirrors the +kubebuilder:default on
 	// spec.integration.firstEventTimeout. The CRD-schema default only applies
 	// when spec.integration is present in the submitted object; when the
@@ -56,13 +67,31 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 	cachev1alpha1.CacheBackendTypeNIXL:   true,
 }
 
-// CacheBackendDefaulter applies Phase-1 defaults to a CacheBackend at
-// admission time. It stamps spec.replicas and materialises spec.integration
-// solely to persist spec.integration.firstEventTimeout (so an omitted
-// integration block still carries the readiness-gate deadline). It does NOT
-// stamp spec.integration.failOpen — that is defaulted semantically at read
-// time via IntegrationFailOpen (nil spec / nil field => true). It implements
-// [admission.Defaulter] over CacheBackend.
+// CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
+// `+kubebuilder:default=` markers cannot express at admission time. Literal
+// defaults (spec.type, deploymentKind, replicas, integration.engine,
+// integration.role, integration.failOpen) ride on schema markers and are
+// stamped by the apiserver before this handler runs; the webhook only
+// handles the schema-inexpressible ones:
+//
+//   - Materialises spec.integration solely to persist
+//     spec.integration.firstEventTimeout when the operator omits the
+//     integration block entirely (a CRD-schema default only applies when
+//     the parent object is present).
+//   - Computes spec.autoscaling.minReplicas from spec.replicas when
+//     autoscaling is opted into and minReplicas is left unset — the HPA
+//     floor needs to follow the workload's baseline declaration, which is
+//     cluster-context the schema cannot encode.
+//
+// It does NOT stamp spec.integration.failOpen explicitly — once the
+// defaulter materialises spec.integration above, the apiserver applies
+// the `+kubebuilder:default=true` marker on the now-present failOpen
+// field (alongside engine, role, firstEventTimeout) before persisting,
+// so an admitted CR with no integration block ends up with failOpen
+// populated in etcd. The read-time fallback in [IntegrationFailOpen]
+// covers callers that bypass the apiserver (raw-struct test invocation,
+// partial deserialization). It implements [admission.Defaulter] over
+// CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
@@ -122,6 +151,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectCrossNamespaceEndpointWithoutOptIn,
+	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -146,23 +176,64 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 
 // +kubebuilder:webhook:path=/mutate-inferencecache-io-v1alpha1-cachebackend,mutating=true,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachebackends,verbs=create;update,versions=v1alpha1,name=mcachebackend.inferencecache.io,admissionReviewVersions=v1
 
-// Default implements [admission.Defaulter]. It stamps spec.replicas (the
-// only Phase-1 default this webhook applies) when the operator left it
-// unset; a non-nil pointer is treated as an explicit choice and left alone.
+// Default implements [admission.Defaulter]. It applies the defaults the
+// CRD-schema markers cannot express:
+//
+//   - Materialises spec.integration when omitted so spec.integration.
+//     firstEventTimeout carries the readiness-gate deadline (the
+//     `+kubebuilder:default` only fires when the parent object is present).
+//   - Computes spec.autoscaling.minReplicas from spec.replicas when
+//     autoscaling is opted in and minReplicas is left unset.
+//
+// Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
+// replicas=1, integration.engine=vllm, integration.role=ReadWrite,
+// integration.failOpen=true) rides on a `+kubebuilder:default=` marker and
+// is stamped by the apiserver before this handler runs. Note that the nested
+// integration.* markers only fire when spec.integration is already present
+// in the submitted object — when the operator omits the integration block
+// entirely the apiserver has nothing to apply nested defaults to, which is
+// why the webhook materialises the parent below (and the read-time
+// helpers in [adapterruntime.ResolveRuntimeID] / [enginewire.IntegrationRole]
+// / [IntegrationFailOpen] provide the same effective default at read time
+// for callers that don't go through admission).
+//
+// A non-nil pointer or non-empty value is treated as an explicit operator
+// choice and left alone, preserving the established "defaulter never
+// clobbers" contract.
 func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.CacheBackend) error {
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)
-
-	if cb.Spec.Replicas == nil {
-		v := defaultReplicas
-		cb.Spec.Replicas = &v
-	}
 
 	if cb.Spec.Integration == nil {
 		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 	}
 	if cb.Spec.Integration.FirstEventTimeout == nil {
 		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
+	}
+
+	// autoscaling.minReplicas defaults to spec.replicas when autoscaling is
+	// opted into and the operator left the floor unset. The literal
+	// spec.replicas default (=1) is applied by the apiserver from the
+	// `+kubebuilder:default` marker before this handler runs, so reading
+	// cb.Spec.Replicas here sees either the operator's explicit value or
+	// the schema default — never nil for a CR that came through admission.
+	// The nil guard is defence-in-depth for tests that construct a
+	// CacheBackend directly and call Default without the apiserver in the
+	// loop; we leave minReplicas alone in that case rather than dereference
+	// a nil pointer.
+	//
+	// The `>= 1` guard mirrors the CRD schema's `minimum: 1` on
+	// autoscaling.minReplicas: spec.replicas allows 0 (scale-to-zero), so a
+	// CR with `replicas: 0` + opted-in autoscaling would otherwise have the
+	// defaulter stamp `minReplicas: 0`, which the apiserver then rejects
+	// against the schema's minimum. Refusing to default in that case leaves
+	// the field unset so the operator's misconfiguration surfaces as a
+	// missing-required-field validation error against autoscaling rather
+	// than a webhook-introduced schema violation.
+	if cb.Spec.Autoscaling != nil && cb.Spec.Autoscaling.MinReplicas == nil &&
+		cb.Spec.Replicas != nil && *cb.Spec.Replicas >= 1 {
+		v := *cb.Spec.Replicas
+		cb.Spec.Autoscaling.MinReplicas = &v
 	}
 
 	return nil
@@ -321,10 +392,13 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 // pair is the pod webhook, and admission rejecting upstream of it gives
 // the operator a useful error instead of a silent miss.
 //
-// The check is bypassed only when Spec.Type is empty: there is no
-// defaulting for type and the missing-type rejection is owned by
-// CRD-level / future field-level validation; piling an "adapter for
-// backend=\"\"" cause on top would not help the user.
+// The check is bypassed only when Spec.Type is empty: a CR that came
+// through admission carries `+kubebuilder:default=LMCache` stamped by
+// the apiserver before this handler runs, so an empty Type here means
+// the caller bypassed the apiserver (raw-struct unit-test invocation).
+// In that case the missing-type rejection is owned by CRD-level /
+// future field-level validation; piling an "adapter for backend=\"\""
+// cause on top would not help the user.
 func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Type == "" {
 		return nil
@@ -785,6 +859,38 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 			fmt.Sprintf("spec.endpoint references namespace %q but CacheBackend is in namespace %q; "+
 				"set spec.allowCrossNamespace=true to opt in to the cross-namespace reference",
 				ns, cb.Namespace),
+		),
+	}
+}
+
+// requireExplicitMinReplicasOnScaleToZeroWithAutoscaling rejects the
+// combination spec.replicas=0 + spec.autoscaling != nil +
+// spec.autoscaling.minReplicas == nil. Without this rule the defaulter
+// declines to compute minReplicas (a 0 value would violate the schema's
+// Minimum=1), the apiserver accepts the CR with minReplicas left unset,
+// and the reconciler's HPA fallback silently picks defaultHPAMinReplicas
+// (=1) — so an operator who wrote "scale to zero" gets "scale 1-N" with
+// no notification. Forcing the operator to either set the floor
+// explicitly or remove the autoscaling block keeps the scale-to-zero
+// intent loud at write time.
+//
+// Bypassed when spec.replicas is nil: the apiserver applies the
+// `+kubebuilder:default=1` marker on spec.replicas before this rule
+// runs for a CR that came through admission, so a nil here means the
+// caller bypassed the apiserver (raw-struct unit-test invocation) and
+// the rule has no replicas value to interpret.
+func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != 0 {
+		return nil
+	}
+	if cb.Spec.Autoscaling == nil || cb.Spec.Autoscaling.MinReplicas != nil {
+		return nil
+	}
+	return field.ErrorList{
+		field.Required(
+			field.NewPath("spec", "autoscaling", "minReplicas"),
+			"spec.replicas=0 with spec.autoscaling enabled requires spec.autoscaling.minReplicas to be set explicitly (must be >=1). "+
+				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
 		),
 	}
 }
