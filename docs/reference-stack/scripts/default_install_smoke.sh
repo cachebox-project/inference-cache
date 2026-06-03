@@ -1362,7 +1362,7 @@ if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_POLICY" --image=curlimages/curl:8.10
     # implies POST.
     curl -sS -m 5 -o /dev/null -w "%{http_code}" \
       -H "Content-Type: application/json" \
-      -d "{\"version\":2,\"policies\":[]}" \
+      -d "{\"version\":3,\"policies\":[]}" \
       http://inference-cache-server:8081/policy || echo "curl_failed:$?"
   ' >/tmp/policy-probe-create.log 2>&1; then
   cat /tmp/policy-probe-create.log >&2 || true
@@ -1477,8 +1477,8 @@ spec:
       sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
       # POST /policy — controller-audience must 204, default-audience must 401.
       # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
-      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":2,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
       echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def"
     volumeMounts:
     - name: controller-token

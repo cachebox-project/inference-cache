@@ -51,13 +51,14 @@ spec:
               eviction:
                 default: LRU
                 description: |-
-                  Eviction is the index entry-eviction algorithm. Reserved on
-                  v1alpha1 for forward compatibility; defaults to LRU. Today pkg/index
-                  runs LRU unconditionally and this field is not yet consulted by the
-                  controller. Additional algorithms extend the enum and gain a
-                  ResolvedPolicy propagation path as their implementations land.
+                  Eviction is the index entry-eviction algorithm applied when the index
+                  exceeds its entry cap. LRU evicts the oldest-by-lastSeen entry first;
+                  LFU evicts the lowest-access-count entry first (ties broken on oldest
+                  lastSeen). The TTL sweep removes stale entries regardless of this
+                  choice, so LFU does not pin hot-but-stale entries. Defaults to LRU.
                 enum:
                 - LRU
+                - LFU
                 type: string
               evictionTTL:
                 description: EvictionTTL is the maximum time a cache entry should

@@ -101,6 +101,7 @@ func New(opts ...Option) *Service {
 		index.WithMetrics(metrics),
 		index.WithTTLResolver(policies),
 		index.WithTenantQuotaResolver(policies),
+		index.WithEvictionResolver(policies),
 	)
 
 	publicMux := http.NewServeMux()

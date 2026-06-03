@@ -186,6 +186,13 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
 // TENANT_HOT / NO_HINT).
 func (s *inferenceCacheService) buildLookupResponse(model string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+	// Credit the LFU access counters for the entries this response actually
+	// delivers. buildLookupResponse runs on every DELIVERED response (including
+	// NO_HINT) but never on the TIMEOUT/early-deadline branches, which return via
+	// timeoutResponse — so a lookup the handler discarded for latency never bumps
+	// a counter. CreditHits is a no-op unless result carries prefix-match hits
+	// (empty for LRU namespaces and for NO_HINT/TENANT_HOT results).
+	result.CreditHits()
 	resp := &icpb.LookupRouteResponse{ReasonCode: reasonForStrategy(result.Strategy)}
 	if len(result.Scores) > 0 {
 		resp.ReplicaScores = make([]*icpb.ReplicaScore, 0, len(result.Scores))

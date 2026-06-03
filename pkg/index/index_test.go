@@ -341,13 +341,18 @@ func TestReadyReflectsStartAndStop(t *testing.T) {
 }
 
 // countingMetrics records the latest reported entry count per model and the
-// running total of tenant evictions per (tenant, reason).
+// running total of tenant evictions per (tenant, reason) and index evictions
+// per (algorithm, reason).
 type countingMetrics struct {
-	last      map[string]int
-	evictions map[string]int // key: tenantID + "|" + reason
+	mu             sync.Mutex
+	last           map[string]int
+	evictions      map[string]int // key: tenantID + "|" + reason
+	indexEvictions map[string]int // key: algorithm + "|" + reason
 }
 
 func (c *countingMetrics) SetIndexEntries(model string, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.last == nil {
 		c.last = map[string]int{}
 	}
@@ -355,10 +360,29 @@ func (c *countingMetrics) SetIndexEntries(model string, n int) {
 }
 
 func (c *countingMetrics) AddTenantEvictions(tenantID, reason string, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.evictions == nil {
 		c.evictions = map[string]int{}
 	}
 	c.evictions[tenantID+"|"+reason] += n
+}
+
+func (c *countingMetrics) AddIndexEvictions(algorithm, reason string, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.indexEvictions == nil {
+		c.indexEvictions = map[string]int{}
+	}
+	c.indexEvictions[algorithm+"|"+reason] += n
+}
+
+// indexEvictionCount returns the recorded index-eviction total for an
+// (algorithm, reason) pair.
+func (c *countingMetrics) indexEvictionCount(algorithm, reason string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.indexEvictions[algorithm+"|"+reason]
 }
 
 func TestMetricsSinkReceivesCounts(t *testing.T) {

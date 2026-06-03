@@ -508,6 +508,43 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	}
 }
 
+// TestReconcilerFlattensEvictionAlgorithm pins the spec.eviction flattening:
+// the upper-case CRD enum becomes the lower-case wire form, and an unset field
+// defaults to LRU (matching the kubebuilder default and the index default).
+func TestReconcilerFlattensEvictionAlgorithm(t *testing.T) {
+	store := cacheserver.NewPolicyStore()
+	srv := httptest.NewServer(policyHandlerForTest(store))
+	defer srv.Close()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newPolicyTestScheme(t)).
+		WithObjects(
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns-lfu"},
+				Spec:       cachev1alpha1.CachePolicySpec{Eviction: cachev1alpha1.CachePolicyEvictionAlgorithmLFU},
+			},
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns-lru"},
+				Spec:       cachev1alpha1.CachePolicySpec{Eviction: cachev1alpha1.CachePolicyEvictionAlgorithmLRU},
+			},
+			&cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns-unset"},
+				Spec:       cachev1alpha1.CachePolicySpec{EvictionTTL: ttlPtr(time.Minute)}, // eviction omitted
+			},
+		).
+		Build()
+	r := &ControlPlaneReconciler{Client: cl, ServerPolicyURL: srv.URL, HTTPClient: srv.Client()}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	for ns, want := range map[string]string{"ns-lfu": "lfu", "ns-lru": "lru", "ns-unset": "lru"} {
+		if got := store.Eviction(ns); got != want {
+			t.Fatalf("Eviction(%s) = %q, want %q", ns, got, want)
+		}
+	}
+}
+
 // policyHandlerForTest wraps the server package's exported handler factory.
 // Kept as a one-line helper so the call site reads naturally in the test.
 func policyHandlerForTest(s *cacheserver.PolicyStore) http.HandlerFunc {

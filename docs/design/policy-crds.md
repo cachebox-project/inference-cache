@@ -10,14 +10,14 @@ This document tracks the policy-side CRDs that sit beside `CacheBackend`. These 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.eviction` | enum | Reserved configuration surface for the index eviction algorithm. Currently `LRU` only (default); `pkg/index` runs LRU-by-`lastSeen` unconditionally and does not yet read this field. Kept on v1alpha1 for forward compatibility; additional algorithms extend the enum and gain a `ResolvedPolicy` propagation path as their implementations land. |
+| `spec.eviction` | enum | Index eviction algorithm applied when the index exceeds its entry cap. `LRU` (default) evicts the oldest-by-`lastSeen` entry first; `LFU` evicts the lowest-access-count entry first, breaking ties on the oldest `lastSeen`. Access counts do not age — the `evictionTTL` sweep removes stale entries regardless of algorithm, so `LFU` does not pin hot-but-stale entries. The controller lower-cases this and propagates it on `ResolvedPolicy`. The index reads it on the cap-based sweep (to order victims) and, in `LFU` namespaces, on the lookup path (to record which entries a *delivered* `LookupRoute` hint credits — a timed-out lookup credits nothing); it never changes a lookup result, and the TTL sweep is algorithm-independent. |
 | `spec.evictionTTL` | duration | Maximum usable lifetime for cache entries. |
 | `spec.minimumPrefixTokens` | integer | Minimum prefix token count before lookup. Minimum `0`. |
 | `spec.lookupTimeoutMs` | integer | Lookup latency budget in milliseconds. Minimum `0`. |
 
 `status.conditions` and `status.observedGeneration` are reserved for controller observations.
 
-Runtime propagation (controller → server `/policy`) is described in [policy-propagation.md](policy-propagation.md): `evictionTTL` drives per-tenant index eviction, `minimumPrefixTokens` and `lookupTimeoutMs` are enforced on the `LookupRoute` path. `spec.eviction` is reserved on v1alpha1 for forward compatibility; today the index runs LRU unconditionally and the field is not yet read by the controller or surfaced on `ResolvedPolicy`. The propagation path lands alongside the first non-LRU implementation.
+Runtime propagation (controller → server `/policy`) is described in [policy-propagation.md](policy-propagation.md): `evictionTTL` drives per-tenant index eviction, `minimumPrefixTokens` and `lookupTimeoutMs` are enforced on the `LookupRoute` path, and `eviction` selects the per-namespace cap-based eviction algorithm. The two eviction knobs are orthogonal: `evictionTTL` removes stale entries on the freshness sweep regardless of algorithm, while `eviction` only decides which entries the cap sweep drops when the index is over its entry cap.
 
 ## CacheTenant
 

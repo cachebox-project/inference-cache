@@ -21,14 +21,11 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	policySchema := loadCRDOpenAPISchema(t, "config/crd/bases/inferencecache.io_cachepolicies.yaml")
 	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
-	// Eviction is kept on v1alpha1 as a forward-compat configuration surface.
-	// pkg/index implements LRU-by-`lastSeen` unconditionally today; the
-	// controller does not yet propagate this field into ResolvedPolicy. The
-	// enum is intentionally a single value so the only acceptable input is
-	// the algorithm we actually run — the field is honest-by-narrow-enum
-	// rather than wired.
+	// Eviction selects the index cap-based eviction algorithm. Both values are
+	// implemented in pkg/index (LRU-by-lastSeen and LFU-by-access-count) and the
+	// controller propagates the choice (lower-cased) into ResolvedPolicy.
 	evictionSchema := mustProperty(t, policySpec, "eviction")
-	requireEnum(t, evictionSchema, []string{"LRU"})
+	requireEnum(t, evictionSchema, []string{"LRU", "LFU"})
 	requireDefault(t, evictionSchema, "LRU")
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
