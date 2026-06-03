@@ -1,0 +1,110 @@
+# Recipe: CPU dev — fastest path to a working cache on a laptop / kind cluster.
+#
+# Scenario: you want to see cache-aware routing end-to-end with no GPU. This
+# pairs a managed LMCache backend with a tiny vLLM engine running on vLLM's
+# dedicated CPU build. A single `kubectl apply -f` gets you a working setup.
+#
+# What binds the two objects: the label `app: cpu-dev` appears in BOTH
+# `CacheBackend.spec.engineSelector.matchLabels` AND the engine Deployment's
+# pod-template labels. The mutating Pod webhook intercepts each engine pod at
+# CREATE, finds the matching CacheBackend, and injects the LMCache engine
+# wiring (env + `--kv-transfer-config`). Drift the labels apart and the
+# webhook silently no-ops — `kubectl get cachebackend` then shows `MATCHED: 0`
+# and the engine runs uncached. See docs/concepts/cachebackend-engine-binding.md.
+#
+# Apply order note: the pod webhook fail-opens (admits the pod unmodified)
+# while `CacheBackend.status.endpoint` is still empty, so a fresh-cluster
+# one-shot apply can race — the first engine pod may come up unwired. If so,
+# wait for the endpoint and recreate the engine pods:
+#
+#   kubectl wait --for=jsonpath='{.status.endpoint}' \
+#     cachebackend/cpu-dev-cache --timeout=60s
+#   kubectl rollout restart deploy/cpu-dev-engine
+#
+# CPU sizing: vLLM's CPU runtime baseline is ~5 GiB before any KV cache. Give
+# the kind node / VM ~10 GiB. Image tags are arch-specific (no shared multi-arch
+# `latest`): the default below is x86_64; on Apple Silicon swap both the image
+# tag to `:latest-arm64` and the nodeSelector arch to `arm64`.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: cpu-dev-cache
+spec:
+  type: LMCache
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: cpu-dev               # <-- binding label (1 of 2)
+  backendConfig:
+    # Served model the engine pods load. Plumbed to the kvevent-subscriber
+    # sidecar so the index keys per-replica entries by model. Tiny + ungated
+    # so it runs on CPU with no auth token.
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    # Managed lmcache-server image. Pin to a digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-dev-engine
+  labels:
+    app: cpu-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cpu-dev
+  template:
+    metadata:
+      labels:
+        app: cpu-dev             # <-- binding label (2 of 2)
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          # vLLM CPU build. Arch-specific — `:latest-arm64` on Apple Silicon.
+          image: vllm/vllm-openai-cpu:latest-x86_64
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            # KV-cache event publisher — the injected subscriber sidecar dials
+            # this to mirror BlockStored/BlockRemoved events to the policy
+            # server. Without it the backend never sees a KV event and stays
+            # Ready=False (AwaitingFirstKVEvent).
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

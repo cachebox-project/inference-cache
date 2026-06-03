@@ -1,0 +1,98 @@
+# Recipe: External cache — point the operator at a cache it manages itself.
+#
+# Scenario: you already run an lmcache-server (or share one across clusters)
+# and don't want the controller to provision a new one. `spec.type: External`
+# makes the controller skip all provisioning (no Deployment, no Service, no
+# HPA); it only mirrors `spec.endpoint` into `status.endpoint` and marks the CR
+# Ready as soon as admission accepts the spec. The pod webhook then wires
+# engine pods matching `spec.engineSelector` to that endpoint with the same
+# LMCache wire format a managed backend uses — the engine can't tell the
+# difference.
+#
+# Admission rules for External:
+#   * spec.endpoint is REQUIRED for type External and REJECTED on any other
+#     type. Accepted shapes: bare `host:port` (canonical) or `lm://host:port`.
+#     A non-empty port is required; IPv6 literals must be bracketed ([::1]:8200).
+#   * If the endpoint resolves to an in-cluster Service in a DIFFERENT namespace
+#     than this CR, set `spec.allowCrossNamespace: true` to acknowledge the
+#     tenancy boundary. The rule does not fire for external hostnames / IPs.
+#   * The controller does NOT probe the endpoint — it trusts the operator.
+#
+# This recipe ships only the CacheBackend + a matching engine Deployment; the
+# cache server itself is assumed to already exist at the endpoint below.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: external-cache
+spec:
+  type: External
+  # Address of the pre-existing cache server you manage. Swap for your own.
+  # Bare host:port shown; `lm://host:port` is also accepted.
+  endpoint: my-cache.example.com:8200
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: external-demo
+  backendConfig:
+    # Model the engine pods load — keys per-replica index entries.
+    model: Qwen/Qwen2.5-0.5B-Instruct
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-demo-engine
+  labels:
+    app: external-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: external-demo
+  template:
+    metadata:
+      labels:
+        app: external-demo
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:latest-x86_64   # `:latest-arm64` on Apple Silicon
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
