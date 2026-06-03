@@ -1,6 +1,8 @@
 # Sample manifests
 
-This directory holds three flavors of `inferencecache.io/v1alpha1` sample CRs:
+This directory holds three flavors of sample manifests (the recipes bundle
+`inferencecache.io/v1alpha1` CRs together with their engine Deployments and, for
+multi-tenant, Namespaces):
 
 - **`recipe-*.yaml`** — the curated **recipe catalog**: named scenarios (cache
   backend + engine + policy/tenant as needed), each a single `kubectl apply -f`
@@ -29,15 +31,18 @@ before applying. All but `recipe-gpu-production` run without a GPU.
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
 
-**Prerequisites per recipe.** Most recipes are self-contained, but two have
-external dependencies: `recipe-external-cache.yaml` needs a cache server already
-running at the endpoint you supply (replace the placeholder), and
-`recipe-multi-tenant.yaml` deploys into two namespaces it creates.
+**Prerequisites per recipe.** Most recipes are self-contained. One has an
+external dependency: `recipe-external-cache.yaml` needs a cache server already
+running at the endpoint you supply (replace the placeholder).
+`recipe-multi-tenant.yaml` has no external dependency but creates and deploys
+into two namespaces of its own.
 
-**Apply + observability.** Each recipe's `kubectl apply` wires the engine to its
-cache once the backend publishes `status.endpoint` (a pod admitted before then
-races past injection and runs unwired until recreated — see each recipe's
-header). KV reuse then works, but a *managed* backend only reaches `Ready=True`
+**Apply + observability.** Each recipe's `kubectl apply` wires matching engine
+pods to the cache. For *managed* backends the wiring becomes available once the
+controller publishes `status.endpoint`, so a pod admitted before then races past
+injection and runs unwired until recreated (see each recipe's header); `External`
+backends wire straight from the `spec.endpoint` you provide and have no such
+race. KV reuse then works, but a *managed* backend only reaches `Ready=True`
 and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
 (empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
@@ -56,9 +61,9 @@ gateway-side client ships.
 ## Apply-clean is enforced
 
 Every non-skipped sample under this directory MUST apply cleanly
-against a cluster running the current CRD schema and the CacheBackend
-admission webhook. (See the opt-out section below for the narrow
-escape hatch.) CI enforces this via:
+against a cluster running the current CRD schema and the CacheBackend,
+CachePolicy, and CacheTenant admission webhooks. (See the opt-out section
+below for the narrow escape hatch.) CI enforces this via:
 
 ```bash
 make verify-samples

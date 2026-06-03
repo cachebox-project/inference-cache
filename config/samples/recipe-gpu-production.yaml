@@ -100,8 +100,9 @@ spec:
       containers:
         - name: vllm
           # CUDA vLLM image. PLACEHOLDER — pin to a digest before production.
+          # (No imagePullPolicy set: once you pin a digest the default Always
+          # pull is unnecessary; set it to suit your registry.)
           image: vllm/vllm-openai:latest
-          imagePullPolicy: IfNotPresent
           command: ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct"]
           args:
             - "--port=8000"
