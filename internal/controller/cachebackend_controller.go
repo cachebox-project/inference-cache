@@ -784,22 +784,23 @@ func pvcName(backend *cachev1alpha1.CacheBackend) string {
 	return backend.Name + "-data"
 }
 
-// multiReplicaRequested reports whether the backend asks for more than one
-// replica, either statically (spec.replicas) or via the autoscaling ceiling
-// (spec.autoscaling.maxReplicas). A persistent backend that trips this cannot
-// be served by a single ReadWriteOnce PVC (multi-attach), so the reconciler
-// gates it (see reconcileInvalidStorage). maxReplicas is checked — not the live
-// HPA replica count — because the operator's intent to ever scale past one is
-// the multi-attach hazard, and admission does not reject it (per the design:
-// surfaced as Ready=False, not rejected, since per-replica PVCs are a follow-up).
+// multiReplicaRequested reports whether the backend's effective replica ceiling
+// exceeds one — the multi-attach hazard for a single ReadWriteOnce PVC, which
+// the reconciler gates (see reconcileInvalidStorage). The check mirrors the
+// controller's HPA-ownership model: when spec.autoscaling is set the HPA owns
+// the live replica count and spec.replicas is ignored for scaling (see
+// applyDeployment), so the ceiling is spec.autoscaling.maxReplicas alone — a
+// stale spec.replicas left at 3 under maxReplicas=1 is NOT a multi-attach
+// hazard and must not be gated. When autoscaling is unset, spec.replicas is the
+// ceiling. The ceiling — not the live count — is what matters: the operator's
+// intent to ever run more than one pod against the shared PVC is the hazard, and
+// admission deliberately surfaces this as Ready=False rather than rejecting
+// (per-replica PVCs via StatefulSet are a follow-up).
 func multiReplicaRequested(backend *cachev1alpha1.CacheBackend) bool {
-	if backend.Spec.Replicas != nil && *backend.Spec.Replicas > 1 {
-		return true
+	if backend.Spec.Autoscaling != nil {
+		return backend.Spec.Autoscaling.MaxReplicas > 1
 	}
-	if backend.Spec.Autoscaling != nil && backend.Spec.Autoscaling.MaxReplicas > 1 {
-		return true
-	}
-	return false
+	return backend.Spec.Replicas != nil && *backend.Spec.Replicas > 1
 }
 
 // applyPVC creates or updates the backend's data PVC idempotently, owned by the
@@ -827,7 +828,12 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 				pvc.Spec.Resources = corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{corev1.ResourceStorage: want},
 				}
-				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil && *scn != "" {
+				// Set StorageClassName whenever the operator specified it,
+				// INCLUDING an explicit empty string: in Kubernetes "" is not
+				// "unset" — it opts out of the default StorageClass (static /
+				// no-provisioner binding). Only a nil pointer means "omit, use
+				// the cluster default".
+				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil {
 					pvc.Spec.StorageClassName = scn
 				}
 			} else {
@@ -842,7 +848,9 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 				}
 				// storageClassName is immutable: a change request can't be
 				// honored by k8s, so log it at debug and leave the live class.
-				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil && *scn != "" {
+				// A nil pointer means the operator did not specify a class on
+				// this edit, so there is nothing to compare.
+				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil {
 					live := ""
 					if pvc.Spec.StorageClassName != nil {
 						live = *pvc.Spec.StorageClassName
@@ -917,7 +925,12 @@ func upsertVolumeMount(mounts []corev1.VolumeMount, m corev1.VolumeMount) []core
 // provisioner's minimum), so it — not spec.storage.pvc.size — is what status
 // reports.
 func boundCapacity(pvc *corev1.PersistentVolumeClaim) string {
-	if pvc == nil {
+	// Only report capacity for a PVC that is actually Bound. status.capacity can
+	// linger on a claim that has left Bound (e.g. Lost), and a Pending claim has
+	// none yet — reporting either would advertise provisioned capacity the
+	// backend does not have. The documented contract is "the bound PVC's
+	// capacity", so gate on the phase.
+	if pvc == nil || pvc.Status.Phase != corev1.ClaimBound {
 		return ""
 	}
 	if q, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && !q.IsZero() {
@@ -934,11 +947,21 @@ func boundCapacity(pvc *corev1.PersistentVolumeClaim) string {
 // (multi-attach). The operator must scale to 1 or drop spec.storage.pvc; the
 // Warning event is emitted on the state transition (see emitTransitionEvents).
 //
-// An existing single-replica workload from a prior valid generation is left
-// untouched (we simply don't re-apply), so a scale-up mistake degrades status
-// without tearing down the running replica.
+// The configuration is invalid, so we refuse to RUN it: any workload from a
+// prior valid generation is shed and status.endpoint is cleared, so the
+// pod-mutating webhook stops wiring engine pods to a backend the operator must
+// fix (leaving a live endpoint advertised while reporting Ready=False would be
+// an inconsistent, confusing state). The PVC is NOT deleted —
+// cleanupOwnedWorkload only sheds Deployment/Service/HPA, and the PVC stays
+// owner-referenced (adopt-and-keep), so persistent data survives the gate and a
+// later scale-to-1 re-provisions against it. Fail-open posture means engines
+// fall back to local prefill while the backend is gated.
 func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+		return ctrl.Result{}, err
+	}
 	err := r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{

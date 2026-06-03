@@ -260,6 +260,86 @@ func TestReconcileMultiReplicaViaAutoscalingGated(t *testing.T) {
 	expectEvent(t, drainEvents(rec), conditionReasonInvalidStorageConfiguration)
 }
 
+func TestReconcilePersistentSingleToMultiReplicaShedsWorkloadAndEndpoint(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	// Valid single-replica persistent backend: provisions Deployment + PVC + endpoint.
+	reconcile(t, r, "cache", "ns1")
+	getDeployment(t, r, "cache", "ns1")
+	getPVC(t, r, "cache-data", "ns1")
+	if ep := getBackend(t, r, "cache", "ns1").Status.Endpoint; ep == "" {
+		t.Fatalf("expected status.endpoint populated for the valid persistent backend")
+	}
+	drainEvents(rec)
+
+	// Operator bumps to multi-replica → the gate trips. The invalid config must
+	// not be left RUNNING: shed the workload and clear the endpoint so the pod
+	// webhook stops wiring engines, while the PVC is retained (data survives).
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Spec.Replicas = ptrInt32(3)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("Deployment must be shed when the backend becomes InvalidStorageConfiguration; get err=%v", err)
+	}
+	cbb := getBackend(t, r, "cache", "ns1")
+	if cbb.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared while gated (pod webhook must stop wiring engines)", cbb.Status.Endpoint)
+	}
+	cond := findCondition(cbb.Status.Conditions, conditionTypeReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonInvalidStorageConfiguration {
+		t.Fatalf("Ready = %+v, want False/InvalidStorageConfiguration", cond)
+	}
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); err != nil {
+		t.Fatalf("PVC must be retained while gated (adopt-and-keep; data survives); get err=%v", err)
+	}
+	expectEvent(t, drainEvents(rec), conditionReasonInvalidStorageConfiguration)
+}
+
+func TestReconcilePersistentStaleReplicasUnderAutoscalingCeilingOneNotGated(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	// Stale spec.replicas=3, but the HPA owns the count and caps it at 1 — no
+	// multi-attach hazard, so the backend must be provisioned, not gated.
+	cb.Spec.Replicas = ptrInt32(3)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 1}
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	getPVC(t, r, "cache-data", "ns1")   // provisioned
+	getDeployment(t, r, "cache", "ns1") // provisioned
+	cond := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady)
+	if cond != nil && cond.Reason == conditionReasonInvalidStorageConfiguration {
+		t.Fatalf("backend wrongly gated: autoscaling ceiling is 1, so stale spec.replicas=3 must be ignored")
+	}
+}
+
+func TestReconcilePVCExplicitEmptyStorageClassPreserved(t *testing.T) {
+	scheme := newScheme(t)
+	empty := ""
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", &empty)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	pvc := getPVC(t, r, "cache-data", "ns1")
+	// Explicit "" opts out of the default StorageClass (static binding); it must
+	// be preserved as "", NOT collapsed to nil (which would use the default).
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "" {
+		t.Fatalf("storageClassName = %v, want explicit \"\" preserved (opt-out of default StorageClass)", pvc.Spec.StorageClassName)
+	}
+}
+
 func TestReconcileCapacityFromBoundPVC(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
@@ -273,8 +353,9 @@ func TestReconcileCapacityFromBoundPVC(t *testing.T) {
 		t.Fatalf("status.capacity = %q, want empty before the PVC binds", cbb.Status.Capacity)
 	}
 
-	// Simulate the binder writing the actual provisioned capacity.
+	// Simulate the binder: PVC goes Bound with its actual provisioned capacity.
 	pvc := getPVC(t, r, "cache-data", "ns1")
+	pvc.Status.Phase = corev1.ClaimBound
 	pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
 	if err := r.Status().Update(context.Background(), pvc); err != nil {
 		t.Fatalf("update pvc status: %v", err)

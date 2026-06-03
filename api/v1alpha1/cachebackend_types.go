@@ -196,9 +196,12 @@ type CacheBackendPVCSpec struct {
 	// +kubebuilder:validation:Required
 	Size resource.Quantity `json:"size"`
 
-	// StorageClassName is the optional StorageClass for the PVC. It is immutable
-	// after the PVC is created — Kubernetes rejects StorageClass changes — so a
-	// later edit is ignored (the controller logs and keeps the existing class).
+	// StorageClassName is the optional StorageClass for the PVC. Omit (leave
+	// null) to use the cluster default StorageClass; set it to the empty string
+	// ("") to explicitly opt out of the default (static / no-provisioner
+	// binding) — the controller preserves the distinction. It is immutable after
+	// the PVC is created — Kubernetes rejects StorageClass changes — so a later
+	// edit is ignored (the controller logs and keeps the existing class).
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 }

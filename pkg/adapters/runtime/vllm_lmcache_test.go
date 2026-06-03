@@ -235,14 +235,21 @@ func TestVLLMLMCacheResolveCacheServerPersistentDeclaresDataVolume(t *testing.T)
 		t.Fatalf("adapter rendered pod volumes %v; the reconciler owns volume mounting", resolved.PodSpec.Volumes)
 	}
 
-	// Deferred device-switch invariant: the lmcache-server storage device stays
-	// "cpu" (positional arg 3 of the legacy command) even when persistence is
-	// requested — switching it to a disk-backed device that spills to the mount
-	// path is a separate follow-up. This assertion is the canary that must be
-	// updated when that follow-up lands.
+	// Deferred device-switch invariant: the lmcache-server command is unchanged
+	// when persistence is requested — the storage device stays "cpu" (positional
+	// arg 3 of the legacy command). Switching it to a disk-backed device that
+	// spills to the mount path is a separate follow-up. Assert the FULL arg set
+	// (not just arg[2] when len==3) so a reshape or drop of the args fails this
+	// canary instead of silently passing.
 	c := resolved.PodSpec.Containers[0]
-	if len(c.Args) == 3 && c.Args[2] != "cpu" {
-		t.Fatalf("storage device arg = %q, want \"cpu\" (disk-backed device is a separate follow-up)", c.Args[2])
+	wantArgs := []string{"0.0.0.0", "65432", "cpu"}
+	if len(c.Args) != len(wantArgs) {
+		t.Fatalf("server args = %v, want %v (storage device must stay cpu; disk-backed device is a separate follow-up)", c.Args, wantArgs)
+	}
+	for i, w := range wantArgs {
+		if c.Args[i] != w {
+			t.Fatalf("server args[%d] = %q, want %q (disk-backed device is a separate follow-up)", i, c.Args[i], w)
+		}
 	}
 }
 
