@@ -44,11 +44,14 @@ const (
 //
 // Persistent storage (spec.storage.pvc) and the autoscaling spec
 // (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
-// HorizontalPodAutoscaler; spec.storage.pvc provisions a PersistentVolumeClaim
+// HorizontalPodAutoscaler; spec.storage.pvc — on a managed Deployment backend
+// (deploymentKind=Deployment, the default) — provisions a PersistentVolumeClaim
 // owner-referenced to the CacheBackend (reclaimed only when the CacheBackend is
 // deleted), mounts it into the cache-server pod at the runtime adapter's
 // declared data path, and reports the bound PVC's actual size in
-// status.capacity. spec.storage.pvc requires a single replica — a ReadWriteOnce
+// status.capacity. (A StatefulSet backend is routed to the unmanaged path today
+// — see DeploymentKind — so it provisions nothing, storage included; per-replica
+// volumeClaimTemplates are a follow-up.) spec.storage.pvc requires a single replica — a ReadWriteOnce
 // PVC cannot be multi-attached, so a persistent backend with replicas (or an
 // autoscaling ceiling) > 1 is surfaced Ready=False/InvalidStorageConfiguration
 // rather than provisioned; per-replica persistent storage via StatefulSet is a

@@ -426,6 +426,21 @@ func TestValidator_PersistentStorageOnExternalBackendRejected(t *testing.T) {
 		"External backends are operator-managed")
 }
 
+func TestValidator_NonPositivePVCSizeRejected(t *testing.T) {
+	// size drives a real PVC request, so a non-positive value must be a
+	// field-scoped rejection at admission, not a late child-PVC failure.
+	for _, sz := range []string{"0", "0Gi"} {
+		v := &CacheBackendValidator{}
+		cb := newBackend()
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+			PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse(sz)},
+		}
+		requireInvalidWithCause(t, v, cb, "spec.storage.pvc.size",
+			"must be a positive storage quantity")
+	}
+}
+
 func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testing.T) {
 	// spec.replicas=0 + spec.autoscaling enabled + nil minReplicas is the
 	// silent-HPA-fallback-to-1 trap: the defaulter declines to default

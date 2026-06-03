@@ -151,6 +151,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectPersistentStorageOnExternal,
+	rejectNonPositivePVCSize,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 }
@@ -855,6 +856,28 @@ func rejectPersistentStorageOnExternal(cb *cachev1alpha1.CacheBackend) field.Err
 		field.Forbidden(
 			field.NewPath("spec", "storage", "pvc"),
 			"External backends are operator-managed (the controller provisions no workload), so spec.storage.pvc cannot be mounted; configure persistence on the pre-existing cache directly",
+		),
+	}
+}
+
+// rejectNonPositivePVCSize rejects a spec.storage.pvc.size that is not strictly
+// positive. The schema marks size required, but "required" does not stop a 0 or
+// negative quantity; now that the value drives a real PVC resource request, a
+// non-positive size must be a field-scoped CacheBackend rejection at admission
+// rather than surfacing late as a child-PVC provisioning failure the operator
+// has to dig for.
+func rejectNonPositivePVCSize(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	if cb.Spec.Storage.PVC.Size.Sign() > 0 {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "storage", "pvc", "size"),
+			cb.Spec.Storage.PVC.Size.String(),
+			"must be a positive storage quantity",
 		),
 	}
 }

@@ -102,7 +102,7 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 
 ### Persistent storage
 
-Setting `spec.storage.pvc` makes the controller provision a `PersistentVolumeClaim` and mount it into the cache-server pod. The seam is the runtime adapter: `ResolveCacheServer` returns a `ResolvedCacheServer` whose `DataVolume` declares the volume name + in-container mount path where the backend keeps persistent data (the adapter is the only layer that knows where its data lives). The controller, seeing the adapter wants persistent data *and* `spec.storage.pvc` set, provisions the PVC and merges the volume + mount into the rendered pod. Future backends (SGLang HiCache, Mooncake) plug in by declaring a different `DataVolume` — the controller stays generic.
+Setting `spec.storage.pvc` on a **managed Deployment backend** (`deploymentKind: Deployment`, the default) makes the controller provision a `PersistentVolumeClaim` and mount it into the cache-server pod. (A `StatefulSet` backend is routed to the unmanaged path today — see [`deploymentKind`](#spec) — so it provisions nothing, storage included; per-replica PVCs via `volumeClaimTemplates` are a follow-up.) The seam is the runtime adapter: `ResolveCacheServer` returns a `ResolvedCacheServer` whose `DataVolume` declares the volume name + in-container mount path where the backend keeps persistent data (the adapter is the only layer that knows where its data lives). The controller, seeing the adapter wants persistent data *and* `spec.storage.pvc` set, provisions the PVC and merges the volume + mount into the rendered pod. Future backends (SGLang HiCache, Mooncake) plug in by declaring a different `DataVolume` — the controller stays generic.
 
 Behavior:
 
