@@ -27,7 +27,7 @@ The `v1alpha1` contract is pre-launch and explicitly unstable (see the carve-out
 | `replicas` | integer | Desired managed backend replicas. Minimum `0`. |
 | `storage.pvc.size` | quantity | Requested PVC capacity when persistent storage is used. Required only when `storage.pvc` is present. Accepted for forward-compat; wiring the PVC into the standalone LMCache server's data directory is deferred to a follow-up — the runtime-adapter interface doesn't yet declare a data-volume contract, so the controller has no place to attach it. Until then this field is inert. |
 | `storage.pvc.storageClassName` | string | Optional StorageClass for PVC-backed cache storage. See `storage.pvc.size` for the wire-up status. |
-| `autoscaling.minReplicas` | integer | Lower bound for HPA replica count. Defaults to `1` when unset. Minimum `1`. |
+| `autoscaling.minReplicas` | integer | Lower bound for HPA replica count. Auto-defaulted to `spec.replicas` on FIRST APPLY ONLY by the admission defaulter when `spec.autoscaling` is set and `minReplicas` is left unset (see [Defaulting](#defaulting-mutating) for the first-apply-only semantics); subsequent edits to `spec.replicas` do NOT move this floor. Minimum `1`. |
 | `autoscaling.maxReplicas` | integer | Upper bound for HPA replica count. Required when `autoscaling` is set. Minimum `1`. Cross-field validation: `minReplicas <= maxReplicas`. |
 | `autoscaling.targetCPUUtilizationPercent` | integer | Target average per-pod CPU utilization for the HPA. Defaults to `80` when unset. Range `[1, 100]`. |
 | `integration.engine` | string | Engine integration target, such as SGLang or vLLM. |

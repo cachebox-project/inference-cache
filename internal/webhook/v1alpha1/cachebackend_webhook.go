@@ -387,10 +387,13 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 // pair is the pod webhook, and admission rejecting upstream of it gives
 // the operator a useful error instead of a silent miss.
 //
-// The check is bypassed only when Spec.Type is empty: there is no
-// defaulting for type and the missing-type rejection is owned by
-// CRD-level / future field-level validation; piling an "adapter for
-// backend=\"\"" cause on top would not help the user.
+// The check is bypassed only when Spec.Type is empty: a CR that came
+// through admission carries `+kubebuilder:default=LMCache` stamped by
+// the apiserver before this handler runs, so an empty Type here means
+// the caller bypassed the apiserver (raw-struct unit-test invocation).
+// In that case the missing-type rejection is owned by CRD-level /
+// future field-level validation; piling an "adapter for backend=\"\""
+// cause on top would not help the user.
 func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Type == "" {
 		return nil
