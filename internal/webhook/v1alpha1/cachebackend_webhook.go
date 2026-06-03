@@ -83,10 +83,15 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 //     floor needs to follow the workload's baseline declaration, which is
 //     cluster-context the schema cannot encode.
 //
-// It does NOT stamp spec.integration.failOpen — the `+kubebuilder:default=true`
-// marker covers it when integration is present, and the read-time fallback
-// in [IntegrationFailOpen] covers the omitted-integration case. It implements
-// [admission.Defaulter] over CacheBackend.
+// It does NOT stamp spec.integration.failOpen explicitly — once the
+// defaulter materialises spec.integration above, the apiserver applies
+// the `+kubebuilder:default=true` marker on the now-present failOpen
+// field (alongside engine, role, firstEventTimeout) before persisting,
+// so an admitted CR with no integration block ends up with failOpen
+// populated in etcd. The read-time fallback in [IntegrationFailOpen]
+// covers callers that bypass the apiserver (raw-struct test invocation,
+// partial deserialization). It implements [admission.Defaulter] over
+// CacheBackend.
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
