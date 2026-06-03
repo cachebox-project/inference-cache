@@ -31,7 +31,20 @@ func newBackend() *cachev1alpha1.CacheBackend {
 
 func i32p(v int32) *int32 { return &v }
 
-func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
+func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
+	// The webhook materialises spec.integration solely to persist
+	// firstEventTimeout: the CRD-schema default for firstEventTimeout only
+	// applies when spec.integration is present in the submitted object, so the
+	// common CR that omits integration entirely relies on the webhook stamping
+	// it here.
+	//
+	// Other Phase-1 literal defaults (spec.replicas=1, spec.type=LMCache,
+	// spec.deploymentKind=Deployment, spec.integration.engine=vllm,
+	// spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
+	// stamped by the apiserver before this handler runs — they are NOT this
+	// defaulter's job, and a unit-level call to Default() on a raw struct
+	// will not see them. The persisted-CR shape is asserted end-to-end in the
+	// envtest below (TestDefaulter_MinimumViableYAMLGetsFullyDefaulted).
 	d := &CacheBackendDefaulter{}
 	cb := newBackend()
 
@@ -39,17 +52,6 @@ func TestDefaulter_StampsReplicasDefaultWhenUnset(t *testing.T) {
 		t.Fatalf("Default returned error: %v", err)
 	}
 
-	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != defaultReplicas {
-		t.Errorf("replicas = %v, want %d", cb.Spec.Replicas, defaultReplicas)
-	}
-	// The defaulter materialises spec.integration solely to persist
-	// firstEventTimeout: the CRD-schema default for firstEventTimeout only
-	// applies when spec.integration is present in the submitted object, so the
-	// common CR that omits integration entirely relies on the webhook stamping
-	// it here. (The retired lookupTimeoutMs/minimumPrefixTokens fields are no
-	// longer part of the type — lookup tuning lives on CachePolicy — and
-	// failOpen's effective default is applied at read time by
-	// IntegrationFailOpen, not stamped here.)
 	if cb.Spec.Integration == nil {
 		t.Fatal("integration block not materialised")
 	}
@@ -70,6 +72,9 @@ func TestDefaulter_DoesNotClobberOperatorValues(t *testing.T) {
 		t.Fatalf("Default returned error: %v", err)
 	}
 
+	// Replicas now defaults via a CRD-schema marker (not the webhook), but the
+	// non-clobber contract still holds: an operator-set value must survive the
+	// webhook regardless of which layer applied the default.
 	if *cb.Spec.Replicas != 7 {
 		t.Errorf("replicas clobbered: got %d, want 7", *cb.Spec.Replicas)
 	}
@@ -94,6 +99,83 @@ func TestDefaulter_PreservesPartiallySetIntegration(t *testing.T) {
 
 	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != 30*time.Second {
 		t.Errorf("operator firstEventTimeout clobbered: got %v, want 30s", cb.Spec.Integration.FirstEventTimeout)
+	}
+}
+
+func TestDefaulter_AutoscalingMinReplicasComputedFromReplicas(t *testing.T) {
+	// When the operator opts into autoscaling without pinning the floor, the
+	// defaulter computes minReplicas from spec.replicas so the HPA's lower
+	// bound follows the baseline declaration rather than a hard-coded
+	// constant. (spec.replicas itself is stamped by the apiserver from its
+	// `+kubebuilder:default=1` marker; the unit test seeds it explicitly so
+	// the assertion does not depend on the marker firing.)
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(3)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 10}
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if cb.Spec.Autoscaling.MinReplicas == nil || *cb.Spec.Autoscaling.MinReplicas != 3 {
+		t.Errorf("autoscaling.minReplicas = %v, want 3 (= spec.replicas)", cb.Spec.Autoscaling.MinReplicas)
+	}
+}
+
+func TestDefaulter_AutoscalingMinReplicasNotClobbered(t *testing.T) {
+	// An operator-set minReplicas survives the defaulter. The non-clobber
+	// contract extends to every default this handler stamps.
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(3)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
+		MinReplicas: i32p(2),
+		MaxReplicas: 10,
+	}
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if *cb.Spec.Autoscaling.MinReplicas != 2 {
+		t.Errorf("autoscaling.minReplicas clobbered: got %d, want 2", *cb.Spec.Autoscaling.MinReplicas)
+	}
+}
+
+func TestDefaulter_AutoscalingMinReplicasSkippedWhenAutoscalingOff(t *testing.T) {
+	// No autoscaling = no defaulting. The reconciler's autoscalingFloor
+	// helper handles the nil-Autoscaling case at runtime; the defaulter
+	// must not synthesise an autoscaling object operators did not request.
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(3)
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if cb.Spec.Autoscaling != nil {
+		t.Errorf("autoscaling materialised unexpectedly: %+v", cb.Spec.Autoscaling)
+	}
+}
+
+func TestDefaulter_AutoscalingMinReplicasSkippedWhenReplicasNil(t *testing.T) {
+	// Defence-in-depth: when a test calls Default() on a raw struct without
+	// the apiserver in the loop, spec.replicas may still be nil (the schema
+	// default did not get a chance to fire). The defaulter must leave
+	// minReplicas alone in that case rather than dereference a nil pointer.
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Replicas = nil
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 10}
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if cb.Spec.Autoscaling.MinReplicas != nil {
+		t.Errorf("autoscaling.minReplicas should stay nil when spec.replicas is nil; got %v", *cb.Spec.Autoscaling.MinReplicas)
 	}
 }
 

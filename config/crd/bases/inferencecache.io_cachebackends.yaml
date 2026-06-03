@@ -95,8 +95,14 @@ spec:
                     type: integer
                   minReplicas:
                     description: |-
-                      MinReplicas is the lower bound for the HPA replica count. Defaults to 1
-                      when unset.
+                      MinReplicas is the lower bound for the HPA replica count. The
+                      admission defaulter computes the default at write time from
+                      spec.replicas (which itself defaults to 1) so the HPA's floor matches
+                      the operator-declared baseline rather than a hard-coded constant —
+                      scaling the workload by editing spec.replicas continues to work even
+                      after autoscaling is enabled. Operators who want a different floor set
+                      the field explicitly; the defaulter never overwrites an operator-set
+                      value.
                     format: int32
                     minimum: 1
                     type: integer
@@ -120,8 +126,12 @@ spec:
                 description: BackendConfig contains backend-specific string settings.
                 type: object
               deploymentKind:
-                description: DeploymentKind identifies whether a managed backend is
-                  reconciled as a Deployment or StatefulSet.
+                default: Deployment
+                description: |-
+                  DeploymentKind identifies whether a managed backend is reconciled as a
+                  Deployment or StatefulSet. Defaults to Deployment — the only kind the
+                  Phase-1 reconciler templates; StatefulSet is reserved for future
+                  per-replica-PVC topologies and is a no-op today.
                 enum:
                 - Deployment
                 - StatefulSet
@@ -192,8 +202,16 @@ spec:
                   the cache backend.
                 properties:
                   engine:
-                    description: Engine identifies the inference engine integration,
-                      such as SGLang or vLLM.
+                    default: vllm
+                    description: |-
+                      Engine identifies the inference engine integration, such as vllm or
+                      sglang. Defaults to vllm — the only runtime ID with a shipping adapter
+                      today (sglang is wired but no adapter ships in v1alpha1). The CRD-level
+                      default only applies when spec.integration is materialised on the
+                      submitted object; when integration is omitted entirely the
+                      [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback
+                      at read time, so the admission validator, reconciler, and pod webhook
+                      all converge on the same effective engine.
                     type: string
                   engineOverrides:
                     description: |-
@@ -471,8 +489,13 @@ spec:
                       field; no extra CRD-level format constraint is imposed.
                     type: string
                   role:
-                    description: Role controls whether the engine reads from, writes
-                      to, or fully participates in the cache.
+                    default: ReadWrite
+                    description: |-
+                      Role controls whether the engine reads from, writes to, or fully
+                      participates in the cache. Defaults to ReadWrite — full participation,
+                      matching the [enginewire.IntegrationRole] read-time fallback for an
+                      omitted integration block. ReadOnly / WriteOnly are specialised
+                      producer/consumer roles operators opt into explicitly.
                     enum:
                     - ReadOnly
                     - WriteOnly
@@ -480,7 +503,11 @@ spec:
                     type: string
                 type: object
               replicas:
-                description: Replicas is the desired number of backend workload replicas.
+                default: 1
+                description: |-
+                  Replicas is the desired number of backend workload replicas. Defaults
+                  to 1 — a conservative single-replica deployment; operators opt into
+                  horizontal scale via spec.autoscaling (which then overrides this floor).
                 format: int32
                 minimum: 0
                 type: integer
@@ -1929,7 +1956,14 @@ spec:
                     type: array
                 type: object
               type:
-                description: Type identifies the backing cache implementation.
+                default: LMCache
+                description: |-
+                  Type identifies the backing cache implementation. Defaults to LMCache —
+                  the standalone lmcache-server workload Phase-1 ships; operators pick
+                  External (operator-supplied endpoint) or another type explicitly when
+                  they need to. The CRD does not constrain Type to an enum today; the
+                  admission validator's runtime-adapter check is the authoritative reject
+                  for unsupported (engine, type) pairs.
                 type: string
             type: object
           status:

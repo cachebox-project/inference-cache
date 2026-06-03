@@ -49,16 +49,29 @@ const (
 // to the runtime adapter's rendered pod (there is no PVC provisioning, no
 // volume injection, and no status.capacity reporting until then).
 type CacheBackendSpec struct {
-	// Type identifies the backing cache implementation.
+	// Type identifies the backing cache implementation. Defaults to LMCache —
+	// the standalone lmcache-server workload Phase-1 ships; operators pick
+	// External (operator-supplied endpoint) or another type explicitly when
+	// they need to. The CRD does not constrain Type to an enum today; the
+	// admission validator's runtime-adapter check is the authoritative reject
+	// for unsupported (engine, type) pairs.
 	// +optional
+	// +kubebuilder:default=LMCache
 	Type CacheBackendType `json:"type,omitempty"`
 
-	// DeploymentKind identifies whether a managed backend is reconciled as a Deployment or StatefulSet.
+	// DeploymentKind identifies whether a managed backend is reconciled as a
+	// Deployment or StatefulSet. Defaults to Deployment — the only kind the
+	// Phase-1 reconciler templates; StatefulSet is reserved for future
+	// per-replica-PVC topologies and is a no-op today.
 	// +optional
+	// +kubebuilder:default=Deployment
 	DeploymentKind CacheBackendDeploymentKind `json:"deploymentKind,omitempty"`
 
-	// Replicas is the desired number of backend workload replicas.
+	// Replicas is the desired number of backend workload replicas. Defaults
+	// to 1 — a conservative single-replica deployment; operators opt into
+	// horizontal scale via spec.autoscaling (which then overrides this floor).
 	// +optional
+	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
 
@@ -174,8 +187,14 @@ type CacheBackendPVCSpec struct {
 //
 // +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
 type CacheBackendAutoscalingSpec struct {
-	// MinReplicas is the lower bound for the HPA replica count. Defaults to 1
-	// when unset.
+	// MinReplicas is the lower bound for the HPA replica count. The
+	// admission defaulter computes the default at write time from
+	// spec.replicas (which itself defaults to 1) so the HPA's floor matches
+	// the operator-declared baseline rather than a hard-coded constant —
+	// scaling the workload by editing spec.replicas continues to work even
+	// after autoscaling is enabled. Operators who want a different floor set
+	// the field explicitly; the defaulter never overwrites an operator-set
+	// value.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas *int32 `json:"minReplicas,omitempty"`
@@ -200,12 +219,25 @@ type CacheBackendAutoscalingSpec struct {
 // CachePolicy.spec.lookupTimeoutMs and CachePolicy.spec.minimumPrefixTokens,
 // which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
-	// Engine identifies the inference engine integration, such as SGLang or vLLM.
+	// Engine identifies the inference engine integration, such as vllm or
+	// sglang. Defaults to vllm — the only runtime ID with a shipping adapter
+	// today (sglang is wired but no adapter ships in v1alpha1). The CRD-level
+	// default only applies when spec.integration is materialised on the
+	// submitted object; when integration is omitted entirely the
+	// [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback
+	// at read time, so the admission validator, reconciler, and pod webhook
+	// all converge on the same effective engine.
 	// +optional
+	// +kubebuilder:default=vllm
 	Engine string `json:"engine,omitempty"`
 
-	// Role controls whether the engine reads from, writes to, or fully participates in the cache.
+	// Role controls whether the engine reads from, writes to, or fully
+	// participates in the cache. Defaults to ReadWrite — full participation,
+	// matching the [enginewire.IntegrationRole] read-time fallback for an
+	// omitted integration block. ReadOnly / WriteOnly are specialised
+	// producer/consumer roles operators opt into explicitly.
 	// +optional
+	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
 
 	// FirstEventTimeout bounds how long a managed backend may sit

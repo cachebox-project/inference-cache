@@ -89,6 +89,26 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	}
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 
+	// Operator-UX defaults. Each marker below shrinks the minimum-viable
+	// CacheBackend YAML by one field; pinning the served-schema default
+	// here means a future regeneration that drops one is caught at test
+	// time rather than via a confused operator's failed apply.
+	if got, ok := mustProperty(t, specSchema, "type")["default"].(string); !ok || got != "LMCache" {
+		t.Fatalf("spec.type default = %v, want \"LMCache\"", mustProperty(t, specSchema, "type")["default"])
+	}
+	if got, ok := mustProperty(t, specSchema, "deploymentKind")["default"].(string); !ok || got != "Deployment" {
+		t.Fatalf("spec.deploymentKind default = %v, want \"Deployment\"", mustProperty(t, specSchema, "deploymentKind")["default"])
+	}
+	if got, ok := mustProperty(t, specSchema, "replicas")["default"]; !ok || !reflect.DeepEqual(got, float64(1)) {
+		t.Fatalf("spec.replicas default = %v (type %T), want 1", mustProperty(t, specSchema, "replicas")["default"], mustProperty(t, specSchema, "replicas")["default"])
+	}
+	if got, ok := mustProperty(t, integrationSchema, "engine")["default"].(string); !ok || got != "vllm" {
+		t.Fatalf("spec.integration.engine default = %v, want \"vllm\"", mustProperty(t, integrationSchema, "engine")["default"])
+	}
+	if got, ok := mustProperty(t, integrationSchema, "role")["default"].(string); !ok || got != "ReadWrite" {
+		t.Fatalf("spec.integration.role default = %v, want \"ReadWrite\"", mustProperty(t, integrationSchema, "role")["default"])
+	}
+
 	// Retired inert fields must stay absent from the served schema so a
 	// regeneration can't silently reintroduce them. lookupTimeoutMs and
 	// minimumPrefixTokens moved to CachePolicy; indexEntries is superseded by
