@@ -182,7 +182,14 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
 // replicas=1, integration.engine=vllm, integration.role=ReadWrite,
 // integration.failOpen=true) rides on a `+kubebuilder:default=` marker and
-// is stamped by the apiserver before this handler runs.
+// is stamped by the apiserver before this handler runs. Note that the nested
+// integration.* markers only fire when spec.integration is already present
+// in the submitted object — when the operator omits the integration block
+// entirely the apiserver has nothing to apply nested defaults to, which is
+// why the webhook materialises the parent below (and the read-time
+// helpers in [adapterruntime.ResolveRuntimeID] / [enginewire.IntegrationRole]
+// / [IntegrationFailOpen] provide the same effective default at read time
+// for callers that don't go through admission).
 //
 // A non-nil pointer or non-empty value is treated as an explicit operator
 // choice and left alone, preserving the established "defaulter never
@@ -208,7 +215,17 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	// CacheBackend directly and call Default without the apiserver in the
 	// loop; we leave minReplicas alone in that case rather than dereference
 	// a nil pointer.
-	if cb.Spec.Autoscaling != nil && cb.Spec.Autoscaling.MinReplicas == nil && cb.Spec.Replicas != nil {
+	//
+	// The `>= 1` guard mirrors the CRD schema's `minimum: 1` on
+	// autoscaling.minReplicas: spec.replicas allows 0 (scale-to-zero), so a
+	// CR with `replicas: 0` + opted-in autoscaling would otherwise have the
+	// defaulter stamp `minReplicas: 0`, which the apiserver then rejects
+	// against the schema's minimum. Refusing to default in that case leaves
+	// the field unset so the operator's misconfiguration surfaces as a
+	// missing-required-field validation error against autoscaling rather
+	// than a webhook-introduced schema violation.
+	if cb.Spec.Autoscaling != nil && cb.Spec.Autoscaling.MinReplicas == nil &&
+		cb.Spec.Replicas != nil && *cb.Spec.Replicas >= 1 {
 		v := *cb.Spec.Replicas
 		cb.Spec.Autoscaling.MinReplicas = &v
 	}

@@ -179,6 +179,31 @@ func TestDefaulter_AutoscalingMinReplicasSkippedWhenReplicasNil(t *testing.T) {
 	}
 }
 
+func TestDefaulter_AutoscalingMinReplicasSkippedWhenReplicasZero(t *testing.T) {
+	// spec.replicas permits 0 (scale-to-zero is a valid operator choice),
+	// but autoscaling.minReplicas carries `+kubebuilder:validation:Minimum=1`
+	// in the CRD schema. If the defaulter copied a 0 spec.replicas into
+	// minReplicas the apiserver would then reject the persisted object
+	// against the schema — a webhook-introduced validation failure on a CR
+	// the operator did NOT explicitly misconfigure. Refusing to default in
+	// that case leaves the field unset so the operator's combination of
+	// `replicas: 0` + opted-in autoscaling surfaces as a missing-required
+	// field violation against autoscaling itself, which is the actual
+	// problem.
+	d := &CacheBackendDefaulter{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(0)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 10}
+
+	if err := d.Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+
+	if cb.Spec.Autoscaling.MinReplicas != nil {
+		t.Errorf("autoscaling.minReplicas should stay nil when spec.replicas is 0 (would violate schema Minimum=1); got %v", *cb.Spec.Autoscaling.MinReplicas)
+	}
+}
+
 // requireInvalidWithCause runs v against cb and asserts the response is an
 // aggregated Invalid status whose causes contain the substring wantMsg on
 // field wantField. Centralising the assertion keeps the per-rule tests one
