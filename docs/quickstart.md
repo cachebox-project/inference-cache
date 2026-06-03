@@ -49,10 +49,13 @@ kubectl apply -f config/samples/recipe-cpu-dev.yaml
 ```
 
 That single file ships the CacheBackend above plus a matching tiny-model vLLM
-engine Deployment, with the engine wired to the cache. (On a cold cluster the
-first engine pod can race ahead of the cache server's endpoint being published;
-if so, wait for the endpoint and `kubectl rollout restart` the engine — see the
-comment at the top of the recipe.)
+engine Deployment, with the engine wired to the cache (KV offload/reuse) and the
+backend producing `LookupRoute` hints. Acting on those hints to actually route
+requests is the gateway's job, which integrates separately — so this recipe is
+the cache half, not a full gateway round-trip. (On a cold cluster the first
+engine pod can race ahead of the cache server's endpoint being published; if so,
+wait for the endpoint and `kubectl rollout restart` the engine — see the comment
+at the top of the recipe.)
 
 > **One install-time prerequisite for observability.** The piece that publishes
 > KV events — the `kvevent-subscriber` sidecar — is only auto-attached when the

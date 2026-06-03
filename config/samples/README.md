@@ -27,16 +27,24 @@ run without a GPU.
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
 
-**Observability prerequisite.** Each recipe's `kubectl apply` wires the engine
-to its cache (KV reuse works immediately), but a backend only reaches
-`Ready=True` and reports index entries once the `kvevent-subscriber` sidecar is
-auto-attached — which requires the controller to run with
-`--kvevent-subscriber-image` set (empty by default). See the
-[quickstart](../../docs/quickstart.md).
+**Prerequisites per recipe.** Most recipes are self-contained, but two have
+external dependencies: `recipe-external-cache.yaml` needs a cache server already
+running at the endpoint you supply (replace the placeholder), and
+`recipe-multi-tenant.yaml` deploys into two namespaces it creates.
+
+**Apply + observability.** Each recipe's `kubectl apply` wires the engine to its
+cache once the backend publishes `status.endpoint` (a pod admitted before then
+races past injection and runs unwired until recreated — see each recipe's
+header). KV reuse then works, but a backend only reaches `Ready=True` and
+reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
+which requires the controller to run with `--kvevent-subscriber-image` set
+(empty by default). See the [quickstart](../../docs/quickstart.md).
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
-`# verify-samples: skip` marker (server-side dry-run can't create the
-namespaces it depends on); it applies cleanly on a real cluster. A
+`# verify-samples: skip` marker — server-side dry-run can't create the
+namespaces it depends on, so the gate can't cover it. `kubectl apply` orders
+namespace creation ahead of namespaced objects, so it is intended to apply in
+one pass on a real cluster; validate it manually against a kind cluster. A
 cache-aware-routing recipe (full gateway integration) is deferred until the
 gateway-side client ships.
 

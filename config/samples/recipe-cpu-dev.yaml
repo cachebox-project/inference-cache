@@ -1,8 +1,11 @@
 # Recipe: CPU dev — fastest path to a working cache on a laptop / kind cluster.
 #
-# Scenario: you want to see cache-aware routing end-to-end with no GPU. This
-# pairs a managed LMCache backend with a tiny vLLM engine running on vLLM's
-# dedicated CPU build. A single `kubectl apply -f` wires the engine to the cache.
+# Scenario: stand up a cache-aware backend with no GPU. This pairs a managed
+# LMCache backend with a tiny vLLM engine running on vLLM's dedicated CPU build.
+# A single `kubectl apply -f` wires the engine to the cache (KV offload/reuse)
+# and lets the backend produce LookupRoute hints. Acting on those hints to
+# actually route requests is the gateway's job — that integration ships as a
+# separate (deferred) cache-aware-routing recipe, not this one.
 #
 # READY/OBSERVABILITY PREREQUISITE: for the backend to reach Ready=True and
 # report index entries, the kvevent-subscriber sidecar must be auto-attached —

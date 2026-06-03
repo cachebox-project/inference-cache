@@ -1,4 +1,7 @@
-# Recipe: GPU production — a typical production deployment shape.
+# Recipe: GPU production — a production deployment SHAPE TEMPLATE (not a
+# drop-in). It shows the structure of a prod deployment; replace the placeholder
+# images (digest-pin them) and tune the model / resources / quotas for your
+# cluster before applying.
 #
 # Scenario: a real model on GPU engine pods, a managed LMCache backend that
 # autoscales under load, and a per-namespace CachePolicy with production-grade

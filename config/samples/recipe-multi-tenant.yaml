@@ -1,12 +1,13 @@
 # verify-samples: skip
 #
 # Why skipped: this recipe creates Namespaces and namespaced objects in one
-# file. `kubectl apply -f` on a REAL cluster orders namespace creation first and
-# applies cleanly, but the verify-samples gate uses server-side dry-run, which
-# never persists the dry-run-created namespaces — so the namespaced objects fail
-# with "namespaces 'team-a' not found". This is a dry-run limitation, not a
-# schema problem; CacheTenant admission is still gate-covered by
-# cache_v1alpha1_cachetenant.yaml. Apply it to a kind cluster to validate.
+# file. `kubectl apply -f` orders namespace creation ahead of namespaced
+# objects, so on a REAL cluster it is intended to apply in one pass — but the
+# verify-samples gate uses server-side dry-run, which never persists the
+# dry-run-created namespaces, so the namespaced objects fail with "namespaces
+# 'team-a' not found". This is a dry-run limitation, not a schema problem;
+# CacheTenant admission is still gate-covered by cache_v1alpha1_cachetenant.yaml.
+# Validate this recipe manually against a kind cluster.
 #
 # Recipe: Multi-tenant — two tenants with isolated cache identity + entry quotas.
 #
