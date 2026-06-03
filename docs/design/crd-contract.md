@@ -50,8 +50,8 @@ Several statuses are written by more than one component. Coexistence works becau
 | `CacheBackend.status` | `matchedEnginePods`, `conditions`, `firstKVEventObservedAt`, `firstAvailableAt`, `endpoint`, `failOpen` | CacheBackend reconciler |
 | `CacheBackend.status` | `indexParticipation` | CacheIndex snapshot poller |
 | `CachePolicy.status` | `conditions`, `observedGeneration` (reserved) | — (see note) |
-| `CacheTenant.status` | `indexEntries`, `conditions`, `observedGeneration` | tenant quota status writer |
-| `CacheIndex.status` | `replicas[]`, `tenants[]`, `prefixes.summary`, `lastUpdated` | CacheIndex snapshot poller (singleton) |
+| `CacheTenant.status` | `indexEntries`, `conditions`, `observedGeneration` | CacheIndex snapshot poller (per-tenant projection of `/snapshot`) |
+| `CacheIndex.status` | `replicas[]`, `tenants[]`, `prefixes.summary`, `observedServer`, `lastUpdated` | CacheIndex snapshot poller (singleton) |
 
 **`CachePolicy.status` is reserved.** The policy reconciler PUSHES the flattened policy set to the server's `/policy` endpoint (see [policy-propagation.md](policy-propagation.md)); it deliberately does **not** write `CachePolicy.status`. The status fields exist for a future propagation-health writer, but no component writes them today — so `kubectl get cachepolicy` shows configuration, not propagation state.
 
@@ -61,7 +61,7 @@ The controller and server binaries exchange state over **two HTTP endpoints in o
 
 | Direction | Endpoint | Owner of the data | Semantics |
 |---|---|---|---|
-| PULL (controller ← server) | `GET /snapshot` | server (in-memory cache aggregate) | scrape → `CacheIndex.status` + `CacheBackend.status.indexParticipation` |
+| PULL (controller ← server) | `GET /snapshot` | server (in-memory cache aggregate) | one poller projects the scrape onto three surfaces: `CacheIndex.status`, `CacheBackend.status.indexParticipation`, and `CacheTenant.status` |
 | PUSH (controller → server) | `POST /policy` | controller (`CachePolicy`/`CacheTenant` intent) | full snapshot, replace-on-write into server runtime |
 
 The bidirectionality is the point: pulled state reflects what the server has heard from the substrate, pushed state is the operator's declarative intent flowing the other way. Operators reason at the `CacheBackend.status` + `CachePolicy.spec` layer; the bridge is the plumbing that connects the two. Any future "controller orchestrates server runtime state" surface should reuse this shape. The wire schema, versioning, and auth profile (TokenReview-backed bearer + audience binding + a `NetworkPolicy` gate) are specified in [policy-propagation.md](policy-propagation.md).

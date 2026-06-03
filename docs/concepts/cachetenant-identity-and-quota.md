@@ -16,7 +16,7 @@ These are the only spec fields — do not expect others.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `tenantID` | string (required, non-empty) | — | The external tenant identifier carried by gateway/engine traffic (`CacheStateUpdate.tenant_id`). This is **not** the CR name. |
-| `quota.maxIndexEntries` | int64 (min `0`) | unset = unbounded | Max **distinct prefixes** the tenant may hold in the index. Omit `quota` for no cap. `0` is a valid cap (admit nothing). |
+| `quota.maxIndexEntries` | int64 (min `0`) | unset = unbounded | Max **distinct prefixes** the tenant may hold in the index. Omit `quota` for no cap. `0` is a valid cap — the tenant settles at zero retained entries (the index evicts down to the cap; it is not a rejection of ingests). |
 | `isolationMode` | enum (`Fairness`) | `Fairness` | Only value implemented today. |
 | `crypto` | object | empty | Reserved for future cryptographic isolation; carries no fields today. |
 

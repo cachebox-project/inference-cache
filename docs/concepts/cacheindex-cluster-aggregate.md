@@ -25,7 +25,7 @@ The status carries three nested views of the same index, each answering a differ
 | Per-tenant | `status.tenants[]` — `{id, indexEntries, memoryUsed, hitRate}` | Per-tenant footprint. `indexEntries` summed across all tenant rows equals the cluster total by construction (it is the per-tenant breakdown of `prefixes.summary.total`). The empty-string `id` is the untenanted bucket. |
 | Per-replica | `status.replicas[]` — `{id, tenant, cacheMemoryBytes, hitRate, pressure, lastUpdate}` | Per-replica cache health. Only replicas that **reported stats** appear here; prefix-only replicas show up in `CacheBackend.status.indexParticipation` instead, not on this surface. |
 
-Two top-level fields round out the object: `status.observedServer` (which server endpoint the aggregate was scraped from) and `status.lastUpdated` (last data change, per the note above).
+Two top-level fields round out the object: `status.observedServer` (the full snapshot URL the aggregate was scraped from, e.g. `http://…:8081/snapshot`) and `status.lastUpdated` (last data change, per the note above).
 
 `hitRate` and `pressure` are decimal strings in `[0,1]` (e.g. `"0.78"`) — CRDs avoid floats for cross-language portability, so they render as quoted strings.
 
@@ -55,7 +55,7 @@ Illustrative `-o yaml` output:
 
 ```yaml
 status:
-  observedServer: http://inference-cache-server.inference-cache-system.svc:8081
+  observedServer: http://inference-cache-server.inference-cache-system.svc:8081/snapshot
   lastUpdated: "2026-06-02T14:21:08Z"
   prefixes:
     summary:
@@ -79,7 +79,7 @@ status:
       lastUpdate: "2026-06-02T14:21:08Z"
 ```
 
-> Status is server-populated. The block above is *output* you read, not something you can apply — a normal `kubectl apply` writes only `spec`, and the status subresource ignores any `status` you include.
+> The status is written by the controller's snapshot poller (which scrapes the server's `/snapshot`) — the server owns the source data, the controller owns the status write. The block above is *output* you read, not something you can apply — a normal `kubectl apply` writes only `spec`, and the status subresource ignores any `status` you include.
 
 ## Edge case — same pod name across namespaces
 
@@ -114,4 +114,4 @@ A copy ships at [`config/samples/cache_v1alpha1_cacheindex.yaml`](../../config/s
 - [`docs/design/policy-propagation.md`](../design/policy-propagation.md) — the controller↔server bridge (pull vs push) that populates this status.
 - [`docs/design/policy-crds.md`](../design/policy-crds.md) — the CacheIndex CRD contract and status shape.
 - [`docs/design/crd-contract.md`](../design/crd-contract.md) — design rationale and cross-CRD invariants.
-- `cachebackend-engine-binding.md` — how engine pods become the replicas that report into this index.
+- [`cachebackend-engine-binding.md`](cachebackend-engine-binding.md) — how engine pods become the replicas that report into this index.
