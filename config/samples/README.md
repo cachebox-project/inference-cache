@@ -36,7 +36,11 @@ before applying. All but `recipe-gpu-production` run without a GPU.
 external dependency: `recipe-external-cache.yaml` needs a cache server already
 running at the endpoint you supply (replace the placeholder).
 `recipe-multi-tenant.yaml` has no external dependency but creates and deploys
-into two namespaces of its own.
+into two namespaces of its own. `recipe-persistent-cache.yaml` needs a usable
+default StorageClass for its PVC to bind (kind ships one) — on a cluster without
+one, set `spec.storage.pvc.storageClassName` to an existing class (or
+pre-provision a matching PV), otherwise the PVC stays `Pending` and
+`status.capacity` never populates.
 
 **Apply + observability.** Each recipe's `kubectl apply` wires matching engine
 pods to the cache. For *managed* backends the wiring becomes available once the
