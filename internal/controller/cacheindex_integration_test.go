@@ -153,22 +153,24 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			t.Fatalf("identical snapshot churned CacheIndex resourceVersion: %s -> %s", rvAfterFirstWrite, ci.ResourceVersion)
 		}
 
-		mu.Lock()
-		if requests != 2 {
-			t.Fatalf("snapshot requests after two refreshes = %d, want 2", requests)
-		}
-		served = index.Snapshot{
-			TotalPrefixes: 9,
-			Replicas: []index.ReplicaSnapshot{{
-				ReplicaID:        "vllm-0",
-				Tenant:           "tenant-a",
-				CacheMemoryBytes: 500,
-				HitRate:          0.9,
-				LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
-			}},
-			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, MemoryUsed: 500, HitRate: 0.9}},
-		}
-		mu.Unlock()
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if requests != 2 {
+				t.Fatalf("snapshot requests after two refreshes = %d, want 2", requests)
+			}
+			served = index.Snapshot{
+				TotalPrefixes: 9,
+				Replicas: []index.ReplicaSnapshot{{
+					ReplicaID:        "vllm-0",
+					Tenant:           "tenant-a",
+					CacheMemoryBytes: 500,
+					HitRate:          0.9,
+					LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
+				}},
+				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, MemoryUsed: 500, HitRate: 0.9}},
+			}
+		}()
 
 		if err := poller.refresh(ctx); err != nil {
 			t.Fatalf("third refresh: %v", err)
@@ -207,10 +209,14 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if err := k8s.Get(ctx, client.ObjectKey{Name: "cacheindex-status-only-it"}, got); err != nil {
 			t.Fatalf("get CacheIndex: %v", err)
 		}
-		if _, found, _ := unstructured.NestedFieldNoCopy(got.Object, "spec", "userField"); found {
+		if _, found, err := unstructured.NestedFieldNoCopy(got.Object, "spec", "userField"); err != nil {
+			t.Fatalf("read spec.userField: %v", err)
+		} else if found {
 			t.Fatalf("user-writable spec field survived real-apiserver pruning: %#v", got.Object["spec"])
 		}
-		if _, found, _ := unstructured.NestedFieldNoCopy(got.Object, "status", "prefixes", "summary", "total"); found {
+		if _, found, err := unstructured.NestedFieldNoCopy(got.Object, "status", "prefixes", "summary", "total"); err != nil {
+			t.Fatalf("read status.prefixes.summary.total: %v", err)
+		} else if found {
 			t.Fatalf("status supplied on create survived status-subresource isolation: %#v", got.Object["status"])
 		}
 		spec, found, err := unstructured.NestedMap(got.Object, "spec")
