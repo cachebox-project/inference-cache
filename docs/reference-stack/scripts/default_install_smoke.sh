@@ -27,11 +27,16 @@
 #      smoke) and a `Ready=True` condition written by the same poller. The
 #      installed validating webhook also rejects a SECOND CacheTenant reusing
 #      an existing tenantID in the namespace (tenantID-uniqueness).
-#   6. The gRPC surface is reachable and PLAINTEXT by default: config/default
-#      serves :9090 plaintext (TLS is opt-in — phase 12), so a plaintext client
+#   6. PromptTemplate + PDTopology are schema-only in the default install
+#      today: the manager registers their CRDs/RBAC but no status-writing
+#      reconciler. The smoke applies committed samples and asserts
+#      `kubectl get pt` / `kubectl get pdt` render their operator-facing
+#      printer columns.
+#   7. The gRPC surface is reachable and PLAINTEXT by default: config/default
+#      serves :9090 plaintext (TLS is opt-in — phase 13), so a plaintext client
 #      lists services and a `LookupRoute` for an unknown model returns the
 #      fail-open default (`reason_code: NO_HINT`).
-#   7. The CacheBackend ↔ engine-pod binding surfaces operators rely on
+#   8. The CacheBackend ↔ engine-pod binding surfaces operators rely on
 #      actually wire up end-to-end: applying config/samples/cachebackend-
 #      with-engine.yaml drives status.matchedEnginePods=1, stamps the
 #      injected-by annotation on the engine pod, and surfaces the
@@ -41,7 +46,7 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8. The External CacheBackend type end-to-end: applying the committed
+#   9. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
 #      Deployment/Service in its namespace, status.endpoint mirrors
@@ -52,17 +57,17 @@
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time).
-#   9. The /snapshot endpoint rejects unauthenticated callers: a side curl
+#  10. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
-#  10. The /policy endpoint rejects unauthenticated callers: same side-pod
+#  11. The /policy endpoint rejects unauthenticated callers: same side-pod
 #      shape against the write-side endpoint. This is the more dangerous of
 #      the two — /policy is replace-on-write, so a successful unauthenticated
 #      POST would override every namespace's CachePolicy state cluster-wide.
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
-#  11. The audience binding holds on BOTH /snapshot and /policy: a probe
+#  12. The audience binding holds on BOTH /snapshot and /policy: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
 #      and asserts the audience-bound token admits on both endpoints
@@ -79,7 +84,7 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
-#  12. The opt-in gRPC TLS path works: applying config/overlays/server-tls
+#  13. The opt-in gRPC TLS path works: applying config/overlays/server-tls
 #      (config/default + the config/server/tls component) rolls the server with
 #      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
 #      a plaintext client is rejected and the cert-manager-issued chain +
@@ -87,10 +92,10 @@
 #      (`grpcurl -cacert` with -authority <FQDN>; a wrong authority is
 #      rejected) — proving server authentication, not just encryption, for the
 #      overlay operators actually enable. Finally re-runs the SAME
-#      LookupRoute(unknown model) the plaintext phase (6) ran and asserts the
+#      LookupRoute(unknown model) the plaintext phase (7) ran and asserts the
 #      identical fail-open NO_HINT, proving the existing call pattern is
 #      unchanged over TLS (pure transport wrapper, no contract/behavior change).
-#  13. Every sample manifest under config/samples/ applies cleanly against
+#  14. Every sample manifest under config/samples/ applies cleanly against
 #      the live install: a server-side dry-run apply of each *.yaml/*.yml
 #      exercises CRD structural validation + the validating admission webhook
 #      on the real cluster. Complements `make verify-samples` (which runs the
@@ -131,7 +136,7 @@
 # Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
 #           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
 #           GRPC_LOCAL_PORT, LOG_DIR, POLICY_SMOKE_NS, SAMPLE_NS,
-#           SAMPLE_ENDPOINT_TIMEOUT,
+#           PROMPT_TOPOLOGY_SMOKE_NS, SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
@@ -165,6 +170,7 @@ EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 # the way out.
 SAMPLE_NS="${SAMPLE_NS:-cb-engine-smoke}"
 POLICY_SMOKE_NS="${POLICY_SMOKE_NS:-ic-smoke-policy}"
+PROMPT_TOPOLOGY_SMOKE_NS="${PROMPT_TOPOLOGY_SMOKE_NS:-ic-smoke-prompt-topology}"
 # CacheBackend reconciler publishes status.endpoint once the managed
 # lmcache-server Service is created — typically within ~5s. 60s absorbs
 # cold-start jitter.
@@ -238,6 +244,10 @@ collect_diagnostics() {
     >"$LOG_DIR/cachetenants.yaml" 2>&1 || true
   kubectl get cachepolicies -A -o yaml \
     >"$LOG_DIR/cachepolicies.yaml" 2>&1 || true
+  kubectl get prompttemplates -A -o yaml \
+    >"$LOG_DIR/prompttemplates.yaml" 2>&1 || true
+  kubectl get pdtopologies -A -o yaml \
+    >"$LOG_DIR/pdtopologies.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
   # Paired-sample state — only populated if the sample-smoke phase ran;
@@ -595,6 +605,50 @@ if ! grep -q "already claimed by CacheTenant" <<<"$ct_reject_out"; then
   fail "duplicate CacheTenant was rejected, but not by the expected webhook rule (missing 'already claimed by CacheTenant' message)"
 fi
 log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
+
+# --- PromptTemplate + PDTopology schema-only assertion ----------------------
+# The default manager currently registers PromptTemplate/PDTopology types, CRDs,
+# and RBAC, but no PromptTemplate render-controller or PDTopology reconciler is
+# started from cmd/controller/main.go. Their status fields are therefore future
+# status surfaces, not live signals in config/default. Assert the meaningful
+# Phase-1 contract instead: committed samples apply against the real CRDs, and
+# the short-name kubectl tables expose their operator-facing printer columns.
+log "applying PromptTemplate + PDTopology samples in namespace $PROMPT_TOPOLOGY_SMOKE_NS"
+kubectl delete namespace "$PROMPT_TOPOLOGY_SMOKE_NS" --ignore-not-found --wait=true --timeout=60s >/dev/null \
+  || fail "timed out waiting for prior PromptTemplate/PDTopology smoke namespace $PROMPT_TOPOLOGY_SMOKE_NS to delete"
+kubectl create namespace "$PROMPT_TOPOLOGY_SMOKE_NS" --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
+kubectl -n "$PROMPT_TOPOLOGY_SMOKE_NS" apply -f config/samples/cache_v1alpha1_prompttemplate.yaml >/dev/null
+kubectl -n "$PROMPT_TOPOLOGY_SMOKE_NS" apply -f config/samples/cache_v1alpha1_pdtopology.yaml >/dev/null
+
+pt_table="$(kubectl -n "$PROMPT_TOPOLOGY_SMOKE_NS" get pt prompttemplate-sample 2>/dev/null || true)"
+pt_header="$(printf '%s\n' "$pt_table" | sed -n '1p')"
+pt_row="$(printf '%s\n' "$pt_table" | sed -n '2p')"
+if ! grep -Eq "(^|[[:space:]])REVISION([[:space:]]|$)" <<<"$pt_header"; then
+  echo "$pt_table"
+  fail "expected PromptTemplate printer column REVISION in kubectl get pt output"
+fi
+if ! grep -Fq "prompttemplate-sample" <<<"$pt_row"; then
+  echo "$pt_table"
+  fail "expected PromptTemplate printer row to include prompttemplate-sample"
+fi
+
+pdt_table="$(kubectl -n "$PROMPT_TOPOLOGY_SMOKE_NS" get pdt pdtopology-sample 2>/dev/null || true)"
+pdt_header="$(printf '%s\n' "$pdt_table" | sed -n '1p')"
+pdt_row="$(printf '%s\n' "$pdt_table" | sed -n '2p')"
+for column in PREFILL DECODE; do
+  if ! grep -Eq "(^|[[:space:]])${column}([[:space:]]|$)" <<<"$pdt_header"; then
+    echo "$pdt_table"
+    fail "expected PDTopology printer column ${column} in kubectl get pdt output"
+  fi
+done
+if ! grep -Fq "pdtopology-sample" <<<"$pdt_row" || \
+   ! grep -Fq "prefill-a" <<<"$pdt_row" || \
+   ! grep -Fq "decode-a" <<<"$pdt_row"; then
+  echo "$pdt_table"
+  fail "expected PDTopology printer row to include sample name and prefill/decode pool names"
+fi
+log "PromptTemplate/PDTopology are schema-only in default install; samples apply and printer columns render"
 
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
@@ -1613,7 +1667,7 @@ log "opt-in TLS overlay OK: plaintext rejected; cert-manager CA verifies the ser
 
 # Backward-compatibility: the EXISTING call pattern must work UNCHANGED over
 # TLS. Re-run the same LookupRoute(unknown model) the plaintext phase ran (phase
-# 6) and assert the identical fail-open result (reason_code=NO_HINT) — proving
+# 7) and assert the identical fail-open result (reason_code=NO_HINT) — proving
 # TLS is a pure transport wrapper that does not alter the gRPC contract or
 # handler behavior, so a client only swaps plaintext creds for TLS creds.
 # Reflection first, proto-file fallback (same priority order as the plaintext
@@ -1754,4 +1808,4 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
