@@ -607,12 +607,13 @@ fi
 log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
 
 # --- PromptTemplate + PDTopology schema-only assertion ----------------------
-# The default manager currently registers PromptTemplate/PDTopology types, CRDs,
-# and RBAC, but no PromptTemplate render-controller or PDTopology reconciler is
-# started from cmd/controller/main.go. Their status fields are therefore future
-# status surfaces, not live signals in config/default. Assert the meaningful
-# Phase-1 contract instead: committed samples apply against the real CRDs, and
-# the short-name kubectl tables expose their operator-facing printer columns.
+# config/default installs the PromptTemplate/PDTopology CRDs and RBAC, and the
+# controller manager adds their Go types to the scheme, but no PromptTemplate
+# render-controller or PDTopology reconciler is started from cmd/controller/main.go.
+# Their status fields are therefore future status surfaces, not live signals in
+# config/default. Assert the meaningful Phase-1 contract instead: committed
+# samples apply against the real CRDs, and the short-name kubectl tables expose
+# their operator-facing printer columns.
 log "applying PromptTemplate + PDTopology samples in namespace $PROMPT_TOPOLOGY_SMOKE_NS"
 kubectl delete namespace "$PROMPT_TOPOLOGY_SMOKE_NS" --ignore-not-found --wait=true --timeout=60s >/dev/null \
   || fail "timed out waiting for prior PromptTemplate/PDTopology smoke namespace $PROMPT_TOPOLOGY_SMOKE_NS to delete"
