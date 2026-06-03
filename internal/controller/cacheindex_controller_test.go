@@ -35,7 +35,7 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
 		},
 		Tenants: []index.TenantSnapshot{
-			{TenantID: "t1", IndexEntries: 5, MemoryUsed: 100, HitRate: 0.8},
+			{TenantID: "t1", IndexEntries: 5, HitRate: 0.8},
 		},
 	}
 

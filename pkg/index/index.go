@@ -1545,22 +1545,22 @@ type ReplicaSnapshot struct {
 
 // TenantSnapshot is the aggregate footprint for one tenant.
 //
-// MemoryUsed is the sum of the tenant's replicas' cache_memory_bytes — a
-// cluster-wide observability figure only (the engine owns this memory; it is
-// not a per-tenant budget). IndexEntries is the tenant's live distinct-prefix
-// count, the quantity CacheTenant.spec.quota.maxIndexEntries bounds; across all
-// tenants these sum to Snapshot.TotalPrefixes by construction (see Aggregate).
+// IndexEntries is the tenant's live distinct-prefix count, the quantity
+// CacheTenant.spec.quota.maxIndexEntries bounds; across all tenants these sum
+// to Snapshot.TotalPrefixes by construction (see Aggregate). Per-tenant memory
+// is deliberately absent: cache_memory_bytes is the engine total across all
+// tenants on a replica, so summing it per tenant double-counts on shared
+// engines (see PROJECT_CONTEXT §Enforcement boundary).
 type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
-	MemoryUsed   int64   `json:"memoryUsed"`
 	IndexEntries int64   `json:"indexEntries"`
 	HitRate      float32 `json:"hitRate"`
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest
-// stats reported for each replica id; tenant memory/hit-rate dedup replicas
-// within a tenant (it is an approximation — a replica serving multiple models
-// for a tenant is counted once). Results are sorted for deterministic output.
+// stats reported for each replica id; tenant hit-rate dedups replicas within a
+// tenant (it is an approximation — a replica serving multiple models for a
+// tenant is counted once). Results are sorted for deterministic output.
 //
 // Reserved tenants (see WithReservedTenants) are excluded from the snapshot
 // entirely — replicas, tenants, and totals — so a probe in flight cannot
@@ -1656,7 +1656,6 @@ func (i *Index) Snapshot() Snapshot {
 	}
 
 	type tenantAgg struct {
-		mem    int64
 		sumHit float64
 		n      int
 	}
@@ -1670,7 +1669,6 @@ func (i *Index) Snapshot() Snapshot {
 			a = &tenantAgg{}
 			byTenant[bucket] = a
 		}
-		a.mem += s.stats.CacheMemoryBytes
 		a.sumHit += float64(s.stats.HitRate)
 		a.n++
 	}
@@ -1686,19 +1684,14 @@ func (i *Index) Snapshot() Snapshot {
 			return
 		}
 		tenantSeen[t] = struct{}{}
-		var (
-			mem int64
-			hit float32
-		)
+		var hit float32
 		if a := byTenant[t]; a != nil {
-			mem = a.mem
 			if a.n > 0 {
 				hit = float32(a.sumHit / float64(a.n))
 			}
 		}
 		snap.Tenants = append(snap.Tenants, TenantSnapshot{
 			TenantID:     t,
-			MemoryUsed:   mem,
 			IndexEntries: agg.PerTenant[t],
 			HitRate:      hit,
 		})

@@ -53,10 +53,6 @@ type TenantCacheStatus struct {
 	// construction — the per-tenant breakdown of the cluster prefix count.
 	// +optional
 	IndexEntries int64 `json:"indexEntries,omitempty"`
-	// MemoryUsed is the approximate cache memory attributed to the tenant
-	// (summed over the tenant's distinct replicas).
-	// +optional
-	MemoryUsed int64 `json:"memoryUsed,omitempty"`
 	// HitRate is the tenant's mean replica hit rate in [0,1], as a decimal
 	// string (e.g. "0.82").
 	// +optional

@@ -47,7 +47,6 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			Tenants: []index.TenantSnapshot{{
 				TenantID:     "tenant-a",
 				IndexEntries: 7,
-				MemoryUsed:   2048,
 				HitRate:      0.75,
 			}},
 		}
@@ -102,7 +101,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		}
 		tenant := ci.Status.Tenants[0]
 		if tenant.ID != "tenant-a" || tenant.IndexEntries != 7 ||
-			tenant.MemoryUsed != 2048 || tenant.HitRate != "0.75" {
+			tenant.HitRate != "0.75" {
 			t.Fatalf("tenant status = %+v, want tenant-a aggregate from snapshot", tenant)
 		}
 	})
@@ -118,7 +117,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				HitRate:          0.8,
 				LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
 			}},
-			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, MemoryUsed: 100, HitRate: 0.8}},
+			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8}},
 		}
 		var requests int
 		srv := newSnapshotServer(t, &served, &snapshotServerHooks{
@@ -168,7 +167,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 					HitRate:          0.9,
 					LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
 				}},
-				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, MemoryUsed: 500, HitRate: 0.9}},
+				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9}},
 			}
 		}()
 

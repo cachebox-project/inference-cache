@@ -187,7 +187,7 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	index := &CacheIndex{
 		Status: CacheIndexStatus{
 			Replicas: []ReplicaCacheStatus{{ID: "r1", CacheMemoryBytes: 100}},
-			Tenants:  []TenantCacheStatus{{ID: "tenant-a", MemoryUsed: 50}},
+			Tenants:  []TenantCacheStatus{{ID: "tenant-a", IndexEntries: 50}},
 			Prefixes: PrefixStatus{Summary: PrefixSummary{
 				Total: 1,
 				Hot:   0,
@@ -196,10 +196,10 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	}
 	indexCopy := index.DeepCopy()
 	index.Status.Replicas[0].CacheMemoryBytes = 200
-	index.Status.Tenants[0].MemoryUsed = 75
+	index.Status.Tenants[0].IndexEntries = 75
 	index.Status.Prefixes.Summary.Total = 2
 	if indexCopy.Status.Replicas[0].CacheMemoryBytes != 100 ||
-		indexCopy.Status.Tenants[0].MemoryUsed != 50 ||
+		indexCopy.Status.Tenants[0].IndexEntries != 50 ||
 		indexCopy.Status.Prefixes.Summary.Total != 1 {
 		t.Fatalf("CacheIndex was not deep-copied")
 	}

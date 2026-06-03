@@ -346,11 +346,11 @@ func TestSnapshotAggregates(t *testing.T) {
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)
 	}
-	if snap.Tenants[0].TenantID != "tenant-a" || snap.Tenants[0].MemoryUsed != 100 {
-		t.Fatalf("tenant-a = %+v, want memoryUsed 100 (deduped)", snap.Tenants[0])
+	if snap.Tenants[0].TenantID != "tenant-a" || snap.Tenants[0].IndexEntries != 2 || snap.Tenants[0].HitRate != 0.8 {
+		t.Fatalf("tenant-a = %+v, want indexEntries 2 hitRate 0.8 (deduped)", snap.Tenants[0])
 	}
-	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].MemoryUsed != 200 {
-		t.Fatalf("tenant-b = %+v, want memoryUsed 200", snap.Tenants[1])
+	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].IndexEntries != 1 || snap.Tenants[1].HitRate != 0.6 {
+		t.Fatalf("tenant-b = %+v, want indexEntries 1 hitRate 0.6", snap.Tenants[1])
 	}
 }
 

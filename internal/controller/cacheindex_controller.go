@@ -598,7 +598,6 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
 			ID:           t.TenantID,
 			IndexEntries: t.IndexEntries,
-			MemoryUsed:   t.MemoryUsed,
 			HitRate:      formatRate(t.HitRate),
 		})
 	}

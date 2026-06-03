@@ -52,7 +52,6 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 		}},
 		Tenants: []TenantSnapshot{{
 			TenantID:     "team-a",
-			MemoryUsed:   100,
 			IndexEntries: 3,
 			HitRate:      0.5,
 		}},
@@ -94,7 +93,7 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	if len(tenants) != 1 {
 		t.Fatalf("expected one tenant row; got %d", len(tenants))
 	}
-	wantTenant := []string{"tenantId", "memoryUsed", "indexEntries", "hitRate"}
+	wantTenant := []string{"tenantId", "indexEntries", "hitRate"}
 	assertExactKeys(t, "TenantSnapshot", tenants[0], wantTenant)
 }
 
