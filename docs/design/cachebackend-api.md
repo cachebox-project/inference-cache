@@ -186,12 +186,15 @@ The controller serves two webhooks for CacheBackend, both registered as `failure
 
 ### Defaulting (mutating)
 
-Stamps `spec.replicas` (the only Phase-1 default this webhook applies) when the operator has not specified it. Operator-set values are never clobbered.
+Most Phase-1 literal defaults ride on `+kubebuilder:default=` markers stamped by the apiserver before the webhook runs (`spec.type=LMCache`, `spec.deploymentKind=Deployment`, `spec.replicas=1`, `spec.integration.engine=vllm`, `spec.integration.role=ReadWrite`, `spec.integration.failOpen=true`, `spec.integration.firstEventTimeout=5m`). The webhook only handles the defaults the schema cannot express; operator-set values are never clobbered.
 
-| Field | Default |
-|---|---|
-| `spec.replicas` | `1` |
-| `spec.integration.firstEventTimeout` | `5m` (CRD-schema default when `spec.integration` is present; the webhook also stamps it when it materializes `spec.integration`) |
+| Field | Default | Layer |
+|---|---|---|
+| `spec.type`, `spec.deploymentKind`, `spec.replicas`, `spec.integration.{engine,role,failOpen,firstEventTimeout}` | per-field literals (see field godoc) | `+kubebuilder:default=` markers — apiserver |
+| `spec.integration.firstEventTimeout` (when `spec.integration` is omitted entirely) | `5m` | webhook materialises `spec.integration` so the nested marker has a parent object to apply to |
+| `spec.autoscaling.minReplicas` (FIRST APPLY ONLY, when `spec.autoscaling != nil` and `spec.autoscaling.minReplicas == nil`) | `= spec.replicas` (post-marker-default; skipped when `spec.replicas` is 0 to avoid violating the schema's `Minimum=1`) | webhook |
+
+The `spec.autoscaling.minReplicas` default is **first-apply only**. The defaulter refuses to overwrite a non-nil value, AND once stamped the field is owned by the apiserver field manager, so a subsequent edit to `spec.replicas` does NOT recompute or move `minReplicas`. This matches the standard Kubernetes HPA convention that scaling intent flows through HPA fields once an HPA owns the workload — to widen or narrow the autoscaling band post-apply, edit `spec.autoscaling.minReplicas` directly. (The `replicas=0` + autoscaling + nil minReplicas case is rejected at admission rather than defaulted; see the validator table below.)
 
 ### Validating
 
@@ -203,6 +206,7 @@ Rejects structurally-broken specs that the reconciler cannot do anything useful 
 | `spec.endpoint` is only valid on `External` | A non-`External` `spec.type` with a non-empty `spec.endpoint`. The field is meaningful only for the External passthrough adapter; for managed types the controller overwrites `status.endpoint` from the live Service it provisions, so a user-supplied `spec.endpoint` would be silently ignored. Whitespace-only values are treated as empty. |
 | Memory-only backends cannot declare PVC storage | `spec.storage.pvc` set when `spec.type` is in the Phase-1 memory-only set (`AIBrix`, `NIXL`). These backends have no persistent tier; a PVC would never mount. |
 | Cross-namespace endpoint requires opt-in | `spec.endpoint` resolves to a Service in a namespace other than the CacheBackend's, and `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator should acknowledge. Bare hostnames, IPs, and unqualified names pass through (no namespace to compare against). |
+| `spec.replicas=0` + autoscaling requires explicit `minReplicas` | `spec.replicas=0` with `spec.autoscaling != nil` and `spec.autoscaling.minReplicas == nil`. The defaulter declines to compute `minReplicas` from a 0 replicas value (it would violate the schema's `Minimum=1`), so without this rule the apiserver accepts the CR and the reconciler's HPA fallback silently picks `1` — overriding the operator's "scale to zero" intent with no notification. The rejection tells the operator to either set `minReplicas` explicitly or remove `spec.autoscaling` to scale to zero unconditionally. |
 | `spec.integration.engineOverrides` cannot touch reserved args/env | An entry in `engineOverrides.args` / `engineOverrides.suppressArgs` matches a leading flag token the adapter declares as `ReservedArgs()`, or an entry in `engineOverrides.env` / `engineOverrides.suppressEnv` matches a name in `ReservedEnv()`. The rejection names both the offending flag/env and the adapter so the operator can fix the spec rather than wait for the engine to crash. The reserved set is per-adapter (the vLLM+LMCache adapter reserves `--kv-transfer-config`, `VLLM_USE_V1`, `LMCACHE_REMOTE_URL`, `INFERENCECACHE_FAIL_OPEN`). |
 | Runtime/backend pair must be supported by an installed adapter | Effective `(engine, spec.type)` pair has no registered runtime adapter, so the reconciler would fall back to unmanaged AND the pod webhook would fail-open without injecting engine config. The effective engine is resolved with the same helper the reconciler and pod webhook use: `spec.integration.engine` lower-cased, defaulting to `vllm` when unset (Phase-1 default — the only engine the shipping adapters target). Applies to `spec.type=External` too: the External passthrough adapter has its own (vLLM-only) Supports gate, so `External` with `engine: sglang` is rejected at admission instead of silently un-wired downstream. Bypassed only for an empty `spec.type` (required-field rejection wins). The rejection message names both sides of the offending pair and lists the supported pairs the controller's registered adapters expose, e.g. `no runtime adapter supports the (engine="vllm", backend="Mooncake") pair; supported pairs in this build: vllm/LMCache, vllm/External`. |
 

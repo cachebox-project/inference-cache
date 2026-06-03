@@ -257,3 +257,154 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 			hpa.Spec.Autoscaling.MinReplicas)
 	}
 }
+
+// TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate pins the
+// FIRST-APPLY-ONLY semantics of the autoscaling.minReplicas default: the
+// admission defaulter computes minReplicas from spec.replicas exactly once
+// (at the create that opted into autoscaling), and a subsequent update that
+// bumps spec.replicas does NOT recompute the floor. This matches the
+// standard Kubernetes HPA convention — once an HPA owns the workload, the
+// operator-set HPA fields are the source of truth for the autoscaling
+// band; spec.replicas edits flow through the HPA controller, not back into
+// minReplicas via the admission defaulter.
+//
+// Without this guarantee an operator who applied at replicas=3 (floor=3 by
+// default), then bumped to replicas=5 to manually pre-warm the workload,
+// would silently see the autoscaling floor jump to 5 too — turning a
+// transient pre-warm into a permanent over-provision. The non-clobber
+// contract in the defaulter (refuses to overwrite a non-nil MinReplicas)
+// plus the apiserver field manager pinning the previously-stamped value
+// together produce the desired "first apply only" behavior; this envtest
+// pins it against future regression.
+//
+// Skips when KUBEBUILDER_ASSETS is unset so default CI stays green; run
+// with the same incantation as the test above.
+func TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping envtest in short mode")
+	}
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS unset; skipping CacheBackend defaulter envtest")
+	}
+
+	webhookManifest := filepath.Join("..", "..", "..", "config", "webhook", "manifests.yaml")
+
+	env := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+		WebhookInstallOptions: envtest.WebhookInstallOptions{
+			Paths: []string{webhookManifest},
+		},
+	}
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatalf("envtest.Start: %v", err)
+	}
+	t.Cleanup(func() { _ = env.Stop() })
+
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("clientgoscheme.AddToScheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("cachev1alpha1.AddToScheme: %v", err)
+	}
+
+	wopts := env.WebhookInstallOptions
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme: scheme,
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Host:    wopts.LocalServingHost,
+			Port:    wopts.LocalServingPort,
+			CertDir: wopts.LocalServingCertDir,
+		}),
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		t.Fatalf("ctrl.NewManager: %v", err)
+	}
+	if err := SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
+		t.Fatalf("SetupCacheBackendWebhookWithManager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgrErr := make(chan error, 1)
+	go func() { mgrErr <- mgr.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-mgrErr:
+			if err != nil && !isContextCanceledErr(err) {
+				t.Logf("manager exited with error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Logf("manager did not exit within 5s")
+		}
+	})
+
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		t.Fatalf("manager cache did not sync")
+	}
+	waitForWebhookPort(t, wopts.LocalServingHost, wopts.LocalServingPort)
+
+	k8s := mgr.GetClient()
+	live := mgr.GetAPIReader()
+	mkNamespace(t, ctx, k8s, "team-a")
+
+	// --- Step 1: apply CR with spec.replicas=3, autoscaling.maxReplicas=10,
+	// no minReplicas. The defaulter computes minReplicas=3 from spec.replicas.
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "minfloor", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Replicas: i32p(3),
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
+			},
+			BackendConfig: map[string]string{
+				"model": "meta-llama/Meta-Llama-3-8B-Instruct",
+			},
+			Autoscaling: &cachev1alpha1.CacheBackendAutoscalingSpec{
+				MaxReplicas: 10,
+			},
+		},
+	}
+	if err := k8s.Create(ctx, cb); err != nil {
+		t.Fatalf("first-apply CacheBackend should be admitted: %v", err)
+	}
+
+	// --- Step 2: assert post-apply minReplicas == 3 (first-apply default).
+	var afterCreate cachev1alpha1.CacheBackend
+	if err := live.Get(ctx, client.ObjectKey{Name: "minfloor", Namespace: "team-a"}, &afterCreate); err != nil {
+		t.Fatalf("get back created CR: %v", err)
+	}
+	if afterCreate.Spec.Autoscaling == nil || afterCreate.Spec.Autoscaling.MinReplicas == nil ||
+		*afterCreate.Spec.Autoscaling.MinReplicas != 3 {
+		t.Fatalf("post-apply autoscaling.minReplicas = %v, want 3 (= spec.replicas first-apply default)",
+			afterCreate.Spec.Autoscaling.MinReplicas)
+	}
+
+	// --- Step 3: update spec.replicas=5 (operator scales workload manually).
+	afterCreate.Spec.Replicas = i32p(5)
+	if err := k8s.Update(ctx, &afterCreate); err != nil {
+		t.Fatalf("update spec.replicas=5 should be admitted: %v", err)
+	}
+
+	// --- Step 4: assert post-update minReplicas == 3 (NOT recomputed).
+	// The non-clobber semantics in the defaulter plus the apiserver field-
+	// manager ownership of the previously-stamped minReplicas together
+	// keep the floor anchored at the first-apply value. A regression
+	// would show minReplicas=5 here (defaulter re-running on every admit
+	// and re-deriving from spec.replicas).
+	var afterUpdate cachev1alpha1.CacheBackend
+	if err := live.Get(ctx, client.ObjectKey{Name: "minfloor", Namespace: "team-a"}, &afterUpdate); err != nil {
+		t.Fatalf("get back updated CR: %v", err)
+	}
+	if afterUpdate.Spec.Replicas == nil || *afterUpdate.Spec.Replicas != 5 {
+		t.Errorf("spec.replicas update lost: got %v, want 5", afterUpdate.Spec.Replicas)
+	}
+	if afterUpdate.Spec.Autoscaling == nil || afterUpdate.Spec.Autoscaling.MinReplicas == nil ||
+		*afterUpdate.Spec.Autoscaling.MinReplicas != 3 {
+		t.Fatalf("post-update autoscaling.minReplicas = %v, want 3 (operator-owned after first apply; spec.replicas edits must NOT recompute the floor)",
+			afterUpdate.Spec.Autoscaling.MinReplicas)
+	}
+}

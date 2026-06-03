@@ -69,7 +69,17 @@ type CacheBackendSpec struct {
 
 	// Replicas is the desired number of backend workload replicas. Defaults
 	// to 1 — a conservative single-replica deployment; operators opt into
-	// horizontal scale via spec.autoscaling (which then overrides this floor).
+	// horizontal scale via spec.autoscaling.
+	//
+	// When spec.autoscaling is set, the HPA owns the live replica count and
+	// the autoscaling floor (spec.autoscaling.minReplicas) is auto-defaulted
+	// to spec.replicas on FIRST APPLY ONLY by the admission defaulter.
+	// Subsequent edits to spec.replicas do NOT move the autoscaling floor —
+	// minReplicas is operator-owned (and operator-pinned via the apiserver
+	// field manager) after first apply, matching the standard Kubernetes HPA
+	// convention that scaling intent flows through HPA fields once an HPA
+	// owns the workload. To widen or narrow the autoscaling band post-apply,
+	// edit spec.autoscaling.minReplicas directly.
 	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
@@ -190,11 +200,15 @@ type CacheBackendAutoscalingSpec struct {
 	// MinReplicas is the lower bound for the HPA replica count. The
 	// admission defaulter computes the default at write time from
 	// spec.replicas (which itself defaults to 1) so the HPA's floor matches
-	// the operator-declared baseline rather than a hard-coded constant —
-	// scaling the workload by editing spec.replicas continues to work even
-	// after autoscaling is enabled. Operators who want a different floor set
-	// the field explicitly; the defaulter never overwrites an operator-set
-	// value.
+	// the operator-declared baseline rather than a hard-coded constant. This
+	// is a FIRST-APPLY-ONLY default: the defaulter never overwrites an
+	// operator-set value, AND once stamped the field is owned by the
+	// apiserver field manager — subsequent edits to spec.replicas do NOT
+	// recompute or move minReplicas, matching the standard Kubernetes HPA
+	// convention that scaling intent flows through HPA fields once an HPA
+	// owns the workload. To widen or narrow the autoscaling band post-apply,
+	// edit spec.autoscaling.minReplicas directly. Operators who want a
+	// non-default floor on first apply set the field explicitly.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas *int32 `json:"minReplicas,omitempty"`

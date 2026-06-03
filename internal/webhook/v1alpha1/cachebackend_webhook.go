@@ -146,6 +146,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
 	rejectCrossNamespaceEndpointWithoutOptIn,
+	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -850,6 +851,38 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 			fmt.Sprintf("spec.endpoint references namespace %q but CacheBackend is in namespace %q; "+
 				"set spec.allowCrossNamespace=true to opt in to the cross-namespace reference",
 				ns, cb.Namespace),
+		),
+	}
+}
+
+// requireExplicitMinReplicasOnScaleToZeroWithAutoscaling rejects the
+// combination spec.replicas=0 + spec.autoscaling != nil +
+// spec.autoscaling.minReplicas == nil. Without this rule the defaulter
+// declines to compute minReplicas (a 0 value would violate the schema's
+// Minimum=1), the apiserver accepts the CR with minReplicas left unset,
+// and the reconciler's HPA fallback silently picks defaultHPAMinReplicas
+// (=1) — so an operator who wrote "scale to zero" gets "scale 1-N" with
+// no notification. Forcing the operator to either set the floor
+// explicitly or remove the autoscaling block keeps the scale-to-zero
+// intent loud at write time.
+//
+// Bypassed when spec.replicas is nil: the apiserver applies the
+// `+kubebuilder:default=1` marker on spec.replicas before this rule
+// runs for a CR that came through admission, so a nil here means the
+// caller bypassed the apiserver (raw-struct unit-test invocation) and
+// the rule has no replicas value to interpret.
+func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != 0 {
+		return nil
+	}
+	if cb.Spec.Autoscaling == nil || cb.Spec.Autoscaling.MinReplicas != nil {
+		return nil
+	}
+	return field.ErrorList{
+		field.Required(
+			field.NewPath("spec", "autoscaling", "minReplicas"),
+			"spec.replicas=0 with spec.autoscaling enabled requires spec.autoscaling.minReplicas to be set explicitly (must be >=1). "+
+				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
 		),
 	}
 }

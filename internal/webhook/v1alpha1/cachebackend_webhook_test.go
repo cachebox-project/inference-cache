@@ -410,6 +410,50 @@ func TestValidator_PersistentStorageOnHierarchicalBackendAdmitted(t *testing.T) 
 	}
 }
 
+func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testing.T) {
+	// spec.replicas=0 + spec.autoscaling enabled + nil minReplicas is the
+	// silent-HPA-fallback-to-1 trap: the defaulter declines to default
+	// minReplicas (a 0 value would violate the schema's Minimum=1), the
+	// apiserver accepts the CR with minReplicas unset, and the reconciler's
+	// HPA fallback picks defaultHPAMinReplicas=1 — overriding the operator's
+	// "scale to zero" intent without notification. Admission must reject
+	// the combination so the operator either sets the floor explicitly or
+	// removes the autoscaling block to truly scale to zero.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(0)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 10}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling.minReplicas",
+		"spec.replicas=0 with spec.autoscaling enabled requires spec.autoscaling.minReplicas")
+}
+
+func TestValidator_ReplicasZeroWithAutoscalingAndExplicitMinReplicasAdmitted(t *testing.T) {
+	// Operator who genuinely wants scale-to-zero-then-autoscale-up sets
+	// minReplicas explicitly. (CRD schema enforces Minimum=1 on minReplicas,
+	// so the smallest meaningful value here is 1.)
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(0)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
+		MinReplicas: i32p(1),
+		MaxReplicas: 10,
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("replicas=0 + autoscaling + explicit minReplicas rejected: %v", err)
+	}
+}
+
+func TestValidator_ReplicasZeroWithoutAutoscalingAdmitted(t *testing.T) {
+	// Pure scale-to-zero (no autoscaling block) is allowed. The HPA-fallback
+	// trap only applies when autoscaling is opted into.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Replicas = i32p(0)
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("replicas=0 without autoscaling rejected: %v", err)
+	}
+}
+
 func TestValidator_CrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
 	v := &CacheBackendValidator{}
 	cb := newBackend()
