@@ -21,7 +21,7 @@ The status carries three nested views of the same index, each answering a differ
 
 | Surface | Status path | Meaning |
 |---|---|---|
-| Cluster total | `status.prefixes.summary.total` | Distinct prefixes across the whole index. (`status.prefixes.summary.hot` is reserved and always `0` today — per-prefix access counting is not implemented yet.) |
+| Cluster total | `status.prefixes.summary.total` | Distinct prefixes across the whole index. (`status.prefixes.summary.hot` is reserved and always `0` today — the hot-prefix aggregation into this field is not wired yet, even though per-entry LFU access counters already exist internally.) |
 | Per-tenant | `status.tenants[]` — `{id, indexEntries, memoryUsed, hitRate}` | Per-tenant footprint. `indexEntries` summed across all tenant rows equals the cluster total by construction (it is the per-tenant breakdown of `prefixes.summary.total`). The empty-string `id` is the untenanted bucket. |
 | Per-replica | `status.replicas[]` — `{id, tenant, cacheMemoryBytes, hitRate, pressure, lastUpdate}` | Per-replica cache health. Only replicas that **reported stats** appear here; prefix-only replicas show up in `CacheBackend.status.indexParticipation` instead, not on this surface. |
 
