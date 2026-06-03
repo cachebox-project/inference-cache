@@ -10,7 +10,7 @@ CacheIndex is the mirror image of the CachePolicy **push**. Where the CachePolic
 
 | Direction | Surface | Mechanism |
 |---|---|---|
-| PULL (this doc) | `CacheIndex.status` | Controller polls the server's internal `GET :8081/snapshot` roughly every ~25s and writes the status **write-only-on-change**. |
+| PULL (this doc) | `CacheIndex.status` | Controller polls the server's internal `GET /snapshot` (on the `:8081` listener) roughly every ~30s and writes the status **write-only-on-change**. |
 | PUSH (contrast) | server policy state | CachePolicy reconciler posts resolved policy to the server. |
 
 Because the write happens **only when the data changes**, a steady-state poll that sees no change does **not** advance `status.lastUpdated`. So `lastUpdated` marks the last *data* change, not the last poll. Poller liveness lives in controller metrics, not in this field — do not read a stale `lastUpdated` as "the poller died." See [`docs/design/policy-propagation.md`](../design/policy-propagation.md) for the bridge in full.
@@ -48,7 +48,7 @@ cluster-default   1428       30s       6d
 Start wide, then drill in:
 
 1. **Headline count.** `kubectl get cacheindex cluster-default` — the `PREFIXES` column is the whole-cluster distinct-prefix total at a glance, and `CHANGED` tells you how fresh that number is.
-2. **Per-tenant / per-replica breakdown.** `kubectl get cacheindex cluster-default -o yaml` — read `status.tenants[]` to answer "why is tenant X not getting cache hits?" (low `indexEntries` or `hitRate` for that tenant), and `status.replicas[]` to answer "is replica Y reporting state?" (its `id` present, with a recent `lastUpdate`).
+2. **Per-tenant / per-replica breakdown.** `kubectl get cacheindex cluster-default -o yaml` — read `status.tenants[]` to answer "why is tenant X not getting cache hits?" (low `indexEntries` or `hitRate` for that tenant), and `status.replicas[]` to answer "is replica Y reporting state?" — **presence of its `id` row** is the signal that it has reported stats. Do **not** read `lastUpdate` as a liveness clock: it is write-only-on-change, so a replica reporting identical stats keeps a steady `lastUpdate` while still being perfectly alive. For reporter liveness, use the server's `/metrics`, not this field.
 3. **Per-backend detail.** For one CacheBackend's participation, read `CacheBackend.status.indexParticipation` instead — that surface includes prefix-only replicas that never reported stats and so are absent from `CacheIndex.status.replicas[]`.
 
 Illustrative `-o yaml` output:
@@ -79,7 +79,7 @@ status:
       lastUpdate: "2026-06-02T14:21:08Z"
 ```
 
-> Status is server-populated. The block above is *output* you read, not something you can apply — the status subresource rejects writes from `kubectl apply`.
+> Status is server-populated. The block above is *output* you read, not something you can apply — a normal `kubectl apply` writes only `spec`, and the status subresource ignores any `status` you include.
 
 ## Edge case — same pod name across namespaces
 
@@ -105,7 +105,7 @@ A copy ships at [`config/samples/cache_v1alpha1_cacheindex.yaml`](../../config/s
 ## When NOT to use it
 
 - **It is not a routing input.** Gateways do not read `CacheIndex` to make routing decisions — that is what the `LookupRoute` gRPC hint is for. CacheIndex is observability only.
-- **You never write data into it.** The spec is empty by design; `kubectl apply` of status fields is rejected. If you find yourself wanting to set a value here, you want a different CR.
+- **You never write data into it.** The spec is empty by design; `kubectl apply` writes only `spec`, and any `status` you include is ignored by the status subresource. If you find yourself wanting to set a value here, you want a different CR.
 - **`lastUpdated` is not a liveness probe.** It marks the last data change, not the last successful poll. Use controller metrics to confirm the poller is alive.
 - **Per-backend questions belong elsewhere.** For one CacheBackend's prefix count and last-event time — including prefix-only replicas — read `CacheBackend.status.indexParticipation`, not this aggregate.
 

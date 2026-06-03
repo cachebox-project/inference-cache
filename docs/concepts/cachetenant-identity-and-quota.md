@@ -4,8 +4,10 @@
 tenant two things at once: a stable **identity** the index isolates on, and an
 optional **entry-count quota** that caps how much of the index that tenant may
 hold. Reach for it when you want per-tenant isolation of cache hints and a
-ceiling on a tenant's index growth. Without a CacheTenant, ingests whose
-`tenant_id` matches no CR land in the empty-tenant bucket and are unbounded.
+ceiling on a tenant's index growth. Without a matching CacheTenant, an ingest
+still keys under whatever `tenant_id` it carries — it simply runs **unbounded**
+(no quota is applied). Only ingests carrying *no* `tenant_id` fall into the
+empty-tenant bucket; a non-empty `tenant_id` always gets its own bucket, CR or not.
 
 ## Spec fields
 
@@ -89,14 +91,17 @@ by the bare `tenantID` string.
 
 | Scenario | Outcome |
 |---|---|
-| Two CacheTenants with the same `tenantID` in **one** namespace | Hard-rejected at admission (a duplicate within a namespace is an unambiguous mistake). |
+| Two CacheTenants with the same `tenantID` in **one** namespace | Rejected at admission (a duplicate within a namespace is an unambiguous mistake) — but the check is *best-effort* (list-then-admit, raceable by concurrent creates), with the controller's deterministic dedup as the authoritative backstop. |
 | Same `tenantID` across **different** namespaces | Permitted — can be deliberate (e.g. a migration). |
 
 When cross-namespace duplicates collide, the controller deterministically picks
-one effective owner (first by `(namespace, name)` ascending). The shadowed CR
-surfaces a `DuplicateTenantID` / not-effective status condition rather than
-silently advertising a budget that isn't enforced. See
-[`docs/design/policy-propagation.md`](../design/policy-propagation.md#tenant-mapping-phase-1)
+one effective owner — among the **quota-bearing** CacheTenants for that
+`tenantID`, the first by `(namespace, name)` ascending wins. (A duplicate
+*without* `quota.maxIndexEntries` carries no budget to enforce, so it never
+becomes the enforced owner.) The shadowed CR surfaces a `DuplicateTenantID` /
+not-effective status condition rather than silently advertising a budget that
+isn't enforced. See
+[`docs/design/policy-propagation.md`](../design/policy-propagation.md#wire-schema-v3)
 for the tie-break.
 
 ## Example

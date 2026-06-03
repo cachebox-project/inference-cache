@@ -33,11 +33,13 @@ The group is vendor-neutral identity (see `CONTRIBUTING.md`) — no cloud-vendor
 
 ## Status-surface invariants
 
-Every CRD that carries a status follows the same three rules:
+Every **spec-reconciled** CRD that carries a status follows the same three rules:
 
 - **Conditions are the authoritative health surface.** Status health is expressed as a `[]metav1.Condition` array (`status.conditions`, `+listType=map` keyed on `type`) plus `status.observedGeneration`. Conditions are the idiomatic Kubernetes signal — `kubectl wait --for=condition=Ready`, dashboards, and GitOps tooling all understand them — so they are the *only* authoritative health signal the contract exposes.
 - **No single-enum `Health` field.** A former status enum was removed (the Health-field removal) precisely because a one-word enum that no dashboard or controller reads is worse than Conditions: it looks authoritative, drifts silently, and duplicates state Conditions already carry. New status surfaces MUST use Conditions, not a bespoke health enum.
 - **Status is write-only-on-change via `Status().Patch`.** Writers never `Update` the whole object and never re-write an unchanged status. This keeps `resourceVersion` stable when nothing changed, which matters because some statuses have more than one writer (below) — a churning writer would fight the others and spam watch traffic.
+
+**Exception — `CacheIndex`.** Its status is a pure server-reflection, not the outcome of reconciling a user-authored spec, so it carries **neither `conditions` nor `observedGeneration`**: there is no spec generation to observe and no health to assert beyond freshness, which `status.lastUpdated` (also write-only-on-change) conveys directly. The Conditions/`observedGeneration` rule above applies to the spec-reconciled CRDs; `CacheIndex` is the deliberate carve-out.
 
 ## Reconciler patterns — who writes what
 

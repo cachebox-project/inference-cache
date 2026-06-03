@@ -6,9 +6,13 @@ no prefix-length gate, no lookup deadline), so **most namespaces need no CachePo
 all** — you reach for one only when a specific namespace has a measured reason to deviate
 (a hot-prefix workload, a latency SLO, an unusually short or long prefix distribution).
 
-`CachePolicy` is **namespaced** (shortName `cpol`), and **at most one per namespace** — a
-second one is rejected at admission. The CR is purely declarative: the controller pushes
-its resolved fields to the server, which is where enforcement actually happens (see
+`CachePolicy` is **namespaced** (shortName `cpol`), and **effectively one per namespace**: a
+second one is rejected at admission — but that check is *best-effort* (it lists-then-admits,
+so concurrent creates or CRs predating the webhook can slip through), so the controller's
+deterministic dedup is the authoritative backstop. When more than one ever coexists, the
+lexicographically-smallest by `metadata.name` wins and the rest are dropped from the pushed
+snapshot. The CR is purely declarative: the controller pushes its resolved fields to the
+server, which is where enforcement actually happens (see
 [Propagation](#propagation-controller--server) below).
 
 ## The four spec knobs
@@ -71,13 +75,15 @@ keep it warm in the index.
 
 The only write the lookup path makes is an `LFU` access-count bump on a *delivered* hint
 (a `TIMEOUT`'d lookup credits nothing). That bump feeds cap-eviction ordering only; it
-never touches `lastSeen` and never affects TTL.
+never touches `lastSeen` and never affects TTL. It is also the single documented exception
+to otherwise side-effect-free lookups — the contract note lives in
+[`docs/design/grpc-contract.md`](../design/grpc-contract.md).
 
 ## Propagation (controller → server)
 
 The controller watches every `CachePolicy` cluster-wide and **pushes** a full snapshot to
-the server's internal `POST :8081/policy` endpoint on every reconcile plus a periodic tick
-(~30s). The server adopts **replace-on-write**: deleting a `CachePolicy` reverts its
+the server's internal `POST /policy` endpoint (on the `:8081` listener) on every reconcile
+plus a periodic tick (~30s). The server adopts **replace-on-write**: deleting a `CachePolicy` reverts its
 namespace to server defaults on the next snapshot. The server's policy store is in-memory
 soft state, so the periodic re-push re-syncs a restarted server without operator action.
 
