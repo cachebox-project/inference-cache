@@ -150,6 +150,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectEndpointOnNonExternal,
 	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
+	rejectPersistentStorageOnExternal,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 }
@@ -831,6 +832,29 @@ func rejectPersistentStorageOnMemoryOnly(cb *cachev1alpha1.CacheBackend) field.E
 		field.Forbidden(
 			field.NewPath("spec", "storage", "pvc"),
 			fmt.Sprintf("CacheBackend type %q is memory-only and cannot declare spec.storage.pvc", cb.Spec.Type),
+		),
+	}
+}
+
+// rejectPersistentStorageOnExternal rejects a PVC-backed storage spec on an
+// External backend. External backends are operator-managed and pre-exist — the
+// controller provisions no Deployment/Service/pod for them (see
+// CacheBackendReconciler.reconcileExternal) — so there is no controller-managed
+// workload to mount a controller-provisioned PVC into. Admitting it would
+// persist an inert field the reconciler silently ignores; operators that want
+// persistent storage on a pre-existing cache configure it on that cache
+// directly.
+func rejectPersistentStorageOnExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
+		return nil
+	}
+	return field.ErrorList{
+		field.Forbidden(
+			field.NewPath("spec", "storage", "pvc"),
+			"External backends are operator-managed (the controller provisions no workload), so spec.storage.pvc cannot be mounted; configure persistence on the pre-existing cache directly",
 		),
 	}
 }

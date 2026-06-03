@@ -410,6 +410,22 @@ func TestValidator_PersistentStorageOnHierarchicalBackendAdmitted(t *testing.T) 
 	}
 }
 
+func TestValidator_PersistentStorageOnExternalBackendRejected(t *testing.T) {
+	// External backends are operator-managed; the controller provisions no
+	// workload to mount a PVC into, so spec.storage.pvc must be rejected rather
+	// than persisted as an inert field. A valid endpoint is set so only the
+	// storage rule fires.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "user-supplied.example:8080"
+	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.storage.pvc",
+		"External backends are operator-managed")
+}
+
 func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testing.T) {
 	// spec.replicas=0 + spec.autoscaling enabled + nil minReplicas is the
 	// silent-HPA-fallback-to-1 trap: the defaulter declines to default

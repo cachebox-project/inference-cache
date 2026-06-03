@@ -135,7 +135,17 @@ func TestReconcilePersistentStorageRemovedKeepsPVCAndWarns(t *testing.T) {
 	if _, err := getOptionalPVC(r, "cache-data", "ns1"); err != nil {
 		t.Fatalf("PVC must be retained on spec.storage.pvc removal (adopt-and-keep); get err=%v", err)
 	}
-	expectEvent(t, drainEvents(rec), eventReasonOrphanedPVCRetained)
+	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
+		t.Fatalf("OrphanedPVCRetained events after removal = %d, want exactly 1", n)
+	}
+
+	// Fire-once: the warning is on the steady-state path, but repeat reconciles
+	// must NOT re-emit it (annotation-guarded).
+	reconcile(t, r, "cache", "ns1")
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 0 {
+		t.Fatalf("OrphanedPVCRetained re-fired on resync = %d times, want 0 (must warn once per orphaning)", n)
+	}
 
 	// The pod reverts to ephemeral — no PVC-backed volume.
 	dep := getDeployment(t, r, "cache", "ns1")
@@ -144,6 +154,17 @@ func TestReconcilePersistentStorageRemovedKeepsPVCAndWarns(t *testing.T) {
 			t.Fatalf("pod should no longer mount the retained PVC after storage removal; got %+v", v)
 		}
 	}
+}
+
+// countEvents returns how many recorded events contain substr.
+func countEvents(events []string, substr string) int {
+	n := 0
+	for _, e := range events {
+		if strings.Contains(e, substr) {
+			n++
+		}
+	}
+	return n
 }
 
 func TestReconcilePVCSizeIncreasePatched(t *testing.T) {

@@ -862,6 +862,10 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 					}
 				}
 			}
+			// Re-adoption: clear the "already warned" marker (if any) left by a
+			// prior adopt-and-keep orphaning, so a future spec.storage.pvc
+			// removal warns again. delete on an absent key is a no-op.
+			delete(pvc.Annotations, annotationStorageRetainedWarned)
 			return controllerutil.SetControllerReference(backend, pvc, r.Scheme)
 		})
 		return e
@@ -985,13 +989,22 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 	return ctrl.Result{}, err
 }
 
-// warnRetainedPVC emits a Warning when spec.storage.pvc has been removed but the
-// CR still owns a data PVC (adopt-and-keep). The PVC is intentionally NOT
-// deleted — destroying persistent storage on a spec edit is irreversible data
-// loss, so it stays owner-referenced and is reclaimed only when the CacheBackend
-// itself is deleted. Fail-soft: a NotFound (the common case — no PVC was ever
-// provisioned) or a transient Get error simply emits nothing. A PVC we do not
-// own is left entirely alone.
+// warnRetainedPVC emits a Warning ONCE when spec.storage.pvc has been removed
+// but the CR still owns a data PVC (adopt-and-keep). The PVC is intentionally
+// NOT deleted — destroying persistent storage on a spec edit is irreversible
+// data loss, so it stays owner-referenced and is reclaimed only when the
+// CacheBackend itself is deleted.
+//
+// Fire-once: this runs on the steady-state reconcile path, which repeats on
+// every resync, so emitting unconditionally would re-fire the Warning forever.
+// We stamp the retained PVC with an annotation the first time we warn and skip
+// when it is already present, so the event fires once per orphaning rather than
+// per reconcile. applyPVC clears the annotation when the backend re-adopts the
+// PVC (spec.storage.pvc re-added), so a later removal warns again.
+//
+// Fail-soft: a NotFound (the common case — no PVC was ever provisioned) or a
+// transient Get/Patch error simply emits nothing (the next reconcile retries).
+// A PVC we do not own is left entirely alone.
 func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
 	if r.Recorder == nil {
 		return
@@ -1002,6 +1015,19 @@ func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *c
 		return
 	}
 	if !metav1.IsControlledBy(pvc, backend) {
+		return
+	}
+	if pvc.Annotations[annotationStorageRetainedWarned] == "true" {
+		return // already warned for this orphaned PVC — stay quiet on resync.
+	}
+	// Stamp first, then emit: if the stamp write fails we skip the event and
+	// retry on the next reconcile, so a persistent Patch failure can't spam.
+	patch := client.MergeFrom(pvc.DeepCopy())
+	if pvc.Annotations == nil {
+		pvc.Annotations = map[string]string{}
+	}
+	pvc.Annotations[annotationStorageRetainedWarned] = "true"
+	if err := r.Patch(ctx, pvc, patch); err != nil {
 		return
 	}
 	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, eventReasonOrphanedPVCRetained, eventReasonOrphanedPVCRetained,
@@ -1445,6 +1471,12 @@ const (
 // shared by the status condition and the Warning event so kubectl describe and
 // the event stream say the same thing.
 const invalidStorageMessage = "spec.storage.pvc requires a single replica: a ReadWriteOnce PVC cannot be multi-attached across replicas. Scale to spec.replicas=1 and spec.autoscaling.maxReplicas<=1, or remove spec.storage.pvc. Per-replica persistent storage via StatefulSet is a separate follow-up."
+
+// annotationStorageRetainedWarned marks a retained (adopt-and-keep) PVC for
+// which the OrphanedPVCRetained Warning has already been emitted, so the
+// steady-state reconcile path warns once per orphaning rather than on every
+// resync. Cleared by applyPVC when the backend re-adopts the PVC.
+const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warned"
 
 // managedReadiness maps the Deployment's rollout state to the Ready
 // condition (status + reason + message). Ready=True requires the Deployment
