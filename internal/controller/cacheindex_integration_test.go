@@ -189,6 +189,9 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 	})
 
 	t.Run("StatusOnlySpecPrunedAndCreateStatusIgnored", func(t *testing.T) {
+		// CacheIndex is status-only by structural schema + status subresource:
+		// the empty spec schema prunes user fields, and the apiserver ignores
+		// status written through the main resource endpoint.
 		u := &unstructured.Unstructured{}
 		u.SetAPIVersion("inferencecache.io/v1alpha1")
 		u.SetKind("CacheIndex")
