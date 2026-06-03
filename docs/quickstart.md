@@ -61,9 +61,13 @@ at the top of the recipe.)
 > KV events — the `kvevent-subscriber` sidecar — is only auto-attached when the
 > controller runs with `--kvevent-subscriber-image` set, which is **empty by
 > default**. Engine↔cache wiring (KV reuse) works without it, but until it is
-> set no KV events are reported, so the backend stays `Ready=False`
-> (`AwaitingFirstKVEvent`) and `PREFIXES` stays `0`. Set that flag on the
-> controller to get the Ready/observability surface below.
+> set no KV events are reported: a managed backend holds at `Ready=False`
+> (`AwaitingFirstKVEvent`) and then, once the `firstEventTimeout` window
+> (default `5m`) elapses, flips to `Ready=False` (`NoKVEventsObserved`) with
+> `Degraded=True`; `PREFIXES` stays `0` throughout. Set that flag on the
+> controller to get the Ready/observability surface below. (External backends
+> are exempt from this gate — they go Ready as soon as admission accepts the
+> endpoint.)
 
 ## What you get
 

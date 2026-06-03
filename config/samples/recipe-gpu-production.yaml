@@ -34,7 +34,9 @@
 # requires the controller to run with --kvevent-subscriber-image set (empty by
 # default). Without it the engine is wired to the cache (KV reuse works) but no
 # KV events are reported, so the backend holds at Ready=False /
-# AwaitingFirstKVEvent. See docs/quickstart.md.
+# AwaitingFirstKVEvent and, after the firstEventTimeout window (default 5m),
+# degrades to Ready=False / NoKVEventsObserved with Degraded=True. See
+# docs/quickstart.md.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

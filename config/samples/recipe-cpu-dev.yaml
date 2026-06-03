@@ -11,8 +11,14 @@
 # report index entries, the kvevent-subscriber sidecar must be auto-attached —
 # that requires the controller to run with --kvevent-subscriber-image set (it is
 # empty by default). Without it the engine is still wired to the cache (KV reuse
-# works), but no KV events are reported and `kubectl get cachebackend` holds at
-# Ready=False / AwaitingFirstKVEvent with PREFIXES 0. See docs/quickstart.md.
+# works), but no KV events are reported: the backend holds at Ready=False /
+# AwaitingFirstKVEvent and, after the firstEventTimeout window (default 5m),
+# degrades to Ready=False / NoKVEventsObserved with Degraded=True; PREFIXES stays
+# 0. See docs/quickstart.md.
+#
+# CPU caveat: LMCache offload is functional on the CPU image (the repo's
+# CPU substrate canary exercises cross-pod KV reuse via the lmcache-server), but
+# representative offload performance wants a GPU — see docs/reference-stack/.
 #
 # What binds the two objects: the label `app: cpu-dev` appears in BOTH
 # `CacheBackend.spec.engineSelector.matchLabels` AND the engine Deployment's

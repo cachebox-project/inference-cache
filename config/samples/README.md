@@ -15,9 +15,11 @@ This directory holds three flavors of `inferencecache.io/v1alpha1` sample CRs:
 
 ## Recipe catalog
 
-Each recipe is a single self-contained file with a top-of-file comment
-explaining the scenario and the apply steps. All but `recipe-gpu-production`
-run without a GPU.
+Each recipe is a single file with a top-of-file comment explaining the scenario
+and the apply steps. Most are self-contained; see "Prerequisites per recipe"
+below for the two that aren't (external cache, multi-tenant), and note
+`recipe-gpu-production` is a shape template whose placeholder images you pin
+before applying. All but `recipe-gpu-production` run without a GPU.
 
 | Recipe | Use case |
 | --- | --- |
@@ -35,10 +37,13 @@ running at the endpoint you supply (replace the placeholder), and
 **Apply + observability.** Each recipe's `kubectl apply` wires the engine to its
 cache once the backend publishes `status.endpoint` (a pod admitted before then
 races past injection and runs unwired until recreated — see each recipe's
-header). KV reuse then works, but a backend only reaches `Ready=True` and
-reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
+header). KV reuse then works, but a *managed* backend only reaches `Ready=True`
+and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
-(empty by default). See the [quickstart](../../docs/quickstart.md).
+(empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
+degrades to `NoKVEventsObserved`. `External` backends are exempt from that gate —
+they go `Ready` as soon as admission accepts the endpoint. See the
+[quickstart](../../docs/quickstart.md).
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
 `# verify-samples: skip` marker — server-side dry-run can't create the
@@ -62,7 +67,8 @@ make verify-samples
 The target spins up an envtest apiserver, installs the CRDs from
 `config/crd/bases/` and the webhook configuration from
 `config/webhook/manifests.yaml`, registers the CacheBackend defaulter +
-validator in-process with the shipping adapter registry, then runs
+validator (with the shipping adapter registry) plus the CachePolicy and
+CacheTenant validators in-process, then runs
 `kubectl apply --dry-run=server -f <file>` for every YAML in this
 directory.
 
