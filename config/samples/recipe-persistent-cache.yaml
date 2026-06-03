@@ -1,0 +1,127 @@
+# Recipe: persistent PVC-backed cache — the CPU-dev shape plus spec.storage.pvc.
+#
+# Scenario: a managed LMCache backend whose cache-server pod gets a
+# PersistentVolumeClaim, paired (single `kubectl apply -f`) with a tiny vLLM CPU
+# engine wired to it. The label `app: persistent-cache` appears in BOTH
+# CacheBackend.spec.engineSelector.matchLabels AND the engine Deployment's
+# pod-template labels — that is what the mutating Pod webhook matches to inject
+# the LMCache engine wiring (see docs/concepts/cachebackend-engine-binding.md).
+#
+# What spec.storage.pvc does here:
+#   * The controller provisions a PVC named `persistent-cache-data`
+#     owner-referenced to the CacheBackend (ReadWriteOnce), mounts it into the
+#     cache-server pod, and reports the bound size in status.capacity. The PVC
+#     is reclaimed ONLY when the CacheBackend is deleted (owner-reference GC).
+#   * Removing spec.storage.pvc later LEAVES the PVC in place (adopt-and-keep) —
+#     destroying persistent storage on a spec edit would be data loss. To
+#     reclaim it, run `kubectl delete cachebackend persistent-cache`.
+#   * SINGLE-REPLICA ONLY: a ReadWriteOnce PVC cannot be multi-attached, so keep
+#     replicas: 1 and do not set an autoscaling ceiling > 1, or the backend is
+#     surfaced Ready=False / InvalidStorageConfiguration and not provisioned.
+#     Per-replica PVCs via a StatefulSet are a separate ticket.
+#
+# NOT YET KV-PERSISTENT: provisioning + mounting the PVC is wired, but the
+# lmcache-server still runs its in-memory storage device, so KV does NOT yet
+# survive a pod restart — the volume is attached but not written to. Switching
+# the server to a disk-backed device that spills to the mount is a separate
+# follow-up.
+#
+# PREREQUISITE: the PVC needs a usable default StorageClass to bind (kind ships
+# one). If your cluster has no default StorageClass, set spec.storage.pvc.
+# storageClassName to one that exists (or pre-provision a matching PV) — without
+# a binding path the PVC stays Pending and status.capacity never populates. On a
+# WaitForFirstConsumer StorageClass the PVC binds only once the cache-server pod
+# schedules.
+#
+# READY/OBSERVABILITY + apply-order + CPU-sizing caveats are identical to
+# recipe-cpu-dev.yaml — see that recipe's header. On Apple Silicon swap the
+# engine image tag to `:latest-arm64` and the nodeSelector arch to `arm64`.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: persistent-cache
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  # Single replica is required for a PVC-backed (ReadWriteOnce) backend.
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: persistent-cache        # <-- binding label (1 of 2)
+  backendConfig:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    # Managed lmcache-server image. Pin to a digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+  storage:
+    pvc:
+      # Requested size. Increasable later (the controller patches the request
+      # up; the StorageClass expands the volume if it allows expansion); not
+      # shrinkable.
+      size: 10Gi
+      # Optional StorageClass. Omit for the cluster default; set "" to opt out
+      # of the default (static binding). Immutable after creation.
+      # storageClassName: fast-ssd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persistent-cache-engine
+  labels:
+    app: persistent-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: persistent-cache
+  template:
+    metadata:
+      labels:
+        app: persistent-cache        # <-- binding label (2 of 2)
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
+      containers:
+        - name: vllm
+          # vLLM CPU build. Arch-specific — `:latest-arm64` on Apple Silicon.
+          image: vllm/vllm-openai-cpu:latest-x86_64
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+          args:
+            - "--port=8000"
+            - "--dtype=bfloat16"
+            - "--max-model-len=8192"
+            - "--enforce-eager"
+            - "--enable-prefix-caching"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: kv-events, containerPort: 5557 }
+            - { name: kv-replay, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "6Gi"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

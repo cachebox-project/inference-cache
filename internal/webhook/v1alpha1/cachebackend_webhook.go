@@ -150,6 +150,8 @@ var DefaultValidationRules = []ValidationRule{
 	rejectEndpointOnNonExternal,
 	rejectInvalidExternalEndpoint,
 	rejectPersistentStorageOnMemoryOnly,
+	rejectNonPositivePVCSize,
+	rejectStorageWithOverlongName,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 }
@@ -831,6 +833,60 @@ func rejectPersistentStorageOnMemoryOnly(cb *cachev1alpha1.CacheBackend) field.E
 		field.Forbidden(
 			field.NewPath("spec", "storage", "pvc"),
 			fmt.Sprintf("CacheBackend type %q is memory-only and cannot declare spec.storage.pvc", cb.Spec.Type),
+		),
+	}
+}
+
+// rejectNonPositivePVCSize rejects a spec.storage.pvc.size that is not strictly
+// positive. The schema marks size required, but "required" does not stop a 0 or
+// negative quantity; now that the value drives a real PVC resource request, a
+// non-positive size must be a field-scoped CacheBackend rejection at admission
+// rather than surfacing late as a child-PVC provisioning failure the operator
+// has to dig for.
+func rejectNonPositivePVCSize(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	if cb.Spec.Storage.PVC.Size.Sign() > 0 {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "storage", "pvc", "size"),
+			cb.Spec.Storage.PVC.Size.String(),
+			"must be a positive storage quantity",
+		),
+	}
+}
+
+// pvcNameSuffix mirrors the suffix the controller appends when deriving the
+// data PVC name (CacheBackendReconciler.pvcName builds "<name>-data"). It lives
+// here as a literal — the webhook package cannot import the controller package —
+// so keep the two in lockstep if the derivation ever changes.
+const pvcNameSuffix = "-data"
+
+// maxK8sNameLen is the Kubernetes object-name limit (DNS-1123 subdomain).
+const maxK8sNameLen = 253
+
+// rejectStorageWithOverlongName rejects spec.storage.pvc when the PVC name the
+// controller would derive (<name>-data) exceeds the Kubernetes object-name
+// limit. The apiserver already bounds the CacheBackend name at 253 chars, but
+// appending the suffix can push the derived child name over the limit, which
+// would make the PVC uncreatable and the backend silently unreconcilable (the
+// controller's PVC apply would fail every reconcile). Catching it at admission
+// turns that latent failure into a clear, field-scoped rejection.
+func rejectStorageWithOverlongName(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	if len(cb.Name)+len(pvcNameSuffix) <= maxK8sNameLen {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("metadata", "name"),
+			cb.Name,
+			fmt.Sprintf("too long for a persistent backend: the derived PVC name %q would exceed the %d-character limit; shorten the CacheBackend name or omit spec.storage.pvc", cb.Name+pvcNameSuffix, maxK8sNameLen),
 		),
 	}
 }

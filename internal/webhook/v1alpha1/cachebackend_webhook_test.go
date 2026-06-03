@@ -410,6 +410,45 @@ func TestValidator_PersistentStorageOnHierarchicalBackendAdmitted(t *testing.T) 
 	}
 }
 
+func TestValidator_NonPositivePVCSizeRejected(t *testing.T) {
+	// size drives a real PVC request, so a non-positive value must be a
+	// field-scoped rejection at admission, not a late child-PVC failure.
+	for _, sz := range []string{"0", "0Gi"} {
+		v := &CacheBackendValidator{}
+		cb := newBackend()
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+			PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse(sz)},
+		}
+		requireInvalidWithCause(t, v, cb, "spec.storage.pvc.size",
+			"must be a positive storage quantity")
+	}
+}
+
+func TestValidator_StorageWithOverlongNameRejected(t *testing.T) {
+	// The derived PVC name (<name>-data) must fit the 253-char k8s name limit;
+	// a near-max CacheBackend name + the suffix would otherwise make the backend
+	// silently unreconcilable. 250 + len("-data")=5 = 255 > 253.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	cb.Name = strings.Repeat("a", 250)
+	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	requireInvalidWithCause(t, v, cb, "metadata.name", "would exceed the 253-character limit")
+
+	// A normal-length name with the same storage spec is accepted.
+	ok := newBackend()
+	ok.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	ok.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
+		t.Fatalf("normal-length persistent backend rejected: %v", err)
+	}
+}
+
 func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testing.T) {
 	// spec.replicas=0 + spec.autoscaling enabled + nil minReplicas is the
 	// silent-HPA-fallback-to-1 trap: the defaulter declines to default
@@ -826,8 +865,8 @@ func (stubVLLMLMCacheAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1a
 	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
 }
 
-func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return nil, nil, nil
+func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*adapterruntime.ResolvedCacheServer, error) {
+	return nil, nil
 }
 func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
 	return nil
@@ -866,8 +905,8 @@ func (stubExternalAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1alph
 	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal
 }
 
-func (stubExternalAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return nil, nil, nil
+func (stubExternalAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*adapterruntime.ResolvedCacheServer, error) {
+	return nil, nil
 }
 func (stubExternalAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
 	return nil

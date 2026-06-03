@@ -43,11 +43,30 @@ const (
 // CacheBackendSpec defines the desired state of a cache backend.
 //
 // Persistent storage (spec.storage.pvc) and the autoscaling spec
-// (spec.autoscaling) are both surfaced here for v1alpha1 forward-compat. The
-// autoscaling spec is reconciled into a HorizontalPodAutoscaler today;
-// spec.storage.pvc is accepted but inert until a follow-up wires it through
-// to the runtime adapter's rendered pod (there is no PVC provisioning, no
-// volume injection, and no status.capacity reporting until then).
+// (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
+// HorizontalPodAutoscaler. On a managed Deployment backend
+// (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
+// PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
+// when the CacheBackend is deleted), mounts it into the cache-server pod at the
+// runtime adapter's declared data path, and reports the bound PVC's actual size
+// in status.capacity.
+//
+// Two scoping rules apply:
+//
+//   - Only a managed Deployment backend provisions storage. A StatefulSet
+//     backend is routed to the unmanaged path today (see DeploymentKind), so it
+//     provisions nothing, storage included; per-replica volumeClaimTemplates are
+//     a follow-up. An External backend provisions no workload at all, so
+//     spec.storage.pvc is a no-op there.
+//   - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
+//     multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
+//     Ready=False/InvalidStorageConfiguration rather than provisioned;
+//     per-replica persistent storage via StatefulSet is a separate follow-up.
+//
+// NOTE: provisioning + mounting the PVC does not by itself make the cache server
+// spill KV to it — switching the LMCache server to a disk-backed storage device
+// is a separate follow-up; until then the volume is attached but the server
+// keeps KV in memory.
 type CacheBackendSpec struct {
 	// Type identifies the backing cache implementation. Defaults to LMCache —
 	// the standalone lmcache-server workload Phase-1 ships; operators pick
@@ -181,11 +200,19 @@ type CacheBackendStorageSpec struct {
 
 // CacheBackendPVCSpec defines PVC-backed storage settings.
 type CacheBackendPVCSpec struct {
-	// Size is the requested persistent storage size.
+	// Size is the requested persistent storage size. It can be increased later
+	// (the controller patches the PVC request up, and the StorageClass expands
+	// the volume if it allows expansion); it cannot be decreased — Kubernetes
+	// does not support shrinking a PVC, so a smaller value is ignored.
 	// +kubebuilder:validation:Required
 	Size resource.Quantity `json:"size"`
 
-	// StorageClassName is the optional StorageClass for the PVC.
+	// StorageClassName is the optional StorageClass for the PVC. Omit (leave
+	// null) to use the cluster default StorageClass; set it to the empty string
+	// ("") to explicitly opt out of the default (static / no-provisioner
+	// binding) — the controller preserves the distinction. It is immutable after
+	// the PVC is created — Kubernetes rejects StorageClass changes — so a later
+	// edit is ignored (the controller logs and keeps the existing class).
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 }
@@ -477,12 +504,12 @@ type CacheBackendStatus struct {
 	Endpoint string `json:"endpoint,omitempty"`
 
 	// Capacity is a human-readable summary of the backend's provisioned
-	// capacity (e.g. the requested PVC size when persistent storage is
-	// actually wired through to the cache server). It is informational;
-	// clients must not parse it. The field is intentionally left empty
-	// until the storage wire-up follow-up lands — the rendered cache-server
-	// pod has no data volume to attach a PVC to today, so reporting a
-	// requested size as "provisioned" would mislead operators.
+	// capacity: the bound PersistentVolumeClaim's actual capacity when
+	// spec.storage.pvc is set and the PVC has bound (the real provisioned size,
+	// which may exceed the request), or empty for an ephemeral backend or while
+	// the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
+	// binds only once the pod schedules). It is informational; clients must not
+	// parse it.
 	// +optional
 	Capacity string `json:"capacity,omitempty"`
 
