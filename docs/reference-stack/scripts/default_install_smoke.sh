@@ -41,7 +41,7 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   7b. Persistent KV storage (spec.storage.pvc): a single-replica LMCache
+#   7b. PVC-backed storage wire-up (spec.storage.pvc): a single-replica LMCache
 #      CacheBackend with spec.storage.pvc.size set provisions a PVC
 #      owner-referenced to the CacheBackend, mounts it into the cache-server
 #      pod, binds (waiting for the WaitForFirstConsumer pod schedule first),
@@ -1033,7 +1033,7 @@ log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter caden
 kubectl delete namespace "$SAMPLE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
-# --- persistent KV storage (spec.storage.pvc) wire-up -----------------------
+# --- PVC-backed storage (spec.storage.pvc) wire-up --------------------------
 # spec.storage.pvc provisions a PVC owner-referenced to the CacheBackend and
 # mounts it into the cache-server pod. This phase asserts the operator-facing
 # surfaces this change delivers — PVC created + owner ref, the data-volume
