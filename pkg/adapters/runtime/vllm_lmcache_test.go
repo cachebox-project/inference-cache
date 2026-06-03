@@ -44,16 +44,38 @@ func TestVLLMLMCacheSupports(t *testing.T) {
 	}
 }
 
+// resolvePod unwraps ResolveCacheServer for tests that only assert on the
+// rendered pod, failing on error or a nil result. Tests that need the Service
+// or DataVolume call ResolveCacheServer directly.
+func resolvePod(t *testing.T, a KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) *corev1.PodSpec {
+	t.Helper()
+	resolved, err := a.ResolveCacheServer(cb)
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if resolved == nil || resolved.PodSpec == nil {
+		t.Fatalf("ResolveCacheServer returned nil resolved/pod")
+	}
+	return resolved.PodSpec
+}
+
 func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	resolved, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if pod == nil || svc == nil {
-		t.Fatalf("ResolveCacheServer returned nil pod or svc")
+	if resolved == nil || resolved.PodSpec == nil || resolved.Service == nil {
+		t.Fatalf("ResolveCacheServer returned nil resolved/pod/svc")
+	}
+	pod, svc := resolved.PodSpec, resolved.Service
+
+	// An ephemeral backend (no spec.storage.pvc) declares no data volume and
+	// keeps the in-memory "cpu" storage device — status quo preserved.
+	if resolved.DataVolume != nil {
+		t.Fatalf("DataVolume = %+v, want nil for an ephemeral backend", resolved.DataVolume)
 	}
 
 	if len(pod.Containers) != 1 {
@@ -105,10 +127,7 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	// adapter must render a TCP probe targeting the named lmcache port so
 	// Ready waits on the real accept loop.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, newLMCacheBackend(nil))
 	probe := pod.Containers[0].ReadinessProbe
 	if probe == nil {
 		t.Fatalf("ReadinessProbe is nil; want a TCP probe so Ready waits on the actual accept loop")
@@ -125,10 +144,7 @@ func TestVLLMLMCacheResolveCacheServerNoRequestsWithoutAutoscaling(t *testing.T)
 	// Non-autoscaled backends keep the previous "no requests" rendering so
 	// upgrades don't change scheduling for users who don't opt into an HPA.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, newLMCacheBackend(nil))
 	if len(pod.Containers[0].Resources.Requests) != 0 {
 		t.Fatalf("container Requests = %v, want empty when autoscaling is unset", pod.Containers[0].Resources.Requests)
 	}
@@ -142,10 +158,7 @@ func TestVLLMLMCacheResolveCacheServerHasResourceRequestsWhenAutoscaled(t *testi
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	reqs := pod.Containers[0].Resources.Requests
 	cpu, hasCPU := reqs[corev1.ResourceCPU]
 	if !hasCPU || cpu.IsZero() {
@@ -161,10 +174,7 @@ func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
 
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	if got := pod.Containers[0].Image; got != "registry.example.com/lmcache:pinned" {
 		t.Fatalf("container image = %q, want overridden", got)
 	}
@@ -176,10 +186,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 		"serverCommand": "python3 -m lmcache.v1.multiprocess.server --cpu-buffer-size 60",
 	})
 
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	c := pod.Containers[0]
 	if len(c.Command) != 1 || c.Command[0] != "python3" {
 		t.Fatalf("command = %v, want [python3]", c.Command)
@@ -197,8 +204,45 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 
 func TestVLLMLMCacheResolveCacheServerNilCache(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	if _, _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, err := a.ResolveCacheServer(nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerPersistentDeclaresDataVolume(t *testing.T) {
+	// When spec.storage.pvc is set, the adapter declares a DataVolume so the
+	// reconciler can provision + mount a PVC. The adapter declares (name +
+	// mount path) but does NOT add the volume/mount itself — the reconciler
+	// owns the PVC name and the merge.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{PVC: &cachev1alpha1.CacheBackendPVCSpec{}}
+
+	resolved, err := a.ResolveCacheServer(cb)
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if resolved.DataVolume == nil {
+		t.Fatalf("DataVolume = nil, want non-nil when spec.storage.pvc is set")
+	}
+	if resolved.DataVolume.VolumeName == "" {
+		t.Fatalf("DataVolume.VolumeName is empty; want a stable volume name")
+	}
+	if !strings.HasPrefix(resolved.DataVolume.MountPath, "/") {
+		t.Fatalf("DataVolume.MountPath = %q, want an absolute in-container path", resolved.DataVolume.MountPath)
+	}
+	if len(resolved.PodSpec.Volumes) != 0 {
+		t.Fatalf("adapter rendered pod volumes %v; the reconciler owns volume mounting", resolved.PodSpec.Volumes)
+	}
+
+	// Deferred device-switch invariant: the lmcache-server storage device stays
+	// "cpu" (positional arg 3 of the legacy command) even when persistence is
+	// requested — switching it to a disk-backed device that spills to the mount
+	// path is a separate follow-up. This assertion is the canary that must be
+	// updated when that follow-up lands.
+	c := resolved.PodSpec.Containers[0]
+	if len(c.Args) == 3 && c.Args[2] != "cpu" {
+		t.Fatalf("storage device arg = %q, want \"cpu\" (disk-backed device is a separate follow-up)", c.Args[2])
 	}
 }
 

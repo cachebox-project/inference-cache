@@ -1,0 +1,57 @@
+# A managed LMCache backend that requests PVC-backed persistent storage.
+#
+# When spec.storage.pvc is set, the controller provisions a
+# PersistentVolumeClaim owner-referenced to this CacheBackend (named
+# <name>-data), mounts it into the cache-server pod at the runtime adapter's
+# declared data path, and reports the bound PVC's actual size in
+# status.capacity. The PVC is reclaimed ONLY when this CacheBackend is deleted
+# (owner-reference GC) — removing spec.storage.pvc from the CR LEAVES the PVC
+# in place (adopt-and-keep), because destroying persistent storage in response
+# to a spec edit would be irreversible data loss. To reclaim the volume,
+# `kubectl delete cachebackend` it.
+#
+# Two scope notes for this recipe:
+#
+#   * NOT YET KV-PERSISTENT. Provisioning + mounting the PVC is wired, but the
+#     lmcache-server still runs with its in-memory storage device, so KV does
+#     NOT yet survive a pod restart. Switching the server to a disk-backed
+#     storage device that spills to the mounted volume is a separate follow-up.
+#     The volume is attached today; it is not written to yet.
+#
+#   * SINGLE-REPLICA ONLY. A ReadWriteOnce PVC cannot be mounted by more than
+#     one pod, so a persistent backend must keep replicas: 1 (and must not set
+#     an autoscaling ceiling > 1). A persistent backend that requests more than
+#     one replica is surfaced Ready=False / InvalidStorageConfiguration and its
+#     workload is not provisioned. Per-replica persistent storage via a
+#     StatefulSet (volumeClaimTemplates) is a separate ticket.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-persistent
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  # Single replica is required for a PVC-backed (ReadWriteOnce) backend.
+  replicas: 1
+  integration:
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  backendConfig:
+    model: meta-llama/Meta-Llama-3-8B-Instruct
+    # Pin to a real digest for non-local runs.
+    serverImage: lmcache/standalone:latest
+  storage:
+    pvc:
+      # Requested size. Can be increased later (the controller patches the PVC
+      # request up; the StorageClass expands the volume if it allows expansion);
+      # it cannot be shrunk.
+      size: 10Gi
+      # Optional StorageClass. Immutable after creation — Kubernetes rejects
+      # StorageClass changes, so a later edit is ignored. Omit to use the
+      # cluster default StorageClass.
+      # storageClassName: fast-ssd
