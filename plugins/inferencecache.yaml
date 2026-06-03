@@ -1,0 +1,102 @@
+# krew plugin manifest for the inferencecache CLI.
+#
+# STATUS: PREPARED, NOT YET SUBMITTED to krew-index. The full krew publish flow
+# (release tarballs, real sha256 sums, version bump automation) is owned by the
+# F4 CLI-plugin work; this manifest is the early scaffold so the doctor MVP can
+# be installed as `kubectl inferencecache doctor` once releases are cut.
+#
+# The version and per-platform `uri`/`sha256` fields below are PLACEHOLDERS
+# (v0.0.0, all-zero digests). Replace them with a tagged release and the real
+# tarball digests before running `kubectl krew install --manifest` or opening a
+# krew-index PR. Validate locally first with:
+#   kubectl krew install --manifest=plugins/inferencecache.yaml --archive=<tarball>
+apiVersion: krew.googlecontainer.com/v1alpha2
+kind: Plugin
+metadata:
+  name: inferencecache
+spec:
+  version: v0.0.0
+  homepage: https://github.com/cachebox-project/inference-cache
+  shortDescription: Diagnose an inference-cache installation
+  description: |
+    inferencecache is the operator CLI for the inference-cache control plane.
+
+    Its `doctor` subcommand runs a read-only pre-flight diagnostic — server
+    gRPC health, the /snapshot and /policy endpoints, per-CacheBackend health
+    (readiness, engine-pod matching, index participation, endpoint
+    reachability), engine-pod injection, orphaned pods, CacheTenant quota, and
+    CachePolicy coverage — and reports OK / WARN / FAIL findings with stable,
+    greppable codes. It exits 0 / 1 / 2 for CI gating and never mutates cluster
+    state.
+
+    Usage:
+      kubectl inferencecache doctor
+      kubectl inferencecache doctor --output=json
+      kubectl inferencecache doctor --config-only --namespace my-ns
+  caveats: |
+    doctor reads your cluster through the current kubeconfig context. To probe
+    the live server endpoints from outside the cluster, port-forward the
+    inference-cache-server Service and pass --server-endpoint, or run with
+    --config-only to validate CacheBackend/CacheTenant/CachePolicy configuration
+    without the live endpoint probes.
+  platforms:
+    - selector:
+        matchLabels:
+          os: linux
+          arch: amd64
+      uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_linux_amd64.tar.gz
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      bin: inferencecache
+      files:
+        - from: inferencecache
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: linux
+          arch: arm64
+      uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_linux_arm64.tar.gz
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      bin: inferencecache
+      files:
+        - from: inferencecache
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: amd64
+      uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_darwin_amd64.tar.gz
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      bin: inferencecache
+      files:
+        - from: inferencecache
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: arm64
+      uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_darwin_arm64.tar.gz
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      bin: inferencecache
+      files:
+        - from: inferencecache
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: windows
+          arch: amd64
+      uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_windows_amd64.tar.gz
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      bin: inferencecache.exe
+      files:
+        - from: inferencecache.exe
+          to: .
+        - from: LICENSE
+          to: .

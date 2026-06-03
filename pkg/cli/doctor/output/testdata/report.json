@@ -1,0 +1,45 @@
+{
+  "summary": {
+    "ok": 2,
+    "info": 1,
+    "warn": 1,
+    "fail": 1,
+    "exitCode": 2
+  },
+  "findings": [
+    {
+      "code": "SV001",
+      "status": "FAIL",
+      "check": "ServerReachability",
+      "resource": "host:9090",
+      "message": "gRPC health check failed: connection refused"
+    },
+    {
+      "code": "CB002",
+      "status": "WARN",
+      "check": "CacheBackendHealth",
+      "resource": "cachebackend/ns1/bad",
+      "message": "status.matchedEnginePods is 0 (LikelySelectorMismatch)"
+    },
+    {
+      "code": "CP001",
+      "status": "INFO",
+      "check": "CachePolicyCoverage",
+      "resource": "namespace/ns1",
+      "message": "no CachePolicy — server defaults apply"
+    },
+    {
+      "code": "SV003",
+      "status": "OK",
+      "check": "ServerReachability",
+      "resource": "host:9090",
+      "message": "gRPC health check reports SERVING"
+    },
+    {
+      "code": "EP000",
+      "status": "OK",
+      "check": "Summary",
+      "message": "cluster-wide note with no resource"
+    }
+  ]
+}
