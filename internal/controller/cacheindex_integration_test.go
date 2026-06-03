@@ -64,7 +64,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			t.Fatalf("refresh: %v", err)
 		}
 
-		ci := getCacheIndex(t, k8s, DefaultCacheIndexName)
+		ci := getCacheIndex(ctx, t, k8s, DefaultCacheIndexName)
 		if ci.Status.ObservedServer != srv.URL+"/snapshot" {
 			t.Fatalf("observedServer = %q, want %q", ci.Status.ObservedServer, srv.URL+"/snapshot")
 		}
@@ -76,6 +76,17 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		}
 		if ci.Status.Prefixes.Summary.Hot != 0 {
 			t.Fatalf("prefixes.summary.hot = %d, want 0 until access-counting is wired", ci.Status.Prefixes.Summary.Hot)
+		}
+		raw := getCacheIndexUnstructured(ctx, t, k8s, DefaultCacheIndexName)
+		hot, found, err := unstructured.NestedInt64(raw.Object, "status", "prefixes", "summary", "hot")
+		if err != nil {
+			t.Fatalf("read persisted status.prefixes.summary.hot: %v", err)
+		}
+		if !found {
+			t.Fatal("persisted status.prefixes.summary.hot is missing, want explicit hot: 0")
+		}
+		if hot != 0 {
+			t.Fatalf("persisted status.prefixes.summary.hot = %d, want 0", hot)
 		}
 		if len(ci.Status.Replicas) != 1 {
 			t.Fatalf("replicas = %+v, want exactly one row", ci.Status.Replicas)
@@ -128,7 +139,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if err := poller.refresh(ctx); err != nil {
 			t.Fatalf("first refresh: %v", err)
 		}
-		ci := getCacheIndex(t, k8s, name)
+		ci := getCacheIndex(ctx, t, k8s, name)
 		if ci.Status.Prefixes.Summary.Total != 3 || len(ci.Status.Replicas) != 1 {
 			t.Fatalf("first status = %+v, want total 3 and one replica", ci.Status)
 		}
@@ -137,7 +148,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if err := poller.refresh(ctx); err != nil {
 			t.Fatalf("second refresh: %v", err)
 		}
-		ci = getCacheIndex(t, k8s, name)
+		ci = getCacheIndex(ctx, t, k8s, name)
 		if ci.ResourceVersion != rvAfterFirstWrite {
 			t.Fatalf("identical snapshot churned CacheIndex resourceVersion: %s -> %s", rvAfterFirstWrite, ci.ResourceVersion)
 		}
@@ -162,7 +173,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if err := poller.refresh(ctx); err != nil {
 			t.Fatalf("third refresh: %v", err)
 		}
-		ci = getCacheIndex(t, k8s, name)
+		ci = getCacheIndex(ctx, t, k8s, name)
 		if ci.ResourceVersion == rvAfterFirstWrite {
 			t.Fatal("changed snapshot did not write a new CacheIndex status revision")
 		}
@@ -222,7 +233,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if err := poller.refresh(ctx); err != nil {
 			t.Fatalf("refresh after create-status was ignored: %v", err)
 		}
-		ci := getCacheIndex(t, k8s, "cacheindex-status-only-it")
+		ci := getCacheIndex(ctx, t, k8s, "cacheindex-status-only-it")
 		if ci.Status.Prefixes.Summary.Total != 1 {
 			t.Fatalf("controller status update did not persist through status subresource; total = %d, want 1", ci.Status.Prefixes.Summary.Total)
 		}
@@ -241,6 +252,10 @@ func newSnapshotServer(t *testing.T, served *index.Snapshot, hooks *snapshotServ
 			http.NotFound(w, r)
 			return
 		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if hooks != nil && hooks.Lock != nil {
 			hooks.Lock.Lock()
 			defer hooks.Lock.Unlock()
@@ -255,11 +270,22 @@ func newSnapshotServer(t *testing.T, served *index.Snapshot, hooks *snapshotServ
 	}))
 }
 
-func getCacheIndex(t *testing.T, k8s client.Client, name string) *cachev1alpha1.CacheIndex {
+func getCacheIndex(ctx context.Context, t *testing.T, k8s client.Client, name string) *cachev1alpha1.CacheIndex {
 	t.Helper()
 	var ci cachev1alpha1.CacheIndex
-	if err := k8s.Get(context.Background(), types.NamespacedName{Name: name}, &ci); err != nil {
+	if err := k8s.Get(ctx, types.NamespacedName{Name: name}, &ci); err != nil {
 		t.Fatalf("get CacheIndex %s: %v", name, err)
 	}
 	return &ci
+}
+
+func getCacheIndexUnstructured(ctx context.Context, t *testing.T, k8s client.Client, name string) *unstructured.Unstructured {
+	t.Helper()
+	ci := &unstructured.Unstructured{}
+	ci.SetAPIVersion("inferencecache.io/v1alpha1")
+	ci.SetKind("CacheIndex")
+	if err := k8s.Get(ctx, types.NamespacedName{Name: name}, ci); err != nil {
+		t.Fatalf("get unstructured CacheIndex %s: %v", name, err)
+	}
+	return ci
 }
