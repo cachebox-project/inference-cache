@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -153,6 +154,65 @@ func TestReconcilePersistentStorageRemovedKeepsPVCAndWarns(t *testing.T) {
 		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == "cache-data" {
 			t.Fatalf("pod should no longer mount the retained PVC after storage removal; got %+v", v)
 		}
+	}
+}
+
+func TestReconcilePersistentStorageRefusesToAdoptUnownedPVC(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	// An operator-created PVC that merely shares the derived name <cb>-data,
+	// owned by nobody. Adopting it (adding our controller owner ref) would make
+	// it GC'd with the CacheBackend — irreversible data loss.
+	foreign := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-data", Namespace: "ns1"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb, foreign)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile must error rather than adopt an unowned PVC named cache-data")
+	}
+
+	// The foreign PVC must NOT have been adopted (no controller owner ref added).
+	pvc := getPVC(t, r, "cache-data", "ns1")
+	if owner := metav1.GetControllerOf(pvc); owner != nil {
+		t.Fatalf("unowned PVC was adopted (controller owner=%+v); must be left untouched to avoid GC/data-loss", owner)
+	}
+	// And no Deployment was provisioned (apply aborted on the PVC error).
+	if _, derr := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(derr) {
+		t.Fatalf("Deployment must not be provisioned when PVC apply fails; get err=%v", derr)
+	}
+}
+
+func TestReconcileExternalIgnoresStoragePVC(t *testing.T) {
+	// External backends are operator-managed: the controller provisions no
+	// workload and no PVC, so spec.storage.pvc is a no-op for them (handling
+	// External persistence is out of scope — the operator configures it on the
+	// pre-existing cache). Pin that no-op: no PVC is created, and status mirrors
+	// the endpoint as usual.
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "user-supplied.example:8080"
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("External backend must not provision a PVC for spec.storage.pvc; get err=%v", err)
+	}
+	if ep := getBackend(t, r, "cache", "ns1").Status.Endpoint; ep != "user-supplied.example:8080" {
+		t.Fatalf("status.endpoint = %q, want the mirrored External endpoint", ep)
 	}
 }
 

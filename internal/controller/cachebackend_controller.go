@@ -845,6 +845,18 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 					pvc.Spec.StorageClassName = scn
 				}
 			} else {
+				// Never adopt a PVC we do not own. CreateOrUpdate's Get matched an
+				// existing object named <cb>-data; if it is not controller-owned by
+				// THIS CacheBackend it may be an operator-created PVC that merely
+				// shares the derived name. Adding our controller owner reference
+				// here would make that PVC garbage-collected when the CacheBackend
+				// is deleted — irreversible data loss. Refuse by returning an error
+				// so CreateOrUpdate makes no write; the reconcile surfaces it and
+				// requeues until the operator renames the CacheBackend or removes
+				// the conflicting PVC.
+				if !metav1.IsControlledBy(pvc, backend) {
+					return fmt.Errorf("pvc %s/%s already exists and is not owned by this CacheBackend; refusing to adopt it (rename the CacheBackend or remove the conflicting PVC)", pvc.Namespace, pvc.Name)
+				}
 				// Update: size is expandable (if the StorageClass allows it);
 				// patch the request up only — never down (k8s rejects shrink).
 				have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]

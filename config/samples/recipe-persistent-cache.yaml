@@ -7,8 +7,8 @@
 # status.capacity. The PVC is reclaimed ONLY when this CacheBackend is deleted
 # (owner-reference GC) — removing spec.storage.pvc from the CR LEAVES the PVC
 # in place (adopt-and-keep), because destroying persistent storage in response
-# to a spec edit would be irreversible data loss. To reclaim the volume,
-# `kubectl delete cachebackend` it.
+# to a spec edit would be irreversible data loss. To reclaim the volume, run
+# `kubectl delete cachebackend cachebackend-persistent`.
 #
 # Two scope notes for this recipe:
 #
