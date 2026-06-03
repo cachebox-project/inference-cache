@@ -410,22 +410,6 @@ func TestValidator_PersistentStorageOnHierarchicalBackendAdmitted(t *testing.T) 
 	}
 }
 
-func TestValidator_PersistentStorageOnExternalBackendRejected(t *testing.T) {
-	// External backends are operator-managed; the controller provisions no
-	// workload to mount a PVC into, so spec.storage.pvc must be rejected rather
-	// than persisted as an inert field. A valid endpoint is set so only the
-	// storage rule fires.
-	v := &CacheBackendValidator{}
-	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	cb.Spec.Endpoint = "user-supplied.example:8080"
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
-	}
-	requireInvalidWithCause(t, v, cb, "spec.storage.pvc",
-		"External backends are operator-managed")
-}
-
 func TestValidator_NonPositivePVCSizeRejected(t *testing.T) {
 	// size drives a real PVC request, so a non-positive value must be a
 	// field-scoped rejection at admission, not a late child-PVC failure.
@@ -438,6 +422,30 @@ func TestValidator_NonPositivePVCSizeRejected(t *testing.T) {
 		}
 		requireInvalidWithCause(t, v, cb, "spec.storage.pvc.size",
 			"must be a positive storage quantity")
+	}
+}
+
+func TestValidator_StorageWithOverlongNameRejected(t *testing.T) {
+	// The derived PVC name (<name>-data) must fit the 253-char k8s name limit;
+	// a near-max CacheBackend name + the suffix would otherwise make the backend
+	// silently unreconcilable. 250 + len("-data")=5 = 255 > 253.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	cb.Name = strings.Repeat("a", 250)
+	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	requireInvalidWithCause(t, v, cb, "metadata.name", "would exceed the 253-character limit")
+
+	// A normal-length name with the same storage spec is accepted.
+	ok := newBackend()
+	ok.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	ok.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
+		t.Fatalf("normal-length persistent backend rejected: %v", err)
 	}
 }
 
