@@ -650,6 +650,7 @@ if ! grep -Fq "pdtopology-sample" <<<"$pdt_row" || \
   fail "expected PDTopology printer row to include sample name and prefill/decode pool names"
 fi
 log "PromptTemplate/PDTopology are schema-only in default install; samples apply and printer columns render"
+kubectl delete namespace "$PROMPT_TOPOLOGY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --- gRPC fail-open assertion ----------------------------------------------
 log "port-forwarding svc/inference-cache-server :9090 -> localhost:$GRPC_LOCAL_PORT"
