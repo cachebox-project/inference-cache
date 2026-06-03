@@ -428,9 +428,14 @@ func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testi
 }
 
 func TestValidator_ReplicasZeroWithAutoscalingAndExplicitMinReplicasAdmitted(t *testing.T) {
-	// Operator who genuinely wants scale-to-zero-then-autoscale-up sets
-	// minReplicas explicitly. (CRD schema enforces Minimum=1 on minReplicas,
-	// so the smallest meaningful value here is 1.)
+	// Operator who pairs replicas=0 with autoscaling sets minReplicas
+	// explicitly to declare the intended HPA floor. With minReplicas=1 the
+	// HPA scales the workload back up to 1 immediately (minReplicas=1 means
+	// "never below one"); the test pins that the admission rule fires only
+	// on the nil-minReplicas trap, not on the explicit-floor case. (CRD
+	// schema enforces Minimum=1 on minReplicas, so the smallest legal
+	// explicit value here is 1; true scale-to-zero requires removing the
+	// autoscaling block entirely, which the next test covers.)
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(0)
