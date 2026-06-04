@@ -213,21 +213,45 @@ func PolicyReachability(ctx context.Context, doer HTTPDoer, url string) []doctor
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
 		return []doctor.Finding{{
 			Code:     doctor.CodePolicyRouteMissing,
 			Status:   doctor.StatusFail,
 			Check:    checkPolicyReachability,
 			Resource: url,
-			Message:  "HEAD /policy returned HTTP 404 — the /policy route is not mounted on the server (a wired route answers 200/401/405, never 404)",
+			Message:  "HEAD /policy returned HTTP 404 — the /policy route is not mounted on the server (a wired route answers 200/401/403/405, never 404)",
+		}}
+	case policyStatusWired(resp.StatusCode):
+		return []doctor.Finding{{
+			Code:     doctor.CodePolicyRouteWired,
+			Status:   doctor.StatusOK,
+			Check:    checkPolicyReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("/policy route is wired (HTTP %d to a non-mutating HEAD)", resp.StatusCode),
+		}}
+	default:
+		return []doctor.Finding{{
+			Code:     doctor.CodePolicyRouteUnexpected,
+			Status:   doctor.StatusWarn,
+			Check:    checkPolicyReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("/policy is mounted but answered HTTP %d (expected 2xx/401/403/405) — the server or its middleware may be erroring", resp.StatusCode),
 		}}
 	}
+}
 
-	return []doctor.Finding{{
-		Code:     doctor.CodePolicyRouteWired,
-		Status:   doctor.StatusOK,
-		Check:    checkPolicyReachability,
-		Resource: url,
-		Message:  fmt.Sprintf("/policy route is wired (HTTP %d to a non-mutating HEAD)", resp.StatusCode),
-	}}
+// policyStatusWired reports whether a /policy HEAD status proves a healthy,
+// mounted route: any 2xx, or the auth/method-mismatch codes a wired handler
+// legitimately returns.
+func policyStatusWired(code int) bool {
+	if code >= 200 && code < 300 {
+		return true
+	}
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed:
+		return true
+	default:
+		return false
+	}
 }

@@ -55,15 +55,16 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `SN004` | OK | `/snapshot` 200 with JSON body |
 | `SN005` | WARN | `/snapshot` reachable but auth-gated (401/403); supply a controller-audience token |
 | `PL001` | FAIL | `/policy` route not wired (connection refused, or HTTP 404 = route not mounted) |
-| `PL002` | OK | `/policy` route is wired (200 / 401 / 405) |
+| `PL002` | OK | `/policy` route is wired (2xx / 401 / 403 / 405) |
+| `PL003` | WARN | `/policy` mounted but answered an unexpected status (e.g. 5xx) |
 | `CB001` | WARN | CacheBackend `Ready` is not `True` |
 | `CB002` | WARN | managed backend with a selector matches 0 engine pods (LikelySelectorMismatch) |
 | `CB003` | WARN | no KV event ever observed for the backend (EngineNotReportingState) |
 | `CB004` | WARN | last KV event is stale (EngineStale) |
 | `CB005` | WARN | `status.endpoint` empty or unreachable |
 | `CB006` | OK | CacheBackend healthy on every applicable axis |
-| `EP001` | WARN | matched engine pod missing the injection Event |
-| `EP002` | OK | matched engine pod is injected |
+| `EP001` | WARN | matched engine pod missing an injection marker (no `inferencecache.io/injected-by` annotation and no Event) |
+| `EP002` | OK | matched engine pod is injected (annotation or Event) |
 | `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend; forward-looking — see note below) |
 | `CT001` | WARN | CacheTenant over quota (`QuotaExceeded=True`) |
 | `CT002` | OK | CacheTenant within quota |
@@ -152,9 +153,10 @@ Table — one row per finding (`STATUS  CODE  CHECK  RESOURCE  MESSAGE`).
 
 ## Running in-cluster vs. from a workstation
 
-The declarative Kubernetes-config checks (5–8) work from anywhere your
-kubeconfig can reach the apiserver. The live endpoint probes (1–3) and check 4's
-`status.endpoint` TCP dial need network reachability to the cache-plane server's
+The declarative Kubernetes-config checks (4–8, minus check 4's TCP dial) work
+from anywhere your kubeconfig can reach the apiserver. The live endpoint probes
+(1–3) and check 4's `status.endpoint` TCP dial need network reachability to the
+cache-plane server's
 gRPC `:9090` / snapshot-policy `:8081` ports and to each backend's endpoint —
 which from a workstation are usually in-cluster Service DNS / ClusterIPs that do
 not resolve. `--config-only` skips the endpoint probes (1–3) and check 4's TCP

@@ -111,9 +111,13 @@ const (
 	// CodePolicyRouteMissing: the /policy route is not wired (connection
 	// refused / dial failure).
 	CodePolicyRouteMissing = "PL001"
-	// CodePolicyRouteWired: the /policy route answered (any HTTP status,
-	// including 401/405, proves the route exists).
+	// CodePolicyRouteWired: the /policy route answered with an expected status
+	// (2xx / 401 / 403 / 405), proving the route exists.
 	CodePolicyRouteWired = "PL002"
+	// CodePolicyRouteUnexpected: the /policy route answered, but with an
+	// unexpected status (e.g. 5xx) — the route is mounted but the server or its
+	// middleware is erroring. Worth a look, but not a missing route.
+	CodePolicyRouteUnexpected = "PL003"
 
 	// CodeBackendNotReady: the CacheBackend's Ready condition is not True.
 	CodeBackendNotReady = "CB001"

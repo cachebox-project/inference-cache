@@ -299,6 +299,29 @@ func TestPolicyReachability(t *testing.T) {
 		}
 	})
 
+	t.Run("5xx is mounted-but-erroring (PL003 WARN)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		fs := PolicyReachability(ctx, srv.Client(), srv.URL+"/policy")
+		f := hasCode(fs, doctor.CodePolicyRouteUnexpected)
+		if f == nil || f.Status != doctor.StatusWarn {
+			t.Fatalf("want PL003 WARN on 500, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("401 from auth is still wired (PL002 OK)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		fs := PolicyReachability(ctx, srv.Client(), srv.URL+"/policy")
+		if hasCode(fs, doctor.CodePolicyRouteWired) == nil {
+			t.Fatalf("want PL002 OK on 401, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("transport error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		url := srv.URL + "/policy"
