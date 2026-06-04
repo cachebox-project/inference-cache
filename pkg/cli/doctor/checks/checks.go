@@ -31,7 +31,7 @@ import (
 )
 
 // DefaultStaleWindow is how long a CacheBackend may go without a fresh KV event
-// before doctor flags it as stale (matches the ticket's "within last 2m").
+// before doctor flags it as stale ("within last 2m" per the doctor spec).
 const DefaultStaleWindow = 2 * time.Minute
 
 // DefaultOrphanWindow bounds how far back doctor looks for NoMatchingCacheBackend

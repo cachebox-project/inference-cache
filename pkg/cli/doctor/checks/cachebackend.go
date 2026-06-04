@@ -17,15 +17,33 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 
 // CacheBackendHealth inspects each CacheBackend in scope across the dimensions
 // the controller surfaces on status: Ready, matched engine pods, index
-// participation (prefix count + event freshness), and endpoint reachability.
-// Every failing axis emits its own finding so the operator sees exactly what is
-// wrong; a backend that passes every axis emits a single OK.
+// participation (KV-event freshness), and endpoint reachability. Every failing
+// axis emits its own finding so the operator sees exactly what is wrong; a
+// backend that passes every applicable axis emits a single OK.
+//
+// Two health models coexist:
+//   - Managed backends (the default): the controller provisions the cache
+//     workload, matches engine pods by spec.engineSelector, and gates Ready on
+//     observing a KV event. All axes apply.
+//   - External backends (spec.type=External): the operator supplies the cache
+//     endpoint; readiness is endpoint acceptance, NOT engine-pod matching or
+//     KV-event observation (they never enter that gate — see PROJECT_CONTEXT).
+//     For these, doctor checks only Ready + endpoint reachability, so a valid
+//     External config is not spuriously flagged for "0 matched pods" or "no
+//     index participation".
 //
 // The matched-engine-pod axis prefers the controller-written
 // status.matchedEnginePods (its authoritative snapshot) but falls back to a
 // live label match when status is absent — so doctor flags a selector mismatch
 // even before the controller has reconciled, which is exactly the freshly-
-// misconfigured state operators run doctor in.
+// misconfigured state operators run doctor in. It fires only when the backend
+// actually declares an engineSelector: a selectorless backend has nothing to
+// mismatch.
+//
+// The index-participation axis keys off lastEventAt, not the prefix count: zero
+// warm prefixes is a VALID state for an up-but-idle backend (PROJECT_CONTEXT),
+// so doctor flags "engine not reporting" only when no KV event has ever been
+// observed, and "engine stale" when events were seen but have stopped.
 func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now time.Time, staleWindow time.Duration, dial TCPDialer) []doctor.Finding {
 	var backends cachev1alpha1.CacheBackendList
 	if err := c.List(ctx, &backends, client.InNamespace(ns)); err != nil {
@@ -37,85 +55,98 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		cb := &backends.Items[i]
 		ref := resourceRef("CacheBackend", cb.Namespace, cb.Name)
 		healthy := true
-
-		// Ready condition.
-		if ready := findCondition(cb.Status.Conditions, conditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
-			healthy = false
-			findings = append(findings, doctor.Finding{
-				Code:     doctor.CodeBackendNotReady,
-				Status:   doctor.StatusWarn,
-				Check:    checkCacheBackendHealth,
-				Resource: ref,
-				Message:  notReadyMessage(ready),
-			})
-		}
-
-		// Matched engine pods.
-		matched := matchedEnginePodCount(ctx, c, cb)
-		if matched == 0 {
-			healthy = false
-			findings = append(findings, doctor.Finding{
-				Code:     doctor.CodeBackendSelectorMismatch,
-				Status:   doctor.StatusWarn,
-				Check:    checkCacheBackendHealth,
-				Resource: ref,
-				Message:  "status.matchedEnginePods is 0 (LikelySelectorMismatch): spec.engineSelector matches no engine pods — the engine Deployment may be missing, scaled to zero, or its pod labels have drifted from the selector",
-			})
-		}
-
-		// Index participation: prefix count + event freshness.
-		ip := cb.Status.IndexParticipation
-		if ip == nil || ip.PrefixCount == 0 {
-			healthy = false
-			findings = append(findings, doctor.Finding{
-				Code:     doctor.CodeBackendNotReportingState,
-				Status:   doctor.StatusWarn,
-				Check:    checkCacheBackendHealth,
-				Resource: ref,
-				Message:  "status.indexParticipation.prefixCount is 0 (EngineNotReportingState): no warm prefixes attributed to this backend — the engine's KV-event publisher may be silent or the subscriber sidecar absent",
-			})
-		} else if ip.LastEventAt == nil || now.Sub(ip.LastEventAt.Time) > staleWindow {
-			healthy = false
-			findings = append(findings, doctor.Finding{
-				Code:     doctor.CodeBackendStale,
-				Status:   doctor.StatusWarn,
-				Check:    checkCacheBackendHealth,
-				Resource: ref,
-				Message:  staleMessage(ip.LastEventAt, now, staleWindow),
-			})
-		}
-
-		// Endpoint presence + reachability.
-		if f, ok := endpointFinding(ctx, cb, ref, dial); ok {
+		note := func(f doctor.Finding) {
 			healthy = false
 			findings = append(findings, f)
 		}
 
+		// Ready condition (all backends).
+		if ready := findCondition(cb.Status.Conditions, conditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
+			note(doctor.Finding{
+				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
+				Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
+			})
+		}
+
+		managed := cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal
+		if managed {
+			// Matched engine pods — only meaningful when a selector is declared.
+			if hasEngineSelector(cb) {
+				count, err := matchedEnginePodCount(ctx, c, cb)
+				switch {
+				case err != nil:
+					note(doctor.Finding{
+						Code: doctor.CodeAPIReadFailed, Status: doctor.StatusFail,
+						Check: checkCacheBackendHealth, Resource: ref,
+						Message: fmt.Sprintf("could not determine matched engine pods (selector-mismatch check inconclusive): %v", err),
+					})
+				case count == 0:
+					note(doctor.Finding{
+						Code: doctor.CodeBackendSelectorMismatch, Status: doctor.StatusWarn,
+						Check: checkCacheBackendHealth, Resource: ref,
+						Message: "status.matchedEnginePods is 0 (LikelySelectorMismatch): spec.engineSelector matches no engine pods — the engine Deployment may be missing, scaled to zero, or its pod labels have drifted from the selector",
+					})
+				}
+			}
+
+			// Index participation: keyed off KV-event freshness, not prefix count.
+			if f, ok := participationFinding(cb.Status.IndexParticipation, ref, now, staleWindow); ok {
+				note(f)
+			}
+		}
+
+		// Endpoint presence + reachability (all backends).
+		if f, ok := endpointFinding(ctx, cb, ref, dial); ok {
+			note(f)
+		}
+
 		if healthy {
 			findings = append(findings, doctor.Finding{
-				Code:     doctor.CodeBackendHealthy,
-				Status:   doctor.StatusOK,
-				Check:    checkCacheBackendHealth,
-				Resource: ref,
-				Message:  fmt.Sprintf("Ready, %d matched engine pod(s), %d prefix(es) indexed, endpoint reachable", matched, prefixCount(ip)),
+				Code: doctor.CodeBackendHealthy, Status: doctor.StatusOK,
+				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, managed),
 			})
 		}
 	}
 	return findings
 }
 
+func hasEngineSelector(cb *cachev1alpha1.CacheBackend) bool {
+	return cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
+}
+
+// participationFinding evaluates the index-participation axis. It returns a
+// finding (and ok=true) only when the backend is genuinely not reporting state
+// (no KV event ever observed) or has gone stale (events seen but older than the
+// window). A backend with a fresh event but zero warm prefixes is healthy.
+func participationFinding(ip *cachev1alpha1.CacheBackendIndexParticipation, ref string, now time.Time, staleWindow time.Duration) (doctor.Finding, bool) {
+	if ip == nil || ip.LastEventAt == nil {
+		return doctor.Finding{
+			Code: doctor.CodeBackendNotReportingState, Status: doctor.StatusWarn,
+			Check: checkCacheBackendHealth, Resource: ref,
+			Message: "no KV event observed for this backend (EngineNotReportingState): status.indexParticipation is unpopulated or lastEventAt is unset — the engine's KV-event publisher may be silent or the subscriber sidecar absent",
+		}, true
+	}
+	if now.Sub(ip.LastEventAt.Time) > staleWindow {
+		return doctor.Finding{
+			Code: doctor.CodeBackendStale, Status: doctor.StatusWarn,
+			Check: checkCacheBackendHealth, Resource: ref,
+			Message: staleMessage(ip.LastEventAt, now, staleWindow),
+		}, true
+	}
+	return doctor.Finding{}, false
+}
+
 // matchedEnginePodCount returns the controller-written status.matchedEnginePods
 // when present, else a live label-match count against the backend's namespace.
-func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alpha1.CacheBackend) int {
+// A pod-list failure is returned as an error (not silently coerced to 0) so the
+// caller can report it as inconclusive rather than as a selector mismatch.
+func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alpha1.CacheBackend) (int, error) {
 	if cb.Status.MatchedEnginePods != nil {
-		return int(*cb.Status.MatchedEnginePods)
-	}
-	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
-		return 0
+		return int(*cb.Status.MatchedEnginePods), nil
 	}
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods, client.InNamespace(cb.Namespace)); err != nil {
-		return 0
+		return 0, err
 	}
 	count := 0
 	for i := range pods.Items {
@@ -123,7 +154,7 @@ func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alph
 			count++
 		}
 	}
-	return count
+	return count, nil
 }
 
 // endpointFinding reports an endpoint problem (missing, or present-but-
@@ -132,11 +163,9 @@ func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alph
 func endpointFinding(ctx context.Context, cb *cachev1alpha1.CacheBackend, ref string, dial TCPDialer) (doctor.Finding, bool) {
 	if cb.Status.Endpoint == "" {
 		return doctor.Finding{
-			Code:     doctor.CodeBackendEndpointUnreachable,
-			Status:   doctor.StatusWarn,
-			Check:    checkCacheBackendHealth,
-			Resource: ref,
-			Message:  "status.endpoint is empty — clients have no address to reach this backend yet",
+			Code: doctor.CodeBackendEndpointUnreachable, Status: doctor.StatusWarn,
+			Check: checkCacheBackendHealth, Resource: ref,
+			Message: "status.endpoint is empty — clients have no address to reach this backend yet",
 		}, true
 	}
 	if dial == nil {
@@ -144,11 +173,9 @@ func endpointFinding(ctx context.Context, cb *cachev1alpha1.CacheBackend, ref st
 	}
 	if err := dial(ctx, cb.Status.Endpoint); err != nil {
 		return doctor.Finding{
-			Code:     doctor.CodeBackendEndpointUnreachable,
-			Status:   doctor.StatusWarn,
-			Check:    checkCacheBackendHealth,
-			Resource: ref,
-			Message:  fmt.Sprintf("status.endpoint %q is not reachable over TCP: %v", cb.Status.Endpoint, err),
+			Code: doctor.CodeBackendEndpointUnreachable, Status: doctor.StatusWarn,
+			Check: checkCacheBackendHealth, Resource: ref,
+			Message: fmt.Sprintf("status.endpoint %q is not reachable over TCP: %v", cb.Status.Endpoint, err),
 		}, true
 	}
 	return doctor.Finding{}, false
@@ -162,11 +189,15 @@ func notReadyMessage(ready *metav1.Condition) string {
 }
 
 func staleMessage(lastEventAt *metav1.Time, now time.Time, staleWindow time.Duration) string {
-	if lastEventAt == nil {
-		return fmt.Sprintf("status.indexParticipation.lastEventAt is unset (EngineStale): no KV event observed within the last %s", staleWindow)
-	}
 	age := now.Sub(lastEventAt.Time).Round(time.Second)
 	return fmt.Sprintf("status.indexParticipation.lastEventAt is %s old (EngineStale): exceeds the %s freshness window — KV events have stopped flowing", age, staleWindow)
+}
+
+func healthyMessage(cb *cachev1alpha1.CacheBackend, managed bool) string {
+	if !managed {
+		return "External backend: Ready, endpoint reachable"
+	}
+	return fmt.Sprintf("Ready, engine pods matched, %d prefix(es) indexed, endpoint reachable", prefixCount(cb.Status.IndexParticipation))
 }
 
 func prefixCount(ip *cachev1alpha1.CacheBackendIndexParticipation) int64 {

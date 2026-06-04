@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -114,7 +115,7 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 	}
 
 	if !opts.configOnly {
-		grpcTarget, snapshotURL, policyURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint, opts.namespace)
+		grpcTarget, snapshotURL, policyURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
 		if err != nil {
 			// Don't abort: the cluster-configuration checks still provide value,
 			// and leaving the endpoint deps nil makes checks 1-3 emit structured
@@ -177,18 +178,23 @@ func restConfig(kubeconfig, kubeContext string) (*rest.Config, error) {
 // inference-cache-server Service. The discovered host is the in-cluster Service
 // DNS name (resolvable when doctor runs in-cluster); from a workstation, pass
 // --server-endpoint pointing at a kubectl port-forward.
-func resolveEndpoints(ctx context.Context, c client.Client, override, namespace string) (grpcTarget, snapshotURL, policyURL string, err error) {
+//
+// Discovery is independent of the --namespace flag: --namespace scopes which
+// CacheBackends/Tenants/Policies doctor inspects, not where the server lives.
+// The server is found in the default system namespace, or by a cluster-wide
+// search, so `doctor -n app-ns` still probes the real server rather than
+// inference-cache-server.app-ns.svc.
+func resolveEndpoints(ctx context.Context, c client.Client, override string) (grpcTarget, snapshotURL, policyURL string, err error) {
 	var host string
 	grpcPort := defaultGRPCPort
-	switch {
-	case override != "":
+	if override != "" {
 		if h, p, splitErr := net.SplitHostPort(override); splitErr == nil {
 			host, grpcPort = h, p
 		} else {
 			host = override
 		}
-	default:
-		ns, findErr := findServerServiceNamespace(ctx, c, namespace)
+	} else {
+		ns, findErr := findServerServiceNamespace(ctx, c)
 		if findErr != nil {
 			return "", "", "", findErr
 		}
@@ -200,12 +206,9 @@ func resolveEndpoints(ctx context.Context, c client.Client, override, namespace 
 }
 
 // findServerServiceNamespace locates the namespace hosting the
-// inference-cache-server Service: the requested namespace if set, else the
-// default system namespace if the Service is there, else a cluster-wide search.
-func findServerServiceNamespace(ctx context.Context, c client.Client, namespace string) (string, error) {
-	if namespace != "" {
-		return namespace, nil
-	}
+// inference-cache-server Service: the default system namespace if the Service is
+// there, else a cluster-wide search.
+func findServerServiceNamespace(ctx context.Context, c client.Client) (string, error) {
 	var svc corev1.Service
 	if err := c.Get(ctx, client.ObjectKey{Namespace: defaultSystemNamespace, Name: defaultServerService}, &svc); err == nil {
 		return defaultSystemNamespace, nil
@@ -222,17 +225,24 @@ func findServerServiceNamespace(ctx context.Context, c client.Client, namespace 
 	return "", fmt.Errorf("could not find a %q Service in any namespace; pass --server-endpoint", defaultServerService)
 }
 
-// readToken returns the bearer token at path, or "" if it cannot be read (which
-// drives doctor's unauthenticated /snapshot probe).
+// readToken returns the trimmed bearer token at path. A missing file is the
+// expected workstation case and silently yields "" (doctor then probes the
+// unauthenticated path). A file that EXISTS but cannot be read (e.g. a
+// permission error) is surfaced as a warning rather than masquerading as an
+// unauthenticated probe, and the token is whitespace-trimmed so a trailing
+// newline in a hand-created file never corrupts the Authorization header.
 func readToken(path string) string {
 	if path == "" {
 		return ""
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: could not read --snapshot-token-file %q: %v; probing /snapshot unauthenticated\n", path, err)
+		}
 		return ""
 	}
-	return string(b)
+	return strings.TrimSpace(string(b))
 }
 
 // dialTCP reports whether a TCP connection to addr succeeds. addr may carry an
@@ -249,8 +259,8 @@ func dialTCP(ctx context.Context, addr string) error {
 
 func stripScheme(addr string) string {
 	for _, scheme := range []string{"lm://", "http://", "https://"} {
-		if len(addr) >= len(scheme) && addr[:len(scheme)] == scheme {
-			return addr[len(scheme):]
+		if strings.HasPrefix(addr, scheme) {
+			return strings.TrimPrefix(addr, scheme)
 		}
 	}
 	return addr

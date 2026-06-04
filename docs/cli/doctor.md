@@ -53,21 +53,36 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `SN002` | WARN | `/snapshot` 200 but body is not JSON |
 | `SN003` | INFO | `/snapshot` answered without authentication |
 | `SN004` | OK | `/snapshot` 200 with JSON body |
-| `PL001` | FAIL | `/policy` route not wired |
-| `PL002` | OK | `/policy` route is wired |
+| `PL001` | FAIL | `/policy` route not wired (connection refused, or HTTP 404 = route not mounted) |
+| `PL002` | OK | `/policy` route is wired (200 / 401 / 405) |
 | `CB001` | WARN | CacheBackend `Ready` is not `True` |
-| `CB002` | WARN | `matchedEnginePods == 0` (LikelySelectorMismatch) |
-| `CB003` | WARN | `indexParticipation.prefixCount == 0` (EngineNotReportingState) |
+| `CB002` | WARN | managed backend with a selector matches 0 engine pods (LikelySelectorMismatch) |
+| `CB003` | WARN | no KV event ever observed for the backend (EngineNotReportingState) |
 | `CB004` | WARN | last KV event is stale (EngineStale) |
 | `CB005` | WARN | `status.endpoint` empty or unreachable |
-| `CB006` | OK | CacheBackend healthy on every axis |
+| `CB006` | OK | CacheBackend healthy on every applicable axis |
 | `EP001` | WARN | matched engine pod missing the injection Event |
 | `EP002` | OK | matched engine pod is injected |
-| `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend) |
+| `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend; forward-looking — see note below) |
 | `CT001` | WARN | CacheTenant over quota (`QuotaExceeded=True`) |
 | `CT002` | OK | CacheTenant within quota |
 | `CP001` | INFO | namespace with CacheBackends has no CachePolicy (server defaults apply) |
 | `CP002` | OK | namespace has CachePolicy coverage |
+
+Notes:
+
+- **`CB003` keys off KV-event observation, not prefix count.** Zero warm prefixes
+  is a valid state for an up-but-idle backend, so doctor flags "engine not
+  reporting" only when *no* KV event has ever been observed (`lastEventAt`
+  unset), and `CB004` when events were seen but have since gone stale — an idle
+  backend with a fresh event is healthy (`CB006`).
+- **External backends** (`spec.type=External`) are checked for `Ready` and
+  endpoint reachability only. Engine-pod matching (`CB002`) and index
+  participation (`CB003`/`CB004`) are managed-backend concerns and are skipped,
+  so a valid External config is not spuriously flagged.
+- **`OP001` is forward-looking.** No controller emits the `NoMatchingCacheBackend`
+  Event yet, so this check is a no-op against today's clusters; it begins
+  reporting automatically once the engine-pod binding work adds the emitter.
 
 ## Exit codes
 
@@ -91,9 +106,7 @@ inferencecache doctor
 
 WARN
   WARN CB002  cachebackend/default/mismatched
-      status.matchedEnginePods is 0 (LikelySelectorMismatch): spec.engineSelector
-      matches no engine pods — the engine Deployment may be missing, scaled to
-      zero, or its pod labels have drifted from the selector
+      status.matchedEnginePods is 0 (LikelySelectorMismatch): spec.engineSelector matches no engine pods
 
 OK
   OK   SV003  10.96.0.10:9090
@@ -171,9 +184,10 @@ kubectl apply -f config/samples/cache_v1alpha1_cachebackend.yaml
 # Validate configuration without the live server (works pre-port-forward):
 ./bin/inferencecache doctor --config-only
 
-# Full run against the live server:
+# Full run against the live server (Service DNS does not resolve from a
+# workstation, so point doctor at the port-forward):
 kubectl -n inference-cache-system port-forward svc/inference-cache-server 9090:9090 8081:8081 &
-./bin/inferencecache doctor
+./bin/inferencecache doctor --server-endpoint localhost
 ```
 
 Expected: a freshly-applied CacheBackend whose engine Deployment has not rolled

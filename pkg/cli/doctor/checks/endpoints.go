@@ -159,9 +159,12 @@ func SnapshotReachability(ctx context.Context, doer HTTPDoer, url, token string)
 }
 
 // PolicyReachability confirms the /policy route exists without mutating it. It
-// issues a non-mutating HTTP HEAD: any HTTP response — including 401, 404, or
-// 405 from a method/auth mismatch — proves the route is wired, so only a
-// transport-level failure (connection refused, DNS, timeout) is a FAIL.
+// issues a non-mutating HTTP HEAD. A mounted route answers with its own status
+// (200, 401 from auth, or 405 from the GET/POST/PUT-only handler rejecting
+// HEAD) — all of which prove the route is wired. A 404, by contrast, is what the
+// server's ServeMux returns when /policy is NOT registered at all, so it is a
+// FAIL: the route doctor claims to verify is absent. A transport-level failure
+// (connection refused, DNS, timeout) is likewise a FAIL.
 func PolicyReachability(ctx context.Context, doer HTTPDoer, url string) []doctor.Finding {
 	if doer == nil || url == "" {
 		return []doctor.Finding{{
@@ -195,6 +198,16 @@ func PolicyReachability(ctx context.Context, doer HTTPDoer, url string) []doctor
 		}}
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []doctor.Finding{{
+			Code:     doctor.CodePolicyRouteMissing,
+			Status:   doctor.StatusFail,
+			Check:    checkPolicyReachability,
+			Resource: url,
+			Message:  "HEAD /policy returned HTTP 404 — the /policy route is not mounted on the server (a wired route answers 200/401/405, never 404)",
+		}}
+	}
 
 	return []doctor.Finding{{
 		Code:     doctor.CodePolicyRouteWired,

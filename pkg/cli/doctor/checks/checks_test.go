@@ -271,6 +271,17 @@ func TestPolicyReachability(t *testing.T) {
 		}
 	})
 
+	t.Run("404 means route not mounted (PL001 FAIL)", func(t *testing.T) {
+		// A bare ServeMux with nothing registered at /policy returns 404.
+		srv := httptest.NewServer(http.NewServeMux())
+		defer srv.Close()
+		fs := PolicyReachability(ctx, srv.Client(), srv.URL+"/policy")
+		f := hasCode(fs, doctor.CodePolicyRouteMissing)
+		if f == nil || f.Status != doctor.StatusFail {
+			t.Fatalf("want PL001 FAIL on 404, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("transport error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		url := srv.URL + "/policy"
@@ -391,18 +402,33 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("prefix present but lastEventAt nil is stale", func(t *testing.T) {
+	t.Run("prefix present but lastEventAt nil is not-reporting", func(t *testing.T) {
+		// Zero warm prefixes is a VALID state; the not-reporting signal is the
+		// absence of any KV event (lastEventAt nil), reported as CB003 — never a
+		// CB003 driven by prefixCount==0 alone.
 		cb := healthyBackend(now)
 		cb.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 3, LastEventAt: nil}
 		c := fakeClient(t, cb)
 		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
-		f := hasCode(fs, doctor.CodeBackendStale)
-		if f == nil || !strings.Contains(f.Message, "unset") {
-			t.Fatalf("want CB004 for nil lastEventAt, got %v", codesOf(fs))
+		if hasCode(fs, doctor.CodeBackendNotReportingState) == nil {
+			t.Fatalf("want CB003 for nil lastEventAt, got %v", codesOf(fs))
+		}
+		if hasCode(fs, doctor.CodeBackendStale) != nil {
+			t.Fatalf("should not be CB004 when lastEventAt is nil, got %v", codesOf(fs))
 		}
 	})
 
-	t.Run("matched count falls back through pod list error", func(t *testing.T) {
+	t.Run("zero prefixes with a fresh event is healthy", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 0, LastEventAt: &metav1.Time{Time: now.Add(-5 * time.Second)}}
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("prefixCount==0 with a fresh event must be CB006 (idle is healthy), got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("pod-list error is inconclusive (API001), not a selector mismatch", func(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns1"},
 			Spec:       cachev1alpha1.CacheBackendSpec{EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}}},
@@ -412,8 +438,41 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 			return ok
 		}, err: errors.New("pods down")}
 		fs := CacheBackendHealth(ctx, c, "ns1", now, DefaultStaleWindow, okDial)
-		if hasCode(fs, doctor.CodeBackendSelectorMismatch) == nil {
-			t.Fatalf("pod-list error should yield 0 matches => CB002, got %v", codesOf(fs))
+		if hasCode(fs, doctor.CodeAPIReadFailed) == nil {
+			t.Fatalf("pod-list error should be API001 (inconclusive), got %v", codesOf(fs))
+		}
+		if hasCode(fs, doctor.CodeBackendSelectorMismatch) != nil {
+			t.Fatalf("pod-list error must NOT be reported as CB002, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("External backend skips pod-match and index-participation axes", func(t *testing.T) {
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1"},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type:     cachev1alpha1.CacheBackendTypeExternal,
+				Endpoint: "cache.example.com:8200",
+			},
+			Status: cachev1alpha1.CacheBackendStatus{
+				Endpoint:   "cache.example.com:8200",
+				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+			},
+		}
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("External backend should be CB006 (no CB002/CB003 false positives), got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("selectorless managed backend skips the matched-pods axis", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Spec.EngineSelector = nil
+		cb.Status.MatchedEnginePods = nil
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if hasCode(fs, doctor.CodeBackendSelectorMismatch) != nil {
+			t.Fatalf("a backend with no engineSelector has nothing to mismatch, got %v", codesOf(fs))
 		}
 	})
 }

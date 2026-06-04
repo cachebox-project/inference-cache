@@ -3,6 +3,7 @@ package output
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/cachebox-project/inference-cache/pkg/cli/doctor"
@@ -23,9 +24,16 @@ func renderTable(w io.Writer, r *doctor.Report) error {
 			resource = "-"
 		}
 		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			f.Status.String(), f.Code, f.Check, resource, f.Message); err != nil {
+			f.Status.String(), f.Code, f.Check, resource, oneLine(f.Message)); err != nil {
 			return err
 		}
 	}
 	return tw.Flush()
+}
+
+// oneLine collapses any embedded tabs/newlines (e.g. from a wrapped API error
+// message) to single spaces so each finding stays on exactly one row and the
+// tab-delimited columns can't be split by message content.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
