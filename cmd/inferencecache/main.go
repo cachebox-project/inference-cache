@@ -23,8 +23,8 @@ func main() {
 }
 
 // run wires up the root command and returns the process exit code. The doctor
-// subcommand sets a CI-gating exit code (0/1/2) via exitCoder; any other error
-// (bad flags, client construction) maps to 1.
+// subcommand writes its CI-gating exit code (0/1/2) through the shared code
+// pointer; any other error (bad flags, client construction) maps to 1.
 func run() int {
 	var code int
 	root := newRootCommand(&code)

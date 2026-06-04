@@ -31,10 +31,10 @@ CacheBackend / engine-pod data path, then tenant and policy configuration:
 |---|-------|------------------|
 | 1 | Server reachability | gRPC dial + `grpc.health.v1` `Health/Check` (service `""`) returns `SERVING` |
 | 2 | `/snapshot` reachability | HTTP GET returns 200 with a JSON-parseable body (bearer token if available; flags the unauthenticated path) |
-| 3 | `/policy` reachability | the route is wired (non-mutating HEAD; any HTTP response proves it exists) |
-| 4 | Per-CacheBackend health | `Ready=True`; matched engine pods > 0; index prefix count > 0; last KV event is fresh; `status.endpoint` populated and reachable |
-| 5 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries an `InjectedByCacheBackend` Event |
-| 6 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h |
+| 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 200/401/405 = wired, 404 = not mounted) |
+| 4 | Per-CacheBackend health | `Ready=True`; managed backends match engine pods and have observed a fresh KV event (zero warm prefixes is fine); `status.endpoint` populated and reachable |
+| 5 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
+| 6 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
 | 7 | CacheTenant health | `QuotaExceeded` condition is not `True` |
 | 8 | CachePolicy coverage | each namespace with CacheBackends has at least one CachePolicy |
 
@@ -53,6 +53,7 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `SN002` | WARN | `/snapshot` 200 but body is not JSON |
 | `SN003` | INFO | `/snapshot` answered without authentication |
 | `SN004` | OK | `/snapshot` 200 with JSON body |
+| `SN005` | WARN | `/snapshot` reachable but auth-gated (401/403); supply a controller-audience token |
 | `PL001` | FAIL | `/policy` route not wired (connection refused, or HTTP 404 = route not mounted) |
 | `PL002` | OK | `/policy` route is wired (200 / 401 / 405) |
 | `CB001` | WARN | CacheBackend `Ready` is not `True` |
@@ -151,9 +152,14 @@ Table — one row per finding (`STATUS  CODE  CHECK  RESOURCE  MESSAGE`).
 
 ## Running in-cluster vs. from a workstation
 
-The Kubernetes-config checks (4–8) work from anywhere your kubeconfig can reach
-the apiserver. The live endpoint probes (1–3) need to reach the cache-plane
-server's gRPC `:9090` and snapshot/policy `:8081` ports:
+The declarative Kubernetes-config checks (5–8) work from anywhere your
+kubeconfig can reach the apiserver. The live endpoint probes (1–3) and check 4's
+`status.endpoint` TCP dial need network reachability to the cache-plane server's
+gRPC `:9090` / snapshot-policy `:8081` ports and to each backend's endpoint —
+which from a workstation are usually in-cluster Service DNS / ClusterIPs that do
+not resolve. `--config-only` skips the endpoint probes (1–3) and check 4's TCP
+dial (it still validates `status.endpoint` is published), so it is the right
+mode from a workstation without a port-forward:
 
 - **In-cluster** (e.g. a debug pod): the server is discovered by Service DNS and
   reached directly.
@@ -167,6 +173,11 @@ server's gRPC `:9090` and snapshot/policy `:8081` ports:
 
   — or skip the endpoint probes entirely with `--config-only` to validate just
   the CacheBackend / CacheTenant / CachePolicy configuration.
+
+  On a default auth-gated install, `/snapshot` requires an audience-bound
+  controller token; without one doctor reports `SN005` (reachable but auth-gated)
+  rather than verifying the body. Provide one with
+  `--snapshot-token-file=<path>` if you need the full `/snapshot` check.
 
 > Note: the doctor dials the gRPC port in plaintext, matching the default
 > install. If the server is deployed with the TLS overlay, run doctor in-cluster

@@ -102,6 +102,11 @@ const (
 	CodeSnapshotUnauthenticated = "SN003"
 	// CodeSnapshotOK: /snapshot returned 200 with a JSON-parseable body.
 	CodeSnapshotOK = "SN004"
+	// CodeSnapshotAuthGated: /snapshot is reachable but rejected the request
+	// with 401/403 — auth is enforced and doctor lacked a valid (audience-bound)
+	// token. The endpoint is healthy; doctor just could not verify the body, so
+	// this degrades gracefully to a WARN rather than a connectivity FAIL.
+	CodeSnapshotAuthGated = "SN005"
 
 	// CodePolicyRouteMissing: the /policy route is not wired (connection
 	// refused / dial failure).
@@ -115,8 +120,10 @@ const (
 	// CodeBackendSelectorMismatch: status.matchedEnginePods is 0 — the engine
 	// selector most likely matches no pods (label drift / engine not deployed).
 	CodeBackendSelectorMismatch = "CB002"
-	// CodeBackendNotReportingState: status.indexParticipation.prefixCount is 0 —
-	// the engine is matched but reporting no warm prefixes.
+	// CodeBackendNotReportingState: no KV event has ever been observed for the
+	// backend (status.indexParticipation absent, or lastEventAt unset) — the
+	// engine's KV-event publisher is silent. Zero warm prefixes alone does NOT
+	// trigger this: an idle backend with a fresh event is healthy.
 	CodeBackendNotReportingState = "CB003"
 	// CodeBackendStale: status.indexParticipation.lastEventAt is older than the
 	// staleness window — KV events have stopped flowing.

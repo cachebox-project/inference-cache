@@ -63,6 +63,21 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 			continue
 		}
 		ref := resourceRef("Pod", pod.Namespace, pod.Name)
+
+		// Prefer the durable inferencecache.io/injected-by annotation (the
+		// authoritative wiring signal) over the InjectedByCacheBackend Event,
+		// which can be GC'd out from under a correctly-injected long-running pod.
+		if pod.Annotations[annotationInjectedBy] != "" {
+			findings = append(findings, doctor.Finding{
+				Code:     doctor.CodeEnginePodInjected,
+				Status:   doctor.StatusOK,
+				Check:    checkEnginePodInjection,
+				Resource: ref,
+				Message:  fmt.Sprintf("engine pod matched CacheBackend %q and carries the inferencecache.io/injected-by annotation", matchedBackend),
+			})
+			continue
+		}
+
 		events, err := listEventsFor(ctx, c, pod.Namespace, "Pod", pod.Name)
 		if err != nil {
 			findings = append(findings, listError(checkEnginePodInjection, "Event", err))

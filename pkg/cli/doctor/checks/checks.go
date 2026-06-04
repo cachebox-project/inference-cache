@@ -48,6 +48,12 @@ const (
 	conditionReady         = "Ready"
 	conditionQuotaExceeded = "QuotaExceeded"
 
+	// annotationInjectedBy is the durable, authoritative wiring signal the pod
+	// webhook stamps on an injected engine pod (its value is the owning
+	// CacheBackend's namespace/name). It outlives the InjectedByCacheBackend
+	// Event, which can be GC'd, so the injection audit prefers it.
+	annotationInjectedBy = "inferencecache.io/injected-by"
+
 	eventInjectedByCacheBackend = "InjectedByCacheBackend"
 	// eventNoMatchingCacheBackend is the orphan-pod signal the OrphanPods check
 	// (OP001) reads. NOTE: no controller emits this Event today — only the

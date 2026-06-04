@@ -103,7 +103,7 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		if healthy {
 			findings = append(findings, doctor.Finding{
 				Code: doctor.CodeBackendHealthy, Status: doctor.StatusOK,
-				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, managed),
+				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, managed, dial != nil),
 			})
 		}
 	}
@@ -193,11 +193,18 @@ func staleMessage(lastEventAt *metav1.Time, now time.Time, staleWindow time.Dura
 	return fmt.Sprintf("status.indexParticipation.lastEventAt is %s old (EngineStale): exceeds the %s freshness window — KV events have stopped flowing", age, staleWindow)
 }
 
-func healthyMessage(cb *cachev1alpha1.CacheBackend, managed bool) string {
-	if !managed {
-		return "External backend: Ready, endpoint reachable"
+func healthyMessage(cb *cachev1alpha1.CacheBackend, managed, dialed bool) string {
+	// Only claim "reachable" when an actual TCP probe ran; with no dialer
+	// (e.g. --config-only) doctor verified the endpoint is published, not that
+	// it answers.
+	endpoint := "endpoint present"
+	if dialed {
+		endpoint = "endpoint reachable"
 	}
-	return fmt.Sprintf("Ready, engine pods matched, %d prefix(es) indexed, endpoint reachable", prefixCount(cb.Status.IndexParticipation))
+	if !managed {
+		return "External backend: Ready, " + endpoint
+	}
+	return fmt.Sprintf("Ready, engine pods matched, %d prefix(es) indexed, %s", prefixCount(cb.Status.IndexParticipation), endpoint)
 }
 
 func prefixCount(ip *cachev1alpha1.CacheBackendIndexParticipation) int64 {

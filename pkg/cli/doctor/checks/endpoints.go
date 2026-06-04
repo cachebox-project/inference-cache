@@ -109,6 +109,20 @@ func SnapshotReachability(ctx context.Context, doer HTTPDoer, url, token string)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// The endpoint is reachable but auth-gated and our token (if any) was
+		// rejected. Degrade gracefully — flag the auth state rather than failing
+		// connectivity. On a default auth-gated install, doctor needs an
+		// audience-bound controller token via --snapshot-token-file to verify
+		// the body.
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotAuthGated,
+			Status:   doctor.StatusWarn,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("/snapshot is reachable but returned HTTP %d (auth enforced): doctor's token was missing or rejected — pass an audience-bound controller token via --snapshot-token-file to verify the snapshot body", resp.StatusCode),
+		}}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return []doctor.Finding{{
 			Code:     doctor.CodeSnapshotUnreachable,

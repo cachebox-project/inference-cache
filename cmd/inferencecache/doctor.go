@@ -115,13 +115,17 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 	}
 
 	if !opts.configOnly {
+		// CacheBackend endpoint TCP reachability is independent of finding the
+		// cache server, so wire the dialer regardless of server discovery.
+		deps.DialTCP = dialTCP
+
 		grpcTarget, snapshotURL, policyURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
 		if err != nil {
 			// Don't abort: the cluster-configuration checks still provide value,
 			// and leaving the endpoint deps nil makes checks 1-3 emit structured
 			// FAIL findings (exit 2) — consistent with a server that is down,
 			// rather than a bare error on a separate channel.
-			fmt.Fprintf(os.Stderr, "warning: %v; skipping live endpoint probes\n", err)
+			fmt.Fprintf(os.Stderr, "warning: %v; skipping live server endpoint probes\n", err)
 		} else {
 			conn, err := grpccreds.NewClient(grpcTarget, grpccreds.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
@@ -135,7 +139,6 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 			deps.SnapshotURL = snapshotURL
 			deps.PolicyURL = policyURL
 			deps.Token = readToken(opts.tokenFile)
-			deps.DialTCP = dialTCP
 		}
 	}
 
@@ -160,7 +163,11 @@ func scheme() *runtime.Scheme {
 }
 
 // restConfig honors --kubeconfig and --context using the same client-go loading
-// rules kubectl uses, falling back to KUBECONFIG / ~/.kube/config / in-cluster.
+// rules kubectl uses (KUBECONFIG / ~/.kube/config), and falls back to the
+// in-cluster ServiceAccount config when no kubeconfig is resolvable — so doctor
+// works both from a workstation and when run as a pod. The in-cluster fallback
+// is taken only when the operator did NOT explicitly pass --kubeconfig/--context
+// (an explicit path that fails to load is a real error worth surfacing).
 func restConfig(kubeconfig, kubeContext string) (*rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfig != "" {
@@ -170,7 +177,16 @@ func restConfig(kubeconfig, kubeContext string) (*rest.Config, error) {
 	if kubeContext != "" {
 		overrides.CurrentContext = kubeContext
 	}
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+	if err == nil {
+		return cfg, nil
+	}
+	if kubeconfig == "" && kubeContext == "" {
+		if inCluster, icErr := rest.InClusterConfig(); icErr == nil {
+			return inCluster, nil
+		}
+	}
+	return nil, err
 }
 
 // resolveEndpoints returns the gRPC target and the /snapshot + /policy URLs,

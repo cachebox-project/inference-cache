@@ -235,6 +235,23 @@ func TestSnapshotReachability(t *testing.T) {
 		}
 	})
 
+	t.Run("auth-gated degrades to SN005 WARN, not a FAIL", func(t *testing.T) {
+		for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			fs := SnapshotReachability(ctx, srv.Client(), srv.URL, "")
+			srv.Close()
+			f := hasCode(fs, doctor.CodeSnapshotAuthGated)
+			if f == nil || f.Status != doctor.StatusWarn {
+				t.Fatalf("status %d: want SN005 WARN, got %v", status, codesOf(fs))
+			}
+			if hasCode(fs, doctor.CodeSnapshotUnreachable) != nil {
+				t.Fatalf("status %d: auth-gated must not be SN001 FAIL", status)
+			}
+		}
+	})
+
 	t.Run("transport error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		url := srv.URL
@@ -507,23 +524,32 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	}
 	// also a selector-less backend (skipped) for coverage
 	noSelector := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "nosel", Namespace: "ns1"}}
-	injected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
+	// Injected via the durable annotation (no Event needed — the authoritative signal).
+	injected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationInjectedBy: "ns1/be"}}}
+	// Injected per the Event but missing the annotation (older webhook / fallback path).
+	injectedViaEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
 	notInjected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
 	unrelated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns1", Labels: map[string]string{"app": "web"}}}
 
-	c := fakeClient(t, backend, noSelector, injected, notInjected, unrelated,
-		podEvent("inj", "ns1", eventInjectedByCacheBackend, now))
+	c := fakeClient(t, backend, noSelector, injected, injectedViaEvent, notInjected, unrelated,
+		podEvent("inj-evt", "ns1", eventInjectedByCacheBackend, now))
 
 	fs := EnginePodInjectionAudit(ctx, c, "")
-	if f := hasCode(fs, doctor.CodeEnginePodInjected); f == nil {
-		t.Errorf("want EP002 for injected pod, got %v", codesOf(fs))
+	injectedCount := 0
+	for _, f := range fs {
+		if f.Code == doctor.CodeEnginePodInjected {
+			injectedCount++
+		}
+	}
+	if injectedCount != 2 {
+		t.Errorf("want 2 EP002 (annotation + event paths), got %d (%v)", injectedCount, codesOf(fs))
 	}
 	if f := hasCode(fs, doctor.CodeEnginePodNotInjected); f == nil || f.Status != doctor.StatusWarn {
 		t.Errorf("want EP001 WARN for uninjected pod, got %v", codesOf(fs))
 	}
-	// 'unrelated' must not appear.
-	if len(fs) != 2 {
-		t.Errorf("expected exactly 2 findings (one per matching pod), got %v", codesOf(fs))
+	// 'unrelated' must not appear; 3 matching pods => 3 findings.
+	if len(fs) != 3 {
+		t.Errorf("expected exactly 3 findings (one per matching pod), got %v", codesOf(fs))
 	}
 
 	t.Run("backend list error", func(t *testing.T) {
@@ -549,7 +575,11 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	})
 
 	t.Run("event list error", func(t *testing.T) {
-		c := listErrClient{Client: fakeClient(t, backend, injected), failOn: func(l client.ObjectList) bool {
+		// Use a pod WITHOUT the injected-by annotation so the audit falls through
+		// to the (failing) Event list rather than short-circuiting on the
+		// annotation.
+		unannotated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
+		c := listErrClient{Client: fakeClient(t, backend, unannotated), failOn: func(l client.ObjectList) bool {
 			_, ok := l.(*corev1.EventList)
 			return ok
 		}, err: errors.New("x")}
