@@ -1550,7 +1550,10 @@ type ReplicaSnapshot struct {
 // to Snapshot.TotalPrefixes by construction (see Aggregate). Per-tenant memory
 // is deliberately absent: cache_memory_bytes is the engine total across all
 // tenants on a replica, so summing it per tenant double-counts on shared
-// engines (see PROJECT_CONTEXT §Enforcement boundary).
+// engines. For memory, read the per-replica ReplicaSnapshot.CacheMemoryBytes
+// (engine total per replica). See docs/design/crd-contract.md and
+// docs/concepts/cachetenant-identity-and-quota.md for the enforcement
+// boundary rationale.
 type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
 	IndexEntries int64   `json:"indexEntries"`

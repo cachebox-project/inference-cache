@@ -296,9 +296,11 @@ func TestSnapshotAggregates(t *testing.T) {
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 1}},
 		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
 	// Same replica reports again under a different model for the same tenant.
-	// Tenant HitRate dedups replicas (counts replica-a once); IndexEntries does
-	// not dedup — it counts each (replica, model) distinct prefix, so the same
-	// replica reporting under a second model adds to the tenant's entry count.
+	// Tenant HitRate dedups replicas (counts replica-a once). Tenant
+	// IndexEntries counts distinct (tenant, model, hash_scheme, prefix_hash)
+	// keys — replica is not in the aggregate key, so the same prefix from two
+	// replicas would still count once, but a second MODEL on the same replica
+	// is a distinct key and adds a row to the tenant's entry count.
 	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m2", Tenant: "tenant-a", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p2"), TokenCount: 1}},
 		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
@@ -344,9 +346,11 @@ func TestSnapshotAggregates(t *testing.T) {
 		t.Fatalf("tenants on replicas = %q / %q, want tenant-a / tenant-b",
 			snap.Replicas[0].Tenant, snap.Replicas[1].Tenant)
 	}
-	// Tenants sorted by id. tenant-a's IndexEntries == 2 (one per model on
-	// replica-a; entries are NOT replica-deduped); only HitRate is deduped per
-	// replica, so tenant-a's HitRate stays at 0.8 from the single replica.
+	// Tenants sorted by id. tenant-a's IndexEntries == 2: two distinct
+	// (tenant, model, hash_scheme, prefix_hash) keys ((tenant-a, m1, vllm, p1)
+	// and (tenant-a, m2, vllm, p2)) — the second Ingest added a new key
+	// because the model differed. HitRate is deduped per replica (replica-a
+	// counted once), so tenant-a's HitRate is 0.8 from that single replica.
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)
 	}

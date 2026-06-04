@@ -534,6 +534,24 @@ if [ -z "$ci_changed" ] || [ "$ci_changed" = "<none>" ] || [ "$ci_changed" = "<u
 fi
 log "CacheIndex printer columns render Prefixes=$ci_prefixes Changed=$ci_changed"
 
+# --- CacheIndex CRD schema-trim assertion ----------------------------------
+# Per-tenant memory was removed from status.tenants[] (engine KV cache is a
+# shared, tenant-unaware pool — on any engine serving multiple tenants the
+# value double-counts). The honest per-replica field stays. Probing the live
+# CRD proves the trim made it into the installed bundle, not just the repo.
+ci_field_type() {
+  kubectl get crd cacheindices.inferencecache.io \
+    -o "jsonpath={.spec.versions[?(@.name=='v1alpha1')].schema.openAPIV3Schema.properties.$1.type}" \
+    2>/dev/null || true
+}
+if [ -n "$(ci_field_type 'status.properties.tenants.items.properties.memoryUsed')" ]; then
+  fail "CRD still serves removed status.tenants[].memoryUsed (schema trim not installed)"
+fi
+if [ -z "$(ci_field_type 'status.properties.replicas.items.properties.cacheMemoryBytes')" ]; then
+  fail "CRD is missing status.replicas[].cacheMemoryBytes (the honest per-replica engine total — must remain after the per-tenant trim)"
+fi
+log "CacheIndex CRD reflects the schema trim (status.tenants[].memoryUsed absent; status.replicas[].cacheMemoryBytes present)"
+
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing
 # table columns render. The gRPC side-effect assertion below proves this CR
