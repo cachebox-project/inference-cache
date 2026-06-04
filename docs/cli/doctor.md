@@ -32,7 +32,7 @@ CacheBackend / engine-pod data path, then tenant and policy configuration:
 | 1 | Server reachability | gRPC dial + `grpc.health.v1` `Health/Check` (service `""`) returns `SERVING` |
 | 2 | `/snapshot` reachability | HTTP GET returns 200 with a JSON-parseable body (bearer token if available; flags the unauthenticated path) |
 | 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 2xx/401/403/405 = wired, 404 = not mounted, 5xx = WARN) |
-| 4 | Per-CacheBackend health | `Ready=True`; managed backends match engine pods and have observed a fresh KV event (zero warm prefixes is fine); `status.endpoint` populated and reachable |
+| 4 | Per-CacheBackend health | `Ready=True`; managed backends have ever observed a KV event (durable `firstKVEventObservedAt` latch) and, if `lastEventAt` is present, it is fresh (drained backends with a cleared `lastEventAt` are not flagged); `status.endpoint` populated and reachable |
 | 5 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
 | 6 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
 | 7 | CacheTenant health | `QuotaExceeded` condition is not `True` |
@@ -75,9 +75,14 @@ Notes:
 
 - **`CB003` keys off KV-event observation, not prefix count.** Zero warm prefixes
   is a valid state for an up-but-idle backend, so doctor flags "engine not
-  reporting" only when *no* KV event has ever been observed (`lastEventAt`
-  unset), and `CB004` when events were seen but have since gone stale — an idle
-  backend with a fresh event is healthy (`CB006`).
+  reporting" only when *no* KV event has ever been observed — which means BOTH
+  the durable `status.firstKVEventObservedAt` latch and the current-view
+  `status.indexParticipation.lastEventAt` are unset. A drained backend that has
+  ever observed an event keeps the latch set (write-once, never cleared) so it
+  is correctly NOT reported as "never observed" even when its current
+  `lastEventAt` has been cleared by the poller. `CB004` fires only when
+  `lastEventAt` IS present but has gone stale — an idle backend with a fresh
+  event is healthy (`CB006`).
 - **External backends** (`spec.type=External`) are checked for `Ready` and
   endpoint reachability only. Engine-pod matching (`CB002`) and index
   participation (`CB003`/`CB004`) are managed-backend concerns and are skipped,

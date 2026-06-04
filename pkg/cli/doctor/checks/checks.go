@@ -21,7 +21,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"google.golang.org/grpc"
@@ -221,34 +223,157 @@ func selectorMatches(matchLabels, labels map[string]string) bool {
 	return true
 }
 
+// normalizedEvent is the union shape doctor consumes regardless of which event
+// API the source object came from. Kubernetes has two Event APIs in parallel:
+//
+//   - The legacy core/v1 Event, written by the older
+//     k8s.io/client-go/tools/record EventRecorder. Identifies its target via
+//     metav1.ObjectReference (InvolvedObject), with Reason / LastTimestamp.
+//   - The modern events.k8s.io/v1 Event (GA since K8s 1.19, written by the
+//     newer k8s.io/client-go/tools/events EventRecorder). Identifies its target
+//     via corev1.ObjectReference (Regarding), with Reason / EventTime /
+//     Series.LastObservedTime; LastTimestamp does not exist on this type.
+//
+// The cache-plane controller uses the modern recorder (see
+// internal/controller/engine_pod_events_controller.go), so the real
+// InjectedByCacheBackend Events on a live cluster live in events.k8s.io/v1 —
+// but legacy core/v1 Events still exist on older clusters, in third-party
+// tooling, and in this package's tests. Reading only one API silently misses
+// the other; reading both and normalizing keeps doctor honest against any
+// emitter.
+type normalizedEvent struct {
+	Reason     string
+	Kind       string
+	Namespace  string
+	Name       string
+	UID        types.UID
+	When       time.Time
+	Message    string
+	APIVersion string // for diagnostics in messages: "core/v1" or "events.k8s.io/v1"
+}
+
 // listEventsFor returns the Events in ns (or all namespaces when ns is empty)
-// involving the named object of the given kind. Doctor filters in code rather
-// than via a field selector so the same path works against the fake client used
-// in tests (which does not implement server-side field selection).
-func listEventsFor(ctx context.Context, c client.Client, ns, kind, name string) ([]corev1.Event, error) {
-	var events corev1.EventList
-	if err := c.List(ctx, &events, client.InNamespace(ns)); err != nil {
+// involving the named object of the given kind, normalized across both event
+// APIs. Doctor filters in code rather than via a field selector so the same
+// path works against the fake client used in tests (which does not implement
+// server-side field selection). An error from either API surfaces as the
+// returned error; a NotFound on a non-registered type would short-circuit
+// here, but both v1 APIs are part of the standard client-go scheme used by
+// callers, so this returns successfully even when one API has zero events.
+func listEventsFor(ctx context.Context, c client.Client, ns, kind, name string) ([]normalizedEvent, error) {
+	var out []normalizedEvent
+
+	var legacy corev1.EventList
+	if err := c.List(ctx, &legacy, client.InNamespace(ns)); err != nil {
 		return nil, err
 	}
-	var out []corev1.Event
-	for i := range events.Items {
-		e := events.Items[i]
-		if e.InvolvedObject.Kind == kind && e.InvolvedObject.Name == name {
-			out = append(out, e)
+	for i := range legacy.Items {
+		e := legacy.Items[i]
+		if e.InvolvedObject.Kind != kind || e.InvolvedObject.Name != name {
+			continue
 		}
+		out = append(out, normalizedEvent{
+			Reason:     e.Reason,
+			Kind:       e.InvolvedObject.Kind,
+			Namespace:  e.InvolvedObject.Namespace,
+			Name:       e.InvolvedObject.Name,
+			UID:        e.InvolvedObject.UID,
+			When:       legacyEventTime(e),
+			Message:    e.Message,
+			APIVersion: "core/v1",
+		})
+	}
+
+	var modern eventsv1.EventList
+	if err := c.List(ctx, &modern, client.InNamespace(ns)); err != nil {
+		return nil, err
+	}
+	for i := range modern.Items {
+		e := modern.Items[i]
+		if e.Regarding.Kind != kind || e.Regarding.Name != name {
+			continue
+		}
+		out = append(out, normalizedEvent{
+			Reason:     e.Reason,
+			Kind:       e.Regarding.Kind,
+			Namespace:  e.Regarding.Namespace,
+			Name:       e.Regarding.Name,
+			UID:        e.Regarding.UID,
+			When:       modernEventTime(e),
+			Message:    e.Note,
+			APIVersion: "events.k8s.io/v1",
+		})
 	}
 	return out, nil
 }
 
-// eventTime returns the most informative timestamp on an Event, preferring the
-// series/last-observed time and falling back through lastTimestamp,
-// eventTime, and the object creation time.
-func eventTime(e corev1.Event) time.Time {
+// listAllEvents returns every Event in ns (or cluster-wide when ns is empty)
+// across both APIs, normalized. Used by the OrphanPods check, which scans
+// every pod-targeted Event for a NoMatchingCacheBackend reason rather than
+// looking up a specific pod by name.
+func listAllEvents(ctx context.Context, c client.Client, ns string) ([]normalizedEvent, error) {
+	var out []normalizedEvent
+
+	var legacy corev1.EventList
+	if err := c.List(ctx, &legacy, client.InNamespace(ns)); err != nil {
+		return nil, err
+	}
+	for i := range legacy.Items {
+		e := legacy.Items[i]
+		out = append(out, normalizedEvent{
+			Reason:     e.Reason,
+			Kind:       e.InvolvedObject.Kind,
+			Namespace:  e.InvolvedObject.Namespace,
+			Name:       e.InvolvedObject.Name,
+			UID:        e.InvolvedObject.UID,
+			When:       legacyEventTime(e),
+			Message:    e.Message,
+			APIVersion: "core/v1",
+		})
+	}
+
+	var modern eventsv1.EventList
+	if err := c.List(ctx, &modern, client.InNamespace(ns)); err != nil {
+		return nil, err
+	}
+	for i := range modern.Items {
+		e := modern.Items[i]
+		out = append(out, normalizedEvent{
+			Reason:     e.Reason,
+			Kind:       e.Regarding.Kind,
+			Namespace:  e.Regarding.Namespace,
+			Name:       e.Regarding.Name,
+			UID:        e.Regarding.UID,
+			When:       modernEventTime(e),
+			Message:    e.Note,
+			APIVersion: "events.k8s.io/v1",
+		})
+	}
+	return out, nil
+}
+
+// legacyEventTime returns the most informative timestamp on a core/v1 Event,
+// preferring the series/last-observed time and falling back through
+// lastTimestamp, eventTime, and the object creation time.
+func legacyEventTime(e corev1.Event) time.Time {
 	if e.Series != nil && !e.Series.LastObservedTime.IsZero() {
 		return e.Series.LastObservedTime.Time
 	}
 	if !e.LastTimestamp.IsZero() {
 		return e.LastTimestamp.Time
+	}
+	if !e.EventTime.IsZero() {
+		return e.EventTime.Time
+	}
+	return e.CreationTimestamp.Time
+}
+
+// modernEventTime returns the most informative timestamp on an
+// events.k8s.io/v1 Event. The new API removed LastTimestamp; the canonical
+// fields are EventTime (microsecond) and Series.LastObservedTime.
+func modernEventTime(e eventsv1.Event) time.Time {
+	if e.Series != nil && !e.Series.LastObservedTime.IsZero() {
+		return e.Series.LastObservedTime.Time
 	}
 	if !e.EventTime.IsZero() {
 		return e.EventTime.Time

@@ -16,6 +16,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -553,6 +554,21 @@ func podEvent(podName, ns, reason, uid string, when time.Time) *corev1.Event {
 	}
 }
 
+// podEventV1 builds an events.k8s.io/v1 Event keyed to the pod via the
+// Regarding field — the shape the cache-plane controller actually emits
+// (k8s.io/client-go/tools/events recorder writes this API, not core/v1).
+// Test fixtures use this so the audit's "annotation-or-Event" fallback is
+// validated against the real event surface produced in live clusters.
+func podEventV1(podName, ns, reason, uid string, when time.Time) *eventsv1.Event {
+	return &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: podName + "-" + reason + "-v1", Namespace: ns},
+		Regarding:  corev1.ObjectReference{Kind: "Pod", Namespace: ns, Name: podName, UID: k8stypes.UID(uid)},
+		Reason:     reason,
+		Note:       "msg-v1",
+		EventTime:  metav1.MicroTime{Time: when},
+	}
+}
+
 func TestEnginePodInjectionAudit(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -570,13 +586,20 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	// A FORGED injected-by annotation whose UID does not match the backend — must
 	// NOT be trusted; with no Event it falls through to EP001.
 	forged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "forged", Namespace: "ns1", UID: "forged-uid", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationInjectedBy: "ns1/be", annotationInjectedByUID: "wrong-uid"}}}
-	// Injected per the Event (matched to its UID) but missing the annotation.
-	injectedViaEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt", Namespace: "ns1", UID: "inj-evt-uid", Labels: map[string]string{"app": "engine"}}}
+	// Injected per the LEGACY core/v1 Event (matched to its UID), missing the
+	// annotation. Exercises the back-compat path for older clusters / third-party
+	// recorders.
+	injectedViaLegacyEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt", Namespace: "ns1", UID: "inj-evt-uid", Labels: map[string]string{"app": "engine"}}}
+	// Injected per the MODERN events.k8s.io/v1 Event (Regarding.UID matched).
+	// This is the shape the cache-plane controller actually emits today, so this
+	// case pins the audit against the production event surface.
+	injectedViaModernEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt-v1", Namespace: "ns1", UID: "inj-evt-v1-uid", Labels: map[string]string{"app": "engine"}}}
 	notInjected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", UID: "uninj-uid", Labels: map[string]string{"app": "engine"}}}
 	unrelated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns1", Labels: map[string]string{"app": "web"}}}
 
-	c := fakeClient(t, backend, noSelector, injected, forged, injectedViaEvent, notInjected, unrelated,
-		podEvent("inj-evt", "ns1", eventInjectedByCacheBackend, "inj-evt-uid", now))
+	c := fakeClient(t, backend, noSelector, injected, forged, injectedViaLegacyEvent, injectedViaModernEvent, notInjected, unrelated,
+		podEvent("inj-evt", "ns1", eventInjectedByCacheBackend, "inj-evt-uid", now),
+		podEventV1("inj-evt-v1", "ns1", eventInjectedByCacheBackend, "inj-evt-v1-uid", now))
 
 	fs := EnginePodInjectionAudit(ctx, c, "")
 	injectedCount, notInjectedCount := 0, 0
@@ -588,9 +611,10 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 			notInjectedCount++
 		}
 	}
-	// inj (annotation+uid) and inj-evt (event+uid) => 2 EP002.
-	if injectedCount != 2 {
-		t.Errorf("want 2 EP002 (validated annotation + UID-matched event), got %d (%v)", injectedCount, codesOf(fs))
+	// inj (annotation+uid), inj-evt (legacy event+uid), inj-evt-v1 (modern
+	// event+uid) => 3 EP002.
+	if injectedCount != 3 {
+		t.Errorf("want 3 EP002 (validated annotation + UID-matched event in BOTH event APIs), got %d (%v)", injectedCount, codesOf(fs))
 	}
 	// forged (uid mismatch, no event) and uninj (nothing) => 2 EP001.
 	if notInjectedCount != 2 {
@@ -599,9 +623,9 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	if f := hasCode(fs, doctor.CodeEnginePodNotInjected); f == nil || f.Status != doctor.StatusWarn {
 		t.Errorf("EP001 must be WARN")
 	}
-	// 'unrelated' must not appear; 4 matching pods => 4 findings.
-	if len(fs) != 4 {
-		t.Errorf("expected exactly 4 findings (one per matching pod), got %v", codesOf(fs))
+	// 'unrelated' must not appear; 5 matching pods => 5 findings.
+	if len(fs) != 5 {
+		t.Errorf("expected exactly 5 findings (one per matching pod), got %v", codesOf(fs))
 	}
 
 	t.Run("backend list error", func(t *testing.T) {
@@ -626,13 +650,28 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 		}
 	})
 
-	t.Run("event list error", func(t *testing.T) {
+	t.Run("legacy event list error", func(t *testing.T) {
 		// Use a pod WITHOUT the injected-by annotation so the audit falls through
 		// to the (failing) Event list rather than short-circuiting on the
 		// annotation.
 		unannotated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
 		c := listErrClient{Client: fakeClient(t, backend, unannotated), failOn: func(l client.ObjectList) bool {
 			_, ok := l.(*corev1.EventList)
+			return ok
+		}, err: errors.New("x")}
+		fs := EnginePodInjectionAudit(ctx, c, "")
+		if hasCode(fs, doctor.CodeAPIReadFailed) == nil {
+			t.Fatalf("want API001, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("modern event list error", func(t *testing.T) {
+		// Same setup but fail the events.k8s.io/v1 list — production controllers
+		// emit via that API, so a permissions gap there must also surface as
+		// API001 rather than a silent skip.
+		unannotated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
+		c := listErrClient{Client: fakeClient(t, backend, unannotated), failOn: func(l client.ObjectList) bool {
+			_, ok := l.(*eventsv1.EventList)
 			return ok
 		}, err: errors.New("x")}
 		fs := EnginePodInjectionAudit(ctx, c, "")
@@ -648,21 +687,44 @@ func TestOrphanPods(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	recent := podEvent("orphan", "ns1", eventNoMatchingCacheBackend, "", now.Add(-1*time.Hour))
+	// Recent legacy-API orphan + recent modern-API orphan: both must light up
+	// OP001, so the check works whether the future emitter uses core/v1 or
+	// events.k8s.io/v1.
+	recentLegacy := podEvent("orphan-legacy", "ns1", eventNoMatchingCacheBackend, "", now.Add(-1*time.Hour))
+	recentModern := podEventV1("orphan-modern", "ns1", eventNoMatchingCacheBackend, "", now.Add(-30*time.Minute))
+	// Outside the window: ignored.
 	old := podEvent("stale", "ns1", eventNoMatchingCacheBackend, "", now.Add(-48*time.Hour))
+	oldModern := podEventV1("stale-modern", "ns1", eventNoMatchingCacheBackend, "", now.Add(-48*time.Hour))
+	// Wrong reason: ignored across both APIs.
 	wrongReason := podEvent("ok", "ns1", "SomethingElse", "", now)
+	wrongReasonModern := podEventV1("ok-modern", "ns1", "SomethingElse", "", now)
 
-	c := fakeClient(t, recent, old, wrongReason)
+	c := fakeClient(t, recentLegacy, recentModern, old, oldModern, wrongReason, wrongReasonModern)
 	fs := OrphanPods(ctx, c, "", now, DefaultOrphanWindow)
-	if len(fs) != 1 || fs[0].Code != doctor.CodeOrphanPod {
-		t.Fatalf("want single OP001 (recent only), got %v", codesOf(fs))
+	if len(fs) != 2 {
+		t.Fatalf("want 2 OP001 findings (legacy + modern Event APIs in window), got %d (%v)", len(fs), codesOf(fs))
 	}
-	if fs[0].Status != doctor.StatusWarn {
-		t.Errorf("OP001 should be WARN")
+	for _, f := range fs {
+		if f.Code != doctor.CodeOrphanPod || f.Status != doctor.StatusWarn {
+			t.Errorf("each OP001 finding must be WARN; got %+v", f)
+		}
 	}
 
-	t.Run("list error", func(t *testing.T) {
-		c := listErrClient{Client: fakeClient(t), failOn: func(client.ObjectList) bool { return true }, err: errors.New("x")}
+	t.Run("legacy list error", func(t *testing.T) {
+		c := listErrClient{Client: fakeClient(t), failOn: func(l client.ObjectList) bool {
+			_, ok := l.(*corev1.EventList)
+			return ok
+		}, err: errors.New("x")}
+		fs := OrphanPods(ctx, c, "", now, DefaultOrphanWindow)
+		if hasCode(fs, doctor.CodeAPIReadFailed) == nil {
+			t.Fatalf("want API001, got %v", codesOf(fs))
+		}
+	})
+	t.Run("modern list error", func(t *testing.T) {
+		c := listErrClient{Client: fakeClient(t), failOn: func(l client.ObjectList) bool {
+			_, ok := l.(*eventsv1.EventList)
+			return ok
+		}, err: errors.New("x")}
 		fs := OrphanPods(ctx, c, "", now, DefaultOrphanWindow)
 		if hasCode(fs, doctor.CodeAPIReadFailed) == nil {
 			t.Fatalf("want API001, got %v", codesOf(fs))
@@ -801,22 +863,41 @@ func TestFindCondition(t *testing.T) {
 	}
 }
 
-func TestEventTime(t *testing.T) {
+func TestLegacyEventTime(t *testing.T) {
 	base := time.Now().Truncate(time.Second)
 	series := corev1.Event{Series: &corev1.EventSeries{LastObservedTime: metav1.MicroTime{Time: base}}}
-	if !eventTime(series).Equal(base) {
+	if !legacyEventTime(series).Equal(base) {
 		t.Error("series time preferred")
 	}
 	last := corev1.Event{LastTimestamp: metav1.Time{Time: base}}
-	if !eventTime(last).Equal(base) {
+	if !legacyEventTime(last).Equal(base) {
 		t.Error("lastTimestamp fallback")
 	}
 	etime := corev1.Event{EventTime: metav1.MicroTime{Time: base}}
-	if !eventTime(etime).Equal(base) {
+	if !legacyEventTime(etime).Equal(base) {
 		t.Error("eventTime fallback")
 	}
 	created := corev1.Event{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: base}}}
-	if !eventTime(created).Equal(base) {
+	if !legacyEventTime(created).Equal(base) {
+		t.Error("creationTimestamp fallback")
+	}
+}
+
+func TestModernEventTime(t *testing.T) {
+	base := time.Now().Truncate(time.Second)
+	// The events.k8s.io/v1 type has no LastTimestamp; the canonical fields are
+	// Series.LastObservedTime and EventTime, with CreationTimestamp as a final
+	// fallback.
+	series := eventsv1.Event{Series: &eventsv1.EventSeries{LastObservedTime: metav1.MicroTime{Time: base}}}
+	if !modernEventTime(series).Equal(base) {
+		t.Error("series time preferred")
+	}
+	etime := eventsv1.Event{EventTime: metav1.MicroTime{Time: base}}
+	if !modernEventTime(etime).Equal(base) {
+		t.Error("eventTime fallback")
+	}
+	created := eventsv1.Event{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: base}}}
+	if !modernEventTime(created).Equal(base) {
 		t.Error("creationTimestamp fallback")
 	}
 }

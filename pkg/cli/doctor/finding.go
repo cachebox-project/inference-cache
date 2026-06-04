@@ -125,8 +125,11 @@ const (
 	// selector most likely matches no pods (label drift / engine not deployed).
 	CodeBackendSelectorMismatch = "CB002"
 	// CodeBackendNotReportingState: no KV event has ever been observed for the
-	// backend (status.indexParticipation absent, or lastEventAt unset) — the
-	// engine's KV-event publisher is silent. Zero warm prefixes alone does NOT
+	// backend — BOTH the durable status.firstKVEventObservedAt latch and the
+	// current-view status.indexParticipation.lastEventAt are unset, so the
+	// engine's KV-event publisher has never been heard from. A drained backend
+	// that has ever observed an event keeps the latch and is NOT flagged here
+	// (its cleared lastEventAt is expected). Zero warm prefixes alone does NOT
 	// trigger this: an idle backend with a fresh event is healthy.
 	CodeBackendNotReportingState = "CB003"
 	// CodeBackendStale: status.indexParticipation.lastEventAt is older than the

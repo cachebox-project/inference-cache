@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -94,13 +95,16 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 
 		// Fall back to the controller-emitted Event, matched to THIS pod's UID so
 		// an old Event left over from a same-named, recreated pod cannot mark a
-		// freshly-uninjected pod as healthy.
+		// freshly-uninjected pod as healthy. listEventsFor reads BOTH the legacy
+		// core/v1 and the modern events.k8s.io/v1 APIs — the production
+		// controller emits via the modern recorder (events.k8s.io/v1 with
+		// Regarding), and reading only one API would silently miss real Events.
 		events, err := listEventsFor(ctx, c, pod.Namespace, "Pod", pod.Name)
 		if err != nil {
 			findings = append(findings, listError(checkEnginePodInjection, "Event", err))
 			continue
 		}
-		if hasInjectionEventForUID(events, string(pod.UID)) {
+		if hasInjectionEventForUID(events, pod.UID) {
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodeEnginePodInjected,
 				Status:   doctor.StatusOK,
@@ -122,10 +126,12 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 }
 
 // hasInjectionEventForUID reports whether any event is an InjectedByCacheBackend
-// Event whose involvedObject UID matches the pod's current UID.
-func hasInjectionEventForUID(events []corev1.Event, podUID string) bool {
+// Event whose target UID matches the pod's current UID. Operates over the
+// normalized event shape so a match in either the legacy core/v1 or the modern
+// events.k8s.io/v1 API counts.
+func hasInjectionEventForUID(events []normalizedEvent, podUID types.UID) bool {
 	for i := range events {
-		if events[i].Reason == eventInjectedByCacheBackend && string(events[i].InvolvedObject.UID) == podUID {
+		if events[i].Reason == eventInjectedByCacheBackend && events[i].UID == podUID {
 			return true
 		}
 	}
@@ -141,27 +147,29 @@ func hasInjectionEventForUID(events []corev1.Event, podUID string) bool {
 // (see eventNoMatchingCacheBackend), so this check is a no-op against today's
 // clusters and only begins reporting once the engine-pod binding work wires the
 // emitter. It is implemented now so the doctor's check set matches its spec and
-// lights up automatically when the producer lands.
+// lights up automatically when the producer lands — and reads both the legacy
+// core/v1 and modern events.k8s.io/v1 APIs so it works regardless of which
+// recorder the future emitter uses.
 func OrphanPods(ctx context.Context, c client.Client, ns string, now time.Time, window time.Duration) []doctor.Finding {
-	var events corev1.EventList
-	if err := c.List(ctx, &events, client.InNamespace(ns)); err != nil {
+	events, err := listAllEvents(ctx, c, ns)
+	if err != nil {
 		return []doctor.Finding{listError(checkOrphanPods, "Event", err)}
 	}
 	cutoff := now.Add(-window)
 	var findings []doctor.Finding
-	for i := range events.Items {
-		e := events.Items[i]
-		if e.Reason != eventNoMatchingCacheBackend || e.InvolvedObject.Kind != "Pod" {
+	for i := range events {
+		e := events[i]
+		if e.Reason != eventNoMatchingCacheBackend || e.Kind != "Pod" {
 			continue
 		}
-		if eventTime(e).Before(cutoff) {
+		if e.When.Before(cutoff) {
 			continue
 		}
 		findings = append(findings, doctor.Finding{
 			Code:     doctor.CodeOrphanPod,
 			Status:   doctor.StatusWarn,
 			Check:    checkOrphanPods,
-			Resource: resourceRef("Pod", e.InvolvedObject.Namespace, e.InvolvedObject.Name),
+			Resource: resourceRef("Pod", e.Namespace, e.Name),
 			Message:  fmt.Sprintf("pod recorded a NoMatchingCacheBackend Event (LikelyOperatorMisconfiguration): %s", e.Message),
 		})
 	}
