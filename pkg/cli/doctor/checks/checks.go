@@ -48,11 +48,15 @@ const (
 	conditionReady         = "Ready"
 	conditionQuotaExceeded = "QuotaExceeded"
 
-	// annotationInjectedBy is the durable, authoritative wiring signal the pod
-	// webhook stamps on an injected engine pod (its value is the owning
-	// CacheBackend's namespace/name). It outlives the InjectedByCacheBackend
-	// Event, which can be GC'd, so the injection audit prefers it.
-	annotationInjectedBy = "inferencecache.io/injected-by"
+	// annotationInjectedBy is the durable wiring signal the pod webhook stamps on
+	// an injected engine pod; its value is the owning CacheBackend's
+	// namespace/name. annotationInjectedByUID carries that CacheBackend's
+	// metadata.uid — the controller validates the (injected-by, injected-by-uid)
+	// pair against the live CR's UID before it trusts the annotation, so the
+	// injection audit re-validates injected-by-uid against the matched backend's
+	// UID rather than trusting a bare (possibly forged/stale) injected-by.
+	annotationInjectedBy    = "inferencecache.io/injected-by"
+	annotationInjectedByUID = "inferencecache.io/injected-by-uid"
 
 	eventInjectedByCacheBackend = "InjectedByCacheBackend"
 	// eventNoMatchingCacheBackend is the orphan-pod signal the OrphanPods check
@@ -234,16 +238,6 @@ func listEventsFor(ctx context.Context, c client.Client, ns, kind, name string) 
 		}
 	}
 	return out, nil
-}
-
-// hasEventReason reports whether any of the events carries the given reason.
-func hasEventReason(events []corev1.Event, reason string) bool {
-	for i := range events {
-		if events[i].Reason == reason {
-			return true
-		}
-	}
-	return false
 }
 
 // eventTime returns the most informative timestamp on an Event, preferring the

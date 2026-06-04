@@ -115,14 +115,14 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 
 ## Common Targets
 
-- `make build`: build controller and server binaries
+- `make build`: build the controller, server, kvevent-subscriber, and inferencecache binaries
 - `make test`: run unit tests
 - `make lint`: run gofmt and go vet
 - `make ci-lint`: run golangci-lint
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code
 - `make manifests`: regenerate CRD, RBAC, and webhook manifests
-- `make image-build`: build controller and server images
+- `make image-build`: build controller, server, and kvevent-subscriber images
 
 ## Documentation
 

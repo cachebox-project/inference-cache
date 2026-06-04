@@ -89,8 +89,8 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 				}
 			}
 
-			// Index participation: keyed off KV-event freshness, not prefix count.
-			if f, ok := participationFinding(cb.Status.IndexParticipation, ref, now, staleWindow); ok {
+			// Index participation: keyed off KV-event observation, not prefix count.
+			if f, ok := participationFinding(cb.Status.IndexParticipation, cb.Status.FirstKVEventObservedAt, ref, now, staleWindow); ok {
 				note(f)
 			}
 		}
@@ -114,19 +114,29 @@ func hasEngineSelector(cb *cachev1alpha1.CacheBackend) bool {
 	return cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
 }
 
-// participationFinding evaluates the index-participation axis. It returns a
-// finding (and ok=true) only when the backend is genuinely not reporting state
-// (no KV event ever observed) or has gone stale (events seen but older than the
-// window). A backend with a fresh event but zero warm prefixes is healthy.
-func participationFinding(ip *cachev1alpha1.CacheBackendIndexParticipation, ref string, now time.Time, staleWindow time.Duration) (doctor.Finding, bool) {
-	if ip == nil || ip.LastEventAt == nil {
+// participationFinding evaluates the index-participation axis using the right
+// signal for each question:
+//   - "has the engine EVER reported?" — answered by the durable
+//     status.firstKVEventObservedAt latch (written write-once, never cleared).
+//     Only its absence (with no live event either) means EngineNotReportingState.
+//   - "are events still flowing?" — answered by the live lastEventAt, which the
+//     CacheIndex poller legitimately CLEARS when a backend drains (scale-down,
+//     prefixes TTL'd). A drained backend that already proved its publisher works
+//     is healthy, so a cleared lastEventAt with firstKVEventObservedAt set emits
+//     nothing — it is NOT reported as "never observed" (the bug of keying solely
+//     off lastEventAt). Only a present-but-old lastEventAt is EngineStale.
+//
+// Zero warm prefixes is always a valid state and never drives a finding here.
+func participationFinding(ip *cachev1alpha1.CacheBackendIndexParticipation, firstEventAt *metav1.Time, ref string, now time.Time, staleWindow time.Duration) (doctor.Finding, bool) {
+	everObserved := firstEventAt != nil || (ip != nil && ip.LastEventAt != nil)
+	if !everObserved {
 		return doctor.Finding{
 			Code: doctor.CodeBackendNotReportingState, Status: doctor.StatusWarn,
 			Check: checkCacheBackendHealth, Resource: ref,
-			Message: "no KV event observed for this backend (EngineNotReportingState): status.indexParticipation is unpopulated or lastEventAt is unset — the engine's KV-event publisher may be silent or the subscriber sidecar absent",
+			Message: "no KV event ever observed for this backend (EngineNotReportingState): status.firstKVEventObservedAt and indexParticipation.lastEventAt are both unset — the engine's KV-event publisher may be silent or the subscriber sidecar absent",
 		}, true
 	}
-	if now.Sub(ip.LastEventAt.Time) > staleWindow {
+	if ip != nil && ip.LastEventAt != nil && now.Sub(ip.LastEventAt.Time) > staleWindow {
 		return doctor.Finding{
 			Code: doctor.CodeBackendStale, Status: doctor.StatusWarn,
 			Check: checkCacheBackendHealth, Resource: ref,

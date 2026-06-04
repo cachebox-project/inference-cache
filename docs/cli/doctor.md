@@ -31,7 +31,7 @@ CacheBackend / engine-pod data path, then tenant and policy configuration:
 |---|-------|------------------|
 | 1 | Server reachability | gRPC dial + `grpc.health.v1` `Health/Check` (service `""`) returns `SERVING` |
 | 2 | `/snapshot` reachability | HTTP GET returns 200 with a JSON-parseable body (bearer token if available; flags the unauthenticated path) |
-| 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 200/401/405 = wired, 404 = not mounted) |
+| 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 2xx/401/403/405 = wired, 404 = not mounted, 5xx = WARN) |
 | 4 | Per-CacheBackend health | `Ready=True`; managed backends match engine pods and have observed a fresh KV event (zero warm prefixes is fine); `status.endpoint` populated and reachable |
 | 5 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
 | 6 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
@@ -182,8 +182,9 @@ mode from a workstation without a port-forward:
   `--snapshot-token-file=<path>` if you need the full `/snapshot` check.
 
 > Note: the doctor dials the gRPC port in plaintext, matching the default
-> install. If the server is deployed with the TLS overlay, run doctor in-cluster
-> (or use `--config-only`); a TLS-aware probe is a follow-up.
+> install. Under the opt-in TLS overlay the live `:9090` probe cannot succeed
+> (the CLI has no TLS flags yet — a follow-up), so use `--config-only` there; the
+> cluster-configuration checks are unaffected.
 
 ## Manual smoke test (kind)
 

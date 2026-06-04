@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -458,6 +459,23 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("drained backend that ever observed an event is healthy", func(t *testing.T) {
+		// lastEventAt is cleared on drain, but firstKVEventObservedAt is the
+		// durable latch — a backend that already proved its publisher works is
+		// not "never reporting".
+		cb := healthyBackend(now)
+		cb.Status.FirstKVEventObservedAt = &metav1.Time{Time: now.Add(-1 * time.Hour)}
+		cb.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 0, LastEventAt: nil}
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if hasCode(fs, doctor.CodeBackendNotReportingState) != nil {
+			t.Fatalf("drained backend with firstKVEventObservedAt set must not be CB003, got %v", codesOf(fs))
+		}
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("want CB006, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("zero prefixes with a fresh event is healthy", func(t *testing.T) {
 		cb := healthyBackend(now)
 		cb.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 0, LastEventAt: &metav1.Time{Time: now.Add(-5 * time.Second)}}
@@ -525,10 +543,10 @@ func TestPrefixCountNil(t *testing.T) {
 
 // --- EnginePodInjectionAudit ------------------------------------------------
 
-func podEvent(podName, ns, reason string, when time.Time) *corev1.Event {
+func podEvent(podName, ns, reason, uid string, when time.Time) *corev1.Event {
 	return &corev1.Event{
 		ObjectMeta:     metav1.ObjectMeta{Name: podName + "-" + reason, Namespace: ns},
-		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: ns, Name: podName},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: ns, Name: podName, UID: k8stypes.UID(uid)},
 		Reason:         reason,
 		Message:        "msg",
 		LastTimestamp:  metav1.Time{Time: when},
@@ -540,39 +558,50 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	now := time.Now()
 
 	backend := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "be", Namespace: "ns1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "be", Namespace: "ns1", UID: "be-uid"},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}},
 		},
 	}
 	// also a selector-less backend (skipped) for coverage
 	noSelector := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "nosel", Namespace: "ns1"}}
-	// Injected via the durable annotation (no Event needed — the authoritative signal).
-	injected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationInjectedBy: "ns1/be"}}}
-	// Injected per the Event but missing the annotation (older webhook / fallback path).
-	injectedViaEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
-	notInjected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
+	// Injected via the durable annotation, validated against the backend UID.
+	injected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj", Namespace: "ns1", UID: "inj-uid", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationInjectedBy: "ns1/be", annotationInjectedByUID: "be-uid"}}}
+	// A FORGED injected-by annotation whose UID does not match the backend — must
+	// NOT be trusted; with no Event it falls through to EP001.
+	forged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "forged", Namespace: "ns1", UID: "forged-uid", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{annotationInjectedBy: "ns1/be", annotationInjectedByUID: "wrong-uid"}}}
+	// Injected per the Event (matched to its UID) but missing the annotation.
+	injectedViaEvent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "inj-evt", Namespace: "ns1", UID: "inj-evt-uid", Labels: map[string]string{"app": "engine"}}}
+	notInjected := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "uninj", Namespace: "ns1", UID: "uninj-uid", Labels: map[string]string{"app": "engine"}}}
 	unrelated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns1", Labels: map[string]string{"app": "web"}}}
 
-	c := fakeClient(t, backend, noSelector, injected, injectedViaEvent, notInjected, unrelated,
-		podEvent("inj-evt", "ns1", eventInjectedByCacheBackend, now))
+	c := fakeClient(t, backend, noSelector, injected, forged, injectedViaEvent, notInjected, unrelated,
+		podEvent("inj-evt", "ns1", eventInjectedByCacheBackend, "inj-evt-uid", now))
 
 	fs := EnginePodInjectionAudit(ctx, c, "")
-	injectedCount := 0
+	injectedCount, notInjectedCount := 0, 0
 	for _, f := range fs {
-		if f.Code == doctor.CodeEnginePodInjected {
+		switch f.Code {
+		case doctor.CodeEnginePodInjected:
 			injectedCount++
+		case doctor.CodeEnginePodNotInjected:
+			notInjectedCount++
 		}
 	}
+	// inj (annotation+uid) and inj-evt (event+uid) => 2 EP002.
 	if injectedCount != 2 {
-		t.Errorf("want 2 EP002 (annotation + event paths), got %d (%v)", injectedCount, codesOf(fs))
+		t.Errorf("want 2 EP002 (validated annotation + UID-matched event), got %d (%v)", injectedCount, codesOf(fs))
+	}
+	// forged (uid mismatch, no event) and uninj (nothing) => 2 EP001.
+	if notInjectedCount != 2 {
+		t.Errorf("want 2 EP001 (forged annotation + bare pod), got %d (%v)", notInjectedCount, codesOf(fs))
 	}
 	if f := hasCode(fs, doctor.CodeEnginePodNotInjected); f == nil || f.Status != doctor.StatusWarn {
-		t.Errorf("want EP001 WARN for uninjected pod, got %v", codesOf(fs))
+		t.Errorf("EP001 must be WARN")
 	}
-	// 'unrelated' must not appear; 3 matching pods => 3 findings.
-	if len(fs) != 3 {
-		t.Errorf("expected exactly 3 findings (one per matching pod), got %v", codesOf(fs))
+	// 'unrelated' must not appear; 4 matching pods => 4 findings.
+	if len(fs) != 4 {
+		t.Errorf("expected exactly 4 findings (one per matching pod), got %v", codesOf(fs))
 	}
 
 	t.Run("backend list error", func(t *testing.T) {
@@ -619,9 +648,9 @@ func TestOrphanPods(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	recent := podEvent("orphan", "ns1", eventNoMatchingCacheBackend, now.Add(-1*time.Hour))
-	old := podEvent("stale", "ns1", eventNoMatchingCacheBackend, now.Add(-48*time.Hour))
-	wrongReason := podEvent("ok", "ns1", "SomethingElse", now)
+	recent := podEvent("orphan", "ns1", eventNoMatchingCacheBackend, "", now.Add(-1*time.Hour))
+	old := podEvent("stale", "ns1", eventNoMatchingCacheBackend, "", now.Add(-48*time.Hour))
+	wrongReason := podEvent("ok", "ns1", "SomethingElse", "", now)
 
 	c := fakeClient(t, recent, old, wrongReason)
 	fs := OrphanPods(ctx, c, "", now, DefaultOrphanWindow)
