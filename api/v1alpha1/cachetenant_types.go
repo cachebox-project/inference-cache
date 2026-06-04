@@ -65,7 +65,9 @@ type CacheTenantCryptoSpec struct{}
 // No MemoryUsed field: per-tenant memory is not honestly observable on a shared,
 // tenant-unaware engine (ReplicaStats.cache_memory_bytes is the engine total and
 // would be double-counted across tenants sharing it). Operators who want memory
-// signals read the cluster-wide CacheIndex tenant aggregate / Prometheus.
+// signals read the per-replica CacheIndex.status.replicas[].cacheMemoryBytes
+// (engine total per replica; on a shared engine the value covers ALL tenants on
+// that replica) or the equivalent Prometheus metric.
 type CacheTenantStatus struct {
 	// ObservedGeneration is the latest generation observed by the controller.
 	// +optional
