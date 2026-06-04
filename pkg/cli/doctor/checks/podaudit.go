@@ -3,6 +3,7 @@ package checks
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -45,6 +46,13 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		}
 		byNamespace[cb.Namespace] = append(byNamespace[cb.Namespace], sel{backend: cb.Name, uid: string(cb.UID), labels: cb.Spec.EngineSelector.MatchLabels})
 	}
+	// Match the pod webhook's documented tie-break for overlapping selectors:
+	// the lexicographically-smallest CacheBackend name wins. Sorting here makes
+	// the audit's "first match" agree with the backend that actually injected
+	// the pod, rather than depending on List order.
+	for ns := range byNamespace {
+		sort.Slice(byNamespace[ns], func(i, j int) bool { return byNamespace[ns][i].backend < byNamespace[ns][j].backend })
+	}
 
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods, client.InNamespace(ns)); err != nil {
@@ -66,11 +74,13 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		}
 		ref := resourceRef("Pod", pod.Namespace, pod.Name)
 
-		// Trust the durable inferencecache.io/injected-by annotation only when
-		// its injected-by-uid matches the matched backend's UID — the same
-		// validation the controller does, which rejects a forged or stale
-		// annotation. This outlives the GC-able Event.
+		// Trust the durable inferencecache.io/injected-by annotation only when it
+		// both NAMES the matched backend and carries an injected-by-uid matching
+		// that backend's UID — the same consistency the controller requires,
+		// which rejects a forged, stale, or internally-inconsistent annotation
+		// pair. This outlives the GC-able Event.
 		if owner := pod.Annotations[annotationInjectedBy]; owner != "" &&
+			owner == pod.Namespace+"/"+matched.backend &&
 			matched.uid != "" && pod.Annotations[annotationInjectedByUID] == matched.uid {
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodeEnginePodInjected,
