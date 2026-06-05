@@ -87,11 +87,15 @@ The rule does **not** apply to:
 | `UNKNOWN_MODEL` | The tenant is known (has entries somewhere) but the `(tenant, model_id)` pair has **zero entries**. | "Right tenant, wrong `model_id` — there's no cache state for this model in this tenant." Either the model has never served traffic in this tenant or the model identifier disagrees between the producer and consumer. |
 | `UNKNOWN_HASH_SCHEME` | The `(tenant, model_id)` pair has entries, but **none under the request's `hash_scheme`**. | "Right tenant and model, wrong `hash_scheme`. The engine domain you asked about is empty; another engine's entries are there." Almost always a string-value typo or a vLLM-version-bump mismatch (e.g. `vllm` vs `vllm-v1`). |
 
-These are emitted in widening order — tenant, then model within tenant, then
-scheme within (tenant, model) — so the caller learns the **most specific**
-mismatched key. A request whose tenant is wrong gets `UNKNOWN_TENANT`, never
-the downstream codes (we don't know whether the model or scheme would have
-been right under a hypothetical correct tenant).
+These are emitted in **outer-to-inner scope order** — tenant first, then
+model within tenant, then scheme within (tenant, model). A request whose
+tenant is wrong gets `UNKNOWN_TENANT` and stops there; a request whose
+tenant matches but whose model doesn't gets `UNKNOWN_MODEL`; and so on. The
+classifier never reports a finer key as the mismatched one when a wider
+key (above it in scope) already failed — the wider failure subsumes the
+question. So the caller always sees the **outermost** mismatched key, which
+is the one that has to be fixed first regardless of whether the
+deeper-scoped keys are right.
 
 ## 4. Where the classification fits
 
@@ -108,10 +112,11 @@ On a `LookupRoute` request the server runs (in order):
    `TENANT_HOT`. Untouched.
 5. **Contract-key classification (new)** — runs *only* if step 3 (and step 4
    for non-chain requests) found no candidates and the request supplied a
-   non-empty `hash_scheme`. Walks the key triple in widening order and emits
-   the first level that has no data: `UNKNOWN_TENANT` → `UNKNOWN_MODEL` →
-   `UNKNOWN_HASH_SCHEME`. If every level is populated, the miss is a genuinely
-   novel prefix → `NO_HINT` (the existing fail-open default).
+   non-empty `hash_scheme`. Walks the key triple outer-to-inner (widest
+   scope first) and emits the first level that has no data:
+   `UNKNOWN_TENANT` → `UNKNOWN_MODEL` → `UNKNOWN_HASH_SCHEME`. If every level
+   is populated, the miss is a genuinely novel prefix → `NO_HINT` (the
+   existing fail-open default).
 
 The classification runs only on a miss, so it never adds work to the hot path
 of a healthy gateway — `PREFIX_MATCH` and `TENANT_HOT` short-circuit before

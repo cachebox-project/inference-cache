@@ -38,8 +38,12 @@ const (
 // RPCs (RenderTemplate, LookupPDRoute, streams) stay fail-open stubs until their
 // modules land. All lookups remain side-effect-free apart from emitting metrics
 // and fail open — an empty result with NO_HINT (no match / below the configured
-// minimumPrefixTokens) or with TIMEOUT (lookupTimeoutMs budget breach) so the
-// gateway routes as it normally would.
+// minimumPrefixTokens), with TIMEOUT (lookupTimeoutMs budget breach), or with
+// one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
+// when the lookup misses AND the index can identify which contract key did not
+// match anything held (see docs/design/lookuproute-diagnostics.md). Every empty-
+// result path fails open the same way: the gateway routes as it normally would
+// and the diagnostic codes are advisory.
 type inferenceCacheService struct {
 	icpb.UnimplementedInferenceCacheServer
 
@@ -87,10 +91,14 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 //     prefix hit, scored with the pressure- and SLO-aware formula),
 //     StrategyTenantHot (no prefix match but the tenant has recently warm
 //     replicas in the requested engine domain — a softer locality hint), or
-//     StrategyNone (fail-open default). The handler maps Strategy →
-//     reason_code (PREFIX_MATCH / TENANT_HOT / NO_HINT) via reasonForStrategy.
+//     a miss strategy — StrategyUnknownTenant / StrategyUnknownModel /
+//     StrategyUnknownHashScheme when the index can identify which contract
+//     key did not match anything held, otherwise StrategyNone (the
+//     genuine-novel-prefix fail-open default). The handler maps Strategy →
+//     reason_code (PREFIX_MATCH / TENANT_HOT / UNKNOWN_TENANT /
+//     UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME / NO_HINT) via reasonForStrategy.
 //
-// A no-match still returns NO_HINT (fail open) — never an error on the hot path.
+// Every empty-result code is fail-open — never an error on the hot path.
 func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
 	tenant := req.GetTenantId()
 	model := req.GetModelId()

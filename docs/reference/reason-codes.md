@@ -53,7 +53,7 @@ hints behaves exactly like the original B6 ranker.
 | `SLOTightTTFTMs` | TTFT budget (ms) below which the request is "tight" and the SLO bias kicks in. Uses `LookupRouteRequest.slo.ttft_ms`. | `200` | `0` → bias never fires |
 | `SLOTightBias` | Coefficient in the freshness boost: `slo_bias = 1 + freshness × SLOTightBias` when the request is tight. Higher → fresher candidates are favored more aggressively. | `1.0` | `0` → no boost |
 | `TenantHotMinHitRate` | Minimum `hit_rate` for a replica to count as "warm" for the `TENANT_HOT` fallback. | `0.1` | n/a (use `TenantHotMaxAge = 0` to disable the fallback) |
-| `TenantHotMaxAge` | Maximum stats age for a replica to count as "warm". | `5m` | `0` → fallback disabled (prefix-miss always lands at `NO_HINT`) |
+| `TenantHotMaxAge` | Maximum stats age for a replica to count as "warm". | `5m` | `0` → fallback disabled (a prefix miss whose contract keys all populate the index lands at `NO_HINT`; mismatched-key misses still diagnose as `UNKNOWN_*` via the miss-classifier) |
 
 ---
 

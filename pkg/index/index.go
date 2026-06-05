@@ -989,9 +989,11 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 //     Below that, it's "not warm enough" to be a useful hint.
 //
 // The fallback is gated on TenantHotMaxAge > 0 so RankerConfig{} disables
-// it entirely (back to NO_HINT on prefix-miss). The score uses hit_rate as
-// the locality proxy (in place of matched_tokens, which is zero by
-// definition here) and reuses the same pressure/SLO factors as the
+// only the soft locality nudge. The miss-classifier still runs after, so
+// a same-key novel-prefix miss lands at NO_HINT while a mismatched contract
+// key still surfaces as the matching UNKNOWN_* code. The score uses
+// hit_rate as the locality proxy (in place of matched_tokens, which is zero
+// by definition here) and reuses the same pressure/SLO factors as the
 // prefix-match path so a tight-SLO caller still gets a freshness-biased
 // ranking.
 func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
@@ -1470,10 +1472,11 @@ func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme strin
 
 // classifyMiss returns the diagnostic Strategy for a LookupRoute call whose
 // prefix lookup found nothing AND whose TENANT_HOT fallback (when applicable)
-// also did. It walks the contract keys in widening order — tenant, then
-// (tenant, model), then (tenant, model, hash_scheme) — and returns the first
-// level at which the index has no data. If every level is populated the miss
-// is a genuinely novel prefix → StrategyNone (the existing fail-open NO_HINT).
+// also did. It walks the contract keys outer-to-inner (widest scope first)
+// — tenant, then (tenant, model), then (tenant, model, hash_scheme) — and
+// returns the first level at which the index has no data. If every level
+// is populated the miss is a genuinely novel prefix → StrategyNone (the
+// existing fail-open NO_HINT).
 //
 // The whole walk runs under one RLock acquisition so concurrent ingests can't
 // produce a contradictory classification (e.g. tenant unknown → tenant known

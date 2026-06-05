@@ -918,9 +918,12 @@ func TestTenantHotHonorsHitRateThreshold(t *testing.T) {
 }
 
 // TestTenantHotDisabledByZeroMaxAge proves the kill-switch: a RankerConfig
-// with TenantHotMaxAge=0 disables the fallback entirely, so a prefix miss
-// always lands at StrategyNone (NO_HINT). Useful when an operator wants
-// strict baseline behavior back.
+// with TenantHotMaxAge=0 disables the soft locality fallback, so a
+// same-key prefix miss (the case set up below — (t, m, vllm) populated,
+// only this prefix novel) lands at StrategyNone (NO_HINT) instead of
+// TENANT_HOT. The miss-classifier still runs for mismatched contract keys
+// — see the dedicated diagnostics tests; this test pins only the
+// kill-switch behavior on the same-key path.
 func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 	cfg := DefaultRankerConfig()
 	cfg.TenantHotMaxAge = 0 // explicit disable
