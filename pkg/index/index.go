@@ -1492,12 +1492,25 @@ func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme strin
 // requests stay on the fail-open NO_HINT path; emitting UNKNOWN_TENANT for a
 // missing-field caller would be misleading guidance ("change your value"
 // when the actual fix is "supply the field").
+//
+// Cold-start carve-out: a globally-empty index also stays on NO_HINT (every
+// tenant query would otherwise classify as UNKNOWN_TENANT before any
+// ReportCacheState lands). The UNKNOWN_* codes are meant to signal "you
+// queried with a key that does not match what I hold" — but during cold
+// start the server holds NOTHING, so the honest answer is "no hint",
+// not "your tenant_id is wrong." The diagnostic resumes the moment any
+// replica has reported state, which is the asymmetric case the SDK
+// guidance is targeted at (one tenant populated, the gateway pointing at
+// another).
 func (i *Index) classifyMiss(req LookupRequest) Strategy {
 	if req.Tenant == "" || req.Model == "" {
 		return StrategyNone
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	if len(i.prefixes) == 0 {
+		return StrategyNone
+	}
 	if !i.hasAnyForTenantLocked(req.Tenant) {
 		return StrategyUnknownTenant
 	}

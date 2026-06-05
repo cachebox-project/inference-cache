@@ -246,6 +246,51 @@ func TestLookupRouteEmptyHashSchemeStaysNoHint(t *testing.T) {
 	}
 }
 
+// TestLookupRouteColdStartStaysNoHint guards against a false-alert pattern
+// on a globally empty index: when no replica has reported anything yet
+// (server restart, fresh deployment, drained namespace), every LookupRoute
+// would otherwise classify as UNKNOWN_TENANT because every tenant's
+// presence check returns false. That conflicts with the SDK guidance —
+// UNKNOWN_* is meant to signal "you queried with a key that does not
+// match data I hold," but during cold start I hold no data at all. The
+// classifier short-circuits a globally-empty index to NO_HINT so the
+// fail-open path matches the operational reality. As soon as ANY replica
+// reports, the normal diagnostic rules apply again.
+func TestLookupRouteColdStartStaysNoHint(t *testing.T) {
+	idx := New()
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "m", Tenant: "any-tenant", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyNone {
+		t.Fatalf("empty index must stay StrategyNone (cold start, not configuration drift); got %v", got.Strategy)
+	}
+	if len(got.Scores) != 0 {
+		t.Fatalf("cold-start response must carry no scores; got %+v", got.Scores)
+	}
+}
+
+// TestLookupRouteUnknownTenantOnlyWhenIndexHasData pins the boundary between
+// the cold-start guard and the genuine UNKNOWN_TENANT diagnostic: as soon
+// as ANY replica has reported state — even for a different tenant — the
+// classifier resumes flagging mismatched tenant_id queries. So the
+// asymmetric configuration drift (one tenant populated, the gateway-SDK
+// pointing at a different tenant) still surfaces.
+func TestLookupRouteUnknownTenantOnlyWhenIndexHasData(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r1", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}},
+	})
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "m", Tenant: "wrong-tenant", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyUnknownTenant {
+		t.Fatalf("once the index has data, mismatched tenant_id must classify as UNKNOWN_TENANT; got %v", got.Strategy)
+	}
+}
+
 // TestLookupRouteEmptyTenantStaysNoHint extends the same carve-out to
 // tenant_id: an unspecified tenant is a contract violation (the caller
 // didn't supply a required key), not a mismatch. Without this rule, the

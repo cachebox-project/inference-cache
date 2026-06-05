@@ -9,10 +9,11 @@ operators debug "100% `NO_HINT`" without re-deriving the layering from
 captured packets.
 
 This is a **wire-level addition only** — no proto schema or field-number
-change (the `proto/` edit in this PR is a comment widening the documented
-`reason_code` value list; the regenerated stub picks up the comment, no
-binary-format change). `reason_code` is a `string`, and old clients degrade
-`UNKNOWN_*` to their `NO_HINT` default per the forward-compatibility rule in
+change. The `proto/` edit that introduced the codes only widened the inline
+comment on the `reason_code` field; the regenerated stubs picked up the
+comment, with no binary-format change. `reason_code` is a `string`, and old
+clients degrade `UNKNOWN_*` to their `NO_HINT` default per the
+forward-compatibility rule in
 [`../reference/reason-codes.md`](../reference/reason-codes.md).
 
 ## 1. The silent-failure pattern this closes
@@ -73,6 +74,15 @@ The rule does **not** apply to:
   doesn't match anything we have" — emitting them for a missing field
   would be misleading guidance ("change your value" when the actual fix
   is "supply the field").
+- **A globally empty index (cold-start carve-out).** When the server
+  holds zero prefix entries — fresh start before any
+  `ReportCacheState` lands, a fully drained cluster — every tenant
+  query would otherwise classify as `UNKNOWN_TENANT`, flooding
+  gateways with configuration-error signals during normal operation.
+  The classifier short-circuits the globally-empty case to `NO_HINT`;
+  the diagnostic resumes the moment any replica reports, which is the
+  asymmetric case the SDK guidance is targeted at (one tenant
+  populated, the gateway pointing at another).
 - **Policy-gate misses.** The `CachePolicy.spec.minimumPrefixTokens` short-
   circuit returns `NO_HINT` because the lookup never touched the index;
   there's no key-level mismatch to surface.
@@ -112,8 +122,9 @@ On a `LookupRoute` request the server runs (in order):
    `TENANT_HOT`. Untouched.
 5. **Contract-key classification (new)** — runs *only* if step 3 (and step 4
    for non-chain requests) found no candidates and the request supplied a
-   non-empty `hash_scheme`. Walks the key triple outer-to-inner (widest
-   scope first) and emits the first level that has no data:
+   non-empty `hash_scheme`. Short-circuits the cold-start case (globally
+   empty index → `NO_HINT`), then walks the key triple outer-to-inner
+   (widest scope first) and emits the first level that has no data:
    `UNKNOWN_TENANT` → `UNKNOWN_MODEL` → `UNKNOWN_HASH_SCHEME`. If every level
    is populated, the miss is a genuinely novel prefix → `NO_HINT` (the
    existing fail-open default).
@@ -163,8 +174,8 @@ When a gateway-SDK sees `UNKNOWN_TENANT`, the operator playbook is:
    is sending.
 
 A future kvevent-subscriber change to emit additional tenant aliases (e.g.
-also the engine pod's owning Deployment's namespace) is tracked separately
-and is **not** part of this PR.
+also the engine pod's owning Deployment's namespace) is tracked
+separately.
 
 ## 6. Metrics
 
