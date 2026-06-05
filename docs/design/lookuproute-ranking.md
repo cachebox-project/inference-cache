@@ -43,8 +43,14 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the
-state. If no replica holds the prefix, the result is empty with
-`reason_code: NO_HINT` and the gateway falls back.
+state. If no replica holds the prefix, the result is empty; the
+accompanying `reason_code` is `NO_HINT` when the miss is a same-key novel
+prefix (or when the cold-start / empty-key carve-outs apply), or one of
+the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` /
+`UNKNOWN_HASH_SCHEME`) when the miss-classifier identifies a
+contract-key mismatch — see
+[`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md). Either way
+the gateway falls back to its default routing policy.
 
 This is the cache plane's job at its simplest. Everything else in this doc
 *layers on top of this formula* — it never replaces it. When the new
@@ -144,10 +150,15 @@ A few details that matter for correctness:
   of some unrelated chain (because the bytes happen to collide) doesn't
   show up as a partial match against this request. The leading-run rule
   is enforced by where we initialize, not by separate position tracking.
-- **`reason_code` is unchanged.** Any non-empty match — one block or
-  the whole chain — is `PREFIX_MATCH`. `NO_HINT` only fires when nobody
-  holds block 0 (or whenever the engine-opaque guards fire — empty
-  `hash_scheme`, mismatched parallel-array lengths, etc.).
+- **`reason_code` is unchanged on the match side.** Any non-empty match
+  — one block or the whole chain — is `PREFIX_MATCH`. On a miss, the
+  request goes through the same miss-classifier as the exact-match
+  path: a same-key first-block miss yields `NO_HINT`; a contract-key
+  mismatch yields the matching `UNKNOWN_*` code (see
+  [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)). The
+  engine-opaque guards (empty `hash_scheme`, mismatched parallel-array
+  lengths) and the cold-start carve-out continue to surface as
+  `NO_HINT`.
 
 ### Worked example — 5 blocks, 3 deep
 

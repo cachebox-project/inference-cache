@@ -97,11 +97,11 @@ For `LookupRoute` that gives three additive codes on top of the existing vocabul
 
 | Code | Emitted when |
 |---|---|
-| `UNKNOWN_TENANT` | The request supplied a non-empty `tenant_id` and the index has **zero prefix entries for that tenant** across every model and hash scheme. |
+| `UNKNOWN_TENANT` | The request supplied a non-empty `tenant_id`, the index is **not globally empty**, and that `tenant_id` has **zero prefix entries** across every model and hash scheme. |
 | `UNKNOWN_MODEL` | The tenant is known but the `(tenant_id, model_id)` pair has **zero entries**. |
 | `UNKNOWN_HASH_SCHEME` | `(tenant_id, model_id)` has entries, but **none under the request's `hash_scheme`** (e.g. ingest under `vllm`, lookup under `vllm-v1`). |
 
-Diagnostic classification runs after the prefix-match miss, and after the `TENANT_HOT` fallback miss for non-chain requests; chain-bearing requests skip `TENANT_HOT` entirely (by design — a soft locality nudge is the wrong answer to a longest-prefix question) and go straight to the classifier. The miss-classification is identical for both paths.
+Diagnostic classification runs after the prefix-match miss, and after the `TENANT_HOT` fallback miss for non-chain requests; chain-bearing requests skip `TENANT_HOT` entirely (by design — a soft locality nudge is the wrong answer to a longest-prefix question) and go straight to the classifier. The miss-classification is identical for both paths. A **cold-start carve-out** keeps a globally empty index on `NO_HINT` — without it a freshly-started server would surface `UNKNOWN_TENANT` for every query until the first `ReportCacheState` lands, flooding gateways with configuration-error signals during normal operation. The diagnostic resumes the moment any replica reports state, which is the asymmetric configuration-drift case the codes are targeted at.
 
 Codes are emitted in **outer-to-inner scope order** — tenant first, then model within tenant, then scheme within (tenant, model) — so the caller always learns the **outermost** mismatched key (the one that has to be fixed first regardless of whether the deeper-scoped keys are right). An empty `tenant_id`, `model_id`, or `hash_scheme` is a contract violation (not a mismatch) and continues to surface as `NO_HINT`; the diagnostic codes diagnose set-but-wrong keys only. `TIMEOUT`, `PREFIX_MATCH`, and `TENANT_HOT` semantics are unchanged.
 
