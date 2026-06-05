@@ -928,12 +928,20 @@ func sortScoresDescByScoreThenID(scores []ReplicaScore) {
 // The UNKNOWN_* strategies return empty Scores — fail-open semantics are
 // unchanged from NO_HINT; the diagnostic only narrows the reason code.
 func (i *Index) LookupRoute(req LookupRequest) LookupResult {
-	// Empty/unspecified hash_scheme fails open across BOTH strategies. The
-	// prefix-match path already guards this in Lookup, but the TENANT_HOT
-	// fallback keys only on (tenant, model) and would otherwise still emit
-	// a hint — that violates the contract: a request the engine domain of
-	// can't be identified must produce NO_HINT, not a soft locality nudge.
-	if req.HashScheme == "" {
+	// Empty/unspecified contract keys fail open before any prefix-match,
+	// TENANT_HOT, or diagnostic logic runs. The contract requires
+	// tenant_id, model_id, and hash_scheme to be supplied; a request that
+	// omits any of them is a contract violation, not a key mismatch. The
+	// hash_scheme short-circuit also protected against the TENANT_HOT
+	// fallback emitting a hint for an unidentified engine domain; the
+	// tenant/model short-circuits additionally protect against
+	// equally-broken producer state — entries indexed under Tenant: ""
+	// or Model: "" (e.g. the DefaultTenantSentinel bucket the cluster
+	// aggregate counts) would otherwise produce a real PREFIX_MATCH or
+	// TENANT_HOT hint for an empty-key caller. The classifyMiss empty-key
+	// guard alone is not enough: it only runs on a miss path, so a
+	// matching empty-key prefix lookup would bypass it entirely.
+	if req.Tenant == "" || req.Model == "" || req.HashScheme == "" {
 		return LookupResult{Strategy: StrategyNone}
 	}
 	// Chain-bearing requests short-circuit on ANY chain failure (malformed
@@ -1483,17 +1491,12 @@ func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme strin
 // in a single call). The caller (LookupRoute) takes no other locks across
 // this call, so there is no lock-ordering concern.
 //
-// Empty-key carve-out: the UNKNOWN_* codes diagnose SET-but-wrong contract
-// keys (the silent-failure patterns from a real cluster — gateway-SDK sends
-// "vllm-v1" while producers ship under "vllm"; gateway-SDK sends "default"
-// while producers ship under $(POD_NAMESPACE)). A request that simply fails
-// to supply a required key is a contract violation, not a mismatch — same
-// shape as empty hash_scheme (already short-circuited in LookupRoute). Such
-// requests stay on the fail-open NO_HINT path; emitting UNKNOWN_TENANT for a
-// missing-field caller would be misleading guidance ("change your value"
-// when the actual fix is "supply the field").
+// Preconditions enforced by LookupRoute (the only caller): req.Tenant,
+// req.Model, and req.HashScheme are all non-empty. Missing-key requests are
+// short-circuited at the top of LookupRoute and never reach this function,
+// so no empty-key guard is needed here.
 //
-// Cold-start carve-out: a globally-empty index also stays on NO_HINT (every
+// Cold-start carve-out: a globally-empty index stays on NO_HINT (every
 // tenant query would otherwise classify as UNKNOWN_TENANT before any
 // ReportCacheState lands). The UNKNOWN_* codes are meant to signal "you
 // queried with a key that does not match what I hold" — but during cold
@@ -1503,9 +1506,6 @@ func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme strin
 // guidance is targeted at (one tenant populated, the gateway pointing at
 // another).
 func (i *Index) classifyMiss(req LookupRequest) Strategy {
-	if req.Tenant == "" || req.Model == "" {
-		return StrategyNone
-	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	if len(i.prefixes) == 0 {

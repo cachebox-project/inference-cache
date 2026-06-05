@@ -291,6 +291,57 @@ func TestLookupRouteUnknownTenantOnlyWhenIndexHasData(t *testing.T) {
 	}
 }
 
+// TestLookupRouteEmptyTenantFailsOpenEvenWhenIngestedUnderEmpty pins the
+// real failure mode the empty-tenant rule has to prevent: bad producer
+// state could index entries under Tenant: "" (the DefaultTenantSentinel
+// bucket exists for cluster-aggregate purposes), and a lookup with the
+// matching empty tenant would otherwise HIT and return PREFIX_MATCH.
+// The fail-open contract for missing keys requires the lookup itself to
+// short-circuit, BEFORE prefix matching can find a match against
+// equally-broken data. Otherwise the empty-key carve-out in classifyMiss
+// is dead code on the failure mode it was meant to handle.
+func TestLookupRouteEmptyTenantFailsOpenEvenWhenIngestedUnderEmpty(t *testing.T) {
+	idx := New()
+	// Bad producer: indexes under empty tenant (the cluster-aggregate
+	// "untenanted" bucket). Cluster-side aggregates count this, but a
+	// LookupRoute caller with an empty tenant must NOT receive it as a
+	// hint — the empty key is a contract violation, not a tenant match.
+	idx.Ingest(Update{
+		ReplicaID: "r1", Model: "m", Tenant: "", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}},
+	})
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "m", Tenant: "", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyNone {
+		t.Fatalf("empty tenant_id must short-circuit BEFORE the prefix match runs (even if equally-broken data is indexed); got %v", got.Strategy)
+	}
+	if len(got.Scores) != 0 {
+		t.Fatalf("empty-tenant lookup must carry no scores; got %+v", got.Scores)
+	}
+}
+
+// TestLookupRouteEmptyModelFailsOpenEvenWhenIngestedUnderEmpty pins the
+// symmetric guarantee for empty model_id — same bad-producer-state shape.
+func TestLookupRouteEmptyModelFailsOpenEvenWhenIngestedUnderEmpty(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r1", Model: "", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}},
+	})
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyNone {
+		t.Fatalf("empty model_id must short-circuit BEFORE the prefix match runs; got %v", got.Strategy)
+	}
+	if len(got.Scores) != 0 {
+		t.Fatalf("empty-model lookup must carry no scores; got %+v", got.Scores)
+	}
+}
+
 // TestLookupRouteEmptyTenantStaysNoHint extends the same carve-out to
 // tenant_id: an unspecified tenant is a contract violation (the caller
 // didn't supply a required key), not a mismatch. Without this rule, the
