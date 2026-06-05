@@ -219,6 +219,19 @@ const (
 	// warm replicas (hit_rate-based). A coarser locality signal than prefix
 	// match. Handler emits TENANT_HOT.
 	StrategyTenantHot
+	// StrategyUnknownTenant — the request supplied a non-empty tenant_id and
+	// the index holds zero prefix entries for that tenant across every model
+	// and hash_scheme. Handler emits UNKNOWN_TENANT. See
+	// docs/design/lookuproute-diagnostics.md.
+	StrategyUnknownTenant
+	// StrategyUnknownModel — the tenant is known but the (tenant, model_id)
+	// pair has zero entries. Handler emits UNKNOWN_MODEL.
+	StrategyUnknownModel
+	// StrategyUnknownHashScheme — the (tenant, model_id) pair has entries,
+	// but none under the request's hash_scheme. Handler emits
+	// UNKNOWN_HASH_SCHEME — the scheme-mismatch case (e.g. ingest under
+	// "vllm", lookup under "vllm-v1").
+	StrategyUnknownHashScheme
 )
 
 // LookupResult is the orchestrated outcome of LookupRoute — the ranked
@@ -884,13 +897,20 @@ func sortScoresDescByScoreThenID(scores []ReplicaScore) {
 
 // LookupRoute is the orchestrated ranking entrypoint used by the gRPC
 // LookupRoute handler. It runs the prefix-match path first; on a miss it
-// falls back to TENANT_HOT (replicas warm for this tenant+model). The
-// returned Strategy tells the handler which contract reason_code to emit
-// (PREFIX_MATCH | TENANT_HOT | NO_HINT) — keeping that decision in the
-// index keeps the ranker pluggable and the handler stateless.
+// falls back to TENANT_HOT (replicas warm for this tenant+model); on a
+// miss of that too it runs the diagnostic miss classifier to surface a
+// specific contract-key mismatch (UNKNOWN_TENANT / UNKNOWN_MODEL /
+// UNKNOWN_HASH_SCHEME) when one of (tenant, model, hash_scheme) does not
+// match any data held. The returned Strategy tells the handler which
+// contract reason_code to emit (PREFIX_MATCH | TENANT_HOT | NO_HINT |
+// UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME) — keeping that
+// decision in the index keeps the ranker pluggable and the handler
+// stateless. See docs/design/lookuproute-diagnostics.md.
 //
 // TENANT_HOT is intentionally a SOFTER hint than PREFIX_MATCH: there is no
 // prefix overlap, so MatchedTokens is 0 and the gateway is free to ignore.
+// The UNKNOWN_* strategies return empty Scores — fail-open semantics are
+// unchanged from NO_HINT; the diagnostic only narrows the reason code.
 func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	// Empty/unspecified hash_scheme fails open across BOTH strategies. The
 	// prefix-match path already guards this in Lookup, but the TENANT_HOT
@@ -915,7 +935,9 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 		if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
 			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
 		}
-		return LookupResult{Strategy: StrategyNone}
+		// Chain misses never fall through to TENANT_HOT (by design — see
+		// contract doc), so run the miss classifier directly.
+		return LookupResult{Strategy: i.classifyMiss(req)}
 	}
 	if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
 		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
@@ -925,7 +947,10 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 		// softer locality nudge, not a prefix HIT.
 		return LookupResult{Scores: hot, Strategy: StrategyTenantHot}
 	}
-	return LookupResult{Strategy: StrategyNone}
+	// Prefix miss + TENANT_HOT miss → diagnose which contract key (if any) is
+	// the mismatched one. A request whose keys are all populated but whose
+	// prefix is novel still lands at StrategyNone (the fail-open NO_HINT).
+	return LookupResult{Strategy: i.classifyMiss(req)}
 }
 
 // tenantHotCandidates returns replicas warm for (tenant, model) within the
@@ -1370,6 +1395,93 @@ func (i *Index) EntryCountsByModel() map[string]int {
 		counts[key.model]++
 	}
 	return counts
+}
+
+// HasAnyForTenant reports whether the index holds any prefix entries for the
+// tenant across every model and hash_scheme. O(1): backed by prefixesByTenant.
+// Used by LookupRoute's miss-path classifier (and exposed publicly so other
+// debugging / status surfaces can reuse it) to distinguish a wrong tenant_id
+// from a genuinely novel prefix — see docs/design/lookuproute-diagnostics.md.
+func (i *Index) HasAnyForTenant(tenant string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantLocked(tenant)
+}
+
+// HasAnyForTenantModel reports whether (tenant, model) has any prefix entries
+// across every hash_scheme. Backed by servingByScope (bounded by the number of
+// schemes registered for the (tenant, model), typically 1–2). Used by the miss
+// classifier to surface UNKNOWN_MODEL.
+func (i *Index) HasAnyForTenantModel(tenant, model string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantModelLocked(tenant, model)
+}
+
+// HasAnyForTenantModelScheme reports whether (tenant, model, hash_scheme) has
+// any prefix entries. O(1): backed by servingByScope. Used by the miss
+// classifier to surface UNKNOWN_HASH_SCHEME — the scheme-mismatch case
+// (ingest under "vllm", lookup under "vllm-v1").
+func (i *Index) HasAnyForTenantModelScheme(tenant, model, hashScheme string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme)
+}
+
+// hasAnyForTenantLocked is the lock-free variant. Caller holds at least the
+// read lock. The Locked split mirrors aggregateLocked/Aggregate so the miss
+// classifier can run all three checks under a single read-lock acquisition.
+func (i *Index) hasAnyForTenantLocked(tenant string) bool {
+	return i.prefixesByTenant[tenant] > 0
+}
+
+// hasAnyForTenantModelLocked scans servingByScope for any (tenant, model, *)
+// entry. Caller holds at least the read lock. The map is keyed by scope so
+// this is bounded by the number of (tenant, model, hash_scheme) triples in
+// the index — small for realistic workloads.
+func (i *Index) hasAnyForTenantModelLocked(tenant, model string) bool {
+	for scope, replicas := range i.servingByScope {
+		if scope.tenant == tenant && scope.model == model && len(replicas) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAnyForTenantModelSchemeLocked is the per-scope check. Caller holds at
+// least the read lock.
+func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme string) bool {
+	return len(i.servingByScope[scopeKey{tenant, model, hashScheme}]) > 0
+}
+
+// classifyMiss returns the diagnostic Strategy for a LookupRoute call whose
+// prefix lookup found nothing AND whose TENANT_HOT fallback (when applicable)
+// also did. It walks the contract keys in widening order — tenant, then
+// (tenant, model), then (tenant, model, hash_scheme) — and returns the first
+// level at which the index has no data. If every level is populated the miss
+// is a genuinely novel prefix → StrategyNone (the existing fail-open NO_HINT).
+//
+// The whole walk runs under one RLock acquisition so concurrent ingests can't
+// produce a contradictory classification (e.g. tenant unknown → tenant known
+// in a single call). The caller (LookupRoute) takes no other locks across
+// this call, so there is no lock-ordering concern.
+//
+// Empty hash_scheme is unreachable here: LookupRoute short-circuits an empty
+// scheme to StrategyNone before any prefix lookup runs (see grpc-contract
+// "engine-opaque hash_scheme" rule).
+func (i *Index) classifyMiss(req LookupRequest) Strategy {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if !i.hasAnyForTenantLocked(req.Tenant) {
+		return StrategyUnknownTenant
+	}
+	if !i.hasAnyForTenantModelLocked(req.Tenant, req.Model) {
+		return StrategyUnknownModel
+	}
+	if !i.hasAnyForTenantModelSchemeLocked(req.Tenant, req.Model, req.HashScheme) {
+		return StrategyUnknownHashScheme
+	}
+	return StrategyNone
 }
 
 // ttlFor returns the effective TTL for a tenant. A nil resolver, or one that

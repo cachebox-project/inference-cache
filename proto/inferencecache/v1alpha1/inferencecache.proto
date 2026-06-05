@@ -83,7 +83,7 @@ message ReplicaScore {
 
 message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
-  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT
+  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
   int64 lookup_latency_us = 3;
 }
 

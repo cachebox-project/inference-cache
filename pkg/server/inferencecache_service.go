@@ -19,6 +19,17 @@ const (
 	reasonNoHint      = "NO_HINT"
 	reasonTimeout     = "TIMEOUT"
 	reasonOK          = "OK"
+
+	// Diagnostic codes for LookupRoute contract-key mismatches. Emitted on
+	// the miss path when the index can tell the caller that one of
+	// (tenant_id, model_id, hash_scheme) does not match any data it holds —
+	// distinguishing a misconfigured gateway from a genuine novel prefix.
+	// Old clients degrade these to NO_HINT per the forward-compat rule, so
+	// callers that have not been updated continue to fail open. See
+	// docs/design/lookuproute-diagnostics.md.
+	reasonUnknownTenant     = "UNKNOWN_TENANT"
+	reasonUnknownModel      = "UNKNOWN_MODEL"
+	reasonUnknownHashScheme = "UNKNOWN_HASH_SCHEME"
 )
 
 // inferenceCacheService implements the InferenceCache contract
@@ -242,13 +253,20 @@ func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
 // reason_code vocabulary. StrategyNone collapses to NO_HINT — the fail-open
 // default; an unknown strategy is treated the same so a future Strategy
 // addition (e.g. block-level matching) won't surface as a junk reason code
-// before its mapping ships.
+// before its mapping ships. The diagnostic strategies (UNKNOWN_*) surface as
+// the matching contract codes — see docs/design/lookuproute-diagnostics.md.
 func reasonForStrategy(s index.Strategy) string {
 	switch s {
 	case index.StrategyPrefixMatch:
 		return reasonPrefixMatch
 	case index.StrategyTenantHot:
 		return reasonTenantHot
+	case index.StrategyUnknownTenant:
+		return reasonUnknownTenant
+	case index.StrategyUnknownModel:
+		return reasonUnknownModel
+	case index.StrategyUnknownHashScheme:
+		return reasonUnknownHashScheme
 	default:
 		return reasonNoHint
 	}

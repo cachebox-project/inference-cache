@@ -46,7 +46,7 @@ service InferenceCache {
   reason ∈ `OK | TEMPLATE_NOT_FOUND | RENDER_ERROR`
 - **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; }`
 - **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; }`
-  reason ∈ `PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT`
+  reason ∈ `PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME`
 - **LookupPDRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string pd_topology_ref; }`
 - **LookupPDRouteResponse** `{ string prefill_replica_id; string decode_replica_id; string transport_hint; string reason_code; }`
   transport_hint ∈ `Mooncake | NIXL | Direct`
@@ -86,6 +86,24 @@ Still out of scope (later modules): template rendering (D-series), PD routing (P
 **Update — B6 (CacheIndex status surface):** the cluster-wide aggregate is now exposed two ways: an internal HTTP `/snapshot` endpoint on the server (JSON; metadata only — replica/tenant stats + prefix counts, never KV/prompt data), and a cluster-scoped, status-only `CacheIndex` CRD (`kubectl get cacheindex`) that the controller maintains by scraping `/snapshot`. This is outside the gRPC contract (no proto change); see the `CacheIndex` type in `api/v1alpha1` and the `CacheIndexPoller` in `internal/controller`.
 
 **Update — B6 follow-up (`LookupRoute` ranking v2):** the `LookupRoute` ranker now layers three additive strategies on top of the original `matched_tokens × freshness` baseline, **without any proto change** (all inputs were already on the contract). Score becomes `matched_tokens × freshness × pressure_factor × slo_bias` where `pressure_factor = max(0, 1 - PressureWeight × ReplicaStats.pressure)` and `slo_bias = 1 + freshness × SLOTightBias` when `SLO.ttft_ms` is below a configurable threshold (otherwise 1). On a prefix miss, the server falls back to **`TENANT_HOT`**: ranked replicas that are warm for the request's `(tenant, model, hash_scheme)` — i.e. the replica has at least one prefix entry in the requested engine domain AND its latest stats are recent (within a configurable window, default 5m) with `hit_rate` above a floor (default 0.1). `TENANT_HOT` responses carry `matched_tokens=0` because there is no prefix overlap; the gateway must rely on `reason_code`, not `matched_tokens`, to recognize the soft hint. Every knob is tunable per binary and the formula collapses back to the baseline whenever its supporting input is absent (no stats → pressure=0 → factor 1; no SLO hint → bias 0; `TenantHotMaxAge=0` disables the fallback entirely). See [`lookuproute-ranking.md`](./lookuproute-ranking.md) and [`reason-codes.md`](../reference/reason-codes.md) for the full knob table.
+
+## Diagnostic reason codes
+
+`LookupRoute` distinguishes a *novel prefix* (the cache plane has the requested `(tenant_id, model_id, hash_scheme)` populated but not this particular prefix) from a *contract-key mismatch* (the caller asked with a key the cache plane does not recognize at all). The latter is almost always a misconfigured gateway/SDK; surfacing it as a specific `reason_code` is what lets operators debug "100% `NO_HINT`" without re-deriving the layering from packet captures. Closes the wrong-`hash_scheme` and wrong-`tenant_id` silent-miss patterns observed against real clusters.
+
+> **Rule.** Every contract key that can mismatch returns a specific `reason_code` on key-level no-data — not the catch-all `NO_HINT`.
+
+For `LookupRoute` that gives three additive codes on top of the existing vocabulary:
+
+| Code | Emitted when (after a prefix miss AND a `TENANT_HOT` miss) |
+|---|---|
+| `UNKNOWN_TENANT` | The request supplied a non-empty `tenant_id` and the index has **zero prefix entries for that tenant** across every model and hash scheme. |
+| `UNKNOWN_MODEL` | The tenant is known but the `(tenant_id, model_id)` pair has **zero entries**. |
+| `UNKNOWN_HASH_SCHEME` | `(tenant_id, model_id)` has entries, but **none under the request's `hash_scheme`** (e.g. ingest under `vllm`, lookup under `vllm-v1`). |
+
+Codes are emitted in widening order — tenant, then model within tenant, then scheme within (tenant, model) — so the caller learns the **most specific** mismatched key. An empty `hash_scheme` is a contract violation (not a mismatch) and continues to surface as `NO_HINT`; the diagnostic codes diagnose set-but-wrong keys only. `TIMEOUT`, `PREFIX_MATCH`, and `TENANT_HOT` semantics are unchanged.
+
+Old clients degrade `UNKNOWN_*` to their no-hint default per the forward-compatibility rule in [`../reference/reason-codes.md`](../reference/reason-codes.md), so the change is backward-compatible at v1alpha1. Gateway-SDKs that are updated should treat `UNKNOWN_*` like a configuration error (surface to a log/metric, **still fail open** — the cache plane is hint-only, never blocking); `NO_HINT` continues to mean "route normally". See [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md) for the full design (including SDK-author guidance on the `tenant_id = $(POD_NAMESPACE)` convention that producers use).
 
 ## Longest-prefix (block-level) matching
 

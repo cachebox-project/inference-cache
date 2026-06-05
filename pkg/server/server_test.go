@@ -803,15 +803,23 @@ func TestReportThenLookupReturnsPrefixMatch(t *testing.T) {
 		t.Fatalf("matched_tokens = %d, want 128", got)
 	}
 
-	// A different hash_scheme must not match the same bytes (engine isolation).
+	// A different hash_scheme must not match the same bytes (engine
+	// isolation). Post-diagnostics the classifier surfaces the more specific
+	// code — (tenant, model) is populated under vllm; the lookup asks under
+	// sglang — so the reason narrows from NO_HINT to UNKNOWN_HASH_SCHEME.
+	// The cross-scheme no-leak property is unchanged: no replica score
+	// appears.
 	other, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
 		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "sglang", PrefixHash: prefix,
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute (other scheme): %v", err)
 	}
-	if other.GetReasonCode() != "NO_HINT" {
-		t.Fatalf("cross-scheme reason = %q, want NO_HINT", other.GetReasonCode())
+	if other.GetReasonCode() != "UNKNOWN_HASH_SCHEME" {
+		t.Fatalf("cross-scheme reason = %q, want UNKNOWN_HASH_SCHEME (scheme-mismatch diagnostic)", other.GetReasonCode())
+	}
+	if len(other.GetReplicaScores()) != 0 {
+		t.Fatalf("cross-scheme lookup must yield no scores; got %+v", other.GetReplicaScores())
 	}
 }
 
