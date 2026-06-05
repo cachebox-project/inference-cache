@@ -154,10 +154,12 @@ func TestLookupRouteClassifiesUnknownHashScheme(t *testing.T) {
 	}
 }
 
-// TestLookupRouteWideningOrder pins the rule that the MOST SPECIFIC mismatched
-// key wins. A request with both a wrong tenant AND a wrong model receives the
-// outermost diagnostic (UNKNOWN_TENANT) — once the tenant is unknown the server
-// cannot meaningfully say whether the model would have been right.
+// TestLookupRouteWideningOrder pins the rule that the OUTERMOST (widest-scope)
+// mismatched key wins. A request with both a wrong tenant AND a wrong model
+// receives UNKNOWN_TENANT — once the tenant is unknown the server cannot
+// meaningfully say whether the model would have been right under a
+// hypothetical correct tenant, so it reports the wider-scope failure that the
+// caller has to fix first regardless.
 func TestLookupRouteWideningOrder(t *testing.T) {
 	idx := New()
 	idx.Ingest(Update{
