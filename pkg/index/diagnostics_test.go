@@ -244,6 +244,47 @@ func TestLookupRouteEmptyHashSchemeStaysNoHint(t *testing.T) {
 	}
 }
 
+// TestLookupRouteEmptyTenantStaysNoHint extends the same carve-out to
+// tenant_id: an unspecified tenant is a contract violation (the caller
+// didn't supply a required key), not a mismatch. Without this rule, the
+// untenanted bucket (key.tenant == "") becomes a load-bearing "tenant" and
+// any caller that fails to set the field gets a misleading UNKNOWN_TENANT
+// — which the docs reserve for callers that supplied a value that does
+// not match anything held. Symmetric to the empty-hash_scheme rule.
+func TestLookupRouteEmptyTenantStaysNoHint(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}},
+	})
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "m", Tenant: "", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyNone {
+		t.Fatalf("empty tenant_id is a contract violation, not a mismatch; must stay StrategyNone (NO_HINT), got %v", got.Strategy)
+	}
+}
+
+// TestLookupRouteEmptyModelStaysNoHint extends the carve-out to model_id —
+// same shape as the tenant and hash_scheme rules. An unspecified model is a
+// missing key, not a wrong-value mismatch, so it must NOT surface as
+// UNKNOWN_MODEL.
+func TestLookupRouteEmptyModelStaysNoHint(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{
+		ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 10}},
+	})
+
+	got := idx.LookupRoute(LookupRequest{
+		Model: "", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p"),
+	})
+	if got.Strategy != StrategyNone {
+		t.Fatalf("empty model_id is a contract violation, not a mismatch; must stay StrategyNone (NO_HINT), got %v", got.Strategy)
+	}
+}
+
 // TestLookupRouteTenantHotStillFires guards against a layering bug where the
 // new classifier could shadow TENANT_HOT. When TENANT_HOT's preconditions are
 // met (warm stats + at least one prefix entry in the requested

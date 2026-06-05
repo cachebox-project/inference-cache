@@ -204,9 +204,10 @@ type ReplicaScore struct {
 	EstimatedCacheHitProb float32
 }
 
-// Strategy names which ranking path produced a LookupResult, so the gRPC
-// handler can map it to the contract's reason_code vocabulary
-// (PREFIX_MATCH | TENANT_HOT | NO_HINT) without re-running the index logic.
+// Strategy names which ranking-or-classification path produced a LookupResult,
+// so the gRPC handler can map it to the contract's reason_code vocabulary
+// (PREFIX_MATCH | TENANT_HOT | NO_HINT | UNKNOWN_TENANT | UNKNOWN_MODEL |
+// UNKNOWN_HASH_SCHEME) without re-running the index logic.
 type Strategy int
 
 const (
@@ -274,8 +275,11 @@ func (r LookupResult) CreditHits() {
 //	               = 1                                              // otherwise
 //
 // PressureWeight = 0 disables the penalty (pressureFactor=1). SLOTightBias
-// = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables the
-// TENANT_HOT fallback entirely (LookupRoute returns NO_HINT on prefix-miss).
+// = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables only
+// the TENANT_HOT fallback (a prefix miss whose keys all populate the index
+// goes straight to NO_HINT instead of trying for a tenant-warm hint); the
+// miss-classifier still runs, so a prefix miss with a mismatched contract
+// key still surfaces as the matching UNKNOWN_* code.
 type RankerConfig struct {
 	PressureWeight      float32
 	SLOTightTTFTMs      int32
@@ -389,6 +393,17 @@ type Index struct {
 	// prefixes.summary.total.
 	prefixesByTenant map[string]int
 
+	// prefixesByTenantModel mirrors prefixesByTenant at (tenant, model)
+	// granularity, so HasAnyForTenantModel (the LookupRoute miss-classifier
+	// UNKNOWN_MODEL check) is O(1) instead of iterating servingByScope. Same
+	// counted unit (distinct prefix key) and same maintenance invariants:
+	// bumped on first-sight of a new prefix key for the (tenant, model);
+	// dropped when the key's last replica leaves. Without this secondary
+	// index a sustained misconfigured client (e.g. a gateway pinned to the
+	// wrong model_id) would put a global servingByScope scan on the miss
+	// path, scaling with the cluster's scope count instead of staying O(1).
+	prefixesByTenantModel map[modelKey]int
+
 	// servingByScope counts, for each (tenant, model, hash_scheme), how many
 	// distinct prefix entries each replica currently holds. It exists purely
 	// to give the TENANT_HOT fallback an O(1) "does replica R serve scope S?"
@@ -463,17 +478,18 @@ func withClock(now func() time.Time) Option { return func(i *Index) { i.now = no
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
 	i := &Index{
-		ttl:              DefaultTTL,
-		sweepInterval:    DefaultSweepInterval,
-		maxEntries:       DefaultMaxEntries,
-		now:              time.Now,
-		ranker:           DefaultRankerConfig(),
-		prefixes:         make(map[prefixKey]map[string]*replicaEntry),
-		stats:            make(map[statsKey]statEntry),
-		prefixesByTenant: make(map[string]int),
-		servingByScope:   make(map[scopeKey]map[string]int),
-		replicasByModel:  make(map[modelKey]map[string]struct{}),
-		reportedModels:   make(map[string]struct{}),
+		ttl:                   DefaultTTL,
+		sweepInterval:         DefaultSweepInterval,
+		maxEntries:            DefaultMaxEntries,
+		now:                   time.Now,
+		ranker:                DefaultRankerConfig(),
+		prefixes:              make(map[prefixKey]map[string]*replicaEntry),
+		stats:                 make(map[statsKey]statEntry),
+		prefixesByTenant:      make(map[string]int),
+		prefixesByTenantModel: make(map[modelKey]int),
+		servingByScope:        make(map[scopeKey]map[string]int),
+		replicasByModel:       make(map[modelKey]map[string]struct{}),
+		reportedModels:        make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -925,8 +941,10 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	// fall through to TENANT_HOT. The chain caller is asking specifically
 	// for longest-prefix matching; surfacing an unrelated tenant-warm
 	// replica as a soft locality nudge would be a wrong hint against what
-	// they explicitly requested. The contract doc spells this out:
-	// "NO_HINT when no replica matches the first block."
+	// they explicitly requested. Same-key chain misses surface as NO_HINT
+	// (the genuine novel-prefix case); chain misses with a mismatched
+	// contract key surface as the matching UNKNOWN_* code via the
+	// miss-classifier below — same diagnostic surface as the exact path.
 	chainBearing := len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0
 	if chainBearing {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
@@ -1409,9 +1427,10 @@ func (i *Index) HasAnyForTenant(tenant string) bool {
 }
 
 // HasAnyForTenantModel reports whether (tenant, model) has any prefix entries
-// across every hash_scheme. Backed by servingByScope (bounded by the number of
-// schemes registered for the (tenant, model), typically 1–2). Used by the miss
-// classifier to surface UNKNOWN_MODEL.
+// across every hash_scheme. O(1): backed by prefixesByTenantModel. Used by
+// the miss classifier to surface UNKNOWN_MODEL — must stay O(1) so a
+// sustained misconfigured client (a gateway pinned to the wrong model_id)
+// can't put a global scan on the LookupRoute miss path.
 func (i *Index) HasAnyForTenantModel(tenant, model string) bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -1435,17 +1454,12 @@ func (i *Index) hasAnyForTenantLocked(tenant string) bool {
 	return i.prefixesByTenant[tenant] > 0
 }
 
-// hasAnyForTenantModelLocked scans servingByScope for any (tenant, model, *)
-// entry. Caller holds at least the read lock. The map is keyed by scope so
-// this is bounded by the number of (tenant, model, hash_scheme) triples in
-// the index — small for realistic workloads.
+// hasAnyForTenantModelLocked is the O(1) (tenant, model) presence check.
+// Caller holds at least the read lock. Backed by prefixesByTenantModel,
+// which upsert/removeReplicaLocked maintain in lockstep with the prefix map
+// at distinct-prefix-key granularity (same unit as prefixesByTenant).
 func (i *Index) hasAnyForTenantModelLocked(tenant, model string) bool {
-	for scope, replicas := range i.servingByScope {
-		if scope.tenant == tenant && scope.model == model && len(replicas) > 0 {
-			return true
-		}
-	}
-	return false
+	return i.prefixesByTenantModel[modelKey{tenant, model}] > 0
 }
 
 // hasAnyForTenantModelSchemeLocked is the per-scope check. Caller holds at
@@ -1466,10 +1480,19 @@ func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme strin
 // in a single call). The caller (LookupRoute) takes no other locks across
 // this call, so there is no lock-ordering concern.
 //
-// Empty hash_scheme is unreachable here: LookupRoute short-circuits an empty
-// scheme to StrategyNone before any prefix lookup runs (see grpc-contract
-// "engine-opaque hash_scheme" rule).
+// Empty-key carve-out: the UNKNOWN_* codes diagnose SET-but-wrong contract
+// keys (the silent-failure patterns from a real cluster — gateway-SDK sends
+// "vllm-v1" while producers ship under "vllm"; gateway-SDK sends "default"
+// while producers ship under $(POD_NAMESPACE)). A request that simply fails
+// to supply a required key is a contract violation, not a mismatch — same
+// shape as empty hash_scheme (already short-circuited in LookupRoute). Such
+// requests stay on the fail-open NO_HINT path; emitting UNKNOWN_TENANT for a
+// missing-field caller would be misleading guidance ("change your value"
+// when the actual fix is "supply the field").
 func (i *Index) classifyMiss(req LookupRequest) Strategy {
+	if req.Tenant == "" || req.Model == "" {
+		return StrategyNone
+	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	if !i.hasAnyForTenantLocked(req.Tenant) {
@@ -1538,8 +1561,11 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 		replicas = make(map[string]*replicaEntry)
 		i.prefixes[key] = replicas
 		// First replica of a brand-new prefix key → one more distinct prefix
-		// for this tenant (the maxIndexEntries unit).
+		// for this tenant (the maxIndexEntries unit), and one more for the
+		// (tenant, model) bucket the miss-classifier's UNKNOWN_MODEL check
+		// reads.
 		i.prefixesByTenant[key.tenant]++
+		i.prefixesByTenantModel[modelKey{key.tenant, key.model}]++
 	}
 	e, existed := replicas[replicaID]
 	if !existed {
@@ -1567,11 +1593,17 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]*replicaE
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
 		// Last replica gone → the prefix key is removed → one fewer distinct
-		// prefix for this tenant.
+		// prefix for this tenant AND for the (tenant, model) bucket.
 		if n := i.prefixesByTenant[key.tenant] - 1; n <= 0 {
 			delete(i.prefixesByTenant, key.tenant)
 		} else {
 			i.prefixesByTenant[key.tenant] = n
+		}
+		mk := modelKey{key.tenant, key.model}
+		if n := i.prefixesByTenantModel[mk] - 1; n <= 0 {
+			delete(i.prefixesByTenantModel, mk)
+		} else {
+			i.prefixesByTenantModel[mk] = n
 		}
 	}
 	// Drop the replica from the (tenant, model, hash_scheme) serving count

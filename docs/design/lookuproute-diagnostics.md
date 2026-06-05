@@ -8,9 +8,12 @@ gateway/SDK, and surfacing it as a specific `reason_code` is what lets
 operators debug "100% `NO_HINT`" without re-deriving the layering from
 captured packets.
 
-This is a **wire-level addition only** — no proto change. `reason_code` is a
-`string`, and old clients degrade `UNKNOWN_*` to their `NO_HINT` default per the
-forward-compatibility rule in [`../reference/reason-codes.md`](../reference/reason-codes.md).
+This is a **wire-level addition only** — no proto schema or field-number
+change (the `proto/` edit in this PR is a comment widening the documented
+`reason_code` value list; the regenerated stub picks up the comment, no
+binary-format change). `reason_code` is a `string`, and old clients degrade
+`UNKNOWN_*` to their `NO_HINT` default per the forward-compatibility rule in
+[`../reference/reason-codes.md`](../reference/reason-codes.md).
 
 ## 1. The silent-failure pattern this closes
 
@@ -62,11 +65,14 @@ contract-diagnostics pattern.
 
 The rule does **not** apply to:
 
-- **Keys the caller failed to supply.** An empty `hash_scheme` is a contract
-  violation (the request is missing a required scoping field), not a
-  mismatch. Empty-key cases continue to surface as `NO_HINT` per the existing
-  fail-open semantics. The `UNKNOWN_*` codes specifically diagnose "you
-  supplied a value but it doesn't match anything we have."
+- **Keys the caller failed to supply.** An empty `tenant_id`, `model_id`,
+  or `hash_scheme` is a contract violation (the request is missing a
+  required scoping field), not a mismatch. Empty-key cases continue to
+  surface as `NO_HINT` per the existing fail-open semantics. The
+  `UNKNOWN_*` codes specifically diagnose "you supplied a value but it
+  doesn't match anything we have" — emitting them for a missing field
+  would be misleading guidance ("change your value" when the actual fix
+  is "supply the field").
 - **Policy-gate misses.** The `CachePolicy.spec.minimumPrefixTokens` short-
   circuit returns `NO_HINT` because the lookup never touched the index;
   there's no key-level mismatch to surface.
@@ -109,8 +115,11 @@ On a `LookupRoute` request the server runs (in order):
 
 The classification runs only on a miss, so it never adds work to the hot path
 of a healthy gateway — `PREFIX_MATCH` and `TENANT_HOT` short-circuit before
-it. The lookups it does are all O(1) against existing secondary indexes
-(`prefixesByTenant`, `servingByScope`), so the miss path stays cheap.
+it. The three lookups it does are all O(1) against secondary indexes
+maintained in lockstep with the prefix map (`prefixesByTenant`,
+`prefixesByTenantModel`, and per-scope `servingByScope`), so the miss path
+stays cheap even when a sustained misconfigured client puts the diagnostic
+path under load.
 
 Chain-bearing requests run the same classification as the exact path on a
 prefix miss (they do not fall through to `TENANT_HOT` by design — see

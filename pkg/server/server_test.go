@@ -1293,11 +1293,14 @@ func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
 
 // TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot is the symmetric
 // guard to TestLookupRouteMalformedChainNeverFallsThroughToTenantHot: a
-// chain-bearing request with no first-block match must hard-stop at NO_HINT,
-// not surface a TENANT_HOT hint against an unrelated warm replica. The
-// chain caller asked specifically for longest-prefix matching; a soft
-// locality nudge is not what they requested and "no overlap → NO_HINT" is
-// the documented contract.
+// chain-bearing request with no first-block match (under matching contract
+// keys — same (tenant, model, hash_scheme) as the warm replica) must
+// hard-stop at NO_HINT, not surface a TENANT_HOT hint against an unrelated
+// warm replica. The chain caller asked specifically for longest-prefix
+// matching; a soft locality nudge is not what they requested. (Chain
+// misses with a MISMATCHED contract key surface as the matching UNKNOWN_*
+// code instead — that path is covered by the diagnostics tests; this test
+// is about the same-key novel-chain case.)
 func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
 	svc := newTestService()
 	svc.index.Ingest(index.Update{
