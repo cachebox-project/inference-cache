@@ -92,12 +92,14 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// LookupRoute" contract. Fail open with NO_HINT. The metric is still
 	// observed (reason_code=NO_HINT, hint_used=false, latency=0) so the
 	// "one increment per LookupRoute call" contract on
-	// inferencecache_lookup_route_calls_total stays intact — a future
-	// dashboard slicing the metric on tenant_id would surface
-	// "any external traffic against the reserved tenant" as an attempted
-	// probe-scope probe, which is itself a useful operator signal. The
-	// legitimate probe path uses index.LookupRoute directly, not the gRPC
-	// handler.
+	// inferencecache_lookup_route_calls_total stays intact — every external
+	// LookupRoute call is counted in the unified NO_HINT bucket regardless
+	// of which short-circuit produced it. (The metric is labeled by
+	// model / reason_code / hint_used only, not tenant_id, so the bucket
+	// doesn't isolate "reserved-tenant traffic specifically" today; that
+	// would require a schema change owned by the standalone F-series
+	// metric work.) The legitimate probe path uses index.LookupRoute
+	// directly, not the gRPC handler.
 	if tenant == ProbeTenantID {
 		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)

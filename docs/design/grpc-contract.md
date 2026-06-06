@@ -72,6 +72,7 @@ service InferenceCache {
 - **Deterministic `RenderTemplate`** for a fixed `(template_ref, variables, template_revision)`.
 - **Metadata only**: `CacheStateUpdate` / `PrefixEntry` carry hashes + stats, **never KV tensors or prompt text**.
 - **Additive `CacheStateUpdate`**: updates are **incremental deltas (adds/refreshes), not full snapshots** — a replica's prefixes are *not* pruned by their absence from a later update. Removals arrive as `CacheEvent` (`PREFIX_EVICTED` / `ALL_CLEARED`) or expire via TTL. This matches the engine KV-event model (vLLM `BlockStored` / `BlockRemoved`); a stale entry yields a cache miss, never a wrong answer (soft state).
+- **Reserved `tenant_id` namespace.** `tenant_id = "inferencecache.io/probe"` is reserved for the server's functional self-test and is treated specially across the contract: `LookupRoute` returns empty `replica_scores` with `reason_code: NO_HINT`; `GetCacheState` returns the empty aggregate; `ReportCacheState` / `PublishEvent` silently drop messages targeting it; `/snapshot` excludes its replicas, prefixes, and tenant row from the cluster aggregate. External callers cannot read or write the reserved scope through the public contract, and the `CacheTenant` admission webhook rejects CRs that newly claim `spec.tenantID = inferencecache.io/probe`. See [`policy-propagation.md` §`/probe` wire contract](./policy-propagation.md) for the in-process probe path that bypasses the gRPC handlers.
 
 ## Scope of B4 (this contract)
 
