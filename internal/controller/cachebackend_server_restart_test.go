@@ -20,14 +20,18 @@ import (
 )
 
 // cascadeRestartFixture builds a fake-client-backed reconciler plus a fully
-// wired managed CacheBackend with one Ready cache-server pod and one
-// engine Deployment+ReplicaSet+Pod that the webhook has injected against
-// the backend. Shared by every cascade test so each scenario only
-// expresses what's different (UID, status, rate-limit window, …) and the
-// boring setup stays terse.
+// wired managed CacheBackend with one Ready cache-server pod (transitively
+// owned by the CacheBackend-owned Deployment+ReplicaSet, the way the apps
+// controller stack would create them) and one engine
+// Deployment+ReplicaSet+Pod that the webhook has injected against the
+// backend. Shared by every cascade test so each scenario only expresses
+// what's different (UID, status, rate-limit window, …) and the boring
+// setup stays terse.
 type cascadeRestartFixture struct {
 	r          *CacheBackendReconciler
 	backend    *cachev1alpha1.CacheBackend
+	serverDep  *appsv1.Deployment
+	serverRS   *appsv1.ReplicaSet
 	serverPod  *corev1.Pod
 	engineDep  *appsv1.Deployment
 	engineRS   *appsv1.ReplicaSet
@@ -69,19 +73,53 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 		},
 	}
 
-	// The "current Ready" cache-server pod the controller observes. Labeled
-	// with the exact selectorLabels() set so currentServerInstanceUID's
-	// List finds it.
+	tru := true
+	// Cache-server Deployment+ReplicaSet the reconciler "owns" — the
+	// transitive owner chain currentServerInstanceUID's strengthened
+	// ownership check requires to attribute a Ready pod to this backend.
+	f.serverDep = &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      f.cacheName,
+			Namespace: f.cacheNS,
+			UID:       "cache-dep-uid",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selectorLabels(f.cacheName)},
+			},
+		},
+	}
+	f.serverRS = &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      f.cacheName + "-rs",
+			Namespace: f.cacheNS,
+			UID:       "cache-rs-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       f.cacheName,
+				UID:        f.serverDep.UID,
+				Controller: &tru,
+			}},
+		},
+	}
+	// The "current Ready" cache-server pod the controller observes.
+	// Labeled with the exact selectorLabels() set and owner-referenced
+	// up the chain to serverDep so currentServerInstanceUID's transitive
+	// ownership check admits it.
 	f.serverPod = &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "cache-pod-aaa",
 			Namespace: f.cacheNS,
 			UID:       "cache-pod-uid-1",
-			Labels: map[string]string{
-				"app.kubernetes.io/name":       "cachebackend",
-				"app.kubernetes.io/instance":   f.cacheName,
-				"app.kubernetes.io/managed-by": "inference-cache-controller",
-			},
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -107,7 +145,6 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 			},
 		},
 	}
-	tru := true
 	f.engineRS = &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      f.engineDepN + "-rs",
@@ -145,7 +182,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).
-		WithObjects(f.backend, f.serverPod, f.engineDep, f.engineRS, f.enginePod).
+		WithObjects(f.backend, f.serverDep, f.serverRS, f.serverPod, f.engineDep, f.engineRS, f.enginePod).
 		Build()
 	f.r = &CacheBackendReconciler{
 		Client:                          c,
@@ -155,7 +192,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 		serverInstanceCascade:           newServerInstanceCascade(),
 	}
 
-	ResetBackendServerRestartsTotalForTest()
+	resetBackendServerRestartsTotalForTest()
 	return f
 }
 
@@ -317,12 +354,16 @@ func TestReconcileServerInstance_NotReadyPodGivesNoBaseline(t *testing.T) {
 	}
 }
 
-func TestReconcileServerInstance_NoEngineSelectorSkipsCascadeButStillTracksUID(t *testing.T) {
+// TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades
+// covers the case Codex flagged: an operator clears
+// spec.engineSelector AFTER engine pods were already injected. The
+// pods' injected-by annotations persist, the LMCache sockets are still
+// stale on a cache-server restart, and we MUST still cascade-restart
+// them. Selector match is the apiserver-side perf optimization in
+// other reconciler paths; the cascade authoritatively filters on the
+// injected-by annotation pair so the selector-removed case is covered.
+func TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades(t *testing.T) {
 	f := newCascadeRestartFixture(t)
-	// Strip the engine selector — a backend with no claimed engines has no
-	// fleet to cascade-restart, but its observedServerInstance still tracks
-	// the cache-server pod (so a future engine attach inherits the
-	// baseline correctly).
 	f.backend.Spec.EngineSelector = nil
 	if err := f.r.Update(context.Background(), f.backend); err != nil {
 		t.Fatalf("update backend: %v", err)
@@ -341,12 +382,98 @@ func TestReconcileServerInstance_NoEngineSelectorSkipsCascadeButStillTracksUID(t
 	}
 
 	f.reloadEngineDep(t)
-	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
-		t.Fatalf("engine deployment unexpectedly cascaded with no engine selector configured")
+	got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
+	if got != string(f.serverPod.UID) {
+		t.Fatalf("cascade annotation = %q, want %q (already-injected pods must still cascade after selector removal)", got, f.serverPod.UID)
 	}
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
-		t.Fatalf("ObservedServerInstance = %q, want %q (still tracked even without engines)", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
+	}
+}
+
+// TestReconcileServerInstance_StaleInjectedByUIDIsRejected covers
+// Codex's finding that the cascade trusts only the injected-by
+// annotation. A pod stamped with this backend's name but a stale UID
+// (CR was deleted and recreated under the same name) is NOT actually
+// wired to the live CR's cache-server socket — annotating its
+// Deployment would roll unrelated work or do nothing useful.
+func TestReconcileServerInstance_StaleInjectedByUIDIsRejected(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+	// Forge a name-match / UID-mismatch on the engine pod.
+	enginePod := f.enginePod.DeepCopy()
+	enginePod.Annotations[podwebhook.AnnotationInjectedByUID] = "stale-uid-from-deleted-cr"
+	if err := f.r.Update(context.Background(), enginePod); err != nil {
+		t.Fatalf("stale UID annotation: %v", err)
+	}
+
+	f.backend.Status.ObservedServerInstance = "previous-server-uid"
+	if err := f.r.Status().Update(context.Background(), f.backend); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	f.reload(t)
+
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("wait = %v, want 0", wait)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("engine deployment cascaded against a pod with a stale injected-by-uid; want no cascade")
+	}
+}
+
+// TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance
+// covers Codex's finding that a Ready pod carrying the controller-
+// managed labels but NOT controller-owned by THIS backend's Deployment
+// must not advance observedServerInstance (a transition would
+// spuriously trigger an engine rollout).
+func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Pre-seed status to the existing real pod's UID so the next
+	// observation is a no-op transition rather than first-observation.
+	f.backend.Status.ObservedServerInstance = string(f.serverPod.UID)
+	if err := f.r.Status().Update(context.Background(), f.backend); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	f.reload(t)
+
+	// Foreign pod: same labels, NOT owned via the cache-server
+	// Deployment chain. A name lex-smaller than the legit cache pod
+	// so a label-only picker would prefer it.
+	foreign := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aaaa-foreign-pod",
+			Namespace: f.cacheNS,
+			UID:       "foreign-uid",
+			Labels:    selectorLabels(f.cacheName),
+			// No ownerRefs — looks like a bare pod from another tool.
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
+	if err := f.r.Create(context.Background(), foreign); err != nil {
+		t.Fatalf("create foreign pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), foreign); err != nil {
+		t.Fatalf("set foreign ready: %v", err)
+	}
+
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+		t.Fatalf("ObservedServerInstance = %q, want pinned to the legit pod %q (foreign pod must not advance the latch)", got, f.serverPod.UID)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("foreign pod triggered a cascade; want no cascade")
 	}
 }
 

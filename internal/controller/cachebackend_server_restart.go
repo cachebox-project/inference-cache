@@ -51,10 +51,10 @@ const AnnotationCacheServerRestartTrigger = "inferencecache.io/cache-server-rest
 // genuine single-restart recovery is not noticeably delayed.
 //
 // The window is enforced in-memory on the reconciler (see
-// CacheBackendReconciler.cascadeRateLimitReady). Controller restarts reset
-// the window, which is the intended behavior — a controller restart should
-// freely cascade once on the first reconcile of each backend, since the
-// engines may also hold stale connections.
+// serverInstanceCascade.canCascade). Controller restarts reset the window,
+// which is the intended behavior — a controller restart should freely
+// cascade once on the first reconcile of each backend, since the engines
+// may also hold stale connections.
 const DefaultMinServerRestartCascadeInterval = 30 * time.Second
 
 // cascadeRestartReasonServerInstanceChanged is the metric label value used
@@ -72,7 +72,7 @@ const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 // per-Service registry — see pkg/server/metrics.go for the
 // other-direction posture). The Counter is created once at process start
 // and is safe to mutate concurrently; tests reset its inner state by
-// resetting the registry (see ResetBackendServerRestartsTotalForTest).
+// resetting the registry (see resetBackendServerRestartsTotalForTest).
 var backendServerRestartsTotal = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "inferencecache_backend_server_restarts_total",
@@ -85,12 +85,12 @@ func init() {
 	ctrlmetrics.Registry.MustRegister(backendServerRestartsTotal)
 }
 
-// ResetBackendServerRestartsTotalForTest resets the cascade counter to zero
-// for every label combination. Exported only so tests in this package (and
-// envtest tests that boot the reconciler in-process) can assert on
-// per-test counts without leaking state across runs. Production code MUST
-// NOT call this — it would silently zero an operator-visible metric.
-func ResetBackendServerRestartsTotalForTest() {
+// resetBackendServerRestartsTotalForTest resets the cascade counter to
+// zero for every label combination. Package-private so tests in this
+// package can assert on per-test counts without leaking state across
+// runs; intentionally not exported because production callers have no
+// reason to zero an operator-visible metric.
+func resetBackendServerRestartsTotalForTest() {
 	backendServerRestartsTotal.Reset()
 }
 
@@ -234,14 +234,17 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 
 // currentServerInstanceUID returns the UID of the cache-server pod the
 // controller currently treats as "the server instance" for the backend,
-// or "" when no Ready pod exists yet. The pod set is the owned
-// Deployment's pods (selectorLabels(backend.Name)); the chosen
-// representative is the lexicographically-smallest pod-name UID, which is
-// deterministic across reconciles and across apiserver List orderings.
-// For single-replica deployments (the typical and PVC-required shape)
-// this picks the only pod; for multi-replica ephemeral deployments it
-// picks one — a representative-replica change still indicates the cache
-// fleet has been partially replaced, which the cascade correctly handles.
+// or "" when no Ready pod exists yet. The candidate set is the owned
+// Deployment's pods — pods whose controller-owning ReplicaSet is
+// controller-owned by the Deployment named after the backend, identified
+// by both name AND UID so a foreign Ready pod that happens to carry the
+// same controller-managed labels (or a stale ownerRef name that resolves
+// to a different live object) cannot advance observedServerInstance and
+// spuriously trigger an engine rollout. Of those, the pod with the
+// lex-smallest name is the representative instance — a deterministic
+// pick across reconciles and apiserver List orderings, single-pod for
+// the PVC-backed common case and a stable representative for the
+// multi-replica ephemeral case.
 //
 // Reads via APIReader (uncached) where possible to avoid registering a
 // Pod informer; the controller's design explicitly rejects watching all
@@ -252,6 +255,20 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	if reader == nil {
 		reader = r.Client
 	}
+
+	// Fetch the owned Deployment so we can authenticate candidate pods
+	// against its UID. NotFound is the cold-start case (CR exists, the
+	// reconciler hasn't created the Deployment yet, or the operator just
+	// deleted it out-of-band): no pods can be authoritatively attributed
+	// so report "no instance".
+	var ownedDep appsv1.Deployment
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}, &ownedDep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get owned cache-server deployment: %w", err)
+	}
+
 	matcher := labels.SelectorFromSet(selectorLabels(backend.Name))
 	var pods corev1.PodList
 	if err := reader.List(ctx, &pods,
@@ -260,10 +277,13 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	); err != nil {
 		return "", fmt.Errorf("list cache-server pods: %w", err)
 	}
-	// Collect (name, uid) pairs for Ready pods only. A pod that is mid-
-	// rollout (Pending / Terminating) does not represent a serving
-	// instance, and including it would let a rollout's transient state
-	// trigger a cascade even though the prior instance is still serving.
+	// Collect (name, uid) pairs for Ready, attributable pods only. A pod
+	// that is mid-rollout (Pending / Terminating) does not represent a
+	// serving instance — including it would let a rollout's transient
+	// state trigger a cascade even though the prior instance is still
+	// serving. A pod that is Ready but not transitively controller-owned
+	// by THIS backend's Deployment is rejected — see the godoc above for
+	// why the ownership check is required for correctness.
 	type readyPod struct {
 		name string
 		uid  string
@@ -277,6 +297,9 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		if !podIsReady(p) {
 			continue
 		}
+		if !r.podOwnedByDeployment(ctx, reader, p, &ownedDep) {
+			continue
+		}
 		ready = append(ready, readyPod{name: p.Name, uid: string(p.UID)})
 	}
 	if len(ready) == 0 {
@@ -284,6 +307,39 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	}
 	sort.Slice(ready, func(i, j int) bool { return ready[i].name < ready[j].name })
 	return ready[0].uid, nil
+}
+
+// podOwnedByDeployment reports whether pod is transitively controller-
+// owned (pod → ReplicaSet → Deployment) by the given Deployment, matched
+// on both name AND UID at every link. The UID check is what protects
+// against a stale ownerRef name resolving to a different live object
+// (a name-only check would be fooled by a Deployment recreated under
+// the same name). apiVersion is checked at the (kind, apiGroup) level
+// to tolerate `apps/v1` written as `apps/v1` vs the rare bare `v1`.
+func (r *CacheBackendReconciler) podOwnedByDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, dep *appsv1.Deployment) bool {
+	rsRef := metav1.GetControllerOf(pod)
+	if rsRef == nil || rsRef.Kind != "ReplicaSet" || !ownerRefIsAppsV1(rsRef) {
+		return false
+	}
+	var rs appsv1.ReplicaSet
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: rsRef.Name}, &rs); err != nil {
+		return false
+	}
+	if rs.UID != rsRef.UID {
+		return false
+	}
+	depRef := metav1.GetControllerOf(&rs)
+	if depRef == nil || depRef.Kind != "Deployment" || !ownerRefIsAppsV1(depRef) {
+		return false
+	}
+	return depRef.Name == dep.Name && depRef.UID == dep.UID
+}
+
+// ownerRefIsAppsV1 reports whether the owner reference's APIVersion
+// resolves to apps/v1. We tolerate the rare case of an empty APIVersion
+// when the apiserver normalizes it away on read.
+func ownerRefIsAppsV1(ref *metav1.OwnerReference) bool {
+	return ref.APIVersion == "" || ref.APIVersion == "apps/v1"
 }
 
 // podIsReady reports whether the pod is in the Running phase with its
@@ -306,55 +362,75 @@ func podIsReady(p *corev1.Pod) bool {
 	return false
 }
 
-// cascadeRestartEngineDeployments lists engine pods injected for this
-// backend, resolves each to its owning Deployment via the standard
-// pod→ReplicaSet→Deployment owner chain, and patches the trigger
-// annotation onto each unique Deployment's pod template. Returns the
-// count of Deployments annotated.
+// cascadeRestartEngineDeployments finds every engine pod the webhook
+// stamped against this backend, resolves each to its owning Deployment
+// via the standard pod→ReplicaSet→Deployment owner chain, and patches
+// the trigger annotation onto each unique Deployment's pod template.
+// Returns the count of Deployments annotated.
 //
-// Why filter through the injected-by annotation rather than just match
-// the EngineSelector: a Deployment whose pod template labels match the
-// selector but whose pods were created when the webhook was unreachable
-// (failurePolicy=Ignore) holds no stale LMCache connection — restarting
-// it would be a pointless rollout. The injected-by annotation is the
-// authoritative "this pod was wired by us" signal.
+// The pod filter is **the injected-by annotation pair**, not the
+// EngineSelector. The webhook stamps `inferencecache.io/injected-by`
+// AND `inferencecache.io/injected-by-uid` on every successful injection
+// — both are required, and the UID half closes the forgery hole that
+// `failurePolicy=Ignore` would otherwise leave open (an operator with
+// pod-create RBAC could otherwise paste an `injected-by` value
+// pointing at any backend and trick the cascade into rolling its
+// engines). Filtering on the annotation pair, not the selector, also
+// handles the cases the selector-based filter would silently miss:
+//   - Operator removed `spec.engineSelector` after pods were injected.
+//     The injected-by stamp persists on the pods, but the selector
+//     no longer matches them.
+//   - Pod labels drifted from the selector after admission (a
+//     redeploy with edited labels). The pod still holds the stale
+//     LMCache socket, but a label-selector list would miss it.
 //
 // Why annotate the Deployment's pod template (not the pod): the
 // Deployment controller only watches its template; an annotation on a
 // child pod has no rolling-restart effect. Patching
-// spec.template.metadata.annotations is the same mechanism kubectl
-// rollout restart uses (it stamps kubectl.kubernetes.io/restartedAt) —
-// we just project-namespace the key.
+// `spec.template.metadata.annotations` is the same mechanism
+// `kubectl rollout restart` uses (it stamps
+// `kubectl.kubernetes.io/restartedAt`) — we just project-namespace the
+// key.
 //
-// Engine pods owned by non-Deployment workloads (StatefulSet, bare Pod,
-// Job, …) are skipped; rolling-restart via spec.template annotation is a
-// Deployment-shaped contract, and the operator is responsible for
-// restarting other workload kinds on a cache-server replacement.
+// Engine pods owned by non-Deployment workloads (StatefulSet, bare
+// Pod, Job, …) are skipped; rolling-restart via `spec.template`
+// annotation is a Deployment-shaped contract, and the operator is
+// responsible for restarting other workload kinds on a cache-server
+// replacement.
+//
+// The pod List is namespace-scoped (no label selector) because the
+// `injected-by` annotation is the authoritative wiring signal and
+// annotations cannot be apiserver-side selectors. Namespace-bounded —
+// the webhook only stamps `injected-by` on pods in the matched
+// backend's namespace.
 func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Context, backend *cachev1alpha1.CacheBackend, newUID string) (int, error) {
-	sel := backend.Spec.EngineSelector
-	if sel == nil || len(sel.MatchLabels) == 0 {
-		return 0, nil
-	}
-
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
 	}
 
-	matcher := labels.SelectorFromSet(sel.MatchLabels)
 	var pods corev1.PodList
-	if err := reader.List(ctx, &pods,
-		client.InNamespace(backend.Namespace),
-		client.MatchingLabelsSelector{Selector: matcher},
-	); err != nil {
+	if err := reader.List(ctx, &pods, client.InNamespace(backend.Namespace)); err != nil {
 		return 0, fmt.Errorf("list engine pods: %w", err)
 	}
 
 	wantInjectedBy := backend.Namespace + "/" + backend.Name
+	wantInjectedByUID := string(backend.UID)
 	deploymentNames := map[string]struct{}{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Annotations[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
+			continue
+		}
+		// Require the matching injected-by-uid. The webhook always
+		// writes both annotations on a successful injection; a pod
+		// carrying only `injected-by` (or `injected-by-uid` with a
+		// stale UID) is either a forgery or a survivor from a CR
+		// that was deleted and recreated. In both cases the pod is
+		// no longer wired to THIS CR's cache-server, so cascading
+		// would either roll an unrelated workload or do nothing —
+		// neither is helpful.
+		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
 		depName, ok := r.podOwningDeploymentName(ctx, reader, p)
@@ -386,13 +462,19 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 }
 
 // podOwningDeploymentName walks pod → controller-owning ReplicaSet →
-// controller-owning Deployment and returns the Deployment's name (in the
-// same namespace as the pod — apps/v1 ownership is namespaced). Returns
-// false when any link in the chain is missing or the pod is not owned by
-// a Deployment-shaped workload.
+// controller-owning Deployment and returns the Deployment's name (in
+// the same namespace as the pod — apps/v1 ownership is namespaced).
+// Returns false when any link in the chain is missing or the pod is
+// not owned by a Deployment-shaped workload. Each link is checked on
+// both name AND UID: a name-only match would resolve a stale or
+// forged ownerRef to the wrong live object (a Deployment recreated
+// under the same name is the canonical bad case). The
+// (kind, apiVersion) check rejects ownerRefs to non-apps/v1
+// ReplicaSets/Deployments (rare; defensive — a CRD shaped like a
+// ReplicaSet/Deployment from another apiGroup must not be picked up).
 func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, reader client.Reader, pod *corev1.Pod) (string, bool) {
 	rsRef := metav1.GetControllerOf(pod)
-	if rsRef == nil || rsRef.Kind != "ReplicaSet" {
+	if rsRef == nil || rsRef.Kind != "ReplicaSet" || !ownerRefIsAppsV1(rsRef) {
 		return "", false
 	}
 	var rs appsv1.ReplicaSet
@@ -401,11 +483,27 @@ func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, re
 		// pod creation and our List). Fail-soft.
 		return "", false
 	}
-	depRef := metav1.GetControllerOf(&rs)
-	if depRef == nil || depRef.Kind != "Deployment" {
+	if rs.UID != rsRef.UID {
+		// Name resolved to a different live RS (re-created under the
+		// same name). Not the pod's actual owner — fail-soft.
 		return "", false
 	}
-	return depRef.Name, true
+	depRef := metav1.GetControllerOf(&rs)
+	if depRef == nil || depRef.Kind != "Deployment" || !ownerRefIsAppsV1(depRef) {
+		return "", false
+	}
+	// Verify the Deployment named in depRef still exists with the
+	// declared UID. A name-only return would let a stale ownerRef
+	// resolve to a brand-new Deployment that happens to share the
+	// name — which we'd then cascade-restart unrelated work.
+	var dep appsv1.Deployment
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: depRef.Name}, &dep); err != nil {
+		return "", false
+	}
+	if dep.UID != depRef.UID {
+		return "", false
+	}
+	return dep.Name, true
 }
 
 // annotateDeploymentForCascade patches AnnotationCacheServerRestartTrigger

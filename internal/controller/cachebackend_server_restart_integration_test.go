@@ -42,7 +42,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 	t.Run("UIDTransitionAnnotatesEngineDeployment", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		ResetBackendServerRestartsTotalForTest()
+		resetBackendServerRestartsTotalForTest()
 
 		cb := lmcacheBackend("cache", ns)
 		cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
@@ -71,8 +71,17 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		}
 
 		// First Ready cache-server pod. The reconciler should see
-		// this and persist it as the baseline (no cascade).
+		// this and persist it as the baseline (no cascade). The
+		// cache-server pod must be owner-referenced up to the
+		// reconciler-created Deployment so currentServerInstanceUID's
+		// transitive-ownership check admits it. The reconciler creates
+		// the Deployment on the first reconcile; the RS that would
+		// normally own pods is fabricated here (envtest runs no apps
+		// controller).
+		reconcile(t, r, "cache", ns)
+		serverRS1 := newServerReplicaSet(t, k8s, ns, "cache", "cache-rs-1")
 		serverPod1 := newReadyServerPod(ns, "cache-pod-1", "cache")
+		setServerPodOwner(serverPod1, serverRS1)
 		createReady(t, k8s, serverPod1)
 		reconcile(t, r, "cache", ns)
 
@@ -93,11 +102,15 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 		// Simulate the cache-server pod restarting: delete + recreate
 		// with a fresh UID. The Pod controller in envtest does not
-		// run; the test is the authority on what pods exist.
+		// run; the test is the authority on what pods exist. The
+		// replacement pod is owner-referenced to the same RS as the
+		// first — that's what a rolling restart of the Deployment
+		// would produce.
 		if err := k8s.Delete(ctx, serverPod1); err != nil {
 			t.Fatalf("delete first server pod: %v", err)
 		}
 		serverPod2 := newReadyServerPod(ns, "cache-pod-2", "cache")
+		setServerPodOwner(serverPod2, serverRS1)
 		createReady(t, k8s, serverPod2)
 
 		reconcile(t, r, "cache", ns)
@@ -120,7 +133,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 	t.Run("RateLimitedSecondCascadeIsDeferred", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		ResetBackendServerRestartsTotalForTest()
+		resetBackendServerRestartsTotalForTest()
 
 		// Use a long window so the second cascade is definitely
 		// inside it. Restored after the test so other subtests use
@@ -151,12 +164,19 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 			t.Fatalf("create engine pod: %v", err)
 		}
 
-		// Baseline observation + first cascade.
+		// Baseline observation + first cascade. The cache-server pod
+		// must be owner-referenced up to the reconciler-created
+		// Deployment so currentServerInstanceUID's transitive-
+		// ownership check admits it.
+		reconcile(t, r, "cache", ns)
+		serverRS := newServerReplicaSet(t, k8s, ns, "cache", "cache-rs-1")
 		serverPod1 := newReadyServerPod(ns, "cache-pod-1", "cache")
+		setServerPodOwner(serverPod1, serverRS)
 		createReady(t, k8s, serverPod1)
 		reconcile(t, r, "cache", ns)
 
 		serverPod2 := newReadyServerPod(ns, "cache-pod-2", "cache")
+		setServerPodOwner(serverPod2, serverRS)
 		if err := k8s.Delete(ctx, serverPod1); err != nil {
 			t.Fatalf("delete first server pod: %v", err)
 		}
@@ -180,6 +200,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		// pinned to the first cascade's UID; status must stay pinned
 		// likewise.
 		serverPod3 := newReadyServerPod(ns, "cache-pod-3", "cache")
+		setServerPodOwner(serverPod3, serverRS)
 		if err := k8s.Delete(ctx, serverPod2); err != nil {
 			t.Fatalf("delete second server pod: %v", err)
 		}
@@ -342,4 +363,63 @@ func fetchAfterCreate(t *testing.T, k8s interface {
 	if err := k8s.Get(context.Background(), client.ObjectKeyFromObject(obj), obj); err != nil {
 		t.Fatalf("refetch after create: %v", err)
 	}
+}
+
+// newServerReplicaSet fabricates the ReplicaSet the apps/v1 Deployment
+// controller would normally create for the reconciler-managed cache-
+// server Deployment. envtest runs no apps controller, so the test is
+// the authority on what ReplicaSets/Pods exist. The RS is owner-
+// referenced to the reconciler-created Deployment (looked up after the
+// first reconcile creates it) so currentServerInstanceUID's transitive
+// ownership check (pod → RS → Deployment) admits owned pods.
+func newServerReplicaSet(t *testing.T, k8s client.Client, namespace, backendName, rsName string) *appsv1.ReplicaSet {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	if err := k8s.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: backendName}, dep); err != nil {
+		t.Fatalf("server Deployment %s/%s not present (run reconcile first): %v", namespace, backendName, err)
+	}
+	tru := true
+	one := int32(1)
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rsName,
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       dep.Name,
+				UID:        dep.UID,
+				Controller: &tru,
+			}},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: selectorLabels(backendName)},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selectorLabels(backendName)},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache:test"}},
+				},
+			},
+		},
+	}
+	if err := k8s.Create(context.Background(), rs); err != nil {
+		t.Fatalf("create server RS: %v", err)
+	}
+	fetchAfterCreate(t, k8s, rs)
+	return rs
+}
+
+// setServerPodOwner stamps the controller-owner reference from a
+// cache-server pod up to its RS — the missing link the test needs to
+// build for envtest (the apps controller would normally do this).
+func setServerPodOwner(pod *corev1.Pod, rs *appsv1.ReplicaSet) {
+	tru := true
+	pod.OwnerReferences = append(pod.OwnerReferences, metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "ReplicaSet",
+		Name:       rs.Name,
+		UID:        rs.UID,
+		Controller: &tru,
+	})
 }
