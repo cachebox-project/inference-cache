@@ -144,12 +144,12 @@ func TestProbeResultAllPassedZeroValueFailsClosed(t *testing.T) {
 	}
 	// A partially-populated result also fails: two stages ok + one
 	// zero-value field is still "no information" for that stage.
-	partial := ProbeResult{Subscriber: ProbeStageOK, Routing: ProbeStageOK}
+	partial := ProbeResult{Ingest: ProbeStageOK, Routing: ProbeStageOK}
 	if partial.AllPassed() {
 		t.Fatal("ProbeResult with zero-value T2 returned AllPassed=true; want false")
 	}
 	// The all-explicit-ok case still passes.
-	all := ProbeResult{Subscriber: ProbeStageOK, Routing: ProbeStageOK, T2: ProbeStageSkipped}
+	all := ProbeResult{Ingest: ProbeStageOK, Routing: ProbeStageOK, T2: ProbeStageSkipped}
 	if !all.AllPassed() {
 		t.Fatal("explicit ok/ok/skipped ProbeResult should report AllPassed=true")
 	}
@@ -169,8 +169,8 @@ func TestProberRunHappyPathStageABCSkippedT2(t *testing.T) {
 		BackendType: BackendTypeLMCache,
 	})
 
-	if result.Subscriber != ProbeStageOK {
-		t.Errorf("Subscriber = %q, want %q", result.Subscriber, ProbeStageOK)
+	if result.Ingest != ProbeStageOK {
+		t.Errorf("Ingest = %q, want %q", result.Ingest, ProbeStageOK)
 	}
 	if result.Routing != ProbeStageOK {
 		t.Errorf("Routing = %q, want %q", result.Routing, ProbeStageOK)
@@ -262,7 +262,7 @@ func TestProberRunStageCRunsForLMCacheWithProber(t *testing.T) {
 
 // TestProberRunStageAFailsWhenIngestNoOps simulates the silent-failure
 // mode where the subscriber writes but nothing reaches the index. The
-// probe must report Subscriber=failed AND skip Stage B (the routing layer
+// probe must report Ingest=failed AND skip Stage B (the routing layer
 // can't be diagnosed when its input never arrived), so the controller
 // surfaces the upstream stage rather than a cascade.
 func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
@@ -272,8 +272,8 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 	result := prober.Run(t.Context(), ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm",
 	})
-	if result.Subscriber != ProbeStageFailed {
-		t.Errorf("Subscriber = %q, want %q", result.Subscriber, ProbeStageFailed)
+	if result.Ingest != ProbeStageFailed {
+		t.Errorf("Ingest = %q, want %q", result.Ingest, ProbeStageFailed)
 	}
 	if result.Routing != ProbeStageSkipped {
 		t.Errorf("Routing = %q, want %q (cascade from failed Stage A)", result.Routing, ProbeStageSkipped)
@@ -282,9 +282,9 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 		t.Errorf("T2 = %q, want %q (cascade from failed Stage A)", result.T2, ProbeStageSkipped)
 	}
 	if result.AllPassed() {
-		t.Fatal("AllPassed() = true despite Subscriber failed")
+		t.Fatal("AllPassed() = true despite Ingest failed")
 	}
-	if !stageErrorPresent(result.Errors, ProbeStageSubscriber) {
+	if !stageErrorPresent(result.Errors, ProbeStageIngest) {
 		t.Errorf("expected subscriber stage error, got %+v", result.Errors)
 	}
 }
@@ -306,8 +306,8 @@ func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
 	result := prober.Run(t.Context(), ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm", BackendType: BackendTypeLMCache,
 	})
-	if result.Subscriber != ProbeStageOK {
-		t.Errorf("Subscriber = %q, want %q — direct Lookup is unaffected by the routeFn override", result.Subscriber, ProbeStageOK)
+	if result.Ingest != ProbeStageOK {
+		t.Errorf("Ingest = %q, want %q — direct Lookup is unaffected by the routeFn override", result.Ingest, ProbeStageOK)
 	}
 	if result.Routing != ProbeStageFailed {
 		t.Errorf("Routing = %q, want %q", result.Routing, ProbeStageFailed)

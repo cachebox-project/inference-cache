@@ -100,7 +100,7 @@
 #      /snapshot.
 #  12b. The authenticated /probe handler returns the expected default
 #       posture on a clean install: a controller-SA-authenticated POST
-#       gets HTTP 200 AND the parsed JSON body asserts subscriber=ok,
+#       gets HTTP 200 AND the parsed JSON body asserts ingest=ok,
 #       routing=ok, t2=skipped (the Stage-1 default — no T2Prober wired
 #       yet). A regression where the handler returns 200 with a
 #       per-stage "failed" would otherwise slip past the audience-binding
@@ -1813,13 +1813,13 @@ esac
 # The audience-binding section above asserts /probe returned HTTP 200 with the
 # controller-audience token, but a deployed handler can also return 200 with a
 # per-stage `failed`. This section drives one authenticated /probe call,
-# captures the JSON body, and asserts subscriber=ok, routing=ok, t2=skipped
+# captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped
 # (the default Stage-1 posture — no T2Prober is wired, so Stage C is always
 # skipped until the controller-wiring follow-up plumbs a real one). A
 # regression that flips subscriber or routing to failed on a clean install
 # would be a clear signal that the cache-plane internal round-trip itself is
 # broken — exactly the class of bug the probe exists to catch.
-log "asserting authenticated /probe returns subscriber=ok, routing=ok, t2=skipped"
+log "asserting authenticated /probe returns ingest=ok, routing=ok, t2=skipped"
 PROBE_RESULT_POD="ic-probe-result"
 kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 probe_result_yaml=$(cat <<EOF
@@ -1887,16 +1887,16 @@ case "$probe_result_body" in
     ;;
 esac
 # Parse the three stage values; reject anything that isn't the expected
-# default posture (subscriber=ok, routing=ok, t2=skipped). The default-install
+# default posture (ingest=ok, routing=ok, t2=skipped). The default-install
 # CacheBackend has no engine pods reporting state, but the probe synthesizes
 # its own — so Stage A + B must always pass on a clean install regardless of
 # workload. Stage C is "skipped" because no T2Prober is wired in this revision.
 case "$probe_result_body" in
-  *'"subscriber":"ok"'*'"routing":"ok"'*'"t2":"skipped"'*)
-    log "probe result matches expected default posture (subscriber=ok, routing=ok, t2=skipped)"
+  *'"ingest":"ok"'*'"routing":"ok"'*'"t2":"skipped"'*)
+    log "probe result matches expected default posture (ingest=ok, routing=ok, t2=skipped)"
     ;;
   *)
-    fail "probe result does not match expected default posture; want subscriber=ok routing=ok t2=skipped, got: $probe_result_body"
+    fail "probe result does not match expected default posture; want ingest=ok routing=ok t2=skipped, got: $probe_result_body"
     ;;
 esac
 

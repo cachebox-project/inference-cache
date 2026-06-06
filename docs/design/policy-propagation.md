@@ -65,11 +65,11 @@ Response — JSON body, HTTP `200 OK` on every well-formed request (per-stage fa
 ```json
 {
   "backend": "<backend echoed back>",
-  "subscriber": "ok|failed|skipped",
-  "routing":    "ok|failed|skipped",
-  "t2":         "ok|failed|skipped",
+  "ingest":  "ok|failed|skipped",
+  "routing": "ok|failed|skipped",
+  "t2":      "ok|failed|skipped",
   "errors": [
-    { "stage": "subscriber|routing|t2", "message": "..." }
+    { "stage": "ingest|routing|t2", "message": "..." }
   ]
 }
 ```
@@ -78,6 +78,11 @@ Stage values:
 - `ok` — the stage passed.
 - `failed` — the stage failed; `errors` carries a stage-keyed diagnostic message.
 - `skipped` — the stage was not run. T2 is skipped on non-LMCache backends and when no T2Prober is wired. Downstream stages are skipped when an upstream stage failed (cascade prevention).
+
+Stage names:
+- `ingest` — Stage A. Verifies the in-process index ingest path accepts writes. NOTE: this stage writes via `index.Ingest` directly, NOT through the gRPC `ReportCacheState` handler the real subscriber uses (the handler drops messages with `tenant_id = inferencecache.io/probe` by design). A pass proves the index ingest path is healthy; a fail definitively means it's broken. Neither alone proves the wire subscriber path is healthy end-to-end.
+- `routing` — Stage B. Verifies `LookupRoute` returns `PREFIX_MATCH` for the probe-synthesized hash against the just-ingested entry.
+- `t2` — Stage C. Verifies a tier-2 put/get round trip via the supplied `T2Prober` (LMCache backends; skipped otherwise).
 
 Status codes:
 - `200` — body carries the per-stage result; `errors` is empty when all stages passed.

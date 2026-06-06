@@ -48,19 +48,17 @@ import (
 // / skipped; failures name the stage so the controller can surface a
 // stage-specific condition with an operator-actionable message.
 //
-// What Stage A ("subscriber") actually exercises — important caveat:
-// Stage A is a PROXY check on the subscriber pipeline. It writes the
-// synthesized Update via in-process index.Ingest (bypassing the gRPC
-// ReportCacheState handler that the real subscriber traverses, because the
-// handler drops messages with tenant_id = ProbeTenantID — see
-// inferencecache_service.go) and then verifies the entry landed via a
-// direct index.Lookup. A Stage A pass therefore proves that THE INDEX IS
-// ACCEPTING WRITES at all — necessary but not sufficient for "the
-// subscriber pipeline is healthy end-to-end". A Stage A fail definitively
-// means the index's ingest path is broken. The "subscriber" name reflects
-// the operator question this stage answers ("is the subscriber's data
-// landing?"), not the path the probe physically traverses; the failure
-// message explicitly calls out the in-process check.
+// What Stage A ("ingest") actually exercises:
+// Stage A writes the synthesized Update via in-process index.Ingest and
+// verifies the entry landed via direct index.Lookup. It does NOT exercise
+// the gRPC ReportCacheState handler that the real subscriber traverses —
+// the handler drops messages with tenant_id = ProbeTenantID by design (see
+// inferencecache_service.go). A Stage A pass proves the index ingest path
+// is accepting writes; it is NOT proof the full subscriber wire is healthy
+// end-to-end. A Stage A fail definitively means the index ingest path is
+// broken. The wire field name `ingest` matches the path the probe
+// physically traverses, so the operator-facing condition reason cannot be
+// mistaken for a wire-subscriber check.
 //
 // This file ships the server-side machinery and the HTTP /probe handler. The
 // controller wiring — calling /probe from the CacheBackend reconciler and
@@ -112,19 +110,15 @@ const (
 )
 
 // Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
-// inferencecache_backend_probe_result metric `stage` label.
-//
-// "subscriber" is a PROXY name — Stage A exercises the in-process
-// index.Ingest path, not the wire ReportCacheState handler the real
-// subscriber uses (the handler drops probe-tenant messages by design).
-// See the file-top doc for the full caveat. The name is kept because it
-// answers the operator's question ("is the subscriber's data landing in
-// the index?"), and a Stage A fail still definitively means the index
-// ingest path is broken.
+// inferencecache_backend_probe_result metric `stage` label. Stage A's wire
+// name is `ingest` — it exercises in-process index.Ingest, not the wire
+// ReportCacheState handler the real subscriber uses (the handler drops
+// probe-tenant messages by design). See the file-top doc for what a Stage
+// A pass/fail does and does not prove.
 const (
-	ProbeStageSubscriber = "subscriber"
-	ProbeStageRouting    = "routing"
-	ProbeStageT2         = "t2"
+	ProbeStageIngest  = "ingest"
+	ProbeStageRouting = "routing"
+	ProbeStageT2      = "t2"
 )
 
 // BackendTypeLMCache is the spec.type value that gates Stage C. The probe
@@ -172,22 +166,22 @@ type ProbeRequest struct {
 // controller maps a stage's failed result onto the corresponding
 // FunctionalProbeOK condition reason (controller-wiring follow-up):
 //
-//	subscriber failed → ProbeSubscriberFailed
-//	routing    failed → ProbeRoutingFailed
-//	t2         failed → ProbeT2Failed
+//	ingest  failed → ProbeIngestFailed
+//	routing failed → ProbeRoutingFailed
+//	t2      failed → ProbeT2Failed
 //
 // Errors carries a stage-keyed message so the operator-visible condition
 // surfaces a concrete diagnostic, not just "something failed".
 type ProbeResult struct {
-	Backend    string            `json:"backend"`
-	Subscriber ProbeStageResult  `json:"subscriber"`
-	Routing    ProbeStageResult  `json:"routing"`
-	T2         ProbeStageResult  `json:"t2"`
-	Errors     []ProbeStageError `json:"errors,omitempty"`
+	Backend string            `json:"backend"`
+	Ingest  ProbeStageResult  `json:"ingest"`
+	Routing ProbeStageResult  `json:"routing"`
+	T2      ProbeStageResult  `json:"t2"`
+	Errors  []ProbeStageError `json:"errors,omitempty"`
 }
 
 // ProbeStageError names one stage's failure mode in operator-readable form.
-// Stage is one of ProbeStageSubscriber / ProbeStageRouting / ProbeStageT2.
+// Stage is one of ProbeStageIngest / ProbeStageRouting / ProbeStageT2.
 type ProbeStageError struct {
 	Stage   string `json:"stage"`
 	Message string `json:"message"`
@@ -207,7 +201,7 @@ type ProbeStageError struct {
 // constructed a ProbeResult{} without running anything) MUST NOT pass —
 // "no information" is not the same as "all three stages passed."
 func (r ProbeResult) AllPassed() bool {
-	return stagePassed(r.Subscriber) && stagePassed(r.Routing) && stagePassed(r.T2)
+	return stagePassed(r.Ingest) && stagePassed(r.Routing) && stagePassed(r.T2)
 }
 
 // stagePassed returns true only for an explicit ok or skipped — empty
@@ -447,11 +441,8 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	// subscriber uses; that handler drops probe-tenant messages by design).
 	// We check via a DIRECT index.Lookup (not the orchestrated routeFn) so
 	// this stage isolates the ingest+index-write path: if the entry is there,
-	// Stage A passes regardless of any routing-layer regression. The wire
-	// field is named "subscriber" (the operator's question — "is the
-	// subscriber's data landing?"), but the failure message and the file-top
-	// doc spell out the in-process nature explicitly. Routing failures are
-	// stage B's responsibility.
+	// Stage A passes regardless of any routing-layer regression. Routing
+	// failures are stage B's responsibility.
 	update := index.Update{
 		ReplicaID:  replicaID,
 		Model:      req.Model,
@@ -479,10 +470,10 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 		BlockTokenCounts: []int32{ProbeTokenCount},
 	}
 	if !replicaInScores(p.index.Lookup(directReq), replicaID) {
-		result.Subscriber = ProbeStageFailed
+		result.Ingest = ProbeStageFailed
 		result.Errors = append(result.Errors, ProbeStageError{
-			Stage:   ProbeStageSubscriber,
-			Message: "synthesized probe event did not land in the index — server index ingest path is broken (Run calls index.Ingest directly; the real subscriber/ReportCacheState wire is not exercised by this stage)",
+			Stage:   ProbeStageIngest,
+			Message: "synthesized probe event did not land in the index — in-process index ingest path is broken (Stage A calls index.Ingest directly; the wire ReportCacheState handler is not exercised here)",
 		})
 		// An entry that never landed cannot route, so Stage B is undefined;
 		// skip it so the controller's condition pinpoints the upstream stage
@@ -491,7 +482,7 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 		result.T2 = ProbeStageSkipped
 		return result
 	}
-	result.Subscriber = ProbeStageOK
+	result.Ingest = ProbeStageOK
 
 	// Stage B — routing path. Run the orchestrated LookupRoute (PREFIX_MATCH
 	// vs TENANT_HOT vs NO_HINT) against the same hash bytes. The probe synthesizes
