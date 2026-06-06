@@ -176,6 +176,19 @@ type CacheBackendReconciler struct {
 	// shorter value so they don't bake the 30s production delay into
 	// per-test runtime.
 	MatchedEnginePodsRequeueInterval time.Duration
+	// MinServerRestartCascadeInterval overrides the rate-limit window for
+	// the cache-server restart cascade. Zero means "use
+	// [DefaultMinServerRestartCascadeInterval]". Production wiring leaves
+	// this zero; envtest / unit tests shrink the window to keep per-test
+	// runtime cheap.
+	MinServerRestartCascadeInterval time.Duration
+
+	// serverInstanceCascade tracks the last cascade-restart time per
+	// backend so the rate-limit window is enforced in-process. Lazily
+	// initialized in SetupWithManager AND defensively in
+	// reconcileServerInstance (the latter so unit tests that bypass
+	// SetupWithManager get a working reconciler).
+	serverInstanceCascade *serverInstanceCascade
 }
 
 // matchedEnginePodsRequeueInterval returns the effective cadence for this
@@ -193,6 +206,7 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -570,6 +584,23 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	requeueAfter, err := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Cache-server restart cascade: when the Ready cache-server pod UID
+	// changes, cascade-restart every engine Deployment that was injected
+	// against this backend so they re-establish their LMCache client
+	// socket (the upstream LMServerConnector opens its TCP socket in
+	// __init__ only and silently fails every subsequent PUT with EPIPE
+	// after a server restart, until the engine pod itself rolls). Always
+	// runs (even when applyErr != nil), since the cascade is independent
+	// of whether THIS reconcile pass made a successful apply: a transient
+	// apply churn must not delay engine recovery from a cache-server
+	// outage. A non-zero cascadeWait means the rate-limit window
+	// suppressed the cascade; honor it on the requeue so we retry exactly
+	// at the boundary.
+	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
+		requeueAfter = cascadeWait
 	}
 
 	if applyErr != nil {
@@ -1979,6 +2010,9 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Pod informer per the locked design (the test setup just
 		// passes Client, not APIReader).
 		r.APIReader = mgr.GetAPIReader()
+	}
+	if r.serverInstanceCascade == nil {
+		r.serverInstanceCascade = newServerInstanceCascade()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		// NOTE: DO NOT add a predicate that filters status-only updates here.

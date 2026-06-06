@@ -581,6 +581,34 @@ type CacheBackendStatus struct {
 	// +optional
 	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
 
+	// ObservedServerInstance is the metadata.uid of the cache-server pod the
+	// controller last observed Ready for this managed backend (Phase 1: the
+	// lexicographically-smallest Ready pod from the owned Deployment, since
+	// PVC-backed cache servers are single-replica and ephemeral ones rarely
+	// scale beyond one). It is the controller's stable pointer to the current
+	// cache-server process: when the value changes, the cache-server pod has
+	// been replaced (OOM-kill, eviction, node maintenance, image roll), and
+	// every injected engine pod holds a stale LMCache client socket — the
+	// upstream LMServerConnector opens its TCP socket in __init__ only and
+	// silently fails every subsequent PUT with EPIPE until the engine pod
+	// itself rolls.
+	//
+	// On a change from a non-empty prior value the reconciler cascade-restarts
+	// every engine Deployment that owns pods carrying this backend's
+	// inferencecache.io/injected-by annotation, by patching a fresh
+	// inferencecache.io/cache-server-restart-trigger annotation onto the
+	// Deployment's pod template (the same mechanism kubectl rollout restart
+	// uses); the cascade is rate-limited to at most once per ~30s per backend
+	// to dampen restart storms when the cache-server flaps. Empty until the
+	// first Ready cache-server pod is observed, and an empty→set transition
+	// never cascades (no engines depend on a not-yet-existed server). Inert
+	// for External / unsupported-runtime backends. The cascade is an
+	// operator-side recovery for the upstream EPIPE bug and can be retired
+	// once upstream LMCache grows EPIPE-detect-and-reconnect in the
+	// LMServerConnector write path.
+	// +optional
+	ObservedServerInstance string `json:"observedServerInstance,omitempty"`
+
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups
 	// the server's /snapshot replicas by the owning CacheBackend and projects
