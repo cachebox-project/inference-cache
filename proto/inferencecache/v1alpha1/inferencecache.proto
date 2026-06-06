@@ -123,6 +123,19 @@ message ReplicaStats {
   int64 cache_memory_bytes = 2;
   float hit_rate = 3;
   float pressure = 4;
+  // Opaque version string identifying the client-side cache library the
+  // reporting replica is linked against (e.g. an LMCache client release).
+  // The string is engine-opaque on the wire: no semver parsing or ordering
+  // is implied at this layer. Empty / unset is allowed and means "unknown";
+  // older producers that don't fill the field MUST keep being accepted
+  // (additive, v1alpha1-compatible).
+  //
+  // Reserves field 5 for the producer half of an end-to-end client/server
+  // version-skew detection surface. The consumer half — server-side storage
+  // and per-CacheBackend exposure — lands in a follow-up change and is not
+  // part of this contract update; producers can populate the field today,
+  // and the server will silently keep accepting it either way.
+  string client_version = 5;
 }
 
 message CacheStateUpdate {

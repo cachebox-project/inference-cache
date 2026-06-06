@@ -54,7 +54,8 @@ service InferenceCache {
 - **ReplicaScore** `{ string replica_id; float score; int32 matched_tokens; float estimated_cache_hit_prob; }`
 - **CacheStateUpdate** `{ string replica_id; string model_id; string tenant_id; string hash_scheme; int64 timestamp_us; repeated PrefixEntry prefixes; ReplicaStats stats; }`
 - **PrefixEntry** `{ bytes prefix_hash = 1; int32 token_count = 2; repeated bytes block_hashes = 3; repeated int32 block_token_counts = 4; }` — **metadata only**
-- **ReplicaStats** `{ string replica_id; int64 cache_memory_bytes; float hit_rate; float pressure; }`
+- **ReplicaStats** `{ string replica_id = 1; int64 cache_memory_bytes = 2; float hit_rate = 3; float pressure = 4; string client_version = 5; }`
+  `client_version` is an opaque version string identifying the client-side cache library the reporting replica is linked against (e.g. an LMCache client release). It carries no semver semantics on the wire — producers populate it, the server accepts it, no semver parsing or ordering is performed at this layer. Empty / unset is allowed and means "unknown"; older producers that don't fill the field MUST keep being accepted (additive, v1alpha1-compatible). The field reserves wire space for the producer half of an end-to-end client/server version-skew detection surface; the consumer half (server-side storage, per-CacheBackend exposure, the operator-visible status condition that closes the silent client/server mismatch class of bug) lands in a follow-up change and is intentionally out of scope for this contract update.
 - **CacheEvent** `{ Type type; string replica_id; string model_id; string tenant_id; bytes prefix_hash; int64 timestamp_us; }`
   Type ∈ `PREFIX_ADDED | PREFIX_EVICTED | REPLICA_UPDATED | ALL_CLEARED`
 - **Metric** `{ string name; string type; map<string,string> labels; double value; int64 timestamp_us; }` (Prometheus `inferencecache_*`, tech spec §4.3)

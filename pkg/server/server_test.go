@@ -347,6 +347,76 @@ func TestSnapshotEndpointReflectsIngest(t *testing.T) {
 	}
 }
 
+// TestReportCacheState_AcceptsClientVersionOnReplicaStats is a wire-level smoke
+// for the ReplicaStats.client_version (field 5) addition: a producer that sets
+// client_version on its CacheStateUpdate.Stats must be accepted by the real
+// server stream end-to-end (Ack returned, no error, the replica still lands in
+// the snapshot), so older producers that don't fill the field AND newer ones
+// that do both keep working today. The server doesn't yet surface
+// client_version on /snapshot — that wiring lands in a follow-up PR; this test
+// is the guard that the new field has reached the server's regenerated proto
+// descriptor and is silently preserved on the ingest path.
+func TestReportCacheState_AcceptsClientVersionOnReplicaStats(t *testing.T) {
+	conn, _, snapshotURL, stop := startInProcessServerConnFull(t)
+	grpcClient := icpb.NewInferenceCacheClient(conn)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := grpcClient.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId:  "replica-cv",
+		ModelId:    "llama-3-8b",
+		TenantId:   "tenant-cv",
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 64}},
+		Stats: &icpb.ReplicaStats{
+			ReplicaId:        "replica-cv",
+			CacheMemoryBytes: 9999,
+			HitRate:          0.5,
+			ClientVersion:    "lmcache==0.4.2",
+		},
+	}); err != nil {
+		t.Fatalf("send update with client_version: %v", err)
+	}
+	ack, err := stream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("Ack.accepted = false, reason=%q — server rejected an update carrying client_version", ack.GetReasonCode())
+	}
+
+	code, body := getString(t, snapshotURL+"/snapshot")
+	if code != http.StatusOK {
+		t.Fatalf("/snapshot status = %d, want 200", code)
+	}
+	var snap index.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode snapshot JSON: %v (body=%s)", err, body)
+	}
+	if snap.TotalPrefixes != 1 {
+		t.Fatalf("totalPrefixes = %d, want 1 — ingestion path dropped the update", snap.TotalPrefixes)
+	}
+	var got *index.ReplicaSnapshot
+	for i := range snap.Replicas {
+		if snap.Replicas[i].ReplicaID == "replica-cv" {
+			got = &snap.Replicas[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("replica-cv not present in /snapshot.replicas; client_version on the wire broke ingest: %+v", snap.Replicas)
+	}
+	if got.CacheMemoryBytes != 9999 {
+		t.Errorf("replica-cv.cacheMemoryBytes = %d, want 9999 — other ReplicaStats fields stopped flowing alongside client_version", got.CacheMemoryBytes)
+	}
+}
+
 // TestSnapshotNotServedOnPublicListener confirms /snapshot is *only* exposed
 // on the dedicated listener — the same listener the NetworkPolicy restricts.
 // A regression here would silently re-open the endpoint to every pod that can
