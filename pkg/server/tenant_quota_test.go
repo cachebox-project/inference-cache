@@ -32,13 +32,14 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 	}
 }
 
-// TestPolicyPropagationVersionIsV3 pins the wire-format version. v2 accompanied
+// TestPolicyPropagationVersionIsV4 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
-// cap-eviction algorithm). A controller/server version mismatch is rejected with
-// a clear "unsupported version" rather than a decode error.
-func TestPolicyPropagationVersionIsV3(t *testing.T) {
-	if PolicyPropagationVersion != 3 {
-		t.Fatalf("PolicyPropagationVersion = %d, want 3", PolicyPropagationVersion)
+// cap-eviction algorithm); v4 accompanied ResolvedPolicy.MinimumMatchedTokens
+// (result-side floor). A controller/server version mismatch is rejected
+// with a clear "unsupported version" rather than a decode error.
+func TestPolicyPropagationVersionIsV4(t *testing.T) {
+	if PolicyPropagationVersion != 4 {
+		t.Fatalf("PolicyPropagationVersion = %d, want 4", PolicyPropagationVersion)
 	}
 }
 

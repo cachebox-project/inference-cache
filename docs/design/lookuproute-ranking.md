@@ -39,7 +39,13 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
 
    where `freshness = max(0, 1 − age / TTL)` — a linear decay from 1 (just
    reported) to 0 (older than the TTL).
-3. Return them ranked best-first, ties broken by replica ID. `reason_code: PREFIX_MATCH`. (The handler currently returns every qualifying candidate — there is no top-K limit today; the gateway typically uses the top entry.)
+3. Filter the scored replicas through the **matched-tokens floor** (§2.6)
+   so a 1-block chat-template-only overlap is not reported as a routing
+   hit. If at least one replica clears the floor, return them ranked
+   best-first (ties broken by replica ID) with `reason_code: PREFIX_MATCH`.
+   If none clear the floor, the response downgrades to `reason_code: NO_HINT`
+   with empty scores. (The handler returns every qualifying candidate — there is
+   no top-K limit today; the gateway typically uses the top entry.)
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the
@@ -51,6 +57,64 @@ the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` /
 contract-key mismatch — see
 [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md). Either way
 the gateway falls back to its default routing policy.
+
+### 2.6 The matched-tokens floor
+
+The baseline returned `PREFIX_MATCH` for *any* non-zero overlap, which gave
+operators an inflated routing signal: post-the cache-stress harness benchmarks
+showed ~70% of `PREFIX_MATCH` responses were 1-block (16-token) matches —
+the Llama-3 chat-template framing every replica had identically. Trivial
+matches deterministically route to whichever replica's chat-template hash
+arrived first; they are not useful routing decisions, but they were being
+counted as if they were.
+
+The matched-tokens floor adds a per-namespace **result-side** filter on top
+of the score from §2 (and §2.5 longest-prefix matching). Pseudocode:
+
+```
+effective_floor = CachePolicy.spec.minimumMatchedTokens   // per namespace
+                  ?? server_default                       // = 64 (4 blocks)
+
+scored = ranker(request)                                  // §2 / §2.5
+kept   = [s for s in scored if s.matched_tokens >= effective_floor]
+
+if len(kept) > 0:
+    reply(PREFIX_MATCH, kept)
+else:
+    reply(NO_HINT, [])
+```
+
+Key properties:
+
+- **Server-side default.** A namespace with no `CachePolicy` installed still
+  gets the safety floor (`DefaultMinimumMatchedTokens = 64`), so the
+  inflated-metric bug doesn't reappear for unconfigured tenants — which is
+  the common case.
+- **Per-namespace override.** A `CachePolicy.spec.minimumMatchedTokens` value
+  overrides the default for that namespace exactly as written.
+- **`= 0` is the explicit opt-out.** Useful for raw-recall benchmarking and
+  pre-regression tests; reverts a namespace to the
+  every-match-is-`PREFIX_MATCH` behavior.
+- **Per-replica filter, not response-level.** A long-prefix replica still
+  surfaces as `PREFIX_MATCH` even when a sibling replica only matched the
+  trivial chat-template head — the floor drops the sibling, keeps the long
+  match. Only when *no* replica clears the floor does the response
+  downgrade.
+- **Applied BEFORE `CreditHits` runs.** A sub-floor match that is downgraded
+  to `NO_HINT` does not bump the LFU access counter — the contract guarantee
+  that a non-delivered hint never credits remains intact.
+- **Distinct from `minimumPrefixTokens`.** That field is a request-side
+  pre-lookup gate against the *request's* claimed prefix length (skips the
+  index entirely on a too-short request); this is a result-side post-lookup
+  floor against the *realized* per-replica overlap (filters what the index
+  produced).
+
+The default is 64 = four KV blocks at the typical 16-token block size — well
+above the 16-token framing tokens every replica has identically, well below
+any useful real-prompt prefix overlap. Tune up (`minimumMatchedTokens: 256`)
+when a deployment runs especially long system prompts and you want only
+substantial overlaps to count as routing wins; tune down to `0` when
+debugging the ranker or measuring raw recall.
 
 This is the cache plane's job at its simplest. Everything else in this doc
 *layers on top of this formula* — it never replaces it. When the new

@@ -297,6 +297,9 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	if cp.Spec.MinimumPrefixTokens != nil {
 		rp.MinimumPrefixTokens = *cp.Spec.MinimumPrefixTokens
 	}
+	if cp.Spec.MinimumMatchedTokens != nil {
+		rp.MinimumMatchedTokens = *cp.Spec.MinimumMatchedTokens
+	}
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}

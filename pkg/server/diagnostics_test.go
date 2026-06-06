@@ -90,9 +90,12 @@ func TestLookupRouteEmitsUnknownModel(t *testing.T) {
 func TestLookupRouteGenuineMissStillNoHint(t *testing.T) {
 	t.Run("real PREFIX_MATCH unchanged", func(t *testing.T) {
 		svc := newTestService()
+		// TokenCount=128 clears the DefaultMinimumMatchedTokens floor
+		// — the subtest pins "matching keys + a real prefix
+		// stays PREFIX_MATCH", separate from the floor.
 		svc.index.Ingest(index.Update{
 			ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
-			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 		})
 		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),

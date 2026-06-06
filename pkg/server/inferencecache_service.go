@@ -174,7 +174,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	if !hasDeadline {
 		start := time.Now()
 		result := s.lookupFn(lookupReq)
-		return s.buildLookupResponse(model, result, time.Since(start)), nil
+		return s.buildLookupResponse(model, tenant, result, time.Since(start)), nil
 	}
 
 	// Bounded path: a deadline is active, so bound the lookup at wall-clock
@@ -218,7 +218,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
-	return s.buildLookupResponse(model, result, elapsed), nil
+	return s.buildLookupResponse(model, tenant, result, elapsed), nil
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
@@ -227,7 +227,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
 // TENANT_HOT / NO_HINT / UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME)
 // via reasonForStrategy.
-func (s *inferenceCacheService) buildLookupResponse(model string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+	// Result-side floor on matched_tokens. The index returned
+	// PREFIX_MATCH because at least one replica held the requested prefix; that
+	// holds even when the realized overlap is the 1-block chat-template framing
+	// every replica has identically — which inflates operator-visible routing
+	// metrics by ~3× without changing routing quality (the proxy round-robins
+	// among equally-trivial holders). Filter replicas whose match falls below
+	// the policy floor; when none survive, downgrade to NO_HINT so the gateway
+	// rounds robin honestly. The downgrade happens BEFORE CreditHits so a
+	// non-delivered hint never bumps an LFU counter.
+	if result.Strategy == index.StrategyPrefixMatch {
+		result = s.applyMatchedTokensFloor(result, tenant)
+	}
 	// Credit the LFU access counters for the entries this response actually
 	// delivers. buildLookupResponse runs on every DELIVERED response (including
 	// NO_HINT and the UNKNOWN_* diagnostic responses) but never on the
@@ -279,6 +291,59 @@ func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
 		return 0
 	}
 	return s.policies.MinimumPrefixTokens(tenant)
+}
+
+// policyMinimumMatchedTokens returns the per-tenant matched-tokens floor
+// applied to PREFIX_MATCH responses. A nil store skips the floor entirely
+// (used by the test scaffolding that wires a service without a PolicyStore);
+// otherwise the resolver returns the tenant's configured value, or the
+// server-wide DefaultMinimumMatchedTokens when no CachePolicy is set.
+func (s *inferenceCacheService) policyMinimumMatchedTokens(tenant string) int32 {
+	if s.policies == nil {
+		return 0
+	}
+	return s.policies.MinimumMatchedTokens(tenant)
+}
+
+// applyMatchedTokensFloor filters scores below the per-tenant floor and, when
+// no replica survives, replaces the result with a fail-open NO_HINT (drops
+// hits, so LFU credit never runs on a downgraded response). The check is a
+// no-op when the floor is zero (policy opt-out) or when every score already
+// clears the floor — the common case for a real long-prefix match.
+func (s *inferenceCacheService) applyMatchedTokensFloor(result index.LookupResult, tenant string) index.LookupResult {
+	floor := s.policyMinimumMatchedTokens(tenant)
+	if floor <= 0 || len(result.Scores) == 0 {
+		return result
+	}
+	// Walk once: if every score clears the floor we keep the original slice
+	// (zero allocation, common case); only when a sub-floor score appears do
+	// we materialize a filtered copy. The filtered slice is appended without
+	// the original backing array so the discarded scores are eligible for GC
+	// (they may carry MatchedTokens that the caller would otherwise see).
+	belowFloor := false
+	for _, sc := range result.Scores {
+		if sc.MatchedTokens < floor {
+			belowFloor = true
+			break
+		}
+	}
+	if !belowFloor {
+		return result
+	}
+	kept := make([]index.ReplicaScore, 0, len(result.Scores))
+	for _, sc := range result.Scores {
+		if sc.MatchedTokens >= floor {
+			kept = append(kept, sc)
+		}
+	}
+	if len(kept) == 0 {
+		// No replica cleared the floor — downgrade to a fail-open NO_HINT.
+		// Dropping the hits slice is deliberate: a non-delivered hint must
+		// not bump LFU access counters (the LookupResult CreditHits invariant).
+		return index.LookupResult{Strategy: index.StrategyNone}
+	}
+	result.Scores = kept
+	return result
 }
 
 // reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's

@@ -13,13 +13,24 @@ import (
 // can refuse to push (the controller writes the same constant on each push).
 //
 // v2 added the Tenants slice (CacheTenant quota propagation). v3 added
-// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). The version
-// field is the forward-looking guard: a server rejects a body whose version it
+// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
+// ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
+// The version field is the forward-looking guard: a server rejects a body whose version it
 // does not recognize, so a mismatched controller/server pair fails loudly with a
 // clear "unsupported version" rather than silently losing fields. (An older
 // server would instead reject a newer body's unknown field at decode time under
 // DisallowUnknownFields — also a hard failure, just a less descriptive one.)
-const PolicyPropagationVersion = 3
+const PolicyPropagationVersion = 4
+
+// DefaultMinimumMatchedTokens is the server-side fallback floor on
+// MATCHED prefix tokens applied when a tenant has no CachePolicy at all.
+// Mirrors the +kubebuilder:default on CachePolicySpec.MinimumMatchedTokens
+// so the "no policy" and "policy with default value" paths both behave
+// identically — see PolicyStore.MinimumMatchedTokens. 64 ≈ 4 KV blocks at
+// the typical 16-token block size: substantially above the chat-template
+// framing tokens identical across every replica, well below any
+// useful real-prompt overlap.
+const DefaultMinimumMatchedTokens int32 = 64
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -30,6 +41,12 @@ const PolicyPropagationVersion = 3
 //   - EvictionTTL <= 0       → fall back to index.DefaultTTL (via the global
 //     WithTTL the binary configured).
 //   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
+//   - MinimumMatchedTokens <= 0 → floor disabled for THIS namespace (every
+//     matched_tokens count, even 1-block trivial overlap, is reported as
+//     PREFIX_MATCH). A negative pointer round-trips as 0, which is the
+//     intentional opt-out. A tenant with no ResolvedPolicy at all instead
+//     falls back to DefaultMinimumMatchedTokens (the server-side default
+//     floor) via PolicyStore.MinimumMatchedTokens.
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
 //   - Eviction == ""         → LRU (the index default and the kubebuilder default).
 type ResolvedPolicy struct {
@@ -38,9 +55,10 @@ type ResolvedPolicy struct {
 	// against the CachePolicy in namespace "foo".
 	Namespace string `json:"namespace"`
 
-	EvictionTTL         time.Duration `json:"evictionTTL,omitempty"`
-	MinimumPrefixTokens int32         `json:"minimumPrefixTokens,omitempty"`
-	LookupTimeoutMs     int32         `json:"lookupTimeoutMs,omitempty"`
+	EvictionTTL          time.Duration `json:"evictionTTL,omitempty"`
+	MinimumPrefixTokens  int32         `json:"minimumPrefixTokens,omitempty"`
+	MinimumMatchedTokens int32         `json:"minimumMatchedTokens,omitempty"`
+	LookupTimeoutMs      int32         `json:"lookupTimeoutMs,omitempty"`
 	// Eviction is the eviction algorithm in lower-case canonical form
 	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
 	// flattening. Empty means the server default (LRU). The index consults it on
@@ -202,13 +220,32 @@ func (s *PolicyStore) Eviction(tenant string) string {
 	return ""
 }
 
-// MinimumPrefixTokens returns the per-namespace minimum matched-token
-// threshold for LookupRoute. 0 means no threshold.
+// MinimumPrefixTokens returns the per-namespace minimum REQUESTED prefix
+// token threshold for LookupRoute (the request-side pre-lookup gate). 0 means
+// no threshold. Distinct from MinimumMatchedTokens, which gates the realized
+// match AFTER the lookup runs.
 func (s *PolicyStore) MinimumPrefixTokens(tenant string) int32 {
 	if p, ok := s.Lookup(tenant); ok {
 		return p.MinimumPrefixTokens
 	}
 	return 0
+}
+
+// MinimumMatchedTokens returns the per-namespace MATCHED prefix token floor
+// applied to LookupRoute responses. When a tenant has a CachePolicy the field
+// value wins as-is (including the explicit 0 opt-out — "I want every match
+// reported, even trivial ones"); when no policy exists the server-wide
+// DefaultMinimumMatchedTokens applies so the safety floor still fires for
+// unconfigured tenants. <0 round-trips to 0 (no enforcement) — the resolver
+// never returns a negative threshold to callers.
+func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
+	if p, ok := s.Lookup(tenant); ok {
+		if p.MinimumMatchedTokens < 0 {
+			return 0
+		}
+		return p.MinimumMatchedTokens
+	}
+	return DefaultMinimumMatchedTokens
 }
 
 // LookupTimeout returns the per-namespace LookupRoute deadline as a

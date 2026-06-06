@@ -15,13 +15,14 @@ snapshot. The CR is purely declarative: the controller pushes its resolved field
 server, which is where enforcement actually happens (see
 [Propagation](#propagation-controller--server) below).
 
-## The four spec knobs
+## The five spec knobs
 
 | Field | Type | Default | When to tune |
 |---|---|---|---|
 | `eviction` | enum `LRU` \| `LFU` | `LRU` | Cap-based eviction algorithm — which entries get dropped when the index exceeds its entry cap. `LRU` drops oldest-by-`lastSeen`; `LFU` drops the lowest access-count entry (ties broken on oldest `lastSeen`). Switch to `LFU` when a few prefixes are hot and you want them to survive cap pressure. Access counts do **not** age. |
 | `evictionTTL` | duration | server default `30m` | Maximum usable lifetime of a cache entry. The freshness sweep removes entries older than this regardless of eviction algorithm. Must be strictly positive when set (admission rejects `0`/negative). |
-| `minimumPrefixTokens` | int32 (min `0`) | unset = no threshold | Minimum prefix token count before a lookup is attempted. A request shorter than this short-circuits to `NO_HINT` without touching the index — saves work when short prompts can't usefully hit the cache. |
+| `minimumPrefixTokens` | int32 (min `0`) | unset = no threshold | Minimum *requested* prefix token count before a lookup is attempted. A request shorter than this short-circuits to `NO_HINT` **without touching the index** — saves work when short prompts can't usefully hit the cache. Applied BEFORE the lookup runs, against the *request's* claimed prefix length. |
+| `minimumMatchedTokens` | int32 (min `0`) | `64` (4 KV blocks) | Minimum *realized* matched-token count for a response to surface as `PREFIX_MATCH`. Applied AFTER the lookup runs, against the *actual* per-replica overlap. Replicas whose match falls below the floor are filtered; if none survive, the reason code downgrades to `NO_HINT` so the gateway round-robins honestly instead of being credited with a trivial chat-template-only match. Set to `0` to disable entirely (e.g. raw-recall benchmarking). Distinct from `minimumPrefixTokens` — see [Two minimums, one role each](#two-minimums-one-role-each) below. |
 | `lookupTimeoutMs` | int32 (min `0`) | unset = no deadline | Per-lookup latency budget in milliseconds. A breach returns reason code `TIMEOUT` (still fail-open — empty result, never an error to the gateway). See the foot-gun in [Gotchas](#two-gotchas). |
 
 `status` carries only `observedGeneration` + `conditions`, and both are **reserved** — the
@@ -40,15 +41,41 @@ kind: CachePolicy
 metadata:
   name: cachepolicy-sample
 spec:
-  eviction: LFU            # keep frequently-used prefixes under cap pressure
-  evictionTTL: 30m         # drop entries older than 30m since last REPORT
-  minimumPrefixTokens: 32  # short prompts short-circuit to NO_HINT
-  lookupTimeoutMs: 20      # positive => a real 20ms deadline (NOT 0 — see Gotchas)
+  eviction: LFU             # keep frequently-used prefixes under cap pressure
+  evictionTTL: 30m          # drop entries older than 30m since last REPORT
+  minimumPrefixTokens: 32   # short prompts short-circuit to NO_HINT (request-side gate)
+  minimumMatchedTokens: 64  # downgrade trivial overlaps to NO_HINT (result-side floor, default 64)
+  lookupTimeoutMs: 20       # positive => a real 20ms deadline (NOT 0 — see Gotchas)
 ```
 
 A copy-pasteable starting point ships at
 [`config/samples/cache_v1alpha1_cachepolicy.yaml`](../../config/samples/cache_v1alpha1_cachepolicy.yaml)
 (it omits `eviction` to exercise the `LRU` default).
+
+## Two minimums, one role each
+
+The policy carries **two** minimum-token knobs and they enforce at different
+stages of the lookup path. They're orthogonal — a single misconfigured value
+on either side can silently inflate `PREFIX_MATCH` rates without an
+operator-visible signal.
+
+| Knob | Stage | Compared against | Default | Sub-floor outcome |
+|---|---|---|---|---|
+| `minimumPrefixTokens` | BEFORE the index lookup | the *request's* claimed prefix token count (chain sum wins over the legacy single-blob count) | unset = no threshold | Short-circuit to `NO_HINT` — the index is never touched. Saves work on requests that wouldn't usefully hit the cache anyway. |
+| `minimumMatchedTokens` | AFTER the index lookup | each replica's *realized* matched-token overlap | `64` (4 KV blocks at the typical 16-token block size) | Filter that replica from the response. If no replica survives, the reason code downgrades to `NO_HINT`. Stops trivial chat-template-only matches from being counted as routing hits. |
+
+**Why both?** A 5000-token request can still produce a 16-token match (only
+the chat-template framing overlaps). `minimumPrefixTokens` can't catch that
+— the *request* is long enough; it's the *overlap* that's trivial.
+`minimumMatchedTokens` exists for exactly that case (the post-the cache-stress harness
+benchmark showed ~70% of `PREFIX_MATCH` responses were 1-block trivial
+overlaps before this floor landed).
+
+**Setting `minimumMatchedTokens: 0` is the explicit opt-out** — useful when
+you want to measure raw recall, debug the ranker, or pin pre-floor
+behavior in a regression test. With a `CachePolicy` installed the field
+value wins as-is (zero included); with no `CachePolicy` installed the
+server applies the `64` default for the safety floor.
 
 ## Two gotchas
 

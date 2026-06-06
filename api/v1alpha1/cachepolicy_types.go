@@ -47,6 +47,23 @@ type CachePolicySpec struct {
 	// +kubebuilder:validation:Minimum=0
 	MinimumPrefixTokens *int32 `json:"minimumPrefixTokens,omitempty"`
 
+	// MinimumMatchedTokens is the minimum number of MATCHED prefix tokens a
+	// LookupRoute response must achieve before PREFIX_MATCH is returned.
+	// Distinct from MinimumPrefixTokens, which is a request-side gate on
+	// effective prefix tokens BEFORE the index is consulted; this is a
+	// result-side floor applied AFTER the lookup, against the actual matched
+	// overlap. Replicas whose match falls below this threshold are filtered
+	// from the response; if no replica clears the floor, the reason_code is
+	// downgraded to NO_HINT so the gateway round-robins honestly instead of
+	// being credited with a trivial chat-template-only match. Defaults to 64
+	// (4 blocks at the typical 16-token block size — well above the framing
+	// tokens identical across every replica). Set to 0 to disable the floor
+	// entirely.
+	// +optional
+	// +kubebuilder:default=64
+	// +kubebuilder:validation:Minimum=0
+	MinimumMatchedTokens *int32 `json:"minimumMatchedTokens,omitempty"`
+
 	// LookupTimeoutMs bounds cache lookup latency in milliseconds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0

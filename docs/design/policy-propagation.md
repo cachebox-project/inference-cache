@@ -151,16 +151,17 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v3)
+## Wire schema (v4)
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "policies": [
     {
       "namespace": "team-a",
       "evictionTTL": 900000000000,
       "minimumPrefixTokens": 32,
+      "minimumMatchedTokens": 128,
       "lookupTimeoutMs": 25,
       "eviction": "lfu"
     },
@@ -180,9 +181,10 @@ intervention.
 ```
 
 - `version` — schema version. Bumped on a breaking change. The server
-  rejects any value it does not recognize (HTTP 400). Currently `3`
-  (bumped from `1` to `2` when `tenants` was added, then to `3` when
-  `policies[].eviction` was added).
+  rejects any value it does not recognize (HTTP 400). Currently `4`
+  (bumped from `1` to `2` when `tenants` was added, to `3` when
+  `policies[].eviction` was added, and to `4` when
+  `policies[].minimumMatchedTokens` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -196,7 +198,17 @@ intervention.
   defensive default for an unset field and for any legacy/raced data that
   predates the webhook.
 - `policies[].minimumPrefixTokens` — int32. Optional. `<=0` ⇒ "no
-  threshold".
+  threshold". A request-side gate against `LookupRouteRequest`'s claimed
+  prefix length BEFORE the index is touched.
+- `policies[].minimumMatchedTokens` — int32. Optional. `<=0` ⇒ "no floor for
+  this namespace" (the explicit opt-out). A namespace that does NOT have a
+  `CachePolicy` at all instead falls back to `DefaultMinimumMatchedTokens`
+  (= 64) — the server-wide safety floor. Distinct from
+  `minimumPrefixTokens`: this is a result-side filter applied AFTER the
+  index returns, against each replica's realized matched-token overlap.
+  Replicas whose match falls below the floor are filtered from the
+  response; when none survive, the reason code downgrades to `NO_HINT`.
+  See [`lookuproute-ranking.md`](./lookuproute-ranking.md#26-the-matched-tokens-floor).
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒
   "no deadline".
 - `policies[].eviction` — lower-cased cap-eviction algorithm (`"lru"` /
@@ -282,6 +294,7 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
 | `eviction` | `pkg/index` `EvictionResolver` — selects the per-namespace cap-based eviction algorithm. `lru` evicts oldest-by-`lastSeen`; `lfu` evicts the lowest per-entry access count, tie-broken on oldest `lastSeen`. The cap sweep (over `MaxEntries`) consults it to order victims. In `lfu` namespaces the lookup path also reads it to record which entries a *delivered* `LookupRoute` hint credits — the bump is lock-free and applied only when the response is actually returned (a `TIMEOUT`'d lookup credits nothing) and never changes a lookup result. The TTL sweep is algorithm-independent. Emitted as `inferencecache_index_evictions_total{algorithm,reason}`. |
 | `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
+| `minimumMatchedTokens` | Post-lookup floor on each replica's realized `matched_tokens`. The handler resolves the per-tenant floor via `PolicyStore.MinimumMatchedTokens`, which falls back to `DefaultMinimumMatchedTokens` (= 64) for tenants with no `CachePolicy`. Replicas whose `matched_tokens` falls below the floor are filtered from the scored result; if none survive, the response downgrades to `reason_code: NO_HINT` with empty scores. The downgrade runs **before** the LFU `CreditHits` step so a non-delivered hint never bumps the per-entry access counter. See [`lookuproute-ranking.md §2.6`](./lookuproute-ranking.md#26-the-matched-tokens-floor). |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 

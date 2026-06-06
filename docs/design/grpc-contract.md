@@ -83,7 +83,23 @@ What B4 originally landed (now partly superseded by B6, see below): fail-open st
 
 Still out of scope (later modules): template rendering (D-series), PD routing (Phase 2), and the event/metric **streams** `StreamCacheEvents` / `StreamMetrics` (M10). Java stubs are generated when the gateway client (E1) needs them.
 
-**Update — B6 (cache index):** `LookupRoute`, `ReportCacheState`, `PublishEvent`, and `GetCacheState` are now backed by the in-memory `CacheIndex` (`pkg/index`): `ReportCacheState` ingests additive deltas; `PublishEvent` applies scheme-safe deltas only — `PREFIX_EVICTED` / `ALL_CLEARED` (removals) and `REPLICA_UPDATED` (replica liveness), while `PREFIX_ADDED` is a no-op (events carry no `hash_scheme`, so additions/refreshes come via `ReportCacheState`); `LookupRoute` returns ranked replicas (`PREFIX_MATCH` / `TENANT_HOT`), a fail-open miss (`NO_HINT` — no match, no warm-tenant fallback, or below the `CachePolicy.spec.minimumPrefixTokens` gate), a deadline breach (`TIMEOUT` — `CachePolicy.spec.lookupTimeoutMs`, still fail-open), or one of the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` — set-but-wrong contract key, see "Diagnostic reason codes" below); and `GetCacheState` returns the `(tenant, model)` aggregate. The lookup/index metrics (`inferencecache_index_entries`, `inferencecache_lookup_route_*`) are emitted on `/metrics`. `RenderTemplate`, `LookupPDRoute`, and the streams remain fail-open stubs.
+**Update — B6 (cache index):** `LookupRoute`, `ReportCacheState`, `PublishEvent`, and `GetCacheState` are now backed by the in-memory `CacheIndex` (`pkg/index`): `ReportCacheState` ingests additive deltas; `PublishEvent` applies scheme-safe deltas only — `PREFIX_EVICTED` / `ALL_CLEARED` (removals) and `REPLICA_UPDATED` (replica liveness), while `PREFIX_ADDED` is a no-op (events carry no `hash_scheme`, so additions/refreshes come via `ReportCacheState`); `LookupRoute` returns ranked replicas (`PREFIX_MATCH` / `TENANT_HOT`), a fail-open miss (`NO_HINT` — no match, no warm-tenant fallback, below the `CachePolicy.spec.minimumPrefixTokens` request-side gate, or every candidate replica matched fewer tokens than the `CachePolicy.spec.minimumMatchedTokens` result-side floor — see "Matched-tokens floor" below), a deadline breach (`TIMEOUT` — `CachePolicy.spec.lookupTimeoutMs`, still fail-open), or one of the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` — set-but-wrong contract key, see "Diagnostic reason codes" below); and `GetCacheState` returns the `(tenant, model)` aggregate. The lookup/index metrics (`inferencecache_index_entries`, `inferencecache_lookup_route_*`) are emitted on `/metrics`. `RenderTemplate`, `LookupPDRoute`, and the streams remain fail-open stubs.
+
+#### Matched-tokens floor
+
+`PREFIX_MATCH` requires the realized per-replica overlap to clear the per-namespace
+`CachePolicy.spec.minimumMatchedTokens` floor, applied AFTER the index lookup returns.
+Replicas whose matched-tokens count falls below the floor are filtered from the
+response; when no replica survives, the reason code downgrades to `NO_HINT` and the
+gateway round-robins honestly instead of being credited with a trivial 1-block
+chat-template-only match. The server applies a default of `64` (4 KV blocks at the
+typical 16-token block size) to any tenant with no `CachePolicy` installed; an
+explicit `minimumMatchedTokens: 0` disables the floor for that namespace. Distinct
+from the pre-lookup `minimumPrefixTokens` request-side gate — see the policy field
+docs in [`policy-crds.md`](./policy-crds.md) and the operator guide at
+[`docs/concepts/cachepolicy-tuning.md`](../concepts/cachepolicy-tuning.md). The
+filtering happens on the server before the response is built, so the wire shape is
+unchanged and old clients continue to fail open on a downgrade.
 
 **Update — B6 (CacheIndex status surface):** the cluster-wide aggregate is now exposed two ways: an internal HTTP `/snapshot` endpoint on the server (JSON; metadata only — replica/tenant stats + prefix counts, never KV/prompt data), and a cluster-scoped, status-only `CacheIndex` CRD (`kubectl get cacheindex`) that the controller maintains by scraping `/snapshot`. This is outside the gRPC contract (no proto change); see the `CacheIndex` type in `api/v1alpha1` and the `CacheIndexPoller` in `internal/controller`.
 
