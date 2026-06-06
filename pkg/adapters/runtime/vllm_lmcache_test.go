@@ -141,13 +141,21 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerNoRequestsWithoutAutoscaling(t *testing.T) {
-	// Non-autoscaled backends keep the previous "no requests" rendering so
-	// upgrades don't change scheduling for users who don't opt into an HPA.
+func TestVLLMLMCacheResolveCacheServerNoRequestsForRawNilResourcesNoAutoscaling(t *testing.T) {
+	// Renderer baseline for the RAW-STRUCT path (no apiserver in the
+	// loop): spec.resources is nil and spec.autoscaling is nil, so the
+	// adapter renders zero Requests on the container. On a live cluster
+	// the same minimal CacheBackend arrives at the reconciler with the
+	// CRD-stamped memory default already applied to spec.resources — the
+	// reconciler-against-real-apiserver behavior is asserted end-to-end
+	// in TestIntegrationCacheBackendResources/DefaultStampsMemoryLimits…
+	// This test pins the no-default-stamp invariant the unit-test path
+	// relies on so future contributors don't accidentally inject defaults
+	// in the renderer itself.
 	a := NewVLLMLMCacheAdapter()
 	pod := resolvePod(t, a, newLMCacheBackend(nil))
 	if len(pod.Containers[0].Resources.Requests) != 0 {
-		t.Fatalf("container Requests = %v, want empty when autoscaling is unset", pod.Containers[0].Resources.Requests)
+		t.Fatalf("container Requests = %v, want empty when spec.resources is nil and autoscaling is unset (raw-struct path)", pod.Containers[0].Resources.Requests)
 	}
 }
 

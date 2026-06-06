@@ -156,6 +156,7 @@ var DefaultValidationRules = []ValidationRule{
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectResourceLimitsBelowRequests,
 	rejectResourceClaims,
+	rejectNegativeResourceQuantities,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -988,6 +989,42 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 			fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
 		))
 	}
+	return errs
+}
+
+// rejectNegativeResourceQuantities rejects any strictly-negative
+// quantity in spec.resources.requests or spec.resources.limits. The
+// CRD schema serialises each entry as a resource.Quantity string, which
+// admits a leading "-" without complaint at structural validation —
+// the apiserver's Pod resource validator later rejects the pod with a
+// "must be greater than or equal to 0" error that the operator has to
+// chase through child Deployment events. Rejecting at admission turns
+// that latent failure into a field-scoped error at `kubectl apply`.
+//
+// Zero is allowed: a `requests.memory: "0"` shape is unusual but
+// explicitly valid under the kubelet's `>= 0` contract — an operator
+// who writes it is opting into "no guaranteed minimum", which is the
+// kubelet's default treatment of a missing request and a reasonable
+// shape to admit verbatim.
+func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			if qty.Sign() >= 0 {
+				continue
+			}
+			errs = append(errs, field.Invalid(
+				field.NewPath("spec", "resources", kind).Key(string(name)),
+				qty.String(),
+				"must be a non-negative quantity",
+			))
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
 	return errs
 }
 

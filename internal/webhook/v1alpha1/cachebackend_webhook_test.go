@@ -511,6 +511,47 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesNegativeRequestRejected(t *testing.T) {
+	// The CRD schema serialises requests/limits as resource.Quantity
+	// strings — it admits a leading "-" without complaint, and the
+	// kubelet rejects the negative quantity only when the pod tries
+	// to schedule. Reject at admission with a field-scoped error so
+	// the regression surfaces at `kubectl apply`.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("-1Gi")},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.requests[memory]",
+		"must be a non-negative quantity")
+}
+
+func TestValidator_ResourcesNegativeLimitRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("-100m")},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.limits[cpu]",
+		"must be a non-negative quantity")
+}
+
+func TestValidator_ResourcesZeroQuantityAdmitted(t *testing.T) {
+	// Zero is permitted (matches the kubelet's >=0 contract): an
+	// operator who writes `requests.memory: "0"` is explicitly opting
+	// into "no guaranteed minimum", which is a valid (if unusual)
+	// shape. Only strictly-negative quantities are rejected.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("zero-quantity request rejected: %v", err)
+	}
+}
+
 func TestValidator_ResourcesClaimsRejected(t *testing.T) {
 	// corev1.ResourceRequirements exposes Claims for the Dynamic Resource
 	// Allocation (DRA) feature, but the renderer only copies Container.
