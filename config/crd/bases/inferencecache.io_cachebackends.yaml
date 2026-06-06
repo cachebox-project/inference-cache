@@ -2196,31 +2196,40 @@ spec:
                 type: integer
               observedServerInstance:
                 description: |-
-                  ObservedServerInstance is the metadata.uid of the cache-server pod the
-                  controller last observed Ready for this managed backend (Phase 1: the
-                  lexicographically-smallest Ready pod from the owned Deployment, since
-                  PVC-backed cache servers are single-replica and ephemeral ones rarely
-                  scale beyond one). It is the controller's stable pointer to the current
-                  cache-server process: when the value changes, the cache-server pod has
-                  been replaced (OOM-kill, eviction, node maintenance, image roll), and
-                  every injected engine pod holds a stale LMCache client socket — the
-                  upstream LMServerConnector opens its TCP socket in __init__ only and
-                  silently fails every subsequent PUT with EPIPE until the engine pod
-                  itself rolls.
+                  ObservedServerInstance is a stable identifier representing the
+                  current set of Ready cache-server pods the controller observes for
+                  this managed backend — comma-joined, lex-sorted by pod name, of
+                  every Ready pod's metadata.uid that is transitively controller-
+                  owned by the CacheBackend's Deployment. Most managed backends are
+                  single-replica (the PVC-backed shape requires it; ephemeral ones
+                  typically run one too), so this is usually a single UID; multi-
+                  replica ephemeral backends produce a comma-joined list, so
+                  replacement of any replica changes the identifier and triggers
+                  the cascade (a single-pod tracker would silently miss restarts of
+                  the non-first replicas).
 
-                  On a change from a non-empty prior value the reconciler cascade-restarts
-                  every engine Deployment that owns pods carrying this backend's
-                  inferencecache.io/injected-by annotation, by patching a fresh
-                  inferencecache.io/cache-server-restart-trigger annotation onto the
-                  Deployment's pod template (the same mechanism kubectl rollout restart
-                  uses); the cascade is rate-limited to at most once per ~30s per backend
-                  to dampen restart storms when the cache-server flaps. Empty until the
-                  first Ready cache-server pod is observed, and an empty→set transition
-                  never cascades (no engines depend on a not-yet-existed server). Inert
-                  for External / unsupported-runtime backends. The cascade is an
-                  operator-side recovery for the upstream EPIPE bug and can be retired
-                  once upstream LMCache grows EPIPE-detect-and-reconnect in the
-                  LMServerConnector write path.
+                  When the identifier changes, the cache-server pod set has been
+                  replaced (OOM-kill, eviction, node maintenance, image roll), and
+                  every injected engine pod holds a stale LMCache client socket —
+                  the upstream LMServerConnector opens its TCP socket in __init__
+                  only and silently fails every subsequent PUT with EPIPE until the
+                  engine pod itself rolls.
+
+                  On a change from a non-empty prior value the reconciler cascade-
+                  restarts every engine Deployment that owns pods carrying this
+                  backend's inferencecache.io/injected-by + injected-by-uid
+                  annotation pair, by patching a fresh
+                  inferencecache.io/cache-server-restart-trigger annotation onto
+                  the Deployment's pod template (the same mechanism kubectl rollout
+                  restart uses); the cascade is rate-limited to at most once per
+                  ~30s per backend to dampen restart storms when the cache-server
+                  flaps. Empty until the first Ready cache-server pod is observed,
+                  and an empty→set transition never cascades (no engines depend on
+                  a not-yet-existed server). Inert for External / unsupported-
+                  runtime backends. The cascade is an operator-side recovery for
+                  the upstream EPIPE bug and can be retired once upstream LMCache
+                  grows EPIPE-detect-and-reconnect in the LMServerConnector write
+                  path.
                 type: string
             type: object
         type: object

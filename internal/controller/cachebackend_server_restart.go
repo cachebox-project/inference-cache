@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -232,24 +233,29 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	return 0
 }
 
-// currentServerInstanceUID returns the UID of the cache-server pod the
-// controller currently treats as "the server instance" for the backend,
-// or "" when no Ready pod exists yet. The candidate set is the owned
-// Deployment's pods — pods whose controller-owning ReplicaSet is
-// controller-owned by the Deployment named after the backend, identified
-// by both name AND UID so a foreign Ready pod that happens to carry the
-// same controller-managed labels (or a stale ownerRef name that resolves
-// to a different live object) cannot advance observedServerInstance and
-// spuriously trigger an engine rollout. Of those, the pod with the
-// lex-smallest name is the representative instance — a deterministic
-// pick across reconciles and apiserver List orderings, single-pod for
-// the PVC-backed common case and a stable representative for the
-// multi-replica ephemeral case.
+// currentServerInstanceUID returns a stable identifier representing the
+// current set of Ready cache-server pods for the backend, or "" when no
+// Ready pod exists yet. The candidate set is the owned Deployment's
+// pods — pods whose controller-owning ReplicaSet is controller-owned by
+// the backend-owned Deployment, identified by both name AND UID so a
+// foreign Ready pod that happens to carry the same controller-managed
+// labels (or a stale ownerRef name that resolves to a different live
+// object) cannot advance observedServerInstance and spuriously trigger
+// an engine rollout.
+//
+// The identifier is a comma-joined, lex-sorted list of every Ready
+// pod's UID — NOT just the lex-smallest. Multi-replica managed
+// backends (`spec.replicas > 1` on non-PVC backends) replace pods
+// independently; tracking only one would let a restart of any other
+// replica slip past observedServerInstance, so engines bound to that
+// replica would keep their stale LMCache socket forever. Including
+// every Ready pod's UID means a single replacement always changes the
+// identifier and cascades.
 //
 // Reads via APIReader (uncached) where possible to avoid registering a
-// Pod informer; the controller's design explicitly rejects watching all
-// pods cluster-wide (see refreshMatchedEnginePods godoc). Falls back to
-// the cached client when APIReader is nil (test wiring).
+// Pod informer; the controller's design explicitly rejects watching
+// all pods cluster-wide (see refreshMatchedEnginePods godoc). Falls
+// back to the cached client when APIReader is nil (test wiring).
 func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, error) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
@@ -257,16 +263,24 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	}
 
 	// Fetch the owned Deployment so we can authenticate candidate pods
-	// against its UID. NotFound is the cold-start case (CR exists, the
-	// reconciler hasn't created the Deployment yet, or the operator just
-	// deleted it out-of-band): no pods can be authoritatively attributed
-	// so report "no instance".
+	// against its UID. Verify the live Deployment is still controlled by
+	// THIS CacheBackend before using it as the ownership anchor — name
+	// reuse / race conditions could otherwise let a foreign Deployment
+	// re-created under the same name be treated as ours. NotFound is the
+	// cold-start case (CR exists, the reconciler hasn't created the
+	// Deployment yet, or it was deleted out-of-band): no pods can be
+	// authoritatively attributed so report "no instance".
 	var ownedDep appsv1.Deployment
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}, &ownedDep); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", nil
 		}
 		return "", fmt.Errorf("get owned cache-server deployment: %w", err)
+	}
+	if !metav1.IsControlledBy(&ownedDep, backend) {
+		// Foreign Deployment sharing the backend's name. Refuse to
+		// attribute its pods to this CacheBackend.
+		return "", nil
 	}
 
 	matcher := labels.SelectorFromSet(selectorLabels(backend.Name))
@@ -277,13 +291,13 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	); err != nil {
 		return "", fmt.Errorf("list cache-server pods: %w", err)
 	}
-	// Collect (name, uid) pairs for Ready, attributable pods only. A pod
-	// that is mid-rollout (Pending / Terminating) does not represent a
-	// serving instance — including it would let a rollout's transient
-	// state trigger a cascade even though the prior instance is still
-	// serving. A pod that is Ready but not transitively controller-owned
-	// by THIS backend's Deployment is rejected — see the godoc above for
-	// why the ownership check is required for correctness.
+	// Collect every Ready, attributable pod's UID. A pod that is
+	// mid-rollout (Pending / Terminating) does not represent a serving
+	// instance — including it would let a rollout's transient state
+	// trigger a cascade even though the prior instance is still
+	// serving. A pod that is Ready but not transitively controller-
+	// owned by THIS backend's Deployment is rejected — see the godoc
+	// above for why the ownership check is required.
 	type readyPod struct {
 		name string
 		uid  string
@@ -306,7 +320,11 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		return "", nil
 	}
 	sort.Slice(ready, func(i, j int) bool { return ready[i].name < ready[j].name })
-	return ready[0].uid, nil
+	uids := make([]string, len(ready))
+	for i := range ready {
+		uids[i] = ready[i].uid
+	}
+	return strings.Join(uids, ","), nil
 }
 
 // podOwnedByDeployment reports whether pod is transitively controller-

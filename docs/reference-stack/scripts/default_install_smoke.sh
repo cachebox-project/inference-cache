@@ -1092,7 +1092,8 @@ log "InjectedByCacheBackend Event present on the engine pod (UID matches the per
 #     envtest.
 #
 # Must run BEFORE the drift case below, which scales the engine to 0:
-# with no engine pod present, there's no Deployment to cascade-restart.
+# with no engine pod present, no injected-by annotations remain in the
+# namespace, so the cascade would find no Deployments to annotate.
 log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the initial cache-server pod to publish status.observedServerInstance"
 deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
 baseline_server_uid=""

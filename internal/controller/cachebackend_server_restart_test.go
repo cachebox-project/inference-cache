@@ -77,11 +77,20 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 	// Cache-server Deployment+ReplicaSet the reconciler "owns" — the
 	// transitive owner chain currentServerInstanceUID's strengthened
 	// ownership check requires to attribute a Ready pod to this backend.
+	// The Deployment's controller-owner reference points at the
+	// CacheBackend, which is what IsControlledBy expects.
 	f.serverDep = &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      f.cacheName,
 			Namespace: f.cacheNS,
 			UID:       "cache-dep-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: cachev1alpha1.GroupVersion.String(),
+				Kind:       "CacheBackend",
+				Name:       f.backend.Name,
+				UID:        f.backend.UID,
+				Controller: &tru,
+			}},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Template: corev1.PodTemplateSpec{
@@ -355,13 +364,14 @@ func TestReconcileServerInstance_NotReadyPodGivesNoBaseline(t *testing.T) {
 }
 
 // TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades
-// covers the case Codex flagged: an operator clears
-// spec.engineSelector AFTER engine pods were already injected. The
-// pods' injected-by annotations persist, the LMCache sockets are still
-// stale on a cache-server restart, and we MUST still cascade-restart
-// them. Selector match is the apiserver-side perf optimization in
-// other reconciler paths; the cascade authoritatively filters on the
-// injected-by annotation pair so the selector-removed case is covered.
+// asserts that an operator clearing spec.engineSelector AFTER engine
+// pods were already injected does not silently break recovery. The
+// pods' injected-by annotations persist, their LMCache sockets are
+// still stale on a cache-server restart, and the cascade MUST still
+// roll them. Selector match is an apiserver-side perf optimization
+// for other reconciler paths; the cascade authoritatively filters on
+// the injected-by annotation pair, so removing the selector does not
+// disable recovery.
 func TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 	f.backend.Spec.EngineSelector = nil
@@ -392,12 +402,13 @@ func TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades(t *t
 	}
 }
 
-// TestReconcileServerInstance_StaleInjectedByUIDIsRejected covers
-// Codex's finding that the cascade trusts only the injected-by
-// annotation. A pod stamped with this backend's name but a stale UID
-// (CR was deleted and recreated under the same name) is NOT actually
-// wired to the live CR's cache-server socket — annotating its
-// Deployment would roll unrelated work or do nothing useful.
+// TestReconcileServerInstance_StaleInjectedByUIDIsRejected asserts
+// that the cascade rejects a pod whose injected-by name matches but
+// whose injected-by-uid does not (CR deleted and recreated under the
+// same name, or an operator with pod-create RBAC forging the
+// annotation). The pod is NOT actually wired to the live CR's cache-
+// server socket — annotating its Deployment would roll unrelated
+// work or do nothing useful.
 func TestReconcileServerInstance_StaleInjectedByUIDIsRejected(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 	// Forge a name-match / UID-mismatch on the engine pod.
@@ -423,10 +434,10 @@ func TestReconcileServerInstance_StaleInjectedByUIDIsRejected(t *testing.T) {
 }
 
 // TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance
-// covers Codex's finding that a Ready pod carrying the controller-
-// managed labels but NOT controller-owned by THIS backend's Deployment
-// must not advance observedServerInstance (a transition would
-// spuriously trigger an engine rollout).
+// asserts that a Ready pod carrying the controller-managed labels but
+// NOT controller-owned by THIS backend's Deployment must not advance
+// observedServerInstance — otherwise a transition would spuriously
+// trigger an engine rollout.
 func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
@@ -474,6 +485,112 @@ func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *test
 	f.reloadEngineDep(t)
 	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
 		t.Fatalf("foreign pod triggered a cascade; want no cascade")
+	}
+}
+
+// TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod asserts
+// that a backend with multiple Ready cache-server pods (the ephemeral
+// `spec.replicas > 1` shape) encodes every Ready pod's UID into
+// observedServerInstance. Replacing ANY one of the replicas must
+// advance the identifier and cascade — a tracker that watched only
+// one pod would silently miss restarts of the others.
+func TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Add a second Ready cache-server pod owned by the same RS.
+	tru := true
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-bbb",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-2",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), pod2); err != nil {
+		t.Fatalf("create pod2: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), pod2); err != nil {
+		t.Fatalf("set pod2 ready: %v", err)
+	}
+
+	// First observation should encode BOTH pods, sorted by name. With
+	// pod-aaa < pod-bbb, the lex-sorted order is uid-1, uid-2.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("first observation wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantInitial := string(f.serverPod.UID) + "," + string(pod2.UID)
+	if got := f.backend.Status.ObservedServerInstance; got != wantInitial {
+		t.Fatalf("initial ObservedServerInstance = %q, want %q (both Ready pod UIDs, lex-sorted by name)", got, wantInitial)
+	}
+
+	// Replace ONLY the second replica (the one whose UID would be
+	// silently missed by a single-pod tracker).
+	if err := f.r.Delete(context.Background(), pod2); err != nil {
+		t.Fatalf("delete pod2: %v", err)
+	}
+	pod2b := pod2.DeepCopy()
+	pod2b.ResourceVersion = ""
+	pod2b.UID = "cache-pod-uid-2-replacement"
+	if err := f.r.Create(context.Background(), pod2b); err != nil {
+		t.Fatalf("create pod2 replacement: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), pod2b); err != nil {
+		t.Fatalf("ready pod2 replacement: %v", err)
+	}
+
+	// The identifier must now advance to include the replacement UID.
+	// Wait a frame for the rate-limit window — fixture's
+	// MinServerRestartCascadeInterval is 50ms.
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("replacement wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantAfter := string(f.serverPod.UID) + "," + string(pod2b.UID)
+	if got := f.backend.Status.ObservedServerInstance; got != wantAfter {
+		t.Fatalf("ObservedServerInstance after replacement = %q, want %q", got, wantAfter)
+	}
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantAfter {
+		t.Fatalf("cascade annotation = %q, want %q (non-first replica's restart must still cascade)", got, wantAfter)
+	}
+}
+
+// TestReconcileServerInstance_ForeignDeploymentSameNameIgnored asserts
+// that when the backend's CacheBackend.UID does not control the live
+// Deployment named after it (a foreign Deployment recreated under the
+// same name, or operator drift), the reconciler refuses to attribute
+// its pods to the backend and observedServerInstance stays empty.
+func TestReconcileServerInstance_ForeignDeploymentSameNameIgnored(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Rewrite the cache-server Deployment's controller-owner ref to
+	// point at some OTHER CacheBackend (a foreign UID).
+	dep := f.serverDep.DeepCopy()
+	dep.OwnerReferences[0].UID = "foreign-cb-uid"
+	if err := f.r.Update(context.Background(), dep); err != nil {
+		t.Fatalf("rewrite owner ref: %v", err)
+	}
+
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != "" {
+		t.Fatalf("ObservedServerInstance = %q, want empty (foreign Deployment must not be attributed to this backend)", got)
 	}
 }
 
