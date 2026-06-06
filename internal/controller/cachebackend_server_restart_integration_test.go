@@ -87,7 +87,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		reloaded := getBackend(t, r, "cache", ns)
-		if got := reloaded.Status.ObservedServerInstance; got != string(serverPod1.UID) {
+		if got := reloaded.Status.ObservedServerInstance; got != serverInstanceID(serverPod1) {
 			t.Fatalf("baseline ObservedServerInstance = %q, want %q", got, serverPod1.UID)
 		}
 		gotDep := &appsv1.Deployment{}
@@ -117,14 +117,14 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		reloaded = getBackend(t, r, "cache", ns)
-		if got := reloaded.Status.ObservedServerInstance; got != string(serverPod2.UID) {
+		if got := reloaded.Status.ObservedServerInstance; got != serverInstanceID(serverPod2) {
 			t.Fatalf("ObservedServerInstance after UID flip = %q, want %q", got, serverPod2.UID)
 		}
 		if err := k8s.Get(ctx, types.NamespacedName{Name: "vllm-engine", Namespace: ns}, gotDep); err != nil {
 			t.Fatalf("get engine dep: %v", err)
 		}
 		annot := gotDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
-		if annot != string(serverPod2.UID) {
+		if annot != serverInstanceID(serverPod2) {
 			t.Fatalf("cascade annotation = %q, want %q", annot, serverPod2.UID)
 		}
 		if got := cascadeRestartsCount(t, ns, "cache", cascadeRestartReasonServerInstanceChanged); got != 1 {
@@ -189,7 +189,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 			t.Fatalf("get engine dep: %v", err)
 		}
 		firstCascadeUID := gotDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
-		if firstCascadeUID != string(serverPod2.UID) {
+		if firstCascadeUID != serverInstanceID(serverPod2) {
 			t.Fatalf("first cascade annotation = %q, want %q", firstCascadeUID, serverPod2.UID)
 		}
 		if got := cascadeRestartsCount(t, ns, "cache", cascadeRestartReasonServerInstanceChanged); got != 1 {

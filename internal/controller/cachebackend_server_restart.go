@@ -291,16 +291,26 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	); err != nil {
 		return "", fmt.Errorf("list cache-server pods: %w", err)
 	}
-	// Collect every Ready, attributable pod's UID. A pod that is
-	// mid-rollout (Pending / Terminating) does not represent a serving
-	// instance — including it would let a rollout's transient state
-	// trigger a cascade even though the prior instance is still
+	// Collect every Ready, attributable pod's identifier. A pod that
+	// is mid-rollout (Pending / Terminating) does not represent a
+	// serving instance — including it would let a rollout's transient
+	// state trigger a cascade even though the prior instance is still
 	// serving. A pod that is Ready but not transitively controller-
 	// owned by THIS backend's Deployment is rejected — see the godoc
 	// above for why the ownership check is required.
+	//
+	// The per-pod identifier is <podUID>:<containerRunSum> where
+	// containerRunSum is the sum of every container's restart count.
+	// pod.UID alone is invariant across in-place container restarts
+	// (kubelet restarting a crashed container reuses the pod object),
+	// but the LMCache server process inside that pod is fresh and
+	// every engine still holds a stale socket. Including the restart-
+	// count sum makes that case observable: an OOM-killed cache-server
+	// container respawned in the same pod increments the count and
+	// advances the identifier, so the cascade fires.
 	type readyPod struct {
 		name string
-		uid  string
+		id   string
 	}
 	ready := make([]readyPod, 0, len(pods.Items))
 	for i := range pods.Items {
@@ -314,17 +324,35 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		if !r.podOwnedByDeployment(ctx, reader, p, &ownedDep) {
 			continue
 		}
-		ready = append(ready, readyPod{name: p.Name, uid: string(p.UID)})
+		ready = append(ready, readyPod{
+			name: p.Name,
+			id:   fmt.Sprintf("%s:%d", p.UID, containerRunSum(p)),
+		})
 	}
 	if len(ready) == 0 {
 		return "", nil
 	}
 	sort.Slice(ready, func(i, j int) bool { return ready[i].name < ready[j].name })
-	uids := make([]string, len(ready))
+	ids := make([]string, len(ready))
 	for i := range ready {
-		uids[i] = ready[i].uid
+		ids[i] = ready[i].id
 	}
-	return strings.Join(uids, ","), nil
+	return strings.Join(ids, ","), nil
+}
+
+// containerRunSum returns the sum of restart counts across every
+// container reported in pod.status.containerStatuses. Used to detect
+// in-place container restarts (kubelet respawning a crashed container
+// reuses the pod UID but increments the per-container restartCount).
+// init / ephemeral containers are intentionally excluded — the
+// cache-server is a regular workload container and init-container
+// restarts don't affect the LMCache socket.
+func containerRunSum(pod *corev1.Pod) int32 {
+	var sum int32
+	for i := range pod.Status.ContainerStatuses {
+		sum += pod.Status.ContainerStatuses[i].RestartCount
+	}
+	return sum
 }
 
 // podOwnedByDeployment reports whether pod is transitively controller-
@@ -353,11 +381,12 @@ func (r *CacheBackendReconciler) podOwnedByDeployment(ctx context.Context, reade
 	return depRef.Name == dep.Name && depRef.UID == dep.UID
 }
 
-// ownerRefIsAppsV1 reports whether the owner reference's APIVersion
-// resolves to apps/v1. We tolerate the rare case of an empty APIVersion
-// when the apiserver normalizes it away on read.
+// ownerRefIsAppsV1 reports whether the owner reference points at
+// apps/v1. OwnerReference.apiVersion is a required field, so a strict
+// equality match is the right shape — an empty value is invalid input
+// that we should reject rather than tolerate.
 func ownerRefIsAppsV1(ref *metav1.OwnerReference) bool {
-	return ref.APIVersion == "" || ref.APIVersion == "apps/v1"
+	return ref.APIVersion == "apps/v1"
 }
 
 // podIsReady reports whether the pod is in the Running phase with its
@@ -421,6 +450,30 @@ func podIsReady(p *corev1.Pod) bool {
 // annotations cannot be apiserver-side selectors. Namespace-bounded —
 // the webhook only stamps `injected-by` on pods in the matched
 // backend's namespace.
+//
+// Trust model: the only authority required to enqueue a cascade-
+// restart is the CacheBackendReconciler's own SA, which has the
+// `apps/deployments,patch` verb granted via this package's RBAC
+// markers. The injected-by + injected-by-uid annotation pair we read
+// from pods is normally stamped by the mutating Pod webhook (running
+// as the controller SA), so an unprivileged pod-create user cannot
+// forge it: when the webhook is reachable it overwrites or strips
+// those annotations on every CREATE. The narrow forgery window opens
+// only when the webhook is unreachable AT admission time and
+// `MutatingWebhookConfiguration.failurePolicy=Ignore` lets the pod
+// admit unmodified — in that case a caller who can read live CR /
+// ReplicaSet / Deployment UIDs could plant a pod whose annotations +
+// ownerRef chain looks legitimate, triggering a cascade-restart of a
+// Deployment they do not have direct patch RBAC on. The blast radius
+// is bounded to the same namespace as the CacheBackend (pod-list is
+// namespace-scoped here, and the webhook only matches CRs in the
+// pod's namespace), and a normal cluster keeps the webhook reachable
+// — but operators running with hostile namespace tenants should
+// either set `failurePolicy=Fail` on the mutating webhook or accept
+// that pod-create RBAC in a namespace is elevated to "force-restart
+// any in-namespace Deployment whose template the controller can
+// patch". The cache plane's existing engine-pod-events controller
+// makes the same trust assumption for the same reason.
 func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Context, backend *cachev1alpha1.CacheBackend, newUID string) (int, error) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {

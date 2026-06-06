@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -223,6 +224,19 @@ func (f *cascadeRestartFixture) reloadEngineDep(t *testing.T) {
 	f.engineDep = dep
 }
 
+// serverInstanceID is the per-pod identifier currentServerInstanceUID
+// computes: <pod.UID>:<containerRunSum>. Shared by the assertion
+// helpers so tests build the expected observedServerInstance value
+// without duplicating the format. Mirrors containerRunSum in
+// cachebackend_server_restart.go.
+func serverInstanceID(p *corev1.Pod) string {
+	var sum int32
+	for i := range p.Status.ContainerStatuses {
+		sum += p.Status.ContainerStatuses[i].RestartCount
+	}
+	return fmt.Sprintf("%s:%d", p.UID, sum)
+}
+
 func cascadeRestartsCount(t *testing.T, namespace, backend, reason string) float64 {
 	t.Helper()
 	m, err := backendServerRestartsTotal.GetMetricWithLabelValues(namespace, backend, reason)
@@ -251,7 +265,7 @@ func TestReconcileServerInstance_FirstObservationStampsBaseline(t *testing.T) {
 	}
 
 	f.reload(t)
-	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
 	}
 	f.reloadEngineDep(t)
@@ -280,12 +294,12 @@ func TestReconcileServerInstance_UIDChangeCascadesEngineDeployment(t *testing.T)
 
 	f.reloadEngineDep(t)
 	got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
-	if got != string(f.serverPod.UID) {
+	if got != serverInstanceID(f.serverPod) {
 		t.Fatalf("cascade annotation = %q, want %q (the new cache-server pod UID)", got, f.serverPod.UID)
 	}
 
 	f.reload(t)
-	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
@@ -334,7 +348,7 @@ func TestReconcileServerInstance_RateLimitedSecondCascadeIsDeferred(t *testing.T
 	f.reload(t)
 	// Status MUST stay pinned to the first cascade's UID — advancing it
 	// inside the rate-limit window would lose the missed cascade.
-	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want pinned to first-cascade UID %q", got, f.serverPod.UID)
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
@@ -393,11 +407,11 @@ func TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades(t *t
 
 	f.reloadEngineDep(t)
 	got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
-	if got != string(f.serverPod.UID) {
+	if got != serverInstanceID(f.serverPod) {
 		t.Fatalf("cascade annotation = %q, want %q (already-injected pods must still cascade after selector removal)", got, f.serverPod.UID)
 	}
 	f.reload(t)
-	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
 	}
 }
@@ -443,7 +457,7 @@ func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *test
 
 	// Pre-seed status to the existing real pod's UID so the next
 	// observation is a no-op transition rather than first-observation.
-	f.backend.Status.ObservedServerInstance = string(f.serverPod.UID)
+	f.backend.Status.ObservedServerInstance = serverInstanceID(f.serverPod)
 	if err := f.r.Status().Update(context.Background(), f.backend); err != nil {
 		t.Fatalf("seed status: %v", err)
 	}
@@ -479,7 +493,7 @@ func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *test
 		t.Fatalf("wait = %v, want 0", wait)
 	}
 	f.reload(t)
-	if got := f.backend.Status.ObservedServerInstance; got != string(f.serverPod.UID) {
+	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want pinned to the legit pod %q (foreign pod must not advance the latch)", got, f.serverPod.UID)
 	}
 	f.reloadEngineDep(t)
@@ -531,7 +545,7 @@ func TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod(t *testing.T) {
 		t.Fatalf("first observation wait = %v, want 0", wait)
 	}
 	f.reload(t)
-	wantInitial := string(f.serverPod.UID) + "," + string(pod2.UID)
+	wantInitial := serverInstanceID(f.serverPod) + "," + serverInstanceID(pod2)
 	if got := f.backend.Status.ObservedServerInstance; got != wantInitial {
 		t.Fatalf("initial ObservedServerInstance = %q, want %q (both Ready pod UIDs, lex-sorted by name)", got, wantInitial)
 	}
@@ -559,13 +573,66 @@ func TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod(t *testing.T) {
 		t.Fatalf("replacement wait = %v, want 0", wait)
 	}
 	f.reload(t)
-	wantAfter := string(f.serverPod.UID) + "," + string(pod2b.UID)
+	wantAfter := serverInstanceID(f.serverPod) + "," + serverInstanceID(pod2b)
 	if got := f.backend.Status.ObservedServerInstance; got != wantAfter {
 		t.Fatalf("ObservedServerInstance after replacement = %q, want %q", got, wantAfter)
 	}
 	f.reloadEngineDep(t)
 	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantAfter {
 		t.Fatalf("cascade annotation = %q, want %q (non-first replica's restart must still cascade)", got, wantAfter)
+	}
+}
+
+// TestReconcileServerInstance_InPlaceContainerRestartCascades asserts
+// that an in-place container restart inside the cache-server pod
+// (kubelet respawning a crashed container, e.g. on OOM with
+// restartPolicy=Always — pod.UID stays the same) still advances
+// observedServerInstance and triggers the cascade. The per-pod
+// identifier sums containerStatuses[].restartCount, so a bump in any
+// container's restart count changes the identifier without needing
+// the pod to be replaced.
+func TestReconcileServerInstance_InPlaceContainerRestartCascades(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline observation pins the identifier.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline ObservedServerInstance = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Simulate the kubelet bumping the lmcache-server container's
+	// restart count from 0 to 1 (e.g. OOM-killed container respawned
+	// in-place; same pod, same pod.UID, fresh LMCache process).
+	live := &corev1.Pod{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverPod.Name, Namespace: f.cacheNS}, live); err != nil {
+		t.Fatalf("get serverPod: %v", err)
+	}
+	live.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:         "lmcache-server",
+		Ready:        true,
+		RestartCount: 1,
+	}}
+	if err := f.r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("bump container restart count: %v", err)
+	}
+
+	// Wait past the rate-limit window (fixture sets 50ms).
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-restart wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	want := fmt.Sprintf("%s:1", f.serverPod.UID)
+	if got := f.backend.Status.ObservedServerInstance; got != want {
+		t.Fatalf("ObservedServerInstance after container restart = %q, want %q (the restart-count bump must advance the identifier)", got, want)
+	}
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("cascade annotation after container restart = %q, want %q", got, want)
 	}
 }
 
@@ -639,7 +706,7 @@ func TestReconcileServerInstance_AnnotateIdempotent(t *testing.T) {
 	if dep.Spec.Template.Annotations == nil {
 		dep.Spec.Template.Annotations = map[string]string{}
 	}
-	dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] = string(f.serverPod.UID)
+	dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] = serverInstanceID(f.serverPod)
 	if err := f.r.Update(context.Background(), dep); err != nil {
 		t.Fatalf("preseed annotation: %v", err)
 	}
