@@ -57,10 +57,12 @@ func runEngineReporterAgainstServer(t *testing.T, opts []engine.ReporterOption, 
 	case <-time.After(5 * time.Second):
 		t.Fatal("reporter did not drain in time")
 	}
-	// A tiny dwell to let the server finish processing the last gRPC call before
-	// the test issues LookupRoute — Reporter returns once the stream is closed,
-	// but the server's ingest handler may still be running for a microsecond.
-	time.Sleep(50 * time.Millisecond)
+	// Reporter.Run returning means every flush completed: sendAdds calls
+	// CloseAndRecv (the server ingests synchronously before SendAndClose
+	// returns the Ack), publish() is unary (the server ApplyEvent runs
+	// before returning the Ack), and Run's `defer flush()` covers the
+	// shutdown drain. Once `done` fires the server has fully processed
+	// every event, so no extra dwell is needed before LookupRoute.
 	return client, stopServer
 }
 
@@ -133,14 +135,17 @@ func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 	}
 }
 
-// Round-trip the on-the-wire byte shape an integer engine hash takes: subscriber
-// hashToBytes produces 8-byte BE; the gateway proxy must encode the same way
-// for LookupRoute. The single-block lookup must match by exact byte equality.
-// Without that invariant the whole pipeline (L2 offload included) fails silently.
-func TestEngineIntegerHashWireFormatRoundTripsViaReporter(t *testing.T) {
-	// The exact bytes captured live from one vLLM BlockStored event during
-	// the L2 offload diagnosis — `_int_to_be8(15189827530337910230) ==
-	// 0xD2CD1BA8E13D7DD6` per the proxy's wire encoding.
+// The 8-byte-BE byte pattern the subscriber's hashToBytes produces from a
+// vLLM integer hash (covered byte-for-byte by TestDecodeLargeUint64Hash in
+// pkg/adapters/engine) MUST be byte-identical to what the gateway proxy
+// sends in LookupRoute, or the server's prefixKey map lookup misses. This
+// test pins the second half of that round-trip — for a hash whose live wire
+// bytes were captured during the L2 offload diagnosis (0xD2CD1BA8E13D7DD6),
+// feeding those bytes through the Reporter's ingest path and then querying
+// LookupRoute with the same bytes returns PREFIX_MATCH. A regression that
+// silently changed the prefixKey shape, the proto wire bytes, or the
+// reporter's StoredPrefixes hash field would fail here.
+func TestKnownEngineHashBytesMatchViaReporterAndLookupRoute(t *testing.T) {
 	const hashInt uint64 = 0xD2CD1BA8E13D7DD6
 	h := be8(hashInt)
 	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}
@@ -159,6 +164,6 @@ func TestEngineIntegerHashWireFormatRoundTripsViaReporter(t *testing.T) {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
-		t.Fatalf("reason = %q, want PREFIX_MATCH — subscriber-produced and proxy-produced 8-byte-BE encodings must round-trip byte-identical for the same int hash. scores=%+v", resp.GetReasonCode(), resp.GetReplicaScores())
+		t.Fatalf("reason = %q, want PREFIX_MATCH — server prefixKey did not match the bytes the Reporter forwarded for the canonical 0xD2CD1BA8E13D7DD6 hash. scores=%+v", resp.GetReasonCode(), resp.GetReplicaScores())
 	}
 }
