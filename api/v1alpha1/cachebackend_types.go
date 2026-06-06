@@ -185,9 +185,10 @@ type CacheBackendSpec struct {
 	// quantities are rejected (the CRD schema admits a leading "-" but
 	// the kubelet would later reject the pod); `requests` / `limits`
 	// keys that are not valid container resource names are rejected
-	// (standard names cpu/memory/ephemeral-storage and hugepages-*
-	// admit; any other name must be vendor-prefixed like
-	// "nvidia.com/gpu"); and a `limits[X]` strictly less than
+	// (standard names cpu/memory/ephemeral-storage admit; a
+	// `hugepages-<size>` name admits only when the size suffix parses
+	// as a strictly-positive quantity, e.g. "hugepages-2Mi"; any other
+	// name must be vendor-prefixed like "nvidia.com/gpu"); and a `limits[X]` strictly less than
 	// `requests[X]` for the same resource X is rejected. See
 	// docs/design/cachebackend-api.md#resources for the full validator
 	// table.

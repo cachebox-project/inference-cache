@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -544,6 +545,28 @@ func TestValidator_ResourcesUnqualifiedNonStandardNameRejected(t *testing.T) {
 	}
 	requireInvalidWithCause(t, v, cb, "spec.resources.requests[foo]",
 		"not a valid container resource name")
+}
+
+func TestValidator_ResourcesMalformedHugepagesRejected(t *testing.T) {
+	// `hugepages-<size>` is K8s-reserved, but the suffix MUST parse as
+	// a positive resource.Quantity (e.g. "2Mi", "1Gi"). A bare
+	// "hugepages-" or a non-numeric suffix like "hugepages-nope" is
+	// rejected by the apiserver downstream, so admission rejects the
+	// same shapes at write time.
+	for _, name := range []string{"hugepages-", "hugepages-nope", "hugepages-0"} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceName(name): resource.MustParse("1"),
+				},
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.requests[%s]", name),
+				"not a valid container resource name")
+		})
+	}
 }
 
 func TestValidator_ResourcesStandardContainerResourceNamesAdmitted(t *testing.T) {

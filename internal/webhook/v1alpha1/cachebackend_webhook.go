@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -1035,23 +1036,35 @@ func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList 
 }
 
 // validateContainerResourceName mirrors the K8s container-resource-name
-// contract: standard names (cpu, memory, ephemeral-storage) and the
-// hugepages-* family admit unconditionally; any other name must be
-// vendor-prefixed (contain a "/") and satisfy IsQualifiedName. Returns
-// ("", true) on accept; ("…reason…", false) on reject — the reason is
-// surfaced verbatim in the field-scoped admission error.
+// contract: standard names (cpu, memory, ephemeral-storage) admit
+// unconditionally; a `hugepages-<size>` name admits only when the size
+// suffix parses as a strictly-positive resource.Quantity (matching what
+// the apiserver requires of Container.Resources entries); any other
+// name must be vendor-prefixed (contain a "/") and satisfy
+// IsQualifiedName. Returns ("", true) on accept; ("…reason…", false) on
+// reject — the reason is surfaced verbatim in the field-scoped
+// admission error.
 func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
 	s := string(name)
 	switch name {
 	case corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
 		return "", true
 	}
-	if strings.HasPrefix(s, "hugepages-") {
+	const hugePagesPrefix = "hugepages-"
+	if strings.HasPrefix(s, hugePagesPrefix) {
+		suffix := strings.TrimPrefix(s, hugePagesPrefix)
+		qty, err := resource.ParseQuantity(suffix)
+		if err != nil || qty.Sign() <= 0 {
+			return fmt.Sprintf(
+				"%q is not a valid container resource name: %q must be followed by a positive page-size quantity (e.g. \"hugepages-2Mi\")",
+				s, hugePagesPrefix,
+			), false
+		}
 		return "", true
 	}
 	if !strings.Contains(s, "/") {
 		return fmt.Sprintf(
-			"%q is not a valid container resource name: must be one of %q/%q/%q, a hugepages-* variant, or a vendor-prefixed extended resource (e.g. \"nvidia.com/gpu\")",
+			"%q is not a valid container resource name: must be one of %q/%q/%q, a hugepages-<size> variant (e.g. \"hugepages-2Mi\"), or a vendor-prefixed extended resource (e.g. \"nvidia.com/gpu\")",
 			s, corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage,
 		), false
 	}
