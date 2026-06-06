@@ -80,6 +80,45 @@ func TestProbeHashIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestProbeHashEncodingIsInjective pins the length-prefixed canonical
+// encoding: distinct (backend, model, scheme) tuples MUST hash to distinct
+// bytes, even when their string values contain the literal field separators
+// that the previous newline-and-colon scheme used. A regression that
+// re-introduced unescaped concatenation would let a crafted input collide
+// (e.g., a backend that contains "\nmodel:..." could absorb the model field).
+func TestProbeHashEncodingIsInjective(t *testing.T) {
+	// Case 1: the field "m" vs the empty-field case where its boundary text
+	// is absorbed into a neighbor. The OLD newline-based scheme would have
+	// (backend="", model="m", scheme="vllm") and (backend="\nmodel:m",
+	// model="", scheme="vllm") hash equivalently because both produce the
+	// same byte stream after the labeled-with-newlines concatenation.
+	a := ProbeHash("", "m", "vllm")
+	b := ProbeHash("\nmodel:m", "", "vllm")
+	if bytes.Equal(a, b) {
+		t.Errorf("ProbeHash collided on crafted inputs that should be distinct (length-prefixing regression?): %x vs %x", a, b)
+	}
+
+	// Case 2: distinct splits of the same character payload across fields.
+	// abc + d vs ab + cd vs a + bcd — distinct tuples, must produce
+	// distinct hashes once length-prefixed.
+	for _, tc := range []struct {
+		name             string
+		backend, model   string
+		scheme1, scheme2 string
+	}{
+		{"backend/model split", "abc", "d", "vllm", "vllm"},
+		{"model/scheme split", "x", "ab", "cd", "abcd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h1 := ProbeHash(tc.backend, tc.model, tc.scheme1)
+			h2 := ProbeHash(tc.backend, tc.model, tc.scheme2)
+			if tc.scheme1 != tc.scheme2 && bytes.Equal(h1, h2) {
+				t.Errorf("ProbeHash collided on distinct schemes: %x vs %x", h1, h2)
+			}
+		})
+	}
+}
+
 // TestProbeReplicaIDReservedPrefix proves the synthesized replica id always
 // starts with the reserved `__probe-` prefix. Real subscribers set replica_id
 // to the pod name (which cannot start with `__`), so the prefix is the

@@ -42,7 +42,7 @@ silently.
 |---|---|---|---|
 | `inferencecache_server_up` | *(none)* | `1` if the cache policy server is serving requests, `0` otherwise. | Server starts (→`1`) / shuts down (→`0`). Liveness signal. |
 | `inferencecache_server_grpc_tls_enabled` | *(none)* | `1` if the gRPC server (`:9090`) is terminating TLS, `0` if serving plaintext. | Set once at startup from `--tls-cert-file`/`--tls-key-file` (both set → `1`, both empty → `0`). Confirms the prod wire posture from Prometheus. See `docs/design/grpc-tls.md`. |
-| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model. One entry = one unique `(tenant, model, hash_scheme, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, hash)` from `ReportCacheState`; falls on `BlockRemoved` / `AllBlocksCleared` / TTL eviction / max-entries cap. Idempotent re-reports do **not** move it. |
+| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model, **excluding reserved-tenant (`inferencecache.io/probe`) entries**. One entry = one unique `(tenant, model, hash_scheme, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, hash)` from `ReportCacheState`; falls on `BlockRemoved` / `AllBlocksCleared` / TTL eviction / max-entries cap. Idempotent re-reports do **not** move it. The probe's synthetic state IS in the index during a Run but is excluded from this gauge so a scrape that races Stage C cannot transiently surface a probe-tenant count on a real model bucket — see `WithReservedTenants` in `pkg/index/index.go`. |
 
 ### Counters
 

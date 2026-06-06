@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +47,20 @@ import (
 // put/get cycle through the supplied T2Prober). Each stage reports ok / failed
 // / skipped; failures name the stage so the controller can surface a
 // stage-specific condition with an operator-actionable message.
+//
+// What Stage A ("subscriber") actually exercises — important caveat:
+// Stage A is a PROXY check on the subscriber pipeline. It writes the
+// synthesized Update via in-process index.Ingest (bypassing the gRPC
+// ReportCacheState handler that the real subscriber traverses, because the
+// handler drops messages with tenant_id = ProbeTenantID — see
+// inferencecache_service.go) and then verifies the entry landed via a
+// direct index.Lookup. A Stage A pass therefore proves that THE INDEX IS
+// ACCEPTING WRITES at all — necessary but not sufficient for "the
+// subscriber pipeline is healthy end-to-end". A Stage A fail definitively
+// means the index's ingest path is broken. The "subscriber" name reflects
+// the operator question this stage answers ("is the subscriber's data
+// landing?"), not the path the probe physically traverses; the failure
+// message explicitly calls out the in-process check.
 //
 // This file ships the server-side machinery and the HTTP /probe handler. The
 // controller wiring — calling /probe from the CacheBackend reconciler and
@@ -98,6 +113,14 @@ const (
 
 // Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
 // inferencecache_backend_probe_result metric `stage` label.
+//
+// "subscriber" is a PROXY name — Stage A exercises the in-process
+// index.Ingest path, not the wire ReportCacheState handler the real
+// subscriber uses (the handler drops probe-tenant messages by design).
+// See the file-top doc for the full caveat. The name is kept because it
+// answers the operator's question ("is the subscriber's data landing in
+// the index?"), and a Stage A fail still definitively means the index
+// ingest path is broken.
 const (
 	ProbeStageSubscriber = "subscriber"
 	ProbeStageRouting    = "routing"
@@ -351,19 +374,36 @@ func ProbeReplicaID(backend string) string {
 // trip cleanly while real workloads continue to NO_HINT.
 func ProbeHash(backend, model, hashScheme string) []byte {
 	h := sha256.New()
-	// Domain-separated input so a future hashing change can't collide with
+	// Domain-separated v1 marker so a future hashing change can't collide with
 	// any other SHA-256 the project might compute over a similar shape.
 	h.Write([]byte("inferencecache.io/probe/v1\n"))
-	h.Write([]byte("hashScheme:"))
-	h.Write([]byte(hashScheme))
-	h.Write([]byte{'\n'})
-	h.Write([]byte("model:"))
-	h.Write([]byte(model))
-	h.Write([]byte{'\n'})
-	h.Write([]byte("backend:"))
-	h.Write([]byte(backend))
-	h.Write([]byte{'\n'})
+	// Length-prefix each field with a uint32 BE so the canonical input is an
+	// unambiguous encoding regardless of which characters the inputs contain.
+	// The HTTP handler accepts arbitrary non-empty strings, so a caller could
+	// otherwise craft inputs containing the literal separator text
+	// ("hashScheme:", "model:", etc., or a newline) and force two distinct
+	// tuples to hash to the same bytes. Length-prefixing makes that
+	// impossible: (backend, model, scheme) → bytes is injective.
+	probeHashWriteField(h, hashScheme)
+	probeHashWriteField(h, model)
+	probeHashWriteField(h, backend)
 	return h.Sum(nil)
+}
+
+// probeHashWriteField writes one input field as a uint32-BE length prefix
+// followed by its raw bytes. Keeps ProbeHash's canonical encoding readable
+// in one line per field.
+func probeHashWriteField(h hashWriter, s string) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(s)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write([]byte(s))
+}
+
+// hashWriter is the minimal surface of hash.Hash that probeHashWriteField
+// uses. Keeps the helper testable without importing the hash interface.
+type hashWriter interface {
+	Write(p []byte) (int, error)
 }
 
 // Run executes the three stages and returns the per-stage outcome. The
