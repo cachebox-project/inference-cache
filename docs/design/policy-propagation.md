@@ -42,11 +42,13 @@ handler the real subscriber uses (the handler now drops messages with
 `tenant_id = inferencecache.io/probe` by design). A Stage A pass
 therefore proves the index ingest path is accepting writes; it does
 not, on its own, prove the full subscriber wire is healthy end-to-end.
-A Stage A fail still definitively means the index ingest path is broken. It shares the controller-auth profile
-with `/snapshot` and `/policy` because all three endpoints serve one
-caller identity (the controller SA). The probe entries auto-clean on
-each Run via an `ALL_CLEARED` event against the reserved replica, so
-the synthesized state never leaks into a real LookupRoute.
+A Stage A fail still definitively means the index ingest path is broken.
+
+`/probe` shares the controller-auth profile with `/snapshot` and
+`/policy` because all three endpoints serve one caller identity (the
+controller SA). The probe entries auto-clean on each Run via an
+`ALL_CLEARED` event against the reserved replica, so the synthesized
+state never leaks into a real LookupRoute.
 
 #### `/probe` wire contract
 
@@ -80,7 +82,7 @@ Stage values:
 
 Stage names:
 - `ingest` — Stage A. Verifies the in-process index ingest path accepts writes. NOTE: this stage writes via `index.Ingest` directly, NOT through the gRPC `ReportCacheState` handler the real subscriber uses (the handler drops messages with `tenant_id = inferencecache.io/probe` by design). A pass proves the index ingest path is healthy; a fail definitively means it's broken. Neither alone proves the wire subscriber path is healthy end-to-end.
-- `routing` — Stage B. Verifies `LookupRoute` returns `PREFIX_MATCH` for the probe-synthesized hash against the just-ingested entry.
+- `routing` — Stage B. Verifies the in-process `index.LookupRoute` (the orchestrated ranking entrypoint that the gRPC handler delegates to) returns `PREFIX_MATCH` for the probe-synthesized hash against the just-ingested entry. NOTE: this stage calls `index.LookupRoute` directly, NOT the gRPC `inferenceCacheService.LookupRoute` handler. The handler short-circuits `tenant_id = inferencecache.io/probe` to `NO_HINT` by design (defense against external lookups against the reserved scope), so the probe cannot route through it. Handler-level concerns — policy gating (`minimumPrefixTokens`), `lookupTimeoutMs` deadline, proto→domain translation — are not covered by this stage and have their own unit tests under `pkg/server`.
 - `t2` — Stage C. Verifies a tier-2 put/get round trip via the supplied `T2Prober` (LMCache backends; skipped otherwise).
 
 Status codes:
