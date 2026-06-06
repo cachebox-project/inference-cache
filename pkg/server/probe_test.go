@@ -48,12 +48,16 @@ func newProberForTest(t *testing.T, t2 T2Prober) (*Prober, *index.Index) {
 }
 
 // TestProbeHashIsDeterministic pins the round-trip invariant the probe
-// relies on: same (backend, hashScheme) → same bytes. A regression here
-// silently breaks Stage A (the ingested hash and the looked-up hash
-// disagree, so the entry never lands).
+// relies on: same (backend, model, hashScheme) → same bytes. A regression
+// here silently breaks Stage A (the ingested hash and the looked-up hash
+// disagree, so the entry never lands). Model participates so two probes
+// for the same backend on different models cannot synthesize a colliding
+// T2 payload — the payload bytes ARE the hash, so a hypothetical T2
+// prober would otherwise see the same put key for two different probe
+// scopes (Stage C collision risk).
 func TestProbeHashIsDeterministic(t *testing.T) {
-	a := ProbeHash("cb-1", "vllm")
-	b := ProbeHash("cb-1", "vllm")
+	a := ProbeHash("cb-1", "m", "vllm")
+	b := ProbeHash("cb-1", "m", "vllm")
 	if !bytes.Equal(a, b) {
 		t.Fatalf("ProbeHash not deterministic: %x vs %x", a, b)
 	}
@@ -62,13 +66,17 @@ func TestProbeHashIsDeterministic(t *testing.T) {
 	}
 
 	// Different backend → different bytes.
-	if bytes.Equal(a, ProbeHash("cb-2", "vllm")) {
+	if bytes.Equal(a, ProbeHash("cb-2", "m", "vllm")) {
 		t.Fatal("ProbeHash collided on different backend")
 	}
 	// Different scheme → different bytes (engine-domain isolation, mirrors
 	// the index's scheme-disjoint indexing).
-	if bytes.Equal(a, ProbeHash("cb-1", "sglang")) {
+	if bytes.Equal(a, ProbeHash("cb-1", "m", "sglang")) {
 		t.Fatal("ProbeHash collided on different hash_scheme")
+	}
+	// Different model → different bytes (Stage C key isolation).
+	if bytes.Equal(a, ProbeHash("cb-1", "other-model", "vllm")) {
+		t.Fatal("ProbeHash collided on different model — Stage C payloads would collide across concurrent model-specific probes")
 	}
 }
 

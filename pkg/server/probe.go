@@ -247,17 +247,25 @@ type Prober struct {
 	t2    T2Prober
 	now   func() time.Time
 
-	// runMu serializes Run by backend so two concurrent probes for the same
-	// CacheBackend cannot race through the shared reserved-replica state. A
-	// per-(backend, model) mutex is the smallest scope that prevents the race
-	// — probes for DIFFERENT backends synthesize under DIFFERENT __probe-
-	// replica ids and never collide. Without this, two overlapping runs could
-	// see one's cleanup wipe the other's just-ingested entry mid-flight and
-	// report a false subscriber/routing failure. The controller-wiring
-	// follow-up additionally rate-limits to ~once per backend per 30s, so
-	// contention here is rare in practice — the lock is the correctness
+	// runMuMap serializes Run by (backend, model) so two concurrent probes for
+	// the same CacheBackend cannot race through the shared reserved-replica
+	// state. Per-(backend, model) is the smallest scope that prevents the
+	// race — probes for DIFFERENT backends synthesize under DIFFERENT
+	// __probe- replica ids and never collide. Without this, two overlapping
+	// runs could see one's cleanup wipe the other's just-ingested entry mid-
+	// flight and report a false subscriber/routing failure. The controller-
+	// wiring follow-up additionally rate-limits to ~once per backend per 30s,
+	// so contention here is rare in practice — the lock is the correctness
 	// backstop for the no-rate-limit case (tests, hand-invoked probes,
 	// future fast reconcile cycles).
+	//
+	// Memory note: runMuMap accumulates one *sync.Mutex per distinct
+	// (backend, model) pair seen for the server's lifetime — entries are
+	// never evicted. This is bounded by the count of CacheBackends × models
+	// in production (small) but unbounded if the HTTP endpoint receives
+	// arbitrary strings (hand-invoked probes, fuzzing). A future revision
+	// can switch to a bounded LRU if backend churn becomes a real concern;
+	// each mutex is ~8 bytes so even thousands of stale slots are negligible.
 	runMuMap sync.Map // key: "{backend}\x00{model}" → *sync.Mutex
 
 	// ingestFn is the stage-A index-write step. Defaults to p.index.Ingest;
@@ -316,8 +324,15 @@ func ProbeReplicaID(backend string) string {
 }
 
 // ProbeHash returns the deterministic 32-byte SHA-256 of a canonical input
-// keyed by (backend, hashScheme). Same inputs → same bytes; callers can
-// re-derive the hash for assertions without re-running the probe.
+// keyed by (backend, model, hashScheme). Same inputs → same bytes; callers
+// can re-derive the hash for assertions without re-running the probe. Model
+// is part of the key (in addition to backend + hashScheme) so that two
+// probes for the same backend on different models cannot synthesize a
+// colliding T2 payload — the payload IS the hash, so a future LMCache T2
+// prober for backend B running probes for model X and Y in quick succession
+// would otherwise see identical put keys for both. The Stage A/B index key
+// already separates by model via prefixKey, so the model field defends only
+// the T2 (Stage C) path.
 //
 // What the probe round-trip ACTUALLY catches:
 // the probe synthesizes one set of bytes and uses them VERBATIM on both
@@ -334,13 +349,16 @@ func ProbeReplicaID(backend string) string {
 // index's storage format to fix such a mismatch, the probe's hash
 // synthesis must match the new format — otherwise the probe will round-
 // trip cleanly while real workloads continue to NO_HINT.
-func ProbeHash(backend, hashScheme string) []byte {
+func ProbeHash(backend, model, hashScheme string) []byte {
 	h := sha256.New()
 	// Domain-separated input so a future hashing change can't collide with
 	// any other SHA-256 the project might compute over a similar shape.
 	h.Write([]byte("inferencecache.io/probe/v1\n"))
 	h.Write([]byte("hashScheme:"))
 	h.Write([]byte(hashScheme))
+	h.Write([]byte{'\n'})
+	h.Write([]byte("model:"))
+	h.Write([]byte(model))
 	h.Write([]byte{'\n'})
 	h.Write([]byte("backend:"))
 	h.Write([]byte(backend))
@@ -363,7 +381,7 @@ func ProbeHash(backend, hashScheme string) []byte {
 // residue invisible to real workload lookups regardless.
 func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	replicaID := ProbeReplicaID(req.Backend)
-	probeHash := ProbeHash(req.Backend, req.HashScheme)
+	probeHash := ProbeHash(req.Backend, req.Model, req.HashScheme)
 
 	// Serialize probes for this (backend, model) so two overlapping calls cannot
 	// race through the shared reserved-replica state — one's cleanup wiping the
@@ -418,7 +436,7 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 		result.Subscriber = ProbeStageFailed
 		result.Errors = append(result.Errors, ProbeStageError{
 			Stage:   ProbeStageSubscriber,
-			Message: "synthesized probe event did not land in the index — subscriber→index write path is broken",
+			Message: "synthesized probe event did not land in the index — server index ingest path is broken (Run calls index.Ingest directly; the real subscriber/ReportCacheState wire is not exercised by this stage)",
 		})
 		// An entry that never landed cannot route, so Stage B is undefined;
 		// skip it so the controller's condition pinpoints the upstream stage

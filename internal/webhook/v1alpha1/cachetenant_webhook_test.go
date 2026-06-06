@@ -208,6 +208,36 @@ func TestCacheTenantValidateUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("changing tenantID to the reserved probe id is rejected", func(t *testing.T) {
+		// An update that flips an existing tenantID onto
+		// "inferencecache.io/probe" is a newly-introduced spec-rule violation,
+		// so filterIntroducedErrors surfaces it. Without this guard, the
+		// admission rule applies to creates only — and the CR could drift
+		// onto the reserved scope via an UPDATE that bypasses the create path.
+		old := tenant("t1", "team-a", "team-vision")
+		updated := tenant("t1", "team-a", "inferencecache.io/probe")
+		_, err := v.ValidateUpdate(context.Background(), old, updated)
+		if err == nil || !apierrors.IsInvalid(err) {
+			t.Fatalf("expected Invalid rejection on UPDATE flipping tenantID to reserved probe id, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("error %q should explain the reservation", err.Error())
+		}
+	})
+
+	t.Run("unchanged reserved-tenantID predates the rule and is admitted", func(t *testing.T) {
+		// Defensive: a CR that already holds the reserved id (pre-webhook
+		// state) and edits some unrelated field must still admit — the
+		// filterIntroducedErrors logic only blocks NEW violations on update.
+		// Reflects the v1alpha1 tightening seam.
+		old := tenant("legacy", "team-a", "inferencecache.io/probe")
+		updated := tenant("legacy", "team-a", "inferencecache.io/probe")
+		updated.Labels = map[string]string{"unrelated": "true"}
+		if _, err := v.ValidateUpdate(context.Background(), old, updated); err != nil {
+			t.Fatalf("an unchanged reserved-tenantID with unrelated edits must admit, got %v", err)
+		}
+	})
+
 	t.Run("changing tenantID to a unique value is allowed", func(t *testing.T) {
 		old := tenant("t1", "team-a", "team-vision")
 		updated := tenant("t1", "team-a", "team-fresh")

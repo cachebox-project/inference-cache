@@ -1199,8 +1199,16 @@ func (i *Index) Aggregate() Aggregate {
 // iteration, Total == Σ PerTenant always holds — no second pass, no separate
 // counter that could drift. Reserved-tenant entries (see WithReservedTenants)
 // are excluded from BOTH PerTenant and Total so the cluster aggregate the
-// operator sees matches the cap-relevant entry count (Total == effective
-// total == totalEntries - reservedEntries).
+// operator sees never temporarily surfaces synthetic probe state.
+//
+// Unit note: Aggregate counts DISTINCT PREFIX KEYS — one (tenant, model,
+// hash_scheme, prefix_hash) tuple, regardless of how many replicas hold it.
+// The cap accounting (totalEntries / reservedEntries / effectiveTotal)
+// counts REPLICA×PREFIX entries — a prefix held by N replicas contributes N
+// to totalEntries. The two are different units; they aren't expected to
+// match numerically, only to track the same RESERVED-TENANT EXCLUSION
+// principle (the operator-visible aggregate and the cap-enforcement view
+// both treat reserved tenants as if they weren't there).
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
 	for key := range i.prefixes {

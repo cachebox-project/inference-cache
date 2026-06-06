@@ -620,6 +620,34 @@ if ! grep -q "already claimed by CacheTenant" <<<"$ct_reject_out"; then
 fi
 log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
 
+# --- CacheTenant admission: reserved probe tenantID ------------------------
+# The functional self-test uses tenant_id "inferencecache.io/probe" as
+# server-internal state. The CacheTenant admission webhook MUST reject any
+# CR claiming that id so an operator-created tenant cannot collide with the
+# probe scope (which would bypass quota enforcement at the PolicyStore
+# layer and share the probe's reserved replica). The rule fires on CREATE,
+# and on an UPDATE that newly introduces the id — pinned end-to-end by
+# this assertion against the real installed webhook (not just envtest).
+log "asserting a CacheTenant claiming the reserved probe tenantID is rejected at admission"
+reserved_ct_yaml="$(cat <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: cachetenant-reserved-probe
+spec:
+  tenantID: inferencecache.io/probe
+EOF
+)"
+if reserved_ct_out="$(printf '%s\n' "$reserved_ct_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$reserved_ct_out"
+  fail "CacheTenant claiming the reserved probe tenantID was admitted; the reservation rule did not fire on the real install"
+fi
+if ! grep -q "reserved" <<<"$reserved_ct_out"; then
+  echo "$reserved_ct_out"
+  fail "reserved-probe-tenantID CacheTenant was rejected, but not by the expected rule (missing 'reserved' in the diagnostic)"
+fi
+log "CacheTenant claiming the reserved probe tenantID rejected by the installed validating webhook"
+
 # --- PromptTemplate + PDTopology schema-only assertion ----------------------
 # config/default installs the PromptTemplate/PDTopology CRDs and RBAC, and the
 # controller manager adds their Go types to the scheme, but no PromptTemplate
