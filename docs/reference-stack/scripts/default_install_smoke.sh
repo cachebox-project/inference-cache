@@ -1741,8 +1741,8 @@ spec:
       sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
       # POST /policy — controller-audience must 204, default-audience must 401.
       # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
-      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
       # POST /probe — controller-audience must 200, default-audience must 401.
       # Body is a minimal valid ProbeRequest so any non-2xx is auth-side, not body-parse.
       pr_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")
