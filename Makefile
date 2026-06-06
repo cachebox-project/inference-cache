@@ -31,6 +31,7 @@ KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
 GOVULNCHECK_VERSION ?= v1.3.0
+PROMTOOL_VERSION ?= 3.0.1
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -39,8 +40,10 @@ PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
 SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
 LOCAL_BUF := $(LOCALBIN)/buf
+LOCAL_PROMTOOL := $(LOCALBIN)/promtool
 GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
+PROMTOOL ?= $(shell command -v promtool 2>/dev/null || echo $(LOCAL_PROMTOOL))
 
 .PHONY: all
 all: build test ## Build binaries and run tests.
@@ -90,6 +93,25 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 		true; \
 	else \
 		test -s $(LOCAL_BUF) || GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
+	fi
+
+.PHONY: promtool
+promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binary is unavailable.
+	@if command -v promtool >/dev/null 2>&1; then \
+		true; \
+	elif [ ! -x $(LOCAL_PROMTOOL) ]; then \
+		set -e; \
+		os=$$(uname -s | tr A-Z a-z); \
+		arch=$$(uname -m); \
+		case $$arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+		dir=prometheus-$(PROMTOOL_VERSION).$${os}-$${arch}; \
+		tmp=$$(mktemp -d); \
+		echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
+		curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
+		tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
+		mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
+		chmod +x $(LOCAL_PROMTOOL); \
+		rm -rf "$${tmp}"; \
 	fi
 
 ##@ Development
@@ -257,8 +279,18 @@ fmt-check: ## Check Go formatting without modifying files.
 	if [ -n "$$unformatted" ]; then echo "✗ gofmt needed on:"; echo "$$unformatted"; exit 1; fi; \
 	echo "✓ gofmt clean"
 
+.PHONY: verify-prometheus
+verify-prometheus: promtool ## Lint + unit-test the Prometheus alerting rules under config/observability/.
+	@echo "==> promtool check rules (flat alerting-rules.yaml)"
+	@$(PROMTOOL) check rules config/observability/alerting-rules.yaml
+	@echo "==> promtool test rules (prometheus-rules-tests.yaml)"
+	@cd config/observability && $(PROMTOOL) test rules prometheus-rules-tests.yaml
+	@echo "==> drift check: PrometheusRule CR spec.groups matches alerting-rules.yaml groups"
+	@$(GO_CMD) run ./hack/verify-prometheus-drift config/observability/alerting-rules.yaml config/observability/prometheus-rules.yaml
+	@echo "✓ Prometheus rules valid"
+
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

@@ -1,0 +1,16 @@
+# Optional observability overlay — applies the PrometheusRule CR for the
+# inference-cache alert bundle. Requires prometheus-operator / kube-prometheus
+# CRDs to be present in the cluster (`monitoring.coreos.com/v1`).
+#
+# Apply with:
+#   kubectl apply -k config/observability
+#
+# For non-operator installs, see config/observability/alerting-rules.yaml
+# (flat Prometheus rules file).
+#
+# Deliberately not aggregated into `config/default` so the default install
+# stays usable on clusters without prometheus-operator CRDs installed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - prometheus-rules.yaml

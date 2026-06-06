@@ -95,6 +95,29 @@ kubectl -n inference-cache-system wait --for=condition=Available deployment --al
 kubectl get cacheindex cluster-default -o yaml
 ```
 
+## Monitoring
+
+The `inference-cache-server` exposes Prometheus metrics on `:8080/metrics`
+(namespaced `inferencecache_*`). A default alert bundle for the operational
+silent-failure patterns this code has hit in production ships under
+[`config/observability/`](config/observability/) and is **not** included in
+`config/default` — the alerts are opt-in so that installs without
+prometheus-operator CRDs are not affected by an unknown `apiVersion`.
+
+For prometheus-operator / kube-prometheus installs:
+
+```bash
+kubectl apply -k config/observability
+```
+
+For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
+use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
+
+Per-alert runbooks (causes, triage steps, example PromQL): see
+[`docs/observability/alerts.md`](docs/observability/alerts.md). For the
+underlying metric surface, see
+[`docs/reference/metrics.md`](docs/reference/metrics.md).
+
 ## Local Development Cluster
 
 Create a kind cluster for controller development:

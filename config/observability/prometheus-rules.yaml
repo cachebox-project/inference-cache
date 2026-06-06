@@ -1,0 +1,120 @@
+# PrometheusRule for inference-cache, for prometheus-operator / kube-prometheus
+# installs. The `spec.groups` body is a verbatim copy of alerting-rules.yaml in
+# this directory — both files MUST stay in sync. The flat file is what gets
+# linted by `promtool check rules` and exercised by `promtool test rules`;
+# this file is what an operator applies via `kubectl apply -k`. Drift between
+# them is gated by `make verify-prometheus`.
+#
+# The Prometheus operator picks this up automatically when its
+# `PrometheusRule` selector matches the labels below; adjust the selector on
+# your Prometheus CR if these defaults do not match your install.
+#
+# See docs/observability/alerts.md for per-alert runbooks.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: inference-cache-alerts
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: observability
+    # Default kube-prometheus selector labels — most stacks pick these up
+    # automatically. Override or extend if your Prometheus CR uses a
+    # different `ruleSelector`.
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: inferencecache-health
+      interval: 30s
+      rules:
+        - alert: IndexEmpty
+          expr: |
+            (inferencecache_server_up == 1)
+            and on()
+            ((sum(inferencecache_index_entries) or vector(0)) == 0)
+          for: 2m
+          labels:
+            severity: critical
+            component: inference-cache
+          annotations:
+            summary: "Cache index empty while server is up — subscriber → server pipeline broken."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
+
+        - alert: LMCacheT2NoHits
+          expr: |
+            (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 100)
+            and
+            (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) == 0)
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "External prefix cache on pod {{ $labels.pod }} returning zero hits despite >100 queries/sec."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
+    - name: inferencecache-routing
+      interval: 30s
+      rules:
+        - alert: LookupRouteDegenerate
+          expr: |
+            (
+              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m])) > 0.1
+            )
+            and
+            (
+              sum by (model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[10m]))
+              /
+              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m]))
+            ) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "LookupRoute returning NO_HINT for >90% of calls on model {{ $labels.model }} — routing falling back to round-robin."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutedegenerate"
+
+        - alert: LookupRouteHighTimeout
+          expr: |
+            (
+              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m])) > 1
+            )
+            and
+            (
+              sum by (model) (rate(inferencecache_lookup_route_calls_total{reason_code="TIMEOUT"}[10m]))
+              /
+              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "LookupRoute returning TIMEOUT for >5% of calls on model {{ $labels.model }} — server overload or tight deadline."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutehightimeout"
+
+    - name: inferencecache-capacity
+      interval: 30s
+      rules:
+        - alert: IndexEvictionsSpike
+          expr: |
+            sum by (algorithm) (
+              rate(inferencecache_index_evictions_total{reason="cap"}[10m])
+            ) > 10
+          for: 10m
+          labels:
+            severity: info
+            component: inference-cache
+          annotations:
+            summary: "Index evicting >10/sec at MaxEntries cap (algorithm={{ $labels.algorithm }}) — consider raising the cap."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
+
+    # DEFERRED — three additional alerts (VersionSkewDetected,
+    # KvEventsStaleness, ServerProbeFail) are blocked on metrics that the
+    # operator does not yet expose:
+    #   - `inferencecache_backend_version_skew` (gauge)
+    #   - `inferencecache_replica_last_event_at` (gauge)
+    #   - `inferencecache_backend_probe_result` (counter)
+    # The placeholder rules sit in `alerting-rules.yaml` as comments;
+    # mirror them into this CR in the same change that ships the metrics.

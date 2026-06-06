@@ -1,0 +1,229 @@
+# Unit tests for the alerting rules in alerting-rules.yaml. Each Stage 1
+# alert has both a "should fire" and a "should not fire" case; together they
+# pin the threshold and confirm the alert is not spuriously firing on healthy
+# baselines. Run with `promtool test rules prometheus-rules-tests.yaml` (or
+# via `make verify-prometheus`).
+#
+# Synthetic time-series notation: `N+Mx20` is "start at N, add M every step,
+# produce 21 samples total". The default step is `interval:` (30s here). For
+# a counter to be `rate()`-able, we increment monotonically. We size each
+# test long enough for the alert's [10m] rate window to fill PLUS the `for:`
+# dwell. The annotations in `exp_alerts` are full copies of what the rule
+# emits — promtool 3.x checks them strictly, so changing an annotation in
+# alerting-rules.yaml must be mirrored here too. That coupling is
+# intentional: the alert text IS the contract a runbook reader relies on.
+
+rule_files:
+  - alerting-rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # --------------------------------------------------------------------------
+  # IndexEmpty (for: 2m, critical)
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: IndexEmpty fires when server is up and no index_entries series exists
+    input_series:
+      - series: 'inferencecache_server_up'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IndexEmpty
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: inference-cache
+            exp_annotations:
+              summary: "Cache index empty while server is up — subscriber → server pipeline broken."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
+
+  - interval: 30s
+    name: IndexEmpty does not fire when index has entries
+    input_series:
+      - series: 'inferencecache_server_up'
+        values: '1+0x20'
+      - series: 'inferencecache_index_entries{model="llama-3.1-8b"}'
+        values: '1000+0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IndexEmpty
+        exp_alerts: []
+
+  - interval: 30s
+    name: IndexEmpty does not fire when server is down
+    input_series:
+      - series: 'inferencecache_server_up'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IndexEmpty
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # LMCacheT2NoHits (for: 5m, warning)
+  #
+  # Counters grow at 6000/30s = 200/sec on the queries series. The alert
+  # gates on rate > 100/sec (passes) AND rate(hits) == 0. Need ~6 evals of
+  # the condition being true after the 10m rate window has filled, so
+  # eval at t=15m gives stable rates + the 5m `for:` dwell.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: LMCacheT2NoHits fires when queries rise while hits stay at zero
+    input_series:
+      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+        values: '0+6000x40'
+      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LMCacheT2NoHits
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              pod: vllm-0
+            exp_annotations:
+              summary: "External prefix cache on pod vllm-0 returning zero hits despite >100 queries/sec."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
+  - interval: 30s
+    name: LMCacheT2NoHits does not fire when offload is also serving hits
+    input_series:
+      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+        values: '0+6000x40'
+      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+        values: '0+3000x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LMCacheT2NoHits
+        exp_alerts: []
+
+  - interval: 30s
+    name: LMCacheT2NoHits does not fire on a near-idle pod (queries below 100/sec)
+    input_series:
+      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+        values: '0+1500x40'   # 50 queries/sec — below the gate
+      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LMCacheT2NoHits
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # LookupRouteDegenerate (for: 5m, warning)
+  #
+  # 300 NO_HINT + 10 PREFIX_MATCH every 30s = 10.33 calls/sec total, 96.7%
+  # NO_HINT. Trip thresholds: > 0.1/sec total + > 0.9 NO_HINT ratio.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: LookupRouteDegenerate fires when >90% of LookupRoute calls return NO_HINT
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+300x40'
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteDegenerate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              model: llama-3.1-8b
+            exp_annotations:
+              summary: "LookupRoute returning NO_HINT for >90% of calls on model llama-3.1-8b — routing falling back to round-robin."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutedegenerate"
+
+  - interval: 30s
+    name: LookupRouteDegenerate does not fire on a healthy 50-50 split
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+150x40'
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+150x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteDegenerate
+        exp_alerts: []
+
+  - interval: 30s
+    name: LookupRouteDegenerate does not fire on an idle model (rate below floor)
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+1x40'    # 0.033 calls/sec — well below the 0.1/sec floor
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteDegenerate
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # LookupRouteHighTimeout (for: 5m, warning)
+  #
+  # 300 TIMEOUT + 1500 PREFIX_MATCH per 30s = 10 + 50 = 60/sec total, ~16.7%
+  # TIMEOUT. Trip thresholds: > 1/sec total + > 0.05 TIMEOUT ratio.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: LookupRouteHighTimeout fires when >5% of LookupRoute calls TIMEOUT
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
+        values: '0+300x40'
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+1500x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteHighTimeout
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              model: llama-3.1-8b
+            exp_annotations:
+              summary: "LookupRoute returning TIMEOUT for >5% of calls on model llama-3.1-8b — server overload or tight deadline."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutehightimeout"
+
+  - interval: 30s
+    name: LookupRouteHighTimeout does not fire on healthy traffic (TIMEOUT rare)
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
+        values: '0+10x40'     # ~0.33/sec
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+1500x40'   # 50/sec → TIMEOUT ratio ~0.7%
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteHighTimeout
+        exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # IndexEvictionsSpike (for: 10m, info)
+  #
+  # 450/30s = 15 evictions/sec — above the 10/sec threshold. Eval at 22m
+  # gives the rate ~10m to fill plus the 10m `for:` dwell.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: IndexEvictionsSpike fires when cap-driven evictions sustain above 10/sec
+    input_series:
+      - series: 'inferencecache_index_evictions_total{algorithm="lru",reason="cap"}'
+        values: '0+450x50'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: IndexEvictionsSpike
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              component: inference-cache
+              algorithm: lru
+            exp_annotations:
+              summary: "Index evicting >10/sec at MaxEntries cap (algorithm=lru) — consider raising the cap."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
+
+  - interval: 30s
+    name: IndexEvictionsSpike does not fire on TTL-driven evictions alone
+    input_series:
+      - series: 'inferencecache_index_evictions_total{algorithm="lru",reason="ttl"}'
+        values: '0+600x50'    # 20/sec TTL — normal lifecycle, filtered out by reason="cap"
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: IndexEvictionsSpike
+        exp_alerts: []
