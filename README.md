@@ -46,6 +46,9 @@ curl -i http://localhost:8080/readyz    # readiness
 curl -s http://localhost:8080/metrics   # Prometheus metrics (inferencecache_*)
 curl -s http://localhost:8081/snapshot  # internal aggregate (auth-gated in production)
 curl -i -XPOST http://localhost:8081/policy -d '{"version":3,"policies":[]}'  # controller push (auth-gated in production)
+curl -i -XPOST http://localhost:8081/probe \
+  -H 'Content-Type: application/json' \
+  -d '{"backend":"local/dev","model":"dev-model","hashScheme":"vllm"}'        # functional self-test (auth-gated in production)
 ```
 
 The server fails closed by default: omitting both `--allowed-controller-sa` and

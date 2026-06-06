@@ -277,19 +277,18 @@ type Prober struct {
 // T2Prober. Passing nil for t2 disables Stage C (the probe always reports
 // T2=skipped); the controller-wiring follow-up passes a real implementation.
 //
-// The default ingestFn is idx.IngestSkipCap, NOT idx.Ingest: the probe
-// writes one transient entry that the deferred cleanup removes immediately,
-// so triggering the global cap sweep here could evict an oldest real
-// workload entry just to make room for a probe ingest — violating the
-// probe's "never mutates real workload state" invariant on a saturated
-// index. Tests can override ingestFn to drive idx.Ingest directly if they
-// need to exercise the cap path on purpose.
+// The probe routes through idx.Ingest like every other writer; the
+// "no real-workload eviction" invariant is upheld by configuring the
+// index with index.WithReservedTenants(ProbeTenantID) at construction so
+// probe-tenant entries are excluded from the cap accounting AND the cap-
+// sweep victim candidate set. That excludes the probe from cap pressure
+// without exposing a per-write skip-cap footgun on the index API.
 func NewProber(idx *index.Index, t2 T2Prober) *Prober {
 	return &Prober{
 		index:    idx,
 		t2:       t2,
 		now:      time.Now,
-		ingestFn: idx.IngestSkipCap,
+		ingestFn: idx.Ingest,
 		routeFn:  idx.LookupRoute,
 	}
 }

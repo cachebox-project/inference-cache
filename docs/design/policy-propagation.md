@@ -41,6 +41,49 @@ caller identity (the controller SA). The probe entries auto-clean on
 each Run via an `ALL_CLEARED` event against the reserved replica, so
 the synthesized state never leaks into a real LookupRoute.
 
+#### `/probe` wire contract
+
+Request — JSON body, `POST /probe`. All fields are case-sensitive.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `backend` | string | yes | Stable, globally-unique CacheBackend identifier. Canonical form is `<namespace>/<name>` (the controller-wiring follow-up always sends this), but the handler accepts any non-empty string. Interpolated into the reserved replica id (`__probe-<backend>`) and the probe hash, so two CacheBackends with the same `backend` value share a replica id and contention slot. |
+| `model` | string | yes | Model identifier the probe synthesizes state under. Must match the model the controller is checking; the reserved tenant id is server-owned and cannot be passed in. |
+| `hashScheme` | string | yes | Engine domain (`vllm` / `sglang` / etc). Pins the engine the probe's synthetic block lives under so a probe for vllm cannot collide with a probe for sglang on the same backend. |
+| `backendType` | string | no | The CacheBackend's `spec.type`. `LMCache` (or empty, matching the CRD default) runs Stage C; `Memory` / `External` skip it. Unknown values fall through to skip. |
+
+Response — JSON body, HTTP `200 OK` on every well-formed request (per-stage failures are surfaced INSIDE the body, not via HTTP status — the call itself succeeded):
+
+```json
+{
+  "backend": "<backend echoed back>",
+  "subscriber": "ok|failed|skipped",
+  "routing":    "ok|failed|skipped",
+  "t2":         "ok|failed|skipped",
+  "errors": [
+    { "stage": "subscriber|routing|t2", "message": "..." }
+  ]
+}
+```
+
+Stage values:
+- `ok` — the stage passed.
+- `failed` — the stage failed; `errors` carries a stage-keyed diagnostic message.
+- `skipped` — the stage was not run. T2 is skipped on non-LMCache backends and when no T2Prober is wired. Downstream stages are skipped when an upstream stage failed (cascade prevention).
+
+Status codes:
+- `200` — body carries the per-stage result; `errors` is empty when all stages passed.
+- `400` — body decode failure (invalid JSON, trailing content past the first value, missing required field, unknown field).
+- `401` / `403` — auth-middleware rejection (TokenReview failed or wrong SA / wrong audience).
+- `405` — wrong method; only `POST` is allowed (the handler echoes `Allow: POST`).
+
+Isolation + cleanup guarantees:
+- The synthesized state lives under tenant id `inferencecache.io/probe` and replica id `__probe-<backend>`. Both prefixes are reserved by the project's canonical namespace and the `__` Pod-name escape; a real workload cannot collide.
+- The reserved tenant is excluded from the index's global `maxEntries` cap accounting AND its cap-sweep victim candidate set, so a concurrent real-workload `Ingest` cannot evict a real entry to make room for a transient probe entry.
+- Each `Run` calls `ApplyEvent(EventAllCleared)` against the reserved replica via `defer`, leaving the index empty of probe entries on return (even on panic or early-return from a failed Stage A).
+- Reserved-tenant entries are still subject to the TTL sweep as defense-in-depth if the deferred cleanup somehow fails to run.
+- The `CacheTenant` admission webhook rejects any CR claiming `spec.tenantID = inferencecache.io/probe`, and the `ReportCacheState` / `PublishEvent` handlers silently drop messages carrying the same id — so an external client cannot fake state into the reserved scope through the public gRPC contract.
+
 1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
    controller's selector.
 2. **L7 identity** — TokenReview-backed bearer middleware rejects every

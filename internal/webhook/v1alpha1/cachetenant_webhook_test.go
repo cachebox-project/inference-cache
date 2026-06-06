@@ -112,6 +112,29 @@ func TestCacheTenantValidateCreate_NilReaderFailsClosed(t *testing.T) {
 	}
 }
 
+// TestCacheTenantValidateCreate_RejectsReservedProbeTenantID pins the
+// reservation of the server's functional-self-test tenant id at the CRD
+// admission layer. An operator-supplied CacheTenant with
+// spec.tenantID == "inferencecache.io/probe" would otherwise (a) bypass
+// quota enforcement at the PolicyStore layer (which exempts the probe
+// tenant unconditionally) and (b) share the reserved scope with the
+// probe's synthetic state. Reject at admission so the reservation lives at
+// both layers (server policy + CRD admission), and the operator gets a
+// clear "this id is reserved" diagnostic instead of a silent quota bypass.
+func TestCacheTenantValidateCreate_RejectsReservedProbeTenantID(t *testing.T) {
+	v := &CacheTenantValidator{Reader: fakeReaderWith(t)}
+	_, err := v.ValidateCreate(context.Background(), tenant("conflict", "team-a", "inferencecache.io/probe"))
+	if err == nil {
+		t.Fatalf("expected rejection for reserved probe tenant id")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Errorf("expected Invalid error for spec-level rejection, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("error message should explain the reservation: %v", err)
+	}
+}
+
 func TestCacheTenantValidateCreate_NamesSmallestConflictDeterministically(t *testing.T) {
 	// Two siblings already hold the tenantID (a pre-webhook state). The
 	// rejection must name the lexicographically smallest by name, regardless of

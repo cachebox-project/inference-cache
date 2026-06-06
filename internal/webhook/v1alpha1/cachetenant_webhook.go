@@ -64,18 +64,43 @@ type CacheTenantValidator struct {
 }
 
 // CacheTenantValidationRule is the seam plugged-in spec-only admission rules
-// implement, mirroring the CachePolicy/CacheBackend pattern. There are no
-// spec-only rules today — tenantID non-empty (Required + MinLength=1) and
-// quota.maxIndexEntries >= 0 (Minimum=0) are already enforced by kubebuilder
-// markers — so [DefaultCacheTenantValidationRules] is empty. The seam exists
-// so a future cross-field rule appends as a one-liner.
+// implement, mirroring the CachePolicy/CacheBackend pattern.
 type CacheTenantValidationRule func(ct *cachev1alpha1.CacheTenant) field.ErrorList
 
+// reservedProbeTenantID is the tenant id the server uses for its own
+// functional self-test (see ProbeTenantID in pkg/server/probe.go). A real
+// CacheTenant claiming this id would (a) bypass quota enforcement at the
+// PolicyStore layer — the server unconditionally exempts the probe tenant
+// to defend the probe from operator-configured quotas — and (b) share the
+// reserved scope with the probe's synthetic state. Reject at admission so
+// the reservation lives at both layers (server policy + admission).
+// MUST stay in lockstep with pkg/server.ProbeTenantID; the constant is
+// duplicated rather than imported to keep internal/webhook free of a
+// pkg/server dependency.
+const reservedProbeTenantID = "inferencecache.io/probe"
+
+// rejectReservedProbeTenantID rejects any CacheTenant whose spec.tenantID
+// equals the server-reserved probe tenant id. The probe scope is
+// server-internal state; operator-supplied CacheTenants must not govern it.
+var rejectReservedProbeTenantID = func(ct *cachev1alpha1.CacheTenant) field.ErrorList {
+	if ct.Spec.TenantID != reservedProbeTenantID {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(
+		field.NewPath("spec", "tenantID"),
+		ct.Spec.TenantID,
+		"tenantID is reserved for the server's functional self-test (see pkg/server/probe.go); choose a different tenantID",
+	)}
+}
+
 // DefaultCacheTenantValidationRules is the spec-only rule set every admitted
-// CacheTenant is checked against. Empty today (kubebuilder markers cover the
-// structural rules); append here or via [CacheTenantValidator.Rules] to
-// extend admission.
-var DefaultCacheTenantValidationRules = []CacheTenantValidationRule{}
+// CacheTenant is checked against. Today: reject the reserved probe tenant id
+// (kubebuilder markers cover the structural rules — tenantID non-empty,
+// quota.maxIndexEntries >= 0); append here or via [CacheTenantValidator.Rules]
+// to extend admission.
+var DefaultCacheTenantValidationRules = []CacheTenantValidationRule{
+	rejectReservedProbeTenantID,
+}
 
 // SetupCacheTenantWebhookWithManager registers the defaulting and validating
 // webhooks for CacheTenant with mgr. The kubebuilder markers below are the

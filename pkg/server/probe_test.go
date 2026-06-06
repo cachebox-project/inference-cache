@@ -419,14 +419,17 @@ func TestProberRunIsIdempotent(t *testing.T) {
 // TestProberRunDoesNotEvictRealWorkloadOnFullIndex pins the blocking
 // invariant the probe must never violate: on a near-full index (totalEntries
 // already at MaxEntries), the probe's transient ingest MUST NOT trigger the
-// global cap sweep — a triggered sweep would evict an oldest real-workload
-// entry just to make room for an ingest the probe is about to remove anyway.
-// The probe routes through Index.IngestSkipCap for this reason; without that,
-// the test would observe the seeded real-workload entry gone after the probe.
+// global cap sweep. The defense is index.WithReservedTenants(ProbeTenantID):
+// probe entries don't count toward maxEntries AND are excluded from the cap-
+// sweep victim candidate set, so the cap sweep is effectively invisible to
+// the probe path. Without WithReservedTenants the seeded real-workload entry
+// would be evicted to make room for the probe's transient +1.
 func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
-	// Index sized exactly to one entry, so a second ingest would immediately
-	// trigger cap eviction under the normal Ingest path.
-	idx := index.New(index.WithMaxEntries(1))
+	// Index sized exactly to one entry, with the probe tenant reserved.
+	idx := index.New(
+		index.WithMaxEntries(1),
+		index.WithReservedTenants(ProbeTenantID),
+	)
 	idx.Start(t.Context())
 	prober := NewProber(idx, nil)
 
@@ -436,9 +439,9 @@ func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
 	})
 
-	// Run the probe. With IngestSkipCap, this momentarily takes the index to
-	// totalEntries=2, runs the lookup, then cleanup removes the probe entry —
-	// without the cap sweep firing in between to evict the real-workload entry.
+	// Run the probe. With WithReservedTenants, the probe-tenant entry is
+	// cap-invisible: enforceCapLocked sees effectiveTotal=1 (the real entry)
+	// even though totalEntries is 2 momentarily. No eviction.
 	result := prober.Run(t.Context(), ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm",
 	})
@@ -446,14 +449,68 @@ func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
 		t.Fatalf("probe AllPassed = false on near-cap index; result = %+v", result)
 	}
 
-	// The real workload entry MUST survive. If the probe accidentally went
-	// through cap-enforcing Ingest, the seeded entry would have been evicted
-	// before the probe entry was cleaned up.
+	// The real workload entry MUST survive. If the probe-tenant exemption is
+	// broken, the seeded entry would have been evicted as the oldest victim.
 	scores := idx.Lookup(index.LookupRequest{
 		Tenant: "real-tenant", Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
 	})
 	if len(scores) != 1 || scores[0].ReplicaID != "real-replica" {
 		t.Fatalf("real-workload entry evicted by probe ingest on a full index; scores = %+v", scores)
+	}
+}
+
+// TestProberRunConcurrentWithRealWorkloadDoesNotEvict pins the second half
+// of the "no real-workload eviction" invariant: the test above proves the
+// probe's OWN write doesn't trigger the cap sweep; this test proves that a
+// CONCURRENT real-workload Ingest, racing the probe, doesn't pick a real-
+// workload entry as victim either. That requires the reserved-tenants
+// option (excluding probe entries from cap accounting AND victim candidacy).
+// Without that pairing, the probe's transient +1 entry would still push
+// totalEntries over the cap from the concurrent ingest's perspective.
+func TestProberRunConcurrentWithRealWorkloadDoesNotEvict(t *testing.T) {
+	idx := index.New(
+		index.WithMaxEntries(1),
+		index.WithReservedTenants(ProbeTenantID),
+	)
+	idx.Start(t.Context())
+	prober := NewProber(idx, nil)
+
+	idx.Ingest(index.Update{
+		ReplicaID: "real-replica", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
+	})
+
+	const concurrent = 16
+	done := make(chan struct{}, concurrent*2)
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			_ = prober.Run(t.Context(), ProbeRequest{
+				Backend: "cb-1", Model: "m", HashScheme: "vllm",
+			})
+			done <- struct{}{}
+		}()
+		go func() {
+			// Concurrent real-workload re-ingest: same key as the seed, so the
+			// upsert is a refresh — totalEntries stays the same but the cap
+			// sweep still runs. Without WithReservedTenants, the sweep would
+			// see (totalEntries=1 real + 1 probe) > cap=1 and pick a victim.
+			idx.Ingest(index.Update{
+				ReplicaID: "real-replica", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+				Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
+			})
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < concurrent*2; i++ {
+		<-done
+	}
+
+	// The real workload entry must still be there.
+	scores := idx.Lookup(index.LookupRequest{
+		Tenant: "real-tenant", Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 1 || scores[0].ReplicaID != "real-replica" {
+		t.Fatalf("real-workload entry evicted under concurrent probe + ingest; got scores = %+v", scores)
 	}
 }
 

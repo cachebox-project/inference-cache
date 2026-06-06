@@ -102,6 +102,14 @@ func New(opts ...Option) *Service {
 		index.WithTTLResolver(policies),
 		index.WithTenantQuotaResolver(policies),
 		index.WithEvictionResolver(policies),
+		// Reserve the probe tenant from the global cap so a concurrent real-
+		// workload Ingest can never pick a real-workload entry as a victim to
+		// make room for the probe's transient ingest. Probe-tenant entries are
+		// excluded from both the cap accounting (effectiveTotal = totalEntries
+		// - reservedEntries) and the victim candidate set, so the probe path's
+		// "never mutates real workload state" invariant holds even under
+		// concurrent real-workload writes on a saturated index.
+		index.WithReservedTenants(ProbeTenantID),
 	)
 
 	publicMux := http.NewServeMux()

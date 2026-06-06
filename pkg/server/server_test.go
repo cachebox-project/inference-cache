@@ -848,6 +848,81 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 	}
 }
 
+// TestReportCacheStateDropsReservedProbeTenant pins the gRPC defense against
+// an external client writing to the server-reserved probe scope: an ingest
+// carrying tenant_id == ProbeTenantID is silently dropped. The complementary
+// CacheTenant admission rule rejects a CR claiming the same id at the CRD
+// layer; together they keep the probe scope server-internal across all
+// reservation paths.
+func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	stream := &fakeReportStream{updates: []*icpb.CacheStateUpdate{{
+		ReplicaId:  "spoofed",
+		ModelId:    "m",
+		TenantId:   ProbeTenantID,
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 32}},
+	}}}
+	if err := svc.ReportCacheState(stream); err != nil {
+		t.Fatalf("ReportCacheState: %v", err)
+	}
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 0 {
+		t.Fatalf("external ingest under reserved probe tenant landed in the index: %+v", scores)
+	}
+}
+
+// TestPublishEventDropsReservedProbeTenant pins the symmetric guard for
+// CacheEvent: an external PREFIX_EVICTED / ALL_CLEARED targeting the probe
+// tenant must not reach the index. The probe re-synthesizes on every Run so
+// the impact would be limited, but the contract is "external clients can't
+// touch server-internal state" — silent drop, no error on the hot path.
+func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real", Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
+		Type: icpb.CacheEvent_ALL_CLEARED, ReplicaId: "real",
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("Ack should be true even on a silent drop")
+	}
+	// The seeded entry must survive — the ALL_CLEARED was dropped before the index saw it.
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 1 || scores[0].ReplicaID != "real" {
+		t.Fatalf("external CacheEvent against probe tenant disturbed reserved state: %+v", scores)
+	}
+}
+
+// fakeReportStream replays a fixed slice of updates and signals EOF.
+type fakeReportStream struct {
+	icpb.InferenceCache_ReportCacheStateServer
+	updates []*icpb.CacheStateUpdate
+	idx     int
+	acked   bool
+}
+
+func (f *fakeReportStream) Recv() (*icpb.CacheStateUpdate, error) {
+	if f.idx >= len(f.updates) {
+		return nil, io.EOF
+	}
+	u := f.updates[f.idx]
+	f.idx++
+	return u, nil
+}
+
+func (f *fakeReportStream) SendAndClose(*icpb.Ack) error { f.acked = true; return nil }
+
 func TestPublishEventAppliesToIndex(t *testing.T) {
 	svc := newTestService()
 	// Seed two replicas holding the same prefix, then evict one via PublishEvent.
