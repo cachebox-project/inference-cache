@@ -122,8 +122,13 @@ spec:
     # ------------------------------------------------------------------------
     # DEFERRED — the metrics these alerts consume are not yet exposed on
     # /metrics. Enable each rule in the same change that ships its metric.
-    # The same commented-out stubs sit in the flat alerting-rules.yaml; keep
-    # the two in sync when you uncomment (the drift check enforces it).
+    #
+    # NOTE on drift: `hack/verify-prometheus-drift` compares parsed YAML
+    # `groups`, which strips comments — so the commented stubs in this
+    # file and in `alerting-rules.yaml` are NOT enforced to match by CI.
+    # When uncommenting a deferred alert, manually mirror it into BOTH
+    # files in the same change; the drift check will then start
+    # comparing the live rules and lock them in step.
     # ------------------------------------------------------------------------
     #
     # - name: inferencecache-lifecycle

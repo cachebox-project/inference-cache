@@ -14,16 +14,25 @@ This file is the long form: causes, triage steps, example PromQL.
 There are two distribution shapes, same rule set, drift-gated by
 `make verify-prometheus`:
 
-- **prometheus-operator / kube-prometheus installs**: apply the
-  [PrometheusRule CR](../../config/observability/prometheus-rules.yaml):
+- **prometheus-operator / kube-prometheus installs**: apply the bundle:
 
   ```bash
   kubectl apply -k config/observability
   ```
 
-  The CR is pinned to namespace `inference-cache-system` (the operator
-  namespace) and carries the default kube-prometheus selector labels
-  (`prometheus: kube-prometheus`, `role: alert-rules`).
+  Ships TWO CRs together — `kubectl apply -k` applies both:
+  1. A [`ServiceMonitor`](../../config/observability/servicemonitor.yaml)
+     that tells Prometheus to scrape `inference-cache-server:8080/metrics`.
+     Without this, kube-prometheus installs will load the rules but
+     never collect the `inferencecache_*` series the rules read —
+     `prometheus.io/scrape` annotations are commonly ignored in favor of
+     explicit `ServiceMonitor` / `PodMonitor` CRs.
+  2. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
+     carrying the alerts.
+
+  Both CRs are pinned to namespace `inference-cache-system` and carry
+  the default kube-prometheus selector labels (`prometheus: kube-prometheus`,
+  `role: alert-rules` on the rules, plus the ServiceMonitor's own selector).
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
@@ -39,7 +48,14 @@ There are two distribution shapes, same rule set, drift-gated by
 - **Vanilla Prometheus / Helm**: mount
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
   Prometheus via the `rule_files:` config block, a ConfigMap, or the Helm
-  `prometheus.serverFiles` value (depending on your install).
+  `prometheus.serverFiles` value (depending on your install). You ALSO
+  need a `scrape_configs:` entry that points at
+  `inference-cache-server.inference-cache-system.svc.cluster.local:8080/metrics`
+  — or rely on Prometheus's Kubernetes service discovery if the deploy's
+  `prometheus.io/scrape: "true"` annotation is honored by your scraper.
+  ServiceMonitor in the operator bundle is the prometheus-operator
+  equivalent; if you are not on prometheus-operator, the scrape config is
+  your responsibility.
 
 Both files contain the same five Stage 1 alerts plus commented-out
 placeholders for three more that depend on metrics not yet exposed (see
@@ -168,8 +184,20 @@ does not trip it.
 
 vLLM emits `vllm:external_prefix_cache_{queries,hits}_total` on its own
 `/metrics` endpoint (typically `:8000/metrics`), not via this operator.
-The series has been present since vLLM ~0.18. Confirm at least one
-engine pod publishes it before assuming silence means "broken":
+The names and `_total` exposition format are documented at
+[`docs.vllm.ai/.../usage/metrics/`](https://docs.vllm.ai/en/latest/usage/metrics/);
+the series has been present since vLLM 0.18 (the first release tagged in
+the upstream v0.18 docs page).
+
+This operator has no in-process scrape of those upstream metrics — its
+own scraper (`pkg/adapters/engine/metrics_scraper.go`) only reads the T1
+`vllm:prefix_cache_{hits,queries}` plus `vllm:*_cache_usage_perc`. That
+means the alert binds directly to vLLM's exposition, and an upstream
+rename, deprecation, or version skew can silently make the alert inert
+while `promtool test rules` (which uses synthetic series) still passes.
+
+**Operator responsibility:** before enabling the alert in production,
+confirm at least one engine pod publishes the series:
 
 ```bash
 kubectl exec <engine-pod> -- curl -s localhost:8000/metrics \
@@ -180,7 +208,9 @@ A pod running an older vLLM (no offload support) will return no lines;
 the alert won't fire there either (the `unless` guard handles absent
 hits-series, but the queries gate of >1000 tokens/sec assumes the
 metric IS exposed). If your install runs vLLM <0.18 for some pods,
-exclude them via a label in the alert expression or upgrade.
+exclude them via a label in the alert expression or upgrade. If a
+future vLLM release renames the metric, update the alert (and this
+runbook) accordingly.
 
 #### First-response runbook
 
@@ -269,10 +299,11 @@ curl -s localhost:8080/metrics | grep 'inferencecache_lookup_route_calls_total'
 
 # 4. Confirm the index has entries for the model and tenant.
 #    The snapshot endpoint is gated by a SA bearer with the
-#    `inferencecache.io/snapshot` audience. From a controller pod:
-#      TOKEN=$(cat /var/run/secrets/inferencecache.io/snapshot-token/token)
+#    `inferencecache.io/controller` audience (see pkg/server/auth/audience.go).
+#    From a controller pod:
+#      TOKEN=$(cat /var/run/secrets/inferencecache.io/controller-token/token)
 #    Or generate a one-off via `kubectl create token` against the
-#    controller ServiceAccount with `--audience=inferencecache.io/snapshot`.
+#    controller ServiceAccount with `--audience=inferencecache.io/controller`.
 curl -s localhost:8081/snapshot -H "Authorization: Bearer $TOKEN" | jq '.tenants[]'
 ```
 
