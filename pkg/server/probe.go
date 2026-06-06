@@ -441,11 +441,17 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	// dropped the ingest), so cleanup is safe regardless of how far Run got.
 	defer p.cleanup(req.Model, replicaID)
 
-	// Stage A — subscriber pipeline. Synthesize a BlockStored equivalent and
-	// verify it actually lands in the index. We check via a DIRECT index.Lookup
-	// (not the orchestrated routeFn) so this stage isolates the ingest+index-
-	// write path: if the entry is there, Stage A passes regardless of any
-	// routing-layer regression. Routing failures are stage B's responsibility.
+	// Stage A — in-process index ingest. Synthesize a BlockStored equivalent
+	// and verify it actually lands in the index. The probe writes via direct
+	// index.Ingest (NOT through the gRPC ReportCacheState handler the real
+	// subscriber uses; that handler drops probe-tenant messages by design).
+	// We check via a DIRECT index.Lookup (not the orchestrated routeFn) so
+	// this stage isolates the ingest+index-write path: if the entry is there,
+	// Stage A passes regardless of any routing-layer regression. The wire
+	// field is named "subscriber" (the operator's question — "is the
+	// subscriber's data landing?"), but the failure message and the file-top
+	// doc spell out the in-process nature explicitly. Routing failures are
+	// stage B's responsibility.
 	update := index.Update{
 		ReplicaID:  replicaID,
 		Model:      req.Model,
