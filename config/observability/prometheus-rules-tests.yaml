@@ -198,6 +198,31 @@ tests:
               summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
               runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
 
+  - interval: 30s
+    # Regression guard for the unsuffixed counter form. The Python
+    # prometheus_client emits a Counter("foo") as `foo_total`, but some
+    # other Prometheus clients (and some vLLM forks) emit it as bare
+    # `foo`. The alert uses `__name__=~"...(_total)?"` to accept both;
+    # this test pins that behavior. Series name has NO `_total`.
+    name: LMCacheT2NoHits fires on the unsuffixed counter form (some non-Python clients)
+    input_series:
+      - series: 'vllm:external_prefix_cache_queries{namespace="inference-cache-system",pod="vllm-0"}'
+        values: '0+60000x40'
+      - series: 'vllm:external_prefix_cache_hits{namespace="inference-cache-system",pod="vllm-0"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LMCacheT2NoHits
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              namespace: inference-cache-system
+              pod: vllm-0
+            exp_annotations:
+              summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
   # --------------------------------------------------------------------------
   # LookupRouteDegenerate (for: 5m, warning)
   #

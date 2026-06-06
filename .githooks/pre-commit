@@ -13,7 +13,7 @@ set -euo pipefail
 # Paths that define the project's public/core identity — OCI/Oracle banned here.
 # (Cloud-specific integration is allowed, but only in isolated adapters under
 #  pkg/adapters/.../ — those are NOT matched below.)
-CORE_RE='^(api/|proto/|pkg/server/proto/|config/crd/|config/rbac/|config/default/|config/manager/|config/samples/|config/server/|config/webhook/|config/certmanager/|config/overlays/|internal/|PROJECT$|go\.mod$)'
+CORE_RE='^(api/|proto/|pkg/server/proto/|config/crd/|config/rbac/|config/default/|config/manager/|config/observability/|config/samples/|config/server/|config/webhook/|config/certmanager/|config/overlays/|docs/observability/|internal/|PROJECT$|go\.mod$)'
 
 # Banned tokens, word-bounded to avoid false positives like "associate"/"logic".
 BAN_RE='\boci\b|oci\.com|oraclecloud|\boracle\b'

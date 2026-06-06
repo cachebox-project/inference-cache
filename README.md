@@ -112,11 +112,24 @@ kubectl apply -k config/observability
 
 This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
 `inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
-the alerts. Four of the five Stage 1 alerts (`IndexEmpty`,
-`LookupRouteDegenerate`, `LookupRouteHighTimeout`, `IndexEvictionsSpike`)
-become active as soon as the operator is installed — they remain quiet
-on a healthy or idle install (each rule is gated by traffic/rate/
-eviction thresholds; see `for:` + the rate floors in the alert
+the alerts.
+
+> **Caveat — Prometheus Operator selectors.** Both CRs carry example
+> labels (`prometheus: kube-prometheus`, plus `role: alert-rules` on
+> the PrometheusRule) that match a stock kube-prometheus install. If
+> your `Prometheus` CR's `ruleSelector` / `serviceMonitorSelector`
+> uses a different label set (`release: my-prom`, etc.), `kubectl
+> apply -k` succeeds but Prometheus silently ignores both resources.
+> The YAML comments next to each label spell out the introspection
+> command (`kubectl get prometheus -o jsonpath=...`); see
+> [`docs/observability/alerts.md`](docs/observability/alerts.md) for
+> the full discussion.
+
+Four of the five Stage 1 alerts (`IndexEmpty`, `LookupRouteDegenerate`,
+`LookupRouteHighTimeout`, `IndexEvictionsSpike`) become active as soon
+as the operator is installed AND the selectors match — they remain
+quiet on a healthy or idle install (each rule is gated by traffic/
+rate/eviction thresholds; see `for:` + the rate floors in the alert
 expressions) and only fire when the conditions are met.
 
 > **The fifth alert needs a vLLM scrape this bundle does NOT ship.**

@@ -267,8 +267,13 @@ while `promtool test rules` (which uses synthetic series) still passes.
 confirm at least one engine pod publishes the series:
 
 ```bash
+# Matches BOTH the Python-prometheus-client convention
+# (vllm:external_prefix_cache_queries_total) AND the unsuffixed form
+# (vllm:external_prefix_cache_queries) — the alert uses
+# `{__name__=~"...(_total)?"}` so it accepts whichever form your vLLM
+# build emits.
 kubectl exec <engine-pod> -- curl -s localhost:8000/metrics \
-  | grep -E '^vllm:external_prefix_cache_(queries|hits)_total'
+  | grep -E '^vllm:external_prefix_cache_(queries|hits)(_total)?'
 ```
 
 A pod running an older vLLM (no offload support) will return no lines;

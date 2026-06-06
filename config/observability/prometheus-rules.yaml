@@ -57,9 +57,9 @@ spec:
 
         - alert: LMCacheT2NoHits
           expr: |
-            (sum by (namespace, pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 1000)
+            (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[10m])) > 1000)
             unless
-            (sum by (namespace, pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
+            (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_hits(_total)?"}[10m])) > 0)
           for: 5m
           labels:
             severity: warning
