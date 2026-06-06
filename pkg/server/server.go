@@ -87,10 +87,12 @@ type Service struct {
 	snapshotServer    *http.Server
 	snapshotHandler   http.Handler
 	policyHandler     http.Handler
+	probeHandler      http.Handler
 	controllerAuthCfg *controllerAuthConfig
 	metrics           *serverMetrics
 	index             *index.Index
 	policies          *PolicyStore
+	prober            *Prober
 }
 
 // New constructs a cache service.
@@ -148,8 +150,18 @@ func New(opts ...Option) *Service {
 	// snapshots to. Replace-on-write; the controller owns the source of truth
 	// and re-pushes on its tick, so a server restart self-heals.
 	policyHTTPHandler := http.Handler(policyHandler(policies))
+	// /probe — functional self-test. The controller POSTs a probe request
+	// per CacheBackend at reconcile time (controller-wiring follow-up); the
+	// server synthesizes a deterministic round-trip and reports per-stage
+	// outcomes. Shares the controller-auth profile (same listener, same SA
+	// identity); this revision ships with no T2Prober wired, so the T2 stage
+	// always reports skipped until the controller-wiring follow-up plumbs a
+	// real one through.
+	prober := NewProber(idx, nil)
+	probeHTTPHandler := http.Handler(probeHandler(prober))
 	snapshotMux.Handle("/snapshot", snapshotHandler)
 	snapshotMux.Handle("/policy", policyHTTPHandler)
+	snapshotMux.Handle("/probe", probeHTTPHandler)
 
 	s := &Service{
 		publicHTTPServer: &http.Server{
@@ -162,9 +174,11 @@ func New(opts ...Option) *Service {
 		},
 		snapshotHandler: snapshotHandler,
 		policyHandler:   policyHTTPHandler,
+		probeHandler:    probeHTTPHandler,
 		metrics:         metrics,
 		index:           idx,
 		policies:        policies,
+		prober:          prober,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -235,9 +249,19 @@ func New(opts ...Option) *Service {
 		if err != nil {
 			panic(fmt.Sprintf("server: policy auth: %v", err))
 		}
+		probeAuthn, err := auth.NewAuthenticator(auth.Options{
+			Reviewer:               s.controllerAuthCfg.reviewer,
+			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Audience:               s.controllerAuthCfg.audience,
+			Recorder:               s.metrics.ProbeAuthRecorder(),
+		})
+		if err != nil {
+			panic(fmt.Sprintf("server: probe auth: %v", err))
+		}
 		gatedMux := http.NewServeMux()
 		gatedMux.Handle("/snapshot", snapshotAuthn.Middleware(snapshotHandler))
 		gatedMux.Handle("/policy", policyAuthn.Middleware(policyHTTPHandler))
+		gatedMux.Handle("/probe", probeAuthn.Middleware(probeHTTPHandler))
 		s.snapshotServer.Handler = gatedMux
 	}
 	return s

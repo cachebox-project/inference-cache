@@ -32,7 +32,8 @@ const metricNamespace = "inferencecache"
 // (`inferencecache_lookup_route_*`), the quota-eviction counter
 // (`inferencecache_tenant_evictions_total`), the cap/TTL eviction counter
 // (`inferencecache_index_evictions_total`), and the per-endpoint auth counters
-// (`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`).
+// (`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+// `inferencecache_probe_auth_total`).
 // Update this comment when adding a new metric so the ownership note in
 // docs/reference/metrics.md and this struct stay in lockstep.
 type serverMetrics struct {
@@ -46,6 +47,7 @@ type serverMetrics struct {
 	indexEvictions  *prometheus.CounterVec
 	snapshotAuth    *prometheus.CounterVec
 	policyAuth      *prometheus.CounterVec
+	probeAuth       *prometheus.CounterVec
 }
 
 func newServerMetrics() *serverMetrics {
@@ -100,6 +102,18 @@ func newServerMetrics() *serverMetrics {
 		Name:      "policy_auth_total",
 		Help:      "Authentication outcomes for the internal /policy endpoint (ok|unauth|forbidden|error).",
 	}, []string{"result"})
+	// /probe is the third controller↔server endpoint on the snapshot
+	// listener; its auth outcomes get their own counter so dashboards can
+	// distinguish a probe auth failure (which would silently degrade Ready
+	// gating once the controller-wiring follow-up lands) from a snapshot read
+	// failure (info leak attempt) or a policy write failure (active tampering).
+	// Following the same pattern as snapshot/policy keeps the three
+	// controller-facing endpoints structurally uniform.
+	probeAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "probe_auth_total",
+		Help:      "Authentication outcomes for the internal /probe endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
@@ -112,6 +126,7 @@ func newServerMetrics() *serverMetrics {
 		indexEvictions,
 		snapshotAuth,
 		policyAuth,
+		probeAuth,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -127,6 +142,7 @@ func newServerMetrics() *serverMetrics {
 		indexEvictions:  indexEvictions,
 		snapshotAuth:    snapshotAuth,
 		policyAuth:      policyAuth,
+		probeAuth:       probeAuth,
 	}
 }
 
@@ -148,6 +164,19 @@ func (m *serverMetrics) SnapshotAuthRecorder() auth.ResultRecorder {
 func (m *serverMetrics) PolicyAuthRecorder() auth.ResultRecorder {
 	return auth.ResultRecorderFunc(func(r auth.Result) {
 		m.policyAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// ProbeAuthRecorder returns an auth.ResultRecorder that increments the /probe
+// auth counter for each invocation. Wired by Service.New when the snapshot
+// listener has bearer auth configured — /probe joins /snapshot and /policy on
+// the auth-required listener under the shared controller SA identity; the
+// dedicated counter lets dashboards distinguish a probe-side auth failure
+// (which would silently degrade Ready gating once the controller-wiring
+// follow-up lands) from snapshot read or policy write failures.
+func (m *serverMetrics) ProbeAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.probeAuth.WithLabelValues(string(r)).Inc()
 	})
 }
 
