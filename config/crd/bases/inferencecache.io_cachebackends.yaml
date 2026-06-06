@@ -553,17 +553,27 @@ spec:
                 description: |-
                   Resources are the compute resources requested + limited on the cache
                   server container of a managed backend workload (the lmcache-server
-                  container for a Type=LMCache backend). The runtime adapter passes the
-                  value through to Container.Resources verbatim; the kubebuilder default
-                  below stamps a conservative 4Gi request / 8Gi memory limit on the
-                  minimal-YAML path (when the field is OMITTED) so the cache server is
-                  bounded by the cgroup rather than node-pressure OOM-killed by the
-                  kubelet under heavy T2 write load — a cache-stress benchmark against
-                  an un-limited lmcache-server repeatedly OOM-killed the pod within
-                  minutes of T2 traffic, which the default limit eliminates. Operators
-                  tune per-deployment by overriding the field; an explicit empty
-                  `spec.resources: {}` is honored as suppression of the default
-                  (no requests, no limits).
+                  container for a Type=LMCache backend). The runtime adapter passes
+                  the admitted Requests/Limits maps through to Container.Resources;
+                  the kubebuilder default below stamps a conservative 4Gi request /
+                  8Gi memory limit on the minimal-YAML path (when the field is
+                  OMITTED) so the cache server is bounded by the cgroup rather than
+                  node-pressure OOM-killed by the kubelet under heavy T2 write load —
+                  a cache-stress benchmark against an un-limited lmcache-server
+                  repeatedly OOM-killed the pod within minutes of T2 traffic, which
+                  the default limit eliminates. Operators tune per-deployment by
+                  overriding the field; an explicit empty `spec.resources: {}` is
+                  honored as suppression of the default (no requests, no limits).
+
+                  Admission narrows the surface relative to the upstream
+                  ResourceRequirements shape: a non-empty `resources.claims` slice
+                  is rejected (the runtime adapter does not yet plumb pod-level
+                  `spec.resourceClaims`), strictly-negative `requests` / `limits`
+                  quantities are rejected (the CRD schema admits a leading "-" but
+                  the kubelet would later reject the pod), and a `limits[X]` strictly
+                  less than `requests[X]` for the same resource X is rejected. See
+                  docs/design/cachebackend-api.md#resources for the full validator
+                  table.
 
                   When spec.autoscaling is set, the adapter additionally fills in a
                   CPU request fallback (250m) if this field omits one — a
