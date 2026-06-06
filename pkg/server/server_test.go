@@ -26,10 +26,16 @@ import (
 // newTestService builds a service backed by a fresh, empty index + policy
 // store for handler-level unit tests. The index uses the policy store as its
 // TTL resolver so per-tenant TTL changes during a test are reflected exactly
-// as they would be in the running binary.
+// as they would be in the running binary, and reserves the probe tenant so
+// the cap/snapshot/aggregate behavior matches the production binary's
+// Service.New wiring (otherwise tests would see different read-side
+// filtering than the running server).
 func newTestService() *inferenceCacheService {
 	policies := NewPolicyStore()
-	idx := index.New(index.WithTTLResolver(policies))
+	idx := index.New(
+		index.WithTTLResolver(policies),
+		index.WithReservedTenants(ProbeTenantID),
+	)
 	return newInferenceCacheService(idx, newServerMetrics(), policies)
 }
 
@@ -845,6 +851,95 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 	}
 	if resp.GetReplicas()[0].GetCacheMemoryBytes() != 2048 {
 		t.Fatalf("cache_memory_bytes = %d, want 2048", resp.GetReplicas()[0].GetCacheMemoryBytes())
+	}
+}
+
+// TestLookupRouteFailsOpenForReservedProbeTenant pins the symmetric read-side
+// guard: an external gRPC caller that knows (or guesses) a backend name and
+// re-derives the deterministic probe hash MUST NOT observe the synthetic
+// __probe-<backend> replica when querying with tenant_id == ProbeTenantID.
+// Fail-open with NO_HINT — the contract says "never error on the hot path",
+// and the legitimate probe path uses index.LookupRoute directly (not the
+// gRPC handler), so the in-process Run is unaffected.
+func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed something in the probe scope so a leak would actually surface.
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — external lookup against reserved tenant must fail-open", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("external lookup against reserved tenant returned scores: %+v", resp.GetReplicaScores())
+	}
+}
+
+// TestGetCacheStateReturnsEmptyForReservedProbeTenant is the same guard on
+// the per-(tenant, model) aggregate RPC: an external caller MUST NOT see
+// the probe's synthetic replica stats or prefix count via GetCacheState.
+func TestGetCacheStateReturnsEmptyForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("GetCacheState: %v", err)
+	}
+	if resp.GetSummary().GetTotalPrefixes() != 0 {
+		t.Fatalf("GetCacheState exposed %d probe prefixes; want 0", resp.GetSummary().GetTotalPrefixes())
+	}
+	if len(resp.GetReplicas()) != 0 {
+		t.Fatalf("GetCacheState exposed probe replicas: %+v", resp.GetReplicas())
+	}
+}
+
+// TestSnapshotFiltersReservedProbeTenant pins the cluster-aggregate
+// (/snapshot) read-side guard. The CacheIndex poller polls /snapshot every
+// ~25s; a probe in flight during that poll must not be temporarily reflected
+// into operator-visible CacheIndex CR status.
+func TestSnapshotFiltersReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed both a real tenant (visible) and the probe tenant (hidden).
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real-r", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("rp"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{ReplicaID: "real-r", CacheMemoryBytes: 5000, HitRate: 0.5},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("pp"), TokenCount: 16}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	snap := svc.index.Snapshot()
+
+	if snap.TotalPrefixes != 1 {
+		t.Errorf("TotalPrefixes = %d, want 1 — reserved tenant must not contribute to the cluster total", snap.TotalPrefixes)
+	}
+	for _, r := range snap.Replicas {
+		if r.Tenant == ProbeTenantID || strings.HasPrefix(r.ReplicaID, ProbeReplicaPrefix) {
+			t.Errorf("Snapshot exposed reserved replica row: %+v", r)
+		}
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == ProbeTenantID {
+			t.Errorf("Snapshot exposed reserved tenant row: %+v", tn)
+		}
 	}
 }
 

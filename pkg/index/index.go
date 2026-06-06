@@ -1196,11 +1196,17 @@ func (i *Index) Aggregate() Aggregate {
 // aggregateLocked walks the prefix map exactly once, attributing every distinct
 // prefix key to its tenant bucket and the running total in the same step. Caller
 // holds at least the read lock. Because both numbers come from the one
-// iteration, Total == Σ PerTenant == len(i.prefixes) always holds — no second
-// pass, no separate counter that could drift.
+// iteration, Total == Σ PerTenant always holds — no second pass, no separate
+// counter that could drift. Reserved-tenant entries (see WithReservedTenants)
+// are excluded from BOTH PerTenant and Total so the cluster aggregate the
+// operator sees matches the cap-relevant entry count (Total == effective
+// total == totalEntries - reservedEntries).
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		// Untenanted prefixes (key.tenant == "") bucket under "" — collision-free,
 		// since no real CacheTenant tenantID is empty.
 		agg.PerTenant[key.tenant]++
@@ -1264,6 +1270,13 @@ type TenantSnapshot struct {
 // stats reported for each replica id; tenant memory/hit-rate dedup replicas
 // within a tenant (it is an approximation — a replica serving multiple models
 // for a tenant is counted once). Results are sorted for deterministic output.
+//
+// Reserved tenants (see WithReservedTenants) are excluded from the snapshot
+// entirely — replicas, tenants, and totals — so a probe in flight cannot
+// temporarily publish its synthetic `__probe-<backend>` replica or the
+// reserved tenant id into the CacheIndex CR status the controller polls.
+// Same rationale as their exclusion from the cap-sweep victim set:
+// server-internal state must not leak to operator-visible surfaces.
 func (i *Index) Snapshot() Snapshot {
 	i.mu.RLock()
 
@@ -1276,6 +1289,9 @@ func (i *Index) Snapshot() Snapshot {
 	latestByReplica := make(map[tenantReplica]statEntry)
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
+		if i.isReservedTenant(sk.tenant) {
+			continue
+		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[tr] = s
@@ -1297,6 +1313,9 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	prefixByReplica := make(map[tenantReplica]*replicaPrefixAgg)
 	for key, replicas := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		for id, e := range replicas {
 			tr := tenantReplica{key.tenant, id}
 			a := prefixByReplica[tr]
@@ -1313,7 +1332,9 @@ func (i *Index) Snapshot() Snapshot {
 
 	// Per-tenant distinct-prefix counts + the grand total come from ONE
 	// authoritative walk (aggregateLocked) so the reported numbers can't drift:
-	// TotalPrefixes == Σ tenants[].indexEntries by construction.
+	// TotalPrefixes == Σ tenants[].indexEntries by construction. The walk
+	// already excludes reserved tenants, so the snapshot total matches what
+	// operator dashboards expect to see.
 	agg := i.aggregateLocked()
 	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 

@@ -84,6 +84,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	tenant := req.GetTenantId()
 	model := req.GetModelId()
 
+	// Reserved probe scope: never serve external LookupRoute queries against
+	// the server-internal probe tenant. Without this guard, a caller that
+	// knows (or guesses) a backend name could re-derive the deterministic
+	// probe hash and observe the synthetic __probe-<backend> replica during
+	// a Run, contradicting the "server-internal / never leaks into a real
+	// LookupRoute" contract. Fail open with NO_HINT (no metric noise — the
+	// observation isn't useful here and would just pollute the lookup
+	// counters with synthetic traffic). The legitimate probe path uses
+	// index.LookupRoute directly, not the gRPC handler.
+	if tenant == ProbeTenantID {
+		return &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}, nil
+	}
+
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
 	// request that can't clear it — no index lock, no goroutine. A chain
 	// request reports its token budget via block_token_counts (the legacy
@@ -260,7 +273,15 @@ func (*inferenceCacheService) LookupPDRoute(context.Context, *icpb.LookupPDRoute
 }
 
 // GetCacheState returns the aggregate held in the index for a (tenant, model).
+// Reads against the reserved probe tenant return an empty aggregate so
+// in-flight probe state (synthetic replica stats during Stage A / Stage C)
+// never reaches an external caller. The legitimate consumer (the controller)
+// reads the cluster-wide aggregate via /snapshot, which also filters reserved
+// tenants.
 func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCacheStateRequest) (*icpb.GetCacheStateResponse, error) {
+	if req.GetTenantId() == ProbeTenantID {
+		return &icpb.GetCacheStateResponse{Summary: &icpb.CacheSummary{}}, nil
+	}
 	replicas, totalPrefixes := s.index.CacheState(req.GetTenantId(), req.GetModelId())
 
 	resp := &icpb.GetCacheStateResponse{
