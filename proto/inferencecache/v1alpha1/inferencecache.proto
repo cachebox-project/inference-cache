@@ -121,6 +121,23 @@ message ReplicaStats {
   int64 cache_memory_bytes = 2;
   float hit_rate = 3;
   float pressure = 4;
+  // Opaque version string identifying the client-side cache library the
+  // reporting replica is linked against (e.g. an LMCache client release).
+  // The server stores this per replica and compares it against its own
+  // probed backend (server-side) version to surface client/server skew on
+  // the CacheBackend status — the control-plane signal that prevents the
+  // silent T2-write wire-protocol mismatch class of bug from recurring.
+  // The string is engine-opaque at this layer: no semver parsing or
+  // ordering is implied on the wire.
+  //
+  // Backward-compat: empty / unset means "unknown" and never triggers a
+  // skew condition on its own — older subscribers that don't fill this
+  // field continue to be accepted and surface as
+  // VersionCompatible=Unknown rather than False. The downstream consumers
+  // (subscriber populates, server stores + exposes on /snapshot,
+  // controller writes the CacheBackend status condition and extends the
+  // Ready gate) land in follow-up PRs in the same change set.
+  string client_version = 5;
 }
 
 message CacheStateUpdate {
