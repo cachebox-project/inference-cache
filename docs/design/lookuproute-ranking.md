@@ -43,8 +43,14 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the
-state. If no replica holds the prefix, the result is empty with
-`reason_code: NO_HINT` and the gateway falls back.
+state. If no replica holds the prefix, the result is empty; the
+accompanying `reason_code` is `NO_HINT` when the miss is a same-key novel
+prefix (or when the cold-start / empty-key carve-outs apply), or one of
+the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` /
+`UNKNOWN_HASH_SCHEME`) when the miss-classifier identifies a
+contract-key mismatch — see
+[`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md). Either way
+the gateway falls back to its default routing policy.
 
 This is the cache plane's job at its simplest. Everything else in this doc
 *layers on top of this formula* — it never replaces it. When the new
@@ -144,10 +150,15 @@ A few details that matter for correctness:
   of some unrelated chain (because the bytes happen to collide) doesn't
   show up as a partial match against this request. The leading-run rule
   is enforced by where we initialize, not by separate position tracking.
-- **`reason_code` is unchanged.** Any non-empty match — one block or
-  the whole chain — is `PREFIX_MATCH`. `NO_HINT` only fires when nobody
-  holds block 0 (or whenever the engine-opaque guards fire — empty
-  `hash_scheme`, mismatched parallel-array lengths, etc.).
+- **`reason_code` is unchanged on the match side.** Any non-empty match
+  — one block or the whole chain — is `PREFIX_MATCH`. On a miss, the
+  request goes through the same miss-classifier as the exact-match
+  path: a same-key first-block miss yields `NO_HINT`; a contract-key
+  mismatch yields the matching `UNKNOWN_*` code (see
+  [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)). The
+  engine-opaque guards (empty `hash_scheme`, mismatched parallel-array
+  lengths) and the cold-start carve-out continue to surface as
+  `NO_HINT`.
 
 ### Worked example — 5 blocks, 3 deep
 
@@ -296,8 +307,11 @@ strategy:
    so `MatchedTokens = 0` on each returned `ReplicaScore`. **The gateway
    must rely on `reason_code`, not `matched_tokens`, to recognize this
    branch.**
-4. Return them with `reason_code: TENANT_HOT`. If nothing qualifies, fall
-   through to `NO_HINT` like before.
+4. Return them with `reason_code: TENANT_HOT`. If nothing qualifies, the
+   miss-classifier runs (see [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)):
+   a same-key novel-prefix miss falls through to `NO_HINT`, but a
+   mismatched contract key (`tenant_id`, `model_id`, or `hash_scheme`)
+   surfaces as the matching `UNKNOWN_*` code.
 
 This is a deliberately *softer* hint than `PREFIX_MATCH`. The gateway is
 free to honor it or fall back to its default policy. Setting
@@ -435,11 +449,19 @@ And the strategies compose into a single orchestrator:
 
 ```
 LookupRoute(req):
-   if hash_scheme is empty            → NO_HINT      (engine domain unknown — fail open)
-   if there is an exact prefix match  → PREFIX_MATCH (ranked by the full score)
-   else if any tenant-warm replicas   → TENANT_HOT   (ranked by the full score, soft hint)
-   else                                → NO_HINT     (baseline empty-result default)
+   if hash_scheme is empty            → NO_HINT             (engine domain unknown — fail open)
+   if there is an exact prefix match  → PREFIX_MATCH        (ranked by the full score)
+   else if any tenant-warm replicas   → TENANT_HOT          (ranked by the full score, soft hint)
+   else (miss-classifier runs):
+       if index is globally empty     → NO_HINT             (cold start — no data to compare against)
+       if tenant_id not in index      → UNKNOWN_TENANT      (configuration drift)
+       if (tenant, model) not in index → UNKNOWN_MODEL       (configuration drift)
+       if scope not in index          → UNKNOWN_HASH_SCHEME (configuration drift)
+       else                            → NO_HINT             (genuine novel prefix — fail open)
 ```
+
+See [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md) for the
+full design behind the `UNKNOWN_*` codes.
 
 Every factor and threshold is tunable through a `RankerConfig`. Defaults
 are set so that:
@@ -453,15 +475,21 @@ are set so that:
 
 ## 7. The reason-code summary
 
-| Code         | When it fires                                                                                                           | What the gateway treats it as           |
+| Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH` | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain     | Strongest hint — route to top-ranked    |
-| `TENANT_HOT`   | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                       | Softer hint — use or fall back          |
-| `NO_HINT`      | Empty hash_scheme, malformed chain, no prefix match, no warm replicas, or any other unspecified outcome                 | Default routing; cache plane invisible  |
+| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain                                                                                                                  | Strongest hint — route to top-ranked    |
+| `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
+| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), or any other unspecified outcome                  | Default routing; cache plane invisible  |
+| `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |
+| `UNKNOWN_MODEL`       | Prefix miss + `TENANT_HOT` miss + the tenant has entries but the requested `(tenant, model)` does not                                                                                                                                | Same — fail-open; configuration error   |
+| `UNKNOWN_HASH_SCHEME` | Prefix miss + `TENANT_HOT` miss + `(tenant, model)` has entries but the requested `hash_scheme` is absent for it                                                                                                                     | Same — fail-open; configuration error   |
 
 `TIMEOUT` is reserved in the contract vocabulary for a per-tenant lookup
 deadline breach and is handled by the policy-server propagation path — not
-by this ranking layer.
+by this ranking layer. See
+[`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md) for the rule
+behind the `UNKNOWN_*` codes (including the empty-key and cold-start
+carve-outs that keep them on `NO_HINT`).
 
 ## 8. Worked examples
 

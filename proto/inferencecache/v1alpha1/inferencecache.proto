@@ -10,8 +10,10 @@ option go_package = "github.com/cachebox-project/inference-cache/pkg/server/prot
 // Guarantees:
 //   - RenderTemplate / LookupRoute / LookupPDRoute / GetCacheState are
 //     side-effect-free apart from emitting metrics.
-//   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
-//     treat it as a no-op and route as they normally would.
+//   - Fail-open: an empty result is always valid regardless of the
+//     reason_code (NO_HINT, TIMEOUT, or one of the diagnostic codes
+//     UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME); clients treat
+//     it as a no-op and route as they normally would.
 //   - prefix_hash and block_hashes bytes are engine-defined and only matched
 //     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
@@ -83,7 +85,7 @@ message ReplicaScore {
 
 message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
-  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT
+  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
   int64 lookup_latency_us = 3;
 }
 

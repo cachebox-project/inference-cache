@@ -765,7 +765,11 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 			wantScores: 1, // cold replica filtered by hit_rate threshold
 		},
 		{
-			name: "no prefix match AND no warm replicas → StrategyNone",
+			// Stats-only ingest registers no prefix entries → the prefix map is
+			// globally empty → the cold-start carve-out keeps this on the
+			// fail-open NO_HINT path. The no-replica-leak intent is preserved
+			// by the wantScores==0 assertion.
+			name: "stats-only ingest, novel prefix → StrategyNone (globally empty prefix map)",
 			ingest: []Update{
 				{ReplicaID: "cold", Model: model, Tenant: tenant, HashScheme: scheme,
 					Stats: &ReplicaStats{HitRate: 0.0}},
@@ -775,7 +779,11 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 			wantScores: 0,
 		},
 		{
-			name:       "empty index, no signals → StrategyNone (fail open)",
+			// Empty index = cold start. The cold-start carve-out short-circuits
+			// classifyMiss to NO_HINT so a freshly-started server does not flood
+			// every gateway with UNKNOWN_TENANT until the first ReportCacheState
+			// lands. The diagnostic resumes the moment any prefix is reported.
+			name:       "empty index → StrategyNone (cold-start carve-out)",
 			ingest:     nil,
 			req:        LookupRequest{Model: model, Tenant: tenant, HashScheme: scheme, PrefixHash: hashFor("novel")},
 			wantStrat:  StrategyNone,
@@ -907,9 +915,12 @@ func TestTenantHotHonorsHitRateThreshold(t *testing.T) {
 }
 
 // TestTenantHotDisabledByZeroMaxAge proves the kill-switch: a RankerConfig
-// with TenantHotMaxAge=0 disables the fallback entirely, so a prefix miss
-// always lands at StrategyNone (NO_HINT). Useful when an operator wants
-// strict baseline behavior back.
+// with TenantHotMaxAge=0 disables the soft locality fallback, so a
+// same-key prefix miss (the case set up below — (t, m, vllm) populated,
+// only this prefix novel) lands at StrategyNone (NO_HINT) instead of
+// TENANT_HOT. The miss-classifier still runs for mismatched contract keys
+// — see the dedicated diagnostics tests; this test pins only the
+// kill-switch behavior on the same-key path.
 func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 	cfg := DefaultRankerConfig()
 	cfg.TenantHotMaxAge = 0 // explicit disable
@@ -933,6 +944,11 @@ func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 // updates under a different scheme) could leak into hints for the wrong
 // domain. The replica below holds a prefix only under "sglang"; a lookup
 // under "vllm" must NOT promote it via TENANT_HOT.
+//
+// Post-diagnostics: this is also the canonical UNKNOWN_HASH_SCHEME diagnostic
+// shape — (t, m) populated under sglang, the lookup asks under vllm — so
+// the classifier now surfaces the more specific code. The leak guarantee is
+// unchanged: no replica from another scheme ever appears in Scores.
 func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "wrong-engine", Model: "m", Tenant: "t", HashScheme: "sglang",
@@ -941,9 +957,12 @@ func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
-	if res.Strategy != StrategyNone {
-		t.Fatalf("replica serving sglang must NOT surface for a vllm lookup; got %v (%+v)",
+	if res.Strategy != StrategyUnknownHashScheme {
+		t.Fatalf("(t, m) populated under sglang but the lookup asks under vllm: must surface UNKNOWN_HASH_SCHEME; got %v (%+v)",
 			res.Strategy, res.Scores)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("UNKNOWN_HASH_SCHEME must carry no scores (no cross-scheme leak); got %+v", res.Scores)
 	}
 }
 
@@ -987,9 +1006,17 @@ func TestTenantHotDropsReplicaAfterPrefixSweep(t *testing.T) {
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
+	// Sweep drops the only prefix → the index is now globally empty for the
+	// prefix map → cold-start carve-out short-circuits classifyMiss to NO_HINT.
+	// The original "TENANT_HOT must NOT fire" intent is preserved (Scores
+	// empty); reverting to NO_HINT instead of a diagnostic is correct here
+	// because there is no other-tenant data to compare against.
 	if res.Strategy != StrategyNone {
 		t.Fatalf("after sweep, replica with no live serving prefix must NOT enable TENANT_HOT; got %v (%+v)",
 			res.Strategy, res.Scores)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("post-sweep response must carry no scores; got %+v", res.Scores)
 	}
 }
 
@@ -1032,6 +1059,10 @@ func TestLookupIgnoresStaleStatsPressurePenalty(t *testing.T) {
 // for a more subtle case: an update that carries stats but NO prefix entry
 // (regardless of HashScheme) cannot become a TENANT_HOT candidate, because
 // the index has no evidence the replica serves any prefix at all.
+//
+// Stats-only ingest registers no prefix entries → prefix map globally empty
+// → cold-start carve-out keeps the response on NO_HINT. The original
+// guarantee (stats-only replica never appears in Scores) is preserved.
 func TestTenantHotIgnoresStatsOnlyReplicas(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "stats-only", Model: "m", Tenant: "t", HashScheme: "vllm",
@@ -1043,11 +1074,22 @@ func TestTenantHotIgnoresStatsOnlyReplicas(t *testing.T) {
 		t.Fatalf("stats-only update must NOT surface in TENANT_HOT; got %v (%+v)",
 			res.Strategy, res.Scores)
 	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("stats-only response must carry no scores; got %+v", res.Scores)
+	}
 }
 
 // TestTenantHotIsolatedByTenant guards that a warm replica in tenant-a's
 // index can never leak into tenant-b's TENANT_HOT fallback — per-tenant
 // isolation is a hard constraint of the index regardless of strategy.
+//
+// Setup is stats-only ingest, so the prefix map is globally empty → the
+// cold-start carve-out keeps the response on NO_HINT. The no-leak property
+// the test guards (no tenant-a replica appears in tenant-b's Scores) is
+// preserved by the wantScores==0 assertion. The asymmetric UNKNOWN_TENANT
+// case (tenant-a populated with REAL prefixes, lookup for tenant-b) is
+// covered by TestLookupRouteUnknownTenantOnlyWhenIndexHasData in
+// diagnostics_test.go.
 func TestTenantHotIsolatedByTenant(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "warm-a", Model: "m", Tenant: "tenant-a", HashScheme: "vllm",
@@ -1057,6 +1099,9 @@ func TestTenantHotIsolatedByTenant(t *testing.T) {
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
 		t.Fatalf("tenant-b lookup leaked tenant-a's warm replica: %+v", res)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("response must carry no scores (no cross-tenant leak); got %+v", res.Scores)
 	}
 }
 
@@ -1083,6 +1128,12 @@ func TestLookupRouteEmptyHashSchemeFailsOpenAcrossStrategies(t *testing.T) {
 // TestTenantHotIsolatedByModel guards the analogous model isolation: a warm
 // replica for model A in tenant t doesn't surface for model B in tenant t.
 // Different models have disjoint cache state; mixing them would mis-hint.
+//
+// Stats-only ingest registers no prefix entries → prefix map globally empty
+// → cold-start carve-out keeps the response on NO_HINT. The no-leak
+// property is preserved by wantScores==0. The asymmetric UNKNOWN_MODEL case
+// (model-a populated with REAL prefixes, lookup for model-b) is covered by
+// TestLookupRouteClassifiesUnknownModel in diagnostics_test.go.
 func TestTenantHotIsolatedByModel(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "warm", Model: "model-a", Tenant: "t", HashScheme: "vllm",
@@ -1092,6 +1143,9 @@ func TestTenantHotIsolatedByModel(t *testing.T) {
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
 		t.Fatalf("model-b lookup leaked model-a's warm replica: %+v", res)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("response must carry no scores (no cross-model leak); got %+v", res.Scores)
 	}
 }
 

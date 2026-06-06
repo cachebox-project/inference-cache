@@ -19,6 +19,17 @@ const (
 	reasonNoHint      = "NO_HINT"
 	reasonTimeout     = "TIMEOUT"
 	reasonOK          = "OK"
+
+	// Diagnostic codes for LookupRoute contract-key mismatches. Emitted on
+	// the miss path when the index can tell the caller that one of
+	// (tenant_id, model_id, hash_scheme) does not match any data it holds —
+	// distinguishing a misconfigured gateway from a genuine novel prefix.
+	// Old clients degrade these to NO_HINT per the forward-compat rule, so
+	// callers that have not been updated continue to fail open. See
+	// docs/design/lookuproute-diagnostics.md.
+	reasonUnknownTenant     = "UNKNOWN_TENANT"
+	reasonUnknownModel      = "UNKNOWN_MODEL"
+	reasonUnknownHashScheme = "UNKNOWN_HASH_SCHEME"
 )
 
 // inferenceCacheService implements the InferenceCache contract
@@ -27,8 +38,12 @@ const (
 // RPCs (RenderTemplate, LookupPDRoute, streams) stay fail-open stubs until their
 // modules land. All lookups remain side-effect-free apart from emitting metrics
 // and fail open — an empty result with NO_HINT (no match / below the configured
-// minimumPrefixTokens) or with TIMEOUT (lookupTimeoutMs budget breach) so the
-// gateway routes as it normally would.
+// minimumPrefixTokens), with TIMEOUT (lookupTimeoutMs budget breach), or with
+// one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
+// when the lookup misses AND the index can identify which contract key did not
+// match anything held (see docs/design/lookuproute-diagnostics.md). Every empty-
+// result path fails open the same way: the gateway routes as it normally would
+// and the diagnostic codes are advisory.
 type inferenceCacheService struct {
 	icpb.UnimplementedInferenceCacheServer
 
@@ -76,10 +91,14 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 //     prefix hit, scored with the pressure- and SLO-aware formula),
 //     StrategyTenantHot (no prefix match but the tenant has recently warm
 //     replicas in the requested engine domain — a softer locality hint), or
-//     StrategyNone (fail-open default). The handler maps Strategy →
-//     reason_code (PREFIX_MATCH / TENANT_HOT / NO_HINT) via reasonForStrategy.
+//     a miss strategy — StrategyUnknownTenant / StrategyUnknownModel /
+//     StrategyUnknownHashScheme when the index can identify which contract
+//     key did not match anything held, otherwise StrategyNone (the
+//     genuine-novel-prefix fail-open default). The handler maps Strategy →
+//     reason_code (PREFIX_MATCH / TENANT_HOT / UNKNOWN_TENANT /
+//     UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME / NO_HINT) via reasonForStrategy.
 //
-// A no-match still returns NO_HINT (fail open) — never an error on the hot path.
+// Every empty-result code is fail-open — never an error on the hot path.
 func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
 	tenant := req.GetTenantId()
 	model := req.GetModelId()
@@ -184,14 +203,16 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // the matching metric observation. Shared by the synchronous fast-path and
 // the bounded path so the proto shape stays identical across both. The
 // reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
-// TENANT_HOT / NO_HINT).
+// TENANT_HOT / NO_HINT / UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME)
+// via reasonForStrategy.
 func (s *inferenceCacheService) buildLookupResponse(model string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
 	// Credit the LFU access counters for the entries this response actually
 	// delivers. buildLookupResponse runs on every DELIVERED response (including
-	// NO_HINT) but never on the TIMEOUT/early-deadline branches, which return via
-	// timeoutResponse — so a lookup the handler discarded for latency never bumps
-	// a counter. CreditHits is a no-op unless result carries prefix-match hits
-	// (empty for LRU namespaces and for NO_HINT/TENANT_HOT results).
+	// NO_HINT and the UNKNOWN_* diagnostic responses) but never on the
+	// TIMEOUT/early-deadline branches, which return via timeoutResponse — so a
+	// lookup the handler discarded for latency never bumps a counter. CreditHits
+	// is a no-op unless result carries prefix-match hits (empty for LRU
+	// namespaces and for NO_HINT/TENANT_HOT/UNKNOWN_* results).
 	result.CreditHits()
 	resp := &icpb.LookupRouteResponse{ReasonCode: reasonForStrategy(result.Strategy)}
 	if len(result.Scores) > 0 {
@@ -242,13 +263,20 @@ func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
 // reason_code vocabulary. StrategyNone collapses to NO_HINT — the fail-open
 // default; an unknown strategy is treated the same so a future Strategy
 // addition (e.g. block-level matching) won't surface as a junk reason code
-// before its mapping ships.
+// before its mapping ships. The diagnostic strategies (UNKNOWN_*) surface as
+// the matching contract codes — see docs/design/lookuproute-diagnostics.md.
 func reasonForStrategy(s index.Strategy) string {
 	switch s {
 	case index.StrategyPrefixMatch:
 		return reasonPrefixMatch
 	case index.StrategyTenantHot:
 		return reasonTenantHot
+	case index.StrategyUnknownTenant:
+		return reasonUnknownTenant
+	case index.StrategyUnknownModel:
+		return reasonUnknownModel
+	case index.StrategyUnknownHashScheme:
+		return reasonUnknownHashScheme
 	default:
 		return reasonNoHint
 	}
