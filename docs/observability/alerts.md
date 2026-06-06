@@ -137,11 +137,22 @@ kubectl exec <engine-pod> -- cat /etc/vllm/kv-events.yaml 2>/dev/null || \
   kubectl get pod <engine-pod> -o jsonpath='{.spec.containers[?(@.name=="engine")].args}' \
     | tr ',' '\n' | grep -i kv-events
 
-# 4. Confirm the subscriber sidecar is actually receiving and forwarding
-#    events. Its log emits one line per ReportCacheState round-trip — if
-#    the engine publisher is healthy and the gRPC dial works, those
-#    lines should be steady.
-kubectl logs <engine-pod> -c kvevent-subscriber --tail=20 | grep -iE 'reported|sent|failed'
+# 4. Confirm the subscriber sidecar is healthy. The subscriber logs
+#    `subscribed to engine KV events ...` once on startup and is then
+#    silent on the success path; failures (ZMQ recv error, gRPC stream
+#    open/send/close error) are logged at WARN. So the working signal
+#    is "startup log line present, no recent WARN":
+kubectl logs <engine-pod> -c kvevent-subscriber --tail=200 \
+  | grep -E 'subscribed to engine KV events|level=WARN|level=ERROR'
+#    If you see only the "subscribed" line and no WARN/ERROR, the
+#    subscriber half is healthy. To prove forwarding is actually
+#    landing at the server, check that the server's index has at least
+#    one entry attributed to this pod's replica:
+kubectl -n inference-cache-system port-forward svc/inference-cache-server 8081:8081 &
+TOKEN=$(kubectl -n inference-cache-system create token \
+  inference-cache-controller-manager --audience=inferencecache.io/controller)
+curl -s localhost:8081/snapshot -H "Authorization: Bearer $TOKEN" \
+  | jq '.replicas[] | select(.id | startswith("<engine-pod>"))'
 
 # 5. Confirm the controller is wiring the sidecar image.
 kubectl -n inference-cache-system get deploy/inference-cache-controller-manager \
