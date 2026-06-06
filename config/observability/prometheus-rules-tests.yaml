@@ -12,6 +12,11 @@
 # emits — promtool 3.x checks them strictly, so changing an annotation in
 # alerting-rules.yaml must be mirrored here too. That coupling is
 # intentional: the alert text IS the contract a runbook reader relies on.
+#
+# Synthetic series include the `namespace` label because the production
+# rules group by `namespace` to scope per install — Prometheus injects this
+# label from the ServiceMonitor / Service. A test that does not set
+# `namespace` would silently slip past the scope check.
 
 rule_files:
   - alerting-rules.yaml
@@ -24,15 +29,16 @@ tests:
   #
   # Gated on observed LookupRoute traffic so idle installs (operator
   # bundle applied but no engines yet / no gateway) do not page critical.
+  # Per-namespace so one install's outage does not page another's.
   # --------------------------------------------------------------------------
   - interval: 30s
     name: IndexEmpty fires when server up, no index entries, and traffic is flowing
     input_series:
-      - series: 'inferencecache_server_up'
+      - series: 'inferencecache_server_up{namespace="inference-cache-system"}'
         values: '1+0x40'
       # No inferencecache_index_entries series — index is empty.
       # Lookup traffic exists, all NO_HINT (consistent with empty index).
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
         values: '0+300x40'
     alert_rule_test:
       - eval_time: 15m
@@ -41,6 +47,7 @@ tests:
           - exp_labels:
               severity: critical
               component: inference-cache
+              namespace: inference-cache-system
             exp_annotations:
               summary: "Cache index empty while server is up — subscriber → server pipeline broken."
               runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
@@ -48,11 +55,11 @@ tests:
   - interval: 30s
     name: IndexEmpty does not fire when index has entries
     input_series:
-      - series: 'inferencecache_server_up'
+      - series: 'inferencecache_server_up{namespace="inference-cache-system"}'
         values: '1+0x40'
-      - series: 'inferencecache_index_entries{model="llama-3.1-8b"}'
+      - series: 'inferencecache_index_entries{namespace="inference-cache-system",model="llama-3.1-8b"}'
         values: '1000+0x40'
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
         values: '0+300x40'
     alert_rule_test:
       - eval_time: 15m
@@ -62,7 +69,7 @@ tests:
   - interval: 30s
     name: IndexEmpty does not fire when server is down
     input_series:
-      - series: 'inferencecache_server_up'
+      - series: 'inferencecache_server_up{namespace="inference-cache-system"}'
         values: '0+0x40'
     alert_rule_test:
       - eval_time: 15m
@@ -76,13 +83,42 @@ tests:
     # opt-in deployment.
     name: IndexEmpty does not fire on an idle install with no LookupRoute traffic
     input_series:
-      - series: 'inferencecache_server_up'
+      - series: 'inferencecache_server_up{namespace="inference-cache-system"}'
         values: '1+0x40'
       # No index_entries series, no lookup_route_calls_total series.
     alert_rule_test:
       - eval_time: 15m
         alertname: IndexEmpty
         exp_alerts: []
+
+  - interval: 30s
+    # Two installs in one Prometheus: A is broken (no entries, has
+    # traffic), B is healthy (has entries, has traffic). Only A should
+    # alert; B must not be masked or falsely paged.
+    name: IndexEmpty fires only for the broken install when two share a Prometheus
+    input_series:
+      - series: 'inferencecache_server_up{namespace="install-a"}'
+        values: '1+0x40'
+      - series: 'inferencecache_server_up{namespace="install-b"}'
+        values: '1+0x40'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="install-a",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+300x40'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="install-b",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+300x40'
+      - series: 'inferencecache_index_entries{namespace="install-b",model="llama-3.1-8b"}'
+        values: '1000+0x40'
+      # install-a has no index_entries series.
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: IndexEmpty
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: inference-cache
+              namespace: install-a
+            exp_annotations:
+              summary: "Cache index empty while server is up — subscriber → server pipeline broken."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
 
   # --------------------------------------------------------------------------
   # LMCacheT2NoHits (for: 5m, warning)
@@ -95,9 +131,9 @@ tests:
   - interval: 30s
     name: LMCacheT2NoHits fires when queried tokens rise while hit tokens stay at zero
     input_series:
-      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_queries_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+60000x40'
-      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_hits_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+0x40'
     alert_rule_test:
       - eval_time: 15m
@@ -106,6 +142,7 @@ tests:
           - exp_labels:
               severity: warning
               component: inference-cache
+              namespace: inference-cache-system
               pod: vllm-0
             exp_annotations:
               summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
@@ -114,9 +151,9 @@ tests:
   - interval: 30s
     name: LMCacheT2NoHits does not fire when offload is also serving hit tokens
     input_series:
-      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_queries_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+60000x40'
-      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_hits_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+30000x40'
     alert_rule_test:
       - eval_time: 15m
@@ -126,9 +163,9 @@ tests:
   - interval: 30s
     name: LMCacheT2NoHits does not fire on a near-idle pod (queried tokens below 1000/sec)
     input_series:
-      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_queries_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+15000x40'  # 500 tokens/sec — below the gate
-      - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_hits_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+0x40'
     alert_rule_test:
       - eval_time: 15m
@@ -145,7 +182,7 @@ tests:
     # absent altogether.
     name: LMCacheT2NoHits fires when queried tokens rise and the hits counter series is absent
     input_series:
-      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+      - series: 'vllm:external_prefix_cache_queries_total{namespace="inference-cache-system",pod="vllm-0"}'
         values: '0+60000x40'
       # No `vllm:external_prefix_cache_hits_total` series for vllm-0 at all.
     alert_rule_test:
@@ -155,6 +192,7 @@ tests:
           - exp_labels:
               severity: warning
               component: inference-cache
+              namespace: inference-cache-system
               pod: vllm-0
             exp_annotations:
               summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
@@ -169,9 +207,9 @@ tests:
   - interval: 30s
     name: LookupRouteDegenerate fires when >90% of LookupRoute calls return NO_HINT
     input_series:
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
         values: '0+300x40'
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
         values: '0+10x40'
     alert_rule_test:
       - eval_time: 15m
@@ -180,6 +218,7 @@ tests:
           - exp_labels:
               severity: warning
               component: inference-cache
+              namespace: inference-cache-system
               model: llama-3.1-8b
             exp_annotations:
               summary: "LookupRoute returning NO_HINT for >90% of calls on model llama-3.1-8b — routing falling back to round-robin."
@@ -188,9 +227,9 @@ tests:
   - interval: 30s
     name: LookupRouteDegenerate does not fire on a healthy 50-50 split
     input_series:
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
         values: '0+150x40'
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
         values: '0+150x40'
     alert_rule_test:
       - eval_time: 15m
@@ -200,7 +239,7 @@ tests:
   - interval: 30s
     name: LookupRouteDegenerate does not fire on an idle model (rate below floor)
     input_series:
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
         values: '0+1x40'    # 0.033 calls/sec — well below the 0.1/sec floor
     alert_rule_test:
       - eval_time: 15m
@@ -216,9 +255,9 @@ tests:
   - interval: 30s
     name: LookupRouteHighTimeout fires when >5% of LookupRoute calls TIMEOUT
     input_series:
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
         values: '0+300x40'
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
         values: '0+1500x40'
     alert_rule_test:
       - eval_time: 15m
@@ -227,6 +266,7 @@ tests:
           - exp_labels:
               severity: warning
               component: inference-cache
+              namespace: inference-cache-system
               model: llama-3.1-8b
             exp_annotations:
               summary: "LookupRoute returning TIMEOUT for >5% of calls on model llama-3.1-8b — server overload or tight deadline."
@@ -235,9 +275,9 @@ tests:
   - interval: 30s
     name: LookupRouteHighTimeout does not fire on healthy traffic (TIMEOUT rare)
     input_series:
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
         values: '0+10x40'     # ~0.33/sec
-      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
         values: '0+1500x40'   # 50/sec → TIMEOUT ratio ~0.7%
     alert_rule_test:
       - eval_time: 15m
@@ -253,7 +293,7 @@ tests:
   - interval: 30s
     name: IndexEvictionsSpike fires when cap-driven evictions sustain above 10/sec
     input_series:
-      - series: 'inferencecache_index_evictions_total{algorithm="lru",reason="cap"}'
+      - series: 'inferencecache_index_evictions_total{namespace="inference-cache-system",algorithm="lru",reason="cap"}'
         values: '0+450x50'
     alert_rule_test:
       - eval_time: 22m
@@ -262,6 +302,7 @@ tests:
           - exp_labels:
               severity: info
               component: inference-cache
+              namespace: inference-cache-system
               algorithm: lru
             exp_annotations:
               summary: "Index evicting >10/sec at MaxEntries cap (algorithm=lru) — consider raising the cap."
@@ -270,7 +311,7 @@ tests:
   - interval: 30s
     name: IndexEvictionsSpike does not fire on TTL-driven evictions alone
     input_series:
-      - series: 'inferencecache_index_evictions_total{algorithm="lru",reason="ttl"}'
+      - series: 'inferencecache_index_evictions_total{namespace="inference-cache-system",algorithm="lru",reason="ttl"}'
         values: '0+600x50'    # 20/sec TTL — normal lifecycle, filtered out by reason="cap"
     alert_rule_test:
       - eval_time: 22m

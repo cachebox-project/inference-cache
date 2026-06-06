@@ -36,11 +36,11 @@ spec:
       rules:
         - alert: IndexEmpty
           expr: |
-            (inferencecache_server_up == 1)
-            and on()
-            ((sum(inferencecache_index_entries) or vector(0)) == 0)
-            and on()
-            (sum(rate(inferencecache_lookup_route_calls_total[10m])) > 0)
+            (max by (namespace) (inferencecache_server_up) == 1)
+            and on (namespace)
+            (sum by (namespace) (rate(inferencecache_lookup_route_calls_total[10m])) > 0)
+            unless on (namespace)
+            (sum by (namespace) (inferencecache_index_entries) > 0)
           for: 2m
           labels:
             severity: critical
@@ -51,9 +51,9 @@ spec:
 
         - alert: LMCacheT2NoHits
           expr: |
-            (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 1000)
+            (sum by (namespace, pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 1000)
             unless
-            (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
+            (sum by (namespace, pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
           for: 5m
           labels:
             severity: warning
@@ -68,13 +68,13 @@ spec:
         - alert: LookupRouteDegenerate
           expr: |
             (
-              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m])) > 0.1
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 0.1
             )
             and
             (
-              sum by (model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[10m]))
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[10m]))
               /
-              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m]))
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
             ) > 0.9
           for: 5m
           labels:
@@ -87,13 +87,13 @@ spec:
         - alert: LookupRouteHighTimeout
           expr: |
             (
-              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m])) > 1
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 1
             )
             and
             (
-              sum by (model) (rate(inferencecache_lookup_route_calls_total{reason_code="TIMEOUT"}[10m]))
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="TIMEOUT"}[10m]))
               /
-              sum by (model) (rate(inferencecache_lookup_route_calls_total[10m]))
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
             ) > 0.05
           for: 5m
           labels:
@@ -108,7 +108,7 @@ spec:
       rules:
         - alert: IndexEvictionsSpike
           expr: |
-            sum by (algorithm) (
+            sum by (namespace, algorithm) (
               rate(inferencecache_index_evictions_total{reason="cap"}[10m])
             ) > 10
           for: 10m

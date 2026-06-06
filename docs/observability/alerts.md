@@ -61,6 +61,16 @@ Both files contain the same five Stage 1 alerts plus commented-out
 placeholders for three more that depend on metrics not yet exposed (see
 [Deferred alerts](#deferred-alerts) below).
 
+> **One alert depends on a separate scrape this bundle does NOT ship.**
+> [`LMCacheT2NoHits`](#lmcachet2nohits) reads `vllm:external_prefix_cache_*`,
+> which vLLM exposes on its own `/metrics`. The included `ServiceMonitor`
+> covers only `inference-cache-server`. To make `LMCacheT2NoHits` light
+> up, your install must also scrape engine pods — typically by adding a
+> separate `ServiceMonitor` / `PodMonitor` for your vLLM Deployment, or
+> by enabling Prometheus's `kubernetes_sd_configs: pod` scrape against
+> labels you control. The other four alerts work as-is once this bundle
+> is applied.
+
 ---
 
 ## Stage 1 alerts
@@ -118,10 +128,22 @@ curl -s localhost:8080/metrics | grep -E 'inferencecache_server_up|inferencecach
 kubectl get pod -l <engine-selector-label> -o jsonpath='{.items[0].spec.containers[*].name}'
 kubectl logs <engine-pod> -c kvevent-subscriber --tail=50
 
-# 3. Confirm the engine is emitting KV events.
-kubectl exec <engine-pod> -- curl -s localhost:8000/metrics | grep -E 'prefix_cache_(queries|hits)'
+# 3. Confirm the engine's KV-event publisher is ON. Prefix-cache metrics
+#    being present is NOT proof of this — vLLM emits prefix_cache_*
+#    independently of the KV-events publisher. The signal we actually
+#    want is the publisher's ZMQ socket / config:
+kubectl exec <engine-pod> -- ps -ef | grep -E 'kv-events-config|vllm'
+kubectl exec <engine-pod> -- cat /etc/vllm/kv-events.yaml 2>/dev/null || \
+  kubectl get pod <engine-pod> -o jsonpath='{.spec.containers[?(@.name=="engine")].args}' \
+    | tr ',' '\n' | grep -i kv-events
 
-# 4. Confirm the controller is wiring the sidecar image.
+# 4. Confirm the subscriber sidecar is actually receiving and forwarding
+#    events. Its log emits one line per ReportCacheState round-trip — if
+#    the engine publisher is healthy and the gRPC dial works, those
+#    lines should be steady.
+kubectl logs <engine-pod> -c kvevent-subscriber --tail=20 | grep -iE 'reported|sent|failed'
+
+# 5. Confirm the controller is wiring the sidecar image.
 kubectl -n inference-cache-system get deploy/inference-cache-controller-manager \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].args}'
 ```
@@ -463,8 +485,11 @@ one usually clears once the root cause does.
 
 ## Related references
 
-- [Prometheus metrics inventory](../reference/metrics.md) — the full
-  surface this bundle reads from
+- [Prometheus metrics inventory](../reference/metrics.md) — the
+  `inferencecache_*` surface (what THIS operator emits). The bundle
+  also reads vLLM-emitted `vllm:external_prefix_cache_*` for the
+  `LMCacheT2NoHits` alert; those metrics are documented at
+  [`docs.vllm.ai/.../usage/metrics/`](https://docs.vllm.ai/en/latest/usage/metrics/).
 - [Reason-code vocabulary](../reference/reason-codes.md) — meaning of
   each `reason_code` label on `inferencecache_lookup_route_calls_total`
 - [Operator install](../../README.md) — where the alert bundle is

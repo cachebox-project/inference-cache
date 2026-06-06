@@ -16,11 +16,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
-
-	"encoding/json"
 
 	"gopkg.in/yaml.v3"
 )
@@ -66,7 +66,7 @@ func firstDiffLine(a, b []string) int {
 // printDiff emits a minimal unified-style diff: ±N lines of context around
 // the first divergence on each side, prefixed `-` (flat) / `+` (CR). Bounded
 // so a fully-mangled file does not flood CI logs.
-func printDiff(w *os.File, flatLines, crLines []string, contextLines, maxLines int) {
+func printDiff(w io.Writer, flatLines, crLines []string, contextLines, maxLines int) {
 	diffStart := firstDiffLine(flatLines, crLines)
 	if diffStart < 0 {
 		return
