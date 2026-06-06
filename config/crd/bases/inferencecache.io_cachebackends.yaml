@@ -573,10 +573,14 @@ spec:
                   Admission narrows the surface relative to the upstream
                   ResourceRequirements shape: a non-empty `resources.claims` slice
                   is rejected (the runtime adapter does not yet plumb pod-level
-                  `spec.resourceClaims`), strictly-negative `requests` / `limits`
+                  `spec.resourceClaims`); strictly-negative `requests` / `limits`
                   quantities are rejected (the CRD schema admits a leading "-" but
-                  the kubelet would later reject the pod), and a `limits[X]` strictly
-                  less than `requests[X]` for the same resource X is rejected. See
+                  the kubelet would later reject the pod); `requests` / `limits`
+                  keys that are not valid container resource names are rejected
+                  (standard names cpu/memory/ephemeral-storage and hugepages-*
+                  admit; any other name must be vendor-prefixed like
+                  "nvidia.com/gpu"); and a `limits[X]` strictly less than
+                  `requests[X]` for the same resource X is rejected. See
                   docs/design/cachebackend-api.md#resources for the full validator
                   table.
 
