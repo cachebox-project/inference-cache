@@ -96,6 +96,14 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 		Spec: appsv1.DeploymentSpec{
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: selectorLabels(f.cacheName)},
+				// containerRunSum scopes its restart-count sum to
+				// container names from THIS template, so the test
+				// must enumerate the cache-server's container name
+				// (lmcache-server) — sidecars added to the pod by
+				// other admission webhooks would not be included.
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache:test"}},
+				},
 			},
 		},
 	}
@@ -728,6 +736,53 @@ func TestReconcileServerInstance_InPlaceContainerRestartCascades(t *testing.T) {
 	}
 }
 
+// TestReconcileServerInstance_SidecarRestartIgnored asserts that
+// containerRunSum is scoped to the cache-server's own containers (per
+// the owned Deployment's pod template), so a restart of an externally-
+// injected sidecar (service mesh, Datadog, etc. — present in the
+// pod's containerStatuses but absent from the Deployment template)
+// does NOT advance observedServerInstance and does NOT cascade. A
+// cascade for every Istio sidecar crash-loop would be a serious
+// operator-facing regression.
+func TestReconcileServerInstance_SidecarRestartIgnored(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline observation.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+
+	// Inject a sidecar restart event into the pod's containerStatuses.
+	// The sidecar is NOT in the owned Deployment's template, so the
+	// reconciler must ignore its restart count.
+	live := &corev1.Pod{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverPod.Name, Namespace: f.cacheNS}, live); err != nil {
+		t.Fatalf("get serverPod: %v", err)
+	}
+	live.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "lmcache-server", Ready: true, RestartCount: 0},
+		{Name: "istio-proxy", Ready: true, RestartCount: 7},
+	}
+	if err := f.r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("inject sidecar restarts: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-sidecar-restart wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("ObservedServerInstance changed despite only sidecar restart: %q → %q", baseline, got)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("sidecar restart triggered a cascade; only the cache-server's own containers should advance the identifier")
+	}
+}
+
 // TestReconcileServerInstance_ForeignDeploymentSameNameIgnored asserts
 // that when the backend's CacheBackend.UID does not control the live
 // Deployment named after it (a foreign Deployment recreated under the
@@ -825,7 +880,10 @@ func TestReconcileServerInstance_AnnotateIdempotent(t *testing.T) {
 
 func TestPodOwningDeploymentName_ResolvesViaReplicaSet(t *testing.T) {
 	f := newCascadeRestartFixture(t)
-	got, ok := f.r.podOwningDeploymentName(context.Background(), f.r.Client, f.enginePod)
+	got, ok, err := f.r.podOwningDeploymentName(context.Background(), f.r.Client, f.enginePod)
+	if err != nil {
+		t.Fatalf("podOwningDeploymentName err = %v, want nil", err)
+	}
 	if !ok {
 		t.Fatalf("podOwningDeploymentName ok = false, want true")
 	}
@@ -842,8 +900,8 @@ func TestPodOwningDeploymentName_NoOwnerReturnsFalse(t *testing.T) {
 			Namespace: f.engineNS,
 		},
 	}
-	if _, ok := f.r.podOwningDeploymentName(context.Background(), f.r.Client, bare); ok {
-		t.Fatalf("podOwningDeploymentName for an unowned pod returned ok=true; want false")
+	if _, ok, err := f.r.podOwningDeploymentName(context.Background(), f.r.Client, bare); err != nil || ok {
+		t.Fatalf("podOwningDeploymentName for an unowned pod returned (ok=%v, err=%v); want (false, nil)", ok, err)
 	}
 }
 

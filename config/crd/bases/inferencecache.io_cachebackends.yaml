@@ -2230,11 +2230,18 @@ spec:
                   baseline; no engines exist yet) and a strict superset (the
                   rolling-update midpoint where old + new pods are both Ready
                   briefly — the cascade fires on the next transition that drops
-                  the old pod). Inert for External / unsupported-runtime backends
-                  and cleared on transitions to those modes. The cascade is an
-                  operator-side recovery for the upstream EPIPE bug and can be
-                  retired once upstream LMCache grows EPIPE-detect-and-reconnect
-                  in the LMServerConnector write path.
+                  the old pod). Stale-while-unavailable: when no Ready cache-
+                  server pod exists (Deployment scaled to 0, mid-rollout, image
+                  pull stuck), this field intentionally retains the prior value
+                  — clearing it would turn the eventual recovery's
+                  "" → new-uid:0 transition into a first-observation baseline
+                  and silently skip the cascade, which is exactly what this
+                  controller exists to prevent. Inert for External /
+                  unsupported-runtime backends and cleared on transitions to
+                  those modes. The cascade is an operator-side recovery for the
+                  upstream EPIPE bug and can be retired once upstream LMCache
+                  grows EPIPE-detect-and-reconnect in the LMServerConnector
+                  write path.
                 type: string
             type: object
         type: object

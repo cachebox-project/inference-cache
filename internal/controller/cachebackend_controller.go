@@ -615,7 +615,12 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	}
 
 	if applyErr != nil {
-		return ctrl.Result{}, applyErr
+		// Honor the cascade's rate-limit retry boundary even on the
+		// apply-error path: returning a bare ctrl.Result alongside an
+		// error leaves retry timing to controller-runtime's
+		// exponential backoff, which can overshoot the rate-limit
+		// window we want the next reconcile to land at.
+		return ctrl.Result{RequeueAfter: requeueAfter}, applyErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",

@@ -1122,8 +1122,14 @@ if [ -z "$cache_pod" ]; then
   fail "no cache-server pod labeled app.kubernetes.io/instance=qwen-demo-cache found in $SAMPLE_NS"
 fi
 log "deleting cache-server pod $cache_pod to simulate restart"
-kubectl -n "$SAMPLE_NS" delete pod "$cache_pod" \
-  --force --grace-period=0 >/dev/null 2>&1 || true
+# Don't mask the delete with `|| true` — a failed trigger here would
+# silently look like the cascade isn't firing, which would be
+# diagnosed as a controller bug instead of a smoke-script failure.
+if ! kubectl -n "$SAMPLE_NS" delete pod "$cache_pod" \
+     --force --grace-period=0 >/dev/null 2>&1; then
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "failed to delete cache-server pod $cache_pod to simulate restart"
+fi
 
 # Wait for the controller to observe the new pod and update the latch.
 log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for status.observedServerInstance to flip to the replacement's server-instance identifier"

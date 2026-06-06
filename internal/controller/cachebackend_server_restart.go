@@ -96,16 +96,38 @@ func resetBackendServerRestartsTotalForTest() {
 	backendServerRestartsTotal.Reset()
 }
 
-// serverInstanceCascade tracks per-backend rate-limiting state for the
-// server-restart cascade. Used in-process by CacheBackendReconciler; a
-// process restart clears it (intentional — see DefaultMinServerRestartCascadeInterval).
+// cascadeKey keys the per-backend rate-limit map. Includes the
+// CacheBackend's metadata.uid alongside namespace/name so a
+// delete-recreate-with-same-name does not inherit the deleted
+// object's throttle window — the new backend gets a fresh first
+// cascade. Without the UID, an operator who deletes and re-creates
+// a CacheBackend while a cascade was still inside the rate-limit
+// window would silently delay the new backend's first real
+// observation by up to MinServerRestartCascadeInterval.
+type cascadeKey struct {
+	namespace string
+	name      string
+	uid       string
+}
+
+// serverInstanceCascade tracks per-backend rate-limiting state for
+// the server-restart cascade. Used in-process by
+// CacheBackendReconciler; a process restart clears it (intentional —
+// see DefaultMinServerRestartCascadeInterval).
+//
+// The map is not actively pruned: entries are bounded by the number
+// of distinct CacheBackends ever cascaded by the running process,
+// each entry costs ~64 bytes, and a typical cluster has at most a
+// few hundred CacheBackends over its lifetime. Operator-driven
+// churn in the thousands-per-process would warrant adding a
+// TTL-based prune; not worth the complexity for the expected scale.
 type serverInstanceCascade struct {
 	mu     sync.Mutex
-	lastAt map[types.NamespacedName]time.Time
+	lastAt map[cascadeKey]time.Time
 }
 
 func newServerInstanceCascade() *serverInstanceCascade {
-	return &serverInstanceCascade{lastAt: map[types.NamespacedName]time.Time{}}
+	return &serverInstanceCascade{lastAt: map[cascadeKey]time.Time{}}
 }
 
 // canCascade reports whether enough time has elapsed since the previous
@@ -114,7 +136,7 @@ func newServerInstanceCascade() *serverInstanceCascade {
 // next cascade is allowed so the caller can RequeueAfter exactly that
 // long. The check + stamp are done under one lock so concurrent
 // reconciles of the same backend do not double-cascade.
-func (s *serverInstanceCascade) canCascade(key types.NamespacedName, now time.Time, window time.Duration) (bool, time.Duration) {
+func (s *serverInstanceCascade) canCascade(key cascadeKey, now time.Time, window time.Duration) (bool, time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	last, ok := s.lastAt[key]
@@ -158,6 +180,21 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 //   - prior set strictly grows (a rolling update's maxSurge window:
 //     the old pod is still Ready while the new one comes up; the
 //     subsequent transition that drops the old pod IS a cascade)
+//
+// When no Ready cache-server pod exists at all (currentID = ""), the
+// reconciler leaves status.observedServerInstance at its prior value
+// rather than clearing it. The latch is intentionally stale-while-
+// unavailable: a transient cache-server outage (Deployment scaled to
+// 0, all pods Terminating mid-rollout, image pull stuck) must NOT
+// look like "everything is fine, no instance" to the next reconcile,
+// because the eventual recovery will bring back a fresh-UID pod set
+// and that transition IS a real cache-server replacement that
+// requires cascading. Clearing the latch in the no-Ready window
+// would lose the prior-set memory and turn the recovery's
+// "" → "new-uid:0" transition into a first-observation baseline
+// (no cascade) — exactly the scenario this whole controller exists
+// to prevent. The latch returns to a current-view value as soon as
+// a Ready pod is observed.
 //
 // "Real" transitions that DO cascade:
 //   - any prior pod is no longer in the current set (pod replaced)
@@ -219,10 +256,16 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 
 	// Rate-limit: a cascade per backend is allowed at most once per
 	// minServerRestartCascadeInterval. While the window is open we
-	// neither cascade nor advance status.observedServerInstance — leaving
-	// the prior value pinned guarantees the next eligible reconcile still
-	// sees the change and tries again.
-	key := types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}
+	// neither cascade nor advance status.observedServerInstance —
+	// leaving the prior value pinned guarantees the next eligible
+	// reconcile still sees the change and tries again. The key
+	// includes the CacheBackend's UID so a delete-recreate under the
+	// same name gets a fresh window.
+	key := cascadeKey{
+		namespace: backend.Namespace,
+		name:      backend.Name,
+		uid:       string(backend.UID),
+	}
 	if r.serverInstanceCascade == nil {
 		// Defensive lazy-init; the manager wiring should set this in
 		// SetupWithManager but unit tests construct the reconciler
@@ -381,6 +424,19 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	); err != nil {
 		return "", fmt.Errorf("list cache-server pods: %w", err)
 	}
+	// Build the set of container names the owned Deployment renders.
+	// containerRunSum sums restart counts ONLY for these — sidecars
+	// injected by other admission webhooks (Istio's istio-proxy,
+	// linkerd's linkerd-proxy, Datadog agents, etc.) are added to the
+	// pod's containerStatuses but are absent from the Deployment
+	// template, so including them would cascade-restart every engine
+	// any time a service-mesh sidecar crash-looped — completely
+	// unrelated to the LMCache server's actual state.
+	cacheServerContainers := make(map[string]struct{}, len(ownedDep.Spec.Template.Spec.Containers))
+	for _, c := range ownedDep.Spec.Template.Spec.Containers {
+		cacheServerContainers[c.Name] = struct{}{}
+	}
+
 	// Collect every Ready, attributable pod's identifier. A pod that
 	// is mid-rollout (Pending / Terminating) does not represent a
 	// serving instance — including it would let a rollout's transient
@@ -390,14 +446,14 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	// above for why the ownership check is required.
 	//
 	// The per-pod identifier is <podUID>:<containerRunSum> where
-	// containerRunSum is the sum of every container's restart count.
-	// pod.UID alone is invariant across in-place container restarts
-	// (kubelet restarting a crashed container reuses the pod object),
-	// but the LMCache server process inside that pod is fresh and
-	// every engine still holds a stale socket. Including the restart-
-	// count sum makes that case observable: an OOM-killed cache-server
-	// container respawned in the same pod increments the count and
-	// advances the identifier, so the cascade fires.
+	// containerRunSum is the sum of restart counts across the
+	// cache-server's own containers (filtered by the owned
+	// Deployment's template names). pod.UID alone is invariant across
+	// in-place container restarts (kubelet restarting a crashed
+	// container reuses the pod object), but the LMCache server
+	// process inside that pod is fresh and every engine still holds
+	// a stale socket. Including the restart-count sum makes that
+	// case observable.
 	type readyPod struct {
 		name string
 		id   string
@@ -411,12 +467,16 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		if !podIsReady(p) {
 			continue
 		}
-		if !r.podOwnedByDeployment(ctx, reader, p, &ownedDep) {
+		owned, err := r.podOwnedByDeployment(ctx, reader, p, &ownedDep)
+		if err != nil {
+			return "", err
+		}
+		if !owned {
 			continue
 		}
 		ready = append(ready, readyPod{
 			name: p.Name,
-			id:   fmt.Sprintf("%s:%d", p.UID, containerRunSum(p)),
+			id:   fmt.Sprintf("%s:%d", p.UID, containerRunSum(p, cacheServerContainers)),
 		})
 	}
 	if len(ready) == 0 {
@@ -430,45 +490,59 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	return strings.Join(ids, ","), nil
 }
 
-// containerRunSum returns the sum of restart counts across every
-// container reported in pod.status.containerStatuses. Used to detect
-// in-place container restarts (kubelet respawning a crashed container
-// reuses the pod UID but increments the per-container restartCount).
-// init / ephemeral containers are intentionally excluded — the
-// cache-server is a regular workload container and init-container
-// restarts don't affect the LMCache socket.
-func containerRunSum(pod *corev1.Pod) int32 {
+// containerRunSum returns the sum of restart counts across the cache-
+// server's own containers, scoped to the set of container names from
+// the owned Deployment's pod template. Used to detect in-place
+// restarts of the cache-server container (kubelet respawning a crashed
+// container reuses the pod UID but increments restartCount). Sidecars
+// outside the owned set are excluded — see currentServerInstanceUID's
+// godoc for why. init / ephemeral containers are also excluded
+// (RestartCount is on containerStatuses, not init/ephemeral surfaces).
+func containerRunSum(pod *corev1.Pod, cacheServerContainers map[string]struct{}) int32 {
 	var sum int32
 	for i := range pod.Status.ContainerStatuses {
-		sum += pod.Status.ContainerStatuses[i].RestartCount
+		cs := &pod.Status.ContainerStatuses[i]
+		if _, ok := cacheServerContainers[cs.Name]; !ok {
+			continue
+		}
+		sum += cs.RestartCount
 	}
 	return sum
 }
 
 // podOwnedByDeployment reports whether pod is transitively controller-
-// owned (pod → ReplicaSet → Deployment) by the given Deployment, matched
-// on both name AND UID at every link. The UID check is what protects
-// against a stale ownerRef name resolving to a different live object
-// (a name-only check would be fooled by a Deployment recreated under
-// the same name). apiVersion is checked at the (kind, apiGroup) level
-// to tolerate `apps/v1` written as `apps/v1` vs the rare bare `v1`.
-func (r *CacheBackendReconciler) podOwnedByDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, dep *appsv1.Deployment) bool {
+// owned (pod → ReplicaSet → Deployment) by the given Deployment,
+// matched on both name AND UID at every link. The (owned, err) split
+// distinguishes "definitively not owned" (owned=false, err=nil — bare
+// pod / non-Deployment / different Deployment) from "couldn't decide"
+// (err != nil — transient apiserver/RBAC issue). Callers MUST
+// propagate the error so currentServerInstanceUID does not advance
+// the latch over an incomplete picture; collapsing a transient
+// ReplicaSet Get failure to "not owned" would shrink the identifier
+// and look like a pod replacement, triggering a false cascade.
+//
+// A NotFound on the ReplicaSet is treated as "not owned" (the chain
+// has been GCd) — the pod cannot be authoritatively attributed.
+func (r *CacheBackendReconciler) podOwnedByDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, dep *appsv1.Deployment) (bool, error) {
 	rsRef := metav1.GetControllerOf(pod)
 	if rsRef == nil || rsRef.Kind != "ReplicaSet" || !ownerRefIsAppsV1(rsRef) {
-		return false
+		return false, nil
 	}
 	var rs appsv1.ReplicaSet
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: rsRef.Name}, &rs); err != nil {
-		return false
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get owning ReplicaSet %s/%s: %w", pod.Namespace, rsRef.Name, err)
 	}
 	if rs.UID != rsRef.UID {
-		return false
+		return false, nil
 	}
 	depRef := metav1.GetControllerOf(&rs)
 	if depRef == nil || depRef.Kind != "Deployment" || !ownerRefIsAppsV1(depRef) {
-		return false
+		return false, nil
 	}
-	return depRef.Name == dep.Name && depRef.UID == dep.UID
+	return depRef.Name == dep.Name && depRef.UID == dep.UID, nil
 }
 
 // ownerRefIsAppsV1 reports whether the owner reference points at
@@ -594,7 +668,10 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
-		depName, ok := r.podOwningDeploymentName(ctx, reader, p)
+		depName, ok, err := r.podOwningDeploymentName(ctx, reader, p)
+		if err != nil {
+			return 0, err
+		}
 		if !ok {
 			continue
 		}
@@ -625,33 +702,47 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 // podOwningDeploymentName walks pod → controller-owning ReplicaSet →
 // controller-owning Deployment and returns the Deployment's name (in
 // the same namespace as the pod — apps/v1 ownership is namespaced).
-// Returns false when any link in the chain is missing or the pod is
-// not owned by a Deployment-shaped workload. Each link is checked on
-// both name AND UID: a name-only match would resolve a stale or
-// forged ownerRef to the wrong live object (a Deployment recreated
-// under the same name is the canonical bad case). The
-// (kind, apiVersion) check rejects ownerRefs to non-apps/v1
-// ReplicaSets/Deployments (rare; defensive — a CRD shaped like a
+// The (found, err) split distinguishes "definitively not Deployment-
+// owned" (found=false, err=nil — bare pod, StatefulSet, etc.) from
+// "couldn't decide" (err != nil — transient apiserver / RBAC issue).
+// Callers MUST propagate the error so the cascade doesn't advance
+// status.observedServerInstance over an incomplete picture; silently
+// collapsing transient errors to "not owned" would let the cascade
+// skip a Deployment whose owner chain happened to fail to Get, while
+// the latch still moves forward, leaving the engine pods with stale
+// sockets that will never be retried.
+//
+// Each link is checked on both name AND UID: a name-only match would
+// resolve a stale or forged ownerRef to the wrong live object (a
+// Deployment recreated under the same name is the canonical bad
+// case). The (kind, apiVersion) check rejects ownerRefs to non-
+// apps/v1 ReplicaSets/Deployments (defensive — a CRD shaped like a
 // ReplicaSet/Deployment from another apiGroup must not be picked up).
-func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, reader client.Reader, pod *corev1.Pod) (string, bool) {
+//
+// A genuine NotFound on the ReplicaSet or Deployment (the chain has
+// been GCd between our pod List and the Get) returns
+// (found=false, err=nil) — the pod's owner chain is gone, so it
+// cannot be cascaded anyway. Non-NotFound errors bubble up.
+func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, reader client.Reader, pod *corev1.Pod) (string, bool, error) {
 	rsRef := metav1.GetControllerOf(pod)
 	if rsRef == nil || rsRef.Kind != "ReplicaSet" || !ownerRefIsAppsV1(rsRef) {
-		return "", false
+		return "", false, nil
 	}
 	var rs appsv1.ReplicaSet
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: rsRef.Name}, &rs); err != nil {
-		// Transient NotFound is common (RS could have been GCd between
-		// pod creation and our List). Fail-soft.
-		return "", false
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get owning ReplicaSet %s/%s: %w", pod.Namespace, rsRef.Name, err)
 	}
 	if rs.UID != rsRef.UID {
 		// Name resolved to a different live RS (re-created under the
-		// same name). Not the pod's actual owner — fail-soft.
-		return "", false
+		// same name). Not the pod's actual owner.
+		return "", false, nil
 	}
 	depRef := metav1.GetControllerOf(&rs)
 	if depRef == nil || depRef.Kind != "Deployment" || !ownerRefIsAppsV1(depRef) {
-		return "", false
+		return "", false, nil
 	}
 	// Verify the Deployment named in depRef still exists with the
 	// declared UID. A name-only return would let a stale ownerRef
@@ -659,12 +750,15 @@ func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, re
 	// name — which we'd then cascade-restart unrelated work.
 	var dep appsv1.Deployment
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: depRef.Name}, &dep); err != nil {
-		return "", false
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get owning Deployment %s/%s: %w", pod.Namespace, depRef.Name, err)
 	}
 	if dep.UID != depRef.UID {
-		return "", false
+		return "", false, nil
 	}
-	return dep.Name, true
+	return dep.Name, true, nil
 }
 
 // annotateDeploymentForCascade patches AnnotationCacheServerRestartTrigger
