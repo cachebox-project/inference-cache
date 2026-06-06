@@ -1660,8 +1660,8 @@ esac
 #     that earlier gate.
 #   - THIS probe asserts only server-side behavior: that an audience-bound
 #     token admits and a default-audience token of the same SA is rejected,
-#     on BOTH endpoints. It uses an inline duplicate volume spec so it can
-#     run even if the controller's manifest is broken (which would
+#     on all three endpoints. It uses an inline duplicate volume spec so it
+#     can run even if the controller's manifest is broken (which would
 #     otherwise mask the server-side check). It does NOT catch drift in
 #     config/manager/manager.yaml; that's the earlier gate's job.
 log "asserting audience binding on /snapshot, /policy, and /probe"
@@ -1690,7 +1690,7 @@ spec:
       # label), so we expect no L3/L4 drop — but a short -m timeout + explicit
       # curl-exit capture keeps a regression (DNS, Service rename, allowlist
       # drift) from looking like a silent bad outcome. If curl fails on any
-      # of the four scrapes, we emit "K=curl_failed:N" so the case statement
+      # of the six scrapes, we emit "K=curl_failed:N" so the case statement
       # below surfaces the exit code, not the empty-status default.
       controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
       default_token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")

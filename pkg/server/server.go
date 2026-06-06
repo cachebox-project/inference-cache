@@ -87,12 +87,10 @@ type Service struct {
 	snapshotServer    *http.Server
 	snapshotHandler   http.Handler
 	policyHandler     http.Handler
-	probeHandler      http.Handler
 	controllerAuthCfg *controllerAuthConfig
 	metrics           *serverMetrics
 	index             *index.Index
 	policies          *PolicyStore
-	prober            *Prober
 }
 
 // New constructs a cache service.
@@ -174,12 +172,15 @@ func New(opts ...Option) *Service {
 		},
 		snapshotHandler: snapshotHandler,
 		policyHandler:   policyHTTPHandler,
-		probeHandler:    probeHTTPHandler,
 		metrics:         metrics,
 		index:           idx,
 		policies:        policies,
-		prober:          prober,
 	}
+	// probeHTTPHandler and prober are NOT stored on Service: the handler is
+	// already mounted on snapshotMux above (and re-referenced by the auth-
+	// wrapping branch below), and the prober is held alive by the handler's
+	// closure for as long as the Service is. Carrying them as struct fields
+	// that nothing reads would just be inert state.
 	for _, opt := range opts {
 		opt(s)
 	}

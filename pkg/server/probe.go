@@ -505,9 +505,10 @@ func replicaInScores(scores []index.ReplicaScore, replicaID string) bool {
 // probe payload. The probe doesn't inspect the bytes — only that what went
 // in came out — so this is opaque from the probe's perspective.
 func probePayload(probeHash []byte) []byte {
-	// Length-prefixed shape so the T2 backend sees a stable, parseable payload
-	// regardless of the SHA-256 output size — same defense-in-depth as the
-	// probe-hash input domain separator.
+	// Domain-separated header + hash: the marker line acts as the same
+	// defense-in-depth as the probe-hash input domain separator, so a T2
+	// backend that receives a payload tagged with this marker can confidently
+	// recognize it as probe traffic distinct from real workload bytes.
 	out := make([]byte, 0, len(probeHash)+len("probe-payload-v1\n"))
 	out = append(out, "probe-payload-v1\n"...)
 	out = append(out, probeHash...)

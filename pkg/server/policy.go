@@ -274,11 +274,11 @@ func NewPolicyHTTPHandler(store *PolicyStore) http.HandlerFunc {
 //
 // The endpoint is intentionally internal. Auth + NetworkPolicy gating live
 // in server.New, where the same TokenReview-backed bearer middleware that
-// protects /snapshot is also applied here — both endpoints share one
-// controller-SA identity. The handler itself stays auth-agnostic so tests
-// (and any future internal caller) can mount it directly. Body size is
-// capped at 1 MiB to bound memory if a buggy controller sends a runaway
-// snapshot.
+// protects /snapshot and /probe is also applied here — all three
+// controller-facing endpoints share one controller-SA identity. The
+// handler itself stays auth-agnostic so tests (and any future internal
+// caller) can mount it directly. Body size is capped at 1 MiB to bound
+// memory if a buggy controller sends a runaway snapshot.
 func policyHandler(store *PolicyStore) http.HandlerFunc {
 	const maxBytes = 1 << 20 // 1 MiB — comfortably above any realistic snapshot
 	return func(w http.ResponseWriter, r *http.Request) {
