@@ -24,11 +24,13 @@ import (
 // real apiserver. The reconciler here is constructed without
 // APIReader, so all reads go through the embedded client.Client.
 //
-// What's not covered here: a live kubelet rolling a Pod. envtest has no
-// kubelet, so we simulate "the cache-server pod restarted" by deleting
-// the old Pod and creating a new one with the same selector labels and a
-// fresh UID. That matches the only signal the controller is supposed to
-// react to — a UID transition on the Ready cache-server pod.
+// What's not covered here: a live kubelet rolling a Pod or restarting
+// a container in place. envtest has no kubelet, so we simulate "the
+// cache-server pod was replaced" by deleting the old Pod and creating
+// a new one with the same selector labels but a fresh UID. In-place
+// container-restart detection (the restart-sum half of the server-
+// instance identifier) is covered by the fake-client unit suite,
+// which can mutate status.containerStatuses without a kubelet.
 func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)
@@ -88,7 +90,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 		reloaded := getBackend(t, r, "cache", ns)
 		if got := reloaded.Status.ObservedServerInstance; got != serverInstanceID(serverPod1) {
-			t.Fatalf("baseline ObservedServerInstance = %q, want %q", got, serverPod1.UID)
+			t.Fatalf("baseline ObservedServerInstance = %q, want %q", got, serverInstanceID(serverPod1))
 		}
 		gotDep := &appsv1.Deployment{}
 		if err := k8s.Get(ctx, types.NamespacedName{Name: "vllm-engine", Namespace: ns}, gotDep); err != nil {
@@ -118,14 +120,14 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 		reloaded = getBackend(t, r, "cache", ns)
 		if got := reloaded.Status.ObservedServerInstance; got != serverInstanceID(serverPod2) {
-			t.Fatalf("ObservedServerInstance after UID flip = %q, want %q", got, serverPod2.UID)
+			t.Fatalf("ObservedServerInstance after UID flip = %q, want %q", got, serverInstanceID(serverPod2))
 		}
 		if err := k8s.Get(ctx, types.NamespacedName{Name: "vllm-engine", Namespace: ns}, gotDep); err != nil {
 			t.Fatalf("get engine dep: %v", err)
 		}
 		annot := gotDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
 		if annot != serverInstanceID(serverPod2) {
-			t.Fatalf("cascade annotation = %q, want %q", annot, serverPod2.UID)
+			t.Fatalf("cascade annotation = %q, want %q", annot, serverInstanceID(serverPod2))
 		}
 		if got := cascadeRestartsCount(t, ns, "cache", cascadeRestartReasonServerInstanceChanged); got != 1 {
 			t.Fatalf("counter = %v, want 1", got)
@@ -190,7 +192,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		}
 		firstCascadeUID := gotDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
 		if firstCascadeUID != serverInstanceID(serverPod2) {
-			t.Fatalf("first cascade annotation = %q, want %q", firstCascadeUID, serverPod2.UID)
+			t.Fatalf("first cascade annotation = %q, want %q", firstCascadeUID, serverInstanceID(serverPod2))
 		}
 		if got := cascadeRestartsCount(t, ns, "cache", cascadeRestartReasonServerInstanceChanged); got != 1 {
 			t.Fatalf("counter after first cascade = %v, want 1", got)

@@ -44,7 +44,7 @@
 #      regression that hides events from `kubectl describe pod`). Then
 #      the cache-server restart cascade: force-deleting the
 #      cache-server pod flips status.observedServerInstance to the
-#      replacement pod's UID and patches the cascade-restart-trigger
+#      replacement's server-instance identifier and patches the cascade-restart-trigger
 #      annotation onto the engine Deployment's pod template (the
 #      mechanism that drives the rolling restart). Finally scaling the
 #      engine to 0 drives status.matchedEnginePods=0 via the
@@ -194,11 +194,13 @@ SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
 # engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
 # terminate round-trip.
 SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
-# Cache-server restart cascade. Each wait covers a different leg of the
-# loop: the controller observing the replacement cache-server pod's UID,
-# then patching the engine Deployment's pod template annotations. 60s
-# absorbs the cache-server pod's recreate-and-Ready cycle (the busybox
-# stand-in starts in a few seconds; the wait dominates on a cold node).
+# Cache-server restart cascade. Each wait covers a different leg of
+# the loop: the controller observing the replacement cache-server pod
+# and computing its server-instance identifier
+# (`<pod-uid>:<restart-sum>`), then patching the engine Deployment's
+# pod template annotations. 60s absorbs the cache-server pod's
+# recreate-and-Ready cycle (the busybox stand-in starts in a few
+# seconds; the wait dominates on a cold node).
 SAMPLE_CASCADE_TIMEOUT="${SAMPLE_CASCADE_TIMEOUT:-60}"
 # KV-event gate: time budget for the managed cache-server Deployment to pull
 # its image and reach Available, then for the gate to publish
@@ -1084,33 +1086,33 @@ log "InjectedByCacheBackend Event present on the engine pod (UID matches the per
 #
 # This phase asserts the end-to-end loop on the real install:
 #   - status.observedServerInstance picks up the current cache-server
-#     pod's UID after the initial rollout (no cascade — first observation
-#     never cascades).
-#   - Forcing a cache-server pod restart flips observedServerInstance to
-#     the new UID.
-#   - The engine Deployment's spec.template.metadata.annotations gets the
-#     cascade trigger set to that new UID — proving the loop closed
-#     against the installed RBAC + actual apiserver Patch, not just
-#     envtest.
+#     server-instance identifier (`<pod-uid>:<restart-sum>`) after the
+#     initial rollout (no cascade — first observation never cascades).
+#   - Forcing a cache-server pod restart flips observedServerInstance
+#     to the replacement's server-instance identifier.
+#   - The engine Deployment's spec.template.metadata.annotations gets
+#     the cascade trigger set to that new identifier — proving the
+#     loop closed against the installed RBAC + actual apiserver Patch,
+#     not just envtest.
 #
 # Must run BEFORE the drift case below, which scales the engine to 0:
 # with no engine pod present, no injected-by annotations remain in the
 # namespace, so the cascade would find no Deployments to annotate.
 log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the initial cache-server pod to publish status.observedServerInstance"
 deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
-baseline_server_uid=""
+baseline_server_instance=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  baseline_server_uid=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  baseline_server_instance=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
     -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
-  if [ -n "$baseline_server_uid" ]; then break; fi
+  if [ -n "$baseline_server_instance" ]; then break; fi
   sleep 2
 done
-if [ -z "$baseline_server_uid" ]; then
+if [ -z "$baseline_server_instance" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
   kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
   fail "status.observedServerInstance not populated within ${SAMPLE_CASCADE_TIMEOUT}s; cannot exercise the cache-server restart cascade"
 fi
-log "baseline status.observedServerInstance=$baseline_server_uid"
+log "baseline status.observedServerInstance=$baseline_server_instance"
 
 # Force-delete the cache-server pod to simulate the OOM / restart trigger.
 # The Deployment controller recreates it with a fresh UID.
@@ -1124,24 +1126,24 @@ kubectl -n "$SAMPLE_NS" delete pod "$cache_pod" \
   --force --grace-period=0 >/dev/null 2>&1 || true
 
 # Wait for the controller to observe the new pod and update the latch.
-log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for status.observedServerInstance to flip to the replacement pod's UID"
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for status.observedServerInstance to flip to the replacement's server-instance identifier"
 deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
-new_server_uid=""
+new_server_instance=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   cur=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
     -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
-  if [ -n "$cur" ] && [ "$cur" != "$baseline_server_uid" ]; then
-    new_server_uid="$cur"
+  if [ -n "$cur" ] && [ "$cur" != "$baseline_server_instance" ]; then
+    new_server_instance="$cur"
     break
   fi
   sleep 2
 done
-if [ -z "$new_server_uid" ]; then
+if [ -z "$new_server_instance" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
   kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
-  fail "status.observedServerInstance did not advance past $baseline_server_uid within ${SAMPLE_CASCADE_TIMEOUT}s"
+  fail "status.observedServerInstance did not advance past $baseline_server_instance within ${SAMPLE_CASCADE_TIMEOUT}s"
 fi
-log "status.observedServerInstance flipped: $baseline_server_uid → $new_server_uid"
+log "status.observedServerInstance flipped: $baseline_server_instance → $new_server_instance"
 
 # Assert the engine Deployment's pod template carries the cascade trigger
 # annotation set to the new UID. The annotation is the mechanism that
@@ -1153,12 +1155,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   trigger=$(kubectl -n "$SAMPLE_NS" get deploy qwen-engine \
     -o jsonpath='{.spec.template.metadata.annotations.inferencecache\.io/cache-server-restart-trigger}' \
     2>/dev/null || true)
-  if [ "$trigger" = "$new_server_uid" ]; then break; fi
+  if [ "$trigger" = "$new_server_instance" ]; then break; fi
   sleep 2
 done
-if [ "$trigger" != "$new_server_uid" ]; then
+if [ "$trigger" != "$new_server_instance" ]; then
   kubectl -n "$SAMPLE_NS" get deploy qwen-engine -o yaml || true
-  fail "engine Deployment cascade trigger=$trigger, want $new_server_uid (the cache-server restart did not cascade)"
+  fail "engine Deployment cascade trigger=$trigger, want $new_server_instance (the cache-server restart did not cascade)"
 fi
 log "engine Deployment qwen-engine carries inferencecache.io/cache-server-restart-trigger=$trigger"
 

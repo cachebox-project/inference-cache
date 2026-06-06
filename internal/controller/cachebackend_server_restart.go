@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -139,41 +140,49 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 	return DefaultMinServerRestartCascadeInterval
 }
 
-// reconcileServerInstance observes the current Ready cache-server pod UID
-// for this managed backend and, on a change from the persisted
-// status.observedServerInstance, cascade-restarts every injected engine
-// Deployment by patching AnnotationCacheServerRestartTrigger onto each
-// Deployment's pod template. Status is patched only when the observed UID
-// changes; the cascade is rate-limited per CacheBackend (see
+// reconcileServerInstance observes the current Ready cache-server
+// instance identifier for this managed backend and, on a change that
+// reflects an actual cache-server replacement (a pod that was Ready
+// before is no longer Ready, or a container inside a persisting pod
+// has restarted), cascade-restarts every injected engine Deployment
+// by patching AnnotationCacheServerRestartTrigger onto each
+// Deployment's pod template. Status is patched on every transition;
+// cascading is rate-limited per CacheBackend (see
 // DefaultMinServerRestartCascadeInterval) and the function returns a
 // non-zero requeue when the rate-limit deferred the cascade so the
 // caller's reconcile result schedules the retry exactly at the window
 // boundary.
 //
-// Empty→set transitions of the UID NEVER cascade: there are no engines
-// holding a stale connection to a not-yet-existed server. The first
-// observation only persists the UID as the baseline; subsequent
-// transitions cascade.
+// "Transient" transitions that do NOT cascade:
+//   - empty → set (first-observation baseline; no engines existed)
+//   - prior set strictly grows (a rolling update's maxSurge window:
+//     the old pod is still Ready while the new one comes up; the
+//     subsequent transition that drops the old pod IS a cascade)
 //
-// Fail-soft: every error path (Pod list, Deployment list, Patch failure)
-// returns nil and only logs at V(1). Cascading is best-effort recovery
-// from a known soft-failure mode; it must never escalate a transient
-// apiserver hiccup into a Reconcile error that backs off the rest of
-// the reconcile.
+// "Real" transitions that DO cascade:
+//   - any prior pod is no longer in the current set (pod replaced)
+//   - any persisting pod's restart-count sum advanced (in-place
+//     container restart)
+//
+// Fail-soft: every error path (Pod list, Deployment list, Patch
+// failure) returns nil and only logs at V(1). Cascading is best-
+// effort recovery from a known soft-failure mode; it must never
+// escalate a transient apiserver hiccup into a Reconcile error that
+// backs off the rest of the reconcile.
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
-	currentUID, err := r.currentServerInstanceUID(ctx, backend)
+	currentID, err := r.currentServerInstanceUID(ctx, backend)
 	if err != nil {
 		logger.V(1).Info("server-restart cascade skipped: cache-server pod list failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return 0
 	}
-	if currentUID == "" {
+	if currentID == "" {
 		// No Ready cache-server pod yet — nothing to anchor to.
 		return 0
 	}
 
 	prior := backend.Status.ObservedServerInstance
-	if prior == currentUID {
+	if prior == currentID {
 		return 0
 	}
 
@@ -181,11 +190,30 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// there are no engines depending on a not-yet-existed server.
 	if prior == "" {
 		if err := r.patchStatus(ctx, backend, func() {
-			backend.Status.ObservedServerInstance = currentUID
+			backend.Status.ObservedServerInstance = currentID
 		}); err != nil {
 			logger.V(1).Info("server-restart cascade: initial observedServerInstance patch failed",
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		}
+		return 0
+	}
+
+	// Distinguish a real cache-server replacement from a transient
+	// rolling-update widening (old + new pod both Ready briefly). If
+	// the change is just the new pod showing up alongside the old one,
+	// only persist the new baseline — the cascade will fire when the
+	// next transition drops the old pod (or when the persisting pod's
+	// container restarts).
+	if !instanceChangeRequiresCascade(prior, currentID) {
+		if err := r.patchStatus(ctx, backend, func() {
+			backend.Status.ObservedServerInstance = currentID
+		}); err != nil {
+			logger.V(1).Info("server-restart cascade: superset observedServerInstance patch failed",
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		}
+		logger.V(1).Info("server-restart cascade skipped: transient rolling-update superset",
+			"namespace", backend.Namespace, "name", backend.Name,
+			"prior", prior, "current", currentID)
 		return 0
 	}
 
@@ -205,11 +233,11 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	if !ok {
 		logger.V(1).Info("server-restart cascade deferred: rate-limited",
 			"namespace", backend.Namespace, "name", backend.Name,
-			"priorUID", prior, "currentUID", currentUID, "retryAfter", wait.String())
+			"prior", prior, "current", currentID, "retryAfter", wait.String())
 		return wait
 	}
 
-	count, err := r.cascadeRestartEngineDeployments(ctx, backend, currentUID)
+	count, err := r.cascadeRestartEngineDeployments(ctx, backend, currentID)
 	if err != nil {
 		// Soft-fail: log and keep going. The next reconcile (or the
 		// matched-pods cadence requeue) will retry. Do NOT advance
@@ -222,10 +250,10 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	backendServerRestartsTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
 	logger.V(1).Info("server-restart cascade: engine Deployments annotated",
 		"namespace", backend.Namespace, "name", backend.Name,
-		"priorUID", prior, "currentUID", currentUID, "deployments", count)
+		"prior", prior, "current", currentID, "deployments", count)
 
 	if err := r.patchStatus(ctx, backend, func() {
-		backend.Status.ObservedServerInstance = currentUID
+		backend.Status.ObservedServerInstance = currentID
 	}); err != nil {
 		logger.V(1).Info("server-restart cascade: observedServerInstance patch failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
@@ -233,24 +261,86 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	return 0
 }
 
-// currentServerInstanceUID returns a stable identifier representing the
-// current set of Ready cache-server pods for the backend, or "" when no
-// Ready pod exists yet. The candidate set is the owned Deployment's
-// pods — pods whose controller-owning ReplicaSet is controller-owned by
-// the backend-owned Deployment, identified by both name AND UID so a
-// foreign Ready pod that happens to carry the same controller-managed
-// labels (or a stale ownerRef name that resolves to a different live
-// object) cannot advance observedServerInstance and spuriously trigger
-// an engine rollout.
+// instanceChangeRequiresCascade reports whether the prior→current
+// transition reflects an actual cache-server replacement that warrants
+// rolling the engine fleet, as opposed to a transient
+// rolling-update widening (old + new pod both Ready briefly).
 //
-// The identifier is a comma-joined, lex-sorted list of every Ready
-// pod's UID — NOT just the lex-smallest. Multi-replica managed
-// backends (`spec.replicas > 1` on non-PVC backends) replace pods
-// independently; tracking only one would let a restart of any other
-// replica slip past observedServerInstance, so engines bound to that
-// replica would keep their stale LMCache socket forever. Including
-// every Ready pod's UID means a single replacement always changes the
-// identifier and cascades.
+// Algorithm: parse both strings into (pod-UID → restart-sum) maps. A
+// cascade is required iff some pod-UID in prior is either absent in
+// current OR has a different restart-sum in current. A current that
+// is a strict superset of prior (same UIDs at same restart counts,
+// plus extras) is the rolling-update midpoint — no cascade yet.
+//
+// Conservative fallback: if `prior` is non-empty but fails to parse
+// (operator hand-edited the field, or a value from a prior schema
+// shape survives an upgrade), force a cascade. We cannot reason about
+// what the prior set was, so treating any change as a real cascade is
+// safer than silently skipping it.
+func instanceChangeRequiresCascade(prior, current string) bool {
+	pm := parseInstanceMap(prior)
+	if len(pm) == 0 && prior != "" {
+		return true
+	}
+	cm := parseInstanceMap(current)
+	for uid, priorSum := range pm {
+		curSum, ok := cm[uid]
+		if !ok {
+			return true // prior pod is gone — replacement happened.
+		}
+		if curSum != priorSum {
+			return true // pod persists but container restarted in place.
+		}
+	}
+	return false
+}
+
+// parseInstanceMap parses the "<uid1>:<sum1>,<uid2>:<sum2>" identifier
+// shape currentServerInstanceUID emits into a map keyed by pod-UID.
+// Malformed segments are skipped (defensive — the controller is the
+// sole writer, so it should never produce bad shapes, but tolerating
+// them keeps the cascade decision well-defined if the field is hand-
+// edited by an operator).
+func parseInstanceMap(s string) map[string]int32 {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make(map[string]int32, len(parts))
+	for _, p := range parts {
+		i := strings.LastIndexByte(p, ':')
+		if i <= 0 || i == len(p)-1 {
+			continue
+		}
+		sum, err := strconv.ParseInt(p[i+1:], 10, 32)
+		if err != nil {
+			continue
+		}
+		out[p[:i]] = int32(sum)
+	}
+	return out
+}
+
+// currentServerInstanceUID returns a stable identifier representing
+// the current set of Ready cache-server pods for the backend, or ""
+// when no Ready pod exists yet. The candidate set is the owned
+// Deployment's pods — pods whose controller-owning ReplicaSet is
+// controller-owned by the backend-owned Deployment, identified by
+// both name AND UID so a foreign Ready pod that happens to carry the
+// same controller-managed labels (or a stale ownerRef name that
+// resolves to a different live object) cannot advance
+// observedServerInstance and spuriously trigger an engine rollout.
+//
+// The identifier shape is `<pod-uid>:<restart-sum>` per Ready pod,
+// comma-joined and lex-sorted by pod name; for a single-replica
+// backend this is one segment, for multi-replica ephemeral backends
+// it's a comma-joined list. The restart-sum half (sum of
+// pod.status.containerStatuses[].RestartCount) makes in-place
+// container restarts observable: an OOM-killed cache-server container
+// respawned in the same pod reuses pod.UID, so a UID-only identifier
+// would miss it — engines would keep their stale LMCache sockets.
+// Including the restart-sum advances the identifier whenever the
+// LMCache server process inside the pod is fresh.
 //
 // Reads via APIReader (uncached) where possible to avoid registering a
 // Pod informer; the controller's design explicitly rejects watching

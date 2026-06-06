@@ -266,7 +266,7 @@ func TestReconcileServerInstance_FirstObservationStampsBaseline(t *testing.T) {
 
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
-		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want %q", got, serverInstanceID(f.serverPod))
 	}
 	f.reloadEngineDep(t)
 	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
@@ -295,12 +295,12 @@ func TestReconcileServerInstance_UIDChangeCascadesEngineDeployment(t *testing.T)
 	f.reloadEngineDep(t)
 	got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
 	if got != serverInstanceID(f.serverPod) {
-		t.Fatalf("cascade annotation = %q, want %q (the new cache-server pod UID)", got, f.serverPod.UID)
+		t.Fatalf("cascade annotation = %q, want %q (the new cache-server pod UID)", got, serverInstanceID(f.serverPod))
 	}
 
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
-		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want %q", got, serverInstanceID(f.serverPod))
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
 		t.Fatalf("cascade counter = %v, want 1", got)
@@ -349,7 +349,7 @@ func TestReconcileServerInstance_RateLimitedSecondCascadeIsDeferred(t *testing.T
 	// Status MUST stay pinned to the first cascade's UID — advancing it
 	// inside the rate-limit window would lose the missed cascade.
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
-		t.Fatalf("ObservedServerInstance = %q, want pinned to first-cascade UID %q", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want pinned to first-cascade UID %q", got, serverInstanceID(f.serverPod))
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
 		t.Fatalf("cascade counter = %v, want 1 (rate-limited second cascade must not increment)", got)
@@ -408,11 +408,11 @@ func TestReconcileServerInstance_SelectorRemovedButPodStillInjectedCascades(t *t
 	f.reloadEngineDep(t)
 	got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
 	if got != serverInstanceID(f.serverPod) {
-		t.Fatalf("cascade annotation = %q, want %q (already-injected pods must still cascade after selector removal)", got, f.serverPod.UID)
+		t.Fatalf("cascade annotation = %q, want %q (already-injected pods must still cascade after selector removal)", got, serverInstanceID(f.serverPod))
 	}
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
-		t.Fatalf("ObservedServerInstance = %q, want %q", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want %q", got, serverInstanceID(f.serverPod))
 	}
 }
 
@@ -494,7 +494,7 @@ func TestReconcileServerInstance_ForeignReadyPodIgnoredForServerInstance(t *test
 	}
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
-		t.Fatalf("ObservedServerInstance = %q, want pinned to the legit pod %q (foreign pod must not advance the latch)", got, f.serverPod.UID)
+		t.Fatalf("ObservedServerInstance = %q, want pinned to the legit pod %q (foreign pod must not advance the latch)", got, serverInstanceID(f.serverPod))
 	}
 	f.reloadEngineDep(t)
 	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
@@ -580,6 +580,98 @@ func TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod(t *testing.T) {
 	f.reloadEngineDep(t)
 	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantAfter {
 		t.Fatalf("cascade annotation = %q, want %q (non-first replica's restart must still cascade)", got, wantAfter)
+	}
+}
+
+// TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade
+// asserts that a Deployment rolling-update midpoint — when the old
+// pod is still Ready while the new one comes up (maxSurge=1) —
+// advances observedServerInstance but does NOT trigger a cascade.
+// The cascade fires on the NEXT transition that drops the old pod.
+// Without this debounce a normal single-replica rollout would roll
+// the engine fleet twice.
+func TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline: only one pod, observedServerInstance gets stamped.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Simulate the rolling-update midpoint: add a second Ready pod
+	// owned by the same RS (a new replica from maxSurge=1).
+	tru := true
+	newer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-zzz", // sorts AFTER the original
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-new",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), newer); err != nil {
+		t.Fatalf("create newer pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), newer); err != nil {
+		t.Fatalf("ready newer pod: %v", err)
+	}
+
+	// Mid-rollout transition: prior strictly grows. Should advance
+	// status but NOT cascade.
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("midpoint wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantMidpoint := serverInstanceID(f.serverPod) + "," + serverInstanceID(newer)
+	if got := f.backend.Status.ObservedServerInstance; got != wantMidpoint {
+		t.Fatalf("midpoint ObservedServerInstance = %q, want %q (strict superset of prior)", got, wantMidpoint)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("rolling-update midpoint triggered a cascade; the old pod is still Ready so the cascade must wait")
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter at midpoint = %v, want 0", got)
+	}
+
+	// Drop the old pod (rolling update finished). NOW the cascade
+	// must fire — the new pod is what serves traffic, the old pod's
+	// LMCache sockets are unreachable.
+	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
+		t.Fatalf("delete old pod: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-rollout wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantFinal := serverInstanceID(newer)
+	if got := f.backend.Status.ObservedServerInstance; got != wantFinal {
+		t.Fatalf("final ObservedServerInstance = %q, want %q", got, wantFinal)
+	}
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantFinal {
+		t.Fatalf("cascade annotation = %q, want %q (cascade fires once, on the drop of the old pod)", got, wantFinal)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter = %v, want exactly 1 (one rolling update = one cascade)", got)
 	}
 }
 
