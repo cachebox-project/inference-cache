@@ -58,10 +58,22 @@ contract-key mismatch — see
 [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md). Either way
 the gateway falls back to its default routing policy.
 
-### 2.6 The matched-tokens floor
+### 2.6 The matched-tokens floor — a Phase-1 stopgap
+
+**Scope caveat.** This floor is a quick win for Llama-style chat-template
+workloads where the shared prefix is short (~16-32 tokens). It is **not**
+the production-grade ranking answer: workloads with long shared prefixes
+(RAG corpus headers, custom system prompts, few-shot examples) routinely
+match well above any reasonable fixed token floor on content every replica
+has — so the floor lets them through unchanged and the inflated-`PREFIX_MATCH`
+signal returns. The proper fix is a replica-*distinguishing-power* ranker —
+one that measures how rare an overlap is across replicas, not just how
+long — and is tracked as separate follow-up work. Ship the floor as a
+clean stopgap that fixes the visible Phase-2 benchmark inflation; revisit
+when the distinguishing-power algorithm lands.
 
 The baseline returned `PREFIX_MATCH` for *any* non-zero overlap, which gave
-operators an inflated routing signal: post-the cache-stress harness benchmarks
+operators an inflated routing signal: the cache-stress harness benchmarks
 showed ~70% of `PREFIX_MATCH` responses were 1-block (16-token) matches —
 the Llama-3 chat-template framing every replica had identically. Trivial
 matches deterministically route to whichever replica's chat-template hash
