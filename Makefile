@@ -32,6 +32,7 @@ ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
 GOVULNCHECK_VERSION ?= v1.3.0
 PROMTOOL_VERSION ?= 3.0.1
+KUSTOMIZE_VERSION ?= v5.7.0
 # SHA256 checksums of the upstream Prometheus release tarballs we extract
 # `promtool` from. Sourced from
 # https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/sha256sums.txt
@@ -51,6 +52,7 @@ SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
 LOCAL_BUF := $(LOCALBIN)/buf
 LOCAL_PROMTOOL := $(LOCALBIN)/promtool
+LOCAL_KUSTOMIZE := $(LOCALBIN)/kustomize
 GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 # PROMTOOL is resolved AT RECIPE TIME, not parse time — so the version
@@ -109,6 +111,19 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 		true; \
 	else \
 		test -s $(LOCAL_BUF) || GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
+	fi
+
+.PHONY: kustomize
+kustomize: $(LOCALBIN) ## Install kustomize locally; reinstall when the pinned version drifts.
+	@# Pinned to keep `make verify-prometheus` reproducible across the
+	@# GitHub-runner image, minimal containers, and dev shells. We don't
+	@# rely on `kubectl kustomize` because the runner image is implicit
+	@# (a GitHub change could drop kubectl), and even with kubectl
+	@# present the bundled kustomize version drifts independently from
+	@# what dev shells have.
+	@if ! { [ -x $(LOCAL_KUSTOMIZE) ] && $(LOCAL_KUSTOMIZE) version 2>/dev/null | grep -qF "$(KUSTOMIZE_VERSION)"; }; then \
+		rm -f $(LOCAL_KUSTOMIZE); \
+		GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION); \
 	fi
 
 .PHONY: promtool
@@ -326,7 +341,7 @@ fmt-check: ## Check Go formatting without modifying files.
 	echo "✓ gofmt clean"
 
 .PHONY: verify-prometheus
-verify-prometheus: promtool ## Lint + unit-test the Prometheus alerting rules under config/observability/.
+verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alerting rules under config/observability/.
 	@set -e; PROMTOOL=$$($(RESOLVE_PROMTOOL)); \
 	echo "==> using $$PROMTOOL ($$($$PROMTOOL --version 2>&1 | head -1))"; \
 	echo "==> promtool check rules (flat alerting-rules.yaml)"; \
@@ -339,20 +354,14 @@ verify-prometheus: promtool ## Lint + unit-test the Prometheus alerting rules un
 	@# The README advertises `kubectl apply -k config/observability`. A
 	@# broken kustomization.yaml or a YAML-syntax error in any resource
 	@# would silently slip past the promtool checks (which only see the
-	@# flat rules file). Render the overlay through kustomize so CI
-	@# fails fast on rendering errors. NOTE: kustomize only validates
-	@# YAML structure and kustomize patches, not the CR schema — a
-	@# semantically-invalid PrometheusRule / ServiceMonitor still
-	@# renders OK and would only fail at apply time against a live
-	@# apiserver. `kubectl kustomize` is bundled with kubectl 1.14+; we
-	@# discard stdout but propagate stderr/exit-code.
-	@if command -v kubectl >/dev/null 2>&1; then \
-		kubectl kustomize config/observability >/dev/null; \
-		echo "✓ kustomize build clean"; \
-	else \
-		echo "✗ kubectl not installed — install kubectl >= 1.14 to enable the kustomize gate"; \
-		exit 1; \
-	fi
+	@# flat rules file). Render the overlay through the pinned local
+	@# kustomize so CI fails fast on rendering errors. NOTE: kustomize
+	@# only validates YAML structure and kustomize patches, not the
+	@# CR schema — a semantically-invalid PrometheusRule / ServiceMonitor
+	@# still renders OK and would only fail at apply time against a
+	@# live apiserver. We discard stdout but propagate stderr/exit-code.
+	@$(LOCAL_KUSTOMIZE) build config/observability >/dev/null
+	@echo "✓ kustomize build clean"
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
