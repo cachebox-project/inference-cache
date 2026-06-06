@@ -102,6 +102,16 @@ groups:
         # Prometheus clients. The repo's own scraper hedges the same
         # way (pkg/adapters/engine/metrics_scraper.go `sumCounter`), so
         # the alert stays in lockstep with the scraper.
+        #
+        # SCRAPE-SCOPING REQUIREMENT: this expression matches EVERY
+        # scraped vLLM pod in the Prometheus shard — there is no
+        # controller-injected label on engine pods for Prometheus to
+        # filter on. The operator must restrict their vLLM PodMonitor
+        # to cache-bound engine pods (same selector as
+        # `CacheBackend.spec.engineSelector.matchLabels`), otherwise
+        # this alert can fire on unrelated vLLM workloads. See the
+        # "How to enable" section in docs/observability/alerts.md
+        # for the sample scoped PodMonitor.
         expr: |
           (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[10m])) > 1000)
           unless

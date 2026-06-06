@@ -335,6 +335,20 @@ verify-prometheus: promtool ## Lint + unit-test the Prometheus alerting rules un
 	cd config/observability && $$PROMTOOL test rules prometheus-rules-tests.yaml
 	@echo "==> drift check: PrometheusRule CR spec.groups matches alerting-rules.yaml groups"
 	@$(GO_CMD) run ./hack/verify-prometheus-drift config/observability/alerting-rules.yaml config/observability/prometheus-rules.yaml
+	@echo "==> kustomize build config/observability (catches broken kustomization.yaml / CRs)"
+	@# The README advertises `kubectl apply -k config/observability`; a
+	@# broken kustomization.yaml or a malformed CR would silently slip
+	@# past the promtool checks (which only see the flat rules file).
+	@# Render the overlay through kustomize so CI fails fast on shape
+	@# errors. `kubectl kustomize` is bundled with kubectl 1.14+; we
+	@# discard stdout but propagate stderr/exit-code.
+	@if command -v kubectl >/dev/null 2>&1; then \
+		kubectl kustomize config/observability >/dev/null; \
+		echo "✓ kustomize build clean"; \
+	else \
+		echo "✗ kubectl not installed — install kubectl >= 1.14 to enable the kustomize gate"; \
+		exit 1; \
+	fi
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci

@@ -105,7 +105,37 @@ placeholders for three more that depend on metrics not yet exposed (see
 > ServiceMonitor against a headless Service does too (one Endpoints
 > entry per Pod). Static targets do NOT.
 >
-> The other four alerts work as-is once this bundle is applied.
+> **And the PodMonitor MUST scope to cache-bound engine pods only.**
+> The alert reads `vllm:external_prefix_cache_*` from EVERY scraped
+> vLLM pod — there is no controller-injected label on engine pods that
+> Prometheus can filter on, because the operator stamps an
+> `inferencecache.io/injected-by` *annotation* (not a label), and
+> annotations don't show up on scraped series. So scope at scrape time:
+> the PodMonitor's `selector.matchLabels` should match the same labels
+> your `CacheBackend.spec.engineSelector.matchLabels` uses. Otherwise
+> an unrelated vLLM workload in the cluster (no cache-plane wiring,
+> no LMCache offload) will trip `LMCacheT2NoHits` on
+> inference-cache's behalf. A minimal scoped PodMonitor looks like:
+>
+> ```yaml
+> apiVersion: monitoring.coreos.com/v1
+> kind: PodMonitor
+> metadata:
+>   name: vllm-cache-bound
+>   namespace: <your-engine-namespace>
+> spec:
+>   selector:
+>     matchLabels:
+>       app: my-engine                # MUST match CacheBackend.spec.engineSelector.matchLabels
+>   podMetricsEndpoints:
+>     - port: http                    # the port-name your vLLM container exposes /metrics on
+>       path: /metrics
+>       interval: 30s
+> ```
+>
+> The other four alerts work as-is once this bundle is applied — they
+> only read `inferencecache_*` series, which the shipped ServiceMonitor
+> already scopes to `inference-cache-server`.
 >
 > **The alerts rely on a `namespace` label per install.** Both the shipped
 > `ServiceMonitor` for `inference-cache-server` and any prometheus-operator
