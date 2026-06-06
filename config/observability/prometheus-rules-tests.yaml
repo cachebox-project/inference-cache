@@ -21,14 +21,21 @@ evaluation_interval: 30s
 tests:
   # --------------------------------------------------------------------------
   # IndexEmpty (for: 2m, critical)
+  #
+  # Gated on observed LookupRoute traffic so idle installs (operator
+  # bundle applied but no engines yet / no gateway) do not page critical.
   # --------------------------------------------------------------------------
   - interval: 30s
-    name: IndexEmpty fires when server is up and no index_entries series exists
+    name: IndexEmpty fires when server up, no index entries, and traffic is flowing
     input_series:
       - series: 'inferencecache_server_up'
-        values: '1+0x20'
+        values: '1+0x40'
+      # No inferencecache_index_entries series — index is empty.
+      # Lookup traffic exists, all NO_HINT (consistent with empty index).
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+300x40'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: IndexEmpty
         exp_alerts:
           - exp_labels:
@@ -42,11 +49,13 @@ tests:
     name: IndexEmpty does not fire when index has entries
     input_series:
       - series: 'inferencecache_server_up'
-        values: '1+0x20'
+        values: '1+0x40'
       - series: 'inferencecache_index_entries{model="llama-3.1-8b"}'
-        values: '1000+0x20'
+        values: '1000+0x40'
+      - series: 'inferencecache_lookup_route_calls_total{model="llama-3.1-8b",reason_code="PREFIX_MATCH",hint_used="true"}'
+        values: '0+300x40'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
         alertname: IndexEmpty
         exp_alerts: []
 
@@ -54,9 +63,24 @@ tests:
     name: IndexEmpty does not fire when server is down
     input_series:
       - series: 'inferencecache_server_up'
-        values: '0+0x20'
+        values: '0+0x40'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 15m
+        alertname: IndexEmpty
+        exp_alerts: []
+
+  - interval: 30s
+    # An idle install — operator just applied the bundle, no engine pods
+    # yet, no gateway sending LookupRoute traffic. Empty index is the
+    # expected state; alerting critical here would page on every fresh
+    # opt-in deployment.
+    name: IndexEmpty does not fire on an idle install with no LookupRoute traffic
+    input_series:
+      - series: 'inferencecache_server_up'
+        values: '1+0x40'
+      # No index_entries series, no lookup_route_calls_total series.
+    alert_rule_test:
+      - eval_time: 15m
         alertname: IndexEmpty
         exp_alerts: []
 

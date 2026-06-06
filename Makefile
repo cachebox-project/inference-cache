@@ -53,7 +53,13 @@ LOCAL_BUF := $(LOCALBIN)/buf
 LOCAL_PROMTOOL := $(LOCALBIN)/promtool
 GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
-PROMTOOL ?= $(shell command -v promtool 2>/dev/null || echo $(LOCAL_PROMTOOL))
+# PROMTOOL is resolved AT RECIPE TIME, not parse time — so the version
+# check in the `promtool` target above can replace a stale local binary
+# (or refuse a version-mismatched system one) and `verify-prometheus`
+# will still pick up the freshly-installed `$(LOCAL_PROMTOOL)`. A
+# `$(shell command -v promtool)` at parse time would lock in whatever
+# was on PATH when make first started, defeating the version pinning.
+RESOLVE_PROMTOOL = if [ -x $(LOCAL_PROMTOOL) ]; then echo $(LOCAL_PROMTOOL); else echo promtool; fi
 
 .PHONY: all
 all: build test ## Build binaries and run tests.
@@ -106,40 +112,45 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 	fi
 
 .PHONY: promtool
-promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binary is unavailable. Downloads with SHA-256 verification.
-	@# Prefer a system promtool ONLY if it matches the pinned version.
-	@# A version-mismatched system binary can produce different
-	@# error/lint output than CI, which uses the pinned 3.0.1 — so when
-	@# they diverge, install the local pinned binary instead.
-	@if command -v promtool >/dev/null 2>&1 && \
+promtool: $(LOCALBIN) ## Ensure a $(PROMTOOL_VERSION) promtool is available. Downloads with SHA-256 verification.
+	@# Version pinning IS the point — CI runs against $(PROMTOOL_VERSION) and
+	@# different versions can emit subtly different errors. We accept a
+	@# system binary only if its version matches exactly; otherwise we
+	@# install the pinned binary locally (replacing any stale local
+	@# binary too).
+	@if [ -x $(LOCAL_PROMTOOL) ] && \
+		$(LOCAL_PROMTOOL) --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
+		exit 0; \
+	fi; \
+	if command -v promtool >/dev/null 2>&1 && \
 		promtool --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
-		true; \
-	elif [ ! -x $(LOCAL_PROMTOOL) ]; then \
-		set -e; \
-		os=$$(uname -s | tr A-Z a-z); \
-		arch=$$(uname -m); \
-		case $$arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
-		dir=prometheus-$(PROMTOOL_VERSION).$${os}-$${arch}; \
-		case "$${os}_$${arch}" in \
-			linux_amd64)  want_sha="$(PROMTOOL_SHA256_linux_amd64)";; \
-			linux_arm64)  want_sha="$(PROMTOOL_SHA256_linux_arm64)";; \
-			darwin_amd64) want_sha="$(PROMTOOL_SHA256_darwin_amd64)";; \
-			darwin_arm64) want_sha="$(PROMTOOL_SHA256_darwin_arm64)";; \
-			*) echo "✗ unsupported os/arch: $${os}_$${arch} — add a SHA-256 to Makefile and retry."; exit 1;; \
-		esac; \
-		if [ -z "$$want_sha" ]; then \
-			echo "✗ PROMTOOL_SHA256_$${os}_$${arch} is empty — refusing to install promtool without integrity verification."; \
-			exit 1; \
-		fi; \
-		tmp=$$(mktemp -d); \
-		trap 'rm -rf "$$tmp"' EXIT INT TERM; \
-		echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
-		curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
-		echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
-		tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
-		mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
-		chmod +x $(LOCAL_PROMTOOL); \
-	fi
+		exit 0; \
+	fi; \
+	set -e; \
+	rm -f $(LOCAL_PROMTOOL); \
+	os=$$(uname -s | tr A-Z a-z); \
+	arch=$$(uname -m); \
+	case $$arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+	dir=prometheus-$(PROMTOOL_VERSION).$${os}-$${arch}; \
+	case "$${os}_$${arch}" in \
+		linux_amd64)  want_sha="$(PROMTOOL_SHA256_linux_amd64)";; \
+		linux_arm64)  want_sha="$(PROMTOOL_SHA256_linux_arm64)";; \
+		darwin_amd64) want_sha="$(PROMTOOL_SHA256_darwin_amd64)";; \
+		darwin_arm64) want_sha="$(PROMTOOL_SHA256_darwin_arm64)";; \
+		*) echo "✗ unsupported os/arch: $${os}_$${arch} — add a SHA-256 to Makefile and retry."; exit 1;; \
+	esac; \
+	if [ -z "$$want_sha" ]; then \
+		echo "✗ PROMTOOL_SHA256_$${os}_$${arch} is empty — refusing to install promtool without integrity verification."; \
+		exit 1; \
+	fi; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
+	curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
+	echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
+	tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
+	mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
+	chmod +x $(LOCAL_PROMTOOL)
 
 ##@ Development
 
@@ -308,10 +319,12 @@ fmt-check: ## Check Go formatting without modifying files.
 
 .PHONY: verify-prometheus
 verify-prometheus: promtool ## Lint + unit-test the Prometheus alerting rules under config/observability/.
-	@echo "==> promtool check rules (flat alerting-rules.yaml)"
-	@$(PROMTOOL) check rules config/observability/alerting-rules.yaml
-	@echo "==> promtool test rules (prometheus-rules-tests.yaml)"
-	@cd config/observability && $(PROMTOOL) test rules prometheus-rules-tests.yaml
+	@set -e; PROMTOOL=$$($(RESOLVE_PROMTOOL)); \
+	echo "==> using $$PROMTOOL ($$($$PROMTOOL --version 2>&1 | head -1))"; \
+	echo "==> promtool check rules (flat alerting-rules.yaml)"; \
+	$$PROMTOOL check rules config/observability/alerting-rules.yaml; \
+	echo "==> promtool test rules (prometheus-rules-tests.yaml)"; \
+	cd config/observability && $$PROMTOOL test rules prometheus-rules-tests.yaml
 	@echo "==> drift check: PrometheusRule CR spec.groups matches alerting-rules.yaml groups"
 	@$(GO_CMD) run ./hack/verify-prometheus-drift config/observability/alerting-rules.yaml config/observability/prometheus-rules.yaml
 	@echo "✓ Prometheus rules valid"

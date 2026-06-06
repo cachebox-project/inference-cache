@@ -32,15 +32,22 @@ groups:
     interval: 30s
     rules:
       - alert: IndexEmpty
-        # Server reports up=1 but no models hold any prefix entries. Either the
-        # subscriber sidecar is not injected, the engine is not publishing KV
-        # events, or the subscriber→server gRPC dial is failing. The 2m `for`
-        # window dampens a cold-start dwell where the index has not seen its
-        # first event yet.
+        # Server reports up=1, the index holds zero entries, AND a gateway
+        # is actively making LookupRoute calls. The traffic gate is what
+        # distinguishes a genuine "subscriber → server pipeline broken"
+        # outage from a healthy idle install (operator applied the bundle
+        # but no engines deployed yet, no gateway sending traffic). On a
+        # broken install with traffic, every LookupRoute returns NO_HINT
+        # because there's literally nothing to match against — that is the
+        # critical case we want to page on. The 2m `for` dwell still
+        # dampens cold-start where the first KV events have not arrived
+        # yet.
         expr: |
           (inferencecache_server_up == 1)
           and on()
           ((sum(inferencecache_index_entries) or vector(0)) == 0)
+          and on()
+          (sum(rate(inferencecache_lookup_route_calls_total[10m])) > 0)
         for: 2m
         labels:
           severity: critical

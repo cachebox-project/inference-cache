@@ -39,6 +39,8 @@ spec:
             (inferencecache_server_up == 1)
             and on()
             ((sum(inferencecache_index_entries) or vector(0)) == 0)
+            and on()
+            (sum(rate(inferencecache_lookup_route_calls_total[10m])) > 0)
           for: 2m
           labels:
             severity: critical

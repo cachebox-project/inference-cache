@@ -54,13 +54,22 @@ placeholders for three more that depend on metrics not yet exposed (see
 - **Severity**: `critical`
 - **For**: 2 minutes
 - **Source metrics**: `inferencecache_server_up`,
-  `inferencecache_index_entries{model}`
+  `inferencecache_index_entries{model}`,
+  `inferencecache_lookup_route_calls_total`
 
-The cache policy server reports `inferencecache_server_up=1` but the index holds zero
-prefix entries across every model. That means `ReportCacheState` is not
-receiving (or not recording) any KV events from engines. The cache plane
-is effectively a no-op until this clears: every `LookupRoute` returns
-`NO_HINT`; the gateway falls back to its default routing.
+The cache policy server reports `inferencecache_server_up=1` but the
+index holds zero prefix entries across every model **while a gateway is
+actively making `LookupRoute` calls**. That means `ReportCacheState` is
+not receiving (or not recording) any KV events from engines. The cache
+plane is effectively a no-op until this clears: every `LookupRoute`
+returns `NO_HINT`; the gateway falls back to its default routing.
+
+> The traffic gate (`sum(rate(inferencecache_lookup_route_calls_total[10m])) > 0`)
+> distinguishes a genuine pipeline outage from a healthy idle install —
+> e.g. an operator applied the bundle but has not deployed any engines
+> yet, or no gateway is sending traffic. Those installs SHOULD have an
+> empty index; alerting critical there would page every fresh opt-in
+> deployment.
 
 A cold-start dwell (server just started, first engine still booting) is
 normal and dampened by the 2-minute `for:` window. Sustained firing means
@@ -385,7 +394,7 @@ of recurring failure modes:
 | Engine prefix-cache off | `IndexEmpty` (critical) | engine flags `--enable-prefix-caching` + `--kv-events-config` |
 | Offload tier version skew | `LMCacheT2NoHits` (warning) + maybe `LookupRouteDegenerate` if T2 is the only cache path | offload client/server image tags |
 | Tenant or `hash_scheme` mismatch | `LookupRouteDegenerate` (warning) alongside `inferencecache_index_entries > 0` | gateway-side request shape |
-| Server overload | `LookupRouteHighTimeout` (warning) + maybe `LookupRouteDegenerate` | `lookup_route_latency_seconds` p99, `process_resident_memory_bytes`, server's global `MaxEntries` |
+| Server overload | `LookupRouteHighTimeout` (warning) + maybe `LookupRouteDegenerate` | `inferencecache_lookup_route_latency_seconds` p99, `process_resident_memory_bytes`, server's global `MaxEntries` |
 | Working set outgrew config | `IndexEvictionsSpike` (info) | server's global `MaxEntries` vs. observed working-set size; `CacheTenant.spec.quota.maxIndexEntries` per tenant |
 
 If two alerts fire together, work the more-severe one first; the lower
