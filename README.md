@@ -115,8 +115,12 @@ This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
 the alerts.
 
 > **Caveat — Prometheus Operator selectors.** Both CRs carry example
-> labels (`prometheus: kube-prometheus`, plus `role: alert-rules` on
-> the PrometheusRule) that match a stock kube-prometheus install. If
+> labels (`prometheus: k8s`, plus `role: alert-rules` on
+> the PrometheusRule) that match the upstream kube-prometheus stack
+> (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
+> Helm chart uses a different convention (`release: <release-name>`,
+> no `prometheus:` label) — its rule/serviceMonitor selectors do not
+> match what's shipped here. If
 > your `Prometheus` CR's `ruleSelector` / `serviceMonitorSelector`
 > uses a different label set (`release: my-prom`, etc.), `kubectl
 > apply -k` succeeds but Prometheus silently ignores both resources.

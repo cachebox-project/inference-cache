@@ -24,16 +24,20 @@ metadata:
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: observability
-    # NOTE: these are EXAMPLE selector labels matching a stock
-    # kube-prometheus install (`prometheus: kube-prometheus`,
-    # `role: alert-rules`). Prometheus Operator only loads PrometheusRule
-    # CRs whose labels match the Prometheus CR's `ruleSelector`. If your
-    # install uses a different selector (`release: prometheus`,
-    # `app: prometheus`, etc.) `kubectl apply -k` succeeds but Prometheus
-    # silently ignores this rule until the labels match. Check with:
+    # NOTE: these labels target the UPSTREAM kube-prometheus stack's
+    # default `Prometheus` named `k8s` (`prometheus: k8s`,
+    # `role: alert-rules`). Other common conventions to be aware of:
+    #   * `prometheus-community/kube-prometheus-stack` Helm chart →
+    #     `release: <helm-release-name>` (no `prometheus:` label).
+    #   * Custom `Prometheus` CRs → whatever labels their
+    #     `ruleSelector.matchLabels` specifies.
+    # Prometheus Operator only loads PrometheusRule CRs whose labels
+    # match the Prometheus CR's `ruleSelector`; `kubectl apply -k`
+    # succeeds either way but Prometheus silently ignores this rule
+    # until the labels match. Introspect your install with:
     #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.ruleSelector}'
     # and edit these labels to match.
-    prometheus: kube-prometheus
+    prometheus: k8s
     role: alert-rules
 spec:
   groups:

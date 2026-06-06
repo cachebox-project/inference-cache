@@ -148,7 +148,14 @@ promtool: $(LOCALBIN) ## Ensure a $(PROMTOOL_VERSION) promtool is available. Dow
 	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
 	curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
-	echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
+	if command -v shasum >/dev/null 2>&1; then \
+		echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
+	elif command -v sha256sum >/dev/null 2>&1; then \
+		echo "$$want_sha  $${tmp}/promtool.tgz" | sha256sum -c -; \
+	else \
+		echo "✗ neither shasum nor sha256sum is available — refusing to install promtool without integrity verification."; \
+		exit 1; \
+	fi; \
 	tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
 	mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
 	chmod +x $(LOCAL_PROMTOOL)

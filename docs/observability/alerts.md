@@ -33,17 +33,21 @@ There are two distribution shapes, same rule set, drift-gated by
   Both CRs are pinned to namespace `inference-cache-system`. The
   example selector labels each CR carries are:
   - `PrometheusRule` →
-    `prometheus: kube-prometheus`, `role: alert-rules` (matched by
+    `prometheus: k8s`, `role: alert-rules` (matched by
     `Prometheus.spec.ruleSelector`).
   - `ServiceMonitor` →
-    `prometheus: kube-prometheus` (matched by
+    `prometheus: k8s` (matched by
     `Prometheus.spec.serviceMonitorSelector`).
 
-  Both match a stock kube-prometheus install. If your Prometheus CR's
-  `ruleSelector` and `serviceMonitorSelector` use different label sets
-  (e.g. `release: my-prom`, `app: prometheus`), edit each CR's labels
-  to match — the YAML comments next to each label spell out the exact
-  `kubectl get prometheus -o jsonpath=...` introspection command.
+  Both target the **upstream kube-prometheus stack**, whose default
+  `Prometheus` is named `k8s`. The `prometheus-community/kube-prometheus-stack`
+  Helm chart uses a DIFFERENT convention — its selector matches
+  `release: <helm-release-name>` (no `prometheus:` label). Custom
+  Prometheus CRs use whatever their `ruleSelector` /
+  `serviceMonitorSelector` specifies. If your install uses a different
+  label set, edit each CR's labels to match — the YAML comments next
+  to each label spell out the exact `kubectl get prometheus -o
+  jsonpath=...` introspection command.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
@@ -86,13 +90,22 @@ placeholders for three more that depend on metrics not yet exposed (see
 > [`LMCacheT2NoHits`](#lmcachet2nohits) reads `vllm:external_prefix_cache_*`,
 > which vLLM exposes on its own `/metrics`. The included `ServiceMonitor`
 > covers only `inference-cache-server`. To make `LMCacheT2NoHits` light
-> up, your install must also scrape engine pods — typically by adding a
-> separate **`PodMonitor`** for your vLLM Deployment (or `kubernetes_sd_configs: pod`
-> for vanilla Prometheus). **Pod-level scraping is REQUIRED** — the alert
-> groups by `pod` and the alert summary substitutes `{{ $labels.pod }}`,
-> so a Service-level scrape (which collapses all replicas into one series)
-> would render the summary with an empty pod label. The other four alerts
-> work as-is once this bundle is applied.
+> up, your install must also scrape engine pods — typically a separate
+> **`PodMonitor`** for your vLLM Deployment, or a `ServiceMonitor` on
+> a headless / per-pod Service (Endpoints discovery), or
+> `kubernetes_sd_configs: pod` for vanilla Prometheus.
+>
+> **The scrape MUST preserve both `namespace` and `pod` labels** —
+> the alert groups `sum by (namespace, pod)` and its summary
+> substitutes `{{ $labels.pod }}`. A scrape against a load-balanced
+> ClusterIP Service (single target, single `instance` label) would
+> aggregate all replicas under one series with no `pod` label and
+> render the summary with an empty pod. PodMonitor + standard
+> prometheus-operator relabel rules give you both labels for free;
+> ServiceMonitor against a headless Service does too (one Endpoints
+> entry per Pod). Static targets do NOT.
+>
+> The other four alerts work as-is once this bundle is applied.
 >
 > **The alerts rely on a `namespace` label per install.** Both the shipped
 > `ServiceMonitor` for `inference-cache-server` and any prometheus-operator
