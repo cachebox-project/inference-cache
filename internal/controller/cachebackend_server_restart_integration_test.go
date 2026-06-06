@@ -249,7 +249,7 @@ func newEngineDeployment(namespace, name string) *appsv1.Deployment {
 // newEngineReplicaSet fabricates the ReplicaSet the apps/v1 Deployment
 // controller would normally create (envtest does not run that
 // controller). The Deployment is named via a controller-owner reference so
-// podOwningDeploymentName can walk pod → RS → Deployment.
+// podOwningDeployment can walk pod → RS → Deployment.
 func newEngineReplicaSet(namespace, name string, dep *appsv1.Deployment) *appsv1.ReplicaSet {
 	tru := true
 	one := int32(1)

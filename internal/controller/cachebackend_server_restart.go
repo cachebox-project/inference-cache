@@ -27,9 +27,12 @@ import (
 // AnnotationCacheServerRestartTrigger is patched onto an engine Deployment's
 // spec.template.metadata.annotations to drive a rolling restart of its pods
 // when the controller observes that this backend's cache-server pod has been
-// replaced. The value is the new cache-server pod's metadata.uid, so two
-// quick replacements in succession produce distinct annotation values (and
-// distinct rollout revisions). Modeled on the kubectl rollout restart pattern
+// replaced. The value is the same server-instance identifier the controller
+// writes to status.observedServerInstance (`<pod-uid>:<restart-sum>` for a
+// single-replica backend, or a comma-joined lex-sorted list of those for a
+// multi-replica backend), so two quick replacements in succession produce
+// distinct annotation values (and distinct rollout revisions). Modeled on
+// the kubectl rollout restart pattern
 // (kubectl.kubernetes.io/restartedAt), but project-namespaced so an operator
 // running both does not see the two trample each other.
 //
@@ -209,9 +212,17 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
 	currentID, err := r.currentServerInstanceUID(ctx, backend)
 	if err != nil {
+		// A transient observation failure (apiserver hiccup, RBAC
+		// flake on a ReplicaSet Get along the owner chain) leaves
+		// us unable to decide whether a cascade is needed. Return
+		// the rate-limit interval as the requeue hint so the
+		// reconcile retries within the same window we'd cascade in
+		// — without this, the only path back is unrelated watch
+		// events, which can leave the recovery stranded (especially
+		// in the selector-removed-but-still-injected case).
 		logger.V(1).Info("server-restart cascade skipped: cache-server pod list failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return 0
+		return r.minServerRestartCascadeInterval()
 	}
 	if currentID == "" {
 		// No Ready cache-server pod yet — nothing to anchor to.
@@ -638,7 +649,7 @@ func podIsReady(p *corev1.Pod) bool {
 // any in-namespace Deployment whose template the controller can
 // patch". The cache plane's existing engine-pod-events controller
 // makes the same trust assumption for the same reason.
-func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Context, backend *cachev1alpha1.CacheBackend, newUID string) (int, error) {
+func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Context, backend *cachev1alpha1.CacheBackend, serverInstanceID string) (int, error) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
@@ -651,7 +662,18 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 
 	wantInjectedBy := backend.Namespace + "/" + backend.Name
 	wantInjectedByUID := string(backend.UID)
-	deploymentNames := map[string]struct{}{}
+	// Dedupe targets by (name, UID) — not name alone. The owner-chain
+	// walk in podOwningDeploymentName verified the Deployment's UID at
+	// the moment of resolution, but a Deployment could be deleted and
+	// re-created under the same name between resolution and the patch
+	// loop; annotating by name alone in that window would roll an
+	// unrelated workload that happens to share the name. Carrying the
+	// expected UID lets annotateDeploymentForCascade re-check before
+	// patching, closing the TOCTOU window.
+	type targetRef struct {
+		uid string
+	}
+	targets := map[string]targetRef{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Annotations[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
@@ -668,27 +690,33 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
-		depName, ok, err := r.podOwningDeploymentName(ctx, reader, p)
+		depName, depUID, ok, err := r.podOwningDeployment(ctx, reader, p)
 		if err != nil {
 			return 0, err
 		}
 		if !ok {
 			continue
 		}
-		deploymentNames[depName] = struct{}{}
+		// First write wins; if a later pod resolves the same name to a
+		// different UID, that means the chain has churned since the
+		// pod List — keep the UID we saw first (the patch step will
+		// reject if neither identity matches the live Deployment).
+		if _, exists := targets[depName]; !exists {
+			targets[depName] = targetRef{uid: depUID}
+		}
 	}
 
 	// Sort for deterministic patch order (helps tests, helps log
 	// readability; the apiserver does not care).
-	names := make([]string, 0, len(deploymentNames))
-	for n := range deploymentNames {
+	names := make([]string, 0, len(targets))
+	for n := range targets {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 
 	annotated := 0
 	for _, name := range names {
-		patched, err := r.annotateDeploymentForCascade(ctx, backend.Namespace, name, newUID)
+		patched, err := r.annotateDeploymentForCascade(ctx, backend.Namespace, name, targets[name].uid, serverInstanceID)
 		if err != nil {
 			return annotated, err
 		}
@@ -699,9 +727,14 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 	return annotated, nil
 }
 
-// podOwningDeploymentName walks pod → controller-owning ReplicaSet →
-// controller-owning Deployment and returns the Deployment's name (in
-// the same namespace as the pod — apps/v1 ownership is namespaced).
+// podOwningDeployment walks pod → controller-owning ReplicaSet →
+// controller-owning Deployment and returns the Deployment's name AND
+// observed UID (in the same namespace as the pod — apps/v1 ownership
+// is namespaced). The UID is carried back so the caller can re-verify
+// at the moment of patch, closing a TOCTOU window where the resolved
+// Deployment is deleted and re-created under the same name between
+// resolution and annotate.
+//
 // The (found, err) split distinguishes "definitively not Deployment-
 // owned" (found=false, err=nil — bare pod, StatefulSet, etc.) from
 // "couldn't decide" (err != nil — transient apiserver / RBAC issue).
@@ -723,26 +756,26 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 // been GCd between our pod List and the Get) returns
 // (found=false, err=nil) — the pod's owner chain is gone, so it
 // cannot be cascaded anyway. Non-NotFound errors bubble up.
-func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, reader client.Reader, pod *corev1.Pod) (string, bool, error) {
+func (r *CacheBackendReconciler) podOwningDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod) (string, string, bool, error) {
 	rsRef := metav1.GetControllerOf(pod)
 	if rsRef == nil || rsRef.Kind != "ReplicaSet" || !ownerRefIsAppsV1(rsRef) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	var rs appsv1.ReplicaSet
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: rsRef.Name}, &rs); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", false, nil
+			return "", "", false, nil
 		}
-		return "", false, fmt.Errorf("get owning ReplicaSet %s/%s: %w", pod.Namespace, rsRef.Name, err)
+		return "", "", false, fmt.Errorf("get owning ReplicaSet %s/%s: %w", pod.Namespace, rsRef.Name, err)
 	}
 	if rs.UID != rsRef.UID {
 		// Name resolved to a different live RS (re-created under the
 		// same name). Not the pod's actual owner.
-		return "", false, nil
+		return "", "", false, nil
 	}
 	depRef := metav1.GetControllerOf(&rs)
 	if depRef == nil || depRef.Kind != "Deployment" || !ownerRefIsAppsV1(depRef) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	// Verify the Deployment named in depRef still exists with the
 	// declared UID. A name-only return would let a stale ownerRef
@@ -751,24 +784,30 @@ func (r *CacheBackendReconciler) podOwningDeploymentName(ctx context.Context, re
 	var dep appsv1.Deployment
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: depRef.Name}, &dep); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", false, nil
+			return "", "", false, nil
 		}
-		return "", false, fmt.Errorf("get owning Deployment %s/%s: %w", pod.Namespace, depRef.Name, err)
+		return "", "", false, fmt.Errorf("get owning Deployment %s/%s: %w", pod.Namespace, depRef.Name, err)
 	}
 	if dep.UID != depRef.UID {
-		return "", false, nil
+		return "", "", false, nil
 	}
-	return dep.Name, true, nil
+	return dep.Name, string(dep.UID), true, nil
 }
 
 // annotateDeploymentForCascade patches AnnotationCacheServerRestartTrigger
 // onto the Deployment's pod template annotations using a JSON merge
 // patch, so concurrent writers on other template fields are not
-// clobbered. Returns whether a patch was actually issued (false when the
-// trigger already carried newUID — guards against a no-op rollout if the
-// reconciler retries on the same UID). A NotFound on the Deployment is
-// treated as a successful no-op.
-func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Context, namespace, name, newUID string) (bool, error) {
+// clobbered. Returns whether a patch was actually issued (false when
+// the trigger already carried serverInstanceID — guards against a
+// no-op rollout if the reconciler retries on the same identifier).
+//
+// expectedUID is the Deployment UID observed at owner-chain resolution
+// time. If the live Deployment's UID does not match, the resolved
+// target was deleted and re-created under the same name between
+// resolution and patch (TOCTOU); we skip the patch rather than roll an
+// unrelated workload that happens to share the name. NotFound on the
+// live Deployment is the same case — the target has been GCd.
+func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Context, namespace, name, expectedUID, serverInstanceID string) (bool, error) {
 	var dep appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &dep); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -776,7 +815,13 @@ func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Contex
 		}
 		return false, fmt.Errorf("get engine deployment %s/%s: %w", namespace, name, err)
 	}
-	if dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] == newUID {
+	if string(dep.UID) != expectedUID {
+		// Live Deployment has a different UID than the one resolved
+		// during pod owner-chain walking — same name, different
+		// object. Refuse to roll the unrelated workload.
+		return false, nil
+	}
+	if dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] == serverInstanceID {
 		// Already up to date — somebody (us, on a retry) already
 		// patched this round. Skip without bumping the rollout
 		// revision.
@@ -786,7 +831,7 @@ func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Contex
 	if dep.Spec.Template.Annotations == nil {
 		dep.Spec.Template.Annotations = map[string]string{}
 	}
-	dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] = newUID
+	dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] = serverInstanceID
 	if err := r.Patch(ctx, &dep, client.MergeFrom(before)); err != nil {
 		return false, fmt.Errorf("patch engine deployment %s/%s pod-template annotations: %w", namespace, name, err)
 	}

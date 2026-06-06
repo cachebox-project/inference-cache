@@ -878,21 +878,24 @@ func TestReconcileServerInstance_AnnotateIdempotent(t *testing.T) {
 	}
 }
 
-func TestPodOwningDeploymentName_ResolvesViaReplicaSet(t *testing.T) {
+func TestPodOwningDeployment_ResolvesViaReplicaSet(t *testing.T) {
 	f := newCascadeRestartFixture(t)
-	got, ok, err := f.r.podOwningDeploymentName(context.Background(), f.r.Client, f.enginePod)
+	name, uid, ok, err := f.r.podOwningDeployment(context.Background(), f.r.Client, f.enginePod)
 	if err != nil {
-		t.Fatalf("podOwningDeploymentName err = %v, want nil", err)
+		t.Fatalf("podOwningDeployment err = %v, want nil", err)
 	}
 	if !ok {
-		t.Fatalf("podOwningDeploymentName ok = false, want true")
+		t.Fatalf("podOwningDeployment ok = false, want true")
 	}
-	if got != f.engineDepN {
-		t.Fatalf("Deployment name = %q, want %q", got, f.engineDepN)
+	if name != f.engineDepN {
+		t.Fatalf("Deployment name = %q, want %q", name, f.engineDepN)
+	}
+	if uid == "" {
+		t.Fatalf("Deployment UID is empty; the owner-chain walk must return a non-empty UID so the cascade patch can re-verify identity")
 	}
 }
 
-func TestPodOwningDeploymentName_NoOwnerReturnsFalse(t *testing.T) {
+func TestPodOwningDeployment_NoOwnerReturnsFalse(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 	bare := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -900,9 +903,88 @@ func TestPodOwningDeploymentName_NoOwnerReturnsFalse(t *testing.T) {
 			Namespace: f.engineNS,
 		},
 	}
-	if _, ok, err := f.r.podOwningDeploymentName(context.Background(), f.r.Client, bare); err != nil || ok {
-		t.Fatalf("podOwningDeploymentName for an unowned pod returned (ok=%v, err=%v); want (false, nil)", ok, err)
+	if _, _, ok, err := f.r.podOwningDeployment(context.Background(), f.r.Client, bare); err != nil || ok {
+		t.Fatalf("podOwningDeployment for an unowned pod returned (ok=%v, err=%v); want (false, nil)", ok, err)
 	}
+}
+
+// TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch locks in
+// the round-7 fix: if the live Deployment's UID does not match the UID
+// observed during owner-chain resolution, the patch is skipped (the
+// resolved target was deleted and re-created under the same name). A
+// name-only patch in that window would roll an unrelated workload.
+func TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Look up the live Deployment UID so we can pass a *different* one.
+	live := &appsv1.Deployment{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.engineDepN, Namespace: f.engineNS}, live); err != nil {
+		t.Fatalf("get live engine Deployment: %v", err)
+	}
+	bogus := string(live.UID) + "-stale"
+
+	beforeTrigger := live.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]
+
+	patched, err := f.r.annotateDeploymentForCascade(
+		context.Background(),
+		f.engineNS,
+		f.engineDepN,
+		bogus,                 // expectedUID — deliberately stale
+		"new-instance-id-xyz", // serverInstanceID
+	)
+	if err != nil {
+		t.Fatalf("annotateDeploymentForCascade returned err = %v; want nil (TOCTOU skip is not an error)", err)
+	}
+	if patched {
+		t.Fatalf("annotateDeploymentForCascade patched = true; want false (UID mismatch should refuse the patch)")
+	}
+
+	// Confirm the Deployment was NOT modified.
+	after := &appsv1.Deployment{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.engineDepN, Namespace: f.engineNS}, after); err != nil {
+		t.Fatalf("get post-call engine Deployment: %v", err)
+	}
+	if got := after.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != beforeTrigger {
+		t.Fatalf("Deployment annotation was modified despite UID mismatch: before=%q after=%q", beforeTrigger, got)
+	}
+}
+
+// TestReconcileServerInstance_ObservationErrorRequeues asserts that when
+// currentServerInstanceUID fails (transient apiserver/RBAC hiccup),
+// reconcileServerInstance returns a positive requeue duration so the
+// reconcile retries within the rate-limit window — without this, an
+// observation failure would silently skip the cascade and the only
+// path back is unrelated watch events.
+func TestReconcileServerInstance_ObservationErrorRequeues(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Inject a Client whose Pod List errors. The pod List in
+	// currentServerInstanceUID is the first apiserver call on the
+	// reconciler's hot path, so any error here exercises the
+	// "observation failed" branch.
+	f.r.Client = &erroringPodListClient{Client: f.r.Client}
+
+	wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend)
+	if wait <= 0 {
+		t.Fatalf("reconcileServerInstance wait = %v on observation failure; want a positive requeue (rate-limit interval)", wait)
+	}
+	if want := f.r.minServerRestartCascadeInterval(); wait != want {
+		t.Fatalf("reconcileServerInstance wait = %v on observation failure; want %v (the rate-limit interval)", wait, want)
+	}
+}
+
+// erroringPodListClient wraps a client.Client and returns a synthetic
+// error from List() when the target is a PodList. Used to exercise the
+// reconcileServerInstance observation-failure path.
+type erroringPodListClient struct {
+	client.Client
+}
+
+func (c *erroringPodListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.PodList); ok {
+		return fmt.Errorf("synthetic pod-list failure for test")
+	}
+	return c.Client.List(ctx, list, opts...)
 }
 
 // countingClient counts Patch calls on Deployments. Used by

@@ -2201,13 +2201,19 @@ spec:
                   for this managed backend. The shape is `<pod-uid>:<restart-sum>`
                   per Ready pod, comma-joined and lex-sorted by pod name; the
                   restart-sum is the sum of pod.status.containerStatuses[].
-                  RestartCount across the pod's containers, so an in-place
-                  container restart (kubelet respawning a crashed cache-server
-                  container — OOM with restartPolicy=Always reuses pod.UID)
-                  advances the identifier and is observable. For most managed
-                  backends this is a single segment; multi-replica ephemeral
-                  backends (spec.replicas > 1 on non-PVC backends) produce a
-                  comma-joined list.
+                  RestartCount filtered to the cache-server's own containers —
+                  the container names declared on the owned Deployment's pod
+                  template. Sidecars added to the pod by other admission webhooks
+                  (service-mesh proxies, Datadog, etc.) appear in
+                  containerStatuses but are absent from the template and are
+                  intentionally excluded — a service-mesh sidecar crash-loop
+                  must not advance the identifier and roll the engine fleet.
+                  An in-place restart of a cache-server container (kubelet
+                  respawning a crashed container — OOM with restartPolicy=Always
+                  reuses pod.UID) DOES advance the identifier and is observable.
+                  For most managed backends this is a single segment; multi-
+                  replica ephemeral backends (spec.replicas > 1 on non-PVC
+                  backends) produce a comma-joined list.
 
                   When the identifier changes in a way that reflects an actual
                   cache-server replacement — a prior pod is gone, or a persisting

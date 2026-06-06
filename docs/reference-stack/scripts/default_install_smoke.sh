@@ -1152,8 +1152,10 @@ fi
 log "status.observedServerInstance flipped: $baseline_server_instance → $new_server_instance"
 
 # Assert the engine Deployment's pod template carries the cascade trigger
-# annotation set to the new UID. The annotation is the mechanism that
-# drives the rolling restart, so its absence here is a missed cascade.
+# annotation set to the new server-instance identifier (the same value the
+# controller wrote to status.observedServerInstance). The annotation is
+# the mechanism that drives the rolling restart, so its absence here is
+# a missed cascade.
 log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the engine Deployment to receive the cascade trigger annotation"
 deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
 trigger=""
