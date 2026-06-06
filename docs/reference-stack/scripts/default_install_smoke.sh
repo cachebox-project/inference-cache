@@ -55,14 +55,14 @@
 #   8c. CacheBackend.spec.resources defaults + threading: the CRD-schema
 #      default stamps spec.resources.limits.memory on every admitted
 #      CacheBackend (so the cache-server pod is bounded by the cgroup
-#      rather than OOM-killed under T2 write load — the failure mode
-#      that surfaced in the Phase-2 benchmark), and the controller
-#      threads the value into the rendered Deployment container. The
-#      smoke asserts BOTH ends of the contract against the real
-#      kubectl-installed bundle — the CR's spec carries the default AND
-#      the rendered pod template's container shows the same limit —
-#      because either half-failing reintroduces the OOM-cliff
-#      regression.
+#      rather than node-pressure OOM-killed by the kubelet under T2
+#      write load — the failure mode that surfaced in the Phase-2
+#      benchmark), and the controller threads the value into the
+#      rendered Deployment container. The smoke asserts BOTH ends of
+#      the contract against the real kubectl-installed bundle — the
+#      CR's spec carries the default AND the rendered pod template's
+#      container shows the same limit — because either half-failing
+#      reintroduces the regression.
 #   9. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO

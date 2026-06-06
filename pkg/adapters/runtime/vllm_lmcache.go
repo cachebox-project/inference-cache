@@ -350,11 +350,14 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 	if out.Requests == nil {
 		out.Requests = corev1.ResourceList{}
 	}
+	// CPU-only fallback: the autoscaling spec drives a
+	// targetCPUUtilizationPercent HPA, which needs a CPU request as
+	// the denominator. Memory is NOT auto-filled — spec.resources
+	// (carrying the CRD-stamped memory default) is the canonical
+	// source for memory, and synthesising a second memory request
+	// here would override an operator-supplied limits-only shape.
 	if _, hasCPU := out.Requests[corev1.ResourceCPU]; !hasCPU {
 		out.Requests[corev1.ResourceCPU] = resource.MustParse("250m")
-	}
-	if _, hasMem := out.Requests[corev1.ResourceMemory]; !hasMem {
-		out.Requests[corev1.ResourceMemory] = resource.MustParse("1Gi")
 	}
 	return out
 }

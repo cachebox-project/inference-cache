@@ -511,6 +511,36 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesClaimsRejected(t *testing.T) {
+	// corev1.ResourceRequirements exposes Claims for the Dynamic Resource
+	// Allocation (DRA) feature, but the renderer only copies Container.
+	// Resources — it does NOT plumb the matching pod.spec.resourceClaims
+	// the claims field references. Admitting a CR with non-empty Claims
+	// would render a Deployment the apiserver rejects because the claim
+	// names don't resolve at the pod level. Reject at admission until the
+	// renderer learns to thread resourceClaims onto the PodSpec.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Claims: []corev1.ResourceClaim{{Name: "gpu-claim"}},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.claims",
+		"spec.resources.claims is not supported")
+}
+
+func TestValidator_ResourcesEmptyClaimsAdmitted(t *testing.T) {
+	// A nil/empty Claims slice MUST admit — the rule only fires on
+	// operator-supplied entries, never on the absence of the field.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("nil-Claims rejected: %v", err)
+	}
+}
+
 func TestValidator_ResourcesCPULimitsBelowRequestsRejected(t *testing.T) {
 	// The rule generalises across every resource present in BOTH the
 	// Requests and Limits maps — it's not specific to memory. CPU is

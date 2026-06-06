@@ -155,6 +155,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectResourceLimitsBelowRequests,
+	rejectResourceClaims,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -988,6 +989,31 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 		))
 	}
 	return errs
+}
+
+// rejectResourceClaims rejects a non-empty spec.resources.claims slice.
+// corev1.ResourceRequirements exposes Claims for the Dynamic Resource
+// Allocation (DRA) feature, but the runtime adapter only copies
+// Container.Resources onto the rendered pod template — it does NOT
+// populate the matching pod.spec.resourceClaims that claim names
+// reference. Admitting a CR with non-empty Claims would render a
+// Deployment the apiserver rejects because the claim names don't
+// resolve at the pod level (silent breakage that's hard to triage from
+// the CacheBackend side). Reject loudly at admission until the renderer
+// learns to plumb the full pod-level DRA surface.
+//
+// A nil/empty Claims slice is the absence of the field and admits
+// unchanged — the rule fires only on operator-supplied entries.
+func rejectResourceClaims(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil || len(cb.Spec.Resources.Claims) == 0 {
+		return nil
+	}
+	return field.ErrorList{
+		field.Forbidden(
+			field.NewPath("spec", "resources", "claims"),
+			"spec.resources.claims is not supported in v1alpha1: the runtime adapter does not plumb pod.spec.resourceClaims, so a claim-bound container.resources.claims would render a pod the apiserver rejects",
+		),
+	}
 }
 
 // k8sClusterDomain is the standard Kubernetes cluster DNS suffix. Most

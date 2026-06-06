@@ -151,11 +151,15 @@ func TestVLLMLMCacheResolveCacheServerNoRequestsWithoutAutoscaling(t *testing.T)
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerHasResourceRequestsWhenAutoscaled(t *testing.T) {
-	// A CPU-utilization HPA needs the pod's CPU request as the denominator
-	// to compute utilization, so without one the autoscaler never gets a
-	// usable metric. The adapter must therefore declare CPU + memory
-	// requests on the lmcache-server container when spec.autoscaling is set.
+func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) {
+	// A targetCPUUtilizationPercent HPA needs the pod's CPU request
+	// as the utilization denominator, so without one the autoscaler
+	// never gets a usable metric. The adapter must therefore declare
+	// a CPU request on the lmcache-server container when spec.autoscaling
+	// is set. Memory is NOT auto-filled — spec.resources is the
+	// canonical source (and on the apiserver path the CRD-stamped
+	// default carries it); synthesising a second memory request here
+	// would silently override an operator-supplied limits-only shape.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
@@ -165,9 +169,39 @@ func TestVLLMLMCacheResolveCacheServerHasResourceRequestsWhenAutoscaled(t *testi
 	if !hasCPU || cpu.IsZero() {
 		t.Fatalf("container Resources.Requests missing a CPU request under autoscaling: %v", reqs)
 	}
-	mem, hasMem := reqs[corev1.ResourceMemory]
-	if !hasMem || mem.IsZero() {
-		t.Fatalf("container Resources.Requests missing a memory request under autoscaling: %v", reqs)
+	if _, hasMem := reqs[corev1.ResourceMemory]; hasMem {
+		t.Fatalf("container Resources.Requests[memory] = %v, want unset (memory is not auto-filled — spec.resources is the canonical source)", reqs[corev1.ResourceMemory])
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerAutoscalingPreservesLimitsOnlyResources(t *testing.T) {
+	// Operator-supplied limits-only spec.resources combined with
+	// autoscaling MUST surface as: limits intact, requests carry only
+	// the HPA CPU fallback (no synthesised memory request). The
+	// previous behavior synthesised a 1Gi memory request whenever
+	// memory was absent under autoscaling, which silently overrode
+	// the operator's "limit-only" intent — that is the gap this
+	// test pins shut.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+	}
+	pod := resolvePod(t, a, cb)
+	got := pod.Containers[0].Resources
+
+	wantLim := resource.MustParse("8Gi")
+	if mem := got.Limits[corev1.ResourceMemory]; mem.Cmp(wantLim) != 0 {
+		t.Fatalf("Limits[memory] = %v, want operator-supplied %v", mem.String(), wantLim.String())
+	}
+	if _, hasMem := got.Requests[corev1.ResourceMemory]; hasMem {
+		t.Fatalf("Requests[memory] = %v, want unset (operator declared limits-only)", got.Requests[corev1.ResourceMemory])
+	}
+	if cpu, hasCPU := got.Requests[corev1.ResourceCPU]; !hasCPU || cpu.IsZero() {
+		t.Fatalf("Requests[cpu] = %v, want HPA fallback", cpu)
 	}
 }
 
