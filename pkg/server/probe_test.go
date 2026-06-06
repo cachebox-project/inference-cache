@@ -279,6 +279,38 @@ func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
 	}
 }
 
+// TestProberRunStageBDistinguishesWrongReplicaFromWrongStrategy pins the
+// per-failure-mode diagnostic the controller surfaces. When LookupRoute
+// returns PREFIX_MATCH but for a DIFFERENT replica than the probe synthesized,
+// the error message names the expected probe replica explicitly — the operator
+// should see "not among the scored replicas" rather than the misleading
+// "returned PREFIX_MATCH, expected PREFIX_MATCH" the original implementation
+// produced.
+func TestProberRunStageBDistinguishesWrongReplicaFromWrongStrategy(t *testing.T) {
+	prober, _ := newProberForTest(t, nil)
+	prober.routeFn = func(index.LookupRequest) index.LookupResult {
+		return index.LookupResult{
+			Strategy: index.StrategyPrefixMatch,
+			Scores:   []index.ReplicaScore{{ReplicaID: "wrong-replica", MatchedTokens: 16}},
+		}
+	}
+
+	result := prober.Run(t.Context(), ProbeRequest{
+		Backend: "cb-1", Model: "m", HashScheme: "vllm",
+	})
+	if result.Routing != ProbeStageFailed {
+		t.Fatalf("Routing = %q, want %q", result.Routing, ProbeStageFailed)
+	}
+	msg := stageErrorMessage(result.Errors, ProbeStageRouting)
+	expectedReplica := ProbeReplicaID("cb-1")
+	if !strings.Contains(msg, "not among the scored replicas") {
+		t.Errorf("routing error %q should distinguish wrong-replica from wrong-strategy", msg)
+	}
+	if !strings.Contains(msg, expectedReplica) {
+		t.Errorf("routing error %q should name the expected probe replica %q", msg, expectedReplica)
+	}
+}
+
 // TestProberRunStageCDistinguishesPutFromGet covers the LMCache failure
 // modes the operator condition message has to disambiguate: the put silently
 // dropped vs the get returning nothing. A *T2ProbeError carries
@@ -384,6 +416,47 @@ func TestProberRunIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestProberRunDoesNotEvictRealWorkloadOnFullIndex pins the blocking
+// invariant the probe must never violate: on a near-full index (totalEntries
+// already at MaxEntries), the probe's transient ingest MUST NOT trigger the
+// global cap sweep — a triggered sweep would evict an oldest real-workload
+// entry just to make room for an ingest the probe is about to remove anyway.
+// The probe routes through Index.IngestSkipCap for this reason; without that,
+// the test would observe the seeded real-workload entry gone after the probe.
+func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
+	// Index sized exactly to one entry, so a second ingest would immediately
+	// trigger cap eviction under the normal Ingest path.
+	idx := index.New(index.WithMaxEntries(1))
+	idx.Start(t.Context())
+	prober := NewProber(idx, nil)
+
+	// Seed a real-workload entry that fills the entire cap.
+	idx.Ingest(index.Update{
+		ReplicaID: "real-replica", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
+	})
+
+	// Run the probe. With IngestSkipCap, this momentarily takes the index to
+	// totalEntries=2, runs the lookup, then cleanup removes the probe entry —
+	// without the cap sweep firing in between to evict the real-workload entry.
+	result := prober.Run(t.Context(), ProbeRequest{
+		Backend: "cb-1", Model: "m", HashScheme: "vllm",
+	})
+	if !result.AllPassed() {
+		t.Fatalf("probe AllPassed = false on near-cap index; result = %+v", result)
+	}
+
+	// The real workload entry MUST survive. If the probe accidentally went
+	// through cap-enforcing Ingest, the seeded entry would have been evicted
+	// before the probe entry was cleaned up.
+	scores := idx.Lookup(index.LookupRequest{
+		Tenant: "real-tenant", Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 1 || scores[0].ReplicaID != "real-replica" {
+		t.Fatalf("real-workload entry evicted by probe ingest on a full index; scores = %+v", scores)
+	}
+}
+
 // TestProberRunReservedTenantUsedRegardlessOfRequest pins the contract that
 // the caller cannot supply a tenant: ProbeRequest carries no tenant field,
 // so a malicious or buggy caller cannot probe under a real workload tenant
@@ -483,7 +556,11 @@ func TestProbeHandlerRejectsMalformedBody(t *testing.T) {
 		// Trailing JSON value after the first object: rejected so a
 		// crafted body can't smuggle a second decoded value past the
 		// strictness implied by DisallowUnknownFields.
-		{"trailing json", `{"backend":"cb-1","model":"m","hashScheme":"vllm"} {"backend":"x","model":"y","hashScheme":"vllm"}`},
+		{"trailing json object", `{"backend":"cb-1","model":"m","hashScheme":"vllm"} {"backend":"x","model":"y","hashScheme":"vllm"}`},
+		// Trailing closing bracket — the case dec.More() alone misses.
+		{"trailing bracket", `{"backend":"cb-1","model":"m","hashScheme":"vllm"}]`},
+		// Trailing garbage that's neither a JSON value nor a bracket.
+		{"trailing garbage", `{"backend":"cb-1","model":"m","hashScheme":"vllm"}garbage`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

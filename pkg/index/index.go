@@ -507,6 +507,34 @@ func (i *Index) Ready() bool { return i.ready.Load() }
 // engine KV-event model (e.g. vLLM BlockStored / BlockRemoved) and the soft-state
 // guarantee: a stale hint causes a cache miss, never a wrong answer.
 func (i *Index) Ingest(u Update) {
+	i.ingest(u, false)
+}
+
+// IngestSkipCap applies an update WITHOUT triggering the global MaxEntries
+// cap sweep. Use ONLY for ephemeral synthetic state (e.g., the server's
+// functional self-test probe) that will be removed shortly via an explicit
+// ApplyEvent(EventAllCleared) — a normal subscriber path must use Ingest so
+// cap enforcement keeps the index bounded.
+//
+// The cap sweep, when triggered by a near-full-cap ingest, may evict an
+// oldest REAL-workload entry to make room — going through Ingest from the
+// probe path would therefore violate the probe's "never mutates real
+// workload state" invariant on a saturated index. Bypassing the sweep
+// here is safe because the probe is followed by an immediate cleanup that
+// brings totalEntries back below its prior value; the probe's own entries
+// are still subject to the TTL sweep as a defense-in-depth backstop. The
+// tenant-quota check still fires for hasQuota tenants — but the probe
+// tenant (ProbeTenantID in pkg/server) is exempted at the resolver layer
+// (PolicyStore.TenantQuota), so the probe path bypasses both axes.
+func (i *Index) IngestSkipCap(u Update) {
+	i.ingest(u, true)
+}
+
+// ingest is the shared implementation backing both Ingest and
+// IngestSkipCap. skipCap=true skips the global MaxEntries cap sweep at the
+// end of the locked section; everything else (prefix/stats writes, tenant
+// quota enforcement, metrics emission, snapshot reporting) is identical.
+func (i *Index) ingest(u Update, skipCap bool) {
 	ts := u.Timestamp
 	if ts.IsZero() {
 		ts = i.now()
@@ -582,7 +610,10 @@ func (i *Index) Ingest(u Update) {
 	if hasQuota {
 		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
 	}
-	capEvicted := i.enforceCapLocked()
+	var capEvicted map[string]int
+	if !skipCap {
+		capEvicted = i.enforceCapLocked()
+	}
 	i.mu.Unlock()
 
 	if i.metrics != nil {

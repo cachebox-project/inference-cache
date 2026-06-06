@@ -120,14 +120,15 @@ func New(opts ...Option) *Service {
 	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
 	publicMux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
 
-	// /snapshot AND /policy are served from a dedicated listener so a
-	// NetworkPolicy can restrict ingress to the controller's pod selector
-	// without breaking kubelet probes or Prometheus scrapes on the public
-	// listener. Both endpoints are controller-to-server: /snapshot is a
-	// read (controller polls cache aggregate) and /policy is a write
-	// (controller pushes the resolved CachePolicy snapshot, replace-on-
-	// write). They share one auth profile because they share one caller
-	// identity.
+	// /snapshot, /policy, and /probe are served from a dedicated listener
+	// so a NetworkPolicy can restrict ingress to the controller's pod
+	// selector without breaking kubelet probes or Prometheus scrapes on
+	// the public listener. All three endpoints are controller-to-server:
+	// /snapshot is a read (controller polls cache aggregate), /policy is
+	// a write (controller pushes the resolved CachePolicy snapshot,
+	// replace-on-write), and /probe is a controller-driven functional
+	// self-test (POST returns per-stage outcomes). They share one auth
+	// profile because they share one caller identity.
 	snapshotMux := http.NewServeMux()
 	snapshotHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Tighten the contract to GET-only: the controller poller and any

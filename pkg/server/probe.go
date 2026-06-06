@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -275,12 +276,20 @@ type Prober struct {
 // NewProber wires a probe orchestrator to the live index + an optional
 // T2Prober. Passing nil for t2 disables Stage C (the probe always reports
 // T2=skipped); the controller-wiring follow-up passes a real implementation.
+//
+// The default ingestFn is idx.IngestSkipCap, NOT idx.Ingest: the probe
+// writes one transient entry that the deferred cleanup removes immediately,
+// so triggering the global cap sweep here could evict an oldest real
+// workload entry just to make room for a probe ingest — violating the
+// probe's "never mutates real workload state" invariant on a saturated
+// index. Tests can override ingestFn to drive idx.Ingest directly if they
+// need to exercise the cap path on purpose.
 func NewProber(idx *index.Index, t2 T2Prober) *Prober {
 	return &Prober{
 		index:    idx,
 		t2:       t2,
 		now:      time.Now,
-		ingestFn: idx.Ingest,
+		ingestFn: idx.IngestSkipCap,
 		routeFn:  idx.LookupRoute,
 	}
 }
@@ -426,12 +435,29 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	// routing/index layer itself is broken — exactly the encoding/tenant-mismatch
 	// regression class the probe must catch.
 	routeRes := p.routeFn(directReq)
-	if routeRes.Strategy != index.StrategyPrefixMatch || !replicaInScores(routeRes.Scores, replicaID) {
+	switch {
+	case routeRes.Strategy != index.StrategyPrefixMatch:
 		result.Routing = ProbeStageFailed
 		result.Errors = append(result.Errors, ProbeStageError{
 			Stage:   ProbeStageRouting,
 			Message: fmt.Sprintf("LookupRoute returned %s, expected PREFIX_MATCH — possible tenant_id or hash encoding mismatch", reasonForStrategy(routeRes.Strategy)),
 		})
+	case !replicaInScores(routeRes.Scores, replicaID):
+		// Distinct failure mode: strategy is PREFIX_MATCH (the index DID
+		// find a matching prefix), but the probe replica isn't among the
+		// scored replicas. That means an UNRELATED replica is reported as
+		// holding the probe's reserved hash — which should be impossible
+		// given the probe's hash is derived from (backend, hashScheme)
+		// SHA-256 and gated to the reserved replica id. Name the expected
+		// replica explicitly so the operator's condition message points at
+		// a probe-id-derivation regression, not a vague "wrong reason code".
+		result.Routing = ProbeStageFailed
+		result.Errors = append(result.Errors, ProbeStageError{
+			Stage:   ProbeStageRouting,
+			Message: fmt.Sprintf("LookupRoute returned PREFIX_MATCH but probe replica %q is not among the scored replicas — possible probe-id or reserved-replica collision", replicaID),
+		})
+	}
+	if result.Routing == ProbeStageFailed {
 		// Skip Stage C on a routing failure for the same reason Stage B was
 		// skipped on a Stage-A failure: running a downstream stage when an
 		// upstream one is broken cascades the diagnostic — the controller's
@@ -552,11 +578,16 @@ func probeHandler(prober *Prober) http.HandlerFunc {
 			http.Error(w, "decode probe request: "+err.Error()+"\n", http.StatusBadRequest)
 			return
 		}
-		// Reject trailing tokens after the first JSON value so a body like
-		// `{...} {...}` cannot silently slip through DisallowUnknownFields
-		// (which only catches unknown KEYS within the first decoded value).
-		// Mirrors the strictness implied by the field-level guard.
-		if dec.More() {
+		// Reject trailing content after the first JSON value so a body like
+		// `{...} {...}` (or `{...}garbage`) cannot silently slip through
+		// DisallowUnknownFields (which only catches unknown KEYS within the
+		// first decoded value). A second Decode that returns io.EOF means
+		// the body had exactly one top-level value; anything else (another
+		// decoded value, a syntax error, or a stray `]`/`}`) is rejected.
+		// dec.More() alone is NOT sufficient — it returns false for trailing
+		// `]` or `}`, which JSON parsers would otherwise treat as a fault.
+		var trailing json.RawMessage
+		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 			http.Error(w, "probe request body has trailing content after the first JSON value\n", http.StatusBadRequest)
 			return
 		}

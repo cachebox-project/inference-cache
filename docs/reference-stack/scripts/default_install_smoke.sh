@@ -1769,6 +1769,97 @@ case "$audience_probe" in
     ;;
 esac
 
+# --- /probe functional-self-test result assertion -------------------------
+# The audience-binding section above asserts /probe returned HTTP 200 with the
+# controller-audience token, but a deployed handler can also return 200 with a
+# per-stage `failed`. This section drives one authenticated /probe call,
+# captures the JSON body, and asserts subscriber=ok, routing=ok, t2=skipped
+# (the default Stage-1 posture — no T2Prober is wired, so Stage C is always
+# skipped until the controller-wiring follow-up plumbs a real one). A
+# regression that flips subscriber or routing to failed on a clean install
+# would be a clear signal that the cache-plane internal round-trip itself is
+# broken — exactly the class of bug the probe exists to catch.
+log "asserting authenticated /probe returns subscriber=ok, routing=ok, t2=skipped"
+PROBE_RESULT_POD="ic-probe-result"
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+probe_result_yaml=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PROBE_RESULT_POD
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: controller
+spec:
+  serviceAccountName: inference-cache-controller-manager
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: curlimages/curl:8.10.1
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
+      if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
+      # Capture body to stdout — the smoke parses subscriber/routing/t2 from it.
+      curl -sS -m 5 -H "Authorization: Bearer \$controller_token" \\
+        -H "Content-Type: application/json" \\
+        -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' \\
+        http://inference-cache-server:8081/probe || echo "curl_failed:\$?"
+    volumeMounts:
+    - name: controller-token
+      mountPath: /var/run/secrets/inferencecache.io/controller-token
+      readOnly: true
+  volumes:
+  - name: controller-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: inferencecache.io/controller
+          expirationSeconds: 3600
+EOF
+)
+if ! echo "$probe_result_yaml" | kubectl apply -f - >/tmp/probe-result-create.log 2>&1; then
+  cat /tmp/probe-result-create.log >&2 || true
+  fail "kubectl apply for $PROBE_RESULT_POD failed; cannot run /probe result assertion"
+fi
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$PROBE_RESULT_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_result_body="$(kubectl -n "$NAMESPACE" logs "$PROBE_RESULT_POD" 2>/dev/null || true)"
+if [ -z "$probe_result_body" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$PROBE_RESULT_POD" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+log "probe result body: $probe_result_body"
+case "$probe_result_body" in
+  *controller_token_missing*)
+    fail "probe-result pod is missing /var/run/secrets/inferencecache.io/controller-token/token"
+    ;;
+  *"curl_failed:"*)
+    fail "probe-result curl failed: $probe_result_body"
+    ;;
+esac
+# Parse the three stage values; reject anything that isn't the expected
+# default posture (subscriber=ok, routing=ok, t2=skipped). The default-install
+# CacheBackend has no engine pods reporting state, but the probe synthesizes
+# its own — so Stage A + B must always pass on a clean install regardless of
+# workload. Stage C is "skipped" because no T2Prober is wired in this revision.
+case "$probe_result_body" in
+  *'"subscriber":"ok"'*'"routing":"ok"'*'"t2":"skipped"'*)
+    log "probe result matches expected default posture (subscriber=ok, routing=ok, t2=skipped)"
+    ;;
+  *)
+    fail "probe result does not match expected default posture; want subscriber=ok routing=ok t2=skipped, got: $probe_result_body"
+    ;;
+esac
+
 # --- opt-in gRPC TLS overlay verification ----------------------------------
 # config/default is plaintext; Service TLS is an opt-in overlay
 # (config/overlays/server-tls = config/default + the config/server/tls
