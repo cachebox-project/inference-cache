@@ -124,6 +124,7 @@ promtool: $(LOCALBIN) ## Ensure a $(PROMTOOL_VERSION) promtool is available. Dow
 	fi; \
 	if command -v promtool >/dev/null 2>&1 && \
 		promtool --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
+		rm -f $(LOCAL_PROMTOOL); \
 		exit 0; \
 	fi; \
 	set -e; \

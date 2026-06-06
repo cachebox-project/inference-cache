@@ -164,6 +164,24 @@ does not trip it.
    (when the offload backend supports auth — most offload backends
    today do not).
 
+#### Verify the metric is exposed before relying on the alert
+
+vLLM emits `vllm:external_prefix_cache_{queries,hits}_total` on its own
+`/metrics` endpoint (typically `:8000/metrics`), not via this operator.
+The series has been present since vLLM ~0.18. Confirm at least one
+engine pod publishes it before assuming silence means "broken":
+
+```bash
+kubectl exec <engine-pod> -- curl -s localhost:8000/metrics \
+  | grep -E '^vllm:external_prefix_cache_(queries|hits)_total'
+```
+
+A pod running an older vLLM (no offload support) will return no lines;
+the alert won't fire there either (the `unless` guard handles absent
+hits-series, but the queries gate of >1000 tokens/sec assumes the
+metric IS exposed). If your install runs vLLM <0.18 for some pods,
+exclude them via a label in the alert expression or upgrade.
+
 #### First-response runbook
 
 ```bash
@@ -236,15 +254,25 @@ that happens to have published one NO_HINT and nothing else.
 #### First-response runbook
 
 ```bash
-# 1. Confirm the reason_code distribution per model.
+# 1. Port-forward the public + controller-facing HTTP listeners.
+#    :8080 carries /metrics, /healthz, /readyz. :8081 carries the
+#    controller-only /snapshot + /policy endpoints (bearer-auth gated).
 kubectl -n inference-cache-system port-forward svc/inference-cache-server 8080:8080 &
+kubectl -n inference-cache-system port-forward svc/inference-cache-server 8081:8081 &
+
+# 2. Confirm the reason_code distribution per model.
 curl -s localhost:8080/metrics | grep 'inferencecache_lookup_route_calls_total'
 
-# 2. Spot-check what the gateway sends. The fastest way is gRPC client
+# 3. Spot-check what the gateway sends. The fastest way is gRPC client
 #    debug logging in the gateway; failing that, take a tcpdump on the
 #    server pod and decode a few LookupRoute frames.
 
-# 3. Confirm the index has entries for the model and tenant.
+# 4. Confirm the index has entries for the model and tenant.
+#    The snapshot endpoint is gated by a SA bearer with the
+#    `inferencecache.io/snapshot` audience. From a controller pod:
+#      TOKEN=$(cat /var/run/secrets/inferencecache.io/snapshot-token/token)
+#    Or generate a one-off via `kubectl create token` against the
+#    controller ServiceAccount with `--audience=inferencecache.io/snapshot`.
 curl -s localhost:8081/snapshot -H "Authorization: Bearer $TOKEN" | jq '.tenants[]'
 ```
 

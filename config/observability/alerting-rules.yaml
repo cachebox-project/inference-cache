@@ -61,13 +61,24 @@ groups:
         # tokens stays at 0. Classic version-skew or wire-protocol mismatch
         # between offload client (in the engine pod) and offload server.
         #
-        # IMPORTANT: vLLM's `external_prefix_cache_{queries,hits}_total`
-        # count TOKENS, not requests — a single 1500-token prefix counts
-        # as 1500 queries. The 1000 tokens/sec gate is calibrated to catch
-        # a single moderately-sized prefixed request per second; idle
-        # replicas (no prefixed traffic at all) stay below it. The 10m
-        # windows + 5m `for` require sustained zero-hit behavior, not a
-        # transient miss-streak.
+        # Metric provenance: `vllm:external_prefix_cache_{queries,hits}_total`
+        # are emitted by vLLM directly (NOT by this operator). They are
+        # documented at https://docs.vllm.ai/en/latest/usage/metrics/ and
+        # have been present since vLLM ~0.18 (the release that added
+        # LMCache-style offload support). This operator does not currently
+        # scrape them (pkg/adapters/engine/metrics_scraper.go only reads
+        # vllm:prefix_cache_{hits,queries} for T1 plus vllm:*_cache_usage_perc),
+        # so the alert binds directly to vLLM's exposition. Operators
+        # should sanity-check the metric exists on at least one engine pod
+        # before relying on the alert: see the runbook's "verify the
+        # metric is exposed" step.
+        #
+        # IMPORTANT: the counters are TOKENS, not requests — a single
+        # 1500-token prefix counts as 1500 queries. The 1000 tokens/sec
+        # gate is calibrated to catch a single moderately-sized prefixed
+        # request per second; idle replicas (no prefixed traffic at all)
+        # stay below it. The 10m windows + 5m `for` require sustained
+        # zero-hit behavior, not a transient miss-streak.
         #
         # We use `unless` (set difference) rather than `and == 0` so the alert
         # also fires when the hits counter series is entirely absent for the
