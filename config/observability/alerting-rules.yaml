@@ -69,17 +69,23 @@ groups:
         # tokens stays at 0. Classic version-skew or wire-protocol mismatch
         # between offload client (in the engine pod) and offload server.
         #
-        # Metric provenance: `vllm:external_prefix_cache_{queries,hits}_total`
-        # are emitted by vLLM directly (NOT by this operator). They are
-        # documented at https://docs.vllm.ai/en/latest/usage/metrics/ and
+        # Metric provenance: `vllm:external_prefix_cache_{queries,hits}`
+        # are emitted by vLLM directly (NOT by this operator). The
+        # Python prometheus_client adds `_total` to counters at
+        # exposition time, so deployments see either the unsuffixed or
+        # the `_total`-suffixed form — the regex matcher below accepts
+        # BOTH. Upstream docs list the unsuffixed names at
+        # https://docs.vllm.ai/en/latest/usage/metrics/; the series
         # have been present since vLLM ~0.18 (the release that added
-        # LMCache-style offload support). This operator does not currently
-        # scrape them (pkg/adapters/engine/metrics_scraper.go only reads
-        # vllm:prefix_cache_{hits,queries} for T1 plus vllm:*_cache_usage_perc),
-        # so the alert binds directly to vLLM's exposition. Operators
-        # should sanity-check the metric exists on at least one engine pod
-        # before relying on the alert: see the runbook's "verify the
-        # metric is exposed" step.
+        # LMCache-style offload support). This operator does not
+        # currently scrape them
+        # (pkg/adapters/engine/metrics_scraper.go only reads
+        # vllm:prefix_cache_{hits,queries} for T1 plus
+        # vllm:*_cache_usage_perc), so the alert binds directly to
+        # vLLM's exposition. Operators should sanity-check the metric
+        # exists on at least one engine pod before relying on the
+        # alert: see the runbook's "verify the metric is exposed"
+        # step.
         #
         # IMPORTANT: the counters are TOKENS, not requests — a single
         # 1500-token prefix counts as 1500 queries. The 1000 tokens/sec

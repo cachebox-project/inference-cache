@@ -252,9 +252,13 @@ inferencecache_server_up
 
 - **Severity**: `warning`
 - **For**: 5 minutes
-- **Source metrics**: `vllm:external_prefix_cache_queries_total{pod}`,
-  `vllm:external_prefix_cache_hits_total{pod}` (emitted by vLLM, not by
-  this operator)
+- **Source metrics**: `vllm:external_prefix_cache_queries{pod}` (or
+  `_total`-suffixed variant), `vllm:external_prefix_cache_hits{pod}` (or
+  `_total`-suffixed variant). Emitted by vLLM, not by this operator —
+  upstream's metrics page lists the unsuffixed names but the Python
+  prometheus_client convention appends `_total` to counters at
+  exposition time, so deployments see one or the other depending on
+  vLLM build/client. The alert accepts both.
 
 The engine is hitting the external (offload) prefix cache tier at more
 than 1000 **tokens** per second of queries but is getting zero hit
@@ -292,12 +296,14 @@ does not trip it.
 
 #### Verify the metric is exposed before relying on the alert
 
-vLLM emits `vllm:external_prefix_cache_{queries,hits}_total` on its own
-`/metrics` endpoint (typically `:8000/metrics`), not via this operator.
-The names and `_total` exposition format are documented at
+vLLM emits `vllm:external_prefix_cache_{queries,hits}` (or, under the
+Python prometheus_client exposition convention, the `_total`-suffixed
+variants) on its own `/metrics` endpoint (typically `:8000/metrics`),
+not via this operator. The upstream metric names are documented at
 [`docs.vllm.ai/.../usage/metrics/`](https://docs.vllm.ai/en/latest/usage/metrics/);
-the series has been present since vLLM 0.18 (the first release tagged in
-the upstream v0.18 docs page).
+the series have been present since vLLM 0.18 (the first release tagged
+in the upstream v0.18 docs page). Our alert and triage queries accept
+both the unsuffixed and `_total` forms via `{__name__=~"...(_total)?"}`.
 
 This operator has no in-process scrape of those upstream metrics — its
 own scraper (`pkg/adapters/engine/metrics_scraper.go`) only reads the T1
@@ -330,9 +336,11 @@ runbook) accordingly.
 #### First-response runbook
 
 ```bash
-# 1. Confirm the symptom on the engine pod.
+# 1. Confirm the symptom on the engine pod (accepts both the
+#    unsuffixed and `_total` forms; see "Verify the metric is
+#    exposed" above for the upstream-versions distinction).
 kubectl exec <engine-pod> -- curl -s localhost:8000/metrics \
-  | grep -E 'vllm:external_prefix_cache_(queries|hits)_total'
+  | grep -E '^vllm:external_prefix_cache_(queries|hits)(_total)?'
 
 # 2. Compare the offload-client version (in the engine image) against
 #    the offload-server pod image tag. Skew is the root cause in most
@@ -344,17 +352,18 @@ kubectl get pod -l <offload-server-selector> -o jsonpath='{.items[0].spec.contai
 kubectl logs <offload-server-pod> --tail=200 | grep -iE 'invalid|version|protocol|scheme'
 ```
 
-Triage queries:
+Triage queries (use the `{__name__=~"...(_total)?"}` form so the query
+matches whichever exposition shape your vLLM uses):
 
 ```promql
 # External cache hit rate per pod (should be > 0 on a working offload)
-sum by (namespace, pod) (rate(vllm:external_prefix_cache_hits_total[10m]))
+  sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_hits(_total)?"}[10m]))
 /
-sum by (namespace, pod) (rate(vllm:external_prefix_cache_queries_total[10m]))
+  sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[10m]))
 
 # Stores vs. hits over the last hour
-sum by (namespace, pod) (increase(vllm:external_prefix_cache_queries_total[1h]))
-sum by (namespace, pod) (increase(vllm:external_prefix_cache_hits_total[1h]))
+sum by (namespace, pod) (increase({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[1h]))
+sum by (namespace, pod) (increase({__name__=~"vllm:external_prefix_cache_hits(_total)?"}[1h]))
 ```
 
 > The `vllm:` prefix is how vLLM exposes its metrics. If your install
