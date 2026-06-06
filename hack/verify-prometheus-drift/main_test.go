@@ -102,8 +102,8 @@ func TestPrintDiffShowsDivergence(t *testing.T) {
 	printDiff(&buf,
 		[]string{"a", "b", "c", "d", "e"},
 		[]string{"a", "b", "C", "d", "e"},
-		1, // context lines
-		1, // max lines per side after divergence — emits lines diffStart..diffStart+1 only
+		1, // context lines before
+		1, // tail lines after — emits the divergent line (3) plus one more (4)
 	)
 	got := buf.String()
 	// Confirm the divergent lines from both sides appear, prefixed `-`/`+`.
@@ -112,7 +112,7 @@ func TestPrintDiffShowsDivergence(t *testing.T) {
 			t.Fatalf("printDiff output missing %q\nfull output:\n%s", want, got)
 		}
 	}
-	// Bound check — with maxLines=1 and divergence at line 3, output
+	// Bound check — with tailLines=1 and divergence at line 3, output
 	// extends to line 4 (`d`) but NOT line 5 (`e`).
 	if strings.Contains(got, "-e") || strings.Contains(got, "+e") {
 		t.Fatalf("printDiff exceeded maxLines bound: line `e` should not appear\nfull output:\n%s", got)

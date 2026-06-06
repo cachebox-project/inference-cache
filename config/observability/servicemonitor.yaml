@@ -17,9 +17,15 @@ metadata:
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: observability
-    # Default kube-prometheus selector labels — most stacks pick these up
-    # automatically. Override or extend if your Prometheus CR uses a
-    # different `serviceMonitorSelector`.
+    # NOTE: this is an EXAMPLE selector label matching a stock
+    # kube-prometheus install (`prometheus: kube-prometheus`). Prometheus
+    # Operator only loads ServiceMonitor CRs whose labels match the
+    # Prometheus CR's `serviceMonitorSelector`. If your install uses a
+    # different selector (`release: prometheus`, `app: prometheus`,
+    # etc.) `kubectl apply -k` succeeds but Prometheus silently ignores
+    # this scrape target until the labels match. Check with:
+    #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.serviceMonitorSelector}'
+    # and edit this label to match.
     prometheus: kube-prometheus
 spec:
   selector:

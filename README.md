@@ -110,8 +110,20 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
+This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
+`inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
+the alerts. End-to-end, alerts start firing once the operator is
+installed.
+
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
+**You must also configure scraping yourself** — either a `scrape_configs:`
+entry pointing at
+`inference-cache-server.inference-cache-system.svc.cluster.local:8080/metrics`,
+or `kubernetes_sd_configs: pod` with `relabel_configs:` that copies
+`__meta_kubernetes_namespace` to `namespace` (the alerts scope per
+install by this label). Without a working scrape, the rules load but
+fire on nothing.
 
 Per-alert runbooks (causes, triage steps, example PromQL): see
 [`docs/observability/alerts.md`](docs/observability/alerts.md). For the

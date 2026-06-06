@@ -63,10 +63,16 @@ func firstDiffLine(a, b []string) int {
 	return -1
 }
 
-// printDiff emits a minimal unified-style diff: ±N lines of context around
-// the first divergence on each side, prefixed `-` (flat) / `+` (CR). Bounded
+// printDiff emits a minimal unified-style diff: a few lines of context
+// before the first divergence on each side, then the divergent line and a
+// bounded tail of lines after it, prefixed `-` (flat) / `+` (CR). Bounded
 // so a fully-mangled file does not flood CI logs.
-func printDiff(w io.Writer, flatLines, crLines []string, contextLines, maxLines int) {
+//
+// `contextLines` is the number of unchanged lines printed before the
+// divergence. `tailLines` is the maximum number of trailing lines printed
+// AFTER (and not including) the divergent line itself — so the divergent
+// line plus up to `tailLines` more print on each side.
+func printDiff(w io.Writer, flatLines, crLines []string, contextLines, tailLines int) {
 	diffStart := firstDiffLine(flatLines, crLines)
 	if diffStart < 0 {
 		return
@@ -75,16 +81,16 @@ func printDiff(w io.Writer, flatLines, crLines []string, contextLines, maxLines 
 	if startCtx < 1 {
 		startCtx = 1
 	}
-	endFlat := diffStart + maxLines
+	endFlat := diffStart + tailLines
 	if endFlat > len(flatLines) {
 		endFlat = len(flatLines)
 	}
-	endCR := diffStart + maxLines
+	endCR := diffStart + tailLines
 	if endCR > len(crLines) {
 		endCR = len(crLines)
 	}
-	fmt.Fprintf(w, "  divergence first appears at canonical-JSON line %d (showing %d lines of context + up to %d lines after):\n",
-		diffStart, contextLines, maxLines)
+	fmt.Fprintf(w, "  divergence first appears at canonical-JSON line %d (showing %d lines of context + divergent line + up to %d trailing lines):\n",
+		diffStart, contextLines, tailLines)
 	for i := startCtx; i < diffStart; i++ {
 		fmt.Fprintf(w, "   %s\n", flatLines[i-1])
 	}
@@ -151,7 +157,7 @@ func main() {
 			strings.Split(flatCanon, "\n"),
 			strings.Split(crCanon, "\n"),
 			3,  // lines of context before
-			20, // max lines per side after divergence
+			20, // tail lines per side after the divergent line
 		)
 		os.Exit(1)
 	}
