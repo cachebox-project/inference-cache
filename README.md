@@ -82,8 +82,10 @@ The default Kustomize overlay brings up both control-plane components:
 - `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
   HTTP `/healthz`, `/readyz`, `/metrics` probe surface, plus a dedicated
   controller-facing listener carrying `/snapshot` (controller read), `/policy`
-  (controller write), and `/probe` (controller-driven functional self-test),
-  all gated by ServiceAccount bearer auth + a `NetworkPolicy`. Fronted by a
+  (controller write), and `/probe` (functional self-test, intended to be
+  controller-driven once the controller-wiring follow-up lands — the
+  server-side endpoint ships here), all gated by ServiceAccount bearer auth
+  + a `NetworkPolicy`. Fronted by a
   `ClusterIP` Service `inference-cache-server` in the `inference-cache-system`
   namespace with named ports `grpc:9090` (gRPC API), `http:8080` (probes /
   metrics), and `snapshot:8081` (controller-only `/snapshot` + `/policy` +
