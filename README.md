@@ -98,7 +98,7 @@ kubectl get cacheindex cluster-default -o yaml
 ## Monitoring
 
 The `inference-cache-server` exposes Prometheus metrics on `:8080/metrics`
-(namespaced `inferencecache_*`). A default alert bundle for the operational
+(prefixed `inferencecache_*`). A default alert bundle for the operational
 silent-failure patterns this code has hit in production ships under
 [`config/observability/`](config/observability/) and is **not** included in
 `config/default` — the alerts are opt-in so that installs without

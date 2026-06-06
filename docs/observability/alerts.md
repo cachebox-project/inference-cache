@@ -31,8 +31,10 @@ There are two distribution shapes, same rule set, drift-gated by
      carrying the alerts.
 
   Both CRs are pinned to namespace `inference-cache-system` and carry
-  the default kube-prometheus selector labels (`prometheus: kube-prometheus`,
-  `role: alert-rules` on the rules, plus the ServiceMonitor's own selector).
+  example labels (`prometheus: kube-prometheus`, `role: alert-rules`)
+  that match a stock kube-prometheus install's default selector. If your
+  Prometheus CR's `ruleSelector` / `serviceMonitorSelector` uses a
+  different label set, edit the metadata labels on the CRs to match.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
@@ -66,10 +68,23 @@ placeholders for three more that depend on metrics not yet exposed (see
 > which vLLM exposes on its own `/metrics`. The included `ServiceMonitor`
 > covers only `inference-cache-server`. To make `LMCacheT2NoHits` light
 > up, your install must also scrape engine pods — typically by adding a
-> separate `ServiceMonitor` / `PodMonitor` for your vLLM Deployment, or
-> by enabling Prometheus's `kubernetes_sd_configs: pod` scrape against
-> labels you control. The other four alerts work as-is once this bundle
-> is applied.
+> separate **`PodMonitor`** for your vLLM Deployment (or `kubernetes_sd_configs: pod`
+> for vanilla Prometheus). **Pod-level scraping is REQUIRED** — the alert
+> groups by `pod` and the alert summary substitutes `{{ $labels.pod }}`,
+> so a Service-level scrape (which collapses all replicas into one series)
+> would render the summary with an empty pod label. The other four alerts
+> work as-is once this bundle is applied.
+>
+> **The alerts rely on a `namespace` label per install.** Both the shipped
+> `ServiceMonitor` for `inference-cache-server` and any prometheus-operator
+> `PodMonitor` you add for vLLM automatically inject `namespace` via the
+> operator's standard relabel rules (sourced from the
+> `__meta_kubernetes_namespace` Kubernetes SD label). Vanilla Prometheus
+> with hand-written `scrape_configs:` does NOT inject this by default —
+> you must add a `relabel_configs:` entry that copies
+> `__meta_kubernetes_namespace` to a `namespace` label. Without it,
+> per-install isolation collapses into one unlabeled group and one
+> install's outage can mask another's.
 
 ---
 
@@ -266,13 +281,13 @@ Triage queries:
 
 ```promql
 # External cache hit rate per pod (should be > 0 on a working offload)
-sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m]))
+sum by (namespace, pod) (rate(vllm:external_prefix_cache_hits_total[10m]))
 /
-sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m]))
+sum by (namespace, pod) (rate(vllm:external_prefix_cache_queries_total[10m]))
 
 # Stores vs. hits over the last hour
-sum by (pod) (increase(vllm:external_prefix_cache_queries_total[1h]))
-sum by (pod) (increase(vllm:external_prefix_cache_hits_total[1h]))
+sum by (namespace, pod) (increase(vllm:external_prefix_cache_queries_total[1h]))
+sum by (namespace, pod) (increase(vllm:external_prefix_cache_hits_total[1h]))
 ```
 
 > The `vllm:` prefix is how vLLM exposes its metrics. If your install
@@ -344,12 +359,12 @@ Triage queries:
 
 ```promql
 # Per-model NO_HINT ratio over the last hour
-sum by (model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[1h]))
+sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[1h]))
 /
-sum by (model) (rate(inferencecache_lookup_route_calls_total[1h]))
+sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[1h]))
 
 # Distribution across reason codes per model
-sum by (model, reason_code) (rate(inferencecache_lookup_route_calls_total[1h]))
+sum by (namespace, model, reason_code) (rate(inferencecache_lookup_route_calls_total[1h]))
 ```
 
 ---
@@ -397,12 +412,12 @@ Triage queries:
 ```promql
 # Lookup-latency p99 per model
 histogram_quantile(0.99,
-  sum by (model, le) (rate(inferencecache_lookup_route_latency_seconds_bucket[5m]))
+  sum by (namespace, model, le) (rate(inferencecache_lookup_route_latency_seconds_bucket[5m]))
 )
 
 # Server pod CPU + memory pressure
-sum by (pod) (rate(process_cpu_seconds_total[1m]))
-sum by (pod) (process_resident_memory_bytes)
+sum by (namespace, pod) (rate(process_cpu_seconds_total[1m]))
+sum by (namespace, pod) (process_resident_memory_bytes)
 ```
 
 ---
@@ -426,7 +441,7 @@ This is informational, not an outage signal. It is a tuning lever:
 
 1. **Raise the global `MaxEntries` cap** to fit the observed working set.
    Today this requires a code-side server-binary build change; expose it
-   as a CLI flag if you need to retune in place. (Filed for follow-up.)
+   as a CLI flag if you need to retune in place.
 2. **Accept the reduced hit rate** at the current cap.
 3. **Shorten the index TTL** (server's `WithTTL` option, default 30m) so
    old prefixes age out before the cap kicks in.
@@ -446,14 +461,14 @@ Triage queries:
 
 ```promql
 # Cap vs. TTL eviction rate
-sum by (algorithm, reason) (rate(inferencecache_index_evictions_total[10m]))
+sum by (namespace, algorithm, reason) (rate(inferencecache_index_evictions_total[10m]))
 
 # Current index population, per model (sum gives the total against the cap)
 sum(inferencecache_index_entries)
 
 # Per-tenant eviction pressure (CacheTenant quota — distinct from the
 # global cap above)
-sum by (tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
+sum by (namespace, tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
 ```
 
 ---
