@@ -82,7 +82,7 @@ Isolation + cleanup guarantees:
 - The reserved tenant is excluded from the index's global `maxEntries` cap accounting AND its cap-sweep victim candidate set, so a concurrent real-workload `Ingest` cannot evict a real entry to make room for a transient probe entry.
 - Each `Run` calls `ApplyEvent(EventAllCleared)` against the reserved replica via `defer`, leaving the index empty of probe entries on return (even on panic or early-return from a failed Stage A).
 - Reserved-tenant entries are still subject to the TTL sweep as defense-in-depth if the deferred cleanup somehow fails to run.
-- The `CacheTenant` admission webhook rejects any CR claiming `spec.tenantID = inferencecache.io/probe`, and the `ReportCacheState` / `PublishEvent` handlers silently drop messages carrying the same id — so an external client cannot fake state into the reserved scope through the public gRPC contract.
+- The `CacheTenant` admission webhook rejects CRs that newly claim `spec.tenantID = inferencecache.io/probe` — both `ValidateCreate` (unconditionally) and `ValidateUpdate` (only when the change newly introduces the id, via `filterIntroducedErrors`). Pre-existing CRs already holding the reserved id are not trapped on unrelated edits (the v1alpha1 tightening seam). The `ReportCacheState` / `PublishEvent` gRPC handlers silently drop messages carrying the same id — so an external client cannot fake state into the reserved scope through the public gRPC contract.
 
 1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
    controller's selector.

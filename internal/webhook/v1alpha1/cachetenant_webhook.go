@@ -77,11 +77,27 @@ type CacheTenantValidationRule func(ct *cachev1alpha1.CacheTenant) field.ErrorLi
 // MUST stay in lockstep with pkg/server.ProbeTenantID; the constant is
 // duplicated rather than imported to keep internal/webhook free of a
 // pkg/server dependency.
+//
+// Schema-evolution note: adding this rule is an admission TIGHTENING that
+// shrinks the set of accepted CacheTenant.spec.tenantID values. Under the
+// project's v1alpha1 schema-evolution policy, tightening unstable-API
+// validation is permitted (v1alpha1 = "unstable" per K8s upstream
+// convention); the controller-wiring follow-up that introduces the probe
+// surface is itself v1alpha1-internal. Pre-existing CRs that already hold
+// the reserved id are NOT trapped because ValidateUpdate's
+// filterIntroducedErrors only fails NEWLY-introduced violations — an
+// unchanged tenantID on an existing CR continues to admit, and the
+// operator can migrate by changing tenantID OR by deleting the legacy CR.
+// Post-v1beta1, this carve-out expires and any further tightening would
+// require a K8s-standard deprecation cycle.
 const reservedProbeTenantID = "inferencecache.io/probe"
 
-// rejectReservedProbeTenantID rejects any CacheTenant whose spec.tenantID
+// rejectReservedProbeTenantID rejects CacheTenants whose spec.tenantID
 // equals the server-reserved probe tenant id. The probe scope is
 // server-internal state; operator-supplied CacheTenants must not govern it.
+// On CREATE: fires unconditionally. On UPDATE: fires only when the change
+// newly introduces the reserved id (filterIntroducedErrors handles the
+// "unchanged legacy id" carve-out — see reservedProbeTenantID's doc).
 var rejectReservedProbeTenantID = func(ct *cachev1alpha1.CacheTenant) field.ErrorList {
 	if ct.Spec.TenantID != reservedProbeTenantID {
 		return nil

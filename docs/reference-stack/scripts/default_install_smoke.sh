@@ -98,6 +98,18 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
+#  12b. The authenticated /probe handler returns the expected default
+#       posture on a clean install: a controller-SA-authenticated POST
+#       gets HTTP 200 AND the parsed JSON body asserts subscriber=ok,
+#       routing=ok, t2=skipped (the Stage-1 default — no T2Prober wired
+#       yet). A regression where the handler returns 200 with a
+#       per-stage "failed" would otherwise slip past the audience-binding
+#       phase above (which only checks HTTP status).
+#  12c. The CacheTenant admission webhook rejects a CR claiming the
+#       server-reserved probe tenantID (inferencecache.io/probe). Pairs
+#       with the existing duplicate-tenantID assertion to pin BOTH
+#       CacheTenant validation rules end-to-end against the real
+#       installed webhook.
 #  13. The opt-in gRPC TLS path works: applying config/overlays/server-tls
 #      (config/default + the config/server/tls component) rolls the server with
 #      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
