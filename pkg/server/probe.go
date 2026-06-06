@@ -484,28 +484,43 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	}
 	result.Ingest = ProbeStageOK
 
-	// Stage B — routing path. Run the orchestrated LookupRoute (PREFIX_MATCH
-	// vs TENANT_HOT vs NO_HINT) against the same hash bytes. The probe synthesizes
-	// matching scheme + tenant + model on both sides, so a NO_HINT here means the
-	// routing/index layer itself is broken — exactly the encoding/tenant-mismatch
-	// regression class the probe must catch.
+	// Stage B — index routing. Call index.LookupRoute (the orchestrated
+	// ranking entrypoint: PREFIX_MATCH / TENANT_HOT / NO_HINT) against the
+	// same hash bytes. The probe synthesizes matching scheme + tenant + model
+	// on both sides, so a NO_HINT here means the INDEX routing layer itself
+	// is broken (key derivation drift, scheme-disjoint indexing regression,
+	// ranking-v2 regression).
+	//
+	// What Stage B does NOT exercise: this stage calls index.LookupRoute
+	// DIRECTLY, not the gRPC inferenceCacheService.LookupRoute handler. The
+	// service handler short-circuits ProbeTenantID to NO_HINT by design
+	// (defense against external lookups against the reserved scope), so the
+	// probe cannot route through it. Handler-level concerns — policy gating
+	// (minimumPrefixTokens), lookupTimeoutMs deadline, proto→domain
+	// translation in updateFromProto/effectivePrefixTokens — are NOT
+	// covered by Stage B and require their own tests (handler unit tests
+	// exist for each gate in pkg/server/server_test.go). A Stage B pass
+	// proves the index orchestration ranks the probe's hash correctly; it
+	// is not proof the public LookupRoute gRPC handler is healthy
+	// end-to-end.
 	routeRes := p.routeFn(directReq)
 	switch {
 	case routeRes.Strategy != index.StrategyPrefixMatch:
 		result.Routing = ProbeStageFailed
 		result.Errors = append(result.Errors, ProbeStageError{
 			Stage:   ProbeStageRouting,
-			Message: fmt.Sprintf("LookupRoute returned %s, expected PREFIX_MATCH — possible tenant_id or hash encoding mismatch", reasonForStrategy(routeRes.Strategy)),
+			Message: fmt.Sprintf("LookupRoute returned %s, expected PREFIX_MATCH — index routing/key-derivation regression (this stage does not exercise the gRPC handler; see probe.go)", reasonForStrategy(routeRes.Strategy)),
 		})
 	case !replicaInScores(routeRes.Scores, replicaID):
 		// Distinct failure mode: strategy is PREFIX_MATCH (the index DID
 		// find a matching prefix), but the probe replica isn't among the
 		// scored replicas. That means an UNRELATED replica is reported as
 		// holding the probe's reserved hash — which should be impossible
-		// given the probe's hash is derived from (backend, hashScheme)
-		// SHA-256 and gated to the reserved replica id. Name the expected
-		// replica explicitly so the operator's condition message points at
-		// a probe-id-derivation regression, not a vague "wrong reason code".
+		// given the probe's hash is derived from (backend, model,
+		// hashScheme) SHA-256 (length-prefixed; see ProbeHash) and gated
+		// to the reserved replica id. Name the expected replica explicitly
+		// so the operator's condition message points at a probe-id-
+		// derivation regression, not a vague "wrong reason code".
 		result.Routing = ProbeStageFailed
 		result.Errors = append(result.Errors, ProbeStageError{
 			Stage:   ProbeStageRouting,

@@ -291,11 +291,15 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 
 // TestProberRunStageBFailsWhenRouteReturnsNoHint simulates the silent-failure
 // mode where the entry IS in the index but LookupRoute returns NO_HINT
-// (e.g., proxy ↔ server hash-encoding mismatch). Stage A still passes
-// (direct Lookup finds the entry), so the failure is uniquely attributable
-// to the routing layer. Stage C must be SKIPPED on a Stage-B failure so
-// the controller's diagnostic pinpoints the routing layer instead of
-// reporting a cascading T2 result that the operator then has to disentangle.
+// (e.g., an index-side key-derivation regression, a scheme-disjoint
+// indexing bug, or a ranking-v2 regression that drops PREFIX_MATCH hits
+// for valid inputs). Stage A still passes (direct Lookup finds the
+// entry), so the failure is uniquely attributable to index.LookupRoute's
+// orchestration layer. (Stage B calls index.LookupRoute directly, not the
+// gRPC handler — see probe.go's Stage B comment for what's IN vs OUT of
+// scope.) Stage C must be SKIPPED on a Stage-B failure so the controller's
+// diagnostic pinpoints the routing layer instead of reporting a cascading
+// T2 result that the operator then has to disentangle.
 func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
 	t2 := &fakeT2Prober{}
 	prober, _ := newProberForTest(t, t2)
