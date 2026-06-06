@@ -50,11 +50,17 @@ groups:
           runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
 
       - alert: LMCacheT2NoHits
-        # The offload tier silently no-ops: queries climb but hits stays at 0.
-        # Classic version-skew or wire-protocol mismatch between offload
-        # client (in the engine pod) and offload server. The 100 q/s gate
-        # avoids noise on near-idle replicas; the 10m windows + 5m `for`
-        # require sustained zero-hit behavior, not a transient miss-streak.
+        # The offload tier silently no-ops: queried tokens climb but hit
+        # tokens stays at 0. Classic version-skew or wire-protocol mismatch
+        # between offload client (in the engine pod) and offload server.
+        #
+        # IMPORTANT: vLLM's `external_prefix_cache_{queries,hits}_total`
+        # count TOKENS, not requests — a single 1500-token prefix counts
+        # as 1500 queries. The 1000 tokens/sec gate is calibrated to catch
+        # a single moderately-sized prefixed request per second; idle
+        # replicas (no prefixed traffic at all) stay below it. The 10m
+        # windows + 5m `for` require sustained zero-hit behavior, not a
+        # transient miss-streak.
         #
         # We use `unless` (set difference) rather than `and == 0` so the alert
         # also fires when the hits counter series is entirely absent for the
@@ -62,9 +68,10 @@ groups:
         # `_hits_total` series until the first non-zero increment, and `and`
         # requires a matching pod label on both sides to evaluate. The
         # `unless` form drops a pod from the alert set ONLY when it has a
-        # positive hit rate; absent hits + queries > 100 → alert fires.
+        # positive hit-token rate; absent hits + sustained queried-token
+        # rate above the gate → alert fires.
         expr: |
-          (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 100)
+          (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 1000)
           unless
           (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
         for: 5m
@@ -72,7 +79,7 @@ groups:
           severity: warning
           component: inference-cache
         annotations:
-          summary: "External prefix cache on pod {{ $labels.pod }} returning zero hits despite >100 queries/sec."
+          summary: "External prefix cache on pod {{ $labels.pod }} returning zero hit tokens despite >1000 queried tokens/sec."
           runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
 
   # ----------------------------------------------------------------------------

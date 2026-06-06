@@ -107,7 +107,12 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 
 .PHONY: promtool
 promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binary is unavailable. Downloads with SHA-256 verification.
-	@if command -v promtool >/dev/null 2>&1; then \
+	@# Prefer a system promtool ONLY if it matches the pinned version.
+	@# A version-mismatched system binary can produce different
+	@# error/lint output than CI, which uses the pinned 3.0.1 — so when
+	@# they diverge, install the local pinned binary instead.
+	@if command -v promtool >/dev/null 2>&1 && \
+		promtool --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
 		true; \
 	elif [ ! -x $(LOCAL_PROMTOOL) ]; then \
 		set -e; \

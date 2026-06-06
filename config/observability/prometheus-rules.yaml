@@ -49,7 +49,7 @@ spec:
 
         - alert: LMCacheT2NoHits
           expr: |
-            (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 100)
+            (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 1000)
             unless
             (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
           for: 5m
@@ -57,7 +57,7 @@ spec:
             severity: warning
             component: inference-cache
           annotations:
-            summary: "External prefix cache on pod {{ $labels.pod }} returning zero hits despite >100 queries/sec."
+            summary: "External prefix cache on pod {{ $labels.pod }} returning zero hit tokens despite >1000 queried tokens/sec."
             runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
 
     - name: inferencecache-routing
@@ -117,11 +117,51 @@ spec:
             summary: "Index evicting >10/sec at MaxEntries cap (algorithm={{ $labels.algorithm }}) — consider raising the cap."
             runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
 
-    # DEFERRED — three additional alerts (VersionSkewDetected,
-    # KvEventsStaleness, ServerProbeFail) are blocked on metrics that the
-    # operator does not yet expose:
-    #   - `inferencecache_backend_version_skew` (gauge)
-    #   - `inferencecache_replica_last_event_at` (gauge)
-    #   - `inferencecache_backend_probe_result` (counter)
-    # The placeholder rules sit in `alerting-rules.yaml` as comments;
-    # mirror them into this CR in the same change that ships the metrics.
+    # ------------------------------------------------------------------------
+    # DEFERRED — the metrics these alerts consume are not yet exposed on
+    # /metrics. Enable each rule in the same change that ships its metric.
+    # The same commented-out stubs sit in the flat alerting-rules.yaml; keep
+    # the two in sync when you uncomment (the drift check enforces it).
+    # ------------------------------------------------------------------------
+    #
+    # - name: inferencecache-lifecycle
+    #   interval: 30s
+    #   rules:
+    #     - alert: VersionSkewDetected
+    #       # DEFERRED: blocked on the backend version-skew gauge
+    #       # (inferencecache_backend_version_skew). Once the operator-side
+    #       # follow-up exposes that gauge, uncomment.
+    #       expr: inferencecache_backend_version_skew > 0
+    #       for: 1m
+    #       labels:
+    #         severity: warning
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Version skew detected between engine pod and managed cache backend."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#versionskewdetected"
+    #
+    #     - alert: KvEventsStaleness
+    #       # DEFERRED: blocked on the per-replica last-event timestamp
+    #       # (inferencecache_replica_last_event_at). Once the follow-up that
+    #       # gates Ready on first-event-observed lands, uncomment.
+    #       expr: time() - inferencecache_replica_last_event_at > 60
+    #       for: 2m
+    #       labels:
+    #         severity: warning
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Replica {{ $labels.replica_id }} has not emitted a KV event in over 60s."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#kveventsstaleness"
+    #
+    #     - alert: ServerProbeFail
+    #       # DEFERRED: blocked on the synthetic end-to-end probe
+    #       # (inferencecache_backend_probe_result). Once the functional Ready
+    #       # gate ships its outcome counter, uncomment.
+    #       expr: inferencecache_backend_probe_result{result="failed"} > 0
+    #       for: 1m
+    #       labels:
+    #         severity: critical
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Synthetic CacheBackend probe failing on {{ $labels.cachebackend }}."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"

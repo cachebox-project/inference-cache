@@ -56,7 +56,7 @@ placeholders for three more that depend on metrics not yet exposed (see
 - **Source metrics**: `inferencecache_server_up`,
   `inferencecache_index_entries{model}`
 
-The cache policy server reports `server_up=1` but the index holds zero
+The cache policy server reports `inferencecache_server_up=1` but the index holds zero
 prefix entries across every model. That means `ReportCacheState` is not
 receiving (or not recording) any KV events from engines. The cache plane
 is effectively a no-op until this clears: every `LookupRoute` returns
@@ -122,16 +122,23 @@ inferencecache_server_up
   this operator)
 
 The engine is hitting the external (offload) prefix cache tier at more
-than 100 queries per second but is getting zero hits. This is a textbook
-silent-failure signal: the offload tier looks "wired" to Kubernetes (the
-sidecar is up, the CacheBackend is `Ready`), but no offloaded prefix is
-being recalled. Every offload `put` is wasted work; every `get` returns
-empty; the engine refills T2 forever without ever benefiting from it.
+than 1000 **tokens** per second of queries but is getting zero hit
+tokens. This is a textbook silent-failure signal: the offload tier looks
+"wired" to Kubernetes (the sidecar is up, the CacheBackend is `Ready`),
+but no offloaded prefix is being recalled. Every offload `put` is wasted
+work; every `get` returns empty; the engine refills T2 forever without
+ever benefiting from it.
 
-The 100 queries/sec floor avoids false positives on a near-idle replica
-that has only made a handful of queries. The 5-minute `for:` window
-requires sustained zero-hit behavior — a transient miss-streak (e.g.
-after a backend restart with empty T2) does not trip it.
+> **vLLM's `external_prefix_cache_{queries,hits}_total` count tokens,
+> not requests.** A single 1500-token shared prefix counts as 1500
+> queries when it's checked against the offload tier. The 1000 tokens/sec
+> floor catches a single moderately-prefixed request per second; idle
+> replicas (no prefix-caching traffic at all) stay below it. Tune the
+> threshold if your workload's prefix size differs substantially.
+
+The 5-minute `for:` window requires sustained zero-hit behavior — a
+transient miss-streak (e.g. after a backend restart with empty T2)
+does not trip it.
 
 #### Likely causes
 
@@ -323,7 +330,7 @@ This is informational, not an outage signal. It is a tuning lever:
 3. **Shorten the index TTL** (server's `WithTTL` option, default 30m) so
    old prefixes age out before the cap kicks in.
 4. **Tighten per-tenant budgets** via
-   [`CacheTenant.spec.quota.maxIndexEntries`](../reference/metrics.md#counters)
+   [`CacheTenant.spec.quota.maxIndexEntries`](../concepts/cachetenant-identity-and-quota.md)
    so a runaway tenant cannot starve the global cap. The
    `inferencecache_tenant_evictions_total{tenant_id}` counter attributes
    pressure per tenant.

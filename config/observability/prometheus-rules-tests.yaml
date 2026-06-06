@@ -63,16 +63,16 @@ tests:
   # --------------------------------------------------------------------------
   # LMCacheT2NoHits (for: 5m, warning)
   #
-  # Counters grow at 6000/30s = 200/sec on the queries series. The alert
-  # gates on rate > 100/sec (passes) AND rate(hits) == 0. Need ~6 evals of
-  # the condition being true after the 10m rate window has filled, so
-  # eval at t=15m gives stable rates + the 5m `for:` dwell.
+  # vLLM's `external_prefix_cache_{queries,hits}_total` are TOKEN counters,
+  # not request counters. The alert gate is > 1000 tokens/sec. Counters
+  # grow at 60_000/30s = 2000 tokens/sec on the queries series. Eval at
+  # t=15m gives stable rates + the 5m `for:` dwell.
   # --------------------------------------------------------------------------
   - interval: 30s
-    name: LMCacheT2NoHits fires when queries rise while hits stay at zero
+    name: LMCacheT2NoHits fires when queried tokens rise while hit tokens stay at zero
     input_series:
       - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
-        values: '0+6000x40'
+        values: '0+60000x40'
       - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
         values: '0+0x40'
     alert_rule_test:
@@ -84,26 +84,26 @@ tests:
               component: inference-cache
               pod: vllm-0
             exp_annotations:
-              summary: "External prefix cache on pod vllm-0 returning zero hits despite >100 queries/sec."
+              summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
               runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
 
   - interval: 30s
-    name: LMCacheT2NoHits does not fire when offload is also serving hits
+    name: LMCacheT2NoHits does not fire when offload is also serving hit tokens
     input_series:
       - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
-        values: '0+6000x40'
+        values: '0+60000x40'
       - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
-        values: '0+3000x40'
+        values: '0+30000x40'
     alert_rule_test:
       - eval_time: 15m
         alertname: LMCacheT2NoHits
         exp_alerts: []
 
   - interval: 30s
-    name: LMCacheT2NoHits does not fire on a near-idle pod (queries below 100/sec)
+    name: LMCacheT2NoHits does not fire on a near-idle pod (queried tokens below 1000/sec)
     input_series:
       - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
-        values: '0+1500x40'   # 50 queries/sec — below the gate
+        values: '0+15000x40'  # 500 tokens/sec — below the gate
       - series: 'vllm:external_prefix_cache_hits_total{pod="vllm-0"}'
         values: '0+0x40'
     alert_rule_test:
@@ -112,15 +112,17 @@ tests:
         exp_alerts: []
 
   - interval: 30s
-    # Regression guard for the absent-series case Codex flagged: older vLLM
-    # versions / some configurations never publish the `_hits_total` series
-    # until the first non-zero increment. The original `and ... == 0` form
-    # silently dropped the alert because PromQL `and` requires a matching
-    # label set on both sides; the `unless ... > 0` form alerts as intended.
-    name: LMCacheT2NoHits fires when queries rise and the hits counter series is absent
+    # Regression guard for the absent-series case. Older vLLM versions and
+    # some configurations never publish the `_hits_total` series until the
+    # first non-zero increment. A naive `... and rate(hits) == 0` form
+    # silently drops the alert because PromQL `and` requires a matching
+    # label set on both sides; we use `... unless rate(hits) > 0` so the
+    # alert fires when hits is genuinely zero AND when its series is
+    # absent altogether.
+    name: LMCacheT2NoHits fires when queried tokens rise and the hits counter series is absent
     input_series:
       - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
-        values: '0+6000x40'
+        values: '0+60000x40'
       # No `vllm:external_prefix_cache_hits_total` series for vllm-0 at all.
     alert_rule_test:
       - eval_time: 15m
@@ -131,7 +133,7 @@ tests:
               component: inference-cache
               pod: vllm-0
             exp_annotations:
-              summary: "External prefix cache on pod vllm-0 returning zero hits despite >100 queries/sec."
+              summary: "External prefix cache on pod vllm-0 returning zero hit tokens despite >1000 queried tokens/sec."
               runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
 
   # --------------------------------------------------------------------------
