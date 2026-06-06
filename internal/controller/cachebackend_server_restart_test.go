@@ -594,10 +594,13 @@ func TestReconcileServerInstance_MultiReplicaTracksEveryReadyPod(t *testing.T) {
 // TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade
 // asserts that a Deployment rolling-update midpoint — when the old
 // pod is still Ready while the new one comes up (maxSurge=1) —
-// advances observedServerInstance but does NOT trigger a cascade.
-// The cascade fires on the NEXT transition that drops the old pod.
-// Without this debounce a normal single-replica rollout would roll
-// the engine fleet twice.
+// does NOT trigger a cascade AND does NOT advance
+// observedServerInstance. The cascade fires on the NEXT transition
+// that drops the old pod, and the latch stays pinned at the prior
+// baseline through the midpoint so a rollback (see
+// TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade)
+// is a true no-op. Without this debounce a normal single-replica
+// rollout would roll the engine fleet twice.
 func TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
@@ -640,16 +643,16 @@ func TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade(t *testing.
 		t.Fatalf("ready newer pod: %v", err)
 	}
 
-	// Mid-rollout transition: prior strictly grows. Should advance
-	// status but NOT cascade.
+	// Mid-rollout transition: prior strictly grows. Must NOT cascade
+	// AND must NOT advance the latch — keeping prior pinned is what
+	// makes a subsequent rollback a no-op.
 	time.Sleep(60 * time.Millisecond)
 	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
 		t.Fatalf("midpoint wait = %v, want 0", wait)
 	}
 	f.reload(t)
-	wantMidpoint := serverInstanceID(f.serverPod) + "," + serverInstanceID(newer)
-	if got := f.backend.Status.ObservedServerInstance; got != wantMidpoint {
-		t.Fatalf("midpoint ObservedServerInstance = %q, want %q (strict superset of prior)", got, wantMidpoint)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("midpoint ObservedServerInstance = %q, want %q (must stay pinned to baseline through strict-superset; advancing here would make a rollback look like a replacement)", got, baseline)
 	}
 	f.reloadEngineDep(t)
 	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
@@ -680,6 +683,92 @@ func TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade(t *testing.
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
 		t.Fatalf("cascade counter = %v, want exactly 1 (one rolling update = one cascade)", got)
+	}
+}
+
+// TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade
+// covers the round-8 bug: an attempted rolling update where the NEW
+// pod becomes Ready briefly (strict-superset midpoint) and is then
+// rolled back (new pod killed by failing readiness, leaving the
+// ORIGINAL pod alone) must NOT cascade — the original cache-server
+// process and its sockets never changed. The fix is "do not persist
+// the strict-superset midpoint", which makes the rollback path a
+// true no-op (prior=current after the rollback completes).
+func TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline observation: latch = original pod's identifier.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Simulate the rolling-update midpoint: a second Ready pod appears
+	// (maxSurge=1). Strict superset → no cascade AND no latch advance.
+	tru := true
+	newer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-zzz", // sorts AFTER the original
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-newer-but-doomed",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), newer); err != nil {
+		t.Fatalf("create newer pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), newer); err != nil {
+		t.Fatalf("ready newer pod: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("midpoint wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("midpoint ObservedServerInstance = %q, want %q (must stay pinned to baseline; advancing here makes the rollback look like a replacement)", got, baseline)
+	}
+
+	// Now the rollback: the new pod fails readiness / image-pull / etc.
+	// and is killed, leaving ONLY the original pod alone. Pre-fix this
+	// looked like "the new pod was replaced" (prior contained newer,
+	// current does not) and false-cascaded. Post-fix, since the latch
+	// never advanced past baseline, the rollback is prior=current,
+	// no-op.
+	if err := f.r.Delete(context.Background(), newer); err != nil {
+		t.Fatalf("delete rolled-back newer pod: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-rollback wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("post-rollback ObservedServerInstance = %q, want %q (rolled-back rolling update must be a no-op; original pod and its sockets never changed)", got, baseline)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("rolled-back rolling update triggered a cascade; the cache-server process never changed, every engine still holds a live socket")
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter = %v, want 0 (no real cache-server replacement happened)", got)
 	}
 }
 

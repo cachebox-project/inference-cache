@@ -247,18 +247,28 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	}
 
 	// Distinguish a real cache-server replacement from a transient
-	// rolling-update widening (old + new pod both Ready briefly). If
-	// the change is just the new pod showing up alongside the old one,
-	// only persist the new baseline — the cascade will fire when the
-	// next transition drops the old pod (or when the persisting pod's
-	// container restarts).
+	// rolling-update widening (old + new pod both Ready briefly).
+	//
+	// Strict-superset midpoints are NOT persisted as the new baseline.
+	// A failed rollout that gets rolled back (new pod appears Ready,
+	// then fails readiness and is killed, leaving the original pod
+	// alone) returns the set to its prior shape. If we had persisted
+	// the widened set at the midpoint, that return would look like
+	// "the new pod was replaced" and false-cascade — but the original
+	// cache-server process and existing engine sockets never changed.
+	// Keeping the prior latch intact through superset transitions
+	// makes the rollback path a true no-op: prior=current after the
+	// rollback completes.
+	//
+	// Trade-off: when an operator legitimately scales the backend up
+	// (replicas N → N+1) and the new pods become Ready alongside the
+	// old set, observedServerInstance lags the actual pod set until
+	// the next non-superset transition (e.g. a real replacement of one
+	// of the original pods) re-anchors the latch. The latch is the
+	// cascade-decision audit trail, not the operator's pod inventory
+	// — status.matchedEnginePods and `kubectl get pod` cover that —
+	// so brief staleness here is acceptable; a false cascade is not.
 	if !instanceChangeRequiresCascade(prior, currentID) {
-		if err := r.patchStatus(ctx, backend, func() {
-			backend.Status.ObservedServerInstance = currentID
-		}); err != nil {
-			logger.V(1).Info("server-restart cascade: superset observedServerInstance patch failed",
-				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		}
 		logger.V(1).Info("server-restart cascade skipped: transient rolling-update superset",
 			"namespace", backend.Namespace, "name", backend.Name,
 			"prior", prior, "current", currentID)
@@ -325,6 +335,15 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 // current OR has a different restart-sum in current. A current that
 // is a strict superset of prior (same UIDs at same restart counts,
 // plus extras) is the rolling-update midpoint — no cascade yet.
+//
+// The caller MUST NOT persist a strict-superset current as the new
+// baseline. If it did, a rolled-back rolling update (the new pod
+// briefly Ready, then killed by failing readiness, leaving the
+// original pod alone) would later look like "the new pod is gone →
+// real replacement" and false-cascade. Keeping the latch pinned to
+// prior through superset transitions makes the rollback path a
+// no-op and the genuine completion path (original pod drops) a
+// correctly-detected replacement.
 //
 // Conservative fallback: if `prior` is non-empty but fails to parse
 // (operator hand-edited the field, or a value from a prior schema
