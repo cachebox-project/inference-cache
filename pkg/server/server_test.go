@@ -883,6 +883,67 @@ func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
 	}
 }
 
+// TestLookupRouteEmitsMetricForReservedProbeTenantNoHint pins the metric
+// contract on the reserved-tenant short-circuit: even though the call is
+// fail-open without touching the index, observeLookup still fires with
+// reason_code=NO_HINT + hint_used=false, so the "one increment per
+// LookupRoute call" contract on inferencecache_lookup_route_calls_total
+// holds. A future dashboard slicing the metric on tenant_id can surface
+// external traffic against the reserved tenant as an attempted scope probe.
+func TestLookupRouteEmitsMetricForReservedProbeTenantNoHint(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	}); err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	got := lookupCallsValueFromService(t, svc, "m", "NO_HINT", "false")
+	if got != 1 {
+		t.Errorf("lookup_route_calls_total{model=m,reason=NO_HINT,hint_used=false} = %v, want 1 — reserved-tenant short-circuit must still emit the metric", got)
+	}
+}
+
+// lookupCallsValueFromService reads the in-memory counter value for one
+// label set off the service's per-Service Prometheus registry. Avoids
+// pulling in github.com/prometheus/client_golang/prometheus/testutil
+// (and its transitive kylelemons/godebug dep) for one assertion.
+func lookupCallsValueFromService(t *testing.T, svc *inferenceCacheService, model, reason, hintUsed string) float64 {
+	t.Helper()
+	mfs, err := svc.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("registry.Gather: %v", err)
+	}
+	const name = "inferencecache_lookup_route_calls_total"
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			matched := 0
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "model":
+					if l.GetValue() == model {
+						matched++
+					}
+				case "reason_code":
+					if l.GetValue() == reason {
+						matched++
+					}
+				case "hint_used":
+					if l.GetValue() == hintUsed {
+						matched++
+					}
+				}
+			}
+			if matched == 3 {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
 // TestGetCacheStateReturnsEmptyForReservedProbeTenant is the same guard on
 // the per-(tenant, model) aggregate RPC: an external caller MUST NOT see
 // the probe's synthetic replica stats or prefix count via GetCacheState.

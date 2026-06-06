@@ -1431,11 +1431,18 @@ func (i *Index) Snapshot() Snapshot {
 }
 
 // EntryCountsByModel returns the number of distinct prefixes per model.
+// Reserved-tenant entries (see WithReservedTenants) are excluded so the
+// inferencecache_index_entries gauge reportEntries publishes never
+// transiently surfaces synthetic probe state during a Run. Mirrors the
+// snapshot/aggregate exclusion of the reserved scope.
 func (i *Index) EntryCountsByModel() map[string]int {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	counts := make(map[string]int)
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		counts[key.model]++
 	}
 	return counts

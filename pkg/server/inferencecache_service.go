@@ -89,12 +89,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// knows (or guesses) a backend name could re-derive the deterministic
 	// probe hash and observe the synthetic __probe-<backend> replica during
 	// a Run, contradicting the "server-internal / never leaks into a real
-	// LookupRoute" contract. Fail open with NO_HINT (no metric noise — the
-	// observation isn't useful here and would just pollute the lookup
-	// counters with synthetic traffic). The legitimate probe path uses
-	// index.LookupRoute directly, not the gRPC handler.
+	// LookupRoute" contract. Fail open with NO_HINT. The metric is still
+	// observed (reason_code=NO_HINT, hint_used=false, latency=0) so the
+	// "one increment per LookupRoute call" contract on
+	// inferencecache_lookup_route_calls_total stays intact — a future
+	// dashboard slicing the metric on tenant_id would surface
+	// "any external traffic against the reserved tenant" as an attempted
+	// probe-scope probe, which is itself a useful operator signal. The
+	// legitimate probe path uses index.LookupRoute directly, not the gRPC
+	// handler.
 	if tenant == ProbeTenantID {
-		return &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}, nil
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
 	}
 
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a

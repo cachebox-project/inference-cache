@@ -66,11 +66,12 @@ import (
 const ProbeTenantID = "inferencecache.io/probe"
 
 // ProbeReplicaPrefix is the literal prefix every probe replica id starts with.
-// Real subscribers set replica_id = pod-name (see PROJECT_CONTEXT §"Replica
-// identity convention"); pod names cannot start with "__", so the reserved
-// `__probe-` prefix is collision-free. Cleanup keys on this prefix (and the
-// probe tenant + backend-derived suffix) to wipe ONLY the probe's own state on
-// each Run, never a real replica's entries.
+// Real subscribers set replica_id = pod-name; Kubernetes pod names are RFC
+// 1123 subdomain labels that disallow underscores entirely, so the reserved
+// `__probe-` prefix (with its leading underscores) is collision-free with any
+// legitimate replica id. Cleanup keys on this prefix (and the probe tenant +
+// backend-derived suffix) to wipe ONLY the probe's own state on each Run,
+// never a real replica's entries.
 const ProbeReplicaPrefix = "__probe-"
 
 // ProbeTokenCount is the per-block token count carried by the synthesized

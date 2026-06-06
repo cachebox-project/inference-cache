@@ -18,6 +18,75 @@ func (c *fakeClock) add(d time.Duration) { c.t = c.t.Add(d) }
 
 func hash(s string) []byte { return []byte(s) }
 
+// TestReservedTenantHiddenFromCapAndAggregate pins the WithReservedTenants
+// contract: reserved-tenant entries are present in the index (so the probe's
+// Stage A lookup still finds them) but invisible to the cap accounting,
+// aggregate, snapshot, and per-model entry-count gauge — so a probe in flight
+// cannot displace real workload state via the cap sweep AND cannot leak
+// into observability surfaces. Mirrors TestProberRun* in pkg/server, but
+// from the index's perspective.
+func TestReservedTenantHiddenFromCapAndAggregate(t *testing.T) {
+	const reserved = "inferencecache.io/probe"
+	idx := New(WithMaxEntries(1), WithReservedTenants(reserved))
+
+	idx.Ingest(Update{
+		ReplicaID: "real", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("rp"), TokenCount: 64}},
+	})
+	idx.Ingest(Update{
+		ReplicaID: "__probe-cb", Model: "m", Tenant: reserved, HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("pp"), TokenCount: 16}},
+		Stats:    &ReplicaStats{ReplicaID: "__probe-cb", CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	// Cap math sees only the real entry; the probe entry didn't trigger
+	// eviction (which would have removed the real entry under cap=1).
+	if scores := idx.Lookup(LookupRequest{
+		Tenant: "real-tenant", Model: "m", HashScheme: "vllm", PrefixHash: hash("rp"),
+	}); len(scores) != 1 || scores[0].ReplicaID != "real" {
+		t.Fatalf("real workload entry evicted under cap=1; got scores = %+v", scores)
+	}
+
+	// Aggregate excludes the reserved tenant — Total == real-tenant entry count.
+	agg := idx.Aggregate()
+	if agg.Total != 1 {
+		t.Errorf("Aggregate.Total = %d, want 1 — reserved tenant must not contribute", agg.Total)
+	}
+	if _, present := agg.PerTenant[reserved]; present {
+		t.Errorf("Aggregate.PerTenant includes reserved tenant: %+v", agg.PerTenant)
+	}
+
+	// EntryCountsByModel feeds inferencecache_index_entries — must not surface
+	// the synthetic model count from a reserved-tenant entry.
+	if got := idx.EntryCountsByModel()["m"]; got != 1 {
+		t.Errorf("EntryCountsByModel[m] = %d, want 1 — reserved tenant must not bump the per-model gauge", got)
+	}
+
+	// Snapshot: no reserved tenant, no reserved replica.
+	snap := idx.Snapshot()
+	if snap.TotalPrefixes != 1 {
+		t.Errorf("Snapshot.TotalPrefixes = %d, want 1", snap.TotalPrefixes)
+	}
+	for _, r := range snap.Replicas {
+		if r.Tenant == reserved || r.ReplicaID == "__probe-cb" {
+			t.Errorf("Snapshot exposed reserved replica: %+v", r)
+		}
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == reserved {
+			t.Errorf("Snapshot exposed reserved tenant: %+v", tn)
+		}
+	}
+
+	// But the probe's own Stage A lookup STILL finds its entry — the
+	// exemption applies only to external surfaces, not to internal callers.
+	if scores := idx.Lookup(LookupRequest{
+		Tenant: reserved, Model: "m", HashScheme: "vllm", PrefixHash: hash("pp"),
+	}); len(scores) != 1 || scores[0].ReplicaID != "__probe-cb" {
+		t.Fatalf("reserved-tenant lookup must still work for the probe's own Stage A check; got scores = %+v", scores)
+	}
+}
+
 func TestIngestAndLookupRanksByTokensAndFreshness(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))
