@@ -118,6 +118,19 @@ func getRV(t *testing.T, r *CacheBackendReconciler, name, namespace string, obj 
 
 func ptrBool(v bool) *bool { return &v }
 
+type getObservingClient struct {
+	client.Client
+	onGet func(types.NamespacedName, client.Object)
+}
+
+func (c *getObservingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	if err == nil && c.onGet != nil {
+		c.onGet(types.NamespacedName(key), obj)
+	}
+	return err
+}
+
 // pollDeployment waits for a Deployment to exist at key, returning its UID.
 func pollDeployment(t *testing.T, k8s client.Client, key types.NamespacedName, what string) string {
 	t.Helper()
@@ -1048,8 +1061,21 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if err := (&CacheBackendReconciler{
+	hpaGets := make(chan types.NamespacedName, 100)
+	observedClient := &getObservingClient{
 		Client: mgr.GetClient(),
+		onGet: func(key types.NamespacedName, obj client.Object) {
+			if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); !ok {
+				return
+			}
+			select {
+			case hpaGets <- key:
+			default:
+			}
+		},
+	}
+	if err := (&CacheBackendReconciler{
+		Client: observedClient,
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
 	}).SetupWithManager(mgr); err != nil {
@@ -1092,6 +1118,51 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		}
 		t.Fatalf("timed out waiting for CacheBackend %s/%s observedGeneration to reach %d", key.Namespace, key.Name, want)
 	}
+	drainHPAGetEvents := func() {
+		for {
+			select {
+			case <-hpaGets:
+			default:
+				return
+			}
+		}
+	}
+	waitForHPAGet := func(t *testing.T, key types.NamespacedName, what string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case got := <-hpaGets:
+				if got == key {
+					return
+				}
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		t.Fatalf("timed out waiting for reconciler to get HPA %s/%s (%s)", key.Namespace, key.Name, what)
+	}
+	waitForQuietHPAGets := func(t *testing.T, key types.NamespacedName, quietFor time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		quietUntil := time.Now().Add(quietFor)
+		for {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for reconciler HPA gets on %s/%s to go quiet", key.Namespace, key.Name)
+			}
+			remainingQuiet := time.Until(quietUntil)
+			if remainingQuiet <= 0 {
+				return
+			}
+			select {
+			case got := <-hpaGets:
+				if got == key {
+					quietUntil = time.Now().Add(quietFor)
+				}
+			case <-time.After(remainingQuiet):
+				return
+			}
+		}
+	}
 
 	t.Run("OwnsDeploymentWatchRecreatesDeletedChild", func(t *testing.T) {
 		ns := freshNS(t, k8s)
@@ -1131,6 +1202,7 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		// Drain the initial create/status/owned-child event burst before deleting
 		// the HPA. Otherwise an already-queued parent/Deployment reconcile could
 		// recreate the HPA and make this test pass even if Owns(HPA) were absent.
+		drainHPAGetEvents()
 		var live cachev1alpha1.CacheBackend
 		if err := k8s.Get(context.Background(), key, &live); err != nil {
 			t.Fatalf("get CacheBackend before drain update: %v", err)
@@ -1147,6 +1219,9 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 			t.Fatalf("drain update did not advance generation: %d -> %d", beforeGeneration, live.Generation)
 		}
 		waitForObservedGeneration(t, key, live.Generation)
+		waitForHPAGet(t, key, "drain spec update reconcile")
+		waitForHPAGet(t, key, "post-status parent reconcile")
+		waitForQuietHPAGets(t, key, 500*time.Millisecond)
 
 		originalUID := waitForHPA(t, key, "remain after the drain reconcile")
 
