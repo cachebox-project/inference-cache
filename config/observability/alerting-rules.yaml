@@ -55,10 +55,18 @@ groups:
         # client (in the engine pod) and offload server. The 100 q/s gate
         # avoids noise on near-idle replicas; the 10m windows + 5m `for`
         # require sustained zero-hit behavior, not a transient miss-streak.
+        #
+        # We use `unless` (set difference) rather than `and == 0` so the alert
+        # also fires when the hits counter series is entirely absent for the
+        # pod — older vLLM versions and some configurations never publish the
+        # `_hits_total` series until the first non-zero increment, and `and`
+        # requires a matching pod label on both sides to evaluate. The
+        # `unless` form drops a pod from the alert set ONLY when it has a
+        # positive hit rate; absent hits + queries > 100 → alert fires.
         expr: |
           (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 100)
-          and
-          (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) == 0)
+          unless
+          (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
         for: 5m
         labels:
           severity: warning

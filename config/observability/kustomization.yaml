@@ -10,7 +10,15 @@
 #
 # Deliberately not aggregated into `config/default` so the default install
 # stays usable on clusters without prometheus-operator CRDs installed.
+#
+# The PrometheusRule is pinned to `inference-cache-system` (the operator
+# namespace) so it lands somewhere a typical prometheus-operator install's
+# `ruleNamespaceSelector` already scans. If your Prometheus CR watches a
+# different namespace (e.g. `monitoring`), override here:
+#
+#   namespace: monitoring
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+namespace: inference-cache-system
 resources:
   - prometheus-rules.yaml

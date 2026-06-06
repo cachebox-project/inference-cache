@@ -14,6 +14,13 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: inference-cache-alerts
+  # Land in the operator's namespace by default, NOT the caller's current
+  # context. Many prometheus-operator installs use `ruleNamespaceSelector`
+  # to constrain which namespaces are scanned for rules; applying into the
+  # operator namespace is the safest universal default. If your Prometheus
+  # CR's selector points at a different namespace (e.g. `monitoring`),
+  # change the `namespace:` here or set `namespace:` in kustomization.yaml.
+  namespace: inference-cache-system
   labels:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: observability
@@ -43,8 +50,8 @@ spec:
         - alert: LMCacheT2NoHits
           expr: |
             (sum by (pod) (rate(vllm:external_prefix_cache_queries_total[10m])) > 100)
-            and
-            (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) == 0)
+            unless
+            (sum by (pod) (rate(vllm:external_prefix_cache_hits_total[10m])) > 0)
           for: 5m
           labels:
             severity: warning

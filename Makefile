@@ -32,6 +32,16 @@ ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
 GOVULNCHECK_VERSION ?= v1.3.0
 PROMTOOL_VERSION ?= 3.0.1
+# SHA256 checksums of the upstream Prometheus release tarballs we extract
+# `promtool` from. Sourced from
+# https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/sha256sums.txt
+# — verify against that file when bumping PROMTOOL_VERSION. CI relies on the
+# linux-amd64 entry; the others let local dev (Mac arm64/amd64, linux arm64)
+# get the same integrity check.
+PROMTOOL_SHA256_linux_amd64  ?= 43f6f228ef59e0c2f6994e489c5c76c6671553eaa99ded0aea1cd31366222916
+PROMTOOL_SHA256_linux_arm64  ?= 58e8d4f3ab633528fa784740409c529f4a434f8a0e3cf4d2f56e75ce2db69aa8
+PROMTOOL_SHA256_darwin_amd64 ?= d45a9dab9ee9f40a27f2b7dde227843753d6f648ccf2d2c8477b9c7ffd75c0a0
+PROMTOOL_SHA256_darwin_arm64 ?= 803d1ae747d39a4637ad33df254854f2a76663a6dd4ade0066b7f25617feba3d
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -96,7 +106,7 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 	fi
 
 .PHONY: promtool
-promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binary is unavailable.
+promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binary is unavailable. Downloads with SHA-256 verification.
 	@if command -v promtool >/dev/null 2>&1; then \
 		true; \
 	elif [ ! -x $(LOCAL_PROMTOOL) ]; then \
@@ -105,13 +115,25 @@ promtool: $(LOCALBIN) ## Install promtool locally when the system promtool binar
 		arch=$$(uname -m); \
 		case $$arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
 		dir=prometheus-$(PROMTOOL_VERSION).$${os}-$${arch}; \
+		case "$${os}_$${arch}" in \
+			linux_amd64)  want_sha="$(PROMTOOL_SHA256_linux_amd64)";; \
+			linux_arm64)  want_sha="$(PROMTOOL_SHA256_linux_arm64)";; \
+			darwin_amd64) want_sha="$(PROMTOOL_SHA256_darwin_amd64)";; \
+			darwin_arm64) want_sha="$(PROMTOOL_SHA256_darwin_arm64)";; \
+			*) echo "✗ unsupported os/arch: $${os}_$${arch} — add a SHA-256 to Makefile and retry."; exit 1;; \
+		esac; \
+		if [ -z "$$want_sha" ]; then \
+			echo "✗ PROMTOOL_SHA256_$${os}_$${arch} is empty — refusing to install promtool without integrity verification."; \
+			exit 1; \
+		fi; \
 		tmp=$$(mktemp -d); \
+		trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 		echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
 		curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
+		echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
 		tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
 		mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
 		chmod +x $(LOCAL_PROMTOOL); \
-		rm -rf "$${tmp}"; \
 	fi
 
 ##@ Development

@@ -111,6 +111,29 @@ tests:
         alertname: LMCacheT2NoHits
         exp_alerts: []
 
+  - interval: 30s
+    # Regression guard for the absent-series case Codex flagged: older vLLM
+    # versions / some configurations never publish the `_hits_total` series
+    # until the first non-zero increment. The original `and ... == 0` form
+    # silently dropped the alert because PromQL `and` requires a matching
+    # label set on both sides; the `unless ... > 0` form alerts as intended.
+    name: LMCacheT2NoHits fires when queries rise and the hits counter series is absent
+    input_series:
+      - series: 'vllm:external_prefix_cache_queries_total{pod="vllm-0"}'
+        values: '0+6000x40'
+      # No `vllm:external_prefix_cache_hits_total` series for vllm-0 at all.
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LMCacheT2NoHits
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              pod: vllm-0
+            exp_annotations:
+              summary: "External prefix cache on pod vllm-0 returning zero hits despite >100 queries/sec."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
   # --------------------------------------------------------------------------
   # LookupRouteDegenerate (for: 5m, warning)
   #

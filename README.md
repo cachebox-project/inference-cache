@@ -138,6 +138,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make test`: run unit tests
 - `make lint`: run gofmt and go vet
 - `make ci-lint`: run golangci-lint
+- `make verify-prometheus`: lint + unit-test the Prometheus alerting rules under `config/observability/`
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code
 - `make manifests`: regenerate CRD, RBAC, and webhook manifests

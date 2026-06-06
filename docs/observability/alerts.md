@@ -21,9 +21,20 @@ There are two distribution shapes, same rule set, drift-gated by
   kubectl apply -k config/observability
   ```
 
-  The CR's `metadata.labels` (`prometheus: kube-prometheus`, `role:
-  alert-rules`) match the default kube-prometheus rule selector. Adjust the
-  labels if your Prometheus CR's `ruleSelector` is different.
+  The CR is pinned to namespace `inference-cache-system` (the operator
+  namespace) and carries the default kube-prometheus selector labels
+  (`prometheus: kube-prometheus`, `role: alert-rules`).
+
+  > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
+  > prometheus-operator installs run a `Prometheus` CR with both a
+  > `ruleSelector` (matches `PrometheusRule.metadata.labels`) AND a
+  > `ruleNamespaceSelector` (matches the namespaces the rules live in).
+  > The default kube-prometheus install allows all namespaces, but a
+  > hardened install may restrict to e.g. `monitoring`. If
+  > `kubectl get prometheusrule -A` shows the CR landed but Prometheus
+  > never loads it, check your `Prometheus.spec.ruleNamespaceSelector`
+  > and either widen it, override the namespace in
+  > `config/observability/kustomization.yaml`, or move the CR by hand.
 
 - **Vanilla Prometheus / Helm**: mount
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
@@ -250,7 +261,7 @@ default policy. Every TIMEOUT is a missed cache-hit opportunity.
 
 1. **Server overload**: the lookup ranking is in-memory and should be
    sub-millisecond. A surprising p95/p99 tail usually means the working
-   set has grown past what `MaxEntries` was sized for. Check
+   set has grown past what the index's global `MaxEntries` cap was sized for. Check
    `inferencecache_lookup_route_latency_seconds`.
 2. **`CachePolicy.spec.lookupTimeoutMs` too tight**: a 5 ms timeout on a
    gateway-side 50 ms deadline is asymmetric. Either raise the timeout
@@ -270,7 +281,7 @@ curl -s localhost:8080/metrics | grep 'inferencecache_lookup_route_calls_total'
 curl -s localhost:8080/metrics | grep 'inferencecache_lookup_route_latency_seconds'
 
 # 3. Inspect server resource consumption.
-kubectl top pod -n inference-cache-system -l app=inference-cache-server
+kubectl top pod -n inference-cache-system -l app.kubernetes.io/name=inference-cache,app.kubernetes.io/component=server
 ```
 
 Triage queries:
@@ -296,15 +307,26 @@ sum by (pod) (process_resident_memory_bytes)
 
 The cache index is evicting more than 10 entries per second under the
 `reason="cap"` policy. That means the working set has outgrown the
-configured global `MaxEntries`; recent prefix entries are being dropped
-on top of recording new ones — the cache is doing useful work but is
-under sustained capacity pressure.
+**index's global `MaxEntries` cap** — the cluster-wide upper bound on
+total `(replica × prefix)` entries the server's in-memory index will hold
+(default `1_000_000`, configured via the `WithMaxEntries` option on the
+server's index constructor; not currently exposed as a CRD or CLI flag).
+Recent prefix entries are being dropped on top of recording new ones —
+the cache is doing useful work but is under sustained capacity pressure.
 
 This is informational, not an outage signal. It is a tuning lever:
 
-1. **Raise `MaxEntries`** to fit the observed working set.
+1. **Raise the global `MaxEntries` cap** to fit the observed working set.
+   Today this requires a code-side server-binary build change; expose it
+   as a CLI flag if you need to retune in place. (Filed for follow-up.)
 2. **Accept the reduced hit rate** at the current cap.
-3. **Shorten `TTL`** so old prefixes age out before the cap kicks in.
+3. **Shorten the index TTL** (server's `WithTTL` option, default 30m) so
+   old prefixes age out before the cap kicks in.
+4. **Tighten per-tenant budgets** via
+   [`CacheTenant.spec.quota.maxIndexEntries`](../reference/metrics.md#counters)
+   so a runaway tenant cannot starve the global cap. The
+   `inferencecache_tenant_evictions_total{tenant_id}` counter attributes
+   pressure per tenant.
 
 The 10/sec threshold is conservative for steady-state operation; tune
 it locally to your install's expected baseline by editing the alert's
@@ -318,8 +340,12 @@ Triage queries:
 # Cap vs. TTL eviction rate
 sum by (algorithm, reason) (rate(inferencecache_index_evictions_total[10m]))
 
-# Current index population vs. the per-namespace MaxEntries setting
-inferencecache_index_entries
+# Current index population, per model (sum gives the total against the cap)
+sum(inferencecache_index_entries)
+
+# Per-tenant eviction pressure (CacheTenant quota — distinct from the
+# global cap above)
+sum by (tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
 ```
 
 ---
@@ -352,8 +378,8 @@ of recurring failure modes:
 | Engine prefix-cache off | `IndexEmpty` (critical) | engine flags `--enable-prefix-caching` + `--kv-events-config` |
 | Offload tier version skew | `LMCacheT2NoHits` (warning) + maybe `LookupRouteDegenerate` if T2 is the only cache path | offload client/server image tags |
 | Tenant or `hash_scheme` mismatch | `LookupRouteDegenerate` (warning) alongside `inferencecache_index_entries > 0` | gateway-side request shape |
-| Server overload | `LookupRouteHighTimeout` (warning) + maybe `LookupRouteDegenerate` | `lookup_route_latency_seconds` p99, `process_resident_memory_bytes`, `MaxEntries` setting |
-| Working set outgrew config | `IndexEvictionsSpike` (info) | `CachePolicy.MaxEntries` vs. observed working-set size |
+| Server overload | `LookupRouteHighTimeout` (warning) + maybe `LookupRouteDegenerate` | `lookup_route_latency_seconds` p99, `process_resident_memory_bytes`, server's global `MaxEntries` |
+| Working set outgrew config | `IndexEvictionsSpike` (info) | server's global `MaxEntries` vs. observed working-set size; `CacheTenant.spec.quota.maxIndexEntries` per tenant |
 
 If two alerts fire together, work the more-severe one first; the lower
 one usually clears once the root cause does.
