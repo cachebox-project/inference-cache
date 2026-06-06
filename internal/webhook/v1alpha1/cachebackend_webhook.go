@@ -29,10 +29,10 @@ import (
 //
 // Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
 // spec.replicas=1, spec.integration.engine=vllm, spec.integration.role=
-// ReadWrite, spec.integration.failOpen=true) are expressed via
-// `+kubebuilder:default=` markers on the API types and stamped by the
-// apiserver before this webhook runs. The webhook only handles defaults
-// the schema cannot express:
+// ReadWrite, spec.integration.failOpen=true, spec.resources={requests:
+// {memory:4Gi}, limits:{memory:8Gi}}) are expressed via `+kubebuilder:default=`
+// markers on the API types and stamped by the apiserver before this webhook
+// runs. The webhook only handles defaults the schema cannot express:
 //
 //   - spec.integration.firstEventTimeout: the CRD-schema default only fires
 //     when spec.integration is present in the submitted object; when the
@@ -70,9 +70,9 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
 // defaults (spec.type, deploymentKind, replicas, integration.engine,
-// integration.role, integration.failOpen) ride on schema markers and are
-// stamped by the apiserver before this handler runs; the webhook only
-// handles the schema-inexpressible ones:
+// integration.role, integration.failOpen, resources) ride on schema
+// markers and are stamped by the apiserver before this handler runs;
+// the webhook only handles the schema-inexpressible ones:
 //
 //   - Materialises spec.integration solely to persist
 //     spec.integration.firstEventTimeout when the operator omits the
@@ -157,6 +157,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectResourceLimitsBelowRequests,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
+	rejectInvalidResourceNames,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -192,7 +193,8 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
 // replicas=1, integration.engine=vllm, integration.role=ReadWrite,
-// integration.failOpen=true) rides on a `+kubebuilder:default=` marker and
+// integration.failOpen=true, resources={requests:{memory:4Gi},
+// limits:{memory:8Gi}}) rides on a `+kubebuilder:default=` marker and
 // is stamped by the apiserver before this handler runs. Note that the nested
 // integration.* markers only fire when spec.integration is already present
 // in the submitted object — when the operator omits the integration block
@@ -989,6 +991,36 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 			fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
 		))
 	}
+	return errs
+}
+
+// rejectInvalidResourceNames rejects any spec.resources.requests or
+// spec.resources.limits key that fails the standard K8s qualified-name
+// rule (IsQualifiedName from apimachinery/util/validation). The CRD
+// schema treats ResourceList keys as opaque strings — admitting
+// "memory!" or empty-string would persist a CR the apiserver later
+// rejects when the controller renders the child pod. Rejecting at
+// admission turns that latent failure into a field-scoped error at
+// `kubectl apply`. Vendor-prefixed extended resources (e.g.
+// "nvidia.com/gpu") satisfy IsQualifiedName and admit unchanged.
+func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name := range list {
+			for _, msg := range validation.IsQualifiedName(string(name)) {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind),
+					string(name),
+					fmt.Sprintf("%q is not a valid resource name: %s", name, msg),
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
 	return errs
 }
 

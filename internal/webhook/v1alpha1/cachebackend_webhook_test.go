@@ -511,6 +511,41 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesInvalidNameRejected(t *testing.T) {
+	// ResourceList keys are opaque map keys at the CRD-schema layer:
+	// a CR can be admitted with "memory!" or "" as a key, and the
+	// kubelet rejects the pod later. Reject at admission against the
+	// standard K8s IsQualifiedName rule so the regression surfaces at
+	// `kubectl apply`. Vendor-prefixed names ("nvidia.com/gpu") still
+	// admit — they are the canonical extended-resource shape.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceName("memory!"): resource.MustParse("4Gi"),
+		},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.requests",
+		"is not a valid resource name")
+}
+
+func TestValidator_ResourcesValidExtendedNameAdmitted(t *testing.T) {
+	// Vendor-prefixed extended resources are valid K8s ResourceNames;
+	// the rule MUST admit them so operators can declare e.g.
+	// nvidia.com/gpu on the cache-server container (rare but not
+	// structurally forbidden).
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+		},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vendor-prefixed extended resource rejected: %v", err)
+	}
+}
+
 func TestValidator_ResourcesNegativeRequestRejected(t *testing.T) {
 	// The CRD schema serialises requests/limits as resource.Quantity
 	// strings — it admits a leading "-" without complaint, and the
