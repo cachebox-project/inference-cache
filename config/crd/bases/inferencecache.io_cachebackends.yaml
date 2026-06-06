@@ -2196,9 +2196,16 @@ spec:
                 type: integer
               observedServerInstance:
                 description: |-
-                  ObservedServerInstance is a stable identifier representing the
-                  current set of Ready cache-server pods the controller observes
-                  for this managed backend. The shape is `<pod-uid>:<restart-sum>`
+                  ObservedServerInstance is the controller's cascade-decision
+                  baseline: a stable identifier for the set of Ready cache-server
+                  pods the controller last anchored against. It is NOT a live
+                  "current pod set" view — it is intentionally pinned through
+                  transient rolling-update midpoints and through no-Ready
+                  windows so the cascade does not fire on rollbacks or transient
+                  outages (see "Transitions" below). For the actual current
+                  matched-pod inventory operators should consult
+                  status.matchedEnginePods (engine side) and `kubectl get pod`
+                  (cache-server side). The shape is `<pod-uid>:<restart-sum>`
                   per Ready pod, comma-joined and lex-sorted by pod name; the
                   restart-sum is the sum of pod.status.containerStatuses[].
                   RestartCount filtered to the cache-server's own containers —
@@ -2232,22 +2239,26 @@ spec:
                   limited to at most once per ~30s per backend to dampen restart
                   storms when the cache-server flaps.
 
-                  Transitions that DO NOT cascade: empty→set (first-observation
-                  baseline; no engines exist yet) and a strict superset (the
-                  rolling-update midpoint where old + new pods are both Ready
-                  briefly — the cascade fires on the next transition that drops
-                  the old pod). Strict-superset midpoints are NOT persisted as
-                  the new baseline: if they were, a failed rollout that gets
-                  rolled back (the new pod briefly Ready, then killed by failing
-                  readiness, leaving the original pod alone) would later look
-                  like "the new pod was replaced" and false-cascade, even though
-                  the original cache-server process and existing engine sockets
-                  never changed. Keeping the latch pinned through superset
-                  transitions makes the rollback path a no-op. Trade-off: when
-                  an operator legitimately scales the backend up, this field
-                  lags the actual pod set until the next non-superset transition
-                  re-anchors the latch — it is the cascade-decision audit trail,
-                  not the operator's pod inventory (status.matchedEnginePods is).
+                  Transitions that DO NOT cascade: empty→set (first observation;
+                  there is no prior server-instance to invalidate, so no engine
+                  sockets are stale by definition — engines that connected
+                  during the "" window are connecting to the very pod we are
+                  now baselining) and a strict-superset transition that occurs
+                  while the owning Deployment is still rolling (the rolling-
+                  update midpoint where old + new pods are both Ready briefly —
+                  the cascade fires on the next transition that drops the old
+                  pod). Strict-superset midpoints during a roll are NOT
+                  persisted as the new baseline: if they were, a failed rollout
+                  that gets rolled back (the new pod briefly Ready, then killed
+                  by failing readiness, leaving the original pod alone) would
+                  later look like "the new pod was replaced" and false-cascade,
+                  even though the original cache-server process and existing
+                  engine sockets never changed. Strict-superset transitions where
+                  the owning Deployment has converged (spec.replicas ==
+                  status.readyReplicas == status.updatedReplicas, observedGeneration
+                  >= metadata.generation) ARE persisted — those are operator-
+                  driven scale-ups, and the added pods must enter the baseline
+                  so a later replacement of just an added pod cascades correctly.
                   Stale-while-unavailable: when no Ready cache-server pod exists
                   (Deployment scaled to 0, mid-rollout, image pull stuck), this
                   field intentionally retains the prior value — clearing it

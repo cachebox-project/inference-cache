@@ -179,10 +179,17 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 // boundary.
 //
 // "Transient" transitions that do NOT cascade:
-//   - empty → set (first-observation baseline; no engines existed)
-//   - prior set strictly grows (a rolling update's maxSurge window:
-//     the old pod is still Ready while the new one comes up; the
-//     subsequent transition that drops the old pod IS a cascade)
+//   - empty → set (first observation; there is no prior server-instance
+//     to invalidate, so by definition no engine sockets are stale —
+//     any engines that connected during the "" window connected to the
+//     very pod we are now baselining)
+//   - prior set strictly grows AND the owning Deployment is still
+//     rolling (a maxSurge midpoint: the old pod is still Ready while
+//     the new one comes up; the subsequent transition that drops the
+//     old pod IS a cascade). When the Deployment has converged at the
+//     wider count instead — operator-driven scale-up — the widened
+//     set IS persisted as the new baseline, so a later replacement of
+//     any of the added pods cascades correctly.
 //
 // When no Ready cache-server pod exists at all (currentID = ""), the
 // reconciler leaves status.observedServerInstance at its prior value
@@ -210,7 +217,7 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 // escalate a transient apiserver hiccup into a Reconcile error that
 // backs off the rest of the reconcile.
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
-	currentID, err := r.currentServerInstanceUID(ctx, backend)
+	currentID, converged, err := r.currentServerInstanceUID(ctx, backend)
 	if err != nil {
 		// A transient observation failure (apiserver hiccup, RBAC
 		// flake on a ReplicaSet Get along the owner chain) leaves
@@ -249,26 +256,40 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// Distinguish a real cache-server replacement from a transient
 	// rolling-update widening (old + new pod both Ready briefly).
 	//
-	// Strict-superset midpoints are NOT persisted as the new baseline.
-	// A failed rollout that gets rolled back (new pod appears Ready,
-	// then fails readiness and is killed, leaving the original pod
-	// alone) returns the set to its prior shape. If we had persisted
-	// the widened set at the midpoint, that return would look like
-	// "the new pod was replaced" and false-cascade — but the original
-	// cache-server process and existing engine sockets never changed.
-	// Keeping the prior latch intact through superset transitions
-	// makes the rollback path a true no-op: prior=current after the
-	// rollback completes.
+	// Strict-superset transitions split into two cases by the owning
+	// Deployment's convergence flag (see currentServerInstanceUID):
 	//
-	// Trade-off: when an operator legitimately scales the backend up
-	// (replicas N → N+1) and the new pods become Ready alongside the
-	// old set, observedServerInstance lags the actual pod set until
-	// the next non-superset transition (e.g. a real replacement of one
-	// of the original pods) re-anchors the latch. The latch is the
-	// cascade-decision audit trail, not the operator's pod inventory
-	// — status.matchedEnginePods and `kubectl get pod` cover that —
-	// so brief staleness here is acceptable; a false cascade is not.
+	//  - NOT converged (rolling-update midpoint): do NOT persist the
+	//    widened set. If we did, a failed rollout that gets rolled
+	//    back (new pod briefly Ready, then killed by failing
+	//    readiness, leaving the original pod alone) would later look
+	//    like "the new pod was replaced" and false-cascade — but the
+	//    original cache-server process and existing engine sockets
+	//    never changed. Keeping the prior latch intact makes the
+	//    rollback path a true no-op.
+	//
+	//  - Converged (steady-state scale-up): persist the widened set
+	//    as the new baseline. The operator raised spec.replicas, the
+	//    Deployment has reached steady state at the higher count, and
+	//    the added pods are real cache-server processes. If we did
+	//    not persist, a later replacement of just one of the added
+	//    pods would still be a strict superset of the pinned prior
+	//    map — instanceChangeRequiresCascade would return false and
+	//    no cascade would fire, leaving engines that connected to the
+	//    replaced pod with stale sockets.
 	if !instanceChangeRequiresCascade(prior, currentID) {
+		if converged {
+			if err := r.patchStatus(ctx, backend, func() {
+				backend.Status.ObservedServerInstance = currentID
+			}); err != nil {
+				logger.V(1).Info("server-restart cascade: converged-superset observedServerInstance patch failed",
+					"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			}
+			logger.V(1).Info("server-restart cascade skipped: superset at Deployment steady state (scale-up); latch advanced",
+				"namespace", backend.Namespace, "name", backend.Name,
+				"prior", prior, "current", currentID)
+			return 0
+		}
 		logger.V(1).Info("server-restart cascade skipped: transient rolling-update superset",
 			"namespace", backend.Namespace, "name", backend.Name,
 			"prior", prior, "current", currentID)
@@ -395,14 +416,18 @@ func parseInstanceMap(s string) map[string]int32 {
 }
 
 // currentServerInstanceUID returns a stable identifier representing
-// the current set of Ready cache-server pods for the backend, or ""
-// when no Ready pod exists yet. The candidate set is the owned
-// Deployment's pods — pods whose controller-owning ReplicaSet is
-// controller-owned by the backend-owned Deployment, identified by
-// both name AND UID so a foreign Ready pod that happens to carry the
-// same controller-managed labels (or a stale ownerRef name that
-// resolves to a different live object) cannot advance
-// observedServerInstance and spuriously trigger an engine rollout.
+// the current set of Ready cache-server pods for the backend, the
+// owning Deployment's convergence flag (true when the Deployment
+// controller has reached steady state — `spec.replicas` ==
+// `status.readyReplicas` == `status.updatedReplicas` and
+// `status.observedGeneration` >= `metadata.generation`), or "" when no
+// Ready pod exists yet. The candidate set is the owned Deployment's
+// pods — pods whose controller-owning ReplicaSet is controller-owned
+// by the backend-owned Deployment, identified by both name AND UID so
+// a foreign Ready pod that happens to carry the same controller-
+// managed labels (or a stale ownerRef name that resolves to a
+// different live object) cannot advance observedServerInstance and
+// spuriously trigger an engine rollout.
 //
 // The identifier shape is `<pod-uid>:<restart-sum>` per Ready pod,
 // comma-joined and lex-sorted by pod name; for a single-replica
@@ -415,11 +440,19 @@ func parseInstanceMap(s string) map[string]int32 {
 // Including the restart-sum advances the identifier whenever the
 // LMCache server process inside the pod is fresh.
 //
+// The convergence flag lets the caller distinguish a rolling-update
+// midpoint (NOT converged: maxSurge has briefly widened the Ready set
+// above target) from a steady-state scale-up (converged: the operator
+// raised replicas and the new pods are part of the steady state).
+// reconcileServerInstance persists a strict-superset baseline only
+// when converged is true; otherwise it could pin a transient midpoint
+// that a rollback would later misread as a real replacement.
+//
 // Reads via APIReader (uncached) where possible to avoid registering a
 // Pod informer; the controller's design explicitly rejects watching
 // all pods cluster-wide (see refreshMatchedEnginePods godoc). Falls
 // back to the cached client when APIReader is nil (test wiring).
-func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, error) {
+func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, bool, error) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
@@ -436,14 +469,14 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 	var ownedDep appsv1.Deployment
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}, &ownedDep); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", fmt.Errorf("get owned cache-server deployment: %w", err)
+		return "", false, fmt.Errorf("get owned cache-server deployment: %w", err)
 	}
 	if !metav1.IsControlledBy(&ownedDep, backend) {
 		// Foreign Deployment sharing the backend's name. Refuse to
 		// attribute its pods to this CacheBackend.
-		return "", nil
+		return "", false, nil
 	}
 
 	matcher := labels.SelectorFromSet(selectorLabels(backend.Name))
@@ -452,7 +485,7 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		client.InNamespace(backend.Namespace),
 		client.MatchingLabelsSelector{Selector: matcher},
 	); err != nil {
-		return "", fmt.Errorf("list cache-server pods: %w", err)
+		return "", false, fmt.Errorf("list cache-server pods: %w", err)
 	}
 	// Build the set of container names the owned Deployment renders.
 	// containerRunSum sums restart counts ONLY for these — sidecars
@@ -499,7 +532,7 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 		}
 		owned, err := r.podOwnedByDeployment(ctx, reader, p, &ownedDep)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if !owned {
 			continue
@@ -509,15 +542,40 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 			id:   fmt.Sprintf("%s:%d", p.UID, containerRunSum(p, cacheServerContainers)),
 		})
 	}
+
+	// Deployment convergence: spec.replicas == status.readyReplicas
+	// == status.updatedReplicas, AND the controller has observed the
+	// current generation. When all three hold, the Deployment is in
+	// steady state and a strict-superset Ready set against the prior
+	// baseline reflects a legitimate scale-up (not a maxSurge
+	// midpoint). All three are required:
+	//   - readyReplicas == spec.replicas → right number of Ready pods
+	//     (rules out maxSurge widening above target)
+	//   - updatedReplicas == spec.replicas → all Ready pods run the
+	//     latest revision (rules out maxSurge mid-rollout where the
+	//     extras are the new revision)
+	//   - observedGeneration >= metadata.generation → the controller
+	//     has seen the current spec (rules out a just-changed spec
+	//     whose effects haven't propagated yet)
+	// nil spec.Replicas defaults to 1 per the Deployment defaulter
+	// (kubebuilder/apiserver default), so we collapse nil to 1.
+	wantReplicas := int32(1)
+	if ownedDep.Spec.Replicas != nil {
+		wantReplicas = *ownedDep.Spec.Replicas
+	}
+	converged := ownedDep.Status.ObservedGeneration >= ownedDep.Generation &&
+		ownedDep.Status.ReadyReplicas == wantReplicas &&
+		ownedDep.Status.UpdatedReplicas == wantReplicas
+
 	if len(ready) == 0 {
-		return "", nil
+		return "", converged, nil
 	}
 	sort.Slice(ready, func(i, j int) bool { return ready[i].name < ready[j].name })
 	ids := make([]string, len(ready))
 	for i := range ready {
 		ids[i] = ready[i].id
 	}
-	return strings.Join(ids, ","), nil
+	return strings.Join(ids, ","), converged, nil
 }
 
 // containerRunSum returns the sum of restart counts across the cache-

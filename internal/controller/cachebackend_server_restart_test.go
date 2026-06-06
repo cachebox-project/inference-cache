@@ -772,6 +772,174 @@ func TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade(t *testing.
 	}
 }
 
+// TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline covers
+// the round-9 fix: a strict-superset transition where the owning
+// Deployment has reached steady state at the wider count is a
+// legitimate operator scale-up, NOT a rolling-update midpoint. The
+// latch must advance to include the added pod(s) so a later
+// replacement of any of the added pods cascades correctly.
+//
+// Pre-fix: round-8 unconditionally refused to persist superset
+// midpoints. A converged scale-up therefore left the new pod outside
+// the latch forever; a subsequent OOM-kill of just the added pod was
+// observable to engines (their sockets to that pod died) but not to
+// the controller (prior strictly contained current's UIDs at same
+// restart-sums; instanceChangeRequiresCascade returned false). The
+// engines were stranded on stale sockets with no recovery path.
+func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline: 1 Ready pod. Mark Deployment converged at replicas=1
+	// (the fixture defaults to nil-replicas → 1).
+	if err := setOwnedDeploymentConverged(f, 1); err != nil {
+		t.Fatalf("set baseline Deployment converged: %v", err)
+	}
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Operator scales the backend up to 2 replicas. A second Ready pod
+	// arrives, owned by the same RS chain. Mark Deployment converged
+	// at replicas=2 (replicas==readyReplicas==updatedReplicas, with
+	// observedGeneration current).
+	tru := true
+	added := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-zzz",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-added",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), added); err != nil {
+		t.Fatalf("create added pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), added); err != nil {
+		t.Fatalf("ready added pod: %v", err)
+	}
+	if err := setOwnedDeploymentConverged(f, 2); err != nil {
+		t.Fatalf("set converged Deployment at replicas=2: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-scale-up wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantBaseline := serverInstanceID(f.serverPod) + "," + serverInstanceID(added)
+	if got := f.backend.Status.ObservedServerInstance; got != wantBaseline {
+		t.Fatalf("post-scale-up ObservedServerInstance = %q, want %q (Deployment converged at the wider count → latch must advance so a later replacement of the added pod cascades)", got, wantBaseline)
+	}
+	// No cascade should have fired — adding a pod is not a replacement.
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("scale-up triggered a cascade; only replacements/restarts should cascade")
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter after scale-up = %v, want 0", got)
+	}
+
+	// Now replace ONLY the added pod (different UID). Pre-fix this
+	// stays a strict superset of the (round-8-pinned) baseline and
+	// false-misses the cascade. Post-fix the baseline includes the
+	// added pod's UID, so its disappearance is a real replacement and
+	// the cascade fires.
+	if err := f.r.Delete(context.Background(), added); err != nil {
+		t.Fatalf("delete added pod (replacement step 1): %v", err)
+	}
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-zzz", // same name, different UID
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-replacement",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready replacement pod: %v", err)
+	}
+	// Stay converged at replicas=2 throughout (the rate-limit + the
+	// rolling-update test's pattern of 60ms sleep applies).
+	if err := setOwnedDeploymentConverged(f, 2); err != nil {
+		t.Fatalf("re-affirm converged Deployment: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-replacement wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	wantFinal := serverInstanceID(f.serverPod) + "," + serverInstanceID(replacement)
+	if got := f.backend.Status.ObservedServerInstance; got != wantFinal {
+		t.Fatalf("post-replacement ObservedServerInstance = %q, want %q", got, wantFinal)
+	}
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantFinal {
+		t.Fatalf("cascade annotation = %q, want %q (replacement of an added scale-up pod must cascade — pre-round-9 this missed)", got, wantFinal)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter after replacement = %v, want exactly 1", got)
+	}
+}
+
+// setOwnedDeploymentConverged mutates the fixture's serverDep so its
+// Status reflects a converged Deployment at the given replica count.
+// Returns the apply error if any. Used by ConvergedScaleUp test.
+func setOwnedDeploymentConverged(f *cascadeRestartFixture, replicas int32) error {
+	// Fetch a live copy (the fake client tracks resource versions).
+	live := &appsv1.Deployment{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverDep.Name, Namespace: f.serverDep.Namespace}, live); err != nil {
+		return fmt.Errorf("get live serverDep: %w", err)
+	}
+	r := replicas
+	live.Spec.Replicas = &r
+	if err := f.r.Update(context.Background(), live); err != nil {
+		return fmt.Errorf("update serverDep.Spec.Replicas: %w", err)
+	}
+	// Status subresource requires a separate update.
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverDep.Name, Namespace: f.serverDep.Namespace}, live); err != nil {
+		return fmt.Errorf("reload live serverDep: %w", err)
+	}
+	live.Status.ReadyReplicas = replicas
+	live.Status.UpdatedReplicas = replicas
+	live.Status.Replicas = replicas
+	live.Status.ObservedGeneration = live.Generation
+	if err := f.r.Status().Update(context.Background(), live); err != nil {
+		return fmt.Errorf("update serverDep.Status: %w", err)
+	}
+	return nil
+}
+
 // TestReconcileServerInstance_InPlaceContainerRestartCascades asserts
 // that an in-place container restart inside the cache-server pod
 // (kubelet respawning a crashed container, e.g. on OOM with
