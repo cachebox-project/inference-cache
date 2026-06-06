@@ -317,6 +317,30 @@ func TestVLLMLMCacheResolveCacheServerAutoscalingFillsMissingCPU(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheResolveCacheServerAutoscalingReplacesZeroCPU(t *testing.T) {
+	// The admission webhook admits `requests.cpu: "0"` (zero is a
+	// valid kubelet shape — explicit "no guaranteed minimum"), but
+	// paired with autoscaling it gives the HPA a zero denominator
+	// and breaks utilization math. The renderer's fallback contract
+	// is "the HPA always has a usable CPU denominator under
+	// autoscaling", so a zero (or otherwise non-positive)
+	// operator-supplied CPU request MUST be replaced with the 250m
+	// fallback at render time. A POSITIVE operator-supplied value
+	// still survives — that case is pinned by
+	// TestVLLMLMCacheResolveCacheServerAutoscalingRespectsOperatorCPU.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+	}
+	pod := resolvePod(t, a, cb)
+	cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]
+	if cpu.Sign() <= 0 {
+		t.Fatalf("Requests[cpu] = %v, want non-zero HPA fallback (operator wrote 0)", cpu)
+	}
+}
+
 func TestVLLMLMCacheResolveCacheServerAutoscalingRespectsOperatorCPU(t *testing.T) {
 	// If the operator already supplied a CPU request, the autoscaling
 	// fallback MUST NOT overwrite it — the operator's value is

@@ -351,12 +351,21 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 		out.Requests = corev1.ResourceList{}
 	}
 	// CPU-only fallback: the autoscaling spec drives a
-	// targetCPUUtilizationPercent HPA, which needs a CPU request as
-	// the denominator. Memory is NOT auto-filled — spec.resources
-	// (carrying the CRD-stamped memory default) is the canonical
-	// source for memory, and synthesising a second memory request
-	// here would override an operator-supplied limits-only shape.
-	if _, hasCPU := out.Requests[corev1.ResourceCPU]; !hasCPU {
+	// targetCPUUtilizationPercent HPA, which needs a *positive* CPU
+	// request as the denominator. The admission validator admits
+	// requests.cpu: "0" (zero is a valid kubelet shape — "no
+	// guaranteed minimum"), but with autoscaling it gives the HPA a
+	// zero denominator and breaks utilization math; so we treat
+	// present-but-non-positive identically to absent and replace it
+	// with the fallback. A positive operator-supplied value survives
+	// untouched.
+	//
+	// Memory is NOT auto-filled — spec.resources (carrying the
+	// CRD-stamped memory default) is the canonical source for memory,
+	// and synthesising a memory request here would override an
+	// operator-supplied limits-only shape.
+	cpu, hasCPU := out.Requests[corev1.ResourceCPU]
+	if !hasCPU || cpu.Sign() <= 0 {
 		out.Requests[corev1.ResourceCPU] = resource.MustParse("250m")
 	}
 	return out
