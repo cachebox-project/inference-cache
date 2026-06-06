@@ -65,6 +65,12 @@ func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
 // runReporterWindow starts a recording server + Reporter over bufconn, feeds the
 // batches, closes the input, and returns the server after Run has drained.
 func runReporterWindow(t *testing.T, window time.Duration, batches ...*EventBatch) *recordingServer {
+	return runReporterWithOpts(t, []ReporterOption{WithWindow(window)}, batches...)
+}
+
+// runReporterWithOpts is the most general harness; tests that need to set
+// extra ReporterOptions (e.g. WithIgnoreBlockRemoved) pass them through.
+func runReporterWithOpts(t *testing.T, opts []ReporterOption, batches ...*EventBatch) *recordingServer {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
@@ -81,7 +87,7 @@ func runReporterWindow(t *testing.T, window time.Duration, batches ...*EventBatc
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), WithWindow(window))
+	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), opts...)
 	in := make(chan *EventBatch, len(batches))
 	for _, b := range batches {
 		in <- b
@@ -206,6 +212,96 @@ func TestReporterForwardsRemovalsAndClear(t *testing.T) {
 	}
 	if cleared != 1 {
 		t.Errorf("ALL_CLEARED count = %d, want 1", cleared)
+	}
+}
+
+// With WithIgnoreBlockRemoved the reporter must NOT forward BlockRemoved
+// events as PREFIX_EVICTED. This is the L2-tier mode (e.g. LMCache): when
+// the engine evicts a block from GPU the block is still resident at L2 and
+// the cache plane should keep the routing hint until its freshness TTL
+// expires. Forwarding the eviction would erase the hint while the replica
+// can still serve the block from L2 — that is the cache-stress
+// 0-PREFIX_MATCH regression. We also assert that a BlockStored add still
+// reaches the server (via the shutdown flush) — silently dropping adds
+// alongside evictions would defeat the whole reporter.
+func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
+	addHash := []byte{0x01}
+	evictHash := []byte{0x02}
+	rec := runReporterWithOpts(t,
+		// time.Hour so the only path that can deliver the add is the shutdown
+		// flush — exactly as in TestReporterFlushesPendingOnShutdown. That
+		// also confirms BlockRemoved doesn't accidentally trigger the
+		// pre-removal flush when ignore is set.
+		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{addHash}, BlockSize: 16}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{evictHash}}}},
+	)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	// Adds still flow (via the shutdown flush).
+	var addFound bool
+	for _, u := range rec.updates {
+		for _, p := range u.GetPrefixes() {
+			if bytes.Equal(p.GetPrefixHash(), addHash) {
+				addFound = true
+			}
+		}
+	}
+	if !addFound {
+		t.Errorf("BlockStored add was not forwarded with ignore_block_removed=true; ops=%v", rec.ops)
+	}
+
+	// Evictions are dropped — no PREFIX_EVICTED reaches the server.
+	for _, e := range rec.events {
+		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED {
+			t.Errorf("ignore_block_removed=true must drop PREFIX_EVICTED, got eviction for hash=%x", e.GetPrefixHash())
+		}
+	}
+}
+
+// AllBlocksCleared must still flow even with ignore_block_removed=true — it
+// is an engine-wide reset, not a per-block GPU eviction, and an L2 tier
+// cannot mask a clear-all (the engine forgot the prefixes entirely). Pinning
+// this separately keeps the L2 behavior and the engine-wide reset behavior
+// independently visible in the test signal.
+func TestReporterIgnoreBlockRemovedStillForwardsAllCleared(t *testing.T) {
+	rec := runReporterWithOpts(t,
+		[]ReporterOption{WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{AllBlocksCleared{}}},
+	)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var cleared int
+	for _, e := range rec.events {
+		if e.GetType() == icpb.CacheEvent_ALL_CLEARED {
+			cleared++
+		}
+	}
+	if cleared != 1 {
+		t.Errorf("ALL_CLEARED forwarded count = %d, want 1 (engine-wide resets must still flow); events=%v", cleared, rec.events)
+	}
+}
+
+// Default (ignore_block_removed=false) MUST preserve the existing eviction
+// contract — single-tier deployments rely on PREFIX_EVICTED to drop stale
+// hints promptly. Guards against accidental flag-default flips.
+func TestReporterDefaultStillForwardsBlockRemoved(t *testing.T) {
+	h := []byte{0x33}
+	rec := runReporter(t,
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockRemoved{BlockHashes: [][]byte{h}}}},
+	)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var found bool
+	for _, e := range rec.events {
+		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED && bytes.Equal(e.GetPrefixHash(), h) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("default Reporter must forward PREFIX_EVICTED; events=%v", rec.events)
 	}
 }
 

@@ -95,6 +95,35 @@ Concretely:
 * **HA / multi-server policy-server target** — separate ticket.
 * **Readiness gating on first KV event observed** — natural follow-up once this lands.
 
+## L2 cache tier semantics — `--ignore-block-removed`
+
+vLLM's KV-event publisher emits `BlockRemoved` on every block eviction from the
+GPU pool. When the engine sits *alone* (no second-tier cache), that eviction is
+the prefix becoming unreachable and the cache plane must drop the routing hint
+promptly — the subscriber's default behavior, forwarding `BlockRemoved` as
+`PREFIX_EVICTED`, is exactly right.
+
+When the engine is paired with a separate **L2 cache tier** (e.g. LMCache via
+`--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1",...}'`) the
+semantics invert. LMCache retains the block after the engine offloads it from
+GPU, so the replica can still serve the prefix cheaply from the L2 tier. The
+vLLM-emitted `BlockRemoved` no longer means "the prefix is gone"; it means
+"the prefix moved tiers." Forwarding it as `PREFIX_EVICTED` would drop a
+routing hint the replica can still satisfy — the gateway then routes
+elsewhere and the L2 cache hit is wasted. The cache plane should keep the
+entry until its freshness TTL expires; a stale entry yields a cache miss
+(soft state), while a missing entry mis-routes warm traffic away.
+
+The subscriber binary exposes `--ignore-block-removed` (default off, for
+backward compatibility with single-tier deployments). When set the reporter
+drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
+`BlockStored` still flow normally. The vLLM/LMCache adapter
+(`pkg/adapters/runtime/vllm_lmcache.go`) sets the flag unconditionally in the
+sidecar it renders — that adapter only ever stands up a vLLM + LMCache pair,
+so the L2 tier is always present and the flag is always the right choice.
+Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
+the flag off.
+
 ## What this unblocks
 
 * The runbook / demo path no longer needs `port-forward` + a hand-launched

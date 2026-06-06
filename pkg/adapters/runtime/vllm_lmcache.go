@@ -457,6 +457,16 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 			"--tenant-id=$(POD_NAMESPACE)",
 			"--model-id=" + modelID,
 			"--hash-scheme=" + subscriberHashScheme,
+			// This adapter pairs vLLM with LMCache, a separate L2 cache tier
+			// that retains blocks after the engine evicts them from GPU. vLLM
+			// emits BlockRemoved on every GPU eviction even when the block is
+			// still resident at LMCache; forwarding that as PREFIX_EVICTED
+			// would drop a routing hint the replica can still cheaply serve
+			// from L2 — the gateway then routes elsewhere and wastes the L2
+			// hit. Keep the entry until its freshness TTL expires; soft state
+			// means a stale hint is a cache miss at worst, while a missing one
+			// routes the request away from its warm replica.
+			"--ignore-block-removed=true",
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{

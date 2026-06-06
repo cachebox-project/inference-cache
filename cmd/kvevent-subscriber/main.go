@@ -35,20 +35,21 @@ import (
 
 func main() {
 	var (
-		endpoint       = flag.String("engine-endpoint", "tcp://127.0.0.1:5557", "engine KV-event ZMQ PUB endpoint")
-		topic          = flag.String("topic", "kv-events", "ZMQ topic to subscribe to (empty = all)")
-		server         = flag.String("server", "127.0.0.1:9090", "inferencecache-server gRPC address")
-		replica        = flag.String("replica-id", "", "engine replica id (required)")
-		model          = flag.String("model-id", "", "served model id (required)")
-		tenant         = flag.String("tenant-id", "", "tenant id (optional)")
-		scheme         = flag.String("hash-scheme", "vllm", "engine prefix-hash scheme (required, non-empty)")
-		window         = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
-		metricsURL     = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
-		statsInterval  = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
-		cacheSizeBytes = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
-		ceiling        = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
-		cacheTier      = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
-		engineModel    = flag.String("engine-model-name", "", `value of the engine's `+"`model_name`"+` Prometheus label to filter /metrics by (e.g. "Qwen/Qwen2.5-0.5B-Instruct"). Distinct from --model-id (the cache-plane index key). Empty = no label filter (aggregates every series — fine when the engine serves one model).`)
+		endpoint           = flag.String("engine-endpoint", "tcp://127.0.0.1:5557", "engine KV-event ZMQ PUB endpoint")
+		topic              = flag.String("topic", "kv-events", "ZMQ topic to subscribe to (empty = all)")
+		server             = flag.String("server", "127.0.0.1:9090", "inferencecache-server gRPC address")
+		replica            = flag.String("replica-id", "", "engine replica id (required)")
+		model              = flag.String("model-id", "", "served model id (required)")
+		tenant             = flag.String("tenant-id", "", "tenant id (optional)")
+		scheme             = flag.String("hash-scheme", "vllm", "engine prefix-hash scheme (required, non-empty)")
+		window             = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
+		metricsURL         = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
+		statsInterval      = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
+		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
+		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
+		cacheTier          = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
+		engineModel        = flag.String("engine-model-name", "", `value of the engine's `+"`model_name`"+` Prometheus label to filter /metrics by (e.g. "Qwen/Qwen2.5-0.5B-Instruct"). Distinct from --model-id (the cache-plane index key). Empty = no label filter (aggregates every series — fine when the engine serves one model).`)
+		ignoreBlockRemoved = flag.Bool("ignore-block-removed", false, `drop BlockRemoved events instead of forwarding them as PREFIX_EVICTED. Set for engines paired with an L2 cache tier (e.g. LMCache); default off for single-tier deployments. See docs/design/kvevent-subscriber-wiring.md "L2 cache tier semantics".`)
 	)
 	flag.Parse()
 
@@ -85,7 +86,9 @@ func main() {
 	client := icpb.NewInferenceCacheClient(conn)
 
 	reporter := engine.NewReporter(client, cfg,
-		engine.WithWindow(*window), engine.WithLogger(logger))
+		engine.WithWindow(*window),
+		engine.WithLogger(logger),
+		engine.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
 	sub := engine.NewSubscriber(*endpoint, *topic, engine.WithSubscriberLogger(logger))
 
 	scraper := engine.NewMetricsScraper(
@@ -136,6 +139,7 @@ func main() {
 		"stats_interval", statsInterval.String(),
 		"cache_tier", *cacheTier,
 		"engine_model_name", *engineModel,
+		"ignore_block_removed", *ignoreBlockRemoved,
 	)
 
 	if err := sub.Run(ctx, out); err != nil && !errors.Is(err, context.Canceled) {

@@ -21,12 +21,13 @@ import (
 // and must never stall the engine. Errors are logged and dropped (soft state);
 // Run only returns on context cancellation or input close.
 type Reporter struct {
-	client     icpb.InferenceCacheClient
-	cfg        Config
-	window     time.Duration
-	rpcTimeout time.Duration
-	maxPend    int
-	logger     *slog.Logger
+	client             icpb.InferenceCacheClient
+	cfg                Config
+	window             time.Duration
+	rpcTimeout         time.Duration
+	maxPend            int
+	logger             *slog.Logger
+	ignoreBlockRemoved bool
 }
 
 // ReporterOption configures a Reporter.
@@ -40,6 +41,19 @@ func WithRPCTimeout(d time.Duration) ReporterOption { return func(r *Reporter) {
 
 // WithLogger sets the logger (default slog.Default()).
 func WithLogger(l *slog.Logger) ReporterOption { return func(r *Reporter) { r.logger = l } }
+
+// WithIgnoreBlockRemoved drops BlockRemoved events instead of forwarding them as
+// PREFIX_EVICTED. Required when the engine is paired with an L2 cache tier
+// (e.g. LMCache) that retains a block after the engine evicts it from GPU:
+// vLLM emits BlockRemoved on every GPU eviction even when the block is still
+// resident at L2, and forwarding that as PREFIX_EVICTED makes the server drop
+// a routing hint the replica can still cheaply serve from the L2 tier. With
+// the flag set the index keeps the entry until the freshness TTL expires; a
+// stale hint is soft state (cache miss at worst, never a wrong answer), while
+// a missing one routes the request elsewhere and wastes the L2 cache hit.
+func WithIgnoreBlockRemoved(b bool) ReporterOption {
+	return func(r *Reporter) { r.ignoreBlockRemoved = b }
+}
 
 // NewReporter builds a Reporter for one engine replica.
 func NewReporter(client icpb.InferenceCacheClient, cfg Config, opts ...ReporterOption) *Reporter {
@@ -104,6 +118,17 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 						flush()
 					}
 				case BlockRemoved:
+					// When the engine has an L2 cache tier behind it (e.g. LMCache),
+					// BlockRemoved fires every time the engine evicts a block from
+					// GPU even though the block is still cached at L2 — forwarding
+					// it as PREFIX_EVICTED would drop the routing hint while the
+					// replica can still cheaply serve the block. With the flag set
+					// the entry stays in the index until the freshness TTL expires;
+					// rely on TTL for actual staleness and leave the L2-served hint
+					// intact. See WithIgnoreBlockRemoved.
+					if r.ignoreBlockRemoved {
+						continue
+					}
 					// Removals are the pruning path and adds are additive, so the
 					// eviction must not be overtaken by a still-buffered add of the
 					// same block (store-then-evict within one window). Flush pending
