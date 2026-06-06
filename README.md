@@ -125,7 +125,7 @@ the alerts.
 > uses a different label set (`release: my-prom`, etc.), `kubectl
 > apply -k` succeeds but Prometheus silently ignores both resources.
 > The YAML comments next to each label spell out the introspection
-> command (`kubectl get prometheus -o jsonpath=...`); see
+> command (`kubectl get prometheus -A -o jsonpath=...`); see
 > [`docs/observability/alerts.md`](docs/observability/alerts.md) for
 > the full discussion.
 

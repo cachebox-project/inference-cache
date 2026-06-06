@@ -46,7 +46,7 @@ There are two distribution shapes, same rule set, drift-gated by
   Prometheus CRs use whatever their `ruleSelector` /
   `serviceMonitorSelector` specifies. If your install uses a different
   label set, edit each CR's labels to match — the YAML comments next
-  to each label spell out the exact `kubectl get prometheus -o
+  to each label spell out the exact `kubectl get prometheus -A -o
   jsonpath=...` introspection command.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
@@ -229,7 +229,7 @@ kubectl -n inference-cache-system port-forward svc/inference-cache-server 8081:8
 TOKEN=$(kubectl -n inference-cache-system create token \
   inference-cache-controller-manager --audience=inferencecache.io/controller)
 curl -s localhost:8081/snapshot -H "Authorization: Bearer $TOKEN" \
-  | jq '.replicas[] | select(.id | startswith("<engine-pod>"))'
+  | jq '.replicas[] | select(.replicaId | startswith("<engine-pod>"))'
 
 # 5. Confirm the controller is wiring the sidecar image.
 kubectl -n inference-cache-system get deploy/inference-cache-controller-manager \
@@ -539,8 +539,10 @@ Triage queries:
 # Cap vs. TTL eviction rate
 sum by (namespace, algorithm, reason) (rate(inferencecache_index_evictions_total[10m]))
 
-# Current index population, per model (sum gives the total against the cap)
-sum(inferencecache_index_entries)
+# Current index population, per (namespace, model). Sum across models in a
+# namespace gives the total against the cap.
+sum by (namespace, model) (inferencecache_index_entries)
+sum by (namespace) (inferencecache_index_entries)
 
 # Per-tenant eviction pressure (CacheTenant quota — distinct from the
 # global cap above)

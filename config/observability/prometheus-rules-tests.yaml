@@ -67,10 +67,17 @@ tests:
         exp_alerts: []
 
   - interval: 30s
-    name: IndexEmpty does not fire when server is down
+    # The other two clauses of the alert (traffic > 0, no entries) MUST
+    # be satisfied so we are actually pinning the server-up gate — if
+    # we omitted lookup traffic, the test would pass regardless of
+    # whether the rule checked server_up=1.
+    name: IndexEmpty does not fire when server is down even with traffic and empty index
     input_series:
       - series: 'inferencecache_server_up{namespace="inference-cache-system"}'
         values: '0+0x40'
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="NO_HINT",hint_used="false"}'
+        values: '0+300x40'
+      # No inferencecache_index_entries series — index is empty.
     alert_rule_test:
       - eval_time: 15m
         alertname: IndexEmpty
@@ -309,6 +316,19 @@ tests:
         alertname: LookupRouteHighTimeout
         exp_alerts: []
 
+  - interval: 30s
+    # Coverage for the > 1/sec total-rate floor. 100% TIMEOUT but the
+    # total call rate is well below the floor — the alert must NOT
+    # fire on a near-idle model even though its TIMEOUT ratio is 1.0.
+    name: LookupRouteHighTimeout does not fire on near-idle traffic regardless of TIMEOUT ratio
+    input_series:
+      - series: 'inferencecache_lookup_route_calls_total{namespace="inference-cache-system",model="llama-3.1-8b",reason_code="TIMEOUT",hint_used="false"}'
+        values: '0+15x40'     # 0.5/sec — below the 1/sec floor; 100% TIMEOUT
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LookupRouteHighTimeout
+        exp_alerts: []
+
   # --------------------------------------------------------------------------
   # IndexEvictionsSpike (for: 10m, info)
   #
@@ -338,6 +358,20 @@ tests:
     input_series:
       - series: 'inferencecache_index_evictions_total{namespace="inference-cache-system",algorithm="lru",reason="ttl"}'
         values: '0+600x50'    # 20/sec TTL — normal lifecycle, filtered out by reason="cap"
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: IndexEvictionsSpike
+        exp_alerts: []
+
+  - interval: 30s
+    # Coverage for the > 10/sec cap-eviction threshold. Cap evictions
+    # at exactly the threshold MUST NOT fire — a regression that
+    # accidentally weakened the comparator to `>=` would be caught
+    # here. 300/30s = 10/sec exactly.
+    name: IndexEvictionsSpike does not fire at the exact 10/sec cap threshold
+    input_series:
+      - series: 'inferencecache_index_evictions_total{namespace="inference-cache-system",algorithm="lru",reason="cap"}'
+        values: '0+300x50'    # 10/sec — exactly at the threshold (not above)
     alert_rule_test:
       - eval_time: 22m
         alertname: IndexEvictionsSpike
