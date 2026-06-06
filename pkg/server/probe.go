@@ -41,14 +41,14 @@ import (
 // smoke driving a real engine through both halves.
 //
 // The probe synthesizes its own state (a deterministic 16-token block under a
-// reserved tenant_id) and round-trips it through the three stages: a SUBSCRIBER
-// pipeline check (the synthesized event lands in the index), a ROUTING check
-// (the index returns PREFIX_MATCH for the probe's hash), and a T2 check (a
-// put/get cycle through the supplied T2Prober). Each stage reports ok / failed
-// / skipped; failures name the stage so the controller can surface a
-// stage-specific condition with an operator-actionable message.
+// reserved tenant_id) and round-trips it through the three stages: an INGEST
+// check (the synthesized event lands in the index via in-process index.Ingest),
+// a ROUTING check (the index returns PREFIX_MATCH for the probe's hash), and
+// a T2 check (a put/get cycle through the supplied T2Prober). Each stage
+// reports ok / failed / skipped; failures name the stage so the controller
+// can surface a stage-specific condition with an operator-actionable message.
 //
-// What Stage A ("ingest") actually exercises:
+// What Stage A (wire field `ingest`) actually exercises:
 // Stage A writes the synthesized Update via in-process index.Ingest and
 // verifies the entry landed via direct index.Lookup. It does NOT exercise
 // the gRPC ReportCacheState handler that the real subscriber traverses —

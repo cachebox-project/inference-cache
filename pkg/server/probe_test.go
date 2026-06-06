@@ -285,7 +285,7 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 		t.Fatal("AllPassed() = true despite Ingest failed")
 	}
 	if !stageErrorPresent(result.Errors, ProbeStageIngest) {
-		t.Errorf("expected subscriber stage error, got %+v", result.Errors)
+		t.Errorf("expected ingest stage error, got %+v", result.Errors)
 	}
 }
 

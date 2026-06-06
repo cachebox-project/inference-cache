@@ -35,15 +35,14 @@ CacheBackend at reconcile time (once the controller-wiring follow-up
 lands): the server synthesizes a deterministic round-trip — in-process
 index-ingest → routing → tier-2 — under a reserved tenant id
 (`inferencecache.io/probe`) and replica id (`__probe-<backend>`),
-returning per-stage outcomes. Stage A's wire field name is `subscriber`
-(the operator's question, "is the subscriber's data landing in the
-index?"), but the probe writes through in-process `index.Ingest`
-rather than the gRPC `ReportCacheState` handler the real subscriber
-uses — the handler now drops messages with `tenant_id =
-inferencecache.io/probe` by design. A Stage A pass therefore proves the
-index ingest path is accepting writes; it does not, on its own, prove
-the full subscriber wire is healthy end-to-end. A Stage A fail still
-definitively means the index ingest path is broken. It shares the controller-auth profile
+returning per-stage outcomes. Stage A's wire field name is `ingest` —
+matching the path the probe physically traverses: it writes through
+in-process `index.Ingest` rather than the gRPC `ReportCacheState`
+handler the real subscriber uses (the handler now drops messages with
+`tenant_id = inferencecache.io/probe` by design). A Stage A pass
+therefore proves the index ingest path is accepting writes; it does
+not, on its own, prove the full subscriber wire is healthy end-to-end.
+A Stage A fail still definitively means the index ingest path is broken. It shares the controller-auth profile
 with `/snapshot` and `/policy` because all three endpoints serve one
 caller identity (the controller SA). The probe entries auto-clean on
 each Run via an `ALL_CLEARED` event against the reserved replica, so

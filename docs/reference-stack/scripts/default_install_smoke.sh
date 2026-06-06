@@ -1816,7 +1816,7 @@ esac
 # captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped
 # (the default Stage-1 posture — no T2Prober is wired, so Stage C is always
 # skipped until the controller-wiring follow-up plumbs a real one). A
-# regression that flips subscriber or routing to failed on a clean install
+# regression that flips ingest or routing to failed on a clean install
 # would be a clear signal that the cache-plane internal round-trip itself is
 # broken — exactly the class of bug the probe exists to catch.
 log "asserting authenticated /probe returns ingest=ok, routing=ok, t2=skipped"
@@ -1842,7 +1842,7 @@ spec:
     - |
       controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
       if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
-      # Capture body to stdout — the smoke parses subscriber/routing/t2 from it.
+      # Capture body to stdout — the smoke parses ingest/routing/t2 from it.
       curl -sS -m 5 -H "Authorization: Bearer \$controller_token" \\
         -H "Content-Type: application/json" \\
         -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' \\
