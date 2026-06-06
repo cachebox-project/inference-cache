@@ -136,6 +136,18 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Fail closed if either file accidentally gutted its rule body — a
+	// PR that empties `groups:` would otherwise drift-check OK (both
+	// empty) and silently ship an alertless bundle.
+	if len(flat.Groups) == 0 {
+		fmt.Fprintf(os.Stderr, "✗ %s has no rule groups — refusing to drift-check an empty rule set.\n", flatPath)
+		os.Exit(1)
+	}
+	if len(cr.Spec.Groups) == 0 {
+		fmt.Fprintf(os.Stderr, "✗ %s has no rule groups under spec.groups — refusing to drift-check an empty rule set.\n", crPath)
+		os.Exit(1)
+	}
+
 	flatCanon, err := canonical(flat.Groups)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "canonicalize flat groups: %v\n", err)

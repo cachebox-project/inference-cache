@@ -51,13 +51,23 @@ There are two distribution shapes, same rule set, drift-gated by
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
   Prometheus via the `rule_files:` config block, a ConfigMap, or the Helm
   `prometheus.serverFiles` value (depending on your install). You ALSO
-  need a `scrape_configs:` entry that points at
-  `inference-cache-server.inference-cache-system.svc.cluster.local:8080/metrics`
-  — or rely on Prometheus's Kubernetes service discovery if the deploy's
-  `prometheus.io/scrape: "true"` annotation is honored by your scraper.
+  need a `scrape_configs:` entry — and to keep the alerts' per-install
+  scoping working, that scrape must inject a `namespace` label. Two
+  valid shapes:
+  1. **Recommended** — Kubernetes service discovery
+     (`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
+     that copies `__meta_kubernetes_namespace` to a `namespace` label.
+     Works in single-install AND shared-Prometheus setups.
+  2. **Single-install only** — a static DNS scrape of
+     `inference-cache-server.inference-cache-system.svc.cluster.local:8080`.
+     Simpler but produces NO `namespace` label, so the alerts collapse
+     into one unlabeled group. Acceptable when one Prometheus only ever
+     scrapes one inference-cache install; do not use it for shared
+     Prometheus deployments.
+
   ServiceMonitor in the operator bundle is the prometheus-operator
-  equivalent; if you are not on prometheus-operator, the scrape config is
-  your responsibility.
+  equivalent of shape (1); both shapes (1) and (2) require you to wire
+  scrape config explicitly when you are not on prometheus-operator.
 
 Both files contain the same five Stage 1 alerts plus commented-out
 placeholders for three more that depend on metrics not yet exposed (see

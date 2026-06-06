@@ -112,18 +112,30 @@ kubectl apply -k config/observability
 
 This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
 `inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
-the alerts. End-to-end, alerts start firing once the operator is
-installed.
+the alerts. Four of the five Stage 1 alerts (`IndexEmpty`,
+`LookupRouteDegenerate`, `LookupRouteHighTimeout`, `IndexEvictionsSpike`)
+start firing as soon as the operator is installed.
+
+> **The fifth alert needs a vLLM scrape this bundle does NOT ship.**
+> [`LMCacheT2NoHits`](docs/observability/alerts.md#lmcachet2nohits) reads
+> `vllm:external_prefix_cache_*` from vLLM engine pods directly. The
+> shipped `ServiceMonitor` covers only `inference-cache-server`. To make
+> that alert effective, add a separate `PodMonitor` for your vLLM
+> Deployment (or `kubernetes_sd_configs: pod` for vanilla Prometheus)
+> so engine `/metrics` is scraped with both `namespace` and `pod` labels
+> attached. See alerts.md "How to enable" for the requirement.
 
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
-**You must also configure scraping yourself** — either a `scrape_configs:`
-entry pointing at
-`inference-cache-server.inference-cache-system.svc.cluster.local:8080/metrics`,
-or `kubernetes_sd_configs: pod` with `relabel_configs:` that copies
-`__meta_kubernetes_namespace` to `namespace` (the alerts scope per
-install by this label). Without a working scrape, the rules load but
-fire on nothing.
+**You must also configure scraping yourself.** For multi-install or
+per-install isolation, use Kubernetes service discovery
+(`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
+that copies `__meta_kubernetes_namespace` to `namespace` — the alerts
+scope per install by that label. A static DNS scrape (e.g. just
+`inference-cache-server.inference-cache-system.svc.cluster.local:8080`)
+is acceptable for a single install but loses per-install isolation; do
+NOT use it if you scrape multiple inference-cache installs into one
+Prometheus. Without a working scrape, the rules load but fire on nothing.
 
 Per-alert runbooks (causes, triage steps, example PromQL): see
 [`docs/observability/alerts.md`](docs/observability/alerts.md). For the
