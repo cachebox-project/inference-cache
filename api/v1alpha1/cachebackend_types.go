@@ -188,10 +188,15 @@ type CacheBackendSpec struct {
 	// (standard names cpu/memory/ephemeral-storage admit; a
 	// `hugepages-<size>` name admits only when the size suffix parses
 	// as a strictly-positive quantity, e.g. "hugepages-2Mi"; any other
-	// name must be vendor-prefixed like "nvidia.com/gpu"); and a `limits[X]` strictly less than
-	// `requests[X]` for the same resource X is rejected. See
-	// docs/design/cachebackend-api.md#resources for the full validator
-	// table.
+	// name must be third-party vendor-prefixed like "nvidia.com/gpu" —
+	// the K8s-reserved `kubernetes.io/` and `requests.kubernetes.io/`
+	// prefixes are rejected); and the request/limit relationship is
+	// resource-aware — overcommittable resources (cpu, memory,
+	// ephemeral-storage) admit `limits[X] >= requests[X]`, while
+	// non-overcommittable resources (hugepages-*, vendor-prefixed
+	// extended resources) require `limits[X] == requests[X]` when both
+	// are set. See docs/design/cachebackend-api.md#resources for the
+	// full validator table.
 	//
 	// When spec.autoscaling is set, the adapter additionally fills in a
 	// CPU request fallback (250m) if this field omits one — a

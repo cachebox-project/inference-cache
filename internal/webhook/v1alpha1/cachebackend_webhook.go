@@ -957,22 +957,25 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 	}
 }
 
-// rejectResourceLimitsBelowRequests rejects spec.resources whose Limits
-// declare a quantity strictly less than the Requests for the same resource
-// name. K8s itself rejects the inverted shape on Pod admission, but the
-// CRD-schema layer treats Requests/Limits as opaque maps — so a kubectl
-// apply with an inverted CacheBackend.spec.resources is silently accepted,
-// and the operator only learns about the misconfiguration when the
-// rendered cache-server Pod fails to schedule (or worse, gets OOM-killed
-// because the planned limit was too low to host the request). Catching
-// the inversion at admission turns that into a clear field-scoped error.
+// rejectResourceLimitsBelowRequests rejects spec.resources where the
+// request/limit relationship is invalid for the named resource. K8s
+// distinguishes two regimes:
 //
-// The rule iterates the intersection of Requests and Limits — a missing
-// Request OR a missing Limit for a given resource has no comparison to
-// make. Memory is the canonical motivating case (an inverted memory limit
-// makes the OOM-kill cliff worse, not better), but the rule is resource-
-// agnostic so an operator typo on cpu (or any future resource name) is
-// caught with the same diagnostic.
+//   - Overcommittable resources (cpu, memory, ephemeral-storage):
+//     limits[X] MUST be >= requests[X] when both are set. The reverse
+//     is unsatisfiable at scheduling time.
+//   - Non-overcommittable resources (hugepages-*, vendor-prefixed
+//     extended resources like "nvidia.com/gpu"): limits[X] MUST EQUAL
+//     requests[X] when both are set. Overcommitting these resources is
+//     not a meaningful kubelet concept — every page or device is
+//     dedicated, so request and limit must agree.
+//
+// The CRD-schema layer treats Requests/Limits as opaque maps, so an
+// inverted or mismatched shape is silently accepted by the apiserver
+// at write time and only fails when the rendered Pod tries to schedule.
+// Catching it at admission turns the failure into a field-scoped error
+// at `kubectl apply`. Missing Request OR missing Limit has no
+// comparison to make and admits.
 func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Resources == nil {
 		return nil
@@ -983,16 +986,42 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 		if !ok {
 			continue
 		}
-		if lim.Cmp(req) >= 0 {
+		path := field.NewPath("spec", "resources", "limits").Key(string(name))
+		if isOvercommittableResource(name) {
+			if lim.Cmp(req) >= 0 {
+				continue
+			}
+			errs = append(errs, field.Invalid(
+				path,
+				lim.String(),
+				fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
+			))
+			continue
+		}
+		// Non-overcommittable: request and limit must be exactly equal.
+		if lim.Cmp(req) == 0 {
 			continue
 		}
 		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "resources", "limits").Key(string(name)),
+			path,
 			lim.String(),
-			fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
+			fmt.Sprintf("must equal spec.resources.requests[%s] (%s) — %q is a non-overcommittable resource (hugepages and extended resources require request == limit)", name, req.String(), name),
 		))
 	}
 	return errs
+}
+
+// isOvercommittableResource reports whether the resource name is one of
+// the three standard overcommittable container resources for which K8s
+// permits limits > requests. Every other resource (hugepages, vendor-
+// prefixed extended resources) is non-overcommittable and requires
+// request == limit when both are set.
+func isOvercommittableResource(name corev1.ResourceName) bool {
+	switch name {
+	case corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
+		return true
+	}
+	return false
 }
 
 // rejectInvalidResourceNames rejects any spec.resources.requests or
@@ -1066,6 +1095,16 @@ func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
 		return fmt.Sprintf(
 			"%q is not a valid container resource name: must be one of %q/%q/%q, a hugepages-<size> variant (e.g. \"hugepages-2Mi\"), or a vendor-prefixed extended resource (e.g. \"nvidia.com/gpu\")",
 			s, corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage,
+		), false
+	}
+	// "kubernetes.io/" and "requests.kubernetes.io/" are K8s-reserved
+	// native-resource prefixes; extended resources MUST use a third-party
+	// vendor domain instead. Admitting them here would let a CR through
+	// that the apiserver rejects on the rendered Pod.
+	if strings.HasPrefix(s, "kubernetes.io/") || strings.HasPrefix(s, "requests.kubernetes.io/") {
+		return fmt.Sprintf(
+			"%q is not a valid container resource name: %q and %q are K8s-reserved prefixes — extended resources must use a third-party vendor domain (e.g. \"nvidia.com/gpu\")",
+			s, "kubernetes.io/", "requests.kubernetes.io/",
 		), false
 	}
 	if msgs := validation.IsQualifiedName(s); len(msgs) > 0 {

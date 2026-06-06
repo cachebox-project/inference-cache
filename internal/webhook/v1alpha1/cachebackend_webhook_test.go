@@ -512,6 +512,74 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesNonOvercommittableMismatchRejected(t *testing.T) {
+	// K8s requires limits==requests for non-overcommittable resources
+	// (hugepages-* and any extended resource). Only the standard
+	// overcommittable resources (cpu, memory, ephemeral-storage)
+	// permit limits > requests. Mirror that rule at admission so a
+	// CR with limits!=requests on, e.g., hugepages-2Mi or
+	// nvidia.com/gpu is rejected at `kubectl apply` instead of
+	// crashing the rendered Pod.
+	for _, tc := range []struct {
+		name     string
+		resource corev1.ResourceName
+		req      string
+		lim      string
+	}{
+		{"hugepages mismatch", corev1.ResourceName("hugepages-2Mi"), "2Mi", "4Mi"},
+		{"nvidia gpu mismatch", corev1.ResourceName("nvidia.com/gpu"), "1", "2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{tc.resource: resource.MustParse(tc.req)},
+				Limits:   corev1.ResourceList{tc.resource: resource.MustParse(tc.lim)},
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.limits[%s]", tc.resource),
+				"must equal spec.resources.requests")
+		})
+	}
+}
+
+func TestValidator_ResourcesNonOvercommittableEqualAdmitted(t *testing.T) {
+	// The same non-overcommittable resources admit when limits == requests.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+		Limits:   corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("non-overcommittable equal request/limit rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesReservedPrefixesRejected(t *testing.T) {
+	// K8s reserves "kubernetes.io/" and "requests.kubernetes.io/" for
+	// native resources — they cannot be used as vendor prefixes for
+	// extended resources. The webhook must reject them so the rendered
+	// pod doesn't fail apiserver validation later.
+	for _, name := range []string{
+		"kubernetes.io/myresource",
+		"requests.kubernetes.io/myresource",
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceName(name): resource.MustParse("1"),
+				},
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.requests[%s]", name),
+				"not a valid container resource name")
+		})
+	}
+}
+
 func TestValidator_ResourcesInvalidNameRejected(t *testing.T) {
 	// ResourceList keys are opaque map keys at the CRD-schema layer:
 	// a CR can be admitted with structurally-malformed names ("memory!",
