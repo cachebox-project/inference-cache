@@ -26,13 +26,13 @@ import (
 //
 // The public HTTP listener (HTTPAddr) carries kubelet- and Prometheus-facing
 // endpoints (/healthz, /readyz, /metrics). The snapshot listener
-// (SnapshotAddr) carries both /snapshot (controller-read) and /policy
-// (controller-write), each gated by ServiceAccount bearer auth — a
-// NetworkPolicy further restricts L3/L4 access to the controller's pod
-// selector (see config/server). The split exists so kubelet probes and
-// Prometheus scrapes — which can't carry a bearer — stay on an open port
-// while every controller↔server mutation/observation surface lives behind
-// the same auth profile.
+// (SnapshotAddr) carries /snapshot (controller-read), /policy
+// (controller-write), and /probe (controller-driven functional self-test),
+// each gated by ServiceAccount bearer auth — a NetworkPolicy further restricts
+// L3/L4 access to the controller's pod selector (see config/server). The split
+// exists so kubelet probes and Prometheus scrapes — which can't carry a
+// bearer — stay on an open port while every controller↔server mutation/
+// observation surface lives behind the same auth profile.
 type Config struct {
 	GRPCAddr     string
 	HTTPAddr     string

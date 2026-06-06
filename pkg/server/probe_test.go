@@ -139,6 +139,30 @@ func TestProberRunStageCSkippedForNonLMCache(t *testing.T) {
 	}
 }
 
+// TestProberRunStageCTreatsEmptyBackendTypeAsLMCache pins the CRD-default
+// alignment: an omitted BackendType must run Stage C (it matches the
+// CacheBackend.spec.type defaulter, which writes LMCache). The opposite
+// behavior — silently skipping Stage C on an empty field — would flip
+// FunctionalProbeOK True on a backend that never proved its T2 round-trip.
+func TestProberRunStageCTreatsEmptyBackendTypeAsLMCache(t *testing.T) {
+	t2 := &fakeT2Prober{}
+	prober, _ := newProberForTest(t, t2)
+	result := prober.Run(t.Context(), ProbeRequest{
+		Backend:    "cb-default",
+		Model:      "m",
+		HashScheme: "vllm",
+		// BackendType deliberately omitted — controller may send empty if
+		// the CR omitted spec.type (the kubebuilder defaulter writes LMCache,
+		// but a hand-rolled request can still arrive empty).
+	})
+	if result.T2 != ProbeStageOK {
+		t.Errorf("T2 = %q, want %q — empty BackendType must run Stage C (CRD default)", result.T2, ProbeStageOK)
+	}
+	if t2.calls != 1 {
+		t.Errorf("T2Prober calls = %d, want 1 — empty BackendType silently skipped Stage C", t2.calls)
+	}
+}
+
 // TestProberRunStageCRunsForLMCacheWithProber covers the positive Stage-C
 // path: an LMCache backend + a working T2Prober yields T2=ok and exercises
 // the prober. The payload length check proves the orchestrator actually
@@ -275,6 +299,39 @@ func TestProberRunLeavesNoStateInIndex(t *testing.T) {
 	}
 	if len(replicas) != 0 {
 		t.Errorf("replicas after probe = %+v, want empty — replica stats not cleared", replicas)
+	}
+}
+
+// TestProberRunSerializesConcurrentProbesForSameBackend pins the per-
+// (backend, model) mutex that prevents the race where one probe's cleanup
+// wipes another's just-ingested entry mid-flight. Without it, two
+// concurrent Runs for the same backend would surface as false subscriber
+// or routing failures. With it, both Runs land successfully — sequenced —
+// and the index is empty afterwards.
+func TestProberRunSerializesConcurrentProbesForSameBackend(t *testing.T) {
+	prober, idx := newProberForTest(t, nil)
+
+	const concurrent = 8
+	results := make(chan ProbeResult, concurrent)
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			results <- prober.Run(t.Context(), ProbeRequest{
+				Backend: "cb-shared", Model: "m", HashScheme: "vllm",
+			})
+		}()
+	}
+
+	for i := 0; i < concurrent; i++ {
+		r := <-results
+		if !r.AllPassed() {
+			t.Errorf("concurrent run %d: AllPassed() = false; result = %+v", i, r)
+		}
+	}
+
+	// All Runs serialized correctly, so the final state is clean.
+	_, totalPrefixes := idx.CacheState(ProbeTenantID, "m")
+	if totalPrefixes != 0 {
+		t.Errorf("after %d concurrent runs, totalPrefixes = %d, want 0", concurrent, totalPrefixes)
 	}
 }
 

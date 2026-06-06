@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/cachebox-project/inference-cache/pkg/index"
@@ -99,6 +100,12 @@ const (
 // the literal here (rather than importing the CRD types) keeps pkg/server
 // dependency-free of the CRD package, matching the policy/tenant pattern in
 // pkg/server/policy.go.
+//
+// An empty BackendType on a ProbeRequest is treated as LMCache to match the
+// CacheBackend CRD's defaulter (spec.type defaults to LMCache via the
+// kubebuilder marker). Operators who run the probe by hand against a non-
+// LMCache backend must set BackendType explicitly; the controller-wiring
+// follow-up always reads spec.type from the CR and never sends empty.
 const BackendTypeLMCache = "LMCache"
 
 // ProbeRequest carries the parameters the probe needs to synthesize a
@@ -141,9 +148,11 @@ type ProbeStageError struct {
 }
 
 // AllPassed reports whether every stage either passed or was intentionally
-// skipped (no Failed result). Used by the controller (Stage 2) to flip the
-// FunctionalProbeOK condition; carried here so the same predicate gates
-// the HTTP response and any future caller.
+// skipped (no Failed result). The HTTP /probe handler ALWAYS returns the full
+// ProbeResult as JSON (HTTP 200 — the call itself succeeded), and the caller
+// reads AllPassed to flip the FunctionalProbeOK condition once the controller
+// wiring follow-up lands. The predicate is exported so that follow-up doesn't
+// have to re-derive the "passed?" definition from the per-stage fields.
 func (r ProbeResult) AllPassed() bool {
 	return r.Subscriber != ProbeStageFailed && r.Routing != ProbeStageFailed && r.T2 != ProbeStageFailed
 }
@@ -201,6 +210,19 @@ type Prober struct {
 	t2    T2Prober
 	now   func() time.Time
 
+	// runMu serializes Run by backend so two concurrent probes for the same
+	// CacheBackend cannot race through the shared reserved-replica state. A
+	// per-(backend, model) mutex is the smallest scope that prevents the race
+	// — probes for DIFFERENT backends synthesize under DIFFERENT __probe-
+	// replica ids and never collide. Without this, two overlapping runs could
+	// see one's cleanup wipe the other's just-ingested entry mid-flight and
+	// report a false subscriber/routing failure. The controller-wiring
+	// follow-up additionally rate-limits to ~once per backend per 30s, so
+	// contention here is rare in practice — the lock is the correctness
+	// backstop for the no-rate-limit case (tests, hand-invoked probes,
+	// future fast reconcile cycles).
+	runMuMap sync.Map // key: "{backend}\x00{model}" → *sync.Mutex
+
 	// ingestFn is the stage-A index-write step. Defaults to p.index.Ingest;
 	// tests override it to simulate a subscriber pipeline that drops events
 	// (the bug surfaces this way — the writer thinks it sent, the index
@@ -228,6 +250,19 @@ func NewProber(idx *index.Index, t2 T2Prober) *Prober {
 	}
 }
 
+// lockForRun returns the per-(backend, model) mutex Run takes while it
+// synthesizes + cleans up, lazily creating it on first use. The lock scope
+// matches the reserved replica id's (backend, model) tuple — probes for
+// different (backend, model) tuples never contend with each other.
+func (p *Prober) lockForRun(backend, model string) *sync.Mutex {
+	key := backend + "\x00" + model
+	if m, ok := p.runMuMap.Load(key); ok {
+		return m.(*sync.Mutex)
+	}
+	m, _ := p.runMuMap.LoadOrStore(key, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // ProbeReplicaID is the reserved replica id the probe synthesizes its state
 // under for a given backend. Exposed so the controller (when the wiring
 // follow-up lands) can construct the same id when asserting "no probe
@@ -240,15 +275,21 @@ func ProbeReplicaID(backend string) string {
 // keyed by (backend, hashScheme). Same inputs → same bytes; callers can
 // re-derive the hash for assertions without re-running the probe.
 //
-// Encoding note: the index stores prefix-hash bytes raw — the gRPC layer's
-// updateFromProto carries `p.GetPrefixHash()` straight into
-// `prefixKey.prefixHash = string(p.PrefixHash)`. The probe stores the SAME
-// bytes on ingest and uses them VERBATIM on lookup, so the round-trip closes
-// regardless of which wire-encoding the real workload subscriber uses. If
-// future work changes the index's storage format (e.g. to fix a proxy↔server
-// encoding mismatch), the probe's hash synthesis here must match the new
-// format — otherwise the probe will round-trip cleanly while real workloads
-// continue to NO_HINT.
+// What the probe round-trip ACTUALLY catches:
+// the probe synthesizes one set of bytes and uses them VERBATIM on both
+// ingest and lookup, so a NO_HINT here points to a cache-plane-internal
+// regression (index keying drift, scheme handling, policy gating, routing
+// orchestration) — not a proxy/subscriber wire-encoding disagreement.
+// A proxy↔subscriber encoding mismatch by definition involves bytes the
+// PROXY produces vs bytes the SUBSCRIBER reports; this probe doesn't run
+// the proxy, so it cannot reproduce that exact failure. Catching that
+// class of bug requires complementary surfaces (workload-side metrics on
+// the subscriber's emitted hashes vs. the index's stored hashes, or an
+// end-to-end smoke that drives a real engine through both halves).
+// The encoding note matters here because if future work changes the
+// index's storage format to fix such a mismatch, the probe's hash
+// synthesis must match the new format — otherwise the probe will round-
+// trip cleanly while real workloads continue to NO_HINT.
 func ProbeHash(backend, hashScheme string) []byte {
 	h := sha256.New()
 	// Domain-separated input so a future hashing change can't collide with
@@ -279,6 +320,15 @@ func ProbeHash(backend, hashScheme string) []byte {
 func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	replicaID := ProbeReplicaID(req.Backend)
 	probeHash := ProbeHash(req.Backend, req.HashScheme)
+
+	// Serialize probes for this (backend, model) so two overlapping calls cannot
+	// race through the shared reserved-replica state — one's cleanup wiping the
+	// other's just-ingested entry would otherwise surface as a false subscriber
+	// or routing failure. The lock is per-(backend, model); probes for different
+	// CacheBackends run in parallel without contention.
+	mu := p.lockForRun(req.Backend, req.Model)
+	mu.Lock()
+	defer mu.Unlock()
 
 	result := ProbeResult{Backend: req.Backend}
 
@@ -352,11 +402,17 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	}
 
 	// Stage C — T2 cycle. Skip on non-LMCache backends (no tier-2 to test) and
-	// when no prober is wired (Stage 1 default). The payload is small and
-	// deterministic so a successful round-trip is observable as a byte match
-	// on the receiving side; the probe doesn't care about the payload's content,
-	// only that what went in came out.
-	if req.BackendType != BackendTypeLMCache || p.t2 == nil {
+	// when no prober is wired (Stage 1 default). Empty BackendType is treated as
+	// LMCache to match the CacheBackend CRD's default (spec.type defaults to
+	// LMCache via the kubebuilder marker); without this an omitted field would
+	// silently turn a real LMCache probe into "skipped" and the controller's
+	// FunctionalProbeOK condition would flip True on a backend that never
+	// proved its T2 round-trip works. The payload is small and deterministic so
+	// a successful round-trip is observable as a byte match on the receiving
+	// side; the probe doesn't care about the payload's content, only that what
+	// went in came out.
+	runT2 := req.BackendType == BackendTypeLMCache || req.BackendType == ""
+	if !runT2 || p.t2 == nil {
 		result.T2 = ProbeStageSkipped
 		return result
 	}

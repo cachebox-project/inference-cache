@@ -22,12 +22,24 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 |---|---|---|---|
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
+| `/probe`    | controller → server | `POST` | CacheBackend reconcile (controller-wiring follow-up) |
 
-Both `/snapshot` and `/policy` sit on the server's internal `:8081`
-listener with **three independent gates**, each meant to catch a failure
-mode the others can't. `/healthz`, `/readyz`, and `/metrics` stay on
-the open `:8080` listener — kubelet probes and Prometheus scrapes can't
-present a SA bearer.
+All three of `/snapshot`, `/policy`, and `/probe` sit on the server's
+internal `:8081` listener with **three independent gates**, each meant to
+catch a failure mode the others can't. `/healthz`, `/readyz`, and
+`/metrics` stay on the open `:8080` listener — kubelet probes and
+Prometheus scrapes can't present a SA bearer.
+
+`/probe` is the functional self-test the controller will drive per
+CacheBackend at reconcile time (once the controller-wiring follow-up
+lands): the server synthesizes a deterministic round-trip — subscriber-
+pipeline → routing → tier-2 — under a reserved tenant id
+(`inferencecache.io/probe`) and replica id (`__probe-<backend>`),
+returning per-stage outcomes. It shares the controller-auth profile
+with `/snapshot` and `/policy` because all three endpoints serve one
+caller identity (the controller SA). The probe entries auto-clean on
+each Run via an `ALL_CLEARED` event against the reserved replica, so
+the synthesized state never leaks into a real LookupRoute.
 
 1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
    controller's selector.
@@ -55,14 +67,14 @@ trail. The read-side hardening landed first; the write side joined it
 on the same gate, with the audience layer hardening both endpoints
 uniformly.
 
-`inferencecache_snapshot_auth_total` and `inferencecache_policy_auth_total`
-are the per-endpoint observability surfaces for the two L7 layers
-(identity + audience); audience-mismatch denials surface in the
-`unauth` bucket of each counter, with the apiserver's diagnostic
-visible at WARN in the server log (e.g. `token audiences [...] is
-invalid for the target audiences [...]`). NetworkPolicy drops happen
-at the CNI before the listener and are observed via kube state metrics
-+ CNI flow logs, not these counters.
+`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+and `inferencecache_probe_auth_total` are the per-endpoint observability
+surfaces for the two L7 layers (identity + audience); audience-mismatch
+denials surface in the `unauth` bucket of each counter, with the
+apiserver's diagnostic visible at WARN in the server log (e.g.
+`token audiences [...] is invalid for the target audiences [...]`).
+NetworkPolicy drops happen at the CNI before the listener and are
+observed via kube state metrics + CNI flow logs, not these counters.
 
 ## Snapshot semantics
 

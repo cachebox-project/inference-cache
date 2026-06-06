@@ -73,6 +73,14 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
+#  11b. The /probe endpoint rejects unauthenticated callers: same side-pod
+#      shape against the functional-self-test endpoint. /probe shares the
+#      controller-auth profile with /snapshot and /policy, so a regression
+#      that wired /probe outside that profile would let any pod that can
+#      reach :8081 drive a synthetic round-trip (and, once the controller-
+#      wiring follow-up lands, observe the resulting Ready transitions).
+#      Sends a valid ProbeRequest body so the rejection cannot be
+#      misattributed to a 400; valid outcomes are 401 / NetworkPolicy drop.
 #  12. The audience binding holds on BOTH /snapshot and /policy: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
@@ -1559,6 +1567,62 @@ case "$policy_probe_out" in
     ;;
   *)
     fail "unauthenticated /policy probe was not rejected (or curl failed for an unexpected reason); got: $policy_probe_out"
+    ;;
+esac
+
+# --- /probe auth assertion ------------------------------------------------
+# /probe is the controller-driven functional self-test endpoint; same
+# controller-auth profile as /snapshot and /policy. The complementary
+# UNAUTHENTICATED-rejection half is what this section checks — a regression
+# that wired /probe outside the shared auth profile would let any pod that
+# can reach :8081 drive a synthetic round-trip (and, once the controller-
+# wiring follow-up lands, observe the resulting Ready transitions). Sends a
+# valid ProbeRequest body so the rejection cannot be misattributed to a 400;
+# the only valid outcomes are 401 (auth) or curl_failed:28 (NetworkPolicy
+# drop under an enforcing CNI). Mirror of the /policy probe above.
+log "asserting unauthenticated /probe POST from a side pod is rejected"
+SIDE_POD_PROBE="ic-probe-probe"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_PROBE" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # POST a minimal valid ProbeRequest so any non-2xx response must be an
+    # auth rejection, not a body-parse rejection.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      -H "Content-Type: application/json" \
+      -d "{\"backend\":\"smoke\",\"model\":\"smoke-model\",\"hashScheme\":\"vllm\"}" \
+      http://inference-cache-server:8081/probe || echo "curl_failed:$?"
+  ' >/tmp/probe-probe-create.log 2>&1; then
+  cat /tmp/probe-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD_PROBE failed; cannot run /probe auth assertion"
+fi
+
+# 90s budget + describe-pod fallback matches the /snapshot and /policy probes
+# above — the surrounding phases (External-backend, audience-binding) can
+# leave the kubelet busy reaping Terminating pods.
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD_PROBE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD_PROBE" 2>/dev/null || true)"
+if [ -z "$probe_probe_out" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$SIDE_POD_PROBE" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
+# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
+# CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass). 200 (synthesis ran unauthenticated) is the regression this whole
+# section exists to prevent.
+case "$probe_probe_out" in
+  "401"|*"curl_failed:28"*)
+    log "unauthenticated /probe POST rejected (probe output: $probe_probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /probe POST was not rejected (or curl failed for an unexpected reason); got: $probe_probe_out"
     ;;
 esac
 
