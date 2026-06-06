@@ -62,8 +62,8 @@ type controllerAuthConfig struct {
 }
 
 // WithControllerAuth wires bearer-token authentication onto the controller-
-// facing endpoints (/snapshot and /policy), which share the snapshot
-// listener. When unset both endpoints are served without authentication;
+// facing endpoints (/snapshot, /policy, and /probe), which share the snapshot
+// listener. When unset all three endpoints are served without authentication;
 // the production binary always sets it. expectedSA is the canonical
 // ServiceAccount username, e.g.
 // "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
@@ -71,8 +71,8 @@ type controllerAuthConfig struct {
 // binding); pass an empty string to disable audience binding (legacy
 // posture). The production binary defaults audience to
 // auth.ControllerAudience and must keep it aligned with the controller's
-// projected SA token volume. The same audience gates BOTH endpoints because
-// they share one middleware identity (the controller SA).
+// projected SA token volume. The same audience gates all three endpoints
+// because they share one middleware identity (the controller SA).
 func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string) Option {
 	return func(s *Service) {
 		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA, audience: audience}
@@ -216,17 +216,19 @@ func New(opts ...Option) *Service {
 		s.metrics.grpcTLSEnabled.Set(0)
 	}
 
-	// If auth is configured, wrap /snapshot and /policy in the TokenReview
-	// middleware. Two Authenticator instances share the same Reviewer,
-	// ExpectedSA, and Audience but emit per-endpoint metrics
-	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total)
-	// so a dashboard can distinguish a read-side auth failure (info leak
-	// attempt) from a write-side one (active tampering attempt). The two
+	// If auth is configured, wrap /snapshot, /policy, and /probe in the
+	// TokenReview middleware. Three Authenticator instances share the same
+	// Reviewer, ExpectedSA, and Audience but emit per-endpoint metrics
+	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total
+	// + inferencecache_probe_auth_total) so a dashboard can distinguish a
+	// read-side auth failure (info leak attempt) from a write-side one
+	// (active tampering attempt) from a probe-side one (silent Ready-gate
+	// degradation once the controller-wiring follow-up lands). The three
 	// caches are independent — one extra TokenReview per endpoint per TTL
 	// window in the steady state, negligible vs the apiserver's own auth
 	// cost. The shared Audience means the projected SA token at the
-	// controller's volume mount admits to both endpoints uniformly; there's
-	// one trust boundary, not two.
+	// controller's volume mount admits to all three endpoints uniformly;
+	// there's one trust boundary, not three.
 	if s.controllerAuthCfg != nil {
 		snapshotAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,

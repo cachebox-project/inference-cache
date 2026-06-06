@@ -17,17 +17,26 @@ import (
 //
 // The probe is a deterministic synthetic round-trip the controller drives at
 // each CacheBackend reconcile, AFTER the existing first-KV-event baseline check
-// (pods Up, Service endpoints, first KV event seen). It catches the silent-
-// failure modes a Ready=True backend was hiding:
+// (pods Up, Service endpoints, first KV event seen). It catches CACHE-PLANE-
+// INTERNAL silent-failure modes a Ready=True backend was hiding:
 //
-//   - A tenant_id mismatch between subscriber and lookup that silently surfaces
-//     as NO_HINT for every routed request.
-//   - A hash-bytes encoding mismatch between the proxy and the server index
-//     that silently surfaces as NO_HINT for every routed request despite a
-//     well-formed multi-block chain.
-//   - A tier-2 (LMCache) put/get cycle that silently 0-hits across millions
-//     of queries because the engine-side client and server-side storage
-//     disagree on the wire format.
+//   - Index keying / scheme handling / policy gating regressions that drop
+//     well-formed events on ingest (Stage A).
+//   - Routing-layer regressions that return NO_HINT for entries that ARE in
+//     the index (Stage B). This includes tenant_id propagation drift between
+//     the gRPC handler and the index lookup, and any index-side hash-bytes
+//     storage change that the probe's synthesis hasn't been updated to match.
+//   - A tier-2 (LMCache) put/get cycle that silently 0-hits because the
+//     engine-side client and server-side storage disagree on the wire format
+//     (Stage C, when an LMCache T2Prober is wired).
+//
+// What the probe DOES NOT catch: a proxy↔subscriber wire-encoding
+// disagreement at the workload edge. The probe synthesizes one set of bytes
+// and uses them VERBATIM on both ingest and lookup, so a real proxy emitting
+// one encoding while the subscriber reports another is invisible to this
+// probe. That class of bug needs complementary surfaces — workload-side
+// metrics on subscriber-emitted vs index-stored hashes, or an end-to-end
+// smoke driving a real engine through both halves.
 //
 // The probe synthesizes its own state (a deterministic 16-token block under a
 // reserved tenant_id) and round-trips it through the three stages: a SUBSCRIBER
@@ -110,11 +119,23 @@ const BackendTypeLMCache = "LMCache"
 
 // ProbeRequest carries the parameters the probe needs to synthesize a
 // deterministic round-trip. The tenant_id is NOT a request field — it is
-// always ProbeTenantID, fixed server-side. Backend uniquely identifies which
-// CacheBackend the probe is running against; Model + HashScheme pin the
-// engine domain the synthesized state lives under (so a probe for the vllm
-// adapter cannot collide with a probe for the sglang adapter on the same
-// backend); BackendType decides whether Stage C runs.
+// always ProbeTenantID, fixed server-side.
+//
+// Backend uniquely identifies which CacheBackend the probe is running
+// against AND is interpolated into the reserved replica id
+// (__probe-<backend>) and the deterministic probe hash. To prevent
+// same-name CacheBackends in different namespaces from colliding in the
+// reserved replica id, callers MUST pass a globally-unique form — the
+// canonical shape is `<namespace>/<name>` (matching K8s resource identity).
+// The controller-wiring follow-up always sends `<namespace>/<name>`; the
+// HTTP handler validates that the field is non-empty but does not enforce
+// the slash format, since hand-invoked probes on a single-namespace
+// install can use any unique string.
+//
+// Model + HashScheme pin the engine domain the synthesized state lives
+// under (so a probe for the vllm adapter cannot collide with a probe for
+// the sglang adapter on the same backend). BackendType decides whether
+// Stage C runs.
 type ProbeRequest struct {
 	Backend     string `json:"backend"`
 	Model       string `json:"model"`
@@ -148,13 +169,27 @@ type ProbeStageError struct {
 }
 
 // AllPassed reports whether every stage either passed or was intentionally
-// skipped (no Failed result). The HTTP /probe handler ALWAYS returns the full
-// ProbeResult as JSON (HTTP 200 — the call itself succeeded), and the caller
-// reads AllPassed to flip the FunctionalProbeOK condition once the controller
-// wiring follow-up lands. The predicate is exported so that follow-up doesn't
-// have to re-derive the "passed?" definition from the per-stage fields.
+// skipped (every stage has an explicit ok|skipped value, none is failed and
+// none is the zero-value empty string). The HTTP /probe handler ALWAYS
+// returns the full ProbeResult as JSON (HTTP 200 — the call itself
+// succeeded), and the caller reads AllPassed to flip the FunctionalProbeOK
+// condition once the controller wiring follow-up lands. The predicate is
+// exported so that follow-up doesn't have to re-derive the "passed?"
+// definition from the per-stage fields.
+//
+// The zero-value-fails-closed property matters: a partially-decoded result
+// (the JSON envelope was truncated, a future field was renamed, the caller
+// constructed a ProbeResult{} without running anything) MUST NOT pass —
+// "no information" is not the same as "all three stages passed."
 func (r ProbeResult) AllPassed() bool {
-	return r.Subscriber != ProbeStageFailed && r.Routing != ProbeStageFailed && r.T2 != ProbeStageFailed
+	return stagePassed(r.Subscriber) && stagePassed(r.Routing) && stagePassed(r.T2)
+}
+
+// stagePassed returns true only for an explicit ok or skipped — empty
+// string (zero value, unrecognized future outcome) AND failed both return
+// false. Keeps AllPassed's three-stage check readable as one predicate.
+func stagePassed(s ProbeStageResult) bool {
+	return s == ProbeStageOK || s == ProbeStageSkipped
 }
 
 // T2Prober drives a put/get round trip against an external tier-2 backend
@@ -507,6 +542,14 @@ func probeHandler(prober *Prober) http.HandlerFunc {
 		var req ProbeRequest
 		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "decode probe request: "+err.Error()+"\n", http.StatusBadRequest)
+			return
+		}
+		// Reject trailing tokens after the first JSON value so a body like
+		// `{...} {...}` cannot silently slip through DisallowUnknownFields
+		// (which only catches unknown KEYS within the first decoded value).
+		// Mirrors the strictness implied by the field-level guard.
+		if dec.More() {
+			http.Error(w, "probe request body has trailing content after the first JSON value\n", http.StatusBadRequest)
 			return
 		}
 		if req.Backend == "" || req.Model == "" || req.HashScheme == "" {

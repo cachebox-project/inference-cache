@@ -86,6 +86,28 @@ func TestProbeReplicaIDReservedPrefix(t *testing.T) {
 	}
 }
 
+// TestProbeResultAllPassedZeroValueFailsClosed pins the predicate's
+// fail-closed property: a zero-value ProbeResult{} (no stages run, or a
+// partial JSON decode) MUST NOT report passed. "No information" is not the
+// same as "every stage succeeded" — without this guard, the controller-
+// wiring follow-up could flip FunctionalProbeOK True on an empty response.
+func TestProbeResultAllPassedZeroValueFailsClosed(t *testing.T) {
+	if (ProbeResult{}).AllPassed() {
+		t.Fatal("ProbeResult{}.AllPassed() = true, want false — zero-value must not pass")
+	}
+	// A partially-populated result also fails: two stages ok + one
+	// zero-value field is still "no information" for that stage.
+	partial := ProbeResult{Subscriber: ProbeStageOK, Routing: ProbeStageOK}
+	if partial.AllPassed() {
+		t.Fatal("ProbeResult with zero-value T2 returned AllPassed=true; want false")
+	}
+	// The all-explicit-ok case still passes.
+	all := ProbeResult{Subscriber: ProbeStageOK, Routing: ProbeStageOK, T2: ProbeStageSkipped}
+	if !all.AllPassed() {
+		t.Fatal("explicit ok/ok/skipped ProbeResult should report AllPassed=true")
+	}
+}
+
 // TestProberRunHappyPathStageABCSkippedT2 covers the no-T2-prober default:
 // Stage A passes (ingest landed), Stage B passes (LookupRoute returns
 // PREFIX_MATCH), Stage C is Skipped because no T2Prober is wired. This is
@@ -449,6 +471,10 @@ func TestProbeHandlerRejectsMalformedBody(t *testing.T) {
 		{"missing model", `{"backend":"cb-1","hashScheme":"vllm"}`},
 		{"missing hashScheme", `{"backend":"cb-1","model":"m"}`},
 		{"unknown field", `{"backend":"cb-1","model":"m","hashScheme":"vllm","tenant":"override"}`},
+		// Trailing JSON value after the first object: rejected so a
+		// crafted body can't smuggle a second decoded value past the
+		// strictness implied by DisallowUnknownFields.
+		{"trailing json", `{"backend":"cb-1","model":"m","hashScheme":"vllm"} {"backend":"x","model":"y","hashScheme":"vllm"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

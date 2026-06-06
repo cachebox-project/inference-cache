@@ -93,7 +93,7 @@ func main() {
 	} else {
 		// *insecureNoAuth == true, verified above.
 		slog.WarnContext(ctx, "controller_auth_disabled",
-			"reason", "--insecure-disable-auth was set; /snapshot and /policy are unauthenticated. This must NEVER be used in production.")
+			"reason", "--insecure-disable-auth was set; /snapshot, /policy, and /probe are unauthenticated. This must NEVER be used in production.")
 	}
 
 	// Resolve the gRPC transport posture before serving. LoadGRPCTLSCredentials
@@ -136,13 +136,13 @@ func main() {
 // is valid. Extracted from main() so the matrix can be unit-tested without
 // a subprocess harness.
 //
-// The contract (BOTH /snapshot and /policy share this gate since they share
-// one middleware identity):
+// The contract (/snapshot, /policy, and /probe share this gate since they
+// share one middleware identity):
 //   - --allowed-controller-sa AND --insecure-disable-auth are mutually
 //     exclusive (either you authenticate or you explicitly opted out; not both).
 //   - At least one must be set: the previous shape (silent unauth on empty
 //     flag) made it trivial for a real-cluster deploy to accidentally ship
-//     wide-open /snapshot + /policy endpoints, which defeats the hardening.
+//     wide-open controller-facing endpoints, which defeats the hardening.
 //   - --allowed-controller-sa, when set, must exactly match its own trimmed
 //     form: kube-apiserver returns a username that exactly matches
 //     "system:serviceaccount:NS:NAME" (no whitespace), so a pasted SA value
@@ -164,7 +164,7 @@ func validateControllerAuthFlags(expectedSA, audience string, insecureNoAuth boo
 	case expectedSA != "" && insecureNoAuth:
 		return "--allowed-controller-sa and --insecure-disable-auth are mutually exclusive"
 	case expectedSA == "" && !insecureNoAuth:
-		return "missing --allowed-controller-sa; pass --insecure-disable-auth to run /snapshot and /policy without authentication (local development only)"
+		return "missing --allowed-controller-sa; pass --insecure-disable-auth to run /snapshot, /policy, and /probe without authentication (local development only)"
 	case expectedSA != "" && strings.TrimSpace(expectedSA) != expectedSA:
 		return fmt.Sprintf("--allowed-controller-sa has leading/trailing whitespace (%q); the apiserver returns SA usernames without whitespace, so this value would never match and every controller request would 403", expectedSA)
 	case expectedSA != "" && strings.TrimSpace(audience) == "":

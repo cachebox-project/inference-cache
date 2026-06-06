@@ -57,15 +57,19 @@ the synthesized state never leaks into a real LookupRoute.
    cross-surface defense degrades; keep this audience distinct from
    any audience the apiserver accepts.
 
-The two internal endpoints share one auth profile because they share
+All three internal endpoints share one auth profile because they share
 one caller identity (the controller SA). `/snapshot` is the *read* side
-(CacheIndex poll, info leak if exposed) and `/policy` is the *write*
-side (CachePolicy push, active tampering if exposed) — write is more
-dangerous because replace-on-write semantics mean a rogue POST
-overrides every namespace's policy state cluster-wide with no audit
-trail. The read-side hardening landed first; the write side joined it
-on the same gate, with the audience layer hardening both endpoints
-uniformly.
+(CacheIndex poll, info leak if exposed), `/policy` is the *write* side
+(CachePolicy push, active tampering if exposed), and `/probe` is the
+controller-driven *functional-self-test* side (per-CacheBackend
+synthesis; silent Ready-gate degradation if a regression skipped it).
+Write is the most dangerous of the three because replace-on-write
+semantics mean a rogue POST to `/policy` overrides every namespace's
+policy state cluster-wide with no audit trail. The read-side hardening
+landed first; the write side joined it on the same gate; `/probe`
+joined the same shared gate (audience-bound + bearer-validated +
+NetworkPolicy-restricted) with the audience layer hardening all three
+endpoints uniformly.
 
 `inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
 and `inferencecache_probe_auth_total` are the per-endpoint observability

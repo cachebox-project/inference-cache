@@ -94,14 +94,17 @@ with OTEL collectors) without bumping `v1alpha1`.
   via the `index.Metrics` interface after the cap sweep (`reason="cap"`, on ingest)
   and the TTL sweep (`reason="ttl"`); see [`pkg/index/`](../../pkg/index/). The
   per-algorithm tally is emitted after the index lock is released.
-- **`snapshotAuth` + `policyAuth` writers:** the TokenReview middleware in
-  [`pkg/server/auth/`](../../pkg/server/auth/) reports one outcome per
-  request via the `auth.ResultRecorder` interface. The recorders themselves
-  are returned by `serverMetrics.SnapshotAuthRecorder()` and
-  `serverMetrics.PolicyAuthRecorder()` (in `pkg/server/metrics.go`) and
-  wired into the per-endpoint authenticators in `pkg/server/server.go`.
-  One increment per `/snapshot` or `/policy` request reaching the
-  middleware, labeled by `result`.
+- **`snapshotAuth` + `policyAuth` + `probeAuth` writers:** the TokenReview
+  middleware in [`pkg/server/auth/`](../../pkg/server/auth/) reports one
+  outcome per request via the `auth.ResultRecorder` interface. The
+  recorders themselves are returned by `serverMetrics.SnapshotAuthRecorder()`,
+  `serverMetrics.PolicyAuthRecorder()`, and `serverMetrics.ProbeAuthRecorder()`
+  (in `pkg/server/metrics.go`) and wired into the per-endpoint authenticators
+  in `pkg/server/server.go`. One increment per `/snapshot`, `/policy`, or
+  `/probe` request reaching the middleware, labeled by `result`. All three
+  endpoints share the controller-auth profile but emit per-endpoint counters
+  so a dashboard can distinguish read-side, write-side, and probe-side
+  failures.
 
 ---
 
@@ -113,13 +116,15 @@ with OTEL collectors) without bumping `v1alpha1`.
   **`/readyz`** (readiness → `index.Ready()`). These stay unauthenticated —
   kubelet probes and Prometheus scrapes cannot present a SA bearer.
 - Separate **controller-facing** listener (default `:8081`, flag
-  `--snapshot-bind-address`) carries **both** `/snapshot` (controller-read
+  `--snapshot-bind-address`) carries `/snapshot` (controller-read
   of the cluster-wide cache aggregate; populates the `CacheIndex` CR
-  status) and `/policy` (controller-write of the combined resolved
+  status), `/policy` (controller-write of the combined resolved
   snapshot — `CachePolicy` entries plus `CacheTenant` quota entries;
-  replace-on-write). The gate has **THREE independent layers**, each
-  meant to catch a failure mode the others can't, and the same gate
-  applies to BOTH endpoints uniformly (one middleware identity):
+  replace-on-write), and `/probe` (controller-driven functional
+  self-test, per CacheBackend). The gate has **THREE independent
+  layers**, each meant to catch a failure mode the others can't, and
+  the same gate applies to all three endpoints uniformly (one
+  middleware identity):
   - **L3/L4:** a `NetworkPolicy` restricts ingress to the controller's
     pod selector.
   - **L7 identity:** TokenReview-backed bearer middleware rejects every
@@ -130,18 +135,18 @@ with OTEL collectors) without bumping `v1alpha1`.
     at `/var/run/secrets/inferencecache.io/controller-token/token`); the
     server passes `TokenReviewSpec.Audiences=[--controller-audience]` so
     a default-audience apiserver token from the same controller SA is
-    rejected on either endpoint. Under the default apiserver audience
-    configuration, a leaked controller-audience token is useless against
-    the apiserver and vice versa; the cross-surface property holds only
-    while the apiserver is not configured to also accept
-    `inferencecache.io/controller` as an apiserver audience (keep the
-    two distinct).
+    rejected on any of the three endpoints. Under the default apiserver
+    audience configuration, a leaked controller-audience token is
+    useless against the apiserver and vice versa; the cross-surface
+    property holds only while the apiserver is not configured to also
+    accept `inferencecache.io/controller` as an apiserver audience
+    (keep the two distinct).
 
-  `inferencecache_snapshot_auth_total` and
-  `inferencecache_policy_auth_total` (see the counter table above) are
-  the parallel observability surfaces — one per endpoint — for the
+  `inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+  and `inferencecache_probe_auth_total` (see the counter table above)
+  are the parallel observability surfaces — one per endpoint — for the
   **two L7 layers (identity + audience)**. NetworkPolicy drops happen
-  at the CNI before the listener and cannot increment either counter
+  at the CNI before the listener and cannot increment any of these counters
   — observe those via kube state metrics on the policy resource + the
   CNI's flow logs (Calico / Cilium / etc.), separately from the auth
   counters. Audience-mismatch denials land in `result="unauth"` with
