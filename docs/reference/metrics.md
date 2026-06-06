@@ -42,7 +42,7 @@ silently.
 |---|---|---|---|
 | `inferencecache_server_up` | *(none)* | `1` if the cache policy server is serving requests, `0` otherwise. | Server starts (→`1`) / shuts down (→`0`). Liveness signal. |
 | `inferencecache_server_grpc_tls_enabled` | *(none)* | `1` if the gRPC server (`:9090`) is terminating TLS, `0` if serving plaintext. | Set once at startup from `--tls-cert-file`/`--tls-key-file` (both set → `1`, both empty → `0`). Confirms the prod wire posture from Prometheus. See `docs/design/grpc-tls.md`. |
-| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model. One entry = one unique `(tenant, model, hash_scheme, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, hash)` from `ReportCacheState`; falls on `BlockRemoved` / `AllBlocksCleared` / TTL eviction / max-entries cap. Idempotent re-reports do **not** move it. |
+| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model, **excluding reserved-tenant (`inferencecache.io/probe`) entries**. One entry = one unique `(tenant, model, hash_scheme, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, hash)` from `ReportCacheState`; falls on `BlockRemoved` / `AllBlocksCleared` / TTL eviction / max-entries cap. Idempotent re-reports do **not** move it. The probe's synthetic state IS in the index during a Run but is excluded from this gauge so a scrape that races Stage C cannot transiently surface a probe-tenant count on a real model bucket — see `WithReservedTenants` in `pkg/index/index.go`. |
 
 ### Counters
 
@@ -51,6 +51,7 @@ silently.
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
 | `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — this includes the **wrong-audience** case: a token whose JWT audience does not match the server's `--controller-audience` is reported by the apiserver as not authenticated, surfaced here in the same bucket), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses several apiserver-reported denials (plain bad token, `Status.Error` populated by the SA-token authenticator's JWT parser, wrong audience) because they're not distinguishable from the response shape; the middleware logs the apiserver's diagnostic at WARN to the server log so the operator can still tell them apart (e.g. `token audiences [...] is invalid for the target audiences [...]` clearly signals an audience mismatch — usually a manifest/flag drift between controller projection and server `--controller-audience`). A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / audience / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
 | `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat: a wrong-audience controller token shows up in `unauth`, with the apiserver's `token audiences [...] is invalid` diagnostic at WARN. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Read- and write-side caches are independent — the same controller token cache-misses once per endpoint per TTL window in the steady state. |
+| `inferencecache_probe_auth_total` | `result` | One increment per `/probe` request reaching the auth middleware, labeled by outcome. Third controller↔server endpoint on the snapshot listener; this counter mirrors the snapshot/policy pair so dashboards distinguish probe-side auth failures from read-side (`/snapshot`) and write-side (`/policy`) ones. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat. The probe-specific alarming signal is a non-trivial `unauth` rate without a paired `ok` rate: the controller drives `/probe` once per CacheBackend per ~30s (once the controller-wiring follow-up lands), so silent `unauth` here means probe results never reach the reconciler and the `FunctionalProbeOK` condition degrades to unknown — invisible to operators unless this metric is on the dashboard. `forbidden` mirrors the policy-write semantics (some other workload is trying to drive a probe — alarming). All three caches are independent. |
 | `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 | `inferencecache_index_evictions_total` | `algorithm`, `reason` | One increment per **replica×prefix entry** removed by the index's own sweeps (distinct from the quota path above). | `algorithm` ∈ `lru` / `lfu` — the namespace's resolved `CachePolicy.spec.eviction`. `reason` ∈ `cap` (global `MaxEntries` exceeded — victims chosen by the algorithm: oldest-`lastSeen` for `lru`, lowest-access-count for `lfu`) / `ttl` (freshness sweep; algorithm-independent removal, but labeled with the namespace algorithm for attribution). Series are created lazily on the first eviction. A rising `reason="cap"` rate means the index is sustainably above `MaxEntries`; `lfu` keeps frequently-hit prefixes longer than `lru` under the same pressure. |
 
@@ -93,14 +94,17 @@ with OTEL collectors) without bumping `v1alpha1`.
   via the `index.Metrics` interface after the cap sweep (`reason="cap"`, on ingest)
   and the TTL sweep (`reason="ttl"`); see [`pkg/index/`](../../pkg/index/). The
   per-algorithm tally is emitted after the index lock is released.
-- **`snapshotAuth` + `policyAuth` writers:** the TokenReview middleware in
-  [`pkg/server/auth/`](../../pkg/server/auth/) reports one outcome per
-  request via the `auth.ResultRecorder` interface. The recorders themselves
-  are returned by `serverMetrics.SnapshotAuthRecorder()` and
-  `serverMetrics.PolicyAuthRecorder()` (in `pkg/server/metrics.go`) and
-  wired into the per-endpoint authenticators in `pkg/server/server.go`.
-  One increment per `/snapshot` or `/policy` request reaching the
-  middleware, labeled by `result`.
+- **`snapshotAuth` + `policyAuth` + `probeAuth` writers:** the TokenReview
+  middleware in [`pkg/server/auth/`](../../pkg/server/auth/) reports one
+  outcome per request via the `auth.ResultRecorder` interface. The
+  recorders themselves are returned by `serverMetrics.SnapshotAuthRecorder()`,
+  `serverMetrics.PolicyAuthRecorder()`, and `serverMetrics.ProbeAuthRecorder()`
+  (in `pkg/server/metrics.go`) and wired into the per-endpoint authenticators
+  in `pkg/server/server.go`. One increment per `/snapshot`, `/policy`, or
+  `/probe` request reaching the middleware, labeled by `result`. All three
+  endpoints share the controller-auth profile but emit per-endpoint counters
+  so a dashboard can distinguish read-side, write-side, and probe-side
+  failures.
 
 ---
 
@@ -112,13 +116,15 @@ with OTEL collectors) without bumping `v1alpha1`.
   **`/readyz`** (readiness → `index.Ready()`). These stay unauthenticated —
   kubelet probes and Prometheus scrapes cannot present a SA bearer.
 - Separate **controller-facing** listener (default `:8081`, flag
-  `--snapshot-bind-address`) carries **both** `/snapshot` (controller-read
+  `--snapshot-bind-address`) carries `/snapshot` (controller-read
   of the cluster-wide cache aggregate; populates the `CacheIndex` CR
-  status) and `/policy` (controller-write of the combined resolved
+  status), `/policy` (controller-write of the combined resolved
   snapshot — `CachePolicy` entries plus `CacheTenant` quota entries;
-  replace-on-write). The gate has **THREE independent layers**, each
-  meant to catch a failure mode the others can't, and the same gate
-  applies to BOTH endpoints uniformly (one middleware identity):
+  replace-on-write), and `/probe` (controller-driven functional
+  self-test, per CacheBackend). The gate has **THREE independent
+  layers**, each meant to catch a failure mode the others can't, and
+  the same gate applies to all three endpoints uniformly (one
+  middleware identity):
   - **L3/L4:** a `NetworkPolicy` restricts ingress to the controller's
     pod selector.
   - **L7 identity:** TokenReview-backed bearer middleware rejects every
@@ -129,18 +135,18 @@ with OTEL collectors) without bumping `v1alpha1`.
     at `/var/run/secrets/inferencecache.io/controller-token/token`); the
     server passes `TokenReviewSpec.Audiences=[--controller-audience]` so
     a default-audience apiserver token from the same controller SA is
-    rejected on either endpoint. Under the default apiserver audience
-    configuration, a leaked controller-audience token is useless against
-    the apiserver and vice versa; the cross-surface property holds only
-    while the apiserver is not configured to also accept
-    `inferencecache.io/controller` as an apiserver audience (keep the
-    two distinct).
+    rejected on any of the three endpoints. Under the default apiserver
+    audience configuration, a leaked controller-audience token is
+    useless against the apiserver and vice versa; the cross-surface
+    property holds only while the apiserver is not configured to also
+    accept `inferencecache.io/controller` as an apiserver audience
+    (keep the two distinct).
 
-  `inferencecache_snapshot_auth_total` and
-  `inferencecache_policy_auth_total` (see the counter table above) are
-  the parallel observability surfaces — one per endpoint — for the
+  `inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+  and `inferencecache_probe_auth_total` (see the counter table above)
+  are the parallel observability surfaces — one per endpoint — for the
   **two L7 layers (identity + audience)**. NetworkPolicy drops happen
-  at the CNI before the listener and cannot increment either counter
+  at the CNI before the listener and cannot increment any of these counters
   — observe those via kube state metrics on the policy resource + the
   CNI's flow logs (Calico / Cilium / etc.), separately from the auth
   counters. Audience-mismatch denials land in `result="unauth"` with

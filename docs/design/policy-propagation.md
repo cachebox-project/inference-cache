@@ -22,12 +22,81 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 |---|---|---|---|
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
+| `/probe`    | controller → server | `POST` | CacheBackend reconcile (controller-wiring follow-up) |
 
-Both `/snapshot` and `/policy` sit on the server's internal `:8081`
-listener with **three independent gates**, each meant to catch a failure
-mode the others can't. `/healthz`, `/readyz`, and `/metrics` stay on
-the open `:8080` listener — kubelet probes and Prometheus scrapes can't
-present a SA bearer.
+All three of `/snapshot`, `/policy`, and `/probe` sit on the server's
+internal `:8081` listener with **three independent gates**, each meant to
+catch a failure mode the others can't. `/healthz`, `/readyz`, and
+`/metrics` stay on the open `:8080` listener — kubelet probes and
+Prometheus scrapes can't present a SA bearer.
+
+`/probe` is the functional self-test the controller will drive per
+CacheBackend at reconcile time (once the controller-wiring follow-up
+lands): the server synthesizes a deterministic round-trip — in-process
+index-ingest → routing → tier-2 — under a reserved tenant id
+(`inferencecache.io/probe`) and replica id (`__probe-<backend>`),
+returning per-stage outcomes. Stage A's wire field name is `ingest` —
+matching the path the probe physically traverses: it writes through
+in-process `index.Ingest` rather than the gRPC `ReportCacheState`
+handler the real subscriber uses (the handler now drops messages with
+`tenant_id = inferencecache.io/probe` by design). A Stage A pass
+therefore proves the index ingest path is accepting writes; it does
+not, on its own, prove the full subscriber wire is healthy end-to-end.
+A Stage A fail still definitively means the index ingest path is broken.
+
+`/probe` shares the controller-auth profile with `/snapshot` and
+`/policy` because all three endpoints serve one caller identity (the
+controller SA). The probe entries auto-clean on each Run via an
+`ALL_CLEARED` event against the reserved replica, so the synthesized
+state never leaks into a real LookupRoute.
+
+#### `/probe` wire contract
+
+Request — JSON body, `POST /probe`. All fields are case-sensitive.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `backend` | string | yes | Stable, globally-unique CacheBackend identifier. Canonical form is `<namespace>/<name>` (the controller-wiring follow-up always sends this), but the handler accepts any non-empty string. Interpolated into the reserved replica id (`__probe-<backend>`) and the probe hash, so two CacheBackends with the same `backend` value share a replica id and contention slot. |
+| `model` | string | yes | Model identifier the probe synthesizes state under. Must match the model the controller is checking; the reserved tenant id is server-owned and cannot be passed in. |
+| `hashScheme` | string | yes | Engine domain (`vllm` / `sglang` / etc). Pins the engine the probe's synthetic block lives under so a probe for vllm cannot collide with a probe for sglang on the same backend. |
+| `backendType` | string | no | The CacheBackend's `spec.type`. `LMCache` (or empty, matching the CRD default) runs Stage C; `Memory` / `External` skip it. Unknown values fall through to skip. |
+
+Response — JSON body, HTTP `200 OK` on every well-formed request (per-stage failures are surfaced INSIDE the body, not via HTTP status — the call itself succeeded):
+
+```json
+{
+  "backend": "<backend echoed back>",
+  "ingest":  "ok|failed|skipped",
+  "routing": "ok|failed|skipped",
+  "t2":      "ok|failed|skipped",
+  "errors": [
+    { "stage": "ingest|routing|t2", "message": "..." }
+  ]
+}
+```
+
+Stage values:
+- `ok` — the stage passed.
+- `failed` — the stage failed; `errors` carries a stage-keyed diagnostic message.
+- `skipped` — the stage was not run. T2 is skipped on non-LMCache backends and when no T2Prober is wired. Downstream stages are skipped when an upstream stage failed (cascade prevention).
+
+Stage names:
+- `ingest` — Stage A. Verifies the in-process index ingest path accepts writes. NOTE: this stage writes via `index.Ingest` directly, NOT through the gRPC `ReportCacheState` handler the real subscriber uses (the handler drops messages with `tenant_id = inferencecache.io/probe` by design). A pass proves the index ingest path is healthy; a fail definitively means it's broken. Neither alone proves the wire subscriber path is healthy end-to-end.
+- `routing` — Stage B. Verifies the in-process `index.LookupRoute` (the orchestrated ranking entrypoint that the gRPC handler delegates to) returns `PREFIX_MATCH` for the probe-synthesized hash against the just-ingested entry. NOTE: this stage calls `index.LookupRoute` directly, NOT the gRPC `inferenceCacheService.LookupRoute` handler. The handler short-circuits `tenant_id = inferencecache.io/probe` to `NO_HINT` by design (defense against external lookups against the reserved scope), so the probe cannot route through it. Handler-level concerns — policy gating (`minimumPrefixTokens`), `lookupTimeoutMs` deadline, proto→domain translation — are not covered by this stage and have their own unit tests under `pkg/server`.
+- `t2` — Stage C. Verifies a tier-2 put/get round trip via the supplied `T2Prober` (LMCache backends; skipped otherwise).
+
+Status codes:
+- `200` — body carries the per-stage result; `errors` is empty when all stages passed.
+- `400` — body decode failure (invalid JSON, trailing content past the first value, missing required field, unknown field).
+- `401` / `403` — auth-middleware rejection (TokenReview failed or wrong SA / wrong audience).
+- `405` — wrong method; only `POST` is allowed (the handler echoes `Allow: POST`).
+
+Isolation + cleanup guarantees:
+- The synthesized state lives under tenant id `inferencecache.io/probe` and replica id `__probe-<backend>`. Both prefixes are reserved by the project's canonical namespace and the `__` Pod-name escape; a real workload cannot collide.
+- The reserved tenant is excluded from the index's global `maxEntries` cap accounting AND its cap-sweep victim candidate set, so a concurrent real-workload `Ingest` cannot evict a real entry to make room for a transient probe entry.
+- Each `Run` calls `ApplyEvent(EventAllCleared)` against the reserved replica via `defer`, leaving the index empty of probe entries on return (even on panic or early-return from a failed Stage A).
+- Reserved-tenant entries are still subject to the TTL sweep as defense-in-depth if the deferred cleanup somehow fails to run.
+- The `CacheTenant` admission webhook rejects CRs that newly claim `spec.tenantID = inferencecache.io/probe` — both `ValidateCreate` (unconditionally) and `ValidateUpdate` (only when the change newly introduces the id, via `filterIntroducedErrors`). Pre-existing CRs already holding the reserved id are not trapped on unrelated edits (the v1alpha1 tightening seam). The `ReportCacheState` / `PublishEvent` gRPC handlers silently drop messages carrying the same id — so an external client cannot fake state into the reserved scope through the public gRPC contract.
 
 1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
    controller's selector.
@@ -45,24 +114,28 @@ present a SA bearer.
    cross-surface defense degrades; keep this audience distinct from
    any audience the apiserver accepts.
 
-The two internal endpoints share one auth profile because they share
+All three internal endpoints share one auth profile because they share
 one caller identity (the controller SA). `/snapshot` is the *read* side
-(CacheIndex poll, info leak if exposed) and `/policy` is the *write*
-side (CachePolicy push, active tampering if exposed) — write is more
-dangerous because replace-on-write semantics mean a rogue POST
-overrides every namespace's policy state cluster-wide with no audit
-trail. The read-side hardening landed first; the write side joined it
-on the same gate, with the audience layer hardening both endpoints
-uniformly.
+(CacheIndex poll, info leak if exposed), `/policy` is the *write* side
+(CachePolicy push, active tampering if exposed), and `/probe` is the
+controller-driven *functional-self-test* side (per-CacheBackend
+synthesis; silent Ready-gate degradation if a regression skipped it).
+Write is the most dangerous of the three because replace-on-write
+semantics mean a rogue POST to `/policy` overrides every namespace's
+policy state cluster-wide with no audit trail. The read-side hardening
+landed first; the write side joined it on the same gate; `/probe`
+joined the same shared gate (audience-bound + bearer-validated +
+NetworkPolicy-restricted) with the audience layer hardening all three
+endpoints uniformly.
 
-`inferencecache_snapshot_auth_total` and `inferencecache_policy_auth_total`
-are the per-endpoint observability surfaces for the two L7 layers
-(identity + audience); audience-mismatch denials surface in the
-`unauth` bucket of each counter, with the apiserver's diagnostic
-visible at WARN in the server log (e.g. `token audiences [...] is
-invalid for the target audiences [...]`). NetworkPolicy drops happen
-at the CNI before the listener and are observed via kube state metrics
-+ CNI flow logs, not these counters.
+`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+and `inferencecache_probe_auth_total` are the per-endpoint observability
+surfaces for the two L7 layers (identity + audience); audience-mismatch
+denials surface in the `unauth` bucket of each counter, with the
+apiserver's diagnostic visible at WARN in the server log (e.g.
+`token audiences [...] is invalid for the target audiences [...]`).
+NetworkPolicy drops happen at the CNI before the listener and are
+observed via kube state metrics + CNI flow logs, not these counters.
 
 ## Snapshot semantics
 
@@ -265,7 +338,9 @@ reconciles any transient skew.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
-- mTLS for `/policy` and `/snapshot` — the current shape ships
-  TokenReview-backed bearer auth + audience binding + a NetworkPolicy
+- mTLS for `/snapshot`, `/policy`, and `/probe` — the current shape
+  ships TokenReview-backed bearer auth + audience binding + a NetworkPolicy
   gate; mTLS is a separate hardening step tracked under the gRPC TLS
-  posture decision.
+  posture decision, and applies uniformly across the controller-facing
+  bridge (all three endpoints share one auth profile, so mTLS will gate
+  all three at once).

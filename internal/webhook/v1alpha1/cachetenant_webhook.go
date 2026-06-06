@@ -64,18 +64,59 @@ type CacheTenantValidator struct {
 }
 
 // CacheTenantValidationRule is the seam plugged-in spec-only admission rules
-// implement, mirroring the CachePolicy/CacheBackend pattern. There are no
-// spec-only rules today — tenantID non-empty (Required + MinLength=1) and
-// quota.maxIndexEntries >= 0 (Minimum=0) are already enforced by kubebuilder
-// markers — so [DefaultCacheTenantValidationRules] is empty. The seam exists
-// so a future cross-field rule appends as a one-liner.
+// implement, mirroring the CachePolicy/CacheBackend pattern.
 type CacheTenantValidationRule func(ct *cachev1alpha1.CacheTenant) field.ErrorList
 
+// reservedProbeTenantID is the tenant id the server uses for its own
+// functional self-test (see ProbeTenantID in pkg/server/probe.go). A real
+// CacheTenant claiming this id would (a) bypass quota enforcement at the
+// PolicyStore layer — the server unconditionally exempts the probe tenant
+// to defend the probe from operator-configured quotas — and (b) share the
+// reserved scope with the probe's synthetic state. Reject at admission so
+// the reservation lives at both layers (server policy + admission).
+// MUST stay in lockstep with pkg/server.ProbeTenantID; the constant is
+// duplicated rather than imported to keep internal/webhook free of a
+// pkg/server dependency.
+//
+// Schema-evolution note: adding this rule is an admission TIGHTENING that
+// shrinks the set of accepted CacheTenant.spec.tenantID values. Under the
+// project's v1alpha1 schema-evolution policy, tightening unstable-API
+// validation is permitted (v1alpha1 = "unstable" per K8s upstream
+// convention); the controller-wiring follow-up that introduces the probe
+// surface is itself v1alpha1-internal. Pre-existing CRs that already hold
+// the reserved id are NOT trapped because ValidateUpdate's
+// filterIntroducedErrors only fails NEWLY-introduced violations — an
+// unchanged tenantID on an existing CR continues to admit, and the
+// operator can migrate by changing tenantID OR by deleting the legacy CR.
+// Post-v1beta1, this carve-out expires and any further tightening would
+// require a K8s-standard deprecation cycle.
+const reservedProbeTenantID = "inferencecache.io/probe"
+
+// rejectReservedProbeTenantID rejects CacheTenants whose spec.tenantID
+// equals the server-reserved probe tenant id. The probe scope is
+// server-internal state; operator-supplied CacheTenants must not govern it.
+// On CREATE: fires unconditionally. On UPDATE: fires only when the change
+// newly introduces the reserved id (filterIntroducedErrors handles the
+// "unchanged legacy id" carve-out — see reservedProbeTenantID's doc).
+var rejectReservedProbeTenantID = func(ct *cachev1alpha1.CacheTenant) field.ErrorList {
+	if ct.Spec.TenantID != reservedProbeTenantID {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(
+		field.NewPath("spec", "tenantID"),
+		ct.Spec.TenantID,
+		"tenantID is reserved for the server's functional self-test (see pkg/server/probe.go); choose a different tenantID",
+	)}
+}
+
 // DefaultCacheTenantValidationRules is the spec-only rule set every admitted
-// CacheTenant is checked against. Empty today (kubebuilder markers cover the
-// structural rules); append here or via [CacheTenantValidator.Rules] to
-// extend admission.
-var DefaultCacheTenantValidationRules = []CacheTenantValidationRule{}
+// CacheTenant is checked against. Today: reject the reserved probe tenant id
+// (kubebuilder markers cover the structural rules — tenantID non-empty,
+// quota.maxIndexEntries >= 0); append here or via [CacheTenantValidator.Rules]
+// to extend admission.
+var DefaultCacheTenantValidationRules = []CacheTenantValidationRule{
+	rejectReservedProbeTenantID,
+}
 
 // SetupCacheTenantWebhookWithManager registers the defaulting and validating
 // webhooks for CacheTenant with mgr. The kubebuilder markers below are the

@@ -26,13 +26,13 @@ import (
 //
 // The public HTTP listener (HTTPAddr) carries kubelet- and Prometheus-facing
 // endpoints (/healthz, /readyz, /metrics). The snapshot listener
-// (SnapshotAddr) carries both /snapshot (controller-read) and /policy
-// (controller-write), each gated by ServiceAccount bearer auth — a
-// NetworkPolicy further restricts L3/L4 access to the controller's pod
-// selector (see config/server). The split exists so kubelet probes and
-// Prometheus scrapes — which can't carry a bearer — stay on an open port
-// while every controller↔server mutation/observation surface lives behind
-// the same auth profile.
+// (SnapshotAddr) carries /snapshot (controller-read), /policy
+// (controller-write), and /probe (controller-driven functional self-test),
+// each gated by ServiceAccount bearer auth — a NetworkPolicy further restricts
+// L3/L4 access to the controller's pod selector (see config/server). The split
+// exists so kubelet probes and Prometheus scrapes — which can't carry a
+// bearer — stay on an open port while every controller↔server mutation/
+// observation surface lives behind the same auth profile.
 type Config struct {
 	GRPCAddr     string
 	HTTPAddr     string
@@ -62,8 +62,8 @@ type controllerAuthConfig struct {
 }
 
 // WithControllerAuth wires bearer-token authentication onto the controller-
-// facing endpoints (/snapshot and /policy), which share the snapshot
-// listener. When unset both endpoints are served without authentication;
+// facing endpoints (/snapshot, /policy, and /probe), which share the snapshot
+// listener. When unset all three endpoints are served without authentication;
 // the production binary always sets it. expectedSA is the canonical
 // ServiceAccount username, e.g.
 // "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
@@ -71,8 +71,8 @@ type controllerAuthConfig struct {
 // binding); pass an empty string to disable audience binding (legacy
 // posture). The production binary defaults audience to
 // auth.ControllerAudience and must keep it aligned with the controller's
-// projected SA token volume. The same audience gates BOTH endpoints because
-// they share one middleware identity (the controller SA).
+// projected SA token volume. The same audience gates all three endpoints
+// because they share one middleware identity (the controller SA).
 func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string) Option {
 	return func(s *Service) {
 		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA, audience: audience}
@@ -102,6 +102,14 @@ func New(opts ...Option) *Service {
 		index.WithTTLResolver(policies),
 		index.WithTenantQuotaResolver(policies),
 		index.WithEvictionResolver(policies),
+		// Reserve the probe tenant from the global cap so a concurrent real-
+		// workload Ingest can never pick a real-workload entry as a victim to
+		// make room for the probe's transient ingest. Probe-tenant entries are
+		// excluded from both the cap accounting (effectiveTotal = totalEntries
+		// - reservedEntries) and the victim candidate set, so the probe path's
+		// "never mutates real workload state" invariant holds even under
+		// concurrent real-workload writes on a saturated index.
+		index.WithReservedTenants(ProbeTenantID),
 	)
 
 	publicMux := http.NewServeMux()
@@ -120,14 +128,15 @@ func New(opts ...Option) *Service {
 	// /metrics — Prometheus surface (inferencecache_*), tech spec §4.3.
 	publicMux.Handle("/metrics", promhttp.HandlerFor(metrics.registry, promhttp.HandlerOpts{}))
 
-	// /snapshot AND /policy are served from a dedicated listener so a
-	// NetworkPolicy can restrict ingress to the controller's pod selector
-	// without breaking kubelet probes or Prometheus scrapes on the public
-	// listener. Both endpoints are controller-to-server: /snapshot is a
-	// read (controller polls cache aggregate) and /policy is a write
-	// (controller pushes the resolved CachePolicy snapshot, replace-on-
-	// write). They share one auth profile because they share one caller
-	// identity.
+	// /snapshot, /policy, and /probe are served from a dedicated listener
+	// so a NetworkPolicy can restrict ingress to the controller's pod
+	// selector without breaking kubelet probes or Prometheus scrapes on
+	// the public listener. All three endpoints are controller-to-server:
+	// /snapshot is a read (controller polls cache aggregate), /policy is
+	// a write (controller pushes the resolved CachePolicy snapshot,
+	// replace-on-write), and /probe is a controller-driven functional
+	// self-test (POST returns per-stage outcomes). They share one auth
+	// profile because they share one caller identity.
 	snapshotMux := http.NewServeMux()
 	snapshotHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Tighten the contract to GET-only: the controller poller and any
@@ -148,8 +157,18 @@ func New(opts ...Option) *Service {
 	// snapshots to. Replace-on-write; the controller owns the source of truth
 	// and re-pushes on its tick, so a server restart self-heals.
 	policyHTTPHandler := http.Handler(policyHandler(policies))
+	// /probe — functional self-test. The controller POSTs a probe request
+	// per CacheBackend at reconcile time (controller-wiring follow-up); the
+	// server synthesizes a deterministic round-trip and reports per-stage
+	// outcomes. Shares the controller-auth profile (same listener, same SA
+	// identity); this revision ships with no T2Prober wired, so the T2 stage
+	// always reports skipped until the controller-wiring follow-up plumbs a
+	// real one through.
+	prober := NewProber(idx, nil)
+	probeHTTPHandler := http.Handler(probeHandler(prober))
 	snapshotMux.Handle("/snapshot", snapshotHandler)
 	snapshotMux.Handle("/policy", policyHTTPHandler)
+	snapshotMux.Handle("/probe", probeHTTPHandler)
 
 	s := &Service{
 		publicHTTPServer: &http.Server{
@@ -166,6 +185,11 @@ func New(opts ...Option) *Service {
 		index:           idx,
 		policies:        policies,
 	}
+	// probeHTTPHandler and prober are NOT stored on Service: the handler is
+	// already mounted on snapshotMux above (and re-referenced by the auth-
+	// wrapping branch below), and the prober is held alive by the handler's
+	// closure for as long as the Service is. Carrying them as struct fields
+	// that nothing reads would just be inert state.
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -202,17 +226,19 @@ func New(opts ...Option) *Service {
 		s.metrics.grpcTLSEnabled.Set(0)
 	}
 
-	// If auth is configured, wrap /snapshot and /policy in the TokenReview
-	// middleware. Two Authenticator instances share the same Reviewer,
-	// ExpectedSA, and Audience but emit per-endpoint metrics
-	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total)
-	// so a dashboard can distinguish a read-side auth failure (info leak
-	// attempt) from a write-side one (active tampering attempt). The two
+	// If auth is configured, wrap /snapshot, /policy, and /probe in the
+	// TokenReview middleware. Three Authenticator instances share the same
+	// Reviewer, ExpectedSA, and Audience but emit per-endpoint metrics
+	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total
+	// + inferencecache_probe_auth_total) so a dashboard can distinguish a
+	// read-side auth failure (info leak attempt) from a write-side one
+	// (active tampering attempt) from a probe-side one (silent Ready-gate
+	// degradation once the controller-wiring follow-up lands). The three
 	// caches are independent — one extra TokenReview per endpoint per TTL
 	// window in the steady state, negligible vs the apiserver's own auth
 	// cost. The shared Audience means the projected SA token at the
-	// controller's volume mount admits to both endpoints uniformly; there's
-	// one trust boundary, not two.
+	// controller's volume mount admits to all three endpoints uniformly;
+	// there's one trust boundary, not three.
 	if s.controllerAuthCfg != nil {
 		snapshotAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,
@@ -235,9 +261,19 @@ func New(opts ...Option) *Service {
 		if err != nil {
 			panic(fmt.Sprintf("server: policy auth: %v", err))
 		}
+		probeAuthn, err := auth.NewAuthenticator(auth.Options{
+			Reviewer:               s.controllerAuthCfg.reviewer,
+			ExpectedServiceAccount: s.controllerAuthCfg.saName,
+			Audience:               s.controllerAuthCfg.audience,
+			Recorder:               s.metrics.ProbeAuthRecorder(),
+		})
+		if err != nil {
+			panic(fmt.Sprintf("server: probe auth: %v", err))
+		}
 		gatedMux := http.NewServeMux()
 		gatedMux.Handle("/snapshot", snapshotAuthn.Middleware(snapshotHandler))
 		gatedMux.Handle("/policy", policyAuthn.Middleware(policyHTTPHandler))
+		gatedMux.Handle("/probe", probeAuthn.Middleware(probeHTTPHandler))
 		s.snapshotServer.Handler = gatedMux
 	}
 	return s

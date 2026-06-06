@@ -370,6 +370,16 @@ type Index struct {
 	ttlResolver      TTLResolver
 	quotaResolver    TenantQuotaResolver
 	evictionResolver EvictionResolver
+	// reservedTenants identifies tenant ids whose prefix entries are EXCLUDED
+	// from the global maxEntries cap accounting AND the cap-sweep victim
+	// candidate set. The index doesn't know what these tenants are for —
+	// callers (the server) declare them via WithReservedTenants. The intent
+	// is to host ephemeral synthetic state (e.g. the server's functional
+	// self-test probe) that a concurrent real-workload Ingest must never see
+	// as either a cap pressure source OR a candidate to evict. TTL sweep and
+	// per-tenant quota enforcement still apply unchanged. Nil/empty means no
+	// exemptions and the cap behaves identically to its historical shape.
+	reservedTenants map[string]struct{}
 
 	ready atomic.Bool
 
@@ -382,6 +392,12 @@ type Index struct {
 	prefixes     map[prefixKey]map[string]*replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
+	// reservedEntries counts the subset of totalEntries whose tenant is in
+	// reservedTenants. The cap math is `totalEntries - reservedEntries` so
+	// reserved-tenant entries contribute to memory accounting but neither
+	// fill the cap nor get picked as victims. Maintained in lockstep with
+	// totalEntries by upsert/removeReplicaLocked.
+	reservedEntries int
 
 	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
 	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
@@ -470,6 +486,33 @@ func WithTenantQuotaResolver(r TenantQuotaResolver) Option {
 // implementation owns its own concurrency. Mirrors WithTTLResolver.
 func WithEvictionResolver(r EvictionResolver) Option {
 	return func(i *Index) { i.evictionResolver = r }
+}
+
+// WithReservedTenants declares a set of tenant ids whose prefix entries are
+// EXCLUDED from the global maxEntries cap accounting AND the cap-sweep victim
+// candidate set. Intended for ephemeral server-internal state (e.g. the
+// functional self-test probe) so that a concurrent real-workload Ingest
+// neither sees probe entries as cap pressure nor picks one of its own
+// real-workload entries as a victim to make room for a transient probe entry.
+// TTL sweep and per-tenant quota enforcement still apply to reserved tenants
+// unchanged; only the global cap is bypassed. The set is read-only after
+// construction; callers thread the set through this Option once. Empty/nil
+// means no exemptions (historical behavior).
+func WithReservedTenants(tenants ...string) Option {
+	return func(i *Index) {
+		if len(tenants) == 0 {
+			return
+		}
+		if i.reservedTenants == nil {
+			i.reservedTenants = make(map[string]struct{}, len(tenants))
+		}
+		for _, t := range tenants {
+			if t == "" {
+				continue
+			}
+			i.reservedTenants[t] = struct{}{}
+		}
+	}
 }
 
 // withClock overrides the time source (tests only).
@@ -611,6 +654,11 @@ func (i *Index) Ingest(u Update) {
 	if hasQuota {
 		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
 	}
+	// enforceCapLocked is a no-op for reserved-tenant writes that don't push
+	// the effective total (totalEntries - reservedEntries) over maxEntries —
+	// reserved tenants do not fill the cap, so a probe ingest never triggers
+	// eviction here, and a concurrent real-workload ingest sees the probe
+	// entry as cap-invisible too. See WithReservedTenants.
 	capEvicted := i.enforceCapLocked()
 	i.mu.Unlock()
 
@@ -1201,11 +1249,25 @@ func (i *Index) Aggregate() Aggregate {
 // aggregateLocked walks the prefix map exactly once, attributing every distinct
 // prefix key to its tenant bucket and the running total in the same step. Caller
 // holds at least the read lock. Because both numbers come from the one
-// iteration, Total == Σ PerTenant == len(i.prefixes) always holds — no second
-// pass, no separate counter that could drift.
+// iteration, Total == Σ PerTenant always holds — no second pass, no separate
+// counter that could drift. Reserved-tenant entries (see WithReservedTenants)
+// are excluded from BOTH PerTenant and Total so the cluster aggregate the
+// operator sees never temporarily surfaces synthetic probe state.
+//
+// Unit note: Aggregate counts DISTINCT PREFIX KEYS — one (tenant, model,
+// hash_scheme, prefix_hash) tuple, regardless of how many replicas hold it.
+// The cap accounting (totalEntries / reservedEntries / effectiveTotal)
+// counts REPLICA×PREFIX entries — a prefix held by N replicas contributes N
+// to totalEntries. The two are different units; they aren't expected to
+// match numerically, only to track the same RESERVED-TENANT EXCLUSION
+// principle (the operator-visible aggregate and the cap-enforcement view
+// both treat reserved tenants as if they weren't there).
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		// Untenanted prefixes (key.tenant == "") bucket under "" — collision-free,
 		// since no real CacheTenant tenantID is empty.
 		agg.PerTenant[key.tenant]++
@@ -1269,6 +1331,13 @@ type TenantSnapshot struct {
 // stats reported for each replica id; tenant memory/hit-rate dedup replicas
 // within a tenant (it is an approximation — a replica serving multiple models
 // for a tenant is counted once). Results are sorted for deterministic output.
+//
+// Reserved tenants (see WithReservedTenants) are excluded from the snapshot
+// entirely — replicas, tenants, and totals — so a probe in flight cannot
+// temporarily publish its synthetic `__probe-<backend>` replica or the
+// reserved tenant id into the CacheIndex CR status the controller polls.
+// Same rationale as their exclusion from the cap-sweep victim set:
+// server-internal state must not leak to operator-visible surfaces.
 func (i *Index) Snapshot() Snapshot {
 	i.mu.RLock()
 
@@ -1281,6 +1350,9 @@ func (i *Index) Snapshot() Snapshot {
 	latestByReplica := make(map[tenantReplica]statEntry)
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
+		if i.isReservedTenant(sk.tenant) {
+			continue
+		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[tr] = s
@@ -1302,6 +1374,9 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	prefixByReplica := make(map[tenantReplica]*replicaPrefixAgg)
 	for key, replicas := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		for id, e := range replicas {
 			tr := tenantReplica{key.tenant, id}
 			a := prefixByReplica[tr]
@@ -1318,7 +1393,9 @@ func (i *Index) Snapshot() Snapshot {
 
 	// Per-tenant distinct-prefix counts + the grand total come from ONE
 	// authoritative walk (aggregateLocked) so the reported numbers can't drift:
-	// TotalPrefixes == Σ tenants[].indexEntries by construction.
+	// TotalPrefixes == Σ tenants[].indexEntries by construction. The walk
+	// already excludes reserved tenants, so the snapshot total matches what
+	// operator dashboards expect to see.
 	agg := i.aggregateLocked()
 	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 
@@ -1415,11 +1492,18 @@ func (i *Index) Snapshot() Snapshot {
 }
 
 // EntryCountsByModel returns the number of distinct prefixes per model.
+// Reserved-tenant entries (see WithReservedTenants) are excluded so the
+// inferencecache_index_entries gauge reportEntries publishes never
+// transiently surfaces synthetic probe state during a Run. Mirrors the
+// snapshot/aggregate exclusion of the reserved scope.
 func (i *Index) EntryCountsByModel() map[string]int {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	counts := make(map[string]int)
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		counts[key.model]++
 	}
 	return counts
@@ -1592,6 +1676,9 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 		e = &replicaEntry{}
 		replicas[replicaID] = e
 		i.totalEntries++
+		if i.isReservedTenant(key.tenant) {
+			i.reservedEntries++
+		}
 		i.scopeIncLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
 	}
 	e.tokenCount = tokenCount
@@ -1606,6 +1693,9 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]*replicaE
 	}
 	delete(replicas, replicaID)
 	i.totalEntries--
+	if i.isReservedTenant(key.tenant) {
+		i.reservedEntries--
+	}
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
 		// Last replica gone → the prefix key is removed → one fewer distinct
@@ -1765,7 +1855,13 @@ func (i *Index) evictExpired() {
 // over cap). Caller holds the write lock. maxEntries == 0 means unbounded. The
 // sort is O(n log n); it only runs while over the cap.
 func (i *Index) enforceCapLocked() map[string]int {
-	if i.maxEntries <= 0 || i.totalEntries <= i.maxEntries {
+	// Reserved-tenant entries (the probe's synthetic state, etc.) are excluded
+	// from the cap accounting AND the victim candidate set — so a concurrent
+	// real-workload Ingest that fires while a probe is in flight cannot evict
+	// a real-workload entry to make room for a transient probe entry that
+	// cleanup is about to remove. effectiveTotal is the over-cap measurement.
+	effectiveTotal := i.totalEntries - i.reservedEntries
+	if i.maxEntries <= 0 || effectiveTotal <= i.maxEntries {
 		return nil
 	}
 	// Resolve each tenant's algorithm once per sweep (the resolver takes the
@@ -1786,8 +1882,12 @@ func (i *Index) enforceCapLocked() map[string]int {
 		effectiveCount int64
 		lastSeen       time.Time
 	}
-	all := make([]ref, 0, i.totalEntries)
+	all := make([]ref, 0, effectiveTotal)
 	for key, replicas := range i.prefixes {
+		// Skip reserved-tenant entries from the victim candidate set entirely.
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		algo := algoOf(key.tenant)
 		for id, e := range replicas {
 			var eff int64
@@ -1823,7 +1923,7 @@ func (i *Index) enforceCapLocked() map[string]int {
 	})
 	var evicted map[string]int
 	for _, r := range all {
-		if i.totalEntries <= i.maxEntries {
+		if i.totalEntries-i.reservedEntries <= i.maxEntries {
 			break
 		}
 		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
@@ -1833,6 +1933,19 @@ func (i *Index) enforceCapLocked() map[string]int {
 		evicted[r.algo]++
 	}
 	return evicted
+}
+
+// isReservedTenant reports whether the given tenant id was declared as
+// reserved via WithReservedTenants. Tight inlining matters because this is
+// checked on every prefix-entry insert/remove. Returns false on nil sets so
+// the default index (no reservations) pays exactly one extra map-nil check
+// per call.
+func (i *Index) isReservedTenant(tenant string) bool {
+	if len(i.reservedTenants) == 0 {
+		return false
+	}
+	_, ok := i.reservedTenants[tenant]
+	return ok
 }
 
 // tenantQuotaFor returns the tenant's index-entry budget and whether one is

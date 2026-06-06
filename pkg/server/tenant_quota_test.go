@@ -8,6 +8,30 @@ import (
 	"testing"
 )
 
+// TestTenantQuotaExemptsProbeTenant pins the server-internal defense against
+// an operator-created CacheTenant claiming the reserved probe tenant id.
+// CacheTenant.spec.tenantID is a free-form string, so without this exemption a
+// malicious or careless operator could install
+// CacheTenant{tenantID: "inferencecache.io/probe", maxIndexEntries: 0} and
+// silently break Stage A of every CacheBackend functional probe (the ingest
+// would be evicted before it lands). The probe tenant is server-internal state
+// under a server-controlled tenant id; no operator-supplied CacheTenant should
+// govern it.
+func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
+	store := NewPolicyStore()
+	store.ReplaceSnapshot(nil, []ResolvedTenant{
+		{TenantID: ProbeTenantID, MaxIndexEntries: 0, IsolationMode: "Fairness"},
+		// A normal tenant still gets its quota honored.
+		{TenantID: "team-a", MaxIndexEntries: 1000},
+	})
+	if _, ok := store.TenantQuota(ProbeTenantID); ok {
+		t.Fatal("TenantQuota(probe tenant) reported a quota; want exemption (fail open)")
+	}
+	if max, ok := store.TenantQuota("team-a"); !ok || max != 1000 {
+		t.Fatalf("normal tenant quota was disturbed by probe exemption: got (%d, %v), want (1000, true)", max, ok)
+	}
+}
+
 // TestPolicyPropagationVersionIsV3 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
 // cap-eviction algorithm). A controller/server version mismatch is rejected with

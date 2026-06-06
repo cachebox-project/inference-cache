@@ -112,6 +112,29 @@ func TestCacheTenantValidateCreate_NilReaderFailsClosed(t *testing.T) {
 	}
 }
 
+// TestCacheTenantValidateCreate_RejectsReservedProbeTenantID pins the
+// reservation of the server's functional-self-test tenant id at the CRD
+// admission layer. An operator-supplied CacheTenant with
+// spec.tenantID == "inferencecache.io/probe" would otherwise (a) bypass
+// quota enforcement at the PolicyStore layer (which exempts the probe
+// tenant unconditionally) and (b) share the reserved scope with the
+// probe's synthetic state. Reject at admission so the reservation lives at
+// both layers (server policy + CRD admission), and the operator gets a
+// clear "this id is reserved" diagnostic instead of a silent quota bypass.
+func TestCacheTenantValidateCreate_RejectsReservedProbeTenantID(t *testing.T) {
+	v := &CacheTenantValidator{Reader: fakeReaderWith(t)}
+	_, err := v.ValidateCreate(context.Background(), tenant("conflict", "team-a", "inferencecache.io/probe"))
+	if err == nil {
+		t.Fatalf("expected rejection for reserved probe tenant id")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Errorf("expected Invalid error for spec-level rejection, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("error message should explain the reservation: %v", err)
+	}
+}
+
 func TestCacheTenantValidateCreate_NamesSmallestConflictDeterministically(t *testing.T) {
 	// Two siblings already hold the tenantID (a pre-webhook state). The
 	// rejection must name the lexicographically smallest by name, regardless of
@@ -182,6 +205,36 @@ func TestCacheTenantValidateUpdate(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "team-search") {
 			t.Errorf("error %q should name the contested tenantID", err.Error())
+		}
+	})
+
+	t.Run("changing tenantID to the reserved probe id is rejected", func(t *testing.T) {
+		// An update that flips an existing tenantID onto
+		// "inferencecache.io/probe" is a newly-introduced spec-rule violation,
+		// so filterIntroducedErrors surfaces it. Without this guard, the
+		// admission rule applies to creates only — and the CR could drift
+		// onto the reserved scope via an UPDATE that bypasses the create path.
+		old := tenant("t1", "team-a", "team-vision")
+		updated := tenant("t1", "team-a", "inferencecache.io/probe")
+		_, err := v.ValidateUpdate(context.Background(), old, updated)
+		if err == nil || !apierrors.IsInvalid(err) {
+			t.Fatalf("expected Invalid rejection on UPDATE flipping tenantID to reserved probe id, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("error %q should explain the reservation", err.Error())
+		}
+	})
+
+	t.Run("unchanged reserved-tenantID predates the rule and is admitted", func(t *testing.T) {
+		// Defensive: a CR that already holds the reserved id (pre-webhook
+		// state) and edits some unrelated field must still admit — the
+		// filterIntroducedErrors logic only blocks NEW violations on update.
+		// Reflects the v1alpha1 tightening seam.
+		old := tenant("legacy", "team-a", "inferencecache.io/probe")
+		updated := tenant("legacy", "team-a", "inferencecache.io/probe")
+		updated.Labels = map[string]string{"unrelated": "true"}
+		if _, err := v.ValidateUpdate(context.Background(), old, updated); err != nil {
+			t.Fatalf("an unchanged reserved-tenantID with unrelated edits must admit, got %v", err)
 		}
 	})
 

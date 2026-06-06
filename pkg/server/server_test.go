@@ -26,10 +26,16 @@ import (
 // newTestService builds a service backed by a fresh, empty index + policy
 // store for handler-level unit tests. The index uses the policy store as its
 // TTL resolver so per-tenant TTL changes during a test are reflected exactly
-// as they would be in the running binary.
+// as they would be in the running binary, and reserves the probe tenant so
+// the cap/snapshot/aggregate behavior matches the production binary's
+// Service.New wiring (otherwise tests would see different read-side
+// filtering than the running server).
 func newTestService() *inferenceCacheService {
 	policies := NewPolicyStore()
-	idx := index.New(index.WithTTLResolver(policies))
+	idx := index.New(
+		index.WithTTLResolver(policies),
+		index.WithReservedTenants(ProbeTenantID),
+	)
 	return newInferenceCacheService(idx, newServerMetrics(), policies)
 }
 
@@ -925,6 +931,231 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 		t.Fatalf("cache_memory_bytes = %d, want 2048", resp.GetReplicas()[0].GetCacheMemoryBytes())
 	}
 }
+
+// TestLookupRouteFailsOpenForReservedProbeTenant pins the symmetric read-side
+// guard: an external gRPC caller that knows (or guesses) a backend name and
+// re-derives the deterministic probe hash MUST NOT observe the synthetic
+// __probe-<backend> replica when querying with tenant_id == ProbeTenantID.
+// Fail-open with NO_HINT — the contract says "never error on the hot path",
+// and the legitimate probe path uses index.LookupRoute directly (not the
+// gRPC handler), so the in-process Run is unaffected.
+func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed something in the probe scope so a leak would actually surface.
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — external lookup against reserved tenant must fail-open", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("external lookup against reserved tenant returned scores: %+v", resp.GetReplicaScores())
+	}
+}
+
+// TestLookupRouteEmitsMetricForReservedProbeTenantNoHint pins the metric
+// contract on the reserved-tenant short-circuit: even though the call is
+// fail-open without touching the index, observeLookup still fires with
+// reason_code=NO_HINT + hint_used=false, so the "one increment per
+// LookupRoute call" contract on inferencecache_lookup_route_calls_total
+// holds. A future dashboard slicing the metric on tenant_id can surface
+// external traffic against the reserved tenant as an attempted scope probe.
+func TestLookupRouteEmitsMetricForReservedProbeTenantNoHint(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	}); err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	got := lookupCallsValueFromService(t, svc, "m", "NO_HINT", "false")
+	if got != 1 {
+		t.Errorf("lookup_route_calls_total{model=m,reason=NO_HINT,hint_used=false} = %v, want 1 — reserved-tenant short-circuit must still emit the metric", got)
+	}
+}
+
+// lookupCallsValueFromService reads the in-memory counter value for one
+// label set off the service's per-Service Prometheus registry. Avoids
+// pulling in github.com/prometheus/client_golang/prometheus/testutil
+// (and its transitive kylelemons/godebug dep) for one assertion.
+func lookupCallsValueFromService(t *testing.T, svc *inferenceCacheService, model, reason, hintUsed string) float64 {
+	t.Helper()
+	mfs, err := svc.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("registry.Gather: %v", err)
+	}
+	const name = "inferencecache_lookup_route_calls_total"
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			matched := 0
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "model":
+					if l.GetValue() == model {
+						matched++
+					}
+				case "reason_code":
+					if l.GetValue() == reason {
+						matched++
+					}
+				case "hint_used":
+					if l.GetValue() == hintUsed {
+						matched++
+					}
+				}
+			}
+			if matched == 3 {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// TestGetCacheStateReturnsEmptyForReservedProbeTenant is the same guard on
+// the per-(tenant, model) aggregate RPC: an external caller MUST NOT see
+// the probe's synthetic replica stats or prefix count via GetCacheState.
+func TestGetCacheStateReturnsEmptyForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("GetCacheState: %v", err)
+	}
+	if resp.GetSummary().GetTotalPrefixes() != 0 {
+		t.Fatalf("GetCacheState exposed %d probe prefixes; want 0", resp.GetSummary().GetTotalPrefixes())
+	}
+	if len(resp.GetReplicas()) != 0 {
+		t.Fatalf("GetCacheState exposed probe replicas: %+v", resp.GetReplicas())
+	}
+}
+
+// TestSnapshotFiltersReservedProbeTenant pins the cluster-aggregate
+// (/snapshot) read-side guard. The CacheIndex poller polls /snapshot every
+// ~25s; a probe in flight during that poll must not be temporarily reflected
+// into operator-visible CacheIndex CR status.
+func TestSnapshotFiltersReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed both a real tenant (visible) and the probe tenant (hidden).
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real-r", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("rp"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{ReplicaID: "real-r", CacheMemoryBytes: 5000, HitRate: 0.5},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("pp"), TokenCount: 16}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	snap := svc.index.Snapshot()
+
+	if snap.TotalPrefixes != 1 {
+		t.Errorf("TotalPrefixes = %d, want 1 — reserved tenant must not contribute to the cluster total", snap.TotalPrefixes)
+	}
+	for _, r := range snap.Replicas {
+		if r.Tenant == ProbeTenantID || strings.HasPrefix(r.ReplicaID, ProbeReplicaPrefix) {
+			t.Errorf("Snapshot exposed reserved replica row: %+v", r)
+		}
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == ProbeTenantID {
+			t.Errorf("Snapshot exposed reserved tenant row: %+v", tn)
+		}
+	}
+}
+
+// TestReportCacheStateDropsReservedProbeTenant pins the gRPC defense against
+// an external client writing to the server-reserved probe scope: an ingest
+// carrying tenant_id == ProbeTenantID is silently dropped. The complementary
+// CacheTenant admission rule rejects a CR claiming the same id at the CRD
+// layer; together they keep the probe scope server-internal across all
+// reservation paths.
+func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	stream := &fakeReportStream{updates: []*icpb.CacheStateUpdate{{
+		ReplicaId:  "spoofed",
+		ModelId:    "m",
+		TenantId:   ProbeTenantID,
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 32}},
+	}}}
+	if err := svc.ReportCacheState(stream); err != nil {
+		t.Fatalf("ReportCacheState: %v", err)
+	}
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 0 {
+		t.Fatalf("external ingest under reserved probe tenant landed in the index: %+v", scores)
+	}
+}
+
+// TestPublishEventDropsReservedProbeTenant pins the symmetric guard for
+// CacheEvent: an external PREFIX_EVICTED / ALL_CLEARED targeting the probe
+// tenant must not reach the index. The probe re-synthesizes on every Run so
+// the impact would be limited, but the contract is "external clients can't
+// touch server-internal state" — silent drop, no error on the hot path.
+func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real", Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
+		Type: icpb.CacheEvent_ALL_CLEARED, ReplicaId: "real",
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("Ack should be true even on a silent drop")
+	}
+	// The seeded entry must survive — the ALL_CLEARED was dropped before the index saw it.
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 1 || scores[0].ReplicaID != "real" {
+		t.Fatalf("external CacheEvent against probe tenant disturbed reserved state: %+v", scores)
+	}
+}
+
+// fakeReportStream replays a fixed slice of updates and signals EOF.
+type fakeReportStream struct {
+	icpb.InferenceCache_ReportCacheStateServer
+	updates []*icpb.CacheStateUpdate
+	idx     int
+	acked   bool
+}
+
+func (f *fakeReportStream) Recv() (*icpb.CacheStateUpdate, error) {
+	if f.idx >= len(f.updates) {
+		return nil, io.EOF
+	}
+	u := f.updates[f.idx]
+	f.idx++
+	return u, nil
+}
+
+func (f *fakeReportStream) SendAndClose(*icpb.Ack) error { f.acked = true; return nil }
 
 func TestPublishEventAppliesToIndex(t *testing.T) {
 	svc := newTestService()

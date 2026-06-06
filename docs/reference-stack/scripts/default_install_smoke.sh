@@ -73,14 +73,22 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
-#  12. The audience binding holds on BOTH /snapshot and /policy: a probe
+#  11b. The /probe endpoint rejects unauthenticated callers: same side-pod
+#      shape against the functional-self-test endpoint. /probe shares the
+#      controller-auth profile with /snapshot and /policy, so a regression
+#      that wired /probe outside that profile would let any pod that can
+#      reach :8081 drive a synthetic round-trip (and, once the controller-
+#      wiring follow-up lands, observe the resulting Ready transitions).
+#      Sends a valid ProbeRequest body so the rejection cannot be
+#      misattributed to a 400; valid outcomes are 401 / NetworkPolicy drop.
+#  12. The audience binding holds on /snapshot, /policy, AND /probe: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
-#      and asserts the audience-bound token admits on both endpoints
+#      and asserts the audience-bound token admits on all three endpoints
 #      while the default-audience token of the SAME SA is rejected on
-#      both. The two endpoints share one middleware identity (one
-#      controller SA, one audience), so any drift would surface on both
-#      simultaneously. Catches a regression in the SERVER's audience-
+#      all three. The three endpoints share one middleware identity (one
+#      controller SA, one audience), so any drift would surface on all
+#      three simultaneously. Catches a regression in the SERVER's audience-
 #      enforcement half of the contract — `--controller-audience` flag
 #      drift, the middleware forgetting to populate
 #      `TokenReviewSpec.Audiences`, or the apiserver mis-enforcing
@@ -90,6 +98,18 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
+#  12b. The authenticated /probe handler returns the expected default
+#       posture on a clean install: a controller-SA-authenticated POST
+#       gets HTTP 200 AND the parsed JSON body asserts ingest=ok,
+#       routing=ok, t2=skipped (the Stage-1 default — no T2Prober wired
+#       yet). A regression where the handler returns 200 with a
+#       per-stage "failed" would otherwise slip past the audience-binding
+#       phase above (which only checks HTTP status).
+#  12c. The CacheTenant admission webhook rejects a CR claiming the
+#       server-reserved probe tenantID (inferencecache.io/probe). Pairs
+#       with the existing duplicate-tenantID assertion to pin BOTH
+#       CacheTenant validation rules end-to-end against the real
+#       installed webhook.
 #  13. The opt-in gRPC TLS path works: applying config/overlays/server-tls
 #      (config/default + the config/server/tls component) rolls the server with
 #      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
@@ -611,6 +631,34 @@ if ! grep -q "already claimed by CacheTenant" <<<"$ct_reject_out"; then
   fail "duplicate CacheTenant was rejected, but not by the expected webhook rule (missing 'already claimed by CacheTenant' message)"
 fi
 log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
+
+# --- CacheTenant admission: reserved probe tenantID ------------------------
+# The functional self-test uses tenant_id "inferencecache.io/probe" as
+# server-internal state. The CacheTenant admission webhook MUST reject any
+# CR claiming that id so an operator-created tenant cannot collide with the
+# probe scope (which would bypass quota enforcement at the PolicyStore
+# layer and share the probe's reserved replica). The rule fires on CREATE,
+# and on an UPDATE that newly introduces the id — pinned end-to-end by
+# this assertion against the real installed webhook (not just envtest).
+log "asserting a CacheTenant claiming the reserved probe tenantID is rejected at admission"
+reserved_ct_yaml="$(cat <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: cachetenant-reserved-probe
+spec:
+  tenantID: inferencecache.io/probe
+EOF
+)"
+if reserved_ct_out="$(printf '%s\n' "$reserved_ct_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$reserved_ct_out"
+  fail "CacheTenant claiming the reserved probe tenantID was admitted; the reservation rule did not fire on the real install"
+fi
+if ! grep -q "reserved" <<<"$reserved_ct_out"; then
+  echo "$reserved_ct_out"
+  fail "reserved-probe-tenantID CacheTenant was rejected, but not by the expected rule (missing 'reserved' in the diagnostic)"
+fi
+log "CacheTenant claiming the reserved probe tenantID rejected by the installed validating webhook"
 
 # --- PromptTemplate + PDTopology schema-only assertion ----------------------
 # config/default installs the PromptTemplate/PDTopology CRDs and RBAC, and the
@@ -1562,26 +1610,83 @@ case "$policy_probe_out" in
     ;;
 esac
 
-# --- Audience-binding assertion (BOTH /snapshot and /policy) --------------
+# --- /probe auth assertion ------------------------------------------------
+# /probe is the controller-driven functional self-test endpoint; same
+# controller-auth profile as /snapshot and /policy. The complementary
+# UNAUTHENTICATED-rejection half is what this section checks — a regression
+# that wired /probe outside the shared auth profile would let any pod that
+# can reach :8081 drive a synthetic round-trip (and, once the controller-
+# wiring follow-up lands, observe the resulting Ready transitions). Sends a
+# valid ProbeRequest body so the rejection cannot be misattributed to a 400;
+# the only valid outcomes are 401 (auth) or curl_failed:28 (NetworkPolicy
+# drop under an enforcing CNI). Mirror of the /policy probe above.
+log "asserting unauthenticated /probe POST from a side pod is rejected"
+SIDE_POD_PROBE="ic-probe-probe"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_PROBE" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # POST a minimal valid ProbeRequest so any non-2xx response must be an
+    # auth rejection, not a body-parse rejection.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      -H "Content-Type: application/json" \
+      -d "{\"backend\":\"smoke\",\"model\":\"smoke-model\",\"hashScheme\":\"vllm\"}" \
+      http://inference-cache-server:8081/probe || echo "curl_failed:$?"
+  ' >/tmp/probe-probe-create.log 2>&1; then
+  cat /tmp/probe-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD_PROBE failed; cannot run /probe auth assertion"
+fi
+
+# 90s budget + describe-pod fallback matches the /snapshot and /policy probes
+# above — the surrounding phases (External-backend, audience-binding) can
+# leave the kubelet busy reaping Terminating pods.
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD_PROBE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD_PROBE" 2>/dev/null || true)"
+if [ -z "$probe_probe_out" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$SIDE_POD_PROBE" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
+# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
+# CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass). 200 (synthesis ran unauthenticated) is the regression this whole
+# section exists to prevent.
+case "$probe_probe_out" in
+  "401"|*"curl_failed:28"*)
+    log "unauthenticated /probe POST rejected (probe output: $probe_probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /probe POST was not rejected (or curl failed for an unexpected reason); got: $probe_probe_out"
+    ;;
+esac
+
+# --- Audience-binding assertion (/snapshot, /policy, AND /probe) ----------
 # Audience-binding follow-up to the bearer-token gate. The controller pod
 # in production mounts TWO ServiceAccount tokens:
 #   1. The default automount at /var/run/secrets/kubernetes.io/serviceaccount/token
 #      — audience = the apiserver. Used by the controller-runtime client.
 #   2. A projected volume at /var/run/secrets/inferencecache.io/controller-token/token
 #      — audience = "inferencecache.io/controller". Used by the CacheIndex
-#      poller AND the CachePolicy push side — they share the projected
-#      token because /snapshot and /policy share one auth middleware.
+#      poller, the CachePolicy push side, AND the functional-probe driver —
+#      they share the projected token because /snapshot, /policy, and /probe
+#      share one auth middleware.
 # The server passes TokenReviewSpec.Audiences=["inferencecache.io/controller"]
-# on every review for BOTH endpoints, so a default-audience token MUST
-# come back 401 on BOTH even though the SA identity (controller-manager)
+# on every review for ALL THREE endpoints, so a default-audience token MUST
+# come back 401 on all three even though the SA identity (controller-manager)
 # would otherwise be admitted.
 #
-# Why a single probe pod with FOUR scrapes (audience-bound × {snapshot,
-# policy} ∪ default-audience × {snapshot, policy}): the two endpoints share
-# one middleware identity, so audience drift would surface on both
-# simultaneously — but a regression in JUST ONE direction (e.g. the policy
-# handler skipping the auth wrapper) would show up here too. Four small
-# checks, one pod, one assertion: "all four outcomes match the contract."
+# Why a single probe pod with SIX scrapes (audience-bound × {snapshot,
+# policy, probe} ∪ default-audience × {snapshot, policy, probe}): the three
+# endpoints share one middleware identity, so audience drift would surface
+# on all three simultaneously — but a regression in JUST ONE direction (e.g.
+# the probe handler skipping the auth wrapper) would show up here too. Six
+# small checks, one pod, one assertion: "all six outcomes match the contract."
 #
 # Scoping — what each smoke gate actually catches (the assertions are
 # complementary, not redundant):
@@ -1595,11 +1700,11 @@ esac
 #     that earlier gate.
 #   - THIS probe asserts only server-side behavior: that an audience-bound
 #     token admits and a default-audience token of the same SA is rejected,
-#     on BOTH endpoints. It uses an inline duplicate volume spec so it can
-#     run even if the controller's manifest is broken (which would
+#     on all three endpoints. It uses an inline duplicate volume spec so it
+#     can run even if the controller's manifest is broken (which would
 #     otherwise mask the server-side check). It does NOT catch drift in
 #     config/manager/manager.yaml; that's the earlier gate's job.
-log "asserting audience binding on both /snapshot and /policy"
+log "asserting audience binding on /snapshot, /policy, and /probe"
 PROBE_POD="ic-audience-probe"
 kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
@@ -1625,7 +1730,7 @@ spec:
       # label), so we expect no L3/L4 drop — but a short -m timeout + explicit
       # curl-exit capture keeps a regression (DNS, Service rename, allowlist
       # drift) from looking like a silent bad outcome. If curl fails on any
-      # of the four scrapes, we emit "K=curl_failed:N" so the case statement
+      # of the six scrapes, we emit "K=curl_failed:N" so the case statement
       # below surfaces the exit code, not the empty-status default.
       controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
       default_token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
@@ -1638,7 +1743,11 @@ spec:
       # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
       pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
       pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def"
+      # POST /probe — controller-audience must 200, default-audience must 401.
+      # Body is a minimal valid ProbeRequest so any non-2xx is auth-side, not body-parse.
+      pr_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")
+      pr_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")
+      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def probe_ctrl=\$pr_ctrl probe_def=\$pr_def"
     volumeMounts:
     - name: controller-token
       mountPath: /var/run/secrets/inferencecache.io/controller-token
@@ -1675,13 +1784,13 @@ kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --grace-period=0 --force >/dev/n
 
 log "audience probe output: $audience_probe"
 # Expected outcome line, in order:
-#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401
+#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401
 # Anything else is a regression. curl_failed:28 splits out so an operator
 # triaging a red smoke knows whether to look at NetworkPolicy (timeout) vs
 # Service/listener (other curl exit).
 case "$audience_probe" in
-  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401")
-    log "audience binding verified on both endpoints — controller-audience token admitted, default-audience token rejected on /snapshot and /policy"
+  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401")
+    log "audience binding verified on all three endpoints — controller-audience token admitted, default-audience token rejected on /snapshot, /policy, and /probe"
     ;;
   *controller_token_missing*)
     fail "probe pod is missing /var/run/secrets/inferencecache.io/controller-token/token — the projected volume did not mount; check the probe-pod manifest above (and config/manager/manager.yaml for the production analog)"
@@ -1696,7 +1805,98 @@ case "$audience_probe" in
     fail "audience-binding probe could not connect to the controller-facing listener (curl exited non-zero). Check Service name 'inference-cache-server', port 8081, and that the listener is up. Probe output: $audience_probe"
     ;;
   *)
-    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401')"
+    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401')"
+    ;;
+esac
+
+# --- /probe functional-self-test result assertion -------------------------
+# The audience-binding section above asserts /probe returned HTTP 200 with the
+# controller-audience token, but a deployed handler can also return 200 with a
+# per-stage `failed`. This section drives one authenticated /probe call,
+# captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped
+# (the default Stage-1 posture — no T2Prober is wired, so Stage C is always
+# skipped until the controller-wiring follow-up plumbs a real one). A
+# regression that flips ingest or routing to failed on a clean install
+# would be a clear signal that the cache-plane internal round-trip itself is
+# broken — exactly the class of bug the probe exists to catch.
+log "asserting authenticated /probe returns ingest=ok, routing=ok, t2=skipped"
+PROBE_RESULT_POD="ic-probe-result"
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+probe_result_yaml=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PROBE_RESULT_POD
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: controller
+spec:
+  serviceAccountName: inference-cache-controller-manager
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: curlimages/curl:8.10.1
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
+      if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
+      # Capture body to stdout — the smoke parses ingest/routing/t2 from it.
+      curl -sS -m 5 -H "Authorization: Bearer \$controller_token" \\
+        -H "Content-Type: application/json" \\
+        -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' \\
+        http://inference-cache-server:8081/probe || echo "curl_failed:\$?"
+    volumeMounts:
+    - name: controller-token
+      mountPath: /var/run/secrets/inferencecache.io/controller-token
+      readOnly: true
+  volumes:
+  - name: controller-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: inferencecache.io/controller
+          expirationSeconds: 3600
+EOF
+)
+if ! echo "$probe_result_yaml" | kubectl apply -f - >/tmp/probe-result-create.log 2>&1; then
+  cat /tmp/probe-result-create.log >&2 || true
+  fail "kubectl apply for $PROBE_RESULT_POD failed; cannot run /probe result assertion"
+fi
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$PROBE_RESULT_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_result_body="$(kubectl -n "$NAMESPACE" logs "$PROBE_RESULT_POD" 2>/dev/null || true)"
+if [ -z "$probe_result_body" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$PROBE_RESULT_POD" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+log "probe result body: $probe_result_body"
+case "$probe_result_body" in
+  *controller_token_missing*)
+    fail "probe-result pod is missing /var/run/secrets/inferencecache.io/controller-token/token"
+    ;;
+  *"curl_failed:"*)
+    fail "probe-result curl failed: $probe_result_body"
+    ;;
+esac
+# Parse the three stage values; reject anything that isn't the expected
+# default posture (ingest=ok, routing=ok, t2=skipped). The default-install
+# CacheBackend has no engine pods reporting state, but the probe synthesizes
+# its own — so Stage A + B must always pass on a clean install regardless of
+# workload. Stage C is "skipped" because no T2Prober is wired in this revision.
+case "$probe_result_body" in
+  *'"ingest":"ok"'*'"routing":"ok"'*'"t2":"skipped"'*)
+    log "probe result matches expected default posture (ingest=ok, routing=ok, t2=skipped)"
+    ;;
+  *)
+    fail "probe result does not match expected default posture; want ingest=ok routing=ok t2=skipped, got: $probe_result_body"
     ;;
 esac
 
@@ -1913,4 +2113,4 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"

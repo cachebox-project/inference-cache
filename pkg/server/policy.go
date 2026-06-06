@@ -225,7 +225,18 @@ func (s *PolicyStore) LookupTimeout(tenant string) time.Duration {
 // CacheTenant, or the resolver is nil) means no enforcement — the index leaves
 // the tenant unbounded (fail open / soft state). A configured budget of 0 is a
 // valid, enforceable choice (admit nothing) and is distinct from "no quota".
+//
+// The reserved probe tenant (ProbeTenantID) is unconditionally exempt from
+// quota: CacheTenant.spec.tenantID is a free-form string, so without this
+// exemption an operator could create CacheTenant{tenantID: "inferencecache.io/
+// probe", maxIndexEntries: 0} and silently break Stage A of every
+// CacheBackend functional probe (the ingest would be evicted before it lands).
+// The probe is server-internal state under a server-controlled tenant id; no
+// operator-supplied CacheTenant should govern it.
 func (s *PolicyStore) TenantQuota(tenant string) (maxEntries int64, ok bool) {
+	if tenant == ProbeTenantID {
+		return 0, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.tenants[tenant]
@@ -263,11 +274,11 @@ func NewPolicyHTTPHandler(store *PolicyStore) http.HandlerFunc {
 //
 // The endpoint is intentionally internal. Auth + NetworkPolicy gating live
 // in server.New, where the same TokenReview-backed bearer middleware that
-// protects /snapshot is also applied here — both endpoints share one
-// controller-SA identity. The handler itself stays auth-agnostic so tests
-// (and any future internal caller) can mount it directly. Body size is
-// capped at 1 MiB to bound memory if a buggy controller sends a runaway
-// snapshot.
+// protects /snapshot and /probe is also applied here — all three
+// controller-facing endpoints share one controller-SA identity. The
+// handler itself stays auth-agnostic so tests (and any future internal
+// caller) can mount it directly. Body size is capped at 1 MiB to bound
+// memory if a buggy controller sends a runaway snapshot.
 func policyHandler(store *PolicyStore) http.HandlerFunc {
 	const maxBytes = 1 << 20 // 1 MiB — comfortably above any realistic snapshot
 	return func(w http.ResponseWriter, r *http.Request) {

@@ -25,7 +25,7 @@ Runtime propagation (controller → server `/policy`) is described in [policy-pr
 
 | Field | Type | Purpose |
 |---|---|---|
-| `spec.tenantID` | string | Required non-empty external tenant identifier used by gateway and engine traffic. |
+| `spec.tenantID` | string | Required non-empty external tenant identifier used by gateway and engine traffic. The string `inferencecache.io/probe` is **reserved** for the server's functional self-test and is rejected by the validating admission webhook on CREATE (always) and on UPDATE that newly introduces the value (via `filterIntroducedErrors`). Unchanged legacy CRs predating this rule continue to admit on unrelated edits — the v1alpha1 tightening seam. |
 | `spec.quota.maxIndexEntries` | integer | Maximum distinct index prefixes attributed to the tenant. Minimum `0`. Enforced at ingest (see [policy-propagation.md](policy-propagation.md)). |
 | `spec.isolationMode` | enum | `Fairness` in the current phase. |
 | `spec.crypto` | object | Reserved for future cryptographic isolation settings. |

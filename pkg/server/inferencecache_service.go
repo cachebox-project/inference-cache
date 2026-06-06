@@ -103,6 +103,28 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	tenant := req.GetTenantId()
 	model := req.GetModelId()
 
+	// Reserved probe scope: never serve external LookupRoute queries against
+	// the server-internal probe tenant. Without this guard, a caller that
+	// knows (or guesses) a backend name could re-derive the deterministic
+	// probe hash and observe the synthetic __probe-<backend> replica during
+	// a Run, contradicting the "server-internal / never leaks into a real
+	// LookupRoute" contract. Fail open with NO_HINT. The metric is still
+	// observed (reason_code=NO_HINT, hint_used=false, latency=0) so the
+	// "one increment per LookupRoute call" contract on
+	// inferencecache_lookup_route_calls_total stays intact — every external
+	// LookupRoute call is counted in the unified NO_HINT bucket regardless
+	// of which short-circuit produced it. (The metric is labeled by
+	// model / reason_code / hint_used only, not tenant_id, so the bucket
+	// doesn't isolate "reserved-tenant traffic specifically" today; that
+	// would require a schema change owned by the standalone F-series
+	// metric work.) The legitimate probe path uses index.LookupRoute
+	// directly, not the gRPC handler.
+	if tenant == ProbeTenantID {
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
+	}
+
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
 	// request that can't clear it — no index lock, no goroutine. A chain
 	// request reports its token budget via block_token_counts (the legacy
@@ -288,7 +310,15 @@ func (*inferenceCacheService) LookupPDRoute(context.Context, *icpb.LookupPDRoute
 }
 
 // GetCacheState returns the aggregate held in the index for a (tenant, model).
+// Reads against the reserved probe tenant return an empty aggregate so
+// in-flight probe state (synthetic replica stats during Stage A / Stage C)
+// never reaches an external caller. The legitimate consumer (the controller)
+// reads the cluster-wide aggregate via /snapshot, which also filters reserved
+// tenants.
 func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCacheStateRequest) (*icpb.GetCacheStateResponse, error) {
+	if req.GetTenantId() == ProbeTenantID {
+		return &icpb.GetCacheStateResponse{Summary: &icpb.CacheSummary{}}, nil
+	}
 	replicas, totalPrefixes := s.index.CacheState(req.GetTenantId(), req.GetModelId())
 
 	resp := &icpb.GetCacheStateResponse{
@@ -308,6 +338,14 @@ func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCa
 // ReportCacheState ingests replica update deltas (adds/refreshes; removals
 // arrive via PublishEvent or expire by TTL) into the index until the client
 // half-closes, then acks. A non-EOF Recv error is propagated.
+//
+// Updates whose tenant_id equals the server-reserved probe tenant
+// (ProbeTenantID) are DROPPED on ingest. The probe scope is server-internal
+// state; an external client must not be able to write to it via the public
+// gRPC contract (the in-process Prober.Run writes to the index directly, so
+// the legitimate probe path is unaffected). Drops are silent — the contract
+// is fail-open everywhere on the hot path — and complement the CacheTenant
+// admission rule that rejects a CR claiming the same id at the CRD layer.
 func (s *inferenceCacheService) ReportCacheState(stream icpb.InferenceCache_ReportCacheStateServer) error {
 	for {
 		update, err := stream.Recv()
@@ -317,12 +355,23 @@ func (s *inferenceCacheService) ReportCacheState(stream icpb.InferenceCache_Repo
 			}
 			return err
 		}
+		if update.GetTenantId() == ProbeTenantID {
+			continue
+		}
 		s.index.Ingest(updateFromProto(update))
 	}
 }
 
-// PublishEvent applies a single cache-state delta to the index.
+// PublishEvent applies a single cache-state delta to the index. Events
+// against the reserved probe tenant are DROPPED (acked, but not applied) so
+// an external client cannot fake a PREFIX_EVICTED / ALL_CLEARED that would
+// wipe the probe's mid-flight state — the probe re-synthesizes on every Run
+// regardless, but the silent drop keeps the public gRPC contract from
+// touching server-internal state.
 func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEvent) (*icpb.Ack, error) {
+	if ev.GetTenantId() == ProbeTenantID {
+		return &icpb.Ack{Accepted: true}, nil
+	}
 	if t := eventTypeFromProto(ev.GetType()); t != 0 {
 		s.index.ApplyEvent(index.Event{
 			Type:       t,
