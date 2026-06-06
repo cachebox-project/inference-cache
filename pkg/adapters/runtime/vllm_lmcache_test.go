@@ -702,6 +702,14 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 		"--tenant-id=$(POD_NAMESPACE)",
 		"--model-id=Qwen/Qwen2.5-0.5B-Instruct",
 		"--hash-scheme=vllm",
+		// Required for vLLM+LMCache: LMCache is an L2 tier that retains
+		// blocks after the engine evicts them from GPU. Forwarding vLLM's
+		// per-block BlockRemoved as PREFIX_EVICTED would drop a routing
+		// hint the replica can still cheaply serve from L2 — the
+		// cache-stress 0-PREFIX_MATCH regression. Pinning the arg here
+		// keeps a future adapter edit from silently re-enabling the
+		// eviction forward and re-introducing the bug.
+		"--ignore-block-removed=true",
 	}
 	for _, want := range wantArgFragments {
 		if !containsArg(c.Args, want) {
@@ -805,6 +813,7 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 	fs.String("tenant-id", "", "")
 	fs.String("hash-scheme", "", "")
 	fs.Duration("window", 0, "")
+	fs.Bool("ignore-block-removed", false, "")
 
 	if err := fs.Parse(c.Args); err != nil {
 		t.Fatalf("rendered sidecar args rejected by subscriber FlagSet: %v\nargs = %v", err, c.Args)
