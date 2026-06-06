@@ -114,7 +114,10 @@ This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
 `inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
 the alerts. Four of the five Stage 1 alerts (`IndexEmpty`,
 `LookupRouteDegenerate`, `LookupRouteHighTimeout`, `IndexEvictionsSpike`)
-start firing as soon as the operator is installed.
+become active as soon as the operator is installed — they remain quiet
+on a healthy or idle install (each rule is gated by traffic/rate/
+eviction thresholds; see `for:` + the rate floors in the alert
+expressions) and only fire when the conditions are met.
 
 > **The fifth alert needs a vLLM scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](docs/observability/alerts.md#lmcachet2nohits) reads

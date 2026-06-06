@@ -30,11 +30,20 @@ There are two distribution shapes, same rule set, drift-gated by
   2. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
      carrying the alerts.
 
-  Both CRs are pinned to namespace `inference-cache-system` and carry
-  example labels (`prometheus: kube-prometheus`, `role: alert-rules`)
-  that match a stock kube-prometheus install's default selector. If your
-  Prometheus CR's `ruleSelector` / `serviceMonitorSelector` uses a
-  different label set, edit the metadata labels on the CRs to match.
+  Both CRs are pinned to namespace `inference-cache-system`. The
+  example selector labels each CR carries are:
+  - `PrometheusRule` →
+    `prometheus: kube-prometheus`, `role: alert-rules` (matched by
+    `Prometheus.spec.ruleSelector`).
+  - `ServiceMonitor` →
+    `prometheus: kube-prometheus` (matched by
+    `Prometheus.spec.serviceMonitorSelector`).
+
+  Both match a stock kube-prometheus install. If your Prometheus CR's
+  `ruleSelector` and `serviceMonitorSelector` use different label sets
+  (e.g. `release: my-prom`, `app: prometheus`), edit each CR's labels
+  to match — the YAML comments next to each label spell out the exact
+  `kubectl get prometheus -o jsonpath=...` introspection command.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
