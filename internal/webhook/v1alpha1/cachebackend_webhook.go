@@ -995,14 +995,24 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 }
 
 // rejectInvalidResourceNames rejects any spec.resources.requests or
-// spec.resources.limits key that fails the standard K8s qualified-name
-// rule (IsQualifiedName from apimachinery/util/validation). The CRD
-// schema treats ResourceList keys as opaque strings — admitting
-// "memory!" or empty-string would persist a CR the apiserver later
-// rejects when the controller renders the child pod. Rejecting at
-// admission turns that latent failure into a field-scoped error at
-// `kubectl apply`. Vendor-prefixed extended resources (e.g.
-// "nvidia.com/gpu") satisfy IsQualifiedName and admit unchanged.
+// spec.resources.limits key that fails the K8s container-resource-name
+// rules. The CRD schema treats ResourceList keys as opaque strings, so
+// an invalid name persists in etcd and only fails when the apiserver
+// rejects the rendered child pod. Rejecting at admission turns that
+// latent failure into a field-scoped error at `kubectl apply`.
+//
+// K8s container-resource rules are stricter than the bare
+// IsQualifiedName check: a valid container resource name is one of
+//   - the standard scheduled resources (cpu, memory, ephemeral-storage),
+//   - a hugepages-* variant (the prefix is K8s-reserved), or
+//   - a vendor-prefixed extended resource ("vendor.com/foo") that also
+//     satisfies IsQualifiedName.
+//
+// A bare unqualified name like "foo" is admitted by IsQualifiedName but
+// is NOT a valid container resource: the apiserver requires extended
+// resources to carry a "/" — the prefix is the vendor identity. We
+// apply the same rule here so the rejection is consistent with what
+// the rendered Pod would face downstream.
 func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Resources == nil {
 		return nil
@@ -1010,11 +1020,11 @@ func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList 
 	var errs field.ErrorList
 	check := func(list corev1.ResourceList, kind string) {
 		for name := range list {
-			for _, msg := range validation.IsQualifiedName(string(name)) {
+			if msg, ok := validateContainerResourceName(name); !ok {
 				errs = append(errs, field.Invalid(
-					field.NewPath("spec", "resources", kind),
+					field.NewPath("spec", "resources", kind).Key(string(name)),
 					string(name),
-					fmt.Sprintf("%q is not a valid resource name: %s", name, msg),
+					msg,
 				))
 			}
 		}
@@ -1022,6 +1032,33 @@ func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList 
 	check(cb.Spec.Resources.Requests, "requests")
 	check(cb.Spec.Resources.Limits, "limits")
 	return errs
+}
+
+// validateContainerResourceName mirrors the K8s container-resource-name
+// contract: standard names (cpu, memory, ephemeral-storage) and the
+// hugepages-* family admit unconditionally; any other name must be
+// vendor-prefixed (contain a "/") and satisfy IsQualifiedName. Returns
+// ("", true) on accept; ("…reason…", false) on reject — the reason is
+// surfaced verbatim in the field-scoped admission error.
+func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
+	s := string(name)
+	switch name {
+	case corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
+		return "", true
+	}
+	if strings.HasPrefix(s, "hugepages-") {
+		return "", true
+	}
+	if !strings.Contains(s, "/") {
+		return fmt.Sprintf(
+			"%q is not a valid container resource name: must be one of %q/%q/%q, a hugepages-* variant, or a vendor-prefixed extended resource (e.g. \"nvidia.com/gpu\")",
+			s, corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage,
+		), false
+	}
+	if msgs := validation.IsQualifiedName(s); len(msgs) > 0 {
+		return fmt.Sprintf("%q is not a valid container resource name: %s", s, msgs[0]), false
+	}
+	return "", true
 }
 
 // rejectNegativeResourceQuantities rejects any strictly-negative

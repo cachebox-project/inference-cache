@@ -171,7 +171,12 @@ type CacheBackendSpec struct {
 	// repeatedly OOM-killed the pod within minutes of T2 traffic, which
 	// the default limit eliminates. Operators tune per-deployment by
 	// overriding the field; an explicit empty `spec.resources: {}` is
-	// honored as suppression of the default (no requests, no limits).
+	// honored as suppression of the schema-stamped memory request/limit
+	// (no memory request, no memory limit rendered). When spec.autoscaling
+	// is set the runtime adapter still fills in a CPU request fallback
+	// (the HPA-utilization denominator) on top of the empty struct —
+	// that fallback is orthogonal to the memory default this field
+	// controls.
 	//
 	// Admission narrows the surface relative to the upstream
 	// ResourceRequirements shape: a non-empty `resources.claims` slice

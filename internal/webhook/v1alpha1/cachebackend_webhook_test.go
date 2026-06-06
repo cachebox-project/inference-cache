@@ -513,11 +513,9 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 
 func TestValidator_ResourcesInvalidNameRejected(t *testing.T) {
 	// ResourceList keys are opaque map keys at the CRD-schema layer:
-	// a CR can be admitted with "memory!" or "" as a key, and the
-	// kubelet rejects the pod later. Reject at admission against the
-	// standard K8s IsQualifiedName rule so the regression surfaces at
-	// `kubectl apply`. Vendor-prefixed names ("nvidia.com/gpu") still
-	// admit — they are the canonical extended-resource shape.
+	// a CR can be admitted with structurally-malformed names ("memory!",
+	// empty string), and the kubelet rejects the pod later. Reject at
+	// admission so the regression surfaces at `kubectl apply`.
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
@@ -525,8 +523,52 @@ func TestValidator_ResourcesInvalidNameRejected(t *testing.T) {
 			corev1.ResourceName("memory!"): resource.MustParse("4Gi"),
 		},
 	}
-	requireInvalidWithCause(t, v, cb, "spec.resources.requests",
-		"is not a valid resource name")
+	requireInvalidWithCause(t, v, cb, "spec.resources.requests[memory!]",
+		"not a valid container resource name")
+}
+
+func TestValidator_ResourcesUnqualifiedNonStandardNameRejected(t *testing.T) {
+	// K8s container-resource rules are stricter than IsQualifiedName:
+	// a bare name like "foo" (no "/" prefix) is admitted by the schema
+	// AND by IsQualifiedName, but the apiserver rejects the rendered
+	// pod because non-standard container resources MUST be vendor-
+	// prefixed (e.g. "nvidia.com/gpu"). Reject at admission so the
+	// operator sees a field-scoped error at `kubectl apply` rather
+	// than chasing it through a child Deployment apply.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceName("foo"): resource.MustParse("1"),
+		},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.requests[foo]",
+		"not a valid container resource name")
+}
+
+func TestValidator_ResourcesStandardContainerResourceNamesAdmitted(t *testing.T) {
+	// The full set of standard container resource names — cpu, memory,
+	// ephemeral-storage, and any hugepages-* variant — MUST admit. Pin
+	// the contract so a future tightening doesn't accidentally exclude
+	// one of them.
+	for _, name := range []corev1.ResourceName{
+		corev1.ResourceCPU,
+		corev1.ResourceMemory,
+		corev1.ResourceEphemeralStorage,
+		corev1.ResourceName("hugepages-2Mi"),
+		corev1.ResourceName("hugepages-1Gi"),
+	} {
+		t.Run(string(name), func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{name: resource.MustParse("1")},
+			}
+			if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("standard container resource %q rejected: %v", name, err)
+			}
+		})
+	}
 }
 
 func TestValidator_ResourcesValidExtendedNameAdmitted(t *testing.T) {
