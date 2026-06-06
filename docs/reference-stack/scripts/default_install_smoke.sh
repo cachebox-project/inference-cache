@@ -1626,26 +1626,27 @@ case "$probe_probe_out" in
     ;;
 esac
 
-# --- Audience-binding assertion (BOTH /snapshot and /policy) --------------
+# --- Audience-binding assertion (/snapshot, /policy, AND /probe) ----------
 # Audience-binding follow-up to the bearer-token gate. The controller pod
 # in production mounts TWO ServiceAccount tokens:
 #   1. The default automount at /var/run/secrets/kubernetes.io/serviceaccount/token
 #      — audience = the apiserver. Used by the controller-runtime client.
 #   2. A projected volume at /var/run/secrets/inferencecache.io/controller-token/token
 #      — audience = "inferencecache.io/controller". Used by the CacheIndex
-#      poller AND the CachePolicy push side — they share the projected
-#      token because /snapshot and /policy share one auth middleware.
+#      poller, the CachePolicy push side, AND the functional-probe driver —
+#      they share the projected token because /snapshot, /policy, and /probe
+#      share one auth middleware.
 # The server passes TokenReviewSpec.Audiences=["inferencecache.io/controller"]
-# on every review for BOTH endpoints, so a default-audience token MUST
-# come back 401 on BOTH even though the SA identity (controller-manager)
+# on every review for ALL THREE endpoints, so a default-audience token MUST
+# come back 401 on all three even though the SA identity (controller-manager)
 # would otherwise be admitted.
 #
-# Why a single probe pod with FOUR scrapes (audience-bound × {snapshot,
-# policy} ∪ default-audience × {snapshot, policy}): the two endpoints share
-# one middleware identity, so audience drift would surface on both
-# simultaneously — but a regression in JUST ONE direction (e.g. the policy
-# handler skipping the auth wrapper) would show up here too. Four small
-# checks, one pod, one assertion: "all four outcomes match the contract."
+# Why a single probe pod with SIX scrapes (audience-bound × {snapshot,
+# policy, probe} ∪ default-audience × {snapshot, policy, probe}): the three
+# endpoints share one middleware identity, so audience drift would surface
+# on all three simultaneously — but a regression in JUST ONE direction (e.g.
+# the probe handler skipping the auth wrapper) would show up here too. Six
+# small checks, one pod, one assertion: "all six outcomes match the contract."
 #
 # Scoping — what each smoke gate actually catches (the assertions are
 # complementary, not redundant):

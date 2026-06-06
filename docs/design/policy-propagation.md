@@ -281,7 +281,9 @@ reconciles any transient skew.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
-- mTLS for `/policy` and `/snapshot` — the current shape ships
-  TokenReview-backed bearer auth + audience binding + a NetworkPolicy
+- mTLS for `/snapshot`, `/policy`, and `/probe` — the current shape
+  ships TokenReview-backed bearer auth + audience binding + a NetworkPolicy
   gate; mTLS is a separate hardening step tracked under the gRPC TLS
-  posture decision.
+  posture decision, and applies uniformly across the controller-facing
+  bridge (all three endpoints share one auth profile, so mTLS will gate
+  all three at once).

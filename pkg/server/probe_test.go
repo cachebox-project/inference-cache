@@ -246,21 +246,30 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 // mode where the entry IS in the index but LookupRoute returns NO_HINT
 // (e.g., proxy ↔ server hash-encoding mismatch). Stage A still passes
 // (direct Lookup finds the entry), so the failure is uniquely attributable
-// to the routing layer.
+// to the routing layer. Stage C must be SKIPPED on a Stage-B failure so
+// the controller's diagnostic pinpoints the routing layer instead of
+// reporting a cascading T2 result that the operator then has to disentangle.
 func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
-	prober, _ := newProberForTest(t, nil)
+	t2 := &fakeT2Prober{}
+	prober, _ := newProberForTest(t, t2)
 	prober.routeFn = func(index.LookupRequest) index.LookupResult {
 		return index.LookupResult{Strategy: index.StrategyNone}
 	}
 
 	result := prober.Run(t.Context(), ProbeRequest{
-		Backend: "cb-1", Model: "m", HashScheme: "vllm",
+		Backend: "cb-1", Model: "m", HashScheme: "vllm", BackendType: BackendTypeLMCache,
 	})
 	if result.Subscriber != ProbeStageOK {
 		t.Errorf("Subscriber = %q, want %q — direct Lookup is unaffected by the routeFn override", result.Subscriber, ProbeStageOK)
 	}
 	if result.Routing != ProbeStageFailed {
 		t.Errorf("Routing = %q, want %q", result.Routing, ProbeStageFailed)
+	}
+	if result.T2 != ProbeStageSkipped {
+		t.Errorf("T2 = %q, want %q — must skip on Stage-B failure to avoid cascading diagnostic", result.T2, ProbeStageSkipped)
+	}
+	if t2.calls != 0 {
+		t.Errorf("T2Prober was called %d times after Stage B failed; want 0 (cascade prevention)", t2.calls)
 	}
 	if result.AllPassed() {
 		t.Fatal("AllPassed() = true despite Routing failed")

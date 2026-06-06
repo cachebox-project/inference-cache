@@ -432,9 +432,16 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 			Stage:   ProbeStageRouting,
 			Message: fmt.Sprintf("LookupRoute returned %s, expected PREFIX_MATCH — possible tenant_id or hash encoding mismatch", reasonForStrategy(routeRes.Strategy)),
 		})
-	} else {
-		result.Routing = ProbeStageOK
+		// Skip Stage C on a routing failure for the same reason Stage B was
+		// skipped on a Stage-A failure: running a downstream stage when an
+		// upstream one is broken cascades the diagnostic — the controller's
+		// FunctionalProbeOK condition would then have to disentangle whether
+		// a T2 fail was real or a side-effect of routing being broken.
+		// Surface only the upstream stage; the operator fixes that first.
+		result.T2 = ProbeStageSkipped
+		return result
 	}
+	result.Routing = ProbeStageOK
 
 	// Stage C — T2 cycle. Skip on non-LMCache backends (no tier-2 to test) and
 	// when no prober is wired (Stage 1 default). Empty BackendType is treated as

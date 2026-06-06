@@ -51,7 +51,7 @@ curl -i -XPOST http://localhost:8081/policy -d '{"version":3,"policies":[]}'  # 
 The server fails closed by default: omitting both `--allowed-controller-sa` and
 `--insecure-disable-auth` causes it to exit 2 with a stderr message. That keeps
 an operator who forgets the flag from accidentally shipping unauthenticated
-`/snapshot` + `/policy` endpoints on a real cluster.
+`/snapshot`, `/policy`, and `/probe` endpoints on a real cluster.
 
 ## Cluster Prerequisites
 
