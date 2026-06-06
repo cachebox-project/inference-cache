@@ -98,22 +98,43 @@ func TestProbeHashEncodingIsInjective(t *testing.T) {
 		t.Errorf("ProbeHash collided on crafted inputs that should be distinct (length-prefixing regression?): %x vs %x", a, b)
 	}
 
-	// Case 2: distinct splits of the same character payload across fields.
-	// abc + d vs ab + cd vs a + bcd — distinct tuples, must produce
-	// distinct hashes once length-prefixed.
+	// Case 2: distinct splits of the same concatenated character payload
+	// across the three fields. Without length-prefixing, an attacker (or
+	// fuzzer) could craft inputs whose concatenated raw bytes are identical
+	// across two different (backend, model, scheme) tuples — the OLD scheme
+	// would collide. With length-prefixing, every distinct split MUST
+	// produce a distinct hash.
 	for _, tc := range []struct {
-		name             string
-		backend, model   string
-		scheme1, scheme2 string
+		name string
+		a, b struct{ backend, model, scheme string }
 	}{
-		{"backend/model split", "abc", "d", "vllm", "vllm"},
-		{"model/scheme split", "x", "ab", "cd", "abcd"},
+		{
+			name: "split between backend and model",
+			// abcd character payload split (backend="abc", model="d", scheme="vllm")
+			// vs (backend="ab", model="cd", scheme="vllm"). Without length-
+			// prefixing the labeled-with-newlines stream would NOT collide here
+			// (the OLD scheme already had separators between fields), but with
+			// raw concatenation it would.
+			a: struct{ backend, model, scheme string }{"abc", "d", "vllm"},
+			b: struct{ backend, model, scheme string }{"ab", "cd", "vllm"},
+		},
+		{
+			name: "split between model and scheme",
+			a:    struct{ backend, model, scheme string }{"x", "ab", "cd"},
+			b:    struct{ backend, model, scheme string }{"x", "a", "bcd"},
+		},
+		{
+			name: "empty field absorbing neighbor",
+			// The reverse of Case 1 above, expressed via the splits API.
+			a: struct{ backend, model, scheme string }{"", "m", "vllm"},
+			b: struct{ backend, model, scheme string }{"m", "", "vllm"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h1 := ProbeHash(tc.backend, tc.model, tc.scheme1)
-			h2 := ProbeHash(tc.backend, tc.model, tc.scheme2)
-			if tc.scheme1 != tc.scheme2 && bytes.Equal(h1, h2) {
-				t.Errorf("ProbeHash collided on distinct schemes: %x vs %x", h1, h2)
+			h1 := ProbeHash(tc.a.backend, tc.a.model, tc.a.scheme)
+			h2 := ProbeHash(tc.b.backend, tc.b.model, tc.b.scheme)
+			if bytes.Equal(h1, h2) {
+				t.Errorf("ProbeHash collided on distinct tuples (%+v vs %+v): %x", tc.a, tc.b, h1)
 			}
 		})
 	}
