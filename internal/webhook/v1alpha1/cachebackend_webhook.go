@@ -154,6 +154,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectStorageWithOverlongName,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
+	rejectResourceLimitsBelowRequests,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -949,6 +950,44 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
 		),
 	}
+}
+
+// rejectResourceLimitsBelowRequests rejects spec.resources whose Limits
+// declare a quantity strictly less than the Requests for the same resource
+// name. K8s itself rejects the inverted shape on Pod admission, but the
+// CRD-schema layer treats Requests/Limits as opaque maps — so a kubectl
+// apply with an inverted CacheBackend.spec.resources is silently accepted,
+// and the operator only learns about the misconfiguration when the
+// rendered cache-server Pod fails to schedule (or worse, gets OOM-killed
+// because the planned limit was too low to host the request). Catching
+// the inversion at admission turns that into a clear field-scoped error.
+//
+// The rule iterates the intersection of Requests and Limits — a missing
+// Request OR a missing Limit for a given resource has no comparison to
+// make. Memory is the canonical motivating case (an inverted memory limit
+// makes the OOM-kill cliff worse, not better), but the rule is resource-
+// agnostic so an operator typo on cpu (or any future resource name) is
+// caught with the same diagnostic.
+func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for name, req := range cb.Spec.Resources.Requests {
+		lim, ok := cb.Spec.Resources.Limits[name]
+		if !ok {
+			continue
+		}
+		if lim.Cmp(req) >= 0 {
+			continue
+		}
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "resources", "limits").Key(string(name)),
+			lim.String(),
+			fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
+		))
+	}
+	return errs
 }
 
 // k8sClusterDomain is the standard Kubernetes cluster DNS suffix. Most

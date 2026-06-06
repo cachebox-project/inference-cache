@@ -52,6 +52,17 @@
 #      pod, binds (waiting for the WaitForFirstConsumer pod schedule first),
 #      and populates status.capacity from the bound size. (Server-side
 #      disk-backed KV is a separate follow-up; not asserted here.)
+#   8c. CacheBackend.spec.resources defaults + threading: the CRD-schema
+#      default stamps spec.resources.limits.memory on every admitted
+#      CacheBackend (so the cache-server pod is bounded by the cgroup
+#      rather than OOM-killed under T2 write load — the failure mode
+#      that surfaced in the Phase-2 benchmark), and the controller
+#      threads the value into the rendered Deployment container. The
+#      smoke asserts BOTH ends of the contract against the real
+#      kubectl-installed bundle — the CR's spec carries the default AND
+#      the rendered pod template's container shows the same limit —
+#      because either half-failing reintroduces the OOM-cliff
+#      regression.
 #   9. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
@@ -1000,6 +1011,42 @@ if [ "$matched" != "1" ]; then
   fail "status.matchedEnginePods=$matched, want 1 after ${SAMPLE_MATCH_TIMEOUT}s"
 fi
 log "status.matchedEnginePods=1"
+
+# --- spec.resources defaults + thread-through ------------------------------
+# The minimal paired-sample CacheBackend declares no spec.resources, so the
+# CRD-schema default must stamp limits.memory=8Gi (and the matching
+# requests.memory=4Gi) on the persisted CR; the controller must then thread
+# that limit onto the rendered Deployment's lmcache-server container. Both
+# halves must hold — half-failing reintroduces the OOM-kill cliff that
+# motivated bounding the cache-server pod by the cgroup.
+log "asserting spec.resources defaults stamp on the CR and thread to the rendered Deployment"
+cb_lim_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.resources.limits.memory}' 2>/dev/null || true)"
+if [ "$cb_lim_mem" != "8Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "cb.spec.resources.limits.memory=$cb_lim_mem, want 8Gi (CRD schema default not applied)"
+fi
+cb_req_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.resources.requests.memory}' 2>/dev/null || true)"
+if [ "$cb_req_mem" != "4Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "cb.spec.resources.requests.memory=$cb_req_mem, want 4Gi (CRD schema default not applied)"
+fi
+dep_lim_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.limits.memory}' \
+  2>/dev/null || true)"
+if [ "$dep_lim_mem" != "8Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
+  fail "deploy.lmcache-server.resources.limits.memory=$dep_lim_mem, want 8Gi (controller did not thread spec.resources)"
+fi
+dep_req_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.requests.memory}' \
+  2>/dev/null || true)"
+if [ "$dep_req_mem" != "4Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
+  fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (controller did not thread spec.resources)"
+fi
+log "spec.resources defaults stamped + threaded: requests.memory=4Gi limits.memory=8Gi"
 
 # --- KV-event readiness gate assertion (operator-facing) --------------------
 # The managed backend has an engine pod attached (matchedEnginePods=1), but the

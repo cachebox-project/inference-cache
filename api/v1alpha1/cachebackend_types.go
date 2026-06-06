@@ -159,6 +159,30 @@ type CacheBackendSpec struct {
 	// +optional
 	Template *CacheBackendPodSpecOverride `json:"template,omitempty"`
 
+	// Resources are the compute resources requested + limited on the cache
+	// server container of a managed backend workload (the lmcache-server
+	// container for a Type=LMCache backend). The runtime adapter passes the
+	// value through to Container.Resources verbatim; the kubebuilder default
+	// below stamps a conservative 4Gi request / 8Gi memory limit on every
+	// admitted CacheBackend so the cache server is bounded by the cgroup
+	// rather than OOM-killed by the kubelet under heavy T2 write load — a
+	// cache-stress benchmark against an un-limited lmcache-server repeatedly
+	// OOM-killed the pod within minutes of T2 traffic, which the default
+	// limit eliminates. Operators tune per-deployment by overriding the
+	// field.
+	//
+	// When spec.autoscaling is set, the adapter additionally fills in a
+	// CPU request fallback (250m) if this field omits one — a
+	// CPU-utilization HPA needs a CPU request as its denominator. The
+	// fallback never overwrites an operator-supplied CPU request.
+	//
+	// External backends provision no workload of their own, so the field
+	// is inert for spec.type=External.
+	//
+	// +optional
+	// +kubebuilder:default={requests: {memory: "4Gi"}, limits: {memory: "8Gi"}}
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
 	// Endpoint is the operator-supplied network address for an
 	// External backend the controller does NOT provision. The field
 	// is type-scoped: it is REQUIRED when spec.type is External and

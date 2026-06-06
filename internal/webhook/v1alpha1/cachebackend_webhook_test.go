@@ -449,6 +449,83 @@ func TestValidator_StorageWithOverlongNameRejected(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
+	// limits.memory < requests.memory makes the operator's intent
+	// impossible to satisfy at scheduling time and is the canonical
+	// misconfiguration the rule exists to catch. Reject loudly at
+	// admission with a field-scoped error rather than admit a CR the
+	// pod will refuse later (and that the operator would have to
+	// diagnose through downstream kubectl-describe spelunking).
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
+		},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.limits[memory]",
+		"must be greater than or equal to spec.resources.requests[memory]")
+}
+
+func TestValidator_ResourcesLimitsEqualRequestsAdmitted(t *testing.T) {
+	// limits == requests is the canonical "exact size" intent and must
+	// admit. The rule only rejects strict-less-than.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("limits==requests rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesRequestsOnlyAdmitted(t *testing.T) {
+	// Requests-only is a valid shape (no upper bound declared); the
+	// rule MUST NOT synthesise a phantom limit to compare against.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("requests-only rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
+	// Limits-only is also valid (scheduler treats limit as the request
+	// when no request is given); no comparison is meaningful, so the
+	// rule must not fire.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("limits-only rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesCPULimitsBelowRequestsRejected(t *testing.T) {
+	// The rule generalises across every resource present in BOTH the
+	// Requests and Limits maps — it's not specific to memory. CPU is
+	// the obvious second case worth pinning so future contributors don't
+	// silently narrow the rule back to memory-only.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.resources.limits[cpu]",
+		"must be greater than or equal to spec.resources.requests[cpu]")
+}
+
 func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testing.T) {
 	// spec.replicas=0 + spec.autoscaling enabled + nil minReplicas is the
 	// silent-HPA-fallback-to-1 trap: the defaulter declines to default
