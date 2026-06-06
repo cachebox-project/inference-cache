@@ -1076,7 +1076,9 @@ log "InjectedByCacheBackend Event present on the engine pod (UID matches the per
 # EPIPE until the engine pod itself rolls. The controller's
 # observedServerInstance latch detects the cache-server UID transition
 # and cascade-restarts every engine Deployment that owns pods carrying
-# this backend's inferencecache.io/injected-by annotation, by patching
+# this backend's inferencecache.io/injected-by annotation AND the
+# matching inferencecache.io/injected-by-uid (the UID half rejects
+# forgeries and stale name-reuse), by patching
 # AnnotationCacheServerRestartTrigger onto the Deployment's pod template
 # (the same mechanism kubectl rollout restart uses).
 #

@@ -20,8 +20,9 @@ import (
 // cache-server restart cascade against a real apiserver (envtest), so
 // it covers behavior the fake client can't: real Patch + Status().Patch
 // semantics, real Pod readiness-condition handling, and the
-// pod→ReplicaSet→Deployment owner-resolution chain Get'd through the
-// uncached client.
+// pod→ReplicaSet→Deployment owner-resolution chain Get'd against a
+// real apiserver. The reconciler here is constructed without
+// APIReader, so all reads go through the embedded client.Client.
 //
 // What's not covered here: a live kubelet rolling a Pod. envtest has no
 // kubelet, so we simulate "the cache-server pod restarted" by deleting

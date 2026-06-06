@@ -395,6 +395,12 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — External backends
+		// have no controller-managed cache-server pods, and
+		// cleanupOwnedWorkload above has just deleted any prior
+		// managed Deployment. Leaving the latch set would expose a
+		// stale UID to operators.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 
 		// Decide the Ready reason + message in one place so the
@@ -457,6 +463,11 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — cleanupOwnedWorkload
+		// above has just deleted any prior managed Deployment and we
+		// no longer provision one, so a retained UID would advertise
+		// a stale identifier.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
