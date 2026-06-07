@@ -512,6 +512,70 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesFractionalExtendedRejected(t *testing.T) {
+	// K8s requires extended-resource quantities to be integers — a
+	// fractional value like "nvidia.com/gpu: 500m" is rejected by the
+	// apiserver on the rendered Pod. Mirror that rule at admission so
+	// the operator sees a field-scoped error at `kubectl apply`.
+	// Standard overcommittable resources (cpu, memory, ephemeral-
+	// storage) allow fractional values and are not affected.
+	for _, side := range []string{"requests", "limits"} {
+		t.Run(side, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{}
+			entry := corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("500m"),
+			}
+			matching := corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("500m"),
+			}
+			if side == "requests" {
+				cb.Spec.Resources.Requests = entry
+				cb.Spec.Resources.Limits = matching
+			} else {
+				cb.Spec.Resources.Limits = entry
+				cb.Spec.Resources.Requests = matching
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.%s[nvidia.com/gpu]", side),
+				"must be an integer quantity")
+		})
+	}
+}
+
+func TestValidator_ResourcesIntegerExtendedAdmitted(t *testing.T) {
+	// Integer extended-resource quantities (e.g. nvidia.com/gpu: 1)
+	// admit — the rule fires only on fractional values.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+		},
+		Requests: corev1.ResourceList{
+			corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+		},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("integer extended resource rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesFractionalCPUAdmitted(t *testing.T) {
+	// Standard overcommittable CPU MUST still accept fractional values
+	// (250m is the canonical kubelet shape) — the integer rule applies
+	// only to vendor-prefixed extended resources.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("fractional CPU rejected: %v", err)
+	}
+}
+
 func TestValidator_ResourcesNonOvercommittableMismatchRejected(t *testing.T) {
 	// K8s requires limits==requests for non-overcommittable resources
 	// (hugepages-* and any extended resource). Only the standard

@@ -159,6 +159,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
 	rejectInvalidResourceNames,
+	rejectFractionalExtendedResources,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -1022,6 +1023,47 @@ func isOvercommittableResource(name corev1.ResourceName) bool {
 		return true
 	}
 	return false
+}
+
+// rejectFractionalExtendedResources rejects vendor-prefixed extended-
+// resource quantities (e.g. nvidia.com/gpu) that carry a fractional
+// value. K8s allocates extended resources by whole units (a GPU is
+// either claimed or not — no "half a GPU"), so the apiserver rejects
+// fractional shapes on the rendered Pod. Mirror that rule at admission
+// so the operator sees a field-scoped error at `kubectl apply` rather
+// than later in a child-Deployment apply.
+//
+// Standard overcommittable resources (cpu, memory, ephemeral-storage)
+// admit fractional values — "250m" is the canonical kubelet CPU
+// shape and the rule MUST NOT touch them. Hugepages-* are checked
+// elsewhere (rejectInvalidResourceNames validates the suffix); their
+// quantity is also non-fractional by construction but we don't gate
+// on quantity here.
+func rejectFractionalExtendedResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			if isOvercommittableResource(name) {
+				continue
+			}
+			if strings.HasPrefix(string(name), "hugepages-") {
+				continue
+			}
+			if _, ok := qty.AsInt64(); !ok {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind).Key(string(name)),
+					qty.String(),
+					fmt.Sprintf("%q is an extended resource and must be an integer quantity — K8s allocates extended resources by whole units", name),
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
 }
 
 // rejectInvalidResourceNames rejects any spec.resources.requests or

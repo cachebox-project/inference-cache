@@ -587,8 +587,11 @@ spec:
                   ephemeral-storage) admit `limits[X] >= requests[X]`, while
                   non-overcommittable resources (hugepages-*, vendor-prefixed
                   extended resources) require `limits[X] == requests[X]` when both
-                  are set. See docs/design/cachebackend-api.md#resources for the
-                  full validator table.
+                  are set. Vendor-prefixed extended-resource quantities (e.g.
+                  nvidia.com/gpu) must be integer values — K8s allocates extended
+                  resources by whole units. See
+                  docs/design/cachebackend-api.md#resources for the full validator
+                  table.
 
                   When spec.autoscaling is set, the adapter additionally fills in a
                   CPU request fallback (250m) if this field omits one — a
