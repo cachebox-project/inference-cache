@@ -62,6 +62,18 @@ silently.
 
 ---
 
+## Controller metrics (`inferencecache_*`) — exposed today
+
+Emitted by the `cmd/controller` binary, registered into the controller-runtime metrics registry (`sigs.k8s.io/controller-runtime/pkg/metrics`), and served at the manager's `--metrics-bind-address` (default `:8080` on the controller binary — separate process from the server binary's `:8080`). This is a deliberately separate registry from the server's `pkg/server/metrics.go` one; the two processes have disjoint scrape targets.
+
+### Counters
+
+| Metric | Labels | Meaning | Notes |
+|---|---|---|---|
+| `inferencecache_backend_server_restart_cascades_total` | `namespace`, `backend`, `reason` | One increment per cascade-restart **event** the `CacheBackend` reconciler emits when it observes a cache-server-pod replacement and rolls every injected engine `Deployment` for that backend. | NOT a raw restart count: the cascade is rate-limited to at most once per ~30s per backend (see `DefaultMinServerRestartCascadeInterval`), so a crash-looping cache-server that restarts 10× inside one window still increments this counter once. For raw cache-server pod restart rate, scrape `kube_pod_container_status_restarts_total` from kube-state-metrics instead. Today `reason` is always `server_instance_changed`; future operator-initiated "force cascade" surfaces would add their own value. A series is created lazily on the first cascade — a backend that never cascades emits nothing. The cascade itself is the operator-side recovery for the upstream LMCache `LMServerConnector` EPIPE-on-restart bug ([LMCache/LMCache#3565](https://github.com/LMCache/LMCache/issues/3565)); see [`docs/design/cachebackend-api.md` `observedServerInstance`](../design/cachebackend-api.md). |
+
+---
+
 ## Standard collectors (exposed, out of `inferencecache_*` schema)
 
 | Family | Source | Examples | Use |
@@ -76,6 +88,8 @@ with OTEL collectors) without bumping `v1alpha1`.
 ---
 
 ## Where each metric is owned in code
+
+### Server binary (`cmd/server`)
 
 - **Definitions:** [`pkg/server/metrics.go`](../../pkg/server/metrics.go) (the
   `serverMetrics` struct + `newServerMetrics`).
@@ -102,9 +116,26 @@ with OTEL collectors) without bumping `v1alpha1`.
   One increment per `/snapshot` or `/policy` request reaching the
   middleware, labeled by `result`.
 
+### Controller binary (`cmd/controller`)
+
+- **Definitions:** package-level vars in the relevant reconciler files,
+  registered into the controller-runtime metrics registry on `init()`.
+  This is a separate `prometheus.Registry` from the server binary's per-
+  Service registry.
+- **`backendServerRestartCascadesTotal` writer:** the `CacheBackend`
+  reconciler increments it once per cascade in
+  [`internal/controller/cachebackend_server_restart.go`](../../internal/controller/cachebackend_server_restart.go).
+  See the `reconcileServerInstance` godoc for when a cascade is and is
+  not emitted (rate-limit, strict-superset midpoints, converged
+  scale-ups, stale-while-unavailable).
+
 ---
 
 ## How `/metrics` is served
+
+Two binaries each expose their own `/metrics` endpoint — separate processes, separate Prometheus registries, separate scrape targets.
+
+### Server binary (`cmd/server`)
 
 - HTTP endpoint **`/metrics`** on the server's public HTTP listener (default
   `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
@@ -147,6 +178,22 @@ with OTEL collectors) without bumping `v1alpha1`.
   the apiserver's diagnostic in the server WARN log — operators
   chasing a binding regression should grep for
   `token audiences [...] is invalid for the target audiences`.
+
+### Controller binary (`cmd/controller`)
+
+- HTTP endpoint **`/metrics`** on the controller-runtime manager's metrics
+  listener (default `:8080`, flag `--metrics-bind-address`). This is a
+  different process from the server binary's `:8080`, so the two can
+  share the same port number on different pods without conflict.
+- Format: Prometheus exposition. Includes both the
+  `inferencecache_backend_*` controller metrics (defined in this repo)
+  and the standard controller-runtime metrics (`controller_runtime_*`,
+  `workqueue_*`, `rest_client_*`, …) that controller-runtime registers
+  by default.
+- Unauthenticated by default (`secureMetrics=false`); operators who
+  want a bearer-gated controller metrics surface should set
+  `--metrics-secure` and front it with the same TokenReview pattern
+  the server's `:8081` listener uses.
 
 ---
 
