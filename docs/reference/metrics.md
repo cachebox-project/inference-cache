@@ -207,23 +207,49 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
      existing one?
    - Will an operator dashboard care, or is this a debug-only counter? (Debug
      counters belong in logs, not `/metrics`.)
-2. **Define the collector** in `pkg/server/metrics.go`: add a field to
-   `serverMetrics`, construct it in `newServerMetrics`, and register it on the
-   `prometheus.NewRegistry()` block. Use the `metricNamespace` constant so
-   the name is consistently prefixed `inferencecache_*`.
-3. **Add a typed writer method** on `*serverMetrics` (e.g.
-   `observeLookup`, `SetIndexEntries`) and call it from the relevant handler
-   or index path. Don't let handlers touch the prometheus collector directly
-   — keeping the surface narrow makes it test-mockable.
-4. **Update the table above** in the correct sub-section (Gauges / Counters /
-   Histograms). Include labels, meaning, and what makes it move. If the metric
-   is histogram, document the bucket array and *why* those buckets.
-5. **Wire test coverage.** Add an assertion in `pkg/server/metrics_test.go`
-   that the new metric appears in `/metrics` output with the expected name
-   and labels.
-6. **Flag the schema impact in the PR description.** If the metric is a
+2. **Decide which binary owns the metric.** Pick by where the work that
+   moves it actually runs — server-side request handling and the in-memory
+   index belong in the server binary; reconciler / webhook / controller-
+   loop behaviors belong in the controller binary. The two processes use
+   separate Prometheus registries and serve different `/metrics` endpoints
+   (see "How `/metrics` is served"); pick the wrong one and operators
+   scrape the wrong target. Each binary has its own definition and
+   registration pattern:
+
+   - **Server binary (`cmd/server`)**: add a field to `serverMetrics` in
+     `pkg/server/metrics.go`, construct it in `newServerMetrics`, and
+     register it on the `prometheus.NewRegistry()` block. Add a typed
+     writer method on `*serverMetrics` (e.g. `observeLookup`,
+     `SetIndexEntries`) and call it from the relevant handler or index
+     path. Don't let handlers touch the prometheus collector directly —
+     keeping the surface narrow makes it test-mockable.
+   - **Controller binary (`cmd/controller`)**: declare a package-level
+     `prometheus.NewCounterVec` / `NewGaugeVec` / etc. var in the
+     reconciler / webhook file that uses it (e.g.
+     `backendServerRestartCascadesTotal` in
+     `internal/controller/cachebackend_server_restart.go`); register it
+     into `sigs.k8s.io/controller-runtime/pkg/metrics`.`Registry` from
+     an `init()` so it appears on the manager's `/metrics` endpoint
+     without a separate plumbing path. Add a package-private
+     `reset*ForTest()` helper so unit tests can clear state between
+     runs.
+
+   In both cases use the `inferencecache_*` prefix so the surface stays
+   consistently namespaced.
+3. **Update the relevant table above** in the correct binary section
+   (Server / Controller) and sub-section (Gauges / Counters / Histograms).
+   Include labels, meaning, and what makes it move. If the metric is a
+   histogram, document the bucket array and *why* those buckets.
+4. **Wire test coverage.** Server-binary metrics: add an assertion in
+   `pkg/server/metrics_test.go`. Controller-binary metrics: add an
+   assertion in a `_test.go` file alongside the reconciler that increments
+   them (e.g. `cachebackend_server_restart_test.go` — see the
+   `cascadeRestartsCount` helper for the pattern). In both cases verify
+   the metric appears in `/metrics` output with the expected name and
+   labels.
+5. **Flag the schema impact in the PR description.** If the metric is a
    candidate for the §4.3 public schema (F3 owns that effort), say so —
    F3 tracks which `inferencecache_*` series are promoted to the public
    contract vs which remain internal/advisory.
-7. **Dashboards.** If you have a Grafana panel in mind, drop the PromQL in the
+6. **Dashboards.** If you have a Grafana panel in mind, drop the PromQL in the
    PR description so F4 (dashboards + CLI) can pick it up cleanly.

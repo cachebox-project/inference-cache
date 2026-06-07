@@ -126,24 +126,69 @@ type cascadeKey struct {
 	uid       string
 }
 
-// serverInstanceCascade tracks per-backend rate-limiting state for
-// the server-restart cascade. Used in-process by
-// CacheBackendReconciler; a process restart clears it (intentional —
-// see DefaultMinServerRestartCascadeInterval).
+// serverInstanceCascade tracks per-backend in-process state for the
+// server-restart cascade: rate-limiting timestamps AND a shadow of
+// the most-recently-attempted observedServerInstance value. Used in-
+// process by CacheBackendReconciler; a process restart clears it
+// (intentional — see DefaultMinServerRestartCascadeInterval).
 //
-// The map is not actively pruned: entries are bounded by the number
-// of distinct CacheBackends ever cascaded by the running process,
-// each entry costs ~64 bytes, and a typical cluster has at most a
-// few hundred CacheBackends over its lifetime. Operator-driven
-// churn in the thousands-per-process would warrant adding a
+// Why the shadow exists: status.observedServerInstance is written via
+// patchStatus, which can fail (conflict / transient apiserver error).
+// If the patch silently failed and a real cache-server replacement
+// happened before a later successful patch, prior would read as ""
+// on the next reconcile and the replacement would be misclassified
+// as a first observation (empty→set: no cascade), stranding the
+// engines on stale sockets. The shadow records every currentID the
+// reconciler attempted to persist so the next reconcile can recover
+// the intended baseline even when status is still empty. Authority
+// order: a non-empty status.observedServerInstance ALWAYS wins (it's
+// the durable on-cluster source of truth); the shadow is only
+// consulted when status is empty (controller restart loses the
+// shadow but rebuilds it on first observation, so the worst-case
+// degenerates to "treat as first observation"). Process-restart
+// risk is acceptable because the K8s-resident status field carries
+// the value across restarts in the steady-state path.
+//
+// The maps are not actively pruned: entries are bounded by the
+// number of distinct CacheBackends ever observed by the running
+// process, each entry costs ~128 bytes, and a typical cluster has
+// at most a few hundred CacheBackends over its lifetime. Operator-
+// driven churn in the thousands-per-process would warrant adding a
 // TTL-based prune; not worth the complexity for the expected scale.
 type serverInstanceCascade struct {
 	mu     sync.Mutex
 	lastAt map[cascadeKey]time.Time
+	// shadow records the last currentID the reconciler ATTEMPTED to
+	// persist into status.observedServerInstance (whether or not the
+	// patch succeeded). Read fallback when the status field is empty.
+	shadow map[cascadeKey]string
 }
 
 func newServerInstanceCascade() *serverInstanceCascade {
-	return &serverInstanceCascade{lastAt: map[cascadeKey]time.Time{}}
+	return &serverInstanceCascade{
+		lastAt: map[cascadeKey]time.Time{},
+		shadow: map[cascadeKey]string{},
+	}
+}
+
+// recordAttempt stamps the most recent currentID the reconciler
+// decided to persist for the given key. Called BEFORE the patch
+// attempt so a subsequent reconcile can recover the intended
+// baseline even if the patch fails.
+func (s *serverInstanceCascade) recordAttempt(key cascadeKey, currentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shadow[key] = currentID
+}
+
+// lastAttempt returns the most recent currentID the reconciler
+// decided to persist for this key, or "" if no attempt has been
+// recorded since process start. Used as the fallback prior when
+// status.observedServerInstance is empty.
+func (s *serverInstanceCascade) lastAttempt(key cascadeKey) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shadow[key]
 }
 
 // canCascade reports whether enough time has elapsed since the previous
@@ -249,19 +294,66 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 		return 0
 	}
 
-	prior := backend.Status.ObservedServerInstance
-	if prior == currentID {
-		return 0
+	if r.serverInstanceCascade == nil {
+		// Defensive lazy-init; the manager wiring should set this in
+		// SetupWithManager but unit tests construct the reconciler
+		// directly and skip that path.
+		r.serverInstanceCascade = newServerInstanceCascade()
+	}
+	key := cascadeKey{
+		namespace: backend.Namespace,
+		name:      backend.Name,
+		uid:       string(backend.UID),
 	}
 
-	// Empty → set: first observation. Persist as the baseline and stop;
-	// there are no engines depending on a not-yet-existed server.
+	// Compute effective prior. The K8s-resident status field is the
+	// authoritative source when populated; if it is empty, fall back
+	// to the in-memory shadow of the last attempted-to-persist
+	// currentID for this backend. The shadow guards against a
+	// transient patchStatus failure swallowing the baseline: without
+	// it, a status-patch failure on first observation followed by a
+	// real cache-server replacement would misclassify the
+	// replacement as another first-observation (empty→set, no
+	// cascade) and strand the engines on stale sockets.
+	statusField := backend.Status.ObservedServerInstance
+	prior := statusField
 	if prior == "" {
+		prior = r.serverInstanceCascade.lastAttempt(key)
+	}
+	if prior == currentID {
+		// Logical state is in sync. If the K8s status field is also
+		// in sync, we are done. If the field is empty because a prior
+		// persist failed (shadow holds the value but status does
+		// not), retry the patch idempotently so the operator-visible
+		// status field eventually reflects the shadow. Do NOT
+		// re-cascade and do NOT re-increment the counter — the
+		// recovery already happened on the original observation.
+		if statusField == currentID {
+			return 0
+		}
 		if err := r.patchStatus(ctx, backend, func() {
 			backend.Status.ObservedServerInstance = currentID
 		}); err != nil {
-			logger.V(1).Info("server-restart cascade: initial observedServerInstance patch failed",
+			logger.V(1).Info("server-restart cascade: status-field patch retry failed (shadow holds the in-process baseline; will retry)",
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return r.minServerRestartCascadeInterval()
+		}
+		return 0
+	}
+
+	// Empty → set: first observation. There is no prior server-
+	// instance to invalidate, so engines that connected during the
+	// empty window are connecting to the very pod we are baselining.
+	// Persist as the baseline and stop. Record the attempt FIRST so
+	// a patch failure does not lose the baseline (see shadow godoc).
+	if prior == "" {
+		r.serverInstanceCascade.recordAttempt(key, currentID)
+		if err := r.patchStatus(ctx, backend, func() {
+			backend.Status.ObservedServerInstance = currentID
+		}); err != nil {
+			logger.V(1).Info("server-restart cascade: initial observedServerInstance patch failed (in-memory shadow retains the baseline for the next reconcile)",
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return r.minServerRestartCascadeInterval()
 		}
 		return 0
 	}
@@ -289,14 +381,17 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	//    pods would still be a strict superset of the pinned prior
 	//    map — instanceChangeRequiresCascade would return false and
 	//    no cascade would fire, leaving engines that connected to the
-	//    replaced pod with stale sockets.
+	//    replaced pod with stale sockets. Record the attempt FIRST
+	//    so a patch failure does not lose the widened baseline.
 	if !instanceChangeRequiresCascade(prior, currentID) {
 		if converged {
+			r.serverInstanceCascade.recordAttempt(key, currentID)
 			if err := r.patchStatus(ctx, backend, func() {
 				backend.Status.ObservedServerInstance = currentID
 			}); err != nil {
-				logger.V(1).Info("server-restart cascade: converged-superset observedServerInstance patch failed",
+				logger.V(1).Info("server-restart cascade: converged-superset observedServerInstance patch failed (in-memory shadow retains the widened baseline)",
 					"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+				return r.minServerRestartCascadeInterval()
 			}
 			logger.V(1).Info("server-restart cascade skipped: superset at Deployment steady state (scale-up); latch advanced",
 				"namespace", backend.Namespace, "name", backend.Name,
@@ -316,17 +411,6 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// reconcile still sees the change and tries again. The key
 	// includes the CacheBackend's UID so a delete-recreate under the
 	// same name gets a fresh window.
-	key := cascadeKey{
-		namespace: backend.Namespace,
-		name:      backend.Name,
-		uid:       string(backend.UID),
-	}
-	if r.serverInstanceCascade == nil {
-		// Defensive lazy-init; the manager wiring should set this in
-		// SetupWithManager but unit tests construct the reconciler
-		// directly and skip that path.
-		r.serverInstanceCascade = newServerInstanceCascade()
-	}
 	ok, wait := r.serverInstanceCascade.canCascade(key, time.Now(), r.minServerRestartCascadeInterval())
 	if !ok {
 		logger.V(1).Info("server-restart cascade deferred: rate-limited",
@@ -345,17 +429,28 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return r.minServerRestartCascadeInterval()
 	}
-	backendServerRestartCascadesTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
 	logger.V(1).Info("server-restart cascade: engine Deployments annotated",
 		"namespace", backend.Namespace, "name", backend.Name,
 		"prior", prior, "current", currentID, "deployments", count)
 
+	// Persist the new baseline and ONLY THEN increment the cascade
+	// counter. Tying the increment to persist-success enforces "one
+	// increment per cascade event" — without it, a transient patch
+	// failure would leave the latch on the prior, the next reconcile
+	// would re-run the cascade (annotates are no-ops because the
+	// trigger annotation already matches currentID), and the counter
+	// would advance again for the same logical recovery. Record the
+	// attempt in the shadow first so a patch failure does not lose
+	// the baseline.
+	r.serverInstanceCascade.recordAttempt(key, currentID)
 	if err := r.patchStatus(ctx, backend, func() {
 		backend.Status.ObservedServerInstance = currentID
 	}); err != nil {
-		logger.V(1).Info("server-restart cascade: observedServerInstance patch failed",
+		logger.V(1).Info("server-restart cascade: observedServerInstance patch failed (annotates already issued; shadow retains the baseline so the next reconcile will not re-increment)",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return r.minServerRestartCascadeInterval()
 	}
+	backendServerRestartCascadesTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
 	return 0
 }
 

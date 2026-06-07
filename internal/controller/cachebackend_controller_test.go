@@ -460,10 +460,10 @@ func TestReconcileTypeSwitchToExternalCleansUpChildren(t *testing.T) {
 // External backend would surface a UID that no longer maps to any
 // controller-managed pod, and a subsequent flip back to managed
 // would inherit the stale baseline and either false-cascade
-// immediately or false-pin a non-existent pod set. Codex round-10
-// regression: this is the lifecycle contract reconcileExternal
-// encodes, and a status field flip is exactly the kind of seam tests
-// must hold.
+// immediately or false-pin a non-existent pod set. This is the
+// lifecycle contract reconcileExternal encodes; a status-field flip
+// is exactly the kind of seam tests must hold, alongside the
+// preserved-fields contract (firstKVEventObservedAt must survive).
 func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T) {
 	scheme := newScheme(t)
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))

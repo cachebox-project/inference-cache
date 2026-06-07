@@ -687,13 +687,14 @@ func TestReconcileServerInstance_RollingUpdateSupersetDoesNotCascade(t *testing.
 }
 
 // TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade
-// covers the round-8 bug: an attempted rolling update where the NEW
-// pod becomes Ready briefly (strict-superset midpoint) and is then
+// drives the rollback-of-a-rolling-update scenario: the NEW pod
+// becomes Ready briefly (strict-superset midpoint) and is then
 // rolled back (new pod killed by failing readiness, leaving the
-// ORIGINAL pod alone) must NOT cascade — the original cache-server
-// process and its sockets never changed. The fix is "do not persist
-// the strict-superset midpoint", which makes the rollback path a
-// true no-op (prior=current after the rollback completes).
+// ORIGINAL pod alone). This must NOT cascade — the original cache-
+// server process and its sockets never changed. The contract that
+// makes this work is "do not persist the strict-superset midpoint
+// while the Deployment is rolling"; the rollback path then becomes
+// a true no-op (prior=current after the rollback completes).
 func TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
@@ -772,20 +773,21 @@ func TestReconcileServerInstance_RollingUpdateRollbackDoesNotCascade(t *testing.
 	}
 }
 
-// TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline covers
-// the round-9 fix: a strict-superset transition where the owning
-// Deployment has reached steady state at the wider count is a
-// legitimate operator scale-up, NOT a rolling-update midpoint. The
-// latch must advance to include the added pod(s) so a later
-// replacement of any of the added pods cascades correctly.
+// TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline drives
+// the operator-scale-up scenario: a strict-superset transition where
+// the owning Deployment has reached steady state at the wider count
+// is a legitimate scale-up, NOT a rolling-update midpoint. The latch
+// must advance to include the added pod(s) so a later replacement of
+// any of the added pods cascades correctly.
 //
-// Pre-fix: round-8 unconditionally refused to persist superset
-// midpoints. A converged scale-up therefore left the new pod outside
-// the latch forever; a subsequent OOM-kill of just the added pod was
-// observable to engines (their sockets to that pod died) but not to
-// the controller (prior strictly contained current's UIDs at same
-// restart-sums; instanceChangeRequiresCascade returned false). The
-// engines were stranded on stale sockets with no recovery path.
+// The regression this guards against: if the reconciler unconditionally
+// refused to persist superset midpoints, a converged scale-up would
+// leave the new pod outside the latch forever; a subsequent OOM-kill
+// of just the added pod would be observable to engines (their sockets
+// to that pod would die) but not to the controller (prior strictly
+// containing current's UIDs at same restart-sums →
+// instanceChangeRequiresCascade returns false). The engines would
+// be stranded on stale sockets with no recovery path.
 func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
@@ -855,11 +857,11 @@ func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) 
 		t.Fatalf("cascade counter after scale-up = %v, want 0", got)
 	}
 
-	// Now replace ONLY the added pod (different UID). Pre-fix this
-	// stays a strict superset of the (round-8-pinned) baseline and
-	// false-misses the cascade. Post-fix the baseline includes the
-	// added pod's UID, so its disappearance is a real replacement and
-	// the cascade fires.
+	// Now replace ONLY the added pod (different UID). Without the
+	// converged-superset persist, this would stay a strict superset
+	// of the original baseline and miss the cascade. With the
+	// persist, the baseline includes the added pod's UID, so its
+	// disappearance is a real replacement and the cascade fires.
 	if err := f.r.Delete(context.Background(), added); err != nil {
 		t.Fatalf("delete added pod (replacement step 1): %v", err)
 	}
@@ -905,7 +907,7 @@ func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) 
 	}
 	f.reloadEngineDep(t)
 	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantFinal {
-		t.Fatalf("cascade annotation = %q, want %q (replacement of an added scale-up pod must cascade — pre-round-9 this missed)", got, wantFinal)
+		t.Fatalf("cascade annotation = %q, want %q (replacement of an added scale-up pod must cascade — without the converged-superset persist, the missing-UID transition would still look like a strict superset and miss the cascade)", got, wantFinal)
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
 		t.Fatalf("cascade counter after replacement = %v, want exactly 1", got)
@@ -1100,6 +1102,201 @@ func TestReconcileServerInstance_NonInjectedPodsDoNotCascade(t *testing.T) {
 	}
 }
 
+// TestReconcileServerInstance_ShadowRecoversBaselineFromPatchFailure
+// drives the patch-failure-window scenario: a transient
+// status-subresource patch failure on the first observation leaves
+// status.observedServerInstance empty. Without the in-process shadow,
+// a subsequent real cache-server replacement during that window would
+// read prior="" and misclassify the replacement as another first
+// observation (empty→set, no cascade) — engines stuck on stale
+// sockets. With the shadow, the reconciler recovers the intended
+// baseline from in-memory state and the replacement cascades.
+func TestReconcileServerInstance_ShadowRecoversBaselineFromPatchFailure(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Wrap the client so the FIRST status-subresource patch returns a
+	// synthetic error (simulating a conflict / transient apiserver
+	// hiccup), then becomes transparent on subsequent attempts.
+	failOnce := &statusPatchFailingClient{Client: f.r.Client, remaining: 1}
+	f.r.Client = failOnce
+
+	// First observation: status patch fails, latch stays "", but the
+	// shadow records the attempt.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait <= 0 {
+		t.Fatalf("first-observation patch failure should return a requeue duration; got %v", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != "" {
+		t.Fatalf("status.observedServerInstance = %q after simulated patch failure; want empty", got)
+	}
+
+	// Now replace the cache-server pod with a new one (different UID)
+	// — simulating a server restart in the patch-failure window.
+	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
+		t.Fatalf("delete old server pod: %v", err)
+	}
+	tru := true
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-replacement",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-replacement",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready replacement pod: %v", err)
+	}
+
+	// Wait past the rate-limit (fixture is 50ms) so the cascade is
+	// eligible on the next reconcile.
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-replacement wait = %v, want 0", wait)
+	}
+
+	// The cascade must have fired. Without the shadow this would be a
+	// false-empty→set first-observation case (engines stranded).
+	f.reloadEngineDep(t)
+	want := serverInstanceID(replacement)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("cascade annotation = %q, want %q (shadow must recover the lost baseline so the replacement cascades)", got, want)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter = %v, want 1 (replacement after a swallowed baseline-patch must still count as one cascade event)", got)
+	}
+}
+
+// TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist
+// asserts the "one increment per cascade event" contract holds even
+// when the status patch fails on the first attempt. The cascade
+// re-fires on retry (no-op annotates), but the counter must NOT
+// double-count — increments are gated on patch success.
+func TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline observation persists normally.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline == "" {
+		t.Fatalf("baseline observedServerInstance is empty; expected the first observation to persist")
+	}
+
+	// Replace the server pod. The next reconcile should cascade.
+	// Inject a status-patch-failing wrapper so the FIRST cascade-
+	// follow-up patch fails; the cascade itself (annotate engines)
+	// runs successfully, but the latch persist returns an error.
+	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
+		t.Fatalf("delete server pod: %v", err)
+	}
+	tru := true
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-rep2",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-rep2",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready replacement: %v", err)
+	}
+	failOnce := &statusPatchFailingClient{Client: f.r.Client, remaining: 1}
+	f.r.Client = failOnce
+
+	time.Sleep(60 * time.Millisecond)
+	// First cascade attempt: annotates the engine, but the status
+	// patch fails. Counter must NOT advance.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait <= 0 {
+		t.Fatalf("post-replacement first-attempt wait = %v, want positive (persist failed → request retry)", wait)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter after failed persist = %v, want 0 (counter must be gated on persist success)", got)
+	}
+	// Engine annotation should already be applied — the annotate ran
+	// before the persist failed.
+	f.reloadEngineDep(t)
+	want := serverInstanceID(replacement)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("engine annotation = %q, want %q (annotate must precede persist; engines should be recovering)", got, want)
+	}
+
+	// Wait past the rate-limit window so canCascade lets the retry
+	// through. The first attempt already stamped lastAt; the second
+	// attempt must wait past minServerRestartCascadeInterval.
+	time.Sleep(60 * time.Millisecond)
+
+	// Second reconcile: the patch wrapper allows it through. The
+	// cascade re-fires (annotate is a no-op since the trigger
+	// already matches), persist succeeds, counter advances by ONE.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("retry-reconcile wait = %v, want 0", wait)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter after successful persist retry = %v, want exactly 1 (one cascade event = one increment, regardless of how many persist retries were required)", got)
+	}
+}
+
+// statusPatchFailingClient wraps a client.Client and returns a
+// synthetic error from the FIRST `remaining` calls to Status().Patch
+// on a CacheBackend, then passes calls through. Used to simulate a
+// transient status-subresource patch failure window.
+type statusPatchFailingClient struct {
+	client.Client
+	remaining int
+}
+
+func (c *statusPatchFailingClient) Status() client.SubResourceWriter {
+	return &statusPatchFailingSubResource{
+		SubResourceWriter: c.Client.Status(),
+		owner:             c,
+	}
+}
+
+type statusPatchFailingSubResource struct {
+	client.SubResourceWriter
+	owner *statusPatchFailingClient
+}
+
+func (s *statusPatchFailingSubResource) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+	if _, ok := obj.(*cachev1alpha1.CacheBackend); ok && s.owner.remaining > 0 {
+		s.owner.remaining--
+		return fmt.Errorf("synthetic status-subresource patch failure for test")
+	}
+	return s.SubResourceWriter.Patch(ctx, obj, p, opts...)
+}
+
 func TestReconcileServerInstance_AnnotateIdempotent(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 	// Pre-seed the engine Deployment's pod template with the trigger
@@ -1165,11 +1362,12 @@ func TestPodOwningDeployment_NoOwnerReturnsFalse(t *testing.T) {
 	}
 }
 
-// TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch locks in
-// the round-7 fix: if the live Deployment's UID does not match the UID
-// observed during owner-chain resolution, the patch is skipped (the
-// resolved target was deleted and re-created under the same name). A
-// name-only patch in that window would roll an unrelated workload.
+// TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch locks
+// the TOCTOU contract: if the live Deployment's UID does not match
+// the UID observed during owner-chain resolution, the patch is
+// skipped (the resolved target was deleted and re-created under the
+// same name between resolution and annotate). A name-only patch in
+// that window would roll an unrelated workload.
 func TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 

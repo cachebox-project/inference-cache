@@ -633,12 +633,16 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	}
 
 	if applyErr != nil {
-		// Honor the cascade's rate-limit retry boundary even on the
-		// apply-error path: returning a bare ctrl.Result alongside an
-		// error leaves retry timing to controller-runtime's
-		// exponential backoff, which can overshoot the rate-limit
-		// window we want the next reconcile to land at.
-		return ctrl.Result{RequeueAfter: requeueAfter}, applyErr
+		// Return the error so controller-runtime's workqueue
+		// rate-limiter requeues the reconcile. Per the
+		// sigs.k8s.io/controller-runtime/pkg/reconcile contract, when
+		// the error is non-nil the `Result` is ignored — including any
+		// RequeueAfter we might set here — so there is no point
+		// pretending to schedule the cascade retry at the rate-limit
+		// boundary on this path. The rate-limiter's backoff cadence is
+		// the actual retry schedule; the next successful reconcile
+		// then re-enters the cascade path at its own boundary.
+		return ctrl.Result{}, applyErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
