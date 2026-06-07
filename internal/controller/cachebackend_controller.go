@@ -1322,19 +1322,50 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			Message:            progressingMessage,
 			ObservedGeneration: publishedGen,
 		})
-		// Functional-probe condition. The gate decides
-		// whether to write it at all this reconcile (skipped when the
-		// probe is disabled, rate-limited, or upstream Ready=False so the
-		// inherited value persists). meta.SetStatusCondition handles the
-		// write-only-on-change contract — same as the other three
-		// conditions above.
-		if probeVerdict.shouldWriteCondition {
+		// Functional-probe condition. The gate decides whether to write,
+		// remove, or leave it alone this reconcile. meta.SetStatusCondition
+		// / RemoveStatusCondition both honor the write-only-on-change
+		// contract — same as the other three conditions above.
+		switch {
+		case probeVerdict.shouldWriteCondition:
 			cond := probeVerdict.condition
 			cond.ObservedGeneration = publishedGen
 			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+		case probeVerdict.removeCondition:
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 		}
 	})
-	return gate.requeueAfter, err
+	// Commit the rate-limit slot ONLY after the status patch succeeds. A
+	// failed patch must not burn a window — the next reconcile retries
+	// immediately and re-runs the probe call. (The gate sets commitMark
+	// only on a successful probe call, so a rate-limited or HTTP-failed
+	// reconcile is a no-op here.)
+	if err == nil && probeVerdict.commitMark != nil {
+		probeVerdict.commitMark()
+	}
+	// Take the tighter of the KV-gate requeue and the probe-gate requeue
+	// so a stuck-failing backend re-probes when its rate-limit window
+	// expires even without an external watch event. A zero from either
+	// side means "no requeue requested"; min() must therefore ignore the
+	// zero so a non-zero half always wins.
+	requeue := minNonZero(gate.requeueAfter, probeVerdict.requeueAfter)
+	return requeue, err
+}
+
+// minNonZero returns the smaller of two durations, treating a zero on
+// either side as "no value" so a non-zero half always wins. Used to merge
+// the KV-event and functional-probe requeue requests.
+func minNonZero(a, b time.Duration) time.Duration {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // kvReadiness is the resolved readiness verdict after layering the KV-event

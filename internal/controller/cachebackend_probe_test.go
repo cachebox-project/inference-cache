@@ -169,11 +169,22 @@ func TestEvaluateFunctionalProbeRateLimit(t *testing.T) {
 	if !v1.shouldWriteCondition || v1.condition.Status != metav1.ConditionTrue {
 		t.Fatalf("first call should write OK; got %+v", v1.condition)
 	}
+	// Simulate the reconciler committing the status patch — only then is
+	// the rate-limit slot recorded (so a failed patch doesn't burn the
+	// window). This is the contract: gate returns commitMark; caller
+	// invokes it after patchStatus succeeds.
+	if v1.commitMark == nil {
+		t.Fatalf("successful call must return a commitMark closure")
+	}
+	v1.commitMark()
 
 	// Same instant — well inside the 30s window — must NOT call again.
 	v2 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, 30*time.Second, now.Add(5*time.Second))
 	if v2.shouldWriteCondition {
 		t.Errorf("rate-limited call must not write a condition; got %+v", v2.condition)
+	}
+	if v2.requeueAfter <= 0 || v2.requeueAfter > 30*time.Second {
+		t.Errorf("rate-limited verdict should requeue inside the remaining window; got %v", v2.requeueAfter)
 	}
 	if srv.calls.Load() != 1 {
 		t.Errorf("expected exactly 1 probe call across two reconciles within the rate-limit window; got %d", srv.calls.Load())
@@ -186,6 +197,84 @@ func TestEvaluateFunctionalProbeRateLimit(t *testing.T) {
 	}
 	if srv.calls.Load() != 2 {
 		t.Errorf("expected 2 probe calls across the window boundary; got %d", srv.calls.Load())
+	}
+	if v3.commitMark != nil {
+		v3.commitMark()
+	}
+}
+
+// TestEvaluateFunctionalProbeRateLimitedFailurePreservesDowngrade is the
+// regression guard for the Blocking issue raised in PR review: a
+// rate-limited reconcile that hits an existing FunctionalProbeOK=False
+// MUST re-apply the Ready downgrade — otherwise the status patch
+// would silently overwrite the prior Ready=False/Probe*Failed with the
+// upstream KV gate's Ready=True/KVEventsObserved, and the operator-visible
+// signal would mislead.
+func TestEvaluateFunctionalProbeRateLimitedFailurePreservesDowngrade(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{
+			Ingest: cacheserver.ProbeStageFailed, Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
+			Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "broken"}},
+		}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+	limiter := &probeRateLimiter{}
+	now := time.Unix(1_000_000, 0)
+
+	// First reconcile: probe returns ingest=failed. Gate downgrades Ready
+	// + writes FunctionalProbeOK=False. Simulate patch commit so the
+	// rate-limit slot lands.
+	backend := newProbeBackend("cb")
+	v1 := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue, client, limiter, 30*time.Second, now)
+	if !v1.downgradeReady || v1.readyReason != reasonProbeIngestFailed {
+		t.Fatalf("first call should downgrade Ready/ProbeIngestFailed; got %+v", v1)
+	}
+	v1.commitMark()
+	// Simulate the patch having landed the FunctionalProbeOK=False
+	// condition: a watch event on the resulting status now triggers a
+	// second reconcile within the rate-limit window.
+	backend.Status.Conditions = append(backend.Status.Conditions, v1.condition)
+
+	v2 := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue, client, limiter, 30*time.Second, now.Add(5*time.Second))
+	if v2.shouldWriteCondition {
+		t.Errorf("rate-limited reconcile must not overwrite existing condition; got %+v", v2.condition)
+	}
+	if !v2.downgradeReady {
+		t.Fatalf("rate-limited reconcile MUST re-apply Ready downgrade when existing FunctionalProbeOK is False (else KV gate's Ready=True silently overwrites the failure); got verdict %+v", v2)
+	}
+	if v2.readyReason != reasonProbeIngestFailed || v2.readyMessage == "" {
+		t.Errorf("re-applied downgrade should inherit the existing reason/message; got reason=%q message=%q", v2.readyReason, v2.readyMessage)
+	}
+	if srv.calls.Load() != 1 {
+		t.Errorf("rate-limited reconcile must skip the HTTP call; got %d total calls", srv.calls.Load())
+	}
+	if v2.requeueAfter <= 0 {
+		t.Errorf("rate-limited verdict must schedule a requeue so recovery doesn't depend on watch events; got %v", v2.requeueAfter)
+	}
+}
+
+// TestEvaluateFunctionalProbeDisabledClearsExistingCondition pins the
+// "probe was turned off" path: if a backend carries a prior
+// FunctionalProbeOK condition and the operator unsets --server-probe-url
+// (or otherwise nils the client), the gate emits a removeCondition verdict
+// so the stale operator-visible signal doesn't linger forever.
+func TestEvaluateFunctionalProbeDisabledClearsExistingCondition(t *testing.T) {
+	backend := newProbeBackend("cb")
+	backend.Status.Conditions = []metav1.Condition{{
+		Type:   conditionTypeFunctionalProbeOK,
+		Status: metav1.ConditionTrue,
+		Reason: reasonProbeOK,
+	}}
+	v := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue, nil, &probeRateLimiter{}, time.Second, time.Now())
+	if !v.removeCondition || v.shouldWriteCondition {
+		t.Fatalf("want removeCondition=true (no write); got %+v", v)
+	}
+
+	// Without an existing condition, disabling is a true no-op.
+	backendFresh := newProbeBackend("cb-fresh")
+	v2 := evaluateFunctionalProbe(context.Background(), backendFresh, kvReadinessTrue, nil, &probeRateLimiter{}, time.Second, time.Now())
+	if v2.removeCondition || v2.shouldWriteCondition {
+		t.Errorf("nil client + no existing condition must be a no-op; got %+v", v2)
 	}
 }
 
@@ -395,41 +484,48 @@ func stringPtr(s string) *string { return &s }
 
 // TestProbeResultMetricEmitsPerStage confirms the controller-runtime
 // metric registration: every probe call increments three counters
-// (ingest/routing/t2) with one observation each. Asserted via the
-// per-Service Prometheus registry so the test doesn't depend on a global
-// metrics-endpoint scrape.
+// (ingest/routing/t2) with one observation each. The metric is
+// PROCESS-WIDE (registered on the controller-runtime registry, not a
+// per-Service one), so the test asserts a +1 delta against the per-label
+// baseline rather than absolute counter values — running this test
+// repeatedly in-process, or having another test reuse the same label
+// tuple, must NOT cause a spurious failure. Per-test-call isolation is
+// preserved by using a unique backend label ("metric-cb-<test name>")
+// so other tests' baselines don't leak in.
 func TestProbeResultMetricEmitsPerStage(t *testing.T) {
+	const backendKey = "team-a/cb-metric"
 	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
 		return cacheserver.ProbeResult{
-			Backend: "team-a/cb-metric", Ingest: cacheserver.ProbeStageOK,
+			Backend: backendKey, Ingest: cacheserver.ProbeStageOK,
 			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
 		}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
-	// Snapshot baseline values BEFORE the call so the test is resilient
-	// to other tests in the same package incrementing the same
-	// (process-wide) counters.
-	baseline := metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageIngest, "ok") +
-		metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageRouting, "ok") +
-		metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageT2, "skipped")
-	if baseline != 0 {
-		t.Logf("unexpected non-zero baseline = %v; test may not be isolated", baseline)
+	// Snapshot per-label baselines BEFORE the call so the delta assertion
+	// is robust to whatever prior state the counters hold (another test
+	// in this package reusing the label, the same test run twice in
+	// -count=2, etc.).
+	type stageCheck struct {
+		stage, result string
+	}
+	stages := []stageCheck{
+		{cacheserver.ProbeStageIngest, "ok"},
+		{cacheserver.ProbeStageRouting, "ok"},
+		{cacheserver.ProbeStageT2, "skipped"},
+	}
+	before := make(map[stageCheck]float64, len(stages))
+	for _, s := range stages {
+		before[s] = metricCounter(t, backendKey, s.stage, s.result)
 	}
 
 	backend := newProbeBackend("cb-metric")
 	_ = evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue, client, &probeRateLimiter{}, time.Second, time.Now())
 
-	for _, c := range []struct {
-		stage, result string
-		want          float64
-	}{
-		{cacheserver.ProbeStageIngest, "ok", 1},
-		{cacheserver.ProbeStageRouting, "ok", 1},
-		{cacheserver.ProbeStageT2, "skipped", 1},
-	} {
-		if got := metricCounter(t, "team-a/cb-metric", c.stage, c.result); got != c.want {
-			t.Errorf("metric stage=%s result=%s = %v, want %v", c.stage, c.result, got, c.want)
+	for _, s := range stages {
+		got := metricCounter(t, backendKey, s.stage, s.result)
+		if got != before[s]+1 {
+			t.Errorf("metric stage=%s result=%s = %v, want %v (baseline %v + 1)", s.stage, s.result, got, before[s]+1, before[s])
 		}
 	}
 }

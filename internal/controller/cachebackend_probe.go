@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -109,33 +110,42 @@ func init() {
 }
 
 // probeRateLimiter is the per-(namespace, name) "last successfully-called-at"
-// map the reconciler uses to gate the probe call. Exposed as a method on the
-// reconciler (next file) but the type lives here so the gate code that reads
-// it can keep its dependencies focused. *sync.Map is the right shape: each
-// CacheBackend Reconcile is single-flighted by controller-runtime, but the
-// reconciler may process many backends concurrently across its worker
-// goroutines, so the rate-limit map needs to be lock-free across keys.
+// map the reconciler uses to gate the probe call. *sync.Map is the right
+// shape: each CacheBackend Reconcile is single-flighted by controller-
+// runtime, but the reconciler may process many backends concurrently
+// across its worker goroutines, so the rate-limit map needs to be lock-
+// free across keys.
 type probeRateLimiter struct {
 	last sync.Map // key: types.NamespacedName.String() → time.Time
 }
 
-// allow reports whether the caller should issue a probe call for this
-// backend right now. It returns true when no prior probe has been recorded,
-// or when the elapsed time since the last recorded call is >= rateLimit.
-// Updating the recorded "last probed at" timestamp is the caller's
-// responsibility — the rate-limit only counts against successful calls (an
-// HTTP error doesn't extend the window, so the next reconcile retries
-// promptly instead of waiting out the full rate-limit window).
-func (p *probeRateLimiter) allow(key string, now time.Time, rateLimit time.Duration) bool {
+// lastCalled returns the most recently-recorded probe-call timestamp for
+// key, or the zero time if no call has been recorded. The caller uses
+// the result to (a) decide whether to issue a fresh probe call, and
+// (b) schedule a requeue at the next-allowed time so a quiet backend
+// stuck in failure state still recovers when no other watch events fire.
+func (p *probeRateLimiter) lastCalled(key string) time.Time {
 	if p == nil {
-		return true
+		return time.Time{}
 	}
 	v, ok := p.last.Load(key)
 	if !ok {
-		return true
+		return time.Time{}
 	}
-	prev, ok := v.(time.Time)
+	t, ok := v.(time.Time)
 	if !ok {
+		return time.Time{}
+	}
+	return t
+}
+
+// allow reports whether the caller should issue a probe call for this
+// backend right now. Returns true when no prior probe has been recorded
+// (lastCalled is zero) or the elapsed time since the last call is at
+// least rateLimit.
+func (p *probeRateLimiter) allow(key string, now time.Time, rateLimit time.Duration) bool {
+	prev := p.lastCalled(key)
+	if prev.IsZero() {
 		return true
 	}
 	return now.Sub(prev) >= rateLimit
@@ -144,7 +154,9 @@ func (p *probeRateLimiter) allow(key string, now time.Time, rateLimit time.Durat
 // markCalled records that a probe call landed (regardless of probe-stage
 // outcome — a per-stage `failed` is still a successful CALL). HTTP-level
 // errors do NOT record a timestamp so the next reconcile retries
-// immediately.
+// immediately. The reconciler invokes markCalled AFTER the status patch
+// commits — see functionalProbeVerdict.commitMark — so a failed patch
+// does not burn a rate-limit slot, and the next retry re-runs the probe.
 func (p *probeRateLimiter) markCalled(key string, now time.Time) {
 	if p == nil {
 		return
@@ -153,26 +165,60 @@ func (p *probeRateLimiter) markCalled(key string, now time.Time) {
 }
 
 // functionalProbeVerdict is the gate's output, applied to the running
-// kvReadiness verdict by the reconciler's updateManagedStatus.
+// kvReadiness verdict by the reconciler's updateManagedStatus. The struct
+// carries everything the caller needs to (a) atomically write/remove the
+// FunctionalProbeOK condition under the same status patch as the other
+// conditions, (b) re-apply the Ready downgrade across rate-limited
+// reconciles so a previously-failed probe's verdict isn't silently
+// overwritten by the upstream KV gate, (c) requeue the backend at the
+// next-allowed-probe time so a quiet failure recovers on its own, and
+// (d) only burn a rate-limit slot AFTER the status patch persists.
 type functionalProbeVerdict struct {
 	// shouldWriteCondition reports whether the gate decided the
 	// FunctionalProbeOK condition should be (re-)written this reconcile.
-	// False when the gate decided to NO-OP (probe disabled, rate-limited,
-	// upstream Ready=False) — the caller leaves any existing condition
-	// alone.
+	// False when the gate decided to NO-OP (rate-limited with no
+	// existing-False to inherit, upstream Ready=False, probe disabled
+	// with no existing condition to clear) — the caller leaves any
+	// existing condition alone.
 	shouldWriteCondition bool
 
 	// condition is the new FunctionalProbeOK to publish. Populated only
 	// when shouldWriteCondition is true.
 	condition metav1.Condition
 
-	// downgradeReady is set when a probe stage failed (result is `failed`
-	// for ingest/routing/t2). The caller flips the inherited Ready
-	// condition from True to False with the same reason+message — the
-	// operator-visible Ready verdict points at the broken stage.
+	// removeCondition signals the caller to delete any existing
+	// FunctionalProbeOK from the backend's conditions. Set when the
+	// probe is structurally disabled (nil/empty ProbeClient) so a CR
+	// previously gated by a probe that's now turned off doesn't carry
+	// a stale operator-visible condition indefinitely.
+	removeCondition bool
+
+	// downgradeReady is set when the gate decided Ready should be False.
+	// Two paths:
+	//   - Fresh probe call returned a stage failure: downgrade with the
+	//     stage-specific reason and the server's diagnostic.
+	//   - Rate-limited reconcile AND the existing FunctionalProbeOK
+	//     condition was False: re-apply the prior downgrade so the
+	//     status patch doesn't overwrite Ready=False/Probe*Failed with
+	//     the upstream KV-gate's Ready=True/KVEventsObserved.
 	downgradeReady bool
 	readyReason    string
 	readyMessage   string
+
+	// requeueAfter, when non-zero, asks the caller to schedule another
+	// reconcile at most this duration in the future. Used by the rate-
+	// limit path so a quiet backend stuck in failure state still
+	// re-probes when the window expires — without it, recovery would
+	// depend on incidental external watch events.
+	requeueAfter time.Duration
+
+	// commitMark is invoked by the caller AFTER the status patch persists
+	// (i.e. patchStatus returns nil). When non-nil it records the rate-
+	// limit timestamp for the call this verdict represents — so a failed
+	// patch does NOT burn a rate-limit slot, and the next retry re-runs
+	// the probe immediately. Nil when the gate skipped the actual probe
+	// call (rate-limited, bypassed, disabled, etc.).
+	commitMark func()
 }
 
 // evaluateFunctionalProbe layers the functional-probe gate on top of the
@@ -187,13 +233,20 @@ type functionalProbeVerdict struct {
 //
 //	upstream Ready=False (KV gate said no)? → no probe call, no condition write
 //	external/unsupported backend (no managed workload)? → caller doesn't invoke this; out of scope
-//	probe client disabled (nil or empty URL)? → no condition write (probe not configured)
+//	probe client disabled (nil or empty URL)?
+//	    existing FunctionalProbeOK present? → emit removeCondition so the stale
+//	                                          condition is dropped (probe is
+//	                                          structurally off now)
+//	    no existing condition?             → no-op
 //	annotation inferencecache.io/skip-functional-probe=true? → write FunctionalProbeOK=True, reason=ProbeBypassed
-//	rate-limited (last call within rateLimit)? → no condition write (preserve last result)
+//	rate-limited (last call within rateLimit)?
+//	    existing FunctionalProbeOK=False? → re-apply Ready downgrade (no write);
+//	                                       requeue at window expiry
+//	    other existing values             → no condition write; requeue at window expiry
 //	call /probe →
-//	    AllPassed? → write FunctionalProbeOK=True, reason=ProbeOK
-//	    per-stage failed? → write FunctionalProbeOK=False, reason=Probe<Stage>Failed; downgrade Ready
-//	    HTTP error? → write FunctionalProbeOK=Unknown, reason=ProbeError; LEAVE Ready alone
+//	    AllPassed? → write FunctionalProbeOK=True, reason=ProbeOK; mark called
+//	    per-stage failed? → write FunctionalProbeOK=False, reason=Probe<Stage>Failed; downgrade Ready; mark called
+//	    HTTP error? → write FunctionalProbeOK=Unknown, reason=ProbeError; LEAVE Ready alone; DO NOT mark called (retry next reconcile)
 func evaluateFunctionalProbe(
 	ctx context.Context,
 	backend *cachev1alpha1.CacheBackend,
@@ -230,19 +283,39 @@ func evaluateFunctionalProbe(
 	}
 
 	// Probe disabled (nil client, empty URL): the gate is structurally
-	// off. Don't write a condition — a published FunctionalProbeOK on a
-	// reconciler that never calls /probe would just be a misleading lie.
+	// off. Don't publish a fresh condition — a FunctionalProbeOK on a
+	// reconciler that never calls /probe would just be misleading.
+	// But a previously-written condition would persist forever without
+	// our help, so if one exists, ask the caller to remove it.
 	if probe == nil || probe.ProbeURL == "" {
+		if existing := meta.FindStatusCondition(backend.Status.Conditions, conditionTypeFunctionalProbeOK); existing != nil {
+			return functionalProbeVerdict{removeCondition: true}
+		}
 		return functionalProbeVerdict{}
 	}
 
-	// Rate limit. Multiple reconciles within the window inherit the
+	// Rate limit. Multiple reconciles within the window must inherit the
 	// existing condition value — controller-runtime's reconcile loop fires
 	// freely on Watch events, so without this the probe would hammer the
-	// server on every CR/Deployment/Pod tick.
+	// server on every CR/Deployment/Pod tick. CRITICAL: when the existing
+	// condition is False, re-apply the Ready downgrade so the status patch
+	// that updateManagedStatus is about to issue doesn't silently overwrite
+	// Ready=False/ProbeIngestFailed with Ready=True/KVEventsObserved from
+	// the upstream KV gate. Also schedule a requeue at the window-expiry
+	// boundary so a quiet failed backend re-probes when the limit lifts,
+	// without waiting for an incidental watch event.
 	key := backend.Namespace + "/" + backend.Name
 	if !limiter.allow(key, now, rateLimit) {
-		return functionalProbeVerdict{}
+		verdict := functionalProbeVerdict{
+			requeueAfter: requeueUntilNextProbe(limiter.lastCalled(key), rateLimit, now),
+		}
+		existing := meta.FindStatusCondition(backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		if existing != nil && existing.Status == metav1.ConditionFalse {
+			verdict.downgradeReady = true
+			verdict.readyReason = existing.Reason
+			verdict.readyMessage = existing.Message
+		}
+		return verdict
 	}
 
 	// Call the probe. Note: backend = <namespace>/<name> per the wire
@@ -270,6 +343,11 @@ func evaluateFunctionalProbe(
 		// (that's the noise mode the existing CacheIndex poller / policy
 		// pusher already avoid). The Unknown status is the operator's
 		// signal to investigate the probe path itself.
+		//
+		// No commitMark — failed calls don't burn a rate-limit slot, so
+		// the next reconcile retries immediately when the server comes
+		// back. recordProbeResult is also skipped: a failed transport
+		// isn't a per-stage outcome.
 		return functionalProbeVerdict{
 			shouldWriteCondition: true,
 			condition: metav1.Condition{
@@ -282,11 +360,13 @@ func evaluateFunctionalProbe(
 		}
 	}
 
-	// Successful call — record the timestamp so the rate-limit kicks in
-	// for the next reconcile, then translate the per-stage outcome into
-	// the condition and the metric.
-	limiter.markCalled(key, now)
+	// Successful call. Build the verdict; commitMark fires AFTER the
+	// status patch succeeds so a failed patch doesn't burn a rate-limit
+	// slot. The metric records the per-stage outcome immediately because
+	// it observes work we already DID — independent of whether the status
+	// patch persists.
 	recordProbeResult(key, result)
+	commitMark := func() { limiter.markCalled(key, now) }
 
 	if result.AllPassed() {
 		return functionalProbeVerdict{
@@ -298,6 +378,8 @@ func evaluateFunctionalProbe(
 				Message:            "functional probe round-trip succeeded across all enabled stages",
 				ObservedGeneration: backend.Generation,
 			},
+			requeueAfter: rateLimit,
+			commitMark:   commitMark,
 		}
 	}
 
@@ -318,7 +400,26 @@ func evaluateFunctionalProbe(
 		downgradeReady: true,
 		readyReason:    reason,
 		readyMessage:   message,
+		requeueAfter:   rateLimit,
+		commitMark:     commitMark,
 	}
+}
+
+// requeueUntilNextProbe returns the duration from now until the rate-limit
+// window expires for a backend that was last called at lastAt. Returns
+// rateLimit when lastAt is the zero time (defensive — the caller shouldn't
+// reach this branch in that case). A non-positive remaining window
+// degenerates to a tight 1s requeue so the next reconcile fires soon
+// without busy-looping.
+func requeueUntilNextProbe(lastAt time.Time, rateLimit time.Duration, now time.Time) time.Duration {
+	if lastAt.IsZero() {
+		return rateLimit
+	}
+	remaining := rateLimit - now.Sub(lastAt)
+	if remaining <= 0 {
+		return time.Second
+	}
+	return remaining
 }
 
 // stageReasonAndMessage translates a failed ProbeResult into the operator-

@@ -111,6 +111,51 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 		}
 	})
 
+	t.Run("rate-limited second reconcile after failure preserves Ready downgrade", func(t *testing.T) {
+		// Regression guard: the watch event triggered by the failure-status
+		// patch causes an immediate second reconcile. With a tight rate-limit
+		// (so the second call is suppressed) AND an existing
+		// FunctionalProbeOK=False condition on the CR, the gate must
+		// re-apply the Ready downgrade — otherwise the upstream KV gate's
+		// Ready=True silently overwrites the failure verdict.
+		var calls atomic.Int64
+		srv := newProbeIntegrationServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
+			calls.Add(1)
+			return cacheserver.ProbeResult{
+				Backend: req.Backend, Ingest: cacheserver.ProbeStageFailed,
+				Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
+				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "synthesized event not in index"}},
+			}
+		})
+		r := &CacheBackendReconciler{
+			Client: k8s, Scheme: scheme, Log: logr.Discard(),
+			ProbeClient:    &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()},
+			ProbeRateLimit: time.Hour, // wide enough to guarantee the second reconcile is rate-limited
+		}
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(ctx, gatedLMCacheBackend("cache", ns)); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
+		patchLastEventAt(t, k8s, "cache", ns, time.Now())
+		reconcile(t, r, "cache", ns) // first probe call → FunctionalProbeOK=False, Ready=False
+		reconcile(t, r, "cache", ns) // rate-limited second reconcile
+
+		cb := getBackend(t, r, "cache", ns)
+		probe := findCondition(cb.Status.Conditions, conditionTypeFunctionalProbeOK)
+		if probe == nil || probe.Status != metav1.ConditionFalse || probe.Reason != reasonProbeIngestFailed {
+			t.Fatalf("FunctionalProbeOK after rate-limited reconcile = %+v, want False/ProbeIngestFailed (preserved)", probe)
+		}
+		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonProbeIngestFailed {
+			t.Fatalf("Ready after rate-limited reconcile = %+v, want False/ProbeIngestFailed (downgrade re-applied)", ready)
+		}
+		if calls.Load() != 1 {
+			t.Errorf("rate-limited reconcile must skip the HTTP call; got %d total calls", calls.Load())
+		}
+	})
+
 	t.Run("annotation bypass keeps Ready=True without calling /probe", func(t *testing.T) {
 		var calls atomic.Int64
 		srv := newProbeIntegrationServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
