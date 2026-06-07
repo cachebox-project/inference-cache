@@ -159,6 +159,65 @@ type CacheBackendSpec struct {
 	// +optional
 	Template *CacheBackendPodSpecOverride `json:"template,omitempty"`
 
+	// Resources are the compute resources requested + limited on the cache
+	// server container of a managed backend workload (the lmcache-server
+	// container for a Type=LMCache backend). The runtime adapter passes
+	// the admitted Requests/Limits maps through to Container.Resources;
+	// the kubebuilder default below stamps a conservative 4Gi request /
+	// 8Gi memory limit on the minimal-YAML path (when the field is
+	// OMITTED) so the cache server is bounded by the cgroup rather than
+	// node-pressure OOM-killed by the kubelet under heavy T2 write load —
+	// a cache-stress benchmark against an unlimited lmcache-server
+	// repeatedly OOM-killed the pod within minutes of T2 traffic, which
+	// the default limit eliminates. Operators tune per-deployment by
+	// overriding the field; an explicit empty `spec.resources: {}` is
+	// honored as suppression of the schema-stamped memory request/limit
+	// (no memory request, no memory limit rendered). When spec.autoscaling
+	// is set the runtime adapter still fills in a CPU request fallback
+	// (the HPA-utilization denominator) on top of the empty struct —
+	// that fallback is orthogonal to the memory default this field
+	// controls.
+	//
+	// Admission narrows the surface relative to the upstream
+	// ResourceRequirements shape: a non-empty `resources.claims` slice
+	// is rejected (the runtime adapter does not yet plumb pod-level
+	// `spec.resourceClaims`); strictly-negative `requests` / `limits`
+	// quantities are rejected (the CRD schema admits a leading "-" but
+	// the kubelet would later reject the pod); `requests` / `limits`
+	// keys that are not valid container resource names are rejected
+	// (standard names cpu/memory/ephemeral-storage admit; a
+	// `hugepages-<size>` name admits only when the size suffix parses
+	// as a strictly-positive quantity, e.g. "hugepages-2Mi"; any other
+	// name must be third-party vendor-prefixed like "nvidia.com/gpu" —
+	// the K8s-reserved `kubernetes.io/` and `requests.kubernetes.io/`
+	// prefixes are rejected); and the request/limit relationship is
+	// resource-aware — overcommittable resources (cpu, memory,
+	// ephemeral-storage) admit `limits[X] >= requests[X]`, while
+	// non-overcommittable resources (hugepages-*, vendor-prefixed
+	// extended resources) require `limits[X] == requests[X]` when both
+	// are set. Vendor-prefixed extended-resource quantities (e.g.
+	// nvidia.com/gpu) must be integer values — K8s allocates extended
+	// resources by whole units. See
+	// docs/design/cachebackend-api.md#resources for the full validator
+	// table.
+	//
+	// When spec.autoscaling is set, the adapter additionally fills in a
+	// CPU request fallback (250m) if this field omits one — a
+	// CPU-utilization HPA needs a *positive* CPU request as its
+	// denominator. The fallback never overwrites a positive
+	// operator-supplied value; a non-positive value (e.g.
+	// `requests.cpu: "0"`, which the admission validator admits as a
+	// valid kubelet shape for non-autoscaled pods) is treated as
+	// absent and replaced, because the HPA cannot use 0 as a
+	// denominator.
+	//
+	// External backends provision no workload of their own, so the field
+	// is inert for spec.type=External.
+	//
+	// +optional
+	// +kubebuilder:default={requests: {memory: "4Gi"}, limits: {memory: "8Gi"}}
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
 	// Endpoint is the operator-supplied network address for an
 	// External backend the controller does NOT provision. The field
 	// is type-scoped: it is REQUIRED when spec.type is External and

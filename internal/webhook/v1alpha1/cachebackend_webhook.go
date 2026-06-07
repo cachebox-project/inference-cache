@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -29,10 +30,10 @@ import (
 //
 // Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
 // spec.replicas=1, spec.integration.engine=vllm, spec.integration.role=
-// ReadWrite, spec.integration.failOpen=true) are expressed via
-// `+kubebuilder:default=` markers on the API types and stamped by the
-// apiserver before this webhook runs. The webhook only handles defaults
-// the schema cannot express:
+// ReadWrite, spec.integration.failOpen=true, spec.resources={requests:
+// {memory:4Gi}, limits:{memory:8Gi}}) are expressed via `+kubebuilder:default=`
+// markers on the API types and stamped by the apiserver before this webhook
+// runs. The webhook only handles defaults the schema cannot express:
 //
 //   - spec.integration.firstEventTimeout: the CRD-schema default only fires
 //     when spec.integration is present in the submitted object; when the
@@ -70,9 +71,9 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
 // defaults (spec.type, deploymentKind, replicas, integration.engine,
-// integration.role, integration.failOpen) ride on schema markers and are
-// stamped by the apiserver before this handler runs; the webhook only
-// handles the schema-inexpressible ones:
+// integration.role, integration.failOpen, resources) ride on schema
+// markers and are stamped by the apiserver before this handler runs;
+// the webhook only handles the schema-inexpressible ones:
 //
 //   - Materialises spec.integration solely to persist
 //     spec.integration.firstEventTimeout when the operator omits the
@@ -154,6 +155,13 @@ var DefaultValidationRules = []ValidationRule{
 	rejectStorageWithOverlongName,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
+	rejectResourceLimitsBelowRequests,
+	rejectRequestsOnlyForNonOvercommittableResources,
+	rejectResourceClaims,
+	rejectNegativeResourceQuantities,
+	rejectInvalidResourceNames,
+	rejectFractionalExtendedResources,
+	rejectMisalignedHugepageQuantities,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -189,7 +197,8 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
 // replicas=1, integration.engine=vllm, integration.role=ReadWrite,
-// integration.failOpen=true) rides on a `+kubebuilder:default=` marker and
+// integration.failOpen=true, resources={requests:{memory:4Gi},
+// limits:{memory:8Gi}}) rides on a `+kubebuilder:default=` marker and
 // is stamped by the apiserver before this handler runs. Note that the nested
 // integration.* markers only fire when spec.integration is already present
 // in the submitted object — when the operator omits the integration block
@@ -947,6 +956,355 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 			field.NewPath("spec", "autoscaling", "minReplicas"),
 			"spec.replicas=0 with spec.autoscaling enabled requires spec.autoscaling.minReplicas to be set explicitly (must be >=1). "+
 				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
+		),
+	}
+}
+
+// rejectResourceLimitsBelowRequests rejects spec.resources where the
+// request/limit relationship is invalid for the named resource. K8s
+// distinguishes two regimes:
+//
+//   - Overcommittable resources (cpu, memory, ephemeral-storage):
+//     limits[X] MUST be >= requests[X] when both are set. The reverse
+//     is unsatisfiable at scheduling time.
+//   - Non-overcommittable resources (hugepages-*, vendor-prefixed
+//     extended resources like "nvidia.com/gpu"): limits[X] MUST EQUAL
+//     requests[X] when both are set. Overcommitting these resources is
+//     not a meaningful kubelet concept — every page or device is
+//     dedicated, so request and limit must agree.
+//
+// The CRD-schema layer treats Requests/Limits as opaque maps, so an
+// inverted or mismatched shape is silently accepted by the apiserver
+// at write time and only fails when the rendered Pod tries to schedule.
+// Catching it at admission turns the failure into a field-scoped error
+// at `kubectl apply`. Missing Request OR missing Limit has no
+// comparison to make and admits.
+func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for name, req := range cb.Spec.Resources.Requests {
+		lim, ok := cb.Spec.Resources.Limits[name]
+		if !ok {
+			continue
+		}
+		path := field.NewPath("spec", "resources", "limits").Key(string(name))
+		if isOvercommittableResource(name) {
+			if lim.Cmp(req) >= 0 {
+				continue
+			}
+			errs = append(errs, field.Invalid(
+				path,
+				lim.String(),
+				fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
+			))
+			continue
+		}
+		// Non-overcommittable: request and limit must be exactly equal.
+		if lim.Cmp(req) == 0 {
+			continue
+		}
+		errs = append(errs, field.Invalid(
+			path,
+			lim.String(),
+			fmt.Sprintf("must equal spec.resources.requests[%s] (%s) — %q is a non-overcommittable resource (hugepages and extended resources require request == limit)", name, req.String(), name),
+		))
+	}
+	return errs
+}
+
+// isOvercommittableResource reports whether the resource name is one of
+// the three standard overcommittable container resources for which K8s
+// permits limits > requests. Every other resource (hugepages, vendor-
+// prefixed extended resources) is non-overcommittable and requires
+// request == limit when both are set.
+func isOvercommittableResource(name corev1.ResourceName) bool {
+	switch name {
+	case corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
+		return true
+	}
+	return false
+}
+
+// rejectMisalignedHugepageQuantities rejects hugepages-<size> quantities
+// that are not whole multiples of the page size encoded in the resource
+// name. The Linux kernel allocates hugepages in page-sized chunks, so
+// K8s rejects "hugepages-2Mi: 3Mi" (3Mi isn't divisible by 2Mi) on the
+// rendered Pod. Mirror that rule at admission so the operator sees a
+// field-scoped error at `kubectl apply`.
+//
+// The page size comes from the suffix the operator wrote, which
+// rejectInvalidResourceNames has already validated as a positive
+// quantity. A zero quantity admits — it means "no allocation" and
+// is trivially aligned to any page size.
+//
+// Non-hugepage resources are skipped — cpu/memory/ephemeral-storage
+// take any kubelet-valid quantity, and vendor-prefixed extended
+// resources are integer-checked by rejectFractionalExtendedResources.
+func rejectMisalignedHugepageQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	const hugePagesPrefix = "hugepages-"
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			s := string(name)
+			if !strings.HasPrefix(s, hugePagesPrefix) {
+				continue
+			}
+			suffix := strings.TrimPrefix(s, hugePagesPrefix)
+			pageSize, err := resource.ParseQuantity(suffix)
+			if err != nil || pageSize.Sign() <= 0 {
+				// rejectInvalidResourceNames already produced the
+				// malformed-name error; don't pile on with a redundant
+				// divisibility error against an undefined page size.
+				continue
+			}
+			pageVal := pageSize.Value()
+			qtyVal := qty.Value()
+			// Zero is trivially aligned; negative quantities are
+			// rejected by rejectNegativeResourceQuantities; we only
+			// gate on a positive, mis-multiple quantity.
+			if qtyVal <= 0 {
+				continue
+			}
+			if qtyVal%pageVal != 0 {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind).Key(s),
+					qty.String(),
+					fmt.Sprintf("must be a multiple of the page size %s — the Linux kernel allocates hugepages in whole-page chunks", suffix),
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
+}
+
+// rejectFractionalExtendedResources rejects vendor-prefixed extended-
+// resource quantities (e.g. nvidia.com/gpu) that carry a fractional
+// value. K8s allocates extended resources by whole units (a GPU is
+// either claimed or not — no "half a GPU"), so the apiserver rejects
+// fractional shapes on the rendered Pod. Mirror that rule at admission
+// so the operator sees a field-scoped error at `kubectl apply` rather
+// than later in a child-Deployment apply.
+//
+// Standard overcommittable resources (cpu, memory, ephemeral-storage)
+// admit fractional values — "250m" is the canonical kubelet CPU
+// shape and the rule MUST NOT touch them. Hugepages-* are checked
+// elsewhere (rejectInvalidResourceNames validates the suffix); their
+// quantity is also non-fractional by construction but we don't gate
+// on quantity here.
+func rejectFractionalExtendedResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			if isOvercommittableResource(name) {
+				continue
+			}
+			if strings.HasPrefix(string(name), "hugepages-") {
+				continue
+			}
+			if _, ok := qty.AsInt64(); !ok {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind).Key(string(name)),
+					qty.String(),
+					fmt.Sprintf("%q is an extended resource and must be an integer quantity — K8s allocates extended resources by whole units", name),
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
+}
+
+// rejectInvalidResourceNames rejects any spec.resources.requests or
+// spec.resources.limits key that fails the K8s container-resource-name
+// rules. The CRD schema treats ResourceList keys as opaque strings, so
+// an invalid name persists in etcd and only fails when the apiserver
+// rejects the rendered child pod. Rejecting at admission turns that
+// latent failure into a field-scoped error at `kubectl apply`.
+//
+// K8s container-resource rules are stricter than the bare
+// IsQualifiedName check: a valid container resource name is one of
+//   - the standard scheduled resources (cpu, memory, ephemeral-storage),
+//   - a hugepages-* variant (the prefix is K8s-reserved), or
+//   - a vendor-prefixed extended resource ("vendor.com/foo") that also
+//     satisfies IsQualifiedName.
+//
+// A bare unqualified name like "foo" is admitted by IsQualifiedName but
+// is NOT a valid container resource: the apiserver requires extended
+// resources to carry a "/" — the prefix is the vendor identity. We
+// apply the same rule here so the rejection is consistent with what
+// the rendered Pod would face downstream.
+func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name := range list {
+			if msg, ok := validateContainerResourceName(name); !ok {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind).Key(string(name)),
+					string(name),
+					msg,
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
+}
+
+// validateContainerResourceName mirrors the K8s container-resource-name
+// contract: standard names (cpu, memory, ephemeral-storage) admit
+// unconditionally; a `hugepages-<size>` name admits only when the size
+// suffix parses as a strictly-positive resource.Quantity (matching what
+// the apiserver requires of Container.Resources entries); any other
+// name must be vendor-prefixed (contain a "/") and satisfy
+// IsQualifiedName. Returns ("", true) on accept; ("…reason…", false) on
+// reject — the reason is surfaced verbatim in the field-scoped
+// admission error.
+func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
+	s := string(name)
+	switch name {
+	case corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
+		return "", true
+	}
+	const hugePagesPrefix = "hugepages-"
+	if strings.HasPrefix(s, hugePagesPrefix) {
+		suffix := strings.TrimPrefix(s, hugePagesPrefix)
+		qty, err := resource.ParseQuantity(suffix)
+		if err != nil || qty.Sign() <= 0 {
+			return fmt.Sprintf(
+				"%q is not a valid container resource name: %q must be followed by a positive page-size quantity (e.g. \"hugepages-2Mi\")",
+				s, hugePagesPrefix,
+			), false
+		}
+		return "", true
+	}
+	if !strings.Contains(s, "/") {
+		return fmt.Sprintf(
+			"%q is not a valid container resource name: must be one of %q/%q/%q, a hugepages-<size> variant (e.g. \"hugepages-2Mi\"), or a vendor-prefixed extended resource (e.g. \"nvidia.com/gpu\")",
+			s, corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage,
+		), false
+	}
+	// "kubernetes.io/" and "requests.kubernetes.io/" are K8s-reserved
+	// native-resource prefixes; extended resources MUST use a third-party
+	// vendor domain instead. Admitting them here would let a CR through
+	// that the apiserver rejects on the rendered Pod.
+	if strings.HasPrefix(s, "kubernetes.io/") || strings.HasPrefix(s, "requests.kubernetes.io/") {
+		return fmt.Sprintf(
+			"%q is not a valid container resource name: %q and %q are K8s-reserved prefixes — extended resources must use a third-party vendor domain (e.g. \"nvidia.com/gpu\")",
+			s, "kubernetes.io/", "requests.kubernetes.io/",
+		), false
+	}
+	if msgs := validation.IsQualifiedName(s); len(msgs) > 0 {
+		return fmt.Sprintf("%q is not a valid container resource name: %s", s, msgs[0]), false
+	}
+	return "", true
+}
+
+// rejectNegativeResourceQuantities rejects any strictly-negative
+// quantity in spec.resources.requests or spec.resources.limits. The
+// CRD schema serialises each entry as a resource.Quantity string, which
+// admits a leading "-" without complaint at structural validation —
+// the apiserver's Pod resource validator later rejects the pod with a
+// "must be greater than or equal to 0" error that the operator has to
+// chase through child Deployment events. Rejecting at admission turns
+// that latent failure into a field-scoped error at `kubectl apply`.
+//
+// Zero is allowed: a `requests.memory: "0"` shape is unusual but
+// explicitly valid under the kubelet's `>= 0` contract — an operator
+// who writes it is opting into "no guaranteed minimum", which is the
+// kubelet's default treatment of a missing request and a reasonable
+// shape to admit verbatim.
+func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			if qty.Sign() >= 0 {
+				continue
+			}
+			errs = append(errs, field.Invalid(
+				field.NewPath("spec", "resources", kind).Key(string(name)),
+				qty.String(),
+				"must be a non-negative quantity",
+			))
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
+}
+
+// rejectRequestsOnlyForNonOvercommittableResources rejects a non-
+// overcommittable resource (hugepages-*, vendor-prefixed extended
+// resource) declared in `spec.resources.requests` without a matching
+// entry in `spec.resources.limits`. K8s requires both halves for
+// non-overcommittable resources — the kubelet allocates whole pages
+// or devices, so the request and limit must be declared together and
+// be equal. Limits-only IS admitted by K8s (the apiserver auto-
+// populates requests from limits when only limits is set), so the
+// rule fires only on the requests-only direction. Overcommittable
+// resources (cpu, memory, ephemeral-storage) are unaffected — a
+// requests-only cpu / memory shape is the canonical kubelet "no upper
+// bound" pattern.
+func rejectRequestsOnlyForNonOvercommittableResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for name := range cb.Spec.Resources.Requests {
+		if isOvercommittableResource(name) {
+			continue
+		}
+		if _, ok := cb.Spec.Resources.Limits[name]; ok {
+			continue
+		}
+		qty := cb.Spec.Resources.Requests[name]
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "resources", "requests").Key(string(name)),
+			qty.String(),
+			fmt.Sprintf("%q is a non-overcommittable resource — it must also be set in spec.resources.limits with the same value (hugepages and extended resources require requests and limits to be declared together)", name),
+		))
+	}
+	return errs
+}
+
+// rejectResourceClaims rejects a non-empty spec.resources.claims slice.
+// corev1.ResourceRequirements exposes Claims for the Dynamic Resource
+// Allocation (DRA) feature, but the runtime adapter only copies
+// Container.Resources onto the rendered pod template — it does NOT
+// populate the matching pod.spec.resourceClaims that claim names
+// reference. Admitting a CR with non-empty Claims would render a
+// Deployment the apiserver rejects because the claim names don't
+// resolve at the pod level (silent breakage that's hard to triage from
+// the CacheBackend side). Reject loudly at admission until the renderer
+// learns to plumb the full pod-level DRA surface.
+//
+// A nil/empty Claims slice is the absence of the field and admits
+// unchanged — the rule fires only on operator-supplied entries.
+func rejectResourceClaims(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil || len(cb.Spec.Resources.Claims) == 0 {
+		return nil
+	}
+	return field.ErrorList{
+		field.Forbidden(
+			field.NewPath("spec", "resources", "claims"),
+			"spec.resources.claims is not supported in v1alpha1: the runtime adapter does not plumb pod.spec.resourceClaims, so a claim-bound container.resources.claims would render a pod the apiserver rejects",
 		),
 	}
 }

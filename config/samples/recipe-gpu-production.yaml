@@ -50,6 +50,28 @@ spec:
     minReplicas: 2
     maxReplicas: 6
     targetCPUUtilizationPercent: 70
+  # Per-replica resource budget for the lmcache-server container. Omit
+  # spec.resources entirely and the CRD-schema default supplies
+  # `requests.memory=4Gi`, `limits.memory=8Gi` — adequate for a small
+  # workload, conservative enough that the kubelet does not OOM-kill the
+  # cache pod from node-level memory pressure. The cgroup memory limit
+  # is still a hard ceiling: a working set larger than the configured
+  # limit will trigger an in-cgroup OOM-kill, so size the limit to your
+  # KV footprint. Production workloads should override the request/limit
+  # explicitly so the cache pod's cgroup matches what it will actually
+  # hold (and so the cluster-autoscaler reasons about correct headroom).
+  # 16Gi/24Gi below sizes for a Qwen2.5-7B prod shape — tune to yours.
+  #
+  # NOTE: this override is memory-only. The autoscaling block above
+  # requests a CPU-utilization HPA, so the controller fills in a 250m
+  # CPU request fallback automatically (an HPA needs a CPU request as
+  # its utilization denominator). Add `cpu: …` under requests below to
+  # pin the denominator explicitly if you want a different baseline.
+  resources:
+    requests:
+      memory: "16Gi"
+    limits:
+      memory: "24Gi"
   integration:
     engine: vllm
     role: ReadWrite
