@@ -167,7 +167,7 @@ type CacheBackendSpec struct {
 	// 8Gi memory limit on the minimal-YAML path (when the field is
 	// OMITTED) so the cache server is bounded by the cgroup rather than
 	// node-pressure OOM-killed by the kubelet under heavy T2 write load —
-	// a cache-stress benchmark against an un-limited lmcache-server
+	// a cache-stress benchmark against an unlimited lmcache-server
 	// repeatedly OOM-killed the pod within minutes of T2 traffic, which
 	// the default limit eliminates. Operators tune per-deployment by
 	// overriding the field; an explicit empty `spec.resources: {}` is
