@@ -283,23 +283,29 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 //   - any persisting pod's restart-count sum advanced (in-place
 //     container restart)
 //
-// Fail-soft: every error path (Pod list, Deployment list, Patch
-// failure) returns nil and only logs at V(1). Cascading is best-
-// effort recovery from a known soft-failure mode; it must never
-// escalate a transient apiserver hiccup into a Reconcile error that
-// backs off the rest of the reconcile.
+// Fail-soft: every error path (server-instance observation —
+// owned Deployment Get, ReplicaSet owner-chain Get, Pod list;
+// engine-cascade observation/annotate; status patch) logs at V(1)
+// and returns a positive requeue duration (typically
+// minServerRestartCascadeInterval) rather than escalating to the
+// caller as a Reconcile error. Cascading is best-effort recovery
+// from a known soft-failure mode; a transient apiserver hiccup must
+// not back off the rest of the reconcile, but it also must not
+// silently strand recovery — the requeue ensures the next reconcile
+// retries within the cascade window.
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
 	currentID, converged, err := r.currentServerInstanceUID(ctx, backend)
 	if err != nil {
-		// A transient observation failure (apiserver hiccup, RBAC
-		// flake on a ReplicaSet Get along the owner chain) leaves
-		// us unable to decide whether a cascade is needed. Return
-		// the rate-limit interval as the requeue hint so the
-		// reconcile retries within the same window we'd cascade in
-		// — without this, the only path back is unrelated watch
-		// events, which can leave the recovery stranded (especially
-		// in the selector-removed-but-still-injected case).
-		logger.V(1).Info("server-restart cascade skipped: cache-server pod list failed",
+		// A transient observation failure (owned Deployment Get,
+		// ReplicaSet owner-chain Get, or Pod list — see
+		// currentServerInstanceUID for the chain) leaves us unable
+		// to decide whether a cascade is needed. Return the rate-
+		// limit interval as the requeue hint so the reconcile
+		// retries within the same window we'd cascade in — without
+		// this, the only path back is unrelated watch events, which
+		// can leave the recovery stranded (especially in the
+		// selector-removed-but-still-injected case).
+		logger.V(1).Info("server-restart cascade skipped: server-instance observation failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return r.minServerRestartCascadeInterval()
 	}
