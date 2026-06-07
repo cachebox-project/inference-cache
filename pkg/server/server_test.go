@@ -1484,10 +1484,18 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 // request omits the legacy prefix_token_count (a chain-only caller). Without
 // this fallback the policy threshold would erroneously short-circuit every
 // chain request to NO_HINT regardless of its actual token budget.
+//
+// The policy explicitly sets MinimumMatchedTokens=0 so the §2.6 result-side
+// floor is disabled for this namespace. Otherwise the 48-token realized
+// match would clear the request-side gate (32) but fail the
+// DefaultMinimumMatchedTokens (64) the apiserver materializes on a bare CR,
+// and the test would assert PREFIX_MATCH for a configuration that production
+// would actually downgrade to NO_HINT. Making the opt-out explicit pins the
+// test scope to the request-side gate alone, matching its name.
 func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", MinimumPrefixTokens: 32},
+		{Namespace: "team-a", MinimumPrefixTokens: 32, MinimumMatchedTokens: 0},
 	})
 	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
 	counts := []int32{16, 16, 16}

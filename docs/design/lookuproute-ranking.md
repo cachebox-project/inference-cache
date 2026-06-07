@@ -566,12 +566,19 @@ full design behind the `UNKNOWN_*` codes.
 Every factor and threshold is tunable through a `RankerConfig`. Defaults
 are set so that:
 
-- A deployment with **no stats reported** behaves identically to the
-  pre-PR baseline (pressure factor 1, no `TENANT_HOT` candidates qualify).
+- A deployment with **no stats reported** sees pressure factor 1 and no
+  `TENANT_HOT` candidates qualify — those two strategies collapse to the
+  pre-PR baseline. The §2.6 matched-tokens floor still applies on top
+  (default 64), so a sub-floor prefix match downgrades to `NO_HINT`
+  whether stats are reported or not; set `minimumMatchedTokens: 0` to
+  reproduce the strict pre-floor every-overlap-is-`PREFIX_MATCH` ranker
+  behavior end-to-end.
 - A request with **no SLO hint** sees no freshness boost (slo bias 1).
 - Setting `PressureWeight = 0`, `SLOTightBias = 0`, and
   `TenantHotMaxAge = 0` simultaneously is equivalent to the original B6
-  `matched_tokens × freshness` ranker.
+  `matched_tokens × freshness` ranker over the strategies in this doc.
+  Combine with `minimumMatchedTokens: 0` on the `CachePolicy` to also
+  disable the §2.6 floor for the namespace.
 
 ## 7. The reason-code summary
 
@@ -579,7 +586,7 @@ are set so that:
 |---|---|---|
 | `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64). Sub-floor matches are filtered per-replica; if no replica clears, the response downgrades to `NO_HINT`.                                                                            | Strongest hint — route to top-ranked    |
 | `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
-| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), or any other unspecified outcome                  | Default routing; cache plane invisible  |
+| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), or any other unspecified outcome                  | Default routing; cache plane invisible  |
 | `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |
 | `UNKNOWN_MODEL`       | Prefix miss + `TENANT_HOT` miss + the tenant has entries but the requested `(tenant, model)` does not                                                                                                                                | Same — fail-open; configuration error   |
 | `UNKNOWN_HASH_SCHEME` | Prefix miss + `TENANT_HOT` miss + `(tenant, model)` has entries but the requested `hash_scheme` is absent for it                                                                                                                     | Same — fail-open; configuration error   |
