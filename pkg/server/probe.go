@@ -132,8 +132,8 @@ const (
 // An empty BackendType on a ProbeRequest is treated as LMCache to match the
 // CacheBackend CRD's defaulter (spec.type defaults to LMCache via the
 // kubebuilder marker). Operators who run the probe by hand against a non-
-// LMCache backend must set BackendType explicitly; the controller-wiring
-// follow-up always reads spec.type from the CR and never sends empty.
+// LMCache backend must set BackendType explicitly; the CacheBackend
+// reconciler always reads spec.type from the CR and never sends empty.
 const BackendTypeLMCache = "LMCache"
 
 // ProbeRequest carries the parameters the probe needs to synthesize a
@@ -146,7 +146,7 @@ const BackendTypeLMCache = "LMCache"
 // same-name CacheBackends in different namespaces from colliding in the
 // reserved replica id, callers MUST pass a globally-unique form — the
 // canonical shape is `<namespace>/<name>` (matching K8s resource identity).
-// The controller-wiring follow-up always sends `<namespace>/<name>`; the
+// The CacheBackend reconciler always sends `<namespace>/<name>`; the
 // HTTP handler validates that the field is non-empty but does not enforce
 // the slash format, since hand-invoked probes on a single-namespace
 // install can use any unique string.
@@ -163,8 +163,8 @@ type ProbeRequest struct {
 }
 
 // ProbeResult is the per-stage outcome returned to the controller. The
-// controller maps a stage's failed result onto the corresponding
-// FunctionalProbeOK condition reason (controller-wiring follow-up):
+// CacheBackend reconciler maps a stage's failed result onto the
+// corresponding FunctionalProbeOK condition reason:
 //
 //	ingest  failed → ProbeIngestFailed
 //	routing failed → ProbeRoutingFailed

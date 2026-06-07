@@ -256,6 +256,27 @@ func evaluateFunctionalProbe(
 	rateLimit time.Duration,
 	now time.Time,
 ) functionalProbeVerdict {
+	// Probe disabled (nil client, empty URL): the gate is structurally
+	// off. Don't publish a fresh condition — a FunctionalProbeOK on a
+	// reconciler that never calls /probe would just be misleading. But a
+	// previously-written condition would persist forever without our help,
+	// so if one exists, ask the caller to remove it.
+	//
+	// This check runs BEFORE the upstream-not-Ready short-circuit on
+	// purpose: a backend in RolloutInProgress / AwaitingFirstKVEvent /
+	// ReplicasUnavailable is not "ready enough to probe", but if the
+	// operator just disabled --server-probe-url, the stale condition
+	// SHOULD still be cleaned up regardless of upstream readiness. The
+	// alternative (cleanup gated on upstream Ready=True) leaves a stale
+	// FunctionalProbeOK on every not-yet-ready backend until the upstream
+	// gate flips, which can be arbitrarily long.
+	if probe == nil || probe.ProbeURL == "" {
+		if existing := meta.FindStatusCondition(backend.Status.Conditions, conditionTypeFunctionalProbeOK); existing != nil {
+			return functionalProbeVerdict{removeCondition: true}
+		}
+		return functionalProbeVerdict{}
+	}
+
 	// Cascade prevention: the probe answers "is the cache plane round-trip
 	// working for this backend?" but only when the rest of the readiness
 	// chain has already said the backend is otherwise ready. A broken
@@ -280,18 +301,6 @@ func evaluateFunctionalProbe(
 				ObservedGeneration: backend.Generation,
 			},
 		}
-	}
-
-	// Probe disabled (nil client, empty URL): the gate is structurally
-	// off. Don't publish a fresh condition — a FunctionalProbeOK on a
-	// reconciler that never calls /probe would just be misleading.
-	// But a previously-written condition would persist forever without
-	// our help, so if one exists, ask the caller to remove it.
-	if probe == nil || probe.ProbeURL == "" {
-		if existing := meta.FindStatusCondition(backend.Status.Conditions, conditionTypeFunctionalProbeOK); existing != nil {
-			return functionalProbeVerdict{removeCondition: true}
-		}
-		return functionalProbeVerdict{}
 	}
 
 	// Rate limit. Multiple reconciles within the window must inherit the

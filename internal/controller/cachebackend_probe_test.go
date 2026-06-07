@@ -43,8 +43,10 @@ func newProbeBackend(name string) *cachev1alpha1.CacheBackend {
 }
 
 // fakeProbeServer is a minimal /probe responder that returns whatever
-// ProbeResult is configured. nil callback → unreachable (closes the conn
-// after the connection accepts). Counts calls so rate-limit tests can
+// ProbeResult is produced by the supplied callback. `respond` MUST be
+// non-nil — the helper does not synthesize an unreachable mode (transport-
+// failure tests build a closed-server URL directly; see
+// TestProbeClientRunTransportError). Counts calls so rate-limit tests can
 // assert "exactly one probe call across these reconciles".
 type fakeProbeServer struct {
 	*httptest.Server
@@ -53,6 +55,9 @@ type fakeProbeServer struct {
 
 func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest) cacheserver.ProbeResult) *fakeProbeServer {
 	t.Helper()
+	if respond == nil {
+		t.Fatalf("newFakeProbeServer: respond callback must be non-nil")
+	}
 	f := &fakeProbeServer{}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.calls.Add(1)
@@ -275,6 +280,32 @@ func TestEvaluateFunctionalProbeDisabledClearsExistingCondition(t *testing.T) {
 	v2 := evaluateFunctionalProbe(context.Background(), backendFresh, kvReadinessTrue, nil, &probeRateLimiter{}, time.Second, time.Now())
 	if v2.removeCondition || v2.shouldWriteCondition {
 		t.Errorf("nil client + no existing condition must be a no-op; got %+v", v2)
+	}
+}
+
+// TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady is the
+// regression unit for a Codex round-2 finding: the disabled-client cleanup
+// must run BEFORE the upstream-not-Ready short-circuit. Otherwise a backend
+// in RolloutInProgress / AwaitingFirstKVEvent / ReplicasUnavailable would
+// keep its stale FunctionalProbeOK condition indefinitely after
+// --server-probe-url is disabled, because the cascade-short-circuit would
+// return an empty verdict before the cleanup ran.
+func TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady(t *testing.T) {
+	backend := newProbeBackend("cb")
+	backend.Status.Conditions = []metav1.Condition{{
+		Type:   conditionTypeFunctionalProbeOK,
+		Status: metav1.ConditionTrue,
+		Reason: reasonProbeOK,
+	}}
+	// Upstream says Ready=False (e.g. AwaitingFirstKVEvent).
+	upstream := kvReadinessTrue
+	upstream.readyStatus = metav1.ConditionFalse
+	upstream.readyReason = reasonAwaitingFirstKVEvent
+
+	// Probe client is disabled. The cleanup MUST still fire.
+	v := evaluateFunctionalProbe(context.Background(), backend, upstream, nil, &probeRateLimiter{}, time.Second, time.Now())
+	if !v.removeCondition {
+		t.Fatalf("disabled-client cleanup must run regardless of upstream readiness; got %+v", v)
 	}
 }
 
