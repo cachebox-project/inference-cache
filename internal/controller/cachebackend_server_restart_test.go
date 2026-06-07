@@ -1102,6 +1102,107 @@ func TestReconcileServerInstance_NonInjectedPodsDoNotCascade(t *testing.T) {
 	}
 }
 
+// TestReconcileServerInstance_SelfTargetGuardSkipsOwnDeployment
+// drives the self-induced-rollout-loop scenario: an over-broad
+// spec.engineSelector overlaps the cache-server pod's labels AND
+// the pod webhook stamps the cache-server pod with the backend's
+// injected-by + injected-by-uid annotations. Without the
+// self-target guard, the cascade would pull the cache-server's own
+// Deployment into the target set; annotating it would roll the
+// cache-server, the controller would observe the new pod's UID,
+// fire another cascade, and loop forever. The guard recognizes the
+// canonical name (backend.Name == owned-Deployment name) and skips
+// it. The engine Deployment must still be annotated — the guard
+// must be narrow.
+func TestReconcileServerInstance_SelfTargetGuardSkipsOwnDeployment(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Establish baseline.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+
+	// Stamp the cache-server pod with this backend's injected-by
+	// annotations — simulating the misconfiguration the guard
+	// defends against (webhook decided to inject the cache-server
+	// pod because its labels matched spec.engineSelector).
+	live := &corev1.Pod{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverPod.Name, Namespace: f.cacheNS}, live); err != nil {
+		t.Fatalf("get cache-server pod: %v", err)
+	}
+	if live.Annotations == nil {
+		live.Annotations = map[string]string{}
+	}
+	live.Annotations[podwebhook.AnnotationInjectedBy] = f.cacheNS + "/" + f.cacheName
+	live.Annotations[podwebhook.AnnotationInjectedByUID] = string(f.backend.UID)
+	if err := f.r.Update(context.Background(), live); err != nil {
+		t.Fatalf("stamp cache-server pod with injected-by annotations: %v", err)
+	}
+
+	// Replace the cache-server pod to trigger a cascade. Use a new
+	// UID so the cascade decision fires.
+	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
+		t.Fatalf("delete old cache-server pod: %v", err)
+	}
+	tru := true
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-replacement",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-replacement",
+			Labels:    selectorLabels(f.cacheName),
+			Annotations: map[string]string{
+				// Replacement also carries the misconfigured
+				// injected-by stamp.
+				podwebhook.AnnotationInjectedBy:    f.cacheNS + "/" + f.cacheName,
+				podwebhook.AnnotationInjectedByUID: string(f.backend.UID),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement cache-server pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready replacement: %v", err)
+	}
+
+	// Wait past the rate-limit window.
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-replacement wait = %v, want 0", wait)
+	}
+
+	// Self-target guard: the cache-server Deployment must NOT have
+	// been annotated, even though its pod carried the matching
+	// injected-by stamp.
+	ownDep := &appsv1.Deployment{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.cacheName, Namespace: f.cacheNS}, ownDep); err != nil {
+		t.Fatalf("get cache-server Deployment: %v", err)
+	}
+	if _, ok := ownDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("cache-server's own Deployment was annotated for cascade — self-induced rollout loop would follow")
+	}
+
+	// The engine Deployment SHOULD still have been annotated — the
+	// guard must be narrow (only skip the backend's own Deployment).
+	f.reloadEngineDep(t)
+	want := serverInstanceID(replacement)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("engine Deployment cascade annotation = %q, want %q (guard must be narrow — engine cascades still fire)", got, want)
+	}
+}
+
 // TestReconcileServerInstance_ShadowRecoversBaselineFromPatchFailure
 // drives the patch-failure-window scenario: a transient
 // status-subresource patch failure on the first observation leaves

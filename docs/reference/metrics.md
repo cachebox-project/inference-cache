@@ -13,10 +13,16 @@ silently.
 ## Surface conventions
 
 - **Namespace.** Every metric the cache plane owns is prefixed
-  `inferencecache_*` (constant `metricNamespace` in
-  [`pkg/server/metrics.go`](../../pkg/server/metrics.go)). Anything not
-  matching that prefix is from a standard collector (see below) and not part
-  of the §4.3 schema.
+  `inferencecache_*`, in both binaries. Server-binary metrics derive
+  the prefix from the `metricNamespace` constant in
+  [`pkg/server/metrics.go`](../../pkg/server/metrics.go); controller-
+  binary metrics declare it inline on each `prometheus.NewXVec`
+  declaration in `internal/controller/` (see
+  `backendServerRestartCascadesTotal` for the pattern) — the two
+  processes use separate Prometheus registries, so no shared
+  package-level constant is used to enforce the prefix today.
+  Anything not matching that prefix is from a standard collector
+  (see below) and not part of the §4.3 schema.
 - **Registry isolation.** The server uses a **per-`Service` Prometheus
   registry**, not the global default. This keeps the server binary's metrics
   separate from the controller binary's controller-runtime registry, and lets

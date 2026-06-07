@@ -902,6 +902,29 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 		if !ok {
 			continue
 		}
+		// Self-target guard: never cascade-annotate the backend's own
+		// cache-server Deployment. The canonical owned Deployment is
+		// named after the backend (see buildDeployment in
+		// cachebackend_controller.go); podOwningDeployment validates
+		// UID at every link in the owner chain, so a depName equal to
+		// backend.Name here means we resolved to OUR Deployment, not
+		// a foreign Deployment squatting on the same name.
+		//
+		// Without this guard, a misconfigured spec.engineSelector that
+		// overlaps the cache-server pod's labels — combined with a
+		// webhook decision to stamp the cache-server pod with this
+		// backend's injected-by + injected-by-uid annotations — would
+		// pull the cache-server Deployment into the target set. The
+		// resulting annotate-patch bumps the pod template, the
+		// Deployment rolls a new cache-server pod, the controller
+		// observes the new pod's UID, and reconcileServerInstance
+		// fires another cascade — an infinite self-induced rollout
+		// loop. The cache-server's own recovery is observation-driven
+		// (status.observedServerInstance); a forced rollout from
+		// this path is never the right answer.
+		if depName == backend.Name {
+			continue
+		}
 		// First write wins; if a later pod resolves the same name to a
 		// different UID, that means the chain has churned since the
 		// pod List — keep the UID we saw first (the patch step will
