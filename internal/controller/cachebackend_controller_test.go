@@ -12,6 +12,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -504,6 +505,16 @@ func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T)
 	if got.Status.FirstKVEventObservedAt == nil {
 		t.Fatalf("status.firstKVEventObservedAt was clobbered on External transition; it must survive as a monotonic latch")
 	}
+	// The in-memory cascade shadow MUST also be cleared. A retained
+	// shadow would let a later External→managed transition resolve
+	// effectivePrior to the prior-period currentID and false-cascade
+	// the engine fleet on the first new Ready pod.
+	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
+	if r.serverInstanceCascade != nil {
+		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
+			t.Fatalf("cascade shadow = %q after managed→External transition; want cleared (a lingering shadow would false-cascade on the return path)", shadow)
+		}
+	}
 }
 
 // TestReconcileSwitchToStatefulSetClearsObservedServerInstance asserts
@@ -531,6 +542,61 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	got := getBackend(t, r, "cache", "ns1")
 	if got.Status.ObservedServerInstance != "" {
 		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→unmanaged transition", got.Status.ObservedServerInstance)
+	}
+	// In-memory shadow must also be cleared on the unmanaged path.
+	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
+	if r.serverInstanceCascade != nil {
+		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
+			t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
+		}
+	}
+}
+
+// TestReconcileSwitchToInvalidStorageClearsObservedServerInstance
+// asserts that the InvalidStorage gate (reconcileInvalidStorage)
+// clears status.observedServerInstance AND wipes the in-process
+// cascade shadow. Without the clearing, a backend whose
+// configuration is later corrected would inherit the prior-period
+// baseline and false-cascade on the first new Ready pod even
+// though the engine fleet has been waiting on a fail-open backend
+// the whole time.
+func TestReconcileSwitchToInvalidStorageClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// Plant a baseline as if a prior managed period had observed a
+	// Ready cache-server pod.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+
+	// Flip into the InvalidStorage gate: replicas > 1 with a single
+	// ReadWriteOnce PVC is the canonical trigger.
+	switching := getBackend(t, r, "cache", "ns1")
+	two := int32(2)
+	switching.Spec.Replicas = &two
+	switching.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{
+			Size: resource.MustParse("10Gi"),
+		},
+	}
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to invalid storage: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on InvalidStorage gate", got.Status.ObservedServerInstance)
+	}
+	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
+	if r.serverInstanceCascade != nil {
+		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
+			t.Fatalf("cascade shadow = %q after InvalidStorage gate; want cleared (lingering shadow would false-cascade when the operator fixes the config)", shadow)
+		}
 	}
 }
 

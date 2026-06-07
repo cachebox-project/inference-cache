@@ -205,6 +205,23 @@ func (s *serverInstanceCascade) lastAttempt(key cascadeKey) string {
 	return s.shadow[key]
 }
 
+// clear drops both the rate-limit timestamp AND the shadow baseline
+// for the given key. Called when the backend transitions out of the
+// managed path (External, unsupported runtime, invalid storage) and
+// its status.observedServerInstance is cleared on the cluster: the
+// shadow must follow the cluster-visible contract, otherwise a
+// later managed→External→managed transition in the same controller
+// process would still read the prior period's baseline from the
+// shadow and misclassify the first new Ready pod as a replacement
+// instead of an empty→set first observation, triggering an
+// unnecessary engine cascade.
+func (s *serverInstanceCascade) clear(key cascadeKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.lastAt, key)
+	delete(s.shadow, key)
+}
+
 // canCascade reports whether enough time has elapsed since the previous
 // cascade for the given backend. If true, it stamps now as the most
 // recent cascade time. If false, it returns the remaining wait until the
@@ -225,6 +242,32 @@ func (s *serverInstanceCascade) canCascade(key cascadeKey, now time.Time, window
 		return true, 0
 	}
 	return false, window - elapsed
+}
+
+// clearServerInstanceLatchShadow wipes the in-memory shadow + rate-
+// limit timestamp for this backend. Called from lifecycle paths that
+// intentionally clear the on-cluster status.observedServerInstance
+// field (reconcileExternal, reconcileUnmanaged, reconcileInvalidStorage).
+// The shadow must follow the cluster-visible field; otherwise a
+// later managed→External→managed (or invalid→fixed) transition in
+// the same controller process would consult the lingering shadow,
+// resolve effectivePrior to the stale prior-period value, and
+// misclassify the first new Ready pod as a replacement —
+// triggering an unnecessary engine cascade even though the
+// documented contract says the latch is "cleared/inert" between
+// managed periods.
+//
+// Safe to call before serverInstanceCascade has been lazy-inited
+// (no-op in that case).
+func (r *CacheBackendReconciler) clearServerInstanceLatchShadow(backend *cachev1alpha1.CacheBackend) {
+	if r.serverInstanceCascade == nil {
+		return
+	}
+	r.serverInstanceCascade.clear(cascadeKey{
+		namespace: backend.Namespace,
+		name:      backend.Name,
+		uid:       string(backend.UID),
+	})
 }
 
 // minServerRestartCascadeInterval returns the effective rate-limit window

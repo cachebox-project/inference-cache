@@ -384,6 +384,11 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // it on its own; an External backend whose engine pods still report KV events
 // legitimately keeps it).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below — see
+	// clearServerInstanceLatchShadow for why a lingering shadow
+	// across managed→External→managed would false-cascade.
+	r.clearServerInstanceLatchShadow(backend)
 	return r.patchStatus(ctx, backend, func() {
 		// TrimSpace before every decision. Admission rejects a
 		// whitespace-only endpoint at write time, but a pre-existing
@@ -460,6 +465,9 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
 	}
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below.
+	r.clearServerInstanceLatchShadow(backend)
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
@@ -1053,9 +1061,23 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below: a retained
+	// shadow would surface a stale pod identifier while no cache-
+	// server Deployment exists, and would drive a false cascade
+	// when the operator fixes the storage/replicas configuration
+	// and the controller flips back to the managed path.
+	r.clearServerInstanceLatchShadow(backend)
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — cleanupOwnedWorkload
+		// has just deleted the previously-running Deployment (if any)
+		// and we refuse to provision a new one until the operator
+		// fixes the configuration. A retained UID would advertise a
+		// stale identifier and feed a false cascade on the fix-up
+		// transition.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
