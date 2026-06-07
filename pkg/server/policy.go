@@ -356,9 +356,13 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Accept any version in [PolicyMinimumAcceptedVersion, PolicyPropagationVersion].
-		// Anything outside that range — either a controller too old for fields the
-		// server now load-bears on, or a controller too new for the server to
-		// recognize — fails loud with an explicit "unsupported version".
+		// Anything outside that range is a hard 400: a controller too old for
+		// fields the server now load-bears on (`unsupported policy snapshot
+		// version` here), or a controller too new for the server to recognize
+		// (typically caught one layer earlier by DisallowUnknownFields above,
+		// which surfaces as a `decode policy snapshot: json: unknown field "..."`
+		// — also fail-loud, just attributed to the decoder rather than this
+		// branch). Both outcomes give the operator a specific diagnostic.
 		if snap.Version < PolicyMinimumAcceptedVersion || snap.Version > PolicyPropagationVersion {
 			http.Error(w, "unsupported policy snapshot version\n", http.StatusBadRequest)
 			return

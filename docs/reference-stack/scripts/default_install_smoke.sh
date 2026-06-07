@@ -857,8 +857,17 @@ fi
 #      sample carries minimumMatchedTokens explicitly (config/samples/
 #      cache_v1alpha1_cachepolicy.yaml).
 #
-# Without the pushed policy, the trivial-match lookup would be PREFIX_MATCH.
-# This avoids engine pods/images, model traffic, and any new transport.
+# Note: with no CachePolicy at all the server-wide DefaultMinimumMatchedTokens
+# (= 64) ALSO downgrades the trivial 32-token match to NO_HINT — the no-policy
+# fallback fires the same floor as the sample CR sets. The point of the
+# trivial-match assertion is therefore "the pushed CR did not silently drop the
+# result-side floor" rather than "without the CR this would have been
+# PREFIX_MATCH". The low-prefix lookup is the standalone proof that policy
+# adoption happened (its NO_HINT outcome IS owned by the pushed
+# minimumPrefixTokens: 32 — no-policy would have ungated the request and
+# returned PREFIX_MATCH on the 64-token stored prefix). Together they cover
+# both policy enforcement axes end-to-end. Avoids engine pods/images, model
+# traffic, and any new transport.
 log "seeding two prefixes and asserting CachePolicy minimumPrefixTokens (request-side gate) AND minimumMatchedTokens (result-side floor) are both enforced by LookupRoute"
 policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"

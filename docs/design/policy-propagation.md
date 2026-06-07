@@ -180,10 +180,16 @@ intervention.
 }
 ```
 
-- `version` — schema version. Bumped on a breaking change. The server
-  rejects any value it does not recognize (HTTP 400). Currently `4`
-  (bumped from `1` to `2` when `tenants` was added, to `3` when
-  `policies[].eviction` was added, and to `4` when
+- `version` — schema version. Bumped on every schema change so version
+  skew is observable; **whether the bump is rejected at decode is set
+  separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
+  Rollout asymmetry note in §Versioning and forward-compat below. v4
+  in particular is additive and defaultable, so the v4 server still
+  accepts v3 bodies; a hypothetical breaking change would bump
+  `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
+  value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
+  (HTTP 400). Currently `4` (bumped from `1` to `2` when `tenants` was
+  added, to `3` when `policies[].eviction` was added, and to `4` when
   `policies[].minimumMatchedTokens` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
