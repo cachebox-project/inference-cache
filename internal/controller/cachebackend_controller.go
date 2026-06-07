@@ -176,6 +176,36 @@ type CacheBackendReconciler struct {
 	// shorter value so they don't bake the 30s production delay into
 	// per-test runtime.
 	MatchedEnginePodsRequeueInterval time.Duration
+
+	// ProbeClient is the controller's POST /probe wrapper.
+	// Nil disables the functional-probe gate — the FunctionalProbeOK
+	// condition is not written and the Ready gate composition is unchanged
+	// from Stage 1's KV-event-only gate. Production wiring always sets it
+	// (cmd/controller/main.go); fake-client unit tests that don't exercise
+	// the probe gate leave it nil; envtest integration tests inject a
+	// httptest-bound client.
+	ProbeClient *ProbeClient
+
+	// ProbeRateLimit caps the probe call frequency per CacheBackend. Zero
+	// means "use [DefaultProbeRateLimit]" (~30s, matching the ticket's
+	// "max once per CacheBackend per ~30s" requirement). Tests override
+	// to keep runtime down.
+	ProbeRateLimit time.Duration
+
+	// probeLimiter is the per-(namespace, name) "last successful probe call"
+	// cache backing the rate limit. Allocated lazily on first reconcile so a
+	// fresh reconciler doesn't carry the map until the gate is needed.
+	probeLimiter probeRateLimiter
+}
+
+// probeRateLimit returns the effective rate-limit for the functional-probe
+// gate, honoring the per-reconciler override and falling back to
+// [DefaultProbeRateLimit].
+func (r *CacheBackendReconciler) probeRateLimit() time.Duration {
+	if r.ProbeRateLimit > 0 {
+		return r.ProbeRateLimit
+	}
+	return DefaultProbeRateLimit
 }
 
 // matchedEnginePodsRequeueInterval returns the effective cadence for this
@@ -428,6 +458,14 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// Clear any Degraded condition left over from a prior managed state;
 		// External readiness is the endpoint check above, not the KV gate.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		// FunctionalProbeOK doesn't apply to External backends — the probe
+		// gate only fires inside updateManagedStatus, and the controller
+		// doesn't drive any cache-plane round-trip for an external endpoint
+		// (the gate only applies to managed backends). Clear any
+		// FunctionalProbeOK left over from a prior managed state so the
+		// External-mode CR doesn't surface a stale condition that no
+		// reconcile path will ever update.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 	})
 }
 
@@ -447,6 +485,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 	})
 }
 
@@ -1229,6 +1268,16 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// Only the workload-Available state is gated; every other Deployment state
 	// passes through unchanged.
 	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now)
+	// Layer the functional-probe gate on top of the
+	// KV-event verdict. It only fires when the upstream gate would
+	// otherwise say Ready=True — a backend that's already Ready=False for
+	// some other reason can't be diagnosed by a downstream probe, and the
+	// rate-limit caps a healthy-backend probe to ~once per 30s. The verdict
+	// may downgrade Ready to False with a probe-specific reason; the
+	// condition itself is published verbatim in the patchStatus closure
+	// below so it lands atomically alongside Ready/Progressing/Degraded.
+	probeVerdict := evaluateFunctionalProbe(ctx, backend, gate, r.ProbeClient, &r.probeLimiter, r.probeRateLimit(), now)
+	gate = downgradeReadyVerdict(gate, probeVerdict)
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
@@ -1273,6 +1322,17 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			Message:            progressingMessage,
 			ObservedGeneration: publishedGen,
 		})
+		// Functional-probe condition. The gate decides
+		// whether to write it at all this reconcile (skipped when the
+		// probe is disabled, rate-limited, or upstream Ready=False so the
+		// inherited value persists). meta.SetStatusCondition handles the
+		// write-only-on-change contract — same as the other three
+		// conditions above.
+		if probeVerdict.shouldWriteCondition {
+			cond := probeVerdict.condition
+			cond.ObservedGeneration = publishedGen
+			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+		}
 	})
 	return gate.requeueAfter, err
 }

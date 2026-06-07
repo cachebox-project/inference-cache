@@ -1,0 +1,475 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+)
+
+// kvReadinessTrue is the "everything upstream said Ready=True" baseline
+// the gate composes on. The probe gate only fires from this starting
+// state; from any other state the gate is a no-op.
+var kvReadinessTrue = kvReadiness{
+	readyStatus:     metav1.ConditionTrue,
+	readyReason:     reasonKVEventsObserved,
+	readyMessage:    "ok",
+	degradedStatus:  metav1.ConditionFalse,
+	degradedReason:  reasonNotDegraded,
+	degradedMessage: "not degraded",
+}
+
+func newProbeBackend(name string) *cachev1alpha1.CacheBackend {
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:        cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"},
+		},
+	}
+}
+
+// fakeProbeServer is a minimal /probe responder that returns whatever
+// ProbeResult is configured. nil callback → unreachable (closes the conn
+// after the connection accepts). Counts calls so rate-limit tests can
+// assert "exactly one probe call across these reconciles".
+type fakeProbeServer struct {
+	*httptest.Server
+	calls atomic.Int64
+}
+
+func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest) cacheserver.ProbeResult) *fakeProbeServer {
+	t.Helper()
+	f := &fakeProbeServer{}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.calls.Add(1)
+		var req cacheserver.ProbeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(respond(req))
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+// TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits pins the cascade-
+// prevention rule the gate has to honor: when the KV-event verdict already
+// says Ready=False, the probe call is skipped (no metric, no HTTP, no
+// condition). A broken upstream can't be diagnosed by a downstream probe,
+// and bombarding the server for backends that can't be Ready anyway is
+// pure noise.
+func TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	upstream := kvReadinessTrue
+	upstream.readyStatus = metav1.ConditionFalse
+	upstream.readyReason = reasonAwaitingFirstKVEvent
+
+	v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), upstream,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if v.shouldWriteCondition {
+		t.Errorf("upstream Ready=False must not write FunctionalProbeOK; got %+v", v.condition)
+	}
+	if srv.calls.Load() != 0 {
+		t.Errorf("expected 0 probe HTTP calls, got %d", srv.calls.Load())
+	}
+}
+
+// TestEvaluateFunctionalProbeBypassAnnotation pins the operator escape
+// hatch: annotation inferencecache.io/skip-functional-probe="true" flips
+// FunctionalProbeOK=True with reason=ProbeBypassed and short-circuits the
+// HTTP call, so the Ready gate is unaffected and the server isn't probed.
+func TestEvaluateFunctionalProbeBypassAnnotation(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		t.Fatalf("probe call should be skipped when bypassed")
+		return cacheserver.ProbeResult{}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	backend := newProbeBackend("cb")
+	backend.Annotations = map[string]string{annotationSkipFunctionalProbe: "true"}
+
+	v := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if !v.shouldWriteCondition || v.condition.Status != metav1.ConditionTrue || v.condition.Reason != reasonProbeBypassed {
+		t.Fatalf("want FunctionalProbeOK=True/ProbeBypassed; got %+v", v.condition)
+	}
+	if v.downgradeReady {
+		t.Errorf("bypass must NOT downgrade Ready")
+	}
+}
+
+// TestEvaluateFunctionalProbeBypassParserIsStrict pins the conservative
+// annotation parser: only the exact string "true" counts. Any other value
+// (capitalized, whitespace, "1", "yes") leaves the gate enabled, so a
+// fat-fingered annotation can't quietly disable the gate.
+func TestEvaluateFunctionalProbeBypassParserIsStrict(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	for _, value := range []string{"True", "TRUE", "1", "yes", " true ", ""} {
+		t.Run(fmt.Sprintf("value=%q", value), func(t *testing.T) {
+			backend := newProbeBackend("cb")
+			backend.Annotations = map[string]string{annotationSkipFunctionalProbe: value}
+			v := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue,
+				client, &probeRateLimiter{}, time.Second, time.Now())
+			if v.shouldWriteCondition && v.condition.Reason == reasonProbeBypassed {
+				t.Errorf("value %q must not be parsed as bypass", value)
+			}
+		})
+	}
+}
+
+// TestEvaluateFunctionalProbeNilClientDisabled pins the "no probe
+// configured" path. A nil/empty client is the local-dev shape; the gate
+// must NOT write a condition that pretends the probe ran.
+func TestEvaluateFunctionalProbeNilClientDisabled(t *testing.T) {
+	v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue,
+		nil, &probeRateLimiter{}, time.Second, time.Now())
+	if v.shouldWriteCondition {
+		t.Fatalf("nil client must not write a condition; got %+v", v.condition)
+	}
+}
+
+// TestEvaluateFunctionalProbeRateLimit pins the per-(namespace, name)
+// rate-limit: a successful call records a timestamp; a second invocation
+// inside the window skips the HTTP call and inherits the condition.
+func TestEvaluateFunctionalProbeRateLimit(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{Backend: "team-a/cb", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+	limiter := &probeRateLimiter{}
+	now := time.Unix(1_000_000, 0)
+
+	v1 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, 30*time.Second, now)
+	if !v1.shouldWriteCondition || v1.condition.Status != metav1.ConditionTrue {
+		t.Fatalf("first call should write OK; got %+v", v1.condition)
+	}
+
+	// Same instant — well inside the 30s window — must NOT call again.
+	v2 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, 30*time.Second, now.Add(5*time.Second))
+	if v2.shouldWriteCondition {
+		t.Errorf("rate-limited call must not write a condition; got %+v", v2.condition)
+	}
+	if srv.calls.Load() != 1 {
+		t.Errorf("expected exactly 1 probe call across two reconciles within the rate-limit window; got %d", srv.calls.Load())
+	}
+
+	// After the window — a fresh call lands.
+	v3 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, 30*time.Second, now.Add(31*time.Second))
+	if !v3.shouldWriteCondition {
+		t.Errorf("post-window call should write a condition; got %+v", v3.condition)
+	}
+	if srv.calls.Load() != 2 {
+		t.Errorf("expected 2 probe calls across the window boundary; got %d", srv.calls.Load())
+	}
+}
+
+// TestEvaluateFunctionalProbeStageFailureDowngradesReady covers the central
+// shipping behavior: a server-reported stage failure flips
+// FunctionalProbeOK=False AND downgrades Ready with the stage-specific
+// reason. One table case per stage so a future stage addition is an
+// obvious diff.
+func TestEvaluateFunctionalProbeStageFailureDowngradesReady(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		result     cacheserver.ProbeResult
+		wantReason string
+		wantMsg    string
+	}{
+		{
+			name: "ingest failed",
+			result: cacheserver.ProbeResult{
+				Ingest: cacheserver.ProbeStageFailed, Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
+				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "synthesized event did not land"}},
+			},
+			wantReason: reasonProbeIngestFailed,
+			wantMsg:    "synthesized event did not land",
+		},
+		{
+			name: "routing failed",
+			result: cacheserver.ProbeResult{
+				Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageFailed, T2: cacheserver.ProbeStageSkipped,
+				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageRouting, Message: "LookupRoute returned NO_HINT"}},
+			},
+			wantReason: reasonProbeRoutingFailed,
+			wantMsg:    "LookupRoute returned NO_HINT",
+		},
+		{
+			name: "t2 failed",
+			result: cacheserver.ProbeResult{
+				Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageFailed,
+				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageT2, Message: "put failed: connection refused"}},
+			},
+			wantReason: reasonProbeT2Failed,
+			wantMsg:    "put failed: connection refused",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult { return tc.result })
+			client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+			v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue,
+				client, &probeRateLimiter{}, time.Second, time.Now())
+			if !v.shouldWriteCondition {
+				t.Fatalf("expected condition write on stage failure; got %+v", v)
+			}
+			if v.condition.Status != metav1.ConditionFalse || v.condition.Reason != tc.wantReason {
+				t.Errorf("condition = %+v, want status=False reason=%s", v.condition, tc.wantReason)
+			}
+			if !strings.Contains(v.condition.Message, tc.wantMsg) {
+				t.Errorf("condition message %q should include stage diagnostic %q", v.condition.Message, tc.wantMsg)
+			}
+			if !v.downgradeReady || v.readyReason != tc.wantReason {
+				t.Errorf("downgradeReady=%v readyReason=%q; want true + %s", v.downgradeReady, v.readyReason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestEvaluateFunctionalProbeAllPassedWritesOK pins the happy path: every
+// stage `ok` (or `skipped`) → FunctionalProbeOK=True with reason=ProbeOK
+// and no Ready downgrade.
+func TestEvaluateFunctionalProbeAllPassedWritesOK(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{
+			Backend: "team-a/cb", Ingest: cacheserver.ProbeStageOK,
+			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+		}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if !v.shouldWriteCondition || v.condition.Status != metav1.ConditionTrue || v.condition.Reason != reasonProbeOK {
+		t.Fatalf("want FunctionalProbeOK=True/ProbeOK; got %+v", v.condition)
+	}
+	if v.downgradeReady {
+		t.Errorf("success must NOT downgrade Ready; got %+v", v)
+	}
+}
+
+// TestEvaluateFunctionalProbeHTTPErrorIsUnknown pins the fail-soft posture
+// on transport errors: HTTP failure → FunctionalProbeOK=Unknown/ProbeError
+// and Ready is LEFT ALONE. A brief server outage must not flap every
+// backend Ready=False (the same noise mode the snapshot poller already
+// avoids).
+func TestEvaluateFunctionalProbeHTTPErrorIsUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "internal", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if !v.shouldWriteCondition || v.condition.Status != metav1.ConditionUnknown || v.condition.Reason != reasonProbeError {
+		t.Fatalf("want Unknown/ProbeError; got %+v", v.condition)
+	}
+	if v.downgradeReady {
+		t.Errorf("HTTP error must NOT downgrade Ready; got %+v", v)
+	}
+}
+
+// TestEvaluateFunctionalProbeHTTPErrorDoesNotRateLimit confirms the rate-
+// limit only counts SUCCESSFUL probe calls: a failed call leaves the
+// rate-limit slot unset so the next reconcile retries immediately, and a
+// flapping server resolves quickly once it comes back.
+func TestEvaluateFunctionalProbeHTTPErrorDoesNotRateLimit(t *testing.T) {
+	fail := atomic.Bool{}
+	fail.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped})
+	}))
+	defer srv.Close()
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+	limiter := &probeRateLimiter{}
+	now := time.Unix(1_000_000, 0)
+
+	v1 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, time.Minute, now)
+	if v1.condition.Status != metav1.ConditionUnknown {
+		t.Fatalf("expected Unknown on HTTP failure; got %+v", v1.condition)
+	}
+
+	fail.Store(false)
+	v2 := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue, client, limiter, time.Minute, now.Add(time.Second))
+	if v2.condition.Status != metav1.ConditionTrue {
+		t.Fatalf("expected True after server recovers, even within rate-limit window; got %+v", v2.condition)
+	}
+}
+
+// TestEvaluateFunctionalProbeRequestShape pins the wire-contract:
+// backend is namespace/name; model is the fixed sentinel; hashScheme is
+// the lowercased engine value with vllm as the default; backendType is
+// the spec.type string.
+func TestEvaluateFunctionalProbeRequestShape(t *testing.T) {
+	var seen cacheserver.ProbeRequest
+	srv := newFakeProbeServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		seen = req
+		return cacheserver.ProbeResult{Backend: req.Backend, Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	backend := newProbeBackend("cb-1")
+	backend.Spec.Integration.Engine = "SGLang" // mixed-case → lowercased on the wire
+
+	_ = evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if seen.Backend != "team-a/cb-1" {
+		t.Errorf("Backend = %q, want team-a/cb-1", seen.Backend)
+	}
+	if seen.Model != probeFixedModel {
+		t.Errorf("Model = %q, want %q", seen.Model, probeFixedModel)
+	}
+	if seen.HashScheme != "sglang" {
+		t.Errorf("HashScheme = %q, want sglang (lower-cased)", seen.HashScheme)
+	}
+	if seen.BackendType != string(cachev1alpha1.CacheBackendTypeLMCache) {
+		t.Errorf("BackendType = %q, want %q", seen.BackendType, cachev1alpha1.CacheBackendTypeLMCache)
+	}
+}
+
+// TestProbeHashSchemeForBackendDefaults covers the explicit defaulting and
+// trim logic on the engine field.
+func TestProbeHashSchemeForBackendDefaults(t *testing.T) {
+	cases := []struct {
+		name   string
+		engine *string
+		want   string
+	}{
+		{"nil integration", nil, "vllm"},
+		{"empty engine", stringPtr(""), "vllm"},
+		{"whitespace engine", stringPtr("   "), "vllm"},
+		{"vllm lowercase", stringPtr("vllm"), "vllm"},
+		{"VLLM uppercase", stringPtr("VLLM"), "vllm"},
+		{"sglang mixed", stringPtr("SGLang"), "sglang"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newProbeBackend("cb")
+			if tc.engine == nil {
+				backend.Spec.Integration = nil
+			} else {
+				backend.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: *tc.engine}
+			}
+			if got := probeHashSchemeForBackend(backend); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func stringPtr(s string) *string { return &s }
+
+// TestProbeResultMetricEmitsPerStage confirms the controller-runtime
+// metric registration: every probe call increments three counters
+// (ingest/routing/t2) with one observation each. Asserted via the
+// per-Service Prometheus registry so the test doesn't depend on a global
+// metrics-endpoint scrape.
+func TestProbeResultMetricEmitsPerStage(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		return cacheserver.ProbeResult{
+			Backend: "team-a/cb-metric", Ingest: cacheserver.ProbeStageOK,
+			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+		}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	// Snapshot baseline values BEFORE the call so the test is resilient
+	// to other tests in the same package incrementing the same
+	// (process-wide) counters.
+	baseline := metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageIngest, "ok") +
+		metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageRouting, "ok") +
+		metricCounter(t, "team-a/cb-metric", cacheserver.ProbeStageT2, "skipped")
+	if baseline != 0 {
+		t.Logf("unexpected non-zero baseline = %v; test may not be isolated", baseline)
+	}
+
+	backend := newProbeBackend("cb-metric")
+	_ = evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue, client, &probeRateLimiter{}, time.Second, time.Now())
+
+	for _, c := range []struct {
+		stage, result string
+		want          float64
+	}{
+		{cacheserver.ProbeStageIngest, "ok", 1},
+		{cacheserver.ProbeStageRouting, "ok", 1},
+		{cacheserver.ProbeStageT2, "skipped", 1},
+	} {
+		if got := metricCounter(t, "team-a/cb-metric", c.stage, c.result); got != c.want {
+			t.Errorf("metric stage=%s result=%s = %v, want %v", c.stage, c.result, got, c.want)
+		}
+	}
+}
+
+// metricCounter reads the inferencecache_backend_probe_result counter for
+// one label combination by collecting the metric directly. Avoids pulling
+// in the prometheus/testutil dependency just for one assertion (the
+// pkg/server tests use the same trick).
+func metricCounter(t *testing.T, backend, stage, result string) float64 {
+	t.Helper()
+	m, err := probeResultMetric.GetMetricWithLabelValues(backend, stage, result)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	var dtoMetric dto.Metric
+	if err := m.(prometheus.Counter).Write(&dtoMetric); err != nil {
+		t.Fatalf("metric.Write: %v", err)
+	}
+	return dtoMetric.GetCounter().GetValue()
+}
+
+// TestEvaluateFunctionalProbeContextCancellation pins ctx propagation: a
+// cancelled context surfaces as an HTTP error (Unknown), not a panic or a
+// silent True.
+func TestEvaluateFunctionalProbeContextCancellation(t *testing.T) {
+	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		time.Sleep(50 * time.Millisecond)
+		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	})
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	v := evaluateFunctionalProbe(ctx, newProbeBackend("cb"), kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+	if v.condition.Status != metav1.ConditionUnknown {
+		t.Fatalf("cancelled ctx should surface as Unknown; got %+v", v.condition)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("test setup: ctx should be cancelled")
+	}
+}
