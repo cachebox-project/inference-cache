@@ -914,6 +914,75 @@ func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) 
 	}
 }
 
+// TestReconcileServerInstance_ClearedSentinelOverridesStaleStatus
+// drives the failure window in the managed→External→managed
+// transition: the in-memory clear ran (shadow gone, cleared
+// sentinel set) but the on-cluster status patch FAILED, so the
+// status field still holds the prior managed period's identifier.
+// Without the sentinel, the next managed-period reconcile would
+// read prior = statusField (stale) and misclassify the first new
+// Ready pod as a replacement → false-cascade. The sentinel forces
+// effectivePrior = "" so the new period starts with a clean
+// empty→set baseline.
+func TestReconcileServerInstance_ClearedSentinelOverridesStaleStatus(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Plant a stale prior-period status value directly on the CR —
+	// what a managed→External patch-failure window would leave
+	// behind. The actual current pod is f.serverPod with a
+	// different identifier; pre-fix the reconciler would see
+	// stale != current and cascade.
+	f.backend.Status.ObservedServerInstance = "stale-prior-period:0"
+	if err := f.r.Status().Update(context.Background(), f.backend); err != nil {
+		t.Fatalf("plant stale status: %v", err)
+	}
+	f.reload(t)
+
+	// Simulate the in-memory side of the failed-clear scenario:
+	// External path's clearServerInstanceLatchShadow ran (which
+	// sets the cleared sentinel), the status patch errored, then
+	// the operator flipped back to managed before the retry. The
+	// in-memory state for the cascade key is:
+	//   shadow: empty
+	//   cleared: true
+	//   lastAt: empty
+	key := cascadeKey{namespace: f.backend.Namespace, name: f.backend.Name, uid: string(f.backend.UID)}
+	f.r.serverInstanceCascade.clear(key)
+	if !f.r.serverInstanceCascade.isCleared(key) {
+		t.Fatalf("precondition: cleared sentinel not set after clear()")
+	}
+
+	// Reconcile in the new managed period. currentID =
+	// serverInstanceID(f.serverPod) != "stale-prior-period:0".
+	// With the sentinel: effectivePrior="" → empty→set → no
+	// cascade, persist new baseline.
+	// Without the sentinel (the bug): effectivePrior=stale →
+	// real-change branch → cascade fires.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("wait = %v, want 0", wait)
+	}
+
+	f.reload(t)
+	want := serverInstanceID(f.serverPod)
+	if got := f.backend.Status.ObservedServerInstance; got != want {
+		t.Fatalf("status.observedServerInstance = %q, want %q (sentinel should have driven a clean empty→set persist over the stale value)", got, want)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("cascade fired despite the cleared sentinel; this is the false-cascade scenario the sentinel must prevent (managed→External patch-fail + flip-back-to-managed)")
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter = %v, want 0", got)
+	}
+
+	// recordAttempt happened above (during the empty→set persist),
+	// which should have cleared the sentinel — verify so the next
+	// real change DOES cascade correctly.
+	if f.r.serverInstanceCascade.isCleared(key) {
+		t.Fatalf("cleared sentinel still set after a successful empty→set baseline persist; recordAttempt must clear it so subsequent changes are detected normally")
+	}
+}
+
 // TestReconcileServerInstance_ShadowWinsOverStaleStatusOnScaleUpPersistFailure
 // drives the scenario where a converged scale-up's baseline persist
 // fails: the shadow records the widened pod set ("A:0,B:0") but the

@@ -56,10 +56,15 @@ const AnnotationCacheServerRestartTrigger = "inferencecache.io/cache-server-rest
 // genuine single-restart recovery is not noticeably delayed.
 //
 // The window is enforced in-memory on the reconciler (see
-// serverInstanceCascade.canCascade). Controller restarts reset the window,
-// which is the intended behavior — a controller restart should freely
-// cascade once on the first reconcile of each backend, since the engines
-// may also hold stale connections.
+// serverInstanceCascade.canCascade). A controller restart resets the
+// rate-limit window for every backend — the in-memory `lastAt` map is
+// lost — which is the intended behavior: the first cascade after
+// restart is allowed immediately without waiting up to 30s. Whether
+// any cascade actually fires after restart still depends on the
+// normal decision (currentID differs from the durable
+// status.observedServerInstance baseline AND the convergence /
+// strict-superset rules); the restart does not by itself force a
+// cascade on every backend.
 const DefaultMinServerRestartCascadeInterval = 30 * time.Second
 
 // cascadeRestartReasonServerInstanceChanged is the metric label value
@@ -200,6 +205,21 @@ type serverInstanceCascade struct {
 	// because a "baseline" or "converged-superset" persist also
 	// updates the shadow but must NOT be counted.
 	counted map[cascadeKey]string
+	// cleared records that the latch for this key was explicitly
+	// cleared (a lifecycle exit from the managed path —
+	// reconcileExternal, reconcileUnmanaged, or
+	// reconcileInvalidStorage — wiped the shadow and asked the
+	// reconciler to publish status.observedServerInstance="").
+	// The sentinel survives a transient status-patch failure on
+	// that clear: the in-memory cleared bit overrides any stale
+	// non-empty status field on the NEXT reconcile, so a
+	// managed→External→managed flip in a tight patch-failure
+	// window cannot misclassify the new period's first Ready pod
+	// as a replacement of the prior-period identifier.
+	// recordAttempt clears this flag (a new baseline is being
+	// persisted, so we are no longer in the "explicitly cleared"
+	// state).
+	cleared map[cascadeKey]bool
 }
 
 func newServerInstanceCascade() *serverInstanceCascade {
@@ -207,17 +227,21 @@ func newServerInstanceCascade() *serverInstanceCascade {
 		lastAt:  map[cascadeKey]time.Time{},
 		shadow:  map[cascadeKey]string{},
 		counted: map[cascadeKey]string{},
+		cleared: map[cascadeKey]bool{},
 	}
 }
 
 // recordAttempt stamps the most recent currentID the reconciler
 // decided to persist for the given key. Called BEFORE the patch
 // attempt so a subsequent reconcile can recover the intended
-// baseline even if the patch fails.
+// baseline even if the patch fails. Also clears the "explicitly
+// cleared" sentinel (a new baseline is being recorded, so the
+// post-clear gap is closed for this key).
 func (s *serverInstanceCascade) recordAttempt(key cascadeKey, currentID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.shadow[key] = currentID
+	delete(s.cleared, key)
 }
 
 // lastAttempt returns the most recent currentID the reconciler
@@ -249,22 +273,47 @@ func (s *serverInstanceCascade) shouldIncrementCascade(key cascadeKey, currentID
 	return true
 }
 
-// clear drops both the rate-limit timestamp AND the shadow baseline
-// for the given key. Called when the backend transitions out of the
-// managed path (External, unsupported runtime, invalid storage) and
-// its status.observedServerInstance is cleared on the cluster: the
-// shadow must follow the cluster-visible contract, otherwise a
-// later managed→External→managed transition in the same controller
-// process would still read the prior period's baseline from the
-// shadow and misclassify the first new Ready pod as a replacement
-// instead of an empty→set first observation, triggering an
-// unnecessary engine cascade.
+// clear drops the rate-limit timestamp, the shadow baseline, and
+// the counted-cascade ledger for the given key, AND records an
+// explicit "cleared" sentinel that overrides any stale non-empty
+// status.observedServerInstance on the next reconcile. Called when
+// the backend transitions out of the managed path (External,
+// unsupported runtime, invalid storage) and its
+// status.observedServerInstance is also cleared on the cluster.
+//
+// The sentinel exists because the in-memory clear runs BEFORE the
+// status patch that wipes the cluster-resident field, and that
+// patch can fail. Without the sentinel, a tight failure window
+// (clear shadow → status patch fails → operator flips back to
+// managed before retry) would leave shadow empty + status holding
+// the prior period's identifier; the reconciler would then read
+// prior = statusField (stale) and misclassify the first new
+// managed-period Ready pod as a replacement, triggering an
+// unnecessary engine cascade despite the documented "inert/cleared"
+// contract. The sentinel overrides that: cleared[key]=true means
+// "treat prior as empty regardless of what statusField says".
+// recordAttempt deletes the sentinel (a new baseline is now being
+// persisted; we are no longer in the cleared state). Controller
+// restart loses the sentinel; the External/Unmanaged/Invalid
+// path's patchStatus retry on subsequent reconciles is the durable
+// backstop for that case.
 func (s *serverInstanceCascade) clear(key cascadeKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.lastAt, key)
 	delete(s.shadow, key)
 	delete(s.counted, key)
+	s.cleared[key] = true
+}
+
+// isCleared reports whether the latch for this key has been
+// explicitly cleared via clear() and not yet recorded a new
+// attempt. Used by reconcileServerInstance to override a stale
+// non-empty status field on the next managed-period reconcile.
+func (s *serverInstanceCascade) isCleared(key cascadeKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cleared[key]
 }
 
 // canCascade reports whether enough time has elapsed since the previous
@@ -414,27 +463,43 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 		uid:       string(backend.UID),
 	}
 
-	// Compute effective prior. The in-memory shadow IS the authority
-	// when set: it records the last currentID the reconciler decided
-	// to persist, whether or not the patch landed. The K8s-resident
-	// status field is the durable projection of that shadow — when
-	// it disagrees, it is because the most recent persist failed and
-	// has not yet retried. Trusting the status field over a non-
-	// empty shadow would re-introduce the round-12 / round-21
-	// regression: a converged scale-up persist that fails would leave
-	// shadow="A:0,B:0" while status still held the pre-scale "A:0";
-	// a subsequent replacement of just the added pod (current
-	// "A:0,C:0") would then look like a strict superset of the
-	// status-derived prior "A:0" and miss the cascade. By contrast,
-	// using the shadow as prior gives prior="A:0,B:0" and the
-	// missing B is correctly detected as a replacement.
+	// Compute effective prior. Authority order: cleared sentinel →
+	// shadow → statusField.
 	//
-	// Fallback order: shadow → statusField. Controller restart loses
-	// the shadow (in-memory only), at which point the statusField
-	// takes over for that key on the first reconcile that builds it.
+	// 1) The "cleared" sentinel is checked first. A lifecycle exit
+	//    from the managed path (External / Unmanaged / InvalidStorage)
+	//    sets it via clear(); it survives a transient status-patch
+	//    failure on the same clear. If the operator flips back to
+	//    managed before the External-side patchStatus retry has
+	//    landed, statusField would still hold the prior-period
+	//    identifier — but cleared==true forces effectivePrior="",
+	//    so the next observation is treated as a clean first-set
+	//    (no false cascade against the stale value).
+	//
+	// 2) The in-memory shadow IS the authority when set: it records
+	//    the last currentID the reconciler decided to persist,
+	//    whether or not the patch landed. statusField is the durable
+	//    projection of that shadow — when they disagree, it is
+	//    because the most recent persist failed and has not yet
+	//    retried. Trusting statusField over a non-empty shadow would
+	//    re-introduce the round-21 regression: a converged scale-up
+	//    persist that fails would leave shadow="A:0,B:0" while
+	//    status still held the pre-scale "A:0"; a subsequent
+	//    replacement of just the added pod ("A:0,C:0") would look
+	//    like a strict superset of the status-derived "A:0" and miss
+	//    the cascade.
+	//
+	// 3) Otherwise (cold start, controller restart), statusField is
+	//    the durable source — the K8s API survived the restart even
+	//    though the in-process state did not.
 	statusField := backend.Status.ObservedServerInstance
-	prior := r.serverInstanceCascade.lastAttempt(key)
-	if prior == "" {
+	var prior string
+	switch {
+	case r.serverInstanceCascade.isCleared(key):
+		prior = ""
+	case r.serverInstanceCascade.lastAttempt(key) != "":
+		prior = r.serverInstanceCascade.lastAttempt(key)
+	default:
 		prior = statusField
 	}
 	if prior == currentID {
