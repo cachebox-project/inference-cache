@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -450,6 +451,86 @@ func TestReconcileTypeSwitchToExternalCleansUpChildren(t *testing.T) {
 	}
 	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "external.ns1.svc:8080" {
 		t.Fatalf("status.endpoint = %q, want mirrored external endpoint", got)
+	}
+}
+
+// TestReconcileTypeSwitchToExternalClearsObservedServerInstance asserts
+// that status.observedServerInstance is cleared when a managed
+// CacheBackend transitions to External — leaving a stale latch on an
+// External backend would surface a UID that no longer maps to any
+// controller-managed pod, and a subsequent flip back to managed
+// would inherit the stale baseline and either false-cascade
+// immediately or false-pin a non-existent pod set. Codex round-10
+// regression: this is the lifecycle contract reconcileExternal
+// encodes, and a status field flip is exactly the kind of seam tests
+// must hold.
+func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// Plant a baseline ObservedServerInstance — the field is normally
+	// written by reconcileServerInstance; here we set it directly so
+	// the test exercises the External-transition clearing path
+	// without depending on a Ready cache-server pod fixture.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+
+	// Confirm preserved fields we expect NOT to be clobbered alongside
+	// the latch (firstKVEventObservedAt + indexParticipation must
+	// survive the External transition per reconcileExternal's godoc).
+	preserved := getBackend(t, r, "cache", "ns1")
+	preserved.Status.FirstKVEventObservedAt = &metav1.Time{Time: time.Unix(1_000_000_000, 0).UTC()}
+	if err := r.Status().Update(context.Background(), preserved); err != nil {
+		t.Fatalf("plant firstKVEventObservedAt: %v", err)
+	}
+
+	// Switch to External.
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	switching.Spec.Endpoint = "external.ns1.svc:8080"
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to external: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→External transition", got.Status.ObservedServerInstance)
+	}
+	if got.Status.FirstKVEventObservedAt == nil {
+		t.Fatalf("status.firstKVEventObservedAt was clobbered on External transition; it must survive as a monotonic latch")
+	}
+}
+
+// TestReconcileSwitchToStatefulSetClearsObservedServerInstance asserts
+// the same clearing for the managed→unsupported-runtime transition
+// (reconcileUnmanaged path). The StatefulSet deployment-kind is
+// currently the canonical unmanaged trigger.
+func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→unmanaged transition", got.Status.ObservedServerInstance)
 	}
 }
 

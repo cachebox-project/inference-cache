@@ -210,7 +210,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 		serverInstanceCascade:           newServerInstanceCascade(),
 	}
 
-	resetBackendServerRestartsTotalForTest()
+	resetBackendServerRestartCascadesTotalForTest()
 	return f
 }
 
@@ -247,7 +247,7 @@ func serverInstanceID(p *corev1.Pod) string {
 
 func cascadeRestartsCount(t *testing.T, namespace, backend, reason string) float64 {
 	t.Helper()
-	m, err := backendServerRestartsTotal.GetMetricWithLabelValues(namespace, backend, reason)
+	m, err := backendServerRestartCascadesTotal.GetMetricWithLabelValues(namespace, backend, reason)
 	if err != nil {
 		t.Fatalf("get counter %s/%s/%s: %v", namespace, backend, reason, err)
 	}

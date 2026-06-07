@@ -45,7 +45,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 	t.Run("UIDTransitionAnnotatesEngineDeployment", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		resetBackendServerRestartsTotalForTest()
+		resetBackendServerRestartCascadesTotalForTest()
 
 		cb := lmcacheBackend("cache", ns)
 		cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
@@ -136,7 +136,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 	t.Run("RateLimitedSecondCascadeIsDeferred", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		resetBackendServerRestartsTotalForTest()
+		resetBackendServerRestartCascadesTotalForTest()
 
 		// Use a long window so the second cascade is definitely
 		// inside it. Restored after the test so other subtests use

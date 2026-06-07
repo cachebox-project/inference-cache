@@ -2197,79 +2197,27 @@ spec:
               observedServerInstance:
                 description: |-
                   ObservedServerInstance is the controller's cascade-decision
-                  baseline: a stable identifier for the set of Ready cache-server
-                  pods the controller last anchored against. It is NOT a live
-                  "current pod set" view — it is intentionally pinned through
+                  baseline — a stable identifier for the Ready cache-server pod
+                  set the controller last anchored against. NOT a live current-
+                  pod-set view: the controller intentionally pins this through
                   transient rolling-update midpoints and through no-Ready
                   windows so the cascade does not fire on rollbacks or transient
-                  outages (see "Transitions" below). For the actual current
-                  matched-pod inventory operators should consult
+                  outages. For the live pod inventory, operators should consult
                   status.matchedEnginePods (engine side) and `kubectl get pod`
-                  (cache-server side). The shape is `<pod-uid>:<restart-sum>`
-                  per Ready pod, comma-joined and lex-sorted by pod name; the
-                  restart-sum is the sum of pod.status.containerStatuses[].
-                  RestartCount filtered to the cache-server's own containers —
-                  the container names declared on the owned Deployment's pod
-                  template. Sidecars added to the pod by other admission webhooks
-                  (service-mesh proxies, Datadog, etc.) appear in
-                  containerStatuses but are absent from the template and are
-                  intentionally excluded — a service-mesh sidecar crash-loop
-                  must not advance the identifier and roll the engine fleet.
-                  An in-place restart of a cache-server container (kubelet
-                  respawning a crashed container — OOM with restartPolicy=Always
-                  reuses pod.UID) DOES advance the identifier and is observable.
-                  For most managed backends this is a single segment; multi-
-                  replica ephemeral backends (spec.replicas > 1 on non-PVC
-                  backends) produce a comma-joined list.
+                  (cache-server side).
 
-                  When the identifier changes in a way that reflects an actual
-                  cache-server replacement — a prior pod is gone, or a persisting
-                  pod's restart-sum advanced — the cache-server process has been
-                  replaced (OOM-kill, eviction, node maintenance, image roll, in-
-                  place container restart), and every injected engine pod holds a
-                  stale LMCache client socket: the upstream LMServerConnector
-                  opens its TCP socket in __init__ only and silently fails every
-                  subsequent PUT with EPIPE until the engine pod itself rolls. On
-                  such a transition the reconciler cascade-restarts every engine
-                  Deployment that owns pods carrying this backend's
-                  inferencecache.io/injected-by + injected-by-uid annotation pair,
-                  by patching a fresh inferencecache.io/cache-server-restart-
-                  trigger annotation onto the Deployment's pod template (the same
-                  mechanism kubectl rollout restart uses); the cascade is rate-
-                  limited to at most once per ~30s per backend to dampen restart
-                  storms when the cache-server flaps.
+                  Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
+                  and lex-sorted by pod name. restart-sum is the per-pod
+                  containerStatuses[].RestartCount summed across cache-server
+                  containers (the names from the owned Deployment's pod
+                  template; foreign sidecars are excluded). Inert and cleared
+                  for External / unsupported-runtime backends.
 
-                  Transitions that DO NOT cascade: empty→set (first observation;
-                  there is no prior server-instance to invalidate, so no engine
-                  sockets are stale by definition — engines that connected
-                  during the "" window are connecting to the very pod we are
-                  now baselining) and a strict-superset transition that occurs
-                  while the owning Deployment is still rolling (the rolling-
-                  update midpoint where old + new pods are both Ready briefly —
-                  the cascade fires on the next transition that drops the old
-                  pod). Strict-superset midpoints during a roll are NOT
-                  persisted as the new baseline: if they were, a failed rollout
-                  that gets rolled back (the new pod briefly Ready, then killed
-                  by failing readiness, leaving the original pod alone) would
-                  later look like "the new pod was replaced" and false-cascade,
-                  even though the original cache-server process and existing
-                  engine sockets never changed. Strict-superset transitions where
-                  the owning Deployment has converged (spec.replicas ==
-                  status.readyReplicas == status.updatedReplicas, observedGeneration
-                  >= metadata.generation) ARE persisted — those are operator-
-                  driven scale-ups, and the added pods must enter the baseline
-                  so a later replacement of just an added pod cascades correctly.
-                  Stale-while-unavailable: when no Ready cache-server pod exists
-                  (Deployment scaled to 0, mid-rollout, image pull stuck), this
-                  field intentionally retains the prior value — clearing it
-                  would turn the eventual recovery's "" → new-uid:0 transition
-                  into a first-observation baseline and silently skip the
-                  cascade, which is exactly what this controller exists to
-                  prevent. Inert for External / unsupported-runtime backends and
-                  cleared on transitions to those modes. The cascade is an
-                  operator-side recovery for the upstream EPIPE bug and can be
-                  retired once upstream LMCache grows EPIPE-detect-and-reconnect
-                  in the LMServerConnector write path.
+                  Operator-side recovery for the upstream LMCache
+                  LMServerConnector EPIPE-on-restart bug. See
+                  docs/design/cachebackend-api.md for the cascade contract,
+                  transition rules (which changes do / do not cascade), and
+                  rate-limit / no-Ready / rollback / scale-up rationale.
                 type: string
             type: object
         type: object

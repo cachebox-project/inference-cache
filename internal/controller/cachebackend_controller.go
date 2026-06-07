@@ -613,6 +613,24 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
 		requeueAfter = cascadeWait
 	}
+	// Schedule an unconditional periodic re-poll of the cache-server
+	// pod set on managed backends. Reason: an in-place container
+	// restart (kubelet respawning a crashed cache-server container
+	// without bumping pod.UID) does NOT change owned-Deployment status
+	// counts, and the controller deliberately does not watch Pods
+	// cluster-wide (see refreshMatchedEnginePods godoc). The
+	// matched-engine-pods cadence above does not cover this case
+	// either: when an operator removes spec.engineSelector after
+	// engines were injected, len(matchedEnginePods)→0 and that
+	// cadence stops firing, leaving in-place restarts unobservable
+	// until something unrelated triggers a reconcile. Pinning a
+	// floor at the rate-limit interval bounds the observation
+	// latency for in-place restarts at one cadence (cheap: one
+	// Pod List + one Deployment Get per backend per cadence).
+	pollCadence := r.minServerRestartCascadeInterval()
+	if requeueAfter == 0 || pollCadence < requeueAfter {
+		requeueAfter = pollCadence
+	}
 
 	if applyErr != nil {
 		// Honor the cascade's rate-limit retry boundary even on the

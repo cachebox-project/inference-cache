@@ -70,33 +70,46 @@ const DefaultMinServerRestartCascadeInterval = 30 * time.Second
 // label set is stable and grep-discoverable.
 const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 
-// backendServerRestartsTotal counts cascade-restart events the controller
-// has issued, partitioned by the namespaced CacheBackend and the cascade
-// reason. It is registered into the controller-runtime metrics registry on
+// backendServerRestartCascadesTotal counts cascade-restart EVENTS the
+// controller has issued (NOT raw cache-server pod restarts). The
+// metric name is "cascades" because the counter only advances when a
+// cascade is actually emitted — after the rate-limit window has
+// elapsed and an engine-Deployment annotate has been issued. A
+// crash-looping cache-server pod that restarts ten times within one
+// cascade window still produces exactly one increment, because the
+// rate limit collapses observations into a single cascade per window
+// (see DefaultMinServerRestartCascadeInterval). For raw restart
+// rate, operators should compose this metric with the engine fleet's
+// re-roll latency or the cache-server pod restartCount metric from
+// kube-state-metrics; this Counter is the controller's record of
+// "how many times did I emit recovery for this backend", not "how
+// many times did the cache-server crash".
+//
+// Partitioned by namespaced CacheBackend identity and a short reason
+// code. Registered into the controller-runtime metrics registry on
 // package init so it appears on the manager's /metrics endpoint (no
 // per-Service registry — see pkg/server/metrics.go for the
-// other-direction posture). The Counter is created once at process start
-// and is safe to mutate concurrently; tests reset its inner state by
-// resetting the registry (see resetBackendServerRestartsTotalForTest).
-var backendServerRestartsTotal = prometheus.NewCounterVec(
+// other-direction posture). Safe to mutate concurrently; tests
+// reset its inner state via resetBackendServerRestartCascadesTotalForTest.
+var backendServerRestartCascadesTotal = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
-		Name: "inferencecache_backend_server_restarts_total",
-		Help: "Cumulative count of cache-server-restart cascades issued by the CacheBackend controller. A single cascade re-annotates every injected engine Deployment for the backend at once; the count is incremented once per cascade, regardless of how many Deployments were touched (zero is a valid cascade — see status.observedServerInstance docs). Partitioned by the CacheBackend's namespace + name and a short reason code.",
+		Name: "inferencecache_backend_server_restart_cascades_total",
+		Help: "Cumulative count of cache-server-restart cascades issued by the CacheBackend controller. A single cascade re-annotates every injected engine Deployment for the backend at once; the count is incremented once per cascade, regardless of how many Deployments were touched (zero is a valid cascade — see status.observedServerInstance docs). NOT a raw restart count: rate-limiting collapses repeated observations within one cadence window into a single cascade, so this metric undercounts a flapping cache-server's restart rate by design. Partitioned by the CacheBackend's namespace + name and a short reason code.",
 	},
 	[]string{"namespace", "backend", "reason"},
 )
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(backendServerRestartsTotal)
+	ctrlmetrics.Registry.MustRegister(backendServerRestartCascadesTotal)
 }
 
-// resetBackendServerRestartsTotalForTest resets the cascade counter to
-// zero for every label combination. Package-private so tests in this
-// package can assert on per-test counts without leaking state across
-// runs; intentionally not exported because production callers have no
-// reason to zero an operator-visible metric.
-func resetBackendServerRestartsTotalForTest() {
-	backendServerRestartsTotal.Reset()
+// resetBackendServerRestartCascadesTotalForTest resets the cascade
+// counter to zero for every label combination. Package-private so
+// tests in this package can assert on per-test counts without leaking
+// state across runs; intentionally not exported because production
+// callers have no reason to zero an operator-visible metric.
+func resetBackendServerRestartCascadesTotalForTest() {
+	backendServerRestartCascadesTotal.Reset()
 }
 
 // cascadeKey keys the per-backend rate-limit map. Includes the
@@ -332,7 +345,7 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return r.minServerRestartCascadeInterval()
 	}
-	backendServerRestartsTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
+	backendServerRestartCascadesTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
 	logger.V(1).Info("server-restart cascade: engine Deployments annotated",
 		"namespace", backend.Namespace, "name", backend.Name,
 		"prior", prior, "current", currentID, "deployments", count)
