@@ -1,0 +1,46 @@
+# ServiceMonitor for `inference-cache-server`. Without this, a
+# prometheus-operator install will not scrape /metrics on the server's
+# `http:8080` port — kube-prometheus + most hardened installs ignore the
+# `prometheus.io/scrape` annotation in favor of explicit ServiceMonitor /
+# PodMonitor CRs. Loaded by the same `kubectl apply -k config/observability`
+# as the PrometheusRule, so the alert bundle and the scrape config ship
+# together.
+#
+# Selector matches the Service in config/server/server.yaml (same kustomize
+# default install). The endpoint binds by port-NAME (`http`), not number, so
+# this stays correct if the Service is later remapped.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: inference-cache-server
+  namespace: inference-cache-system
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: observability
+    # NOTE: this label targets the UPSTREAM kube-prometheus stack's
+    # default `Prometheus` named `k8s`. Other common conventions:
+    #   * `prometheus-community/kube-prometheus-stack` Helm chart →
+    #     `release: <helm-release-name>` (no `prometheus:` label).
+    #   * Custom `Prometheus` CRs → whatever labels their
+    #     `serviceMonitorSelector.matchLabels` specifies.
+    # Prometheus Operator only loads ServiceMonitor CRs whose labels
+    # match the Prometheus CR's `serviceMonitorSelector`; `kubectl
+    # apply -k` succeeds either way but Prometheus silently ignores
+    # this scrape target until the labels match. Introspect your
+    # install with:
+    #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.serviceMonitorSelector}'
+    # and edit this label to match.
+    prometheus: k8s
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inference-cache
+      app.kubernetes.io/component: server
+  namespaceSelector:
+    matchNames:
+      - inference-cache-system
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

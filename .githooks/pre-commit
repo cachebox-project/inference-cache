@@ -13,7 +13,7 @@ set -euo pipefail
 # Paths that define the project's public/core identity — OCI/Oracle banned here.
 # (Cloud-specific integration is allowed, but only in isolated adapters under
 #  pkg/adapters/.../ — those are NOT matched below.)
-CORE_RE='^(api/|proto/|pkg/server/proto/|config/crd/|config/rbac/|config/default/|config/manager/|config/samples/|config/server/|config/webhook/|config/certmanager/|config/overlays/|internal/|PROJECT$|go\.mod$)'
+CORE_RE='^(api/|proto/|pkg/server/proto/|config/crd/|config/rbac/|config/default/|config/manager/|config/observability/|config/samples/|config/server/|config/webhook/|config/certmanager/|config/overlays/|docs/observability/|internal/|PROJECT$|go\.mod$)'
 
 # Banned tokens, word-bounded to avoid false positives like "associate"/"logic".
 BAN_RE='\boci\b|oci\.com|oraclecloud|\boracle\b'
@@ -25,8 +25,10 @@ violations=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   echo "$f" | grep -qE "$CORE_RE" || continue
-  [ -f "$f" ] || continue
-  if hits=$(grep -niEI "$BAN_RE" "$f"); then
+  # Check the STAGED blob, not the working tree, so an edited working
+  # copy can't mask a bad staged version (matches the convention used
+  # by the internal-reference check further down).
+  if hits=$(git show ":$f" 2>/dev/null | grep -nIEi "$BAN_RE"); then
     echo "✗ $f"
     echo "$hits" | sed 's/^/    /'
     violations=1

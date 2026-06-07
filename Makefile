@@ -31,6 +31,18 @@ KIND_VERSION ?= v0.24.0
 ENVTEST_K8S_VERSION ?= 1.31.0
 BUF_VERSION ?= v1.69.0
 GOVULNCHECK_VERSION ?= v1.3.0
+PROMTOOL_VERSION ?= 3.0.1
+KUSTOMIZE_VERSION ?= v5.7.0
+# SHA256 checksums of the upstream Prometheus release tarballs we extract
+# `promtool` from. Sourced from
+# https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/sha256sums.txt
+# — verify against that file when bumping PROMTOOL_VERSION. CI relies on the
+# linux-amd64 entry; the others let local dev (Mac arm64/amd64, linux arm64)
+# get the same integrity check.
+PROMTOOL_SHA256_linux_amd64  ?= 43f6f228ef59e0c2f6994e489c5c76c6671553eaa99ded0aea1cd31366222916
+PROMTOOL_SHA256_linux_arm64  ?= 58e8d4f3ab633528fa784740409c529f4a434f8a0e3cf4d2f56e75ce2db69aa8
+PROMTOOL_SHA256_darwin_amd64 ?= d45a9dab9ee9f40a27f2b7dde227843753d6f648ccf2d2c8477b9c7ffd75c0a0
+PROMTOOL_SHA256_darwin_arm64 ?= 803d1ae747d39a4637ad33df254854f2a76663a6dd4ade0066b7f25617feba3d
 
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 GOLANGCI_LINT := $(LOCALBIN)/golangci-lint
@@ -39,8 +51,17 @@ PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
 SETUP_ENVTEST := $(LOCALBIN)/setup-envtest
 LOCAL_KIND := $(LOCALBIN)/kind
 LOCAL_BUF := $(LOCALBIN)/buf
+LOCAL_PROMTOOL := $(LOCALBIN)/promtool
+LOCAL_KUSTOMIZE := $(LOCALBIN)/kustomize
 GOVULNCHECK := $(LOCALBIN)/govulncheck
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
+# PROMTOOL is resolved AT RECIPE TIME, not parse time — so the version
+# check in the `promtool` target above can replace a stale local binary
+# (or refuse a version-mismatched system one) and `verify-prometheus`
+# will still pick up the freshly-installed `$(LOCAL_PROMTOOL)`. A
+# `$(shell command -v promtool)` at parse time would lock in whatever
+# was on PATH when make first started, defeating the version pinning.
+RESOLVE_PROMTOOL = if [ -x $(LOCAL_PROMTOOL) ]; then echo $(LOCAL_PROMTOOL); else echo promtool; fi
 
 .PHONY: all
 all: build test ## Build binaries and run tests.
@@ -91,6 +112,68 @@ buf: $(LOCALBIN) ## Install buf locally when the system buf binary is unavailabl
 	else \
 		test -s $(LOCAL_BUF) || GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION); \
 	fi
+
+.PHONY: kustomize
+kustomize: $(LOCALBIN) ## Install kustomize locally; reinstall when the pinned version drifts.
+	@# Pinned to keep `make verify-prometheus` reproducible across the
+	@# GitHub-runner image, minimal containers, and dev shells. We don't
+	@# rely on `kubectl kustomize` because the runner image is implicit
+	@# (a GitHub change could drop kubectl), and even with kubectl
+	@# present the bundled kustomize version drifts independently from
+	@# what dev shells have.
+	@if ! { [ -x $(LOCAL_KUSTOMIZE) ] && $(LOCAL_KUSTOMIZE) version 2>/dev/null | grep -qF "$(KUSTOMIZE_VERSION)"; }; then \
+		rm -f $(LOCAL_KUSTOMIZE); \
+		GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION); \
+	fi
+
+.PHONY: promtool
+promtool: $(LOCALBIN) ## Ensure a $(PROMTOOL_VERSION) promtool is available. Downloads with SHA-256 verification.
+	@# Version pinning IS the point — CI runs against $(PROMTOOL_VERSION) and
+	@# different versions can emit subtly different errors. We accept a
+	@# system binary only if its version matches exactly; otherwise we
+	@# install the pinned binary locally (replacing any stale local
+	@# binary too).
+	@if [ -x $(LOCAL_PROMTOOL) ] && \
+		$(LOCAL_PROMTOOL) --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
+		exit 0; \
+	fi; \
+	if command -v promtool >/dev/null 2>&1 && \
+		promtool --version 2>&1 | head -1 | grep -qF "version $(PROMTOOL_VERSION) "; then \
+		rm -f $(LOCAL_PROMTOOL); \
+		exit 0; \
+	fi; \
+	set -e; \
+	rm -f $(LOCAL_PROMTOOL); \
+	os=$$(uname -s | tr A-Z a-z); \
+	arch=$$(uname -m); \
+	case $$arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+	dir=prometheus-$(PROMTOOL_VERSION).$${os}-$${arch}; \
+	case "$${os}_$${arch}" in \
+		linux_amd64)  want_sha="$(PROMTOOL_SHA256_linux_amd64)";; \
+		linux_arm64)  want_sha="$(PROMTOOL_SHA256_linux_arm64)";; \
+		darwin_amd64) want_sha="$(PROMTOOL_SHA256_darwin_amd64)";; \
+		darwin_arm64) want_sha="$(PROMTOOL_SHA256_darwin_arm64)";; \
+		*) echo "✗ unsupported os/arch: $${os}_$${arch} — add a SHA-256 to Makefile and retry."; exit 1;; \
+	esac; \
+	if [ -z "$$want_sha" ]; then \
+		echo "✗ PROMTOOL_SHA256_$${os}_$${arch} is empty — refusing to install promtool without integrity verification."; \
+		exit 1; \
+	fi; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	echo "downloading promtool $(PROMTOOL_VERSION) ($${os}/$${arch})"; \
+	curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/$${dir}.tar.gz" -o "$${tmp}/promtool.tgz"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		echo "$$want_sha  $${tmp}/promtool.tgz" | shasum -a 256 -c -; \
+	elif command -v sha256sum >/dev/null 2>&1; then \
+		echo "$$want_sha  $${tmp}/promtool.tgz" | sha256sum -c -; \
+	else \
+		echo "✗ neither shasum nor sha256sum is available — refusing to install promtool without integrity verification."; \
+		exit 1; \
+	fi; \
+	tar -xzf "$${tmp}/promtool.tgz" -C "$${tmp}"; \
+	mv "$${tmp}/$${dir}/promtool" $(LOCAL_PROMTOOL); \
+	chmod +x $(LOCAL_PROMTOOL)
 
 ##@ Development
 
@@ -230,7 +313,7 @@ install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooks
 .PHONY: verify-naming
 verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
 	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
-		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/samples config/server config/webhook config/certmanager config/overlays internal PROJECT go.mod 2>/dev/null || true); \
+		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/observability config/samples config/server config/webhook config/certmanager config/overlays docs/observability internal PROJECT go.mod 2>/dev/null || true); \
 	if [ -n "$$bad" ]; then \
 		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
 		echo "$$bad" | sed 's/^/    /'; \
@@ -257,8 +340,32 @@ fmt-check: ## Check Go formatting without modifying files.
 	if [ -n "$$unformatted" ]; then echo "✗ gofmt needed on:"; echo "$$unformatted"; exit 1; fi; \
 	echo "✓ gofmt clean"
 
+.PHONY: verify-prometheus
+verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alerting rules under config/observability/.
+	@set -e; PROMTOOL=$$($(RESOLVE_PROMTOOL)); \
+	echo "==> using $$PROMTOOL ($$($$PROMTOOL --version 2>&1 | head -1))"; \
+	echo "==> promtool check rules (flat alerting-rules.yaml)"; \
+	$$PROMTOOL check rules config/observability/alerting-rules.yaml; \
+	echo "==> promtool test rules (prometheus-rules-tests.yaml)"; \
+	cd config/observability && $$PROMTOOL test rules prometheus-rules-tests.yaml
+	@echo "==> drift check: PrometheusRule CR spec.groups matches alerting-rules.yaml groups"
+	@$(GO_CMD) run ./hack/verify-prometheus-drift config/observability/alerting-rules.yaml config/observability/prometheus-rules.yaml
+	@echo "==> kustomize build config/observability (catches broken kustomization rendering)"
+	@# The README advertises `kubectl apply -k config/observability`. A
+	@# broken kustomization.yaml or a YAML-syntax error in any resource
+	@# would silently slip past the promtool checks (which only see the
+	@# flat rules file). Render the overlay through the pinned local
+	@# kustomize so CI fails fast on rendering errors. NOTE: kustomize
+	@# only validates YAML structure and kustomize patches, not the
+	@# CR schema — a semantically-invalid PrometheusRule / ServiceMonitor
+	@# still renders OK and would only fail at apply time against a
+	@# live apiserver. We discard stdout but propagate stderr/exit-code.
+	@$(LOCAL_KUSTOMIZE) build config/observability >/dev/null
+	@echo "✓ kustomize build clean"
+	@echo "✓ Prometheus rules valid"
+
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

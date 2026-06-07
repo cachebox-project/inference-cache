@@ -83,6 +83,15 @@ jobs:
         git diff --exit-code
         make ci-lint
 
+    # promtool check rules + promtool test rules + drift check that the
+    # PrometheusRule CR (config/observability/prometheus-rules.yaml) stays in
+    # sync with the flat rules file (alerting-rules.yaml). The promtool
+    # binary is downloaded from upstream Prometheus releases by the make
+    # target (no go install — the module path doesn't satisfy Go's v3+
+    # major-version rule).
+    - name: Verify Prometheus alerting rules
+      run: make verify-prometheus
+
     - name: Verify CRDs & deepcopy up to date
       run: |
         make manifests generate

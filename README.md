@@ -101,6 +101,73 @@ kubectl -n inference-cache-system wait --for=condition=Available deployment --al
 kubectl get cacheindex cluster-default -o yaml
 ```
 
+## Monitoring
+
+The `inference-cache-server` exposes Prometheus metrics on `:8080/metrics`
+(prefixed `inferencecache_*`). A default alert bundle for the operational
+silent-failure patterns this code has hit in production ships under
+[`config/observability/`](config/observability/) and is **not** included in
+`config/default` — the alerts are opt-in so that installs without
+prometheus-operator CRDs are not affected by an unknown `apiVersion`.
+
+For prometheus-operator / kube-prometheus installs:
+
+```bash
+kubectl apply -k config/observability
+```
+
+This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
+`inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
+the alerts.
+
+> **Caveat — Prometheus Operator selectors.** Both CRs carry example
+> labels (`prometheus: k8s`, plus `role: alert-rules` on
+> the PrometheusRule) that match the upstream kube-prometheus stack
+> (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
+> Helm chart uses a different convention (`release: <release-name>`,
+> no `prometheus:` label) — its rule/serviceMonitor selectors do not
+> match what's shipped here. If
+> your `Prometheus` CR's `ruleSelector` / `serviceMonitorSelector`
+> uses a different label set (`release: my-prom`, etc.), `kubectl
+> apply -k` succeeds but Prometheus silently ignores both resources.
+> The YAML comments next to each label spell out the introspection
+> command (`kubectl get prometheus -A -o jsonpath=...`); see
+> [`docs/observability/alerts.md`](docs/observability/alerts.md) for
+> the full discussion.
+
+Four of the five Stage 1 alerts (`IndexEmpty`, `LookupRouteDegenerate`,
+`LookupRouteHighTimeout`, `IndexEvictionsSpike`) become active as soon
+as the operator is installed AND the selectors match — they remain
+quiet on a healthy or idle install (each rule is gated by traffic/
+rate/eviction thresholds; see `for:` + the rate floors in the alert
+expressions) and only fire when the conditions are met.
+
+> **The fifth alert needs a vLLM scrape this bundle does NOT ship.**
+> [`LMCacheT2NoHits`](docs/observability/alerts.md#lmcachet2nohits) reads
+> `vllm:external_prefix_cache_*` from vLLM engine pods directly. The
+> shipped `ServiceMonitor` covers only `inference-cache-server`. To make
+> that alert effective, add a separate `PodMonitor` for your vLLM
+> Deployment (or `kubernetes_sd_configs: pod` for vanilla Prometheus)
+> so engine `/metrics` is scraped with both `namespace` and `pod` labels
+> attached. See alerts.md "How to enable" for the requirement.
+
+For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
+use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
+**You must also configure scraping yourself.** For multi-install or
+per-install isolation, use Kubernetes service discovery
+(`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
+that copies `__meta_kubernetes_namespace` to `namespace` — the alerts
+scope per install by that label. A static DNS scrape (e.g. just
+`inference-cache-server.inference-cache-system.svc.cluster.local:8080`)
+is acceptable for a single install but loses per-install isolation; do
+NOT use it if you scrape multiple inference-cache installs into one
+Prometheus. Without a working scrape, the rules load but fire on nothing.
+
+Per-alert runbooks (causes, triage steps, example PromQL): see
+[`docs/observability/alerts.md`](docs/observability/alerts.md). For the
+underlying metric surface, see
+[`docs/reference/metrics.md`](docs/reference/metrics.md).
+
 ## Local Development Cluster
 
 Create a kind cluster for controller development:
@@ -121,6 +188,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make test`: run unit tests
 - `make lint`: run gofmt and go vet
 - `make ci-lint`: run golangci-lint
+- `make verify-prometheus`: lint + unit-test the Prometheus alerting rules under `config/observability/`
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code
 - `make manifests`: regenerate CRD, RBAC, and webhook manifests

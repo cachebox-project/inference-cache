@@ -1,0 +1,184 @@
+# PrometheusRule for inference-cache, for prometheus-operator / kube-prometheus
+# installs. The `spec.groups` body is a verbatim copy of alerting-rules.yaml in
+# this directory — both files MUST stay in sync. The flat file is what gets
+# linted by `promtool check rules` and exercised by `promtool test rules`;
+# this file is what an operator applies via `kubectl apply -k`. Drift between
+# them is gated by `make verify-prometheus`.
+#
+# The Prometheus operator picks this up automatically when its
+# `PrometheusRule` selector matches the labels below; adjust the selector on
+# your Prometheus CR if these defaults do not match your install.
+#
+# See docs/observability/alerts.md for per-alert runbooks.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: inference-cache-alerts
+  # Land in the operator's namespace by default, NOT the caller's current
+  # context. Many prometheus-operator installs use `ruleNamespaceSelector`
+  # to constrain which namespaces are scanned for rules; applying into the
+  # operator namespace is the safest universal default. If your Prometheus
+  # CR's selector points at a different namespace (e.g. `monitoring`),
+  # change the `namespace:` here or set `namespace:` in kustomization.yaml.
+  namespace: inference-cache-system
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: observability
+    # NOTE: these labels target the UPSTREAM kube-prometheus stack's
+    # default `Prometheus` named `k8s` (`prometheus: k8s`,
+    # `role: alert-rules`). Other common conventions to be aware of:
+    #   * `prometheus-community/kube-prometheus-stack` Helm chart →
+    #     `release: <helm-release-name>` (no `prometheus:` label).
+    #   * Custom `Prometheus` CRs → whatever labels their
+    #     `ruleSelector.matchLabels` specifies.
+    # Prometheus Operator only loads PrometheusRule CRs whose labels
+    # match the Prometheus CR's `ruleSelector`; `kubectl apply -k`
+    # succeeds either way but Prometheus silently ignores this rule
+    # until the labels match. Introspect your install with:
+    #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.ruleSelector}'
+    # and edit these labels to match.
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+    - name: inferencecache-health
+      interval: 30s
+      rules:
+        - alert: IndexEmpty
+          expr: |
+            (max by (namespace) (inferencecache_server_up) == 1)
+            and on (namespace)
+            (sum by (namespace) (rate(inferencecache_lookup_route_calls_total[10m])) > 0)
+            unless on (namespace)
+            (sum by (namespace) (inferencecache_index_entries) > 0)
+          for: 2m
+          labels:
+            severity: critical
+            component: inference-cache
+          annotations:
+            summary: "Cache index empty while server is up — subscriber → server pipeline broken."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
+
+        - alert: LMCacheT2NoHits
+          expr: |
+            (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[10m])) > 1000)
+            unless
+            (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_hits(_total)?"}[10m])) > 0)
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "External prefix cache on pod {{ $labels.pod }} returning zero hit tokens despite >1000 queried tokens/sec."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
+    - name: inferencecache-routing
+      interval: 30s
+      rules:
+        - alert: LookupRouteDegenerate
+          expr: |
+            (
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 0.1
+            )
+            and
+            (
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[10m]))
+              /
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
+            ) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "LookupRoute returning NO_HINT for >90% of calls on model {{ $labels.model }} — routing falling back to round-robin."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutedegenerate"
+
+        - alert: LookupRouteHighTimeout
+          expr: |
+            (
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 1
+            )
+            and
+            (
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="TIMEOUT"}[10m]))
+              /
+              sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "LookupRoute returning TIMEOUT for >5% of calls on model {{ $labels.model }} — server overload or tight deadline."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutehightimeout"
+
+    - name: inferencecache-capacity
+      interval: 30s
+      rules:
+        - alert: IndexEvictionsSpike
+          expr: |
+            sum by (namespace, algorithm) (
+              rate(inferencecache_index_evictions_total{reason="cap"}[10m])
+            ) > 10
+          for: 10m
+          labels:
+            severity: info
+            component: inference-cache
+          annotations:
+            summary: "Index evicting >10/sec at MaxEntries cap (algorithm={{ $labels.algorithm }}) — consider raising the cap."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
+
+    # ------------------------------------------------------------------------
+    # DEFERRED — the metrics these alerts consume are not yet exposed on
+    # /metrics. Enable each rule in the same change that ships its metric.
+    #
+    # NOTE on drift: `hack/verify-prometheus-drift` compares parsed YAML
+    # `groups`, which strips comments — so the commented stubs in this
+    # file and in `alerting-rules.yaml` are NOT enforced to match by CI.
+    # When uncommenting a deferred alert, manually mirror it into BOTH
+    # files in the same change; the drift check will then start
+    # comparing the live rules and lock them in step.
+    # ------------------------------------------------------------------------
+    #
+    # - name: inferencecache-lifecycle
+    #   interval: 30s
+    #   rules:
+    #     - alert: VersionSkewDetected
+    #       # DEFERRED: blocked on the backend version-skew gauge
+    #       # (inferencecache_backend_version_skew). Once the operator-side
+    #       # follow-up exposes that gauge, uncomment.
+    #       expr: inferencecache_backend_version_skew > 0
+    #       for: 1m
+    #       labels:
+    #         severity: warning
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Version skew detected between engine pod and managed cache backend."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#versionskewdetected"
+    #
+    #     - alert: KvEventsStaleness
+    #       # DEFERRED: blocked on the per-replica last-event timestamp
+    #       # (inferencecache_replica_last_event_at). Once the follow-up that
+    #       # gates Ready on first-event-observed lands, uncomment.
+    #       expr: time() - inferencecache_replica_last_event_at > 60
+    #       for: 2m
+    #       labels:
+    #         severity: warning
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Replica {{ $labels.replica_id }} has not emitted a KV event in over 60s."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#kveventsstaleness"
+    #
+    #     - alert: ServerProbeFail
+    #       # DEFERRED: blocked on the synthetic end-to-end probe
+    #       # (inferencecache_backend_probe_result). Once the functional Ready
+    #       # gate ships its outcome counter, uncomment.
+    #       expr: inferencecache_backend_probe_result{result="failed"} > 0
+    #       for: 1m
+    #       labels:
+    #         severity: critical
+    #         component: inference-cache
+    #       annotations:
+    #         summary: "Synthetic CacheBackend probe failing on {{ $labels.cachebackend }}."
+    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"

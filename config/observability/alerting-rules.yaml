@@ -1,0 +1,255 @@
+# Prometheus alerting rules for inference-cache.
+#
+# Flat-format rules file (Prometheus `rule_files:` reference, ConfigMap mount,
+# Helm `prometheus.serverFiles`, etc.). For prometheus-operator / kube-prometheus
+# installs, use the equivalent `PrometheusRule` Custom Resource in
+# prometheus-rules.yaml — both files carry the same rule set; drift is gated
+# by `make verify-prometheus`.
+#
+# Each alert below catches a degenerate metric pattern that has bitten
+# production at least once: the metric was on /metrics from day one, but
+# nothing watched the pattern, so the failure ran silently for days.
+#
+# The annotations here are intentionally short — they're what shows up in
+# Slack / PagerDuty. The full runbook (causes, triage steps, example PromQL)
+# lives in docs/observability/alerts.md, linked per-alert in `runbook_url`.
+#
+# Vendor-neutral per project policy: rule names, label values, and annotation
+# text never reference a specific cloud or its domain.
+#
+# Three more alerts are deferred until the metrics they depend on land —
+# `VersionSkewDetected` (needs inferencecache_backend_version_skew),
+# `KvEventsStaleness` (needs inferencecache_replica_last_event_at), and
+# `ServerProbeFail` (needs inferencecache_backend_probe_result). The placeholder
+# rules sit at the bottom of this file as comments; enable them in the same
+# change that exposes the corresponding metric.
+
+groups:
+  # ----------------------------------------------------------------------------
+  # Cache plane health — server pipeline is up but silently broken.
+  # ----------------------------------------------------------------------------
+  - name: inferencecache-health
+    interval: 30s
+    rules:
+      - alert: IndexEmpty
+        # Server reports up=1, the index holds zero entries, AND a gateway
+        # is actively making LookupRoute calls. The traffic gate is what
+        # distinguishes a genuine "subscriber → server pipeline broken"
+        # outage from a healthy idle install (operator applied the bundle
+        # but no engines deployed yet, no gateway sending traffic). On a
+        # broken install with traffic, every LookupRoute returns NO_HINT
+        # because there's literally nothing to match against — that is the
+        # critical case we want to page on. The 2m `for` dwell still
+        # dampens cold-start where the first KV events have not arrived
+        # yet.
+        #
+        # All clauses group by `namespace` (the install scope; Prometheus
+        # adds this label from the ServiceMonitor/Service). When multiple
+        # inference-cache installs share one Prometheus, alerts split per
+        # install — namespace A's broken pipeline does not mask or trip
+        # namespace B's. The phrasing is `... unless namespace has entries`
+        # so an entirely-absent `index_entries` series (e.g. fresh install
+        # before the first KV event) is treated as "empty" automatically.
+        expr: |
+          (max by (namespace) (inferencecache_server_up) == 1)
+          and on (namespace)
+          (sum by (namespace) (rate(inferencecache_lookup_route_calls_total[10m])) > 0)
+          unless on (namespace)
+          (sum by (namespace) (inferencecache_index_entries) > 0)
+        for: 2m
+        labels:
+          severity: critical
+          component: inference-cache
+        annotations:
+          summary: "Cache index empty while server is up — subscriber → server pipeline broken."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexempty"
+
+      - alert: LMCacheT2NoHits
+        # The offload tier silently no-ops: queried tokens climb but hit
+        # tokens stays at 0. Classic version-skew or wire-protocol mismatch
+        # between offload client (in the engine pod) and offload server.
+        #
+        # Metric provenance: `vllm:external_prefix_cache_{queries,hits}`
+        # are emitted by vLLM directly (NOT by this operator). The
+        # Python prometheus_client adds `_total` to counters at
+        # exposition time, so deployments see either the unsuffixed or
+        # the `_total`-suffixed form — the regex matcher below accepts
+        # BOTH. Upstream docs list the unsuffixed names at
+        # https://docs.vllm.ai/en/latest/usage/metrics/; the series
+        # have been present since vLLM ~0.18 (the release that added
+        # LMCache-style offload support). This operator does not
+        # currently scrape them
+        # (pkg/adapters/engine/metrics_scraper.go only reads
+        # vllm:prefix_cache_{hits,queries} for T1 plus
+        # vllm:*_cache_usage_perc), so the alert binds directly to
+        # vLLM's exposition. Operators should sanity-check the metric
+        # exists on at least one engine pod before relying on the
+        # alert: see the runbook's "verify the metric is exposed"
+        # step.
+        #
+        # IMPORTANT: the counters are TOKENS, not requests — a single
+        # 1500-token prefix counts as 1500 queries. The 1000 tokens/sec
+        # gate is calibrated to catch a single moderately-sized prefixed
+        # request per second; idle replicas (no prefixed traffic at all)
+        # stay below it. The 10m windows + 5m `for` require sustained
+        # zero-hit behavior, not a transient miss-streak.
+        #
+        # We use `unless` (set difference) rather than `and == 0` so the alert
+        # also fires when the hits counter series is entirely absent for the
+        # pod — older vLLM versions and some configurations never publish the
+        # `_hits_total` series until the first non-zero increment, and `and`
+        # requires a matching pod label on both sides to evaluate. The
+        # `unless` form drops a pod from the alert set ONLY when it has a
+        # positive hit-token rate; absent hits + sustained queried-token
+        # rate above the gate → alert fires.
+        # The `__name__=~"...(_total)?"` matchers accept both the
+        # Python-prometheus-client convention (counter `foo` exposed as
+        # `foo_total`) AND the unsuffixed form used by some non-Python
+        # Prometheus clients. The repo's own scraper hedges the same
+        # way (pkg/adapters/engine/metrics_scraper.go `sumCounter`), so
+        # the alert stays in lockstep with the scraper.
+        #
+        # SCRAPE-SCOPING REQUIREMENT: this expression matches EVERY
+        # scraped vLLM pod in the Prometheus shard — there is no
+        # controller-injected label on engine pods for Prometheus to
+        # filter on. The operator must restrict their vLLM PodMonitor
+        # to cache-bound engine pods (same selector as
+        # `CacheBackend.spec.engineSelector.matchLabels`), otherwise
+        # this alert can fire on unrelated vLLM workloads. See the
+        # "How to enable" section in docs/observability/alerts.md
+        # for the sample scoped PodMonitor.
+        expr: |
+          (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_queries(_total)?"}[10m])) > 1000)
+          unless
+          (sum by (namespace, pod) (rate({__name__=~"vllm:external_prefix_cache_hits(_total)?"}[10m])) > 0)
+        for: 5m
+        labels:
+          severity: warning
+          component: inference-cache
+        annotations:
+          summary: "External prefix cache on pod {{ $labels.pod }} returning zero hit tokens despite >1000 queried tokens/sec."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lmcachet2nohits"
+
+  # ----------------------------------------------------------------------------
+  # Routing quality — server is up and indexing, but hints are degenerate.
+  # ----------------------------------------------------------------------------
+  - name: inferencecache-routing
+    interval: 30s
+    rules:
+      - alert: LookupRouteDegenerate
+        # >90% NO_HINT means the cache plane has no useful hint for the
+        # gateway — effectively round-robin routing. The 0.1 q/s floor on
+        # total rate gates out idle models; without it, an idle model
+        # publishing 1 NO_HINT and 0 of anything else would trip the alert.
+        expr: |
+          (
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 0.1
+          )
+          and
+          (
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}[10m]))
+            /
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: inference-cache
+        annotations:
+          summary: "LookupRoute returning NO_HINT for >90% of calls on model {{ $labels.model }} — routing falling back to round-robin."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutedegenerate"
+
+      - alert: LookupRouteHighTimeout
+        # >5% TIMEOUT over 10m means the server is too slow (or the gateway's
+        # deadline budget too tight) for the configured timeout to land.
+        # Fail-open still serves the request as NO_HINT, but every TIMEOUT
+        # is a missed cache-hit opportunity.
+        expr: |
+          (
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m])) > 1
+          )
+          and
+          (
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total{reason_code="TIMEOUT"}[10m]))
+            /
+            sum by (namespace, model) (rate(inferencecache_lookup_route_calls_total[10m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: inference-cache
+        annotations:
+          summary: "LookupRoute returning TIMEOUT for >5% of calls on model {{ $labels.model }} — server overload or tight deadline."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#lookuproutehightimeout"
+
+  # ----------------------------------------------------------------------------
+  # Capacity / tuning — the index is healthy but operator policy is too tight.
+  # ----------------------------------------------------------------------------
+  - name: inferencecache-capacity
+    interval: 30s
+    rules:
+      - alert: IndexEvictionsSpike
+        # Cap-driven evictions (reason="cap") at a sustained rate of >10/sec
+        # means the working set has outgrown `MaxEntries`. This is
+        # informational — the index is doing its job — but a tuning signal:
+        # raise the cap, accept lower hit rate, or shorten TTL. TTL-driven
+        # evictions (reason="ttl") are excluded from the gate; they're
+        # normal lifecycle.
+        expr: |
+          sum by (namespace, algorithm) (
+            rate(inferencecache_index_evictions_total{reason="cap"}[10m])
+          ) > 10
+        for: 10m
+        labels:
+          severity: info
+          component: inference-cache
+        annotations:
+          summary: "Index evicting >10/sec at MaxEntries cap (algorithm={{ $labels.algorithm }}) — consider raising the cap."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
+
+  # ----------------------------------------------------------------------------
+  # DEFERRED — the metrics these alerts consume are not yet exposed on
+  # /metrics. Enable each rule in the same change that ships its metric.
+  # ----------------------------------------------------------------------------
+  #
+  # - name: inferencecache-lifecycle
+  #   interval: 30s
+  #   rules:
+  #     - alert: VersionSkewDetected
+  #       # DEFERRED: blocked on the backend version-skew gauge
+  #       # (inferencecache_backend_version_skew). Once the operator-side
+  #       # follow-up exposes that gauge, uncomment.
+  #       expr: inferencecache_backend_version_skew > 0
+  #       for: 1m
+  #       labels:
+  #         severity: warning
+  #         component: inference-cache
+  #       annotations:
+  #         summary: "Version skew detected between engine pod and managed cache backend."
+  #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#versionskewdetected"
+  #
+  #     - alert: KvEventsStaleness
+  #       # DEFERRED: blocked on the per-replica last-event timestamp
+  #       # (inferencecache_replica_last_event_at). Once the follow-up that
+  #       # gates Ready on first-event-observed lands, uncomment.
+  #       expr: time() - inferencecache_replica_last_event_at > 60
+  #       for: 2m
+  #       labels:
+  #         severity: warning
+  #         component: inference-cache
+  #       annotations:
+  #         summary: "Replica {{ $labels.replica_id }} has not emitted a KV event in over 60s."
+  #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#kveventsstaleness"
+  #
+  #     - alert: ServerProbeFail
+  #       # DEFERRED: blocked on the synthetic end-to-end probe
+  #       # (inferencecache_backend_probe_result). Once the functional Ready
+  #       # gate ships its outcome counter, uncomment.
+  #       expr: inferencecache_backend_probe_result{result="failed"} > 0
+  #       for: 1m
+  #       labels:
+  #         severity: critical
+  #         component: inference-cache
+  #       annotations:
+  #         summary: "Synthetic CacheBackend probe failing on {{ $labels.cachebackend }}."
+  #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
