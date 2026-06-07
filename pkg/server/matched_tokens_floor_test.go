@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -265,5 +266,105 @@ func TestLookupRouteSubFloorMatchEmitsNoHintMetric(t *testing.T) {
 	dontWant := `inferencecache_lookup_route_calls_total{hint_used="true",model="m",reason_code="PREFIX_MATCH"}`
 	if strings.Contains(body, dontWant) {
 		t.Errorf("metrics body unexpectedly carried a PREFIX_MATCH series for a sub-floor lookup: %q\n----\n%s", dontWant, body)
+	}
+}
+
+// TestLookupRouteFloorPrunesLFUHitsForFilteredReplicas pins the
+// no-credit-on-non-delivery invariant on the partial-keep path: when ONE
+// replica's match clears the floor and a sibling's match falls below it, only
+// the surviving replica's entries should bump the LFU counter. A naive filter
+// that prunes Scores but leaves the hits map untouched would still credit the
+// dropped replica's entries — silently skewing cap eviction toward replicas
+// whose hints never reached the gateway. The cap eviction observable is the
+// same shape as TestLookupRouteCreditsDeliveredLFUHitOverHandler — but flips
+// the question: not "was the delivered hit credited?", but "was the FILTERED
+// hit suppressed?".
+//
+// Wiring:
+//   - LFU namespace "t" with maxEntries=6 (exactly fits the seeded entries).
+//     The filler ingest that triggers the cap sweep is the 7th, pushing the
+//     cap victim count to 1.
+//   - Lookup chain [b1 b2 b3 b4] (16 tokens/block → 64 total).
+//   - Replica rA holds the full chain → matched_tokens=64, clears the floor.
+//   - Replica rB holds the leading two blocks [b1 b2] → matched_tokens=32,
+//     fails the policy floor of 64.
+//   - 3 chain lookups credit rA's 4 entries (count 3 after); rB's 2 entries
+//     stay at count 0 IFF the hits map was pruned in lockstep.
+//   - The 7th ingest (under replica "filler") forces a single cap eviction.
+//     LFU picks the lowest count; ties broken on oldest lastSeen.
+//
+// Two outcome shapes:
+//
+//   - **Fixed** (this PR): rB's entries are count 0 and older than the filler
+//     entry, so rB's b1 is the LFU victim. The filler stays present; rB's
+//     hold on b1 disappears.
+//   - **Buggy** (pre-fix): rB's entries would have been credited (count 3),
+//     leaving the filler entry as the only count-0 candidate → the filler
+//     gets evicted instead. presentInIndex(filler) flips.
+//
+// presentInIndex is the existing helper from lfu_credit_test.go; it checks
+// whether ANY replica holds the prefix (a single sweep removes only the
+// rB-keyed entry under b1, so b1 itself stays via rA).
+func TestLookupRouteFloorPrunesLFUHitsForFilteredReplicas(t *testing.T) {
+	policies := NewPolicyStore()
+	policies.Replace([]ResolvedPolicy{
+		{Namespace: "t", Eviction: "lfu", MinimumMatchedTokens: 64},
+	})
+	idx := index.New(
+		index.WithTTL(time.Hour),
+		index.WithMaxEntries(6),
+		index.WithEvictionResolver(policies),
+	)
+	svc := newInferenceCacheService(idx, newServerMetrics(), policies)
+
+	base := time.Now()
+	chain := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3"), []byte("b4")}
+	counts := []int32{16, 16, 16, 16}
+
+	// Seed rB FIRST so its b1 entry is older than rA's b1 entry. With
+	// equal-count LFU ties broken on oldest lastSeen, this pins rB's b1 as the
+	// cap victim under the bug-fixed path.
+	svc.index.Ingest(index.Update{
+		ReplicaID: "rB", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Timestamp: base,
+		Prefixes:  []index.PrefixRef{{BlockHashes: chain[:2], BlockTokenCounts: counts[:2]}},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "rA", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Timestamp: base.Add(time.Millisecond),
+		Prefixes:  []index.PrefixRef{{BlockHashes: chain, BlockTokenCounts: counts}},
+	})
+	// At cap: rB owns 2 prefix-keyed entries, rA owns 4 → total = 6.
+
+	for i := 0; i < 3; i++ {
+		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+			ModelId: "m", TenantId: "t", HashScheme: "vllm",
+			BlockHashes: chain, BlockTokenCounts: counts,
+		})
+		if err != nil {
+			t.Fatalf("LookupRoute iter %d: %v", i, err)
+		}
+		if resp.GetReasonCode() != "PREFIX_MATCH" {
+			t.Fatalf("iter %d reason = %q, want PREFIX_MATCH — rA's 64-token match should survive the floor", i, resp.GetReasonCode())
+		}
+		if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "rA" {
+			t.Fatalf("iter %d scores = %+v, want exactly one rA (rB's 32 < floor 64)", i, resp.GetReplicaScores())
+		}
+	}
+
+	// Filler ingest puts the index over the cap and triggers exactly one
+	// eviction. Distinct prefix bytes so it doesn't share a key with the
+	// chain entries.
+	svc.index.Ingest(index.Update{
+		ReplicaID: "filler", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Timestamp: base.Add(time.Second),
+		Prefixes:  []index.PrefixRef{{PrefixHash: []byte("filler"), TokenCount: 32}},
+	})
+
+	// Bug-fixed: rB's entries stay count 0, rB's b1 is the LFU victim
+	// (oldest among count-0 entries). The filler survives.
+	if !presentInIndex(svc.index, "filler") {
+		t.Fatalf("filler entry was evicted, but rB's filtered-out entries should have been the LFU victim — " +
+			"the hits map was NOT pruned in lockstep with the matched-tokens floor filter, so rB's b1 was wrongly credited 3 times")
 	}
 }

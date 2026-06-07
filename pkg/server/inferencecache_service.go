@@ -306,43 +306,42 @@ func (s *inferenceCacheService) policyMinimumMatchedTokens(tenant string) int32 
 }
 
 // applyMatchedTokensFloor filters scores below the per-tenant floor and, when
-// no replica survives, replaces the result with a fail-open NO_HINT (drops
-// hits, so LFU credit never runs on a downgraded response). The check is a
-// no-op when the floor is zero (policy opt-out) or when every score already
-// clears the floor — the common case for a real long-prefix match.
+// no replica survives, replaces the result with a fail-open NO_HINT. The
+// matching LFU hits are pruned in lockstep via LookupResult.RetainReplicas
+// (and dropped entirely on the all-empty downgrade), so a non-delivered
+// hint never bumps an LFU counter — preserving the no-credit-on-non-delivery
+// invariant even on the partial-keep path where one replica survives and a
+// sibling falls below the floor. The check is a no-op when the floor is zero
+// (policy opt-out) or when every score already clears the floor — the common
+// case for a real long-prefix match.
 func (s *inferenceCacheService) applyMatchedTokensFloor(result index.LookupResult, tenant string) index.LookupResult {
 	floor := s.policyMinimumMatchedTokens(tenant)
 	if floor <= 0 || len(result.Scores) == 0 {
 		return result
 	}
-	// Walk once: if every score clears the floor we keep the original slice
-	// (zero allocation, common case); only when a sub-floor score appears do
-	// we materialize a filtered copy. The filtered slice is appended without
-	// the original backing array so the discarded scores are eligible for GC
-	// (they may carry MatchedTokens that the caller would otherwise see).
-	belowFloor := false
-	for _, sc := range result.Scores {
-		if sc.MatchedTokens < floor {
-			belowFloor = true
-			break
-		}
-	}
-	if !belowFloor {
-		return result
-	}
-	kept := make([]index.ReplicaScore, 0, len(result.Scores))
+	// Walk once: classify each score and count survivors. If every score
+	// clears the floor we return the original result untouched (zero
+	// allocation, common case for a real long-prefix match).
+	keep := make(map[string]bool, len(result.Scores))
+	survivors := 0
 	for _, sc := range result.Scores {
 		if sc.MatchedTokens >= floor {
-			kept = append(kept, sc)
+			keep[sc.ReplicaID] = true
+			survivors++
 		}
 	}
-	if len(kept) == 0 {
+	if survivors == len(result.Scores) {
+		return result
+	}
+	if survivors == 0 {
 		// No replica cleared the floor — downgrade to a fail-open NO_HINT.
-		// Dropping the hits slice is deliberate: a non-delivered hint must
-		// not bump LFU access counters (the LookupResult CreditHits invariant).
+		// Constructing a fresh LookupResult drops the hits map entirely so a
+		// non-delivered hint cannot bump an LFU counter.
 		return index.LookupResult{Strategy: index.StrategyNone}
 	}
-	result.Scores = kept
+	// Partial-keep: prune Scores AND hitsByReplica together so dropped
+	// replicas' LFU entries are not credited at CreditHits time.
+	result.RetainReplicas(keep)
 	return result
 }
 

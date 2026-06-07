@@ -240,12 +240,17 @@ const (
 type LookupResult struct {
 	Scores   []ReplicaScore
 	Strategy Strategy
-	// hits are the entries that contributed matched tokens to Scores, captured
-	// (LFU namespaces only) during the lookup but NOT yet counted. The caller
-	// credits them via CreditHits ONLY when it actually delivers this result —
-	// so a lookup the gRPC handler discards as TIMEOUT never bumps an LFU
-	// counter. Unexported: *replicaEntry is an index-internal type.
-	hits []*replicaEntry
+	// hitsByReplica are the entries that contributed matched tokens to Scores,
+	// captured (LFU namespaces only) during the lookup but NOT yet counted.
+	// Keyed by replica ID so callers that prune Scores (e.g. the service-layer
+	// matched-tokens floor that drops sub-floor replicas) can drop the
+	// corresponding entries in lockstep via RetainReplicas — preserving the
+	// no-credit-on-non-delivery invariant even when the response is partially
+	// filtered. The caller credits the surviving entries via CreditHits ONLY
+	// when it actually delivers this result — so a lookup the gRPC handler
+	// discards as TIMEOUT never bumps an LFU counter. Unexported:
+	// *replicaEntry is an index-internal type.
+	hitsByReplica map[string][]*replicaEntry
 }
 
 // CreditHits records one LFU access for each entry that contributed matched
@@ -255,10 +260,41 @@ type LookupResult struct {
 // caller actually received. Lock-free (each accessCount is an atomic), so it is
 // safe to call after the index read lock has been released; a concurrently
 // evicted entry's bump is harmless (soft state). A no-op for LRU namespaces and
-// for NO_HINT/TENANT_HOT results (hits is empty).
+// for NO_HINT/TENANT_HOT results (hitsByReplica is empty).
 func (r LookupResult) CreditHits() {
-	for _, e := range r.hits {
-		e.accessCount.Add(1)
+	for _, entries := range r.hitsByReplica {
+		for _, e := range entries {
+			e.accessCount.Add(1)
+		}
+	}
+}
+
+// RetainReplicas prunes Scores AND hitsByReplica down to the replica IDs whose
+// boolean is true in keep. Callers that filter the scored result post-lookup
+// (the service-layer matched-tokens floor, which drops sub-floor replicas)
+// must call this rather than mutating Scores directly, so the hits map stays
+// in lockstep — otherwise the dropped replica's entries would still be
+// credited at CreditHits time, violating the no-credit-on-non-delivery
+// invariant and skewing LFU cap eviction toward replicas whose hints never
+// reached the gateway. The Scores slice is rebuilt without the original
+// backing array so the dropped scores are eligible for GC. A no-op when
+// every score is already kept; an all-empty keep map collapses Scores to
+// nothing (the caller should normally swap in StrategyNone in that case).
+func (r *LookupResult) RetainReplicas(keep map[string]bool) {
+	if len(r.Scores) == 0 {
+		return
+	}
+	kept := make([]ReplicaScore, 0, len(r.Scores))
+	for _, sc := range r.Scores {
+		if keep[sc.ReplicaID] {
+			kept = append(kept, sc)
+		}
+	}
+	r.Scores = kept
+	for id := range r.hitsByReplica {
+		if !keep[id] {
+			delete(r.hitsByReplica, id)
+		}
 	}
 }
 
@@ -751,12 +787,16 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 }
 
 // lookupWithHits runs the lookup and ALSO returns the entries that contributed
-// matched tokens to the result (LFU namespaces only; nil otherwise). The lookup
-// itself is side-effect-free — it never bumps the LFU counter. The public Lookup
-// discards the hits; LookupRoute carries them on its LookupResult so the gRPC
-// handler can credit them via LookupResult.CreditHits once — and only if — it
-// actually delivers the response (not on a TIMEOUT/early-deadline path).
-func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+// matched tokens to the result, keyed by replica ID (LFU namespaces only; nil
+// otherwise). The lookup itself is side-effect-free — it never bumps the LFU
+// counter. The public Lookup discards the hits; LookupRoute carries them on
+// its LookupResult so the gRPC handler can credit them via
+// LookupResult.CreditHits once — and only if — it actually delivers the
+// response (not on a TIMEOUT/early-deadline path). The per-replica keying
+// lets a post-lookup filter (the service-layer matched-tokens floor) drop
+// sub-floor replicas' entries from the credit list in lockstep with
+// dropping their Scores.
+func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	// Without a known hash_scheme, opaque hash bytes cannot be matched
 	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
@@ -773,7 +813,7 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, []*replicaEnt
 
 // lookupExact is the legacy single-blob exact-match path. Preserved
 // unchanged so existing callers (no block-hash chain) keep their behavior.
-func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
@@ -787,20 +827,27 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	i.mu.RLock()
 	replicas := i.prefixes[key]
 	scores := make([]ReplicaScore, 0, len(replicas))
-	var hits []*replicaEntry
+	var hitsByReplica map[string][]*replicaEntry
 	for id, e := range replicas {
 		fresh := freshnessAt(now, e.lastSeen, ttl)
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
 		// LFU hit capture: this entry is about to contribute matched tokens to
-		// the result, so record it as a candidate "use". Only entries that
-		// contribute a non-zero MatchedTokens are captured — counting
-		// merely-considered entries would inflate the counter with cold data.
-		// The counter is bumped later (LookupResult.CreditHits) and only if the
-		// handler actually delivers this result, never under the read lock.
+		// the result, so record it as a candidate "use" under THIS replica's
+		// key. Only entries that contribute a non-zero MatchedTokens are
+		// captured — counting merely-considered entries would inflate the
+		// counter with cold data. The counter is bumped later
+		// (LookupResult.CreditHits) and only if the handler actually delivers
+		// this result, never under the read lock. Keying by replica ID is what
+		// lets a post-lookup filter (the matched-tokens floor) drop a
+		// sub-floor replica's entries from the credit list in lockstep with
+		// dropping its Score.
 		if lfu && e.tokenCount > 0 {
-			hits = append(hits, e)
+			if hitsByReplica == nil {
+				hitsByReplica = make(map[string][]*replicaEntry, len(replicas))
+			}
+			hitsByReplica[id] = append(hitsByReplica[id], e)
 		}
 		// Only fold in pressure when the replica's stats *payload* is still
 		// fresh under the global TTL. statsReported reflects when the stat
@@ -826,7 +873,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	i.mu.RUnlock()
 
 	sortScoresDescByScoreThenID(scores)
-	return scores, hits
+	return scores, hitsByReplica
 }
 
 // lookupChain implements longest-common-prefix matching against the
@@ -840,7 +887,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 // The pressure and SLO factors from lookupExact compose unchanged: the chain
 // walk only changes how matched_tokens is derived; the score formula
 // (matched_tokens × freshness × pressureFactor × sloBias) is the same.
-func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
@@ -907,7 +954,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	}
 
 	scores := make([]ReplicaScore, 0, len(finalized))
-	var hits []*replicaEntry
+	var hitsByReplica map[string][]*replicaEntry
 	for id, st := range finalized {
 		if st.matchedTokens <= 0 {
 			continue
@@ -918,10 +965,15 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 		}
 		// LFU hit capture: this run contributes a non-zero MatchedTokens to the
 		// result, so every block entry in the matched run is a candidate "use".
-		// Captured here, credited later (only on a delivered response).
-		// (st.entries is non-nil only under LFU.)
-		if lfu {
-			hits = append(hits, st.entries...)
+		// Captured here under THIS replica's ID so a post-lookup filter (the
+		// matched-tokens floor) can drop sub-floor replicas' entries from the
+		// credit list in lockstep with dropping their Scores. Credited later
+		// only on a delivered response. (st.entries is non-nil only under LFU.)
+		if lfu && len(st.entries) > 0 {
+			if hitsByReplica == nil {
+				hitsByReplica = make(map[string][]*replicaEntry, len(finalized))
+			}
+			hitsByReplica[id] = st.entries
 		}
 		// Pressure / SLO compose exactly as in lookupExact: same source of
 		// truth (statsReported within TTL), same factor formulas. The chain
@@ -945,7 +997,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	i.mu.RUnlock()
 
 	sortScoresDescByScoreThenID(scores)
-	return scores, hits
+	return scores, hitsByReplica
 }
 
 // sortScoresDescByScoreThenID gives both lookup paths the same deterministic
@@ -1007,14 +1059,14 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 			return LookupResult{Strategy: StrategyNone}
 		}
 		if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
-			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
+			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 		}
 		// Chain misses never fall through to TENANT_HOT (by design — see
 		// contract doc), so run the miss classifier directly.
 		return LookupResult{Strategy: i.classifyMiss(req)}
 	}
 	if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
-		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
+		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 	}
 	if hot := i.tenantHotCandidates(req); len(hot) > 0 {
 		// TENANT_HOT carries MatchedTokens=0, so no hits to credit — it is a

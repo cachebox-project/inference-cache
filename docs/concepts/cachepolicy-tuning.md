@@ -2,9 +2,14 @@
 
 `CachePolicy` is the opt-in knob for tuning cache lookup and eviction behavior in a
 single namespace. The policy server ships with sane defaults (30m TTL, LRU eviction,
-no prefix-length gate, no lookup deadline), so **most namespaces need no CachePolicy at
-all** — you reach for one only when a specific namespace has a measured reason to deviate
-(a hot-prefix workload, a latency SLO, an unusually short or long prefix distribution).
+no request-side prefix-length gate, a **result-side matched-tokens floor of 64
+(4 KV blocks) so trivial chat-template-only overlaps do not surface as
+`PREFIX_MATCH`** — see [the matched-tokens floor](#two-minimums-one-role-each)
+below for the rationale and the explicit opt-out, no lookup deadline). So **most
+namespaces need no CachePolicy at all** — you reach for one only when a specific
+namespace has a measured reason to deviate (a hot-prefix workload, a latency SLO,
+an unusually short or long prefix distribution, or a benchmark that wants to see
+every overlap counted).
 
 `CachePolicy` is **namespaced** (shortName `cpol`), and **effectively one per namespace**: a
 second one is rejected at admission — but that check is *best-effort* (it lists-then-admits,
@@ -67,7 +72,7 @@ operator-visible signal.
 **Why both?** A 5000-token request can still produce a 16-token match (only
 the chat-template framing overlaps). `minimumPrefixTokens` can't catch that
 — the *request* is long enough; it's the *overlap* that's trivial.
-`minimumMatchedTokens` exists for exactly that case (the post-the cache-stress harness
+`minimumMatchedTokens` exists for exactly that case (the cache-stress harness
 benchmark showed ~70% of `PREFIX_MATCH` responses were 1-block trivial
 overlaps before this floor landed).
 
