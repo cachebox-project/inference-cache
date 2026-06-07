@@ -576,6 +576,68 @@ func TestValidator_ResourcesFractionalCPUAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_ResourcesRequestsOnlyNonOvercommittableRejected(t *testing.T) {
+	// K8s' container-resource contract requires non-overcommittable
+	// resources (hugepages-*, vendor-prefixed extended resources) to
+	// declare BOTH requests and limits — they cannot be specified in
+	// requests alone. Reject at admission so the operator sees a
+	// field-scoped error at `kubectl apply` rather than discovering
+	// the gap downstream.
+	for _, name := range []corev1.ResourceName{
+		"hugepages-2Mi",
+		"nvidia.com/gpu",
+	} {
+		t.Run(string(name), func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			qty := "1"
+			if name == "hugepages-2Mi" {
+				qty = "2Mi"
+			}
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{name: resource.MustParse(qty)},
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.requests[%s]", name),
+				"must also be set in spec.resources.limits")
+		})
+	}
+}
+
+func TestValidator_ResourcesLimitsOnlyNonOvercommittableAdmitted(t *testing.T) {
+	// Limits-only IS admitted for non-overcommittable resources —
+	// K8s auto-populates requests from limits when only limits is set.
+	// The rule we add fires only on the requests-only direction.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+		},
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("limits-only extended resource rejected: %v", err)
+	}
+}
+
+func TestValidator_ResourcesRequestsOnlyOvercommittableAdmitted(t *testing.T) {
+	// The new rule MUST NOT touch overcommittable resources — a
+	// requests-only cpu / memory shape is the canonical kubelet
+	// "no upper bound" pattern and admits today.
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+		t.Run(string(name), func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{name: resource.MustParse("1")},
+			}
+			if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("requests-only overcommittable %q rejected: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestValidator_ResourcesNonOvercommittableMismatchRejected(t *testing.T) {
 	// K8s requires limits==requests for non-overcommittable resources
 	// (hugepages-* and any extended resource). Only the standard

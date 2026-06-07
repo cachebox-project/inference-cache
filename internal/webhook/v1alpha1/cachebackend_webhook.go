@@ -156,6 +156,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectResourceLimitsBelowRequests,
+	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
 	rejectInvalidResourceNames,
@@ -1246,6 +1247,40 @@ func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.Erro
 	}
 	check(cb.Spec.Resources.Requests, "requests")
 	check(cb.Spec.Resources.Limits, "limits")
+	return errs
+}
+
+// rejectRequestsOnlyForNonOvercommittableResources rejects a non-
+// overcommittable resource (hugepages-*, vendor-prefixed extended
+// resource) declared in `spec.resources.requests` without a matching
+// entry in `spec.resources.limits`. K8s requires both halves for
+// non-overcommittable resources — the kubelet allocates whole pages
+// or devices, so the request and limit must be declared together and
+// be equal. Limits-only IS admitted by K8s (the apiserver auto-
+// populates requests from limits when only limits is set), so the
+// rule fires only on the requests-only direction. Overcommittable
+// resources (cpu, memory, ephemeral-storage) are unaffected — a
+// requests-only cpu / memory shape is the canonical kubelet "no upper
+// bound" pattern.
+func rejectRequestsOnlyForNonOvercommittableResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for name := range cb.Spec.Resources.Requests {
+		if isOvercommittableResource(name) {
+			continue
+		}
+		if _, ok := cb.Spec.Resources.Limits[name]; ok {
+			continue
+		}
+		qty := cb.Spec.Resources.Requests[name]
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "resources", "requests").Key(string(name)),
+			qty.String(),
+			fmt.Sprintf("%q is a non-overcommittable resource — it must also be set in spec.resources.limits with the same value (hugepages and extended resources require requests and limits to be declared together)", name),
+		))
+	}
 	return errs
 }
 
