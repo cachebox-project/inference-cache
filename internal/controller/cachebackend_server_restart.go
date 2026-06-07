@@ -771,11 +771,11 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	}
 
 	// Deployment convergence: spec.replicas == status.readyReplicas
-	// == status.updatedReplicas, AND the controller has observed the
-	// current generation. When all three hold, the Deployment is in
-	// steady state and a strict-superset Ready set against the prior
-	// baseline reflects a legitimate scale-up (not a maxSurge
-	// midpoint). All three are required:
+	// == status.updatedReplicas == len(live Ready pods), AND the
+	// controller has observed the current generation. When all four
+	// hold, the Deployment is in steady state and a strict-superset
+	// Ready set against the prior baseline reflects a legitimate
+	// scale-up (not a maxSurge midpoint). All four are required:
 	//   - readyReplicas == spec.replicas → right number of Ready pods
 	//     (rules out maxSurge widening above target)
 	//   - updatedReplicas == spec.replicas → all Ready pods run the
@@ -784,6 +784,19 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	//   - observedGeneration >= metadata.generation → the controller
 	//     has seen the current spec (rules out a just-changed spec
 	//     whose effects haven't propagated yet)
+	//   - len(live Ready pods) == spec.replicas → the live pod list
+	//     we just took for the identifier MATCHES the Deployment
+	//     status's claim. Without this clause, a stale Deployment
+	//     status (the apps controller hasn't yet observed the
+	//     maxSurge new pod) could report readyReplicas==1 while we
+	//     observed 2 Ready pods in the same reconcile — the
+	//     status counters would lie convergence even though the
+	//     midpoint is genuinely transient, and we would persist the
+	//     widened latch as a "scale-up" baseline. A later rollback
+	//     dropping the new pod would then look like a real
+	//     replacement (a UID disappeared from the latch) and
+	//     false-cascade. Cross-checking against the live count is
+	//     cheap and closes that race.
 	// nil spec.Replicas defaults to 1 per the Deployment defaulter
 	// (kubebuilder/apiserver default), so we collapse nil to 1.
 	wantReplicas := int32(1)
@@ -792,7 +805,8 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	}
 	converged := ownedDep.Status.ObservedGeneration >= ownedDep.Generation &&
 		ownedDep.Status.ReadyReplicas == wantReplicas &&
-		ownedDep.Status.UpdatedReplicas == wantReplicas
+		ownedDep.Status.UpdatedReplicas == wantReplicas &&
+		int32(len(ready)) == wantReplicas
 
 	if len(ready) == 0 {
 		return "", converged, nil

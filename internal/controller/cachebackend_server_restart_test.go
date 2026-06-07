@@ -914,6 +914,105 @@ func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) 
 	}
 }
 
+// TestReconcileServerInstance_StaleDeploymentStatusDoesNotPersistMidpoint
+// drives the race where the Deployment.Status counters lie about
+// convergence: spec.replicas=1, status.readyReplicas=1,
+// status.updatedReplicas=1, observedGeneration current — but the
+// LIVE pod list has 2 Ready pods (a maxSurge mid-rollout where the
+// apps/v1 Deployment controller has not yet observed the new pod).
+// If the convergence check trusted only the Status counters, the
+// strict-superset midpoint would be persisted as a "scale-up"
+// baseline; a subsequent rollback dropping the new pod would then
+// look like a real replacement and false-cascade the engine fleet.
+// The cross-check against len(live Ready pods) closes that race.
+func TestReconcileServerInstance_StaleDeploymentStatusDoesNotPersistMidpoint(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Baseline: 1 Ready pod, Deployment converged at replicas=1.
+	if err := setOwnedDeploymentConverged(f, 1); err != nil {
+		t.Fatalf("set baseline Deployment converged: %v", err)
+	}
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Simulate a rolling-update midpoint where the apps controller's
+	// Status counters are STALE: they still claim readyReplicas=1
+	// (matching spec.replicas=1) while the live pod list has 2 Ready
+	// pods. This is what stale-status convergence looks like to our
+	// reconciler. Leave Deployment.Status unchanged — it already
+	// reports {ReadyReplicas: 1, UpdatedReplicas: 1, replicas=1}
+	// from setOwnedDeploymentConverged(f, 1) above.
+	tru := true
+	newer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-zzz",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-newer-stale-status",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), newer); err != nil {
+		t.Fatalf("create newer pod (stale-status midpoint): %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), newer); err != nil {
+		t.Fatalf("ready newer pod: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("midpoint wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	// CRITICAL ASSERTION: the latch must NOT advance. Without the
+	// len(ready)==wantReplicas clause in the convergence check, the
+	// stale-status counters (which look converged at replicas=1)
+	// would convince the reconciler that the {old,new} pair is a
+	// steady-state scale-up rather than a transient midpoint, and
+	// the widened latch would get persisted.
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("midpoint ObservedServerInstance = %q, want %q (stale Deployment.Status counters reported convergence, but the live pod count (%d) > spec.replicas (1) is a midpoint, not a scale-up — the latch must NOT advance or a rollback would false-cascade)", got, baseline, 2)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("stale-status midpoint triggered a cascade; only converged transitions or real replacements should cascade")
+	}
+
+	// Now simulate the rollback: the new pod is killed. The latch
+	// is still on the baseline, so prior == currentID == baseline,
+	// and the rollback is a true no-op.
+	if err := f.r.Delete(context.Background(), newer); err != nil {
+		t.Fatalf("delete rolled-back new pod: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-rollback wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("post-rollback ObservedServerInstance = %q, want %q (rolled-back rolling update must be a no-op; the original pod's process never changed)", got, baseline)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
+		t.Fatalf("cascade counter = %v, want 0 (no real cache-server replacement happened)", got)
+	}
+}
+
 // setOwnedDeploymentConverged mutates the fixture's serverDep so its
 // Status reflects a converged Deployment at the given replica count.
 // Returns the apply error if any. Used by ConvergedScaleUp test.

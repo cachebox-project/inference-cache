@@ -45,7 +45,16 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).
 		WithObjects(objs...).
 		Build()
-	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	return &CacheBackendReconciler{
+		Client: c,
+		Scheme: scheme,
+		Log:    logr.Discard(),
+		// Seed a real serverInstanceCascade so lifecycle tests that
+		// assert on the in-process shadow / lastAt / counted maps
+		// actually exercise the clear path rather than skipping
+		// the check on a nil pointer.
+		serverInstanceCascade: newServerInstanceCascade(),
+	}
 }
 
 func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) {
@@ -470,14 +479,20 @@ func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T)
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
 
 	reconcile(t, r, "cache", "ns1")
-	// Plant a baseline ObservedServerInstance — the field is normally
-	// written by reconcileServerInstance; here we set it directly so
-	// the test exercises the External-transition clearing path
-	// without depending on a Ready cache-server pod fixture.
+	// Plant BOTH a baseline ObservedServerInstance AND an in-memory
+	// shadow value, simulating a managed period that had observed a
+	// Ready cache-server pod. The test then verifies that the
+	// External transition clears BOTH — without the planted shadow,
+	// the shadow assertion would vacuously pass on an empty map.
 	live := getBackend(t, r, "cache", "ns1")
 	live.Status.ObservedServerInstance = "cache-pod-uid:0"
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q (test would be vacuous without a planted value)", got, "cache-pod-uid:0")
 	}
 
 	// Confirm preserved fields we expect NOT to be clobbered alongside
@@ -509,11 +524,8 @@ func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T)
 	// shadow would let a later External→managed transition resolve
 	// effectivePrior to the prior-period currentID and false-cascade
 	// the engine fleet on the first new Ready pod.
-	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
-	if r.serverInstanceCascade != nil {
-		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
-			t.Fatalf("cascade shadow = %q after managed→External transition; want cleared (a lingering shadow would false-cascade on the return path)", shadow)
-		}
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after managed→External transition; want cleared (a lingering shadow would false-cascade on the return path)", shadow)
 	}
 }
 
@@ -531,6 +543,11 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
 	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q", got, "cache-pod-uid:0")
+	}
 
 	switching := getBackend(t, r, "cache", "ns1")
 	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
@@ -544,11 +561,8 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→unmanaged transition", got.Status.ObservedServerInstance)
 	}
 	// In-memory shadow must also be cleared on the unmanaged path.
-	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
-	if r.serverInstanceCascade != nil {
-		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
-			t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
-		}
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
 	}
 }
 
@@ -565,12 +579,19 @@ func TestReconcileSwitchToInvalidStorageClearsObservedServerInstance(t *testing.
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
 
 	reconcile(t, r, "cache", "ns1")
-	// Plant a baseline as if a prior managed period had observed a
-	// Ready cache-server pod.
+	// Plant a baseline AND a shadow value as if a prior managed
+	// period had observed a Ready cache-server pod. Without planting
+	// the shadow, the post-transition shadow assertion would pass
+	// vacuously on an empty map.
 	live := getBackend(t, r, "cache", "ns1")
 	live.Status.ObservedServerInstance = "cache-pod-uid:0"
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q", got, "cache-pod-uid:0")
 	}
 
 	// Flip into the InvalidStorage gate: replicas > 1 with a single
@@ -592,11 +613,8 @@ func TestReconcileSwitchToInvalidStorageClearsObservedServerInstance(t *testing.
 	if got.Status.ObservedServerInstance != "" {
 		t.Fatalf("status.observedServerInstance = %q, want cleared on InvalidStorage gate", got.Status.ObservedServerInstance)
 	}
-	key := cascadeKey{namespace: got.Namespace, name: got.Name, uid: string(got.UID)}
-	if r.serverInstanceCascade != nil {
-		if shadow := r.serverInstanceCascade.lastAttempt(key); shadow != "" {
-			t.Fatalf("cascade shadow = %q after InvalidStorage gate; want cleared (lingering shadow would false-cascade when the operator fixes the config)", shadow)
-		}
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after InvalidStorage gate; want cleared (lingering shadow would false-cascade when the operator fixes the config)", shadow)
 	}
 }
 
