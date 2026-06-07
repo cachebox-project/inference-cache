@@ -228,7 +228,7 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
      reconciler / webhook file that uses it (e.g.
      `backendServerRestartCascadesTotal` in
      `internal/controller/cachebackend_server_restart.go`); register it
-     into `sigs.k8s.io/controller-runtime/pkg/metrics`.`Registry` from
+     into `sigs.k8s.io/controller-runtime/pkg/metrics.Registry` from
      an `init()` so it appears on the manager's `/metrics` endpoint
      without a separate plumbing path. Add a package-private
      `reset*ForTest()` helper so unit tests can clear state between
