@@ -600,10 +600,14 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		endpoint = serviceEndpoint(&liveSvc)
 	}
 
-	requeueAfter, err := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
+	// Do NOT short-circuit on statusErr — the cascade is independent
+	// recovery for stale engine sockets and must not be skipped just
+	// because the unrelated managed-status patch (matchedEnginePods,
+	// Ready / Progressing / Degraded conditions, capacity, …) hit a
+	// transient conflict. The cascade has its own patchStatus path
+	// for the latch field, gated separately. Capture the error and
+	// return it AFTER the cascade has run.
 
 	// Cache-server restart cascade: when the Ready cache-server pod
 	// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
@@ -614,12 +618,13 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	// socket (the upstream LMServerConnector opens its TCP socket in
 	// __init__ only and silently fails every subsequent PUT with EPIPE
 	// after a server restart, until the engine pod itself rolls). Always
-	// runs (even when applyErr != nil), since the cascade is independent
-	// of whether THIS reconcile pass made a successful apply: a transient
-	// apply churn must not delay engine recovery from a cache-server
-	// outage. A non-zero cascadeWait means the rate-limit window
-	// suppressed the cascade; honor it on the requeue so we retry exactly
-	// at the boundary.
+	// runs (even when applyErr != nil OR updateManagedStatus errored),
+	// since the cascade is independent of whether THIS reconcile pass
+	// made a successful apply or a successful unrelated status update:
+	// a transient apply / status-write churn must not delay engine
+	// recovery from a cache-server outage. A non-zero cascadeWait means
+	// the rate-limit window suppressed the cascade; honor it on the
+	// requeue so we retry exactly at the boundary.
 	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
 	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
 		requeueAfter = cascadeWait
@@ -654,6 +659,13 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		// the actual retry schedule; the next successful reconcile
 		// then re-enters the cascade path at its own boundary.
 		return ctrl.Result{}, applyErr
+	}
+	if statusErr != nil {
+		// Surface the deferred status-write failure after the cascade
+		// has had its chance to recover engine FDs. Same workqueue
+		// rate-limiter semantics as the applyErr path: Result is
+		// ignored when err != nil.
+		return ctrl.Result{}, statusErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",

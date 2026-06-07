@@ -1156,7 +1156,12 @@ func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Func
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	return &CacheBackendReconciler{
+		Client:                c,
+		Scheme:                scheme,
+		Log:                   logr.Discard(),
+		serverInstanceCascade: newServerInstanceCascade(),
+	}
 }
 
 // TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded
