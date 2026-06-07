@@ -592,8 +592,13 @@ spec:
 
                   When spec.autoscaling is set, the adapter additionally fills in a
                   CPU request fallback (250m) if this field omits one — a
-                  CPU-utilization HPA needs a CPU request as its denominator. The
-                  fallback never overwrites an operator-supplied CPU request.
+                  CPU-utilization HPA needs a *positive* CPU request as its
+                  denominator. The fallback never overwrites a positive
+                  operator-supplied value; a non-positive value (e.g.
+                  `requests.cpu: "0"`, which the admission validator admits as a
+                  valid kubelet shape for non-autoscaled pods) is treated as
+                  absent and replaced, because the HPA cannot use 0 as a
+                  denominator.
 
                   External backends provision no workload of their own, so the field
                   is inert for spec.type=External.
