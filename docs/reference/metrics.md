@@ -54,6 +54,7 @@ silently.
 | `inferencecache_probe_auth_total` | `result` | One increment per `/probe` request reaching the auth middleware, labeled by outcome. Third controller↔server endpoint on the snapshot listener; this counter mirrors the snapshot/policy pair so dashboards distinguish probe-side auth failures from read-side (`/snapshot`) and write-side (`/policy`) ones. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat. The probe-specific alarming signal is a non-trivial `unauth` rate without a paired `ok` rate: the CacheBackend reconciler drives `/probe` once per CacheBackend per ~30s, so silent `unauth` here means probe results never reach the reconciler and the `FunctionalProbeOK` condition degrades to unknown — invisible to operators unless this metric is on the dashboard. `forbidden` mirrors the policy-write semantics (some other workload is trying to drive a probe — alarming). All three caches are independent. |
 | `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 | `inferencecache_index_evictions_total` | `algorithm`, `reason` | One increment per **replica×prefix entry** removed by the index's own sweeps (distinct from the quota path above). | `algorithm` ∈ `lru` / `lfu` — the namespace's resolved `CachePolicy.spec.eviction`. `reason` ∈ `cap` (global `MaxEntries` exceeded — victims chosen by the algorithm: oldest-`lastSeen` for `lru`, lowest-access-count for `lfu`) / `ttl` (freshness sweep; algorithm-independent removal, but labeled with the namespace algorithm for attribution). Series are created lazily on the first eviction. A rising `reason="cap"` rate means the index is sustainably above `MaxEntries`; `lfu` keeps frequently-hit prefixes longer than `lru` under the same pressure. |
+| `inferencecache_backend_probe_result` | `backend`, `stage`, `result` | **Owned by the controller binary**, not the server. One increment per stage per probe call the CacheBackend reconciler issues to `/probe`. `backend` is the canonical `<namespace>/<name>`; `stage` ∈ `ingest` / `routing` / `t2`; `result` ∈ `ok` / `failed` / `skipped`. A successful probe call emits three increments (one per stage); an HTTP-level failure emits zero (no per-stage outcome was observed). Skipped stages count too — the metric reflects "what the probe round-trip looked like," not "what was exercised." | `backend × stage × result` cardinality is bounded by the size of the CacheBackend fleet × 3 × 3, comfortably small. Probe rate (~once per backend per 30s) keeps total emission tame. Dashboards key off the `result="failed"` slice for the alerting signal — a steady rate means the cache plane has a known regression for that backend; the `stage` label points at which layer broke. See `docs/design/cachebackend-api.md#functional-probe-gate` for the semantics. Registered on the controller-runtime registry in `internal/controller/cachebackend_probe.go`, so it lives in the **controller** `/metrics` endpoint, not the server's. |
 
 ### Histograms
 
@@ -105,6 +106,15 @@ with OTEL collectors) without bumping `v1alpha1`.
   endpoints share the controller-auth profile but emit per-endpoint counters
   so a dashboard can distinguish read-side, write-side, and probe-side
   failures.
+- **`backend_probe_result` writer:** the CacheBackend reconciler in
+  [`internal/controller/cachebackend_probe.go`](../../internal/controller/cachebackend_probe.go)
+  invokes `recordProbeResult(backendKey, result)` after each successful
+  `/probe` call (HTTP-level failures emit no increment — they're not a
+  per-stage outcome). The counter is registered on the controller-runtime
+  registry, so it lives on the **controller** binary's `/metrics` endpoint
+  (separate from the server's). Three increments per successful call (one
+  per stage); skipped stages count so the metric reflects the full probe
+  shape.
 
 ---
 

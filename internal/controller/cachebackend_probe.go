@@ -346,17 +346,42 @@ func evaluateFunctionalProbe(
 		return functionalProbeVerdict{}
 	case err != nil:
 		// HTTP-level failure — server unreachable, transport timeout, 5xx,
-		// JSON decode failure. Publish FunctionalProbeOK=Unknown with the
-		// transport error in the message but DO NOT downgrade Ready: a
-		// brief server outage should not flip every backend Ready=False
-		// (that's the noise mode the existing CacheIndex poller / policy
-		// pusher already avoid). The Unknown status is the operator's
-		// signal to investigate the probe path itself.
+		// JSON decode failure. By default a transient outage publishes
+		// FunctionalProbeOK=Unknown and DOES NOT downgrade Ready: a brief
+		// server outage should not flip every backend Ready=False (that's
+		// the noise mode the existing CacheIndex poller / policy pusher
+		// already avoid). The Unknown status is the operator's signal to
+		// investigate the probe path itself.
+		//
+		// EXCEPTION: if the existing FunctionalProbeOK was already False
+		// from a prior known stage failure, the transient HTTP error must
+		// NOT silently upgrade Ready to True OR overwrite the False
+		// condition with Unknown (which would forget the original
+		// failure reason and the cycle would erase the operator-visible
+		// downgrade). Preserve the existing False condition AND re-apply
+		// the Ready downgrade until a successful probe call proves
+		// recovery — symmetric to the rate-limited path above.
 		//
 		// No commitMark — failed calls don't burn a rate-limit slot, so
 		// the next reconcile retries immediately when the server comes
 		// back. recordProbeResult is also skipped: a failed transport
-		// isn't a per-stage outcome.
+		// isn't a per-stage outcome. A non-zero requeueAfter ensures that
+		// "next reconcile" actually fires on a quiet backend without
+		// relying on incidental external watch events; use the rate-limit
+		// window as a sensible retry cadence.
+		existing := meta.FindStatusCondition(backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		if existing != nil && existing.Status == metav1.ConditionFalse {
+			return functionalProbeVerdict{
+				// Do NOT write a new condition — leave the existing False
+				// in place so a sequence of HTTP errors doesn't fade the
+				// failure to Unknown and then upgrade to True. The False
+				// is sticky until a successful probe resolves it.
+				downgradeReady: true,
+				readyReason:    existing.Reason,
+				readyMessage:   existing.Message,
+				requeueAfter:   rateLimit,
+			}
+		}
 		return functionalProbeVerdict{
 			shouldWriteCondition: true,
 			condition: metav1.Condition{
@@ -366,6 +391,7 @@ func evaluateFunctionalProbe(
 				Message:            "probe call failed: " + truncateMessage(err.Error()),
 				ObservedGeneration: backend.Generation,
 			},
+			requeueAfter: rateLimit,
 		}
 	}
 

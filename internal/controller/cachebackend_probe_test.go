@@ -258,6 +258,70 @@ func TestEvaluateFunctionalProbeRateLimitedFailurePreservesDowngrade(t *testing.
 	}
 }
 
+// TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure is the
+// regression unit for a Codex round-3 finding (symmetric to the round-1
+// rate-limit blocking): a transient /probe HTTP error after a known
+// stage failure must NOT silently upgrade Ready to True, NOR fade the
+// False condition to Unknown (which would lose the original failure
+// reason and then upgrade on the next reconcile). The fix: when an
+// existing FunctionalProbeOK=False is present, an HTTP error preserves
+// the existing condition (no new write) AND re-applies the Ready
+// downgrade. False stays sticky until a successful probe resolves it.
+func TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "outage", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	backend := newProbeBackend("cb")
+	backend.Status.Conditions = []metav1.Condition{{
+		Type:    conditionTypeFunctionalProbeOK,
+		Status:  metav1.ConditionFalse,
+		Reason:  reasonProbeIngestFailed,
+		Message: "synthesized event not in index",
+	}}
+
+	v := evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue,
+		client, &probeRateLimiter{}, time.Second, time.Now())
+
+	if v.shouldWriteCondition {
+		t.Fatalf("HTTP error with existing False must NOT write a new condition (would fade False→Unknown and lose the failure reason); got %+v", v.condition)
+	}
+	if !v.downgradeReady {
+		t.Fatalf("HTTP error with existing False MUST re-apply Ready downgrade so the upstream KV gate doesn't overwrite Ready=False with True; got %+v", v)
+	}
+	if v.readyReason != reasonProbeIngestFailed {
+		t.Errorf("re-applied downgrade should inherit existing reason; got %q, want %q", v.readyReason, reasonProbeIngestFailed)
+	}
+	if v.requeueAfter <= 0 {
+		t.Errorf("HTTP error verdict must schedule a requeue; got %v", v.requeueAfter)
+	}
+}
+
+// TestEvaluateFunctionalProbeHTTPErrorSchedulesRequeue is the regression
+// unit for the Codex round-3 should-fix: the HTTP-error path used to omit
+// requeueAfter, so a transient outage could leave FunctionalProbeOK=Unknown
+// on a quiet backend indefinitely. The verdict now always requeues at the
+// rate-limit cadence so recovery doesn't depend on incidental watch events.
+func TestEvaluateFunctionalProbeHTTPErrorSchedulesRequeue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "outage", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+
+	v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb-fresh"), kvReadinessTrue,
+		client, &probeRateLimiter{}, 45*time.Second, time.Now())
+
+	if v.condition.Status != metav1.ConditionUnknown {
+		t.Fatalf("want Unknown on a fresh HTTP error; got %+v", v.condition)
+	}
+	if v.requeueAfter != 45*time.Second {
+		t.Errorf("HTTP error verdict must requeue at rateLimit cadence; got %v, want 45s", v.requeueAfter)
+	}
+}
+
 // TestEvaluateFunctionalProbeDisabledClearsExistingCondition pins the
 // "probe was turned off" path: if a backend carries a prior
 // FunctionalProbeOK condition and the operator unsets --server-probe-url

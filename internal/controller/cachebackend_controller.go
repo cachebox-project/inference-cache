@@ -193,8 +193,9 @@ type CacheBackendReconciler struct {
 	ProbeRateLimit time.Duration
 
 	// probeLimiter is the per-(namespace, name) "last successful probe call"
-	// cache backing the rate limit. Allocated lazily on first reconcile so a
-	// fresh reconciler doesn't carry the map until the gate is needed.
+	// cache backing the rate limit. Embedded value, so the zero-value
+	// sync.Map inside is usable from struct construction — the rate-limit
+	// gate works on the first reconcile without explicit initialization.
 	probeLimiter probeRateLimiter
 }
 
