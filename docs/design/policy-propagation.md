@@ -167,7 +167,8 @@ intervention.
     },
     {
       "namespace": "team-b",
-      "evictionTTL": 3600000000000
+      "evictionTTL": 3600000000000,
+      "minimumMatchedTokens": 64
     }
   ],
   "tenants": [
