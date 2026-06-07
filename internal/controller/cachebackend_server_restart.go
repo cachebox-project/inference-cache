@@ -82,12 +82,19 @@ const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 // advances exactly once per logical cascade event:
 //
 //   - after the rate-limit window has elapsed for this backend
-//     (DefaultMinServerRestartCascadeInterval),
+//     (DefaultMinServerRestartCascadeInterval), and
 //   - after the engine-pod scan + Deployment-annotate phase has
-//     completed without error, and
-//   - after status.observedServerInstance has been successfully
-//     persisted (so a transient persist failure → retry does not
-//     double-count: see reconcileServerInstance for the gating).
+//     completed without error.
+//
+// The increment fires BEFORE the subsequent status patch: by the
+// time we get here the engines are already annotated and ready to
+// roll, so the metric reflects the recovery the moment it begins —
+// the operator-visible counter does NOT lag behind a transient
+// status-write failure. Double-counting on retry is prevented by
+// the `counted` map in serverInstanceCascade: subsequent
+// reconciles for the same (key, currentID) call
+// shouldIncrementCascade, which returns false because the pair has
+// already been counted.
 //
 // A cascade with ZERO matched engine Deployments still counts as one
 // event — operators want flapping-server symptoms visible even when
