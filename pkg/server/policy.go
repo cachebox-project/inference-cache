@@ -30,10 +30,16 @@ import (
 //     this server still understands); bodies older than that are still
 //     rejected as "unsupported".
 //   - **Older server / newer body.** The reverse — a v3 server receiving a
-//     v4 push — still hard-fails (twice over): the v3 version check rejects
-//     the unrecognized version explicitly ("unsupported policy snapshot
-//     version"), and as a backup DisallowUnknownFields would catch the
-//     unknown minimumMatchedTokens field on each policy.
+//     v4 push — still hard-fails. Because the handler decodes the body
+//     before checking version, DisallowUnknownFields is the FIRST line of
+//     defense: the new minimumMatchedTokens field on each policy is unknown
+//     to the v3 Go struct, so decode rejects the body with
+//     `decode policy snapshot: json: unknown field "minimumMatchedTokens"`.
+//     Even on a hypothetical breaking change where the field rename or
+//     removal slips past DisallowUnknownFields, the explicit version-band
+//     check below catches it with `unsupported policy snapshot version`.
+//     Both diagnostics are fail-loud; the operator sees one specific message,
+//     not silent state loss.
 const PolicyPropagationVersion = 4
 
 // PolicyMinimumAcceptedVersion is the oldest /policy schema this server

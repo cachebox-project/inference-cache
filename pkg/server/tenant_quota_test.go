@@ -52,10 +52,10 @@ func TestPolicyPropagationVersionIsV4(t *testing.T) {
 	}
 }
 
-// TestPolicySnapshotV3AcceptedWithFloorDefault is the explicit regression
-// guard for the server-first rollout case Codex flagged: a v4 server MUST
-// accept a v3 controller's snapshot AND normalize the missing
-// minimumMatchedTokens field to DefaultMinimumMatchedTokens on each policy.
+// TestPolicySnapshotV3AcceptedWithFloorDefault pins the server-first rollout
+// invariant: a v4 server MUST accept a v3 controller's snapshot AND normalize
+// the missing minimumMatchedTokens field to DefaultMinimumMatchedTokens on
+// each policy.
 // Without the normalization, the v3 body would decode the missing field as
 // int32(0) — the v4 explicit-opt-out — silently disabling the floor for
 // every namespace with a CR mid-rollout. The all-other-knobs assertion
