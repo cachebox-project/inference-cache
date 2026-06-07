@@ -17,11 +17,15 @@
 #      columns.
 #   4. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
-#      server's `/policy` endpoint, and `LookupRoute` observes the pushed
-#      minimumPrefixTokens gate without engine pods or inference traffic. The
-#      installed validating webhook also rejects a SECOND CachePolicy in the
-#      namespace (one-per-namespace), proving the bundle's webhook Service +
-#      cert-manager CA-injection path — not just envtest handler logic.
+#      server's `/policy` endpoint, and `LookupRoute` observes BOTH the pushed
+#      `minimumPrefixTokens` request-side gate AND the pushed
+#      `minimumMatchedTokens` result-side floor without engine pods or
+#      inference traffic — three orthogonal lookups (above both, below the
+#      request-side gate, sub-floor realized match) carry the three policy
+#      enforcement paths end-to-end. The installed validating webhook also
+#      rejects a SECOND CachePolicy in the namespace (one-per-namespace),
+#      proving the bundle's webhook Service + cert-manager CA-injection
+#      path — not just envtest handler logic.
 #   5. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller. The
