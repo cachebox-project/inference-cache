@@ -330,9 +330,10 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
-`version` is `3`: it was bumped from `1` to `2` when the `tenants` slice
-was added, then to `3` when `policies[].eviction` (the per-namespace
-cap-eviction algorithm) was added. The server decodes with
+`version` is `4`: it was bumped from `1` to `2` when the `tenants` slice
+was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
+algorithm) was added, and to `4` when `policies[].minimumMatchedTokens`
+(the result-side matched-tokens floor) was added. The server decodes with
 `DisallowUnknownFields`, so a stale controller's push is rejected with a
 clear "unsupported version" error rather than silently dropping fields;
 controller and server roll out together and the periodic re-push

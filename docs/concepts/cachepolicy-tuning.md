@@ -124,8 +124,14 @@ For the wire schema, auth posture, and the one-policy-per-namespace dedup backst
 
 ## When NOT to use it
 
-- **Empty or default-happy cluster.** Server defaults (TTL 30m, LRU, no token threshold,
-  no lookup deadline) are deliberately sane. A fresh cluster needs no `CachePolicy`.
+- **Empty or default-happy cluster.** Server defaults (TTL 30m, LRU, **no request-side
+  prefix threshold**, **result-side `minimumMatchedTokens` floor of 64**, no lookup
+  deadline) are deliberately sane — a fresh cluster needs no `CachePolicy`. Note
+  that the result-side floor IS enabled by default (it filters trivial
+  chat-template-only overlaps even without a CR), so "no CachePolicy" is not the
+  same as "no token enforcement at all" — only the request-side gate is unset.
+  Install a CR with `minimumMatchedTokens: 0` if you specifically want the
+  pre-floor behavior (raw-recall benchmarking, ranker debugging).
 - **No measured SLO.** Don't set `lookupTimeoutMs` unless you have a real latency budget
   — and never set it to `0` expecting a timeout (see [Gotcha 1](#1-lookuptimeoutms-0-means-unbounded-not-fail-instantly)).
 - **Per-tenant quotas.** `CachePolicy` tunes lookup/eviction behavior per namespace; it
