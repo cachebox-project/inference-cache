@@ -37,8 +37,11 @@ const (
 // / GetCacheState are backed by the in-memory CacheIndex (B6); the remaining
 // RPCs (RenderTemplate, LookupPDRoute, streams) stay fail-open stubs until their
 // modules land. All lookups remain side-effect-free apart from emitting metrics
-// and fail open — an empty result with NO_HINT (no match / below the configured
-// minimumPrefixTokens), with TIMEOUT (lookupTimeoutMs budget breach), or with
+// and fail open — an empty result with NO_HINT (no match; below the configured
+// minimumPrefixTokens request-side gate; or every replica's realized
+// matched_tokens fell below the per-namespace minimumMatchedTokens
+// result-side floor — see docs/design/lookuproute-ranking.md §2.6), with
+// TIMEOUT (lookupTimeoutMs budget breach), or with
 // one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
 // when the lookup misses AND the index can identify which contract key did not
 // match anything held (see docs/design/lookuproute-diagnostics.md). Every empty-

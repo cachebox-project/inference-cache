@@ -214,7 +214,14 @@ const (
 	// StrategyNone — no candidates from any strategy. Handler emits NO_HINT.
 	StrategyNone Strategy = iota
 	// StrategyPrefixMatch — at least one replica holds the requested prefix
-	// in this hash_scheme. Handler emits PREFIX_MATCH.
+	// in this hash_scheme. Handler emits PREFIX_MATCH, BUT the service-layer
+	// matched-tokens floor (CachePolicy.spec.minimumMatchedTokens, default 64
+	// — see docs/design/lookuproute-ranking.md §2.6) can still downgrade the
+	// response to NO_HINT before it ships to the wire: replicas whose
+	// matched_tokens falls below the floor are filtered, and if none survive
+	// the strategy is replaced with StrategyNone in buildLookupResponse. The
+	// index itself stays policy-unaware — this Strategy is the *pre-policy*
+	// prefix-match outcome.
 	StrategyPrefixMatch
 	// StrategyTenantHot — no exact prefix match, but the tenant has recently
 	// warm replicas (hit_rate-based). A coarser locality signal than prefix
