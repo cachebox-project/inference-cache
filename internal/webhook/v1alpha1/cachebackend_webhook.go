@@ -160,6 +160,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectNegativeResourceQuantities,
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
+	rejectMisalignedHugepageQuantities,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -1023,6 +1024,63 @@ func isOvercommittableResource(name corev1.ResourceName) bool {
 		return true
 	}
 	return false
+}
+
+// rejectMisalignedHugepageQuantities rejects hugepages-<size> quantities
+// that are not whole multiples of the page size encoded in the resource
+// name. The Linux kernel allocates hugepages in page-sized chunks, so
+// K8s rejects "hugepages-2Mi: 3Mi" (3Mi isn't divisible by 2Mi) on the
+// rendered Pod. Mirror that rule at admission so the operator sees a
+// field-scoped error at `kubectl apply`.
+//
+// The page size comes from the suffix the operator wrote, which
+// rejectInvalidResourceNames has already validated as a positive
+// quantity. A zero quantity admits — it means "no allocation" and
+// is trivially aligned to any page size.
+//
+// Non-hugepage resources are skipped — cpu/memory/ephemeral-storage
+// take any kubelet-valid quantity, and vendor-prefixed extended
+// resources are integer-checked by rejectFractionalExtendedResources.
+func rejectMisalignedHugepageQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Resources == nil {
+		return nil
+	}
+	const hugePagesPrefix = "hugepages-"
+	var errs field.ErrorList
+	check := func(list corev1.ResourceList, kind string) {
+		for name, qty := range list {
+			s := string(name)
+			if !strings.HasPrefix(s, hugePagesPrefix) {
+				continue
+			}
+			suffix := strings.TrimPrefix(s, hugePagesPrefix)
+			pageSize, err := resource.ParseQuantity(suffix)
+			if err != nil || pageSize.Sign() <= 0 {
+				// rejectInvalidResourceNames already produced the
+				// malformed-name error; don't pile on with a redundant
+				// divisibility error against an undefined page size.
+				continue
+			}
+			pageVal := pageSize.Value()
+			qtyVal := qty.Value()
+			// Zero is trivially aligned; negative quantities are
+			// rejected by rejectNegativeResourceQuantities; we only
+			// gate on a positive, mis-multiple quantity.
+			if qtyVal <= 0 {
+				continue
+			}
+			if qtyVal%pageVal != 0 {
+				errs = append(errs, field.Invalid(
+					field.NewPath("spec", "resources", kind).Key(s),
+					qty.String(),
+					fmt.Sprintf("must be a multiple of the page size %s — the Linux kernel allocates hugepages in whole-page chunks", suffix),
+				))
+			}
+		}
+	}
+	check(cb.Spec.Resources.Requests, "requests")
+	check(cb.Spec.Resources.Limits, "limits")
+	return errs
 }
 
 // rejectFractionalExtendedResources rejects vendor-prefixed extended-

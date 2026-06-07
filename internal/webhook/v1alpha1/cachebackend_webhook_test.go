@@ -703,24 +703,94 @@ func TestValidator_ResourcesMalformedHugepagesRejected(t *testing.T) {
 
 func TestValidator_ResourcesStandardContainerResourceNamesAdmitted(t *testing.T) {
 	// The full set of standard container resource names — cpu, memory,
-	// ephemeral-storage, and any hugepages-* variant — MUST admit. Pin
-	// the contract so a future tightening doesn't accidentally exclude
-	// one of them.
-	for _, name := range []corev1.ResourceName{
-		corev1.ResourceCPU,
-		corev1.ResourceMemory,
-		corev1.ResourceEphemeralStorage,
-		corev1.ResourceName("hugepages-2Mi"),
-		corev1.ResourceName("hugepages-1Gi"),
+	// ephemeral-storage, and well-formed hugepages-<size> variants —
+	// MUST admit. Pin the contract so a future tightening doesn't
+	// accidentally exclude one of them. The hugepage quantity is chosen
+	// to be a multiple of the page size advertised in the suffix
+	// (K8s rejects hugepages-2Mi: 1 because 1 byte is not divisible by
+	// 2Mi — see TestValidator_ResourcesHugepagesQuantityMustBeDivisible).
+	for _, tc := range []struct {
+		name corev1.ResourceName
+		qty  string
+	}{
+		{corev1.ResourceCPU, "1"},
+		{corev1.ResourceMemory, "1"},
+		{corev1.ResourceEphemeralStorage, "1"},
+		{corev1.ResourceName("hugepages-2Mi"), "4Mi"},
+		{corev1.ResourceName("hugepages-1Gi"), "2Gi"},
 	} {
-		t.Run(string(name), func(t *testing.T) {
+		t.Run(string(tc.name), func(t *testing.T) {
 			v := &CacheBackendValidator{}
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{name: resource.MustParse("1")},
+				Requests: corev1.ResourceList{tc.name: resource.MustParse(tc.qty)},
+				Limits:   corev1.ResourceList{tc.name: resource.MustParse(tc.qty)},
 			}
 			if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-				t.Fatalf("standard container resource %q rejected: %v", name, err)
+				t.Fatalf("standard container resource %q (qty=%s) rejected: %v", tc.name, tc.qty, err)
+			}
+		})
+	}
+}
+
+func TestValidator_ResourcesHugepagesQuantityMustBeDivisible(t *testing.T) {
+	// K8s rejects hugepages-<size>: <amount> when amount is not a
+	// multiple of the page size — the kernel allocates whole pages.
+	// Mirror that rule at admission so the operator sees a field-
+	// scoped error at `kubectl apply` rather than the apiserver's
+	// downstream rejection on the rendered Pod.
+	for _, tc := range []struct {
+		page string
+		qty  string
+	}{
+		{"hugepages-2Mi", "3Mi"},   // 3Mi is not a multiple of 2Mi
+		{"hugepages-2Mi", "1"},     // 1 byte not a multiple of 2Mi
+		{"hugepages-1Gi", "512Mi"}, // 512Mi is not a multiple of 1Gi
+	} {
+		t.Run(tc.page+"/"+tc.qty, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceName(tc.page): resource.MustParse(tc.qty),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceName(tc.page): resource.MustParse(tc.qty),
+				},
+			}
+			requireInvalidWithCause(t, v, cb,
+				fmt.Sprintf("spec.resources.requests[%s]", tc.page),
+				"must be a multiple of the page size")
+		})
+	}
+}
+
+func TestValidator_ResourcesHugepagesAlignedQuantityAdmitted(t *testing.T) {
+	// Aligned hugepage quantities admit — the rule fires only on
+	// non-multiples of the page size.
+	for _, tc := range []struct {
+		page string
+		qty  string
+	}{
+		{"hugepages-2Mi", "2Mi"},
+		{"hugepages-2Mi", "4Mi"},
+		{"hugepages-2Mi", "0"},
+		{"hugepages-1Gi", "1Gi"},
+		{"hugepages-1Gi", "4Gi"},
+	} {
+		t.Run(tc.page+"/"+tc.qty, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			cb := newBackend()
+			cb.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceName(tc.page): resource.MustParse(tc.qty),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceName(tc.page): resource.MustParse(tc.qty),
+				},
+			}
+			if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("aligned hugepage %s qty=%s rejected: %v", tc.page, tc.qty, err)
 			}
 		})
 	}
