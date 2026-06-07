@@ -176,6 +176,19 @@ type CacheBackendReconciler struct {
 	// shorter value so they don't bake the 30s production delay into
 	// per-test runtime.
 	MatchedEnginePodsRequeueInterval time.Duration
+	// MinServerRestartCascadeInterval overrides the rate-limit window for
+	// the cache-server restart cascade. Zero means "use
+	// [DefaultMinServerRestartCascadeInterval]". Production wiring leaves
+	// this zero; envtest / unit tests shrink the window to keep per-test
+	// runtime cheap.
+	MinServerRestartCascadeInterval time.Duration
+
+	// serverInstanceCascade tracks the last cascade-restart time per
+	// backend so the rate-limit window is enforced in-process. Lazily
+	// initialized in SetupWithManager AND defensively in
+	// reconcileServerInstance (the latter so unit tests that bypass
+	// SetupWithManager get a working reconciler).
+	serverInstanceCascade *serverInstanceCascade
 }
 
 // matchedEnginePodsRequeueInterval returns the effective cadence for this
@@ -193,6 +206,7 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -370,6 +384,11 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // it on its own; an External backend whose engine pods still report KV events
 // legitimately keeps it).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below — see
+	// clearServerInstanceLatchShadow for why a lingering shadow
+	// across managed→External→managed would false-cascade.
+	r.clearServerInstanceLatchShadow(backend)
 	return r.patchStatus(ctx, backend, func() {
 		// TrimSpace before every decision. Admission rejects a
 		// whitespace-only endpoint at write time, but a pre-existing
@@ -381,6 +400,12 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
 		backend.Status.Endpoint = endpoint
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — External backends
+		// have no controller-managed cache-server pods, and
+		// cleanupOwnedWorkload above has just deleted any prior
+		// managed Deployment. Leaving the latch set would expose a
+		// stale UID to operators.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 
 		// Decide the Ready reason + message in one place so the
@@ -440,9 +465,17 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
 	}
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below.
+	r.clearServerInstanceLatchShadow(backend)
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — cleanupOwnedWorkload
+		// above has just deleted any prior managed Deployment and we
+		// no longer provision one, so a retained UID would advertise
+		// a stale identifier.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
@@ -567,13 +600,72 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		endpoint = serviceEndpoint(&liveSvc)
 	}
 
-	requeueAfter, err := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
-	if err != nil {
-		return ctrl.Result{}, err
+	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
+	// Do NOT short-circuit on statusErr — the cascade is independent
+	// recovery for stale engine sockets and must not be skipped just
+	// because the unrelated managed-status patch (matchedEnginePods,
+	// Ready / Progressing / Degraded conditions, capacity, …) hit a
+	// transient conflict. The cascade has its own patchStatus path
+	// for the latch field, gated separately. Capture the error and
+	// return it AFTER the cascade has run.
+
+	// Cache-server restart cascade: when the Ready cache-server pod
+	// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
+	// restart-sum advance from an in-place kubelet-driven container
+	// restart — see currentServerInstanceID's godoc for the shape),
+	// cascade-restart every engine Deployment that was injected
+	// against this backend so they re-establish their LMCache client
+	// socket (the upstream LMServerConnector opens its TCP socket in
+	// __init__ only and silently fails every subsequent PUT with EPIPE
+	// after a server restart, until the engine pod itself rolls). Always
+	// runs (even when applyErr != nil OR updateManagedStatus errored),
+	// since the cascade is independent of whether THIS reconcile pass
+	// made a successful apply or a successful unrelated status update:
+	// a transient apply / status-write churn must not delay engine
+	// recovery from a cache-server outage. A non-zero cascadeWait means
+	// the rate-limit window suppressed the cascade; honor it on the
+	// requeue so we retry exactly at the boundary.
+	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
+		requeueAfter = cascadeWait
+	}
+	// Schedule an unconditional periodic re-poll of the cache-server
+	// pod set on managed backends. Reason: an in-place container
+	// restart (kubelet respawning a crashed cache-server container
+	// without bumping pod.UID) does NOT change owned-Deployment status
+	// counts, and the controller deliberately does not watch Pods
+	// cluster-wide (see refreshMatchedEnginePods godoc). The
+	// matched-engine-pods cadence above does not cover this case
+	// either: when an operator removes spec.engineSelector after
+	// engines were injected, len(matchedEnginePods)→0 and that
+	// cadence stops firing, leaving in-place restarts unobservable
+	// until something unrelated triggers a reconcile. Pinning a
+	// floor at the rate-limit interval bounds the observation
+	// latency for in-place restarts at one cadence (cheap: one
+	// Pod List + one Deployment Get per backend per cadence).
+	pollCadence := r.minServerRestartCascadeInterval()
+	if requeueAfter == 0 || pollCadence < requeueAfter {
+		requeueAfter = pollCadence
 	}
 
 	if applyErr != nil {
+		// Return the error so controller-runtime's workqueue
+		// rate-limiter requeues the reconcile. Per the
+		// sigs.k8s.io/controller-runtime/pkg/reconcile contract, when
+		// the error is non-nil the `Result` is ignored — including any
+		// RequeueAfter we might set here — so there is no point
+		// pretending to schedule the cascade retry at the rate-limit
+		// boundary on this path. The rate-limiter's backoff cadence is
+		// the actual retry schedule; the next successful reconcile
+		// then re-enters the cascade path at its own boundary.
 		return ctrl.Result{}, applyErr
+	}
+	if statusErr != nil {
+		// Surface the deferred status-write failure after the cascade
+		// has had its chance to recover engine FDs. Same workqueue
+		// rate-limiter semantics as the applyErr path: Result is
+		// ignored when err != nil.
+		return ctrl.Result{}, statusErr
 	}
 
 	logger.V(1).Info("reconciled managed CacheBackend",
@@ -984,9 +1076,23 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Wipe the in-memory cascade shadow + rate-limit timestamp
+	// alongside the on-cluster status clearing below: a retained
+	// shadow would surface a stale pod identifier while no cache-
+	// server Deployment exists, and would drive a false cascade
+	// when the operator fixes the storage/replicas configuration
+	// and the controller flips back to the managed path.
+	r.clearServerInstanceLatchShadow(backend)
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
+		// Clear the cache-server-instance latch — cleanupOwnedWorkload
+		// has just deleted the previously-running Deployment (if any)
+		// and we refuse to provision a new one until the operator
+		// fixes the configuration. A retained UID would advertise a
+		// stale identifier and feed a false cascade on the fix-up
+		// transition.
+		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,
@@ -1979,6 +2085,9 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Pod informer per the locked design (the test setup just
 		// passes Client, not APIReader).
 		r.APIReader = mgr.GetAPIReader()
+	}
+	if r.serverInstanceCascade == nil {
+		r.serverInstanceCascade = newServerInstanceCascade()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		// NOTE: DO NOT add a predicate that filters status-only updates here.
