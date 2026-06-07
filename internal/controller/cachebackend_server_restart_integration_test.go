@@ -76,7 +76,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 		// First Ready cache-server pod. The reconciler should see
 		// this and persist it as the baseline (no cascade). The
 		// cache-server pod must be owner-referenced up to the
-		// reconciler-created Deployment so currentServerInstanceUID's
+		// reconciler-created Deployment so currentServerInstanceID's
 		// transitive-ownership check admits it. The reconciler creates
 		// the Deployment on the first reconcile; the RS that would
 		// normally own pods is fabricated here (envtest runs no apps
@@ -169,7 +169,7 @@ func TestIntegrationCacheBackendServerRestartCascade(t *testing.T) {
 
 		// Baseline observation + first cascade. The cache-server pod
 		// must be owner-referenced up to the reconciler-created
-		// Deployment so currentServerInstanceUID's transitive-
+		// Deployment so currentServerInstanceID's transitive-
 		// ownership check admits it.
 		reconcile(t, r, "cache", ns)
 		serverRS := newServerReplicaSet(t, k8s, ns, "cache", "cache-rs-1")
@@ -373,7 +373,7 @@ func fetchAfterCreate(t *testing.T, k8s interface {
 // server Deployment. envtest runs no apps controller, so the test is
 // the authority on what ReplicaSets/Pods exist. The RS is owner-
 // referenced to the reconciler-created Deployment (looked up after the
-// first reconcile creates it) so currentServerInstanceUID's transitive
+// first reconcile creates it) so currentServerInstanceID's transitive
 // ownership check (pod → RS → Deployment) admits owned pods.
 func newServerReplicaSet(t *testing.T, k8s client.Client, namespace, backendName, rsName string) *appsv1.ReplicaSet {
 	t.Helper()

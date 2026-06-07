@@ -76,7 +76,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 
 	tru := true
 	// Cache-server Deployment+ReplicaSet the reconciler "owns" — the
-	// transitive owner chain currentServerInstanceUID's strengthened
+	// transitive owner chain currentServerInstanceID's strengthened
 	// ownership check requires to attribute a Ready pod to this backend.
 	// The Deployment's controller-owner reference points at the
 	// CacheBackend, which is what IsControlledBy expects.
@@ -123,7 +123,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 	}
 	// The "current Ready" cache-server pod the controller observes.
 	// Labeled with the exact selectorLabels() set and owner-referenced
-	// up the chain to serverDep so currentServerInstanceUID's transitive
+	// up the chain to serverDep so currentServerInstanceID's transitive
 	// ownership check admits it.
 	f.serverPod = &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -232,7 +232,7 @@ func (f *cascadeRestartFixture) reloadEngineDep(t *testing.T) {
 	f.engineDep = dep
 }
 
-// serverInstanceID is the per-pod identifier currentServerInstanceUID
+// serverInstanceID is the per-pod identifier currentServerInstanceID
 // computes: <pod.UID>:<containerRunSum>. Shared by the assertion
 // helpers so tests build the expected observedServerInstance value
 // without duplicating the format. Mirrors containerRunSum in
@@ -1282,12 +1282,17 @@ func TestReconcileServerInstance_ShadowRecoversBaselineFromPatchFailure(t *testi
 	}
 }
 
-// TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist
-// asserts the "one increment per cascade event" contract holds even
-// when the status patch fails on the first attempt. The cascade
-// re-fires on retry (no-op annotates), but the counter must NOT
-// double-count — increments are gated on patch success.
-func TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist(t *testing.T) {
+// TestReconcileServerInstance_CounterIncrementsExactlyOncePerEvent
+// drives the "one increment per cascade EVENT" contract through a
+// failed-persist retry cycle. The cascade fires (annotates the
+// engine) on the first attempt, and the counter advances at that
+// point — engines are already recovering, so the metric should
+// reflect the recovery regardless of whether the latch persist
+// succeeded yet. On the subsequent retry the persist finally
+// succeeds via the shadow short-circuit; the counter must NOT
+// double-count because the `counted` map already holds this
+// (key, currentID).
+func TestReconcileServerInstance_CounterIncrementsExactlyOncePerEvent(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
 	// Baseline observation persists normally.
@@ -1295,15 +1300,15 @@ func TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist(t *testing.T)
 		t.Fatalf("baseline wait = %v, want 0", wait)
 	}
 	f.reload(t)
-	baseline := f.backend.Status.ObservedServerInstance
-	if baseline == "" {
+	if baseline := f.backend.Status.ObservedServerInstance; baseline == "" {
 		t.Fatalf("baseline observedServerInstance is empty; expected the first observation to persist")
 	}
 
 	// Replace the server pod. The next reconcile should cascade.
 	// Inject a status-patch-failing wrapper so the FIRST cascade-
 	// follow-up patch fails; the cascade itself (annotate engines)
-	// runs successfully, but the latch persist returns an error.
+	// runs successfully, the counter advances, but the latch persist
+	// returns an error.
 	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
 		t.Fatalf("delete server pod: %v", err)
 	}
@@ -1337,16 +1342,17 @@ func TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist(t *testing.T)
 	f.r.Client = failOnce
 
 	time.Sleep(60 * time.Millisecond)
-	// First cascade attempt: annotates the engine, but the status
-	// patch fails. Counter must NOT advance.
+	// First cascade attempt: annotates the engine + advances the
+	// counter, then the status patch fails. The counter MUST be at
+	// 1 by the end of this reconcile — engines are recovering, so
+	// the operator-visible metric should reflect the event even if
+	// the on-cluster latch could not be advanced yet.
 	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait <= 0 {
 		t.Fatalf("post-replacement first-attempt wait = %v, want positive (persist failed → request retry)", wait)
 	}
-	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 0 {
-		t.Fatalf("cascade counter after failed persist = %v, want 0 (counter must be gated on persist success)", got)
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter after first attempt = %v, want 1 (engines were annotated; the metric must reflect the cascade event regardless of persist success)", got)
 	}
-	// Engine annotation should already be applied — the annotate ran
-	// before the persist failed.
 	f.reloadEngineDep(t)
 	want := serverInstanceID(replacement)
 	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
@@ -1354,18 +1360,25 @@ func TestReconcileServerInstance_CounterIncrementsOnlyAfterPersist(t *testing.T)
 	}
 
 	// Wait past the rate-limit window so canCascade lets the retry
-	// through. The first attempt already stamped lastAt; the second
-	// attempt must wait past minServerRestartCascadeInterval.
+	// through. The status field still holds the PRE-cascade baseline
+	// (the first persist failed), so prior != currentID and the
+	// reconcile re-enters the cascade branch (not the shadow short-
+	// circuit). The cascade then runs idempotently: annotates are
+	// no-ops (the trigger already matches currentID), the counter
+	// does NOT advance (shouldIncrementCascade returns false because
+	// `counted` already holds (key, currentID)), and the persist
+	// finally succeeds.
 	time.Sleep(60 * time.Millisecond)
-
-	// Second reconcile: the patch wrapper allows it through. The
-	// cascade re-fires (annotate is a no-op since the trigger
-	// already matches), persist succeeds, counter advances by ONE.
 	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
 		t.Fatalf("retry-reconcile wait = %v, want 0", wait)
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
-		t.Fatalf("cascade counter after successful persist retry = %v, want exactly 1 (one cascade event = one increment, regardless of how many persist retries were required)", got)
+		t.Fatalf("cascade counter after persist retry = %v, want exactly 1 (one cascade event = one increment, regardless of how many persist retries were required)", got)
+	}
+	// And the status field is now in sync with the in-process baseline.
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != want {
+		t.Fatalf("status.observedServerInstance after retry = %q, want %q (retry must reconcile the field)", got, want)
 	}
 }
 
@@ -1506,7 +1519,7 @@ func TestAnnotateDeploymentForCascade_TOCTOUDifferentUIDSkipsPatch(t *testing.T)
 }
 
 // TestReconcileServerInstance_ObservationErrorRequeues asserts that when
-// currentServerInstanceUID fails (transient apiserver/RBAC hiccup),
+// currentServerInstanceID fails (transient apiserver/RBAC hiccup),
 // reconcileServerInstance returns a positive requeue duration so the
 // reconcile retries within the rate-limit window — without this, an
 // observation failure would silently skip the cascade and the only
@@ -1515,7 +1528,7 @@ func TestReconcileServerInstance_ObservationErrorRequeues(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 
 	// Inject a Client whose Pod List errors. The pod List in
-	// currentServerInstanceUID is the first apiserver call on the
+	// currentServerInstanceID is the first apiserver call on the
 	// reconciler's hot path, so any error here exercises the
 	// "observation failed" branch.
 	f.r.Client = &erroringPodListClient{Client: f.r.Client}

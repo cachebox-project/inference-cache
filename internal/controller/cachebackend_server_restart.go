@@ -62,12 +62,18 @@ const AnnotationCacheServerRestartTrigger = "inferencecache.io/cache-server-rest
 // may also hold stale connections.
 const DefaultMinServerRestartCascadeInterval = 30 * time.Second
 
-// cascadeRestartReasonServerInstanceChanged is the metric label value used
-// when the cache-server pod's UID differs from the value last persisted to
-// status.observedServerInstance. It is the only reason today; future
-// non-UID-change triggers (e.g. an operator-initiated "force cascade"
-// surface) would add their own value. Kept as a constant so the metric
-// label set is stable and grep-discoverable.
+// cascadeRestartReasonServerInstanceChanged is the metric label value
+// used whenever the cache-server SERVER-INSTANCE IDENTIFIER differs
+// from the value last persisted to status.observedServerInstance.
+// This covers both kinds of "the LMCache process is fresh" transition:
+// a pod UID swap (replacement, eviction, image roll) AND a restart-
+// sum-only advance from an in-place kubelet-driven container restart
+// (OOM with restartPolicy=Always reuses pod.UID but resets the
+// process). See currentServerInstanceID for the identifier shape. It
+// is the only reason today; future non-instance-change triggers
+// (e.g. an operator-initiated "force cascade" surface) would add
+// their own value. Kept as a constant so the metric label set is
+// stable and grep-discoverable.
 const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 
 // backendServerRestartCascadesTotal counts cascade-restart DECISIONS
@@ -176,12 +182,24 @@ type serverInstanceCascade struct {
 	// persist into status.observedServerInstance (whether or not the
 	// patch succeeded). Read fallback when the status field is empty.
 	shadow map[cascadeKey]string
+	// counted records the most recent currentID we have already
+	// incremented the cascade counter for. Lets the cascade-fired
+	// branch advance the metric exactly once per logical cascade
+	// EVENT (identified by (key, currentID)), even when the post-
+	// annotate status patch takes multiple retries: the first
+	// attempt records the (key, currentID) and Inc()s; subsequent
+	// reconciles for the same (key, currentID) see counted ==
+	// currentID and skip the increment. Separate from `shadow`
+	// because a "baseline" or "converged-superset" persist also
+	// updates the shadow but must NOT be counted.
+	counted map[cascadeKey]string
 }
 
 func newServerInstanceCascade() *serverInstanceCascade {
 	return &serverInstanceCascade{
-		lastAt: map[cascadeKey]time.Time{},
-		shadow: map[cascadeKey]string{},
+		lastAt:  map[cascadeKey]time.Time{},
+		shadow:  map[cascadeKey]string{},
+		counted: map[cascadeKey]string{},
 	}
 }
 
@@ -205,6 +223,25 @@ func (s *serverInstanceCascade) lastAttempt(key cascadeKey) string {
 	return s.shadow[key]
 }
 
+// shouldIncrementCascade reports whether the cascade counter has
+// already been advanced for (key, currentID). If not — i.e. this
+// is the first observation of this (key, currentID) since process
+// start or since the last clear() — records the pair and returns
+// true; the caller is then responsible for Inc()'ing the metric.
+// Subsequent calls for the same pair return false, even when the
+// post-annotate status patch is retrying across reconciles. This
+// is what enforces "one increment per cascade EVENT" against the
+// retry-after-failed-persist path.
+func (s *serverInstanceCascade) shouldIncrementCascade(key cascadeKey, currentID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.counted[key] == currentID {
+		return false
+	}
+	s.counted[key] = currentID
+	return true
+}
+
 // clear drops both the rate-limit timestamp AND the shadow baseline
 // for the given key. Called when the backend transitions out of the
 // managed path (External, unsupported runtime, invalid storage) and
@@ -220,6 +257,7 @@ func (s *serverInstanceCascade) clear(key cascadeKey) {
 	defer s.mu.Unlock()
 	delete(s.lastAt, key)
 	delete(s.shadow, key)
+	delete(s.counted, key)
 }
 
 // canCascade reports whether enough time has elapsed since the previous
@@ -337,11 +375,11 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 // silently strand recovery — the requeue ensures the next reconcile
 // retries within the cascade window.
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
-	currentID, converged, err := r.currentServerInstanceUID(ctx, backend)
+	currentID, converged, err := r.currentServerInstanceID(ctx, backend)
 	if err != nil {
 		// A transient observation failure (owned Deployment Get,
 		// ReplicaSet owner-chain Get, or Pod list — see
-		// currentServerInstanceUID for the chain) leaves us unable
+		// currentServerInstanceID for the chain) leaves us unable
 		// to decide whether a cascade is needed. Return the rate-
 		// limit interval as the requeue hint so the reconcile
 		// retries within the same window we'd cascade in — without
@@ -425,7 +463,7 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// rolling-update widening (old + new pod both Ready briefly).
 	//
 	// Strict-superset transitions split into two cases by the owning
-	// Deployment's convergence flag (see currentServerInstanceUID):
+	// Deployment's convergence flag (see currentServerInstanceID):
 	//
 	//  - NOT converged (rolling-update midpoint): do NOT persist the
 	//    widened set. If we did, a failed rollout that gets rolled
@@ -496,24 +534,35 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 		"namespace", backend.Namespace, "name", backend.Name,
 		"prior", prior, "current", currentID, "deployments", count)
 
-	// Persist the new baseline and ONLY THEN increment the cascade
-	// counter. Tying the increment to persist-success enforces "one
-	// increment per cascade event" — without it, a transient patch
-	// failure would leave the latch on the prior, the next reconcile
-	// would re-run the cascade (annotates are no-ops because the
-	// trigger annotation already matches currentID), and the counter
-	// would advance again for the same logical recovery. Record the
-	// attempt in the shadow first so a patch failure does not lose
-	// the baseline.
+	// Increment the cascade counter exactly once per cascade EVENT,
+	// keyed by (cascadeKey, currentID). shouldIncrementCascade
+	// records the pair atomically and returns false on subsequent
+	// calls for the same pair; this enforces the "one increment per
+	// cascade event" contract even when the post-annotate status
+	// patch takes multiple retries to land. The counter advances
+	// HERE (not after patchStatus succeeds) because the recovery has
+	// already happened — every injected engine Deployment is
+	// annotated, ready to roll. Subsequent retries via the shadow
+	// short-circuit at the top of this function do not re-enter the
+	// cascade path, so the metric stays in sync with the recovery.
+	if r.serverInstanceCascade.shouldIncrementCascade(key, currentID) {
+		backendServerRestartCascadesTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
+	}
+
+	// Persist the new baseline. Record the attempt in the shadow
+	// FIRST so a patch failure does not lose the baseline (see the
+	// shadow godoc on serverInstanceCascade): on the next reconcile,
+	// the shadow short-circuit branch at the top will retry the
+	// patch idempotently without re-incrementing the counter (the
+	// counted map already holds this currentID).
 	r.serverInstanceCascade.recordAttempt(key, currentID)
 	if err := r.patchStatus(ctx, backend, func() {
 		backend.Status.ObservedServerInstance = currentID
 	}); err != nil {
-		logger.V(1).Info("server-restart cascade: observedServerInstance patch failed (annotates already issued; shadow retains the baseline so the next reconcile will not re-increment)",
+		logger.V(1).Info("server-restart cascade: observedServerInstance patch failed (annotates already issued; shadow + counted retain the event so the next reconcile retries persist without re-counting)",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return r.minServerRestartCascadeInterval()
 	}
-	backendServerRestartCascadesTotal.WithLabelValues(backend.Namespace, backend.Name, cascadeRestartReasonServerInstanceChanged).Inc()
 	return 0
 }
 
@@ -561,7 +610,7 @@ func instanceChangeRequiresCascade(prior, current string) bool {
 }
 
 // parseInstanceMap parses the "<uid1>:<sum1>,<uid2>:<sum2>" identifier
-// shape currentServerInstanceUID emits into a map keyed by pod-UID.
+// shape currentServerInstanceID emits into a map keyed by pod-UID.
 // Malformed segments are skipped (defensive — the controller is the
 // sole writer, so it should never produce bad shapes, but tolerating
 // them keeps the cascade decision well-defined if the field is hand-
@@ -586,7 +635,7 @@ func parseInstanceMap(s string) map[string]int32 {
 	return out
 }
 
-// currentServerInstanceUID returns a stable identifier representing
+// currentServerInstanceID returns a stable identifier representing
 // the current set of Ready cache-server pods for the backend, the
 // owning Deployment's convergence flag (true when the Deployment
 // controller has reached steady state — `spec.replicas` ==
@@ -623,7 +672,7 @@ func parseInstanceMap(s string) map[string]int32 {
 // Pod informer; the controller's design explicitly rejects watching
 // all pods cluster-wide (see refreshMatchedEnginePods godoc). Falls
 // back to the cached client when APIReader is nil (test wiring).
-func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, bool, error) {
+func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, bool, error) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
@@ -754,7 +803,7 @@ func (r *CacheBackendReconciler) currentServerInstanceUID(ctx context.Context, b
 // the owned Deployment's pod template. Used to detect in-place
 // restarts of the cache-server container (kubelet respawning a crashed
 // container reuses the pod UID but increments restartCount). Sidecars
-// outside the owned set are excluded — see currentServerInstanceUID's
+// outside the owned set are excluded — see currentServerInstanceID's
 // godoc for why. init / ephemeral containers are also excluded
 // (RestartCount is on containerStatuses, not init/ephemeral surfaces).
 func containerRunSum(pod *corev1.Pod, cacheServerContainers map[string]struct{}) int32 {
@@ -775,7 +824,7 @@ func containerRunSum(pod *corev1.Pod, cacheServerContainers map[string]struct{})
 // distinguishes "definitively not owned" (owned=false, err=nil — bare
 // pod / non-Deployment / different Deployment) from "couldn't decide"
 // (err != nil — transient apiserver/RBAC issue). Callers MUST
-// propagate the error so currentServerInstanceUID does not advance
+// propagate the error so currentServerInstanceID does not advance
 // the latch over an incomplete picture; collapsing a transient
 // ReplicaSet Get failure to "not owned" would shrink the identifier
 // and look like a pod replacement, triggering a false cascade.

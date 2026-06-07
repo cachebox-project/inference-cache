@@ -605,8 +605,11 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		return ctrl.Result{}, err
 	}
 
-	// Cache-server restart cascade: when the Ready cache-server pod UID
-	// changes, cascade-restart every engine Deployment that was injected
+	// Cache-server restart cascade: when the Ready cache-server pod
+	// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
+	// restart-sum advance from an in-place kubelet-driven container
+	// restart — see currentServerInstanceID's godoc for the shape),
+	// cascade-restart every engine Deployment that was injected
 	// against this backend so they re-establish their LMCache client
 	// socket (the upstream LMServerConnector opens its TCP socket in
 	// __init__ only and silently fails every subsequent PUT with EPIPE
