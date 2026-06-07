@@ -9,18 +9,40 @@ import (
 )
 
 // PolicyPropagationVersion identifies the schema of the /policy snapshot the
-// server accepts. Bumped on a breaking schema change so a stale controller
-// can refuse to push (the controller writes the same constant on each push).
+// server accepts. Bumped on a schema change so version skew is observable
+// (the controller writes the same constant on each push).
 //
 // v2 added the Tenants slice (CacheTenant quota propagation). v3 added
 // ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
 // ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
-// The version field is the forward-looking guard: a server rejects a body whose version it
-// does not recognize, so a mismatched controller/server pair fails loudly with a
-// clear "unsupported version" rather than silently losing fields. (An older
-// server would instead reject a newer body's unknown field at decode time under
-// DisallowUnknownFields — also a hard failure, just a less descriptive one.)
+//
+// Rollout asymmetry — the bump is "additive when the new field can be
+// defaulted; rejected when it can't":
+//
+//   - **Newer server / older body.** A v4 server accepts a v3 body and
+//     normalizes each policy's missing MinimumMatchedTokens to the
+//     server-wide DefaultMinimumMatchedTokens — so a server-first rollout
+//     (v4 server while controller is still v3) does NOT drop existing
+//     CachePolicy state (TTL, timeouts, eviction, prefix gates, quotas).
+//     The normalized result is identical to a no-CachePolicy fallback for
+//     the new field while every prior knob stays enforced. The lenience
+//     window is bounded by PolicyMinimumAcceptedVersion (the oldest body
+//     this server still understands); bodies older than that are still
+//     rejected as "unsupported".
+//   - **Older server / newer body.** The reverse — a v3 server receiving a
+//     v4 push — still hard-fails (twice over): the v3 version check rejects
+//     the unrecognized version explicitly ("unsupported policy snapshot
+//     version"), and as a backup DisallowUnknownFields would catch the
+//     unknown minimumMatchedTokens field on each policy.
 const PolicyPropagationVersion = 4
+
+// PolicyMinimumAcceptedVersion is the oldest /policy schema this server
+// understands. Bodies below this version are rejected outright; bodies at
+// or above are accepted with the new-field normalization described on
+// PolicyPropagationVersion. Bump this in lockstep with PolicyPropagationVersion
+// whenever a schema change is NOT additive-defaultable — anything load-bearing
+// for a tenant, anything whose missing value cannot be safely synthesized.
+const PolicyMinimumAcceptedVersion = 3
 
 // DefaultMinimumMatchedTokens is the server-side fallback floor on
 // MATCHED prefix tokens applied when a tenant has no CachePolicy at all.
@@ -333,11 +355,49 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			http.Error(w, "decode policy snapshot: "+err.Error()+"\n", http.StatusBadRequest)
 			return
 		}
-		if snap.Version != PolicyPropagationVersion {
+		// Accept any version in [PolicyMinimumAcceptedVersion, PolicyPropagationVersion].
+		// Anything outside that range — either a controller too old for fields the
+		// server now load-bears on, or a controller too new for the server to
+		// recognize — fails loud with an explicit "unsupported version".
+		if snap.Version < PolicyMinimumAcceptedVersion || snap.Version > PolicyPropagationVersion {
 			http.Error(w, "unsupported policy snapshot version\n", http.StatusBadRequest)
 			return
 		}
+		// Normalize older bodies so server-first rollouts (newer server, older
+		// controller still pushing v3) preserve every other knob a CR carries.
+		// v3 bodies have no minimumMatchedTokens on policies — JSON decodes the
+		// missing field to int32(0), which is indistinguishable from the v4
+		// explicit-zero opt-out. Fill in DefaultMinimumMatchedTokens so the
+		// post-rollout effective floor on a v3-carrying policy matches the
+		// no-CachePolicy fallback path PolicyStore.MinimumMatchedTokens uses.
+		normalizePolicySnapshotForVersion(&snap)
 		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// normalizePolicySnapshotForVersion rewrites an accepted body so the
+// in-memory store sees the same shape regardless of which (supported) wire
+// version the controller pushed. Today the only normalization is the v3 →
+// v4 minimumMatchedTokens default: a v3 body's missing field would otherwise
+// land as 0 (the v4 explicit opt-out), silently disabling the floor for
+// every namespace with a CR during a server-first rollout. Filling in
+// DefaultMinimumMatchedTokens makes a v3-carrying policy effective-floor
+// match the no-CachePolicy fallback PolicyStore.MinimumMatchedTokens applies
+// to tenants without a CR — so existing policies' floor behavior is
+// preserved until the controller upgrades and starts pushing the explicit
+// field. Bodies already at PolicyPropagationVersion are returned untouched
+// so an operator's explicit `minimumMatchedTokens: 0` opt-out reaches the
+// store as written.
+func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
+	if snap.Version >= PolicyPropagationVersion {
+		return
+	}
+	if snap.Version < 4 {
+		for i := range snap.Policies {
+			if snap.Policies[i].MinimumMatchedTokens == 0 {
+				snap.Policies[i].MinimumMatchedTokens = DefaultMinimumMatchedTokens
+			}
+		}
 	}
 }

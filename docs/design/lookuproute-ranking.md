@@ -156,11 +156,17 @@ A few details that matter for correctness:
   of some unrelated chain (because the bytes happen to collide) doesn't
   show up as a partial match against this request. The leading-run rule
   is enforced by where we initialize, not by separate position tracking.
-- **`reason_code` is unchanged on the match side.** Any non-empty match
-  — one block or the whole chain — is `PREFIX_MATCH`. On a miss, the
-  request goes through the same miss-classifier as the exact-match
-  path: a same-key first-block miss yields `NO_HINT`; a contract-key
-  mismatch yields the matching `UNKNOWN_*` code (see
+- **`reason_code` is unchanged on the match side, subject to the §2.6
+  floor.** Any non-empty match — one block or the whole chain — is
+  `PREFIX_MATCH` *provided* at least one replica's `matched_tokens`
+  clears the per-namespace `minimumMatchedTokens` floor. A chain match
+  that produces only sub-floor per-replica overlaps (e.g. a 1-block run
+  under the default 64-token floor) downgrades to `NO_HINT` exactly the
+  way an exact-match result does — the floor is a §2-and-§2.5 wrapping
+  filter, not a separate strategy. On a miss, the request goes through
+  the same miss-classifier as the exact-match path: a same-key
+  first-block miss yields `NO_HINT`; a contract-key mismatch yields the
+  matching `UNKNOWN_*` code (see
   [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)). The
   engine-opaque guards (empty `hash_scheme`, mismatched parallel-array
   lengths) and the cold-start carve-out continue to surface as
@@ -172,35 +178,47 @@ Request asks for the chain `[h1, h2, h3, h4, h5]` with per-block counts
 `[16, 16, 16, 16, 16]`. Index state for the requested
 `(tenant, model, scheme)`:
 
+Block sizes are 64 tokens each so every per-replica run clears the
+default §2.6 matched-tokens floor; the §2.5 walk illustrates chain
+ranking in isolation from the floor. (A 16-token-per-block example
+under the default `minimumMatchedTokens: 64` would have *every* replica
+in this table filtered out and the response downgraded to `NO_HINT` —
+correct, but it would shadow the longest-prefix mechanics the section
+is teaching.)
+
 | Block hash | Holders → `{tokenCount, lastSeen age}`                                   |
 |------------|---------------------------------------------------------------------------|
-| `h1`       | `replica-A: {16, 1m}, replica-B: {16, 2m}, replica-C: {16, 4m}`           |
-| `h2`       | `replica-A: {32, 1m}, replica-B: {32, 2m}`                                |
-| `h3`       | `replica-A: {48, 1m}`                                                     |
+| `h1`       | `replica-A: {64, 1m}, replica-B: {64, 2m}, replica-C: {64, 4m}`           |
+| `h2`       | `replica-A: {128, 1m}, replica-B: {128, 2m}`                              |
+| `h3`       | `replica-A: {192, 1m}`                                                    |
 | `h4`       | *(nobody)*                                                                |
 | `h5`       | *(nobody)*                                                                |
 
 Walking the chain:
 
-| Step      | Running set after this block                       | Finalized                                  |
-|-----------|----------------------------------------------------|--------------------------------------------|
-| seed `h1` | `A: {tok=16, oldest=1m}, B: {tok=16, oldest=2m}, C: {tok=16, oldest=4m}` | —                                          |
-| at `h2`   | `A: {tok=32, oldest=1m}, B: {tok=32, oldest=2m}`   | `C: {tok=16, oldest=4m}` *(dropped at h2)* |
-| at `h3`   | `A: {tok=48, oldest=1m}`                           | `+ B: {tok=32, oldest=2m}` *(dropped at h3)*|
-| at `h4`   | *(empty — A doesn't hold h4)* → stop walking       | `+ A: {tok=48, oldest=1m}`                 |
+| Step      | Running set after this block                          | Finalized                                  |
+|-----------|-------------------------------------------------------|--------------------------------------------|
+| seed `h1` | `A: {tok=64, oldest=1m}, B: {tok=64, oldest=2m}, C: {tok=64, oldest=4m}` | —                                          |
+| at `h2`   | `A: {tok=128, oldest=1m}, B: {tok=128, oldest=2m}`    | `C: {tok=64, oldest=4m}` *(dropped at h2)* |
+| at `h3`   | `A: {tok=192, oldest=1m}`                             | `+ B: {tok=128, oldest=2m}` *(dropped at h3)*|
+| at `h4`   | *(empty — A doesn't hold h4)* → stop walking          | `+ A: {tok=192, oldest=1m}`                |
 
 Scoring each finalized replica (no pressure/SLO, TTL = 30 min, so
 `freshness = 1 − age/30m`):
 
-| Replica | matched_tokens | freshness | score | rank |
-|---------|----------------|-----------|-------|------|
-| `A`     | 48             | 0.97      | 46.4  | 1    |
-| `B`     | 32             | 0.93      | 29.8  | 2    |
-| `C`     | 16             | 0.87      | 13.9  | 3    |
+| Replica | matched_tokens | freshness | score  | rank |
+|---------|----------------|-----------|--------|------|
+| `A`     | 192            | 0.97      | 186.2  | 1    |
+| `B`     | 128            | 0.93      | 119.5  | 2    |
+| `C`     | 64             | 0.87      | 55.7   | 3    |
 
-Response: `reason_code: PREFIX_MATCH`, scores `[A (46), B (30), C (14)]`
-— the gateway routes to A for the deepest cache hit, with B as a hot
-backup if A is overloaded.
+Response: `reason_code: PREFIX_MATCH`, scores `[A (186), B (119),
+C (55)]` — the gateway routes to A for the deepest cache hit, with B as
+a hot backup if A is overloaded. Under the default §2.6 floor of 64 all
+three clear (A and B by a comfortable margin, C exactly at the
+boundary); raising `minimumMatchedTokens` to 128 would filter C out of
+the response and leave just `[A, B]`, illustrating the per-replica
+floor filter without changing the chain-walk numbers.
 
 ### Backward-compat — what an unmigrated producer or client sees
 
@@ -529,7 +547,10 @@ And the strategies compose into a single orchestrator:
 ```
 LookupRoute(req):
    if hash_scheme is empty            → NO_HINT             (engine domain unknown — fail open)
-   if there is an exact prefix match  → PREFIX_MATCH        (ranked by the full score)
+   if there is an exact or chain match:
+       drop replicas whose matched_tokens < §2.6 floor      (per-namespace minimumMatchedTokens; default 64)
+       if any survive                 → PREFIX_MATCH        (ranked by the full score over the survivors)
+       else                            → NO_HINT             (trivial overlap only — gateway round-robins honestly)
    else if any tenant-warm replicas   → TENANT_HOT          (ranked by the full score, soft hint)
    else (miss-classifier runs):
        if index is globally empty     → NO_HINT             (cold start — no data to compare against)
@@ -556,7 +577,7 @@ are set so that:
 
 | Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain                                                                                                                  | Strongest hint — route to top-ranked    |
+| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64). Sub-floor matches are filtered per-replica; if no replica clears, the response downgrades to `NO_HINT`.                                                                            | Strongest hint — route to top-ranked    |
 | `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
 | `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), or any other unspecified outcome                  | Default routing; cache plane invisible  |
 | `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |

@@ -334,10 +334,37 @@ constant in `pkg/server.PolicyPropagationVersion` on every request.
 was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
 algorithm) was added, and to `4` when `policies[].minimumMatchedTokens`
 (the result-side matched-tokens floor) was added. The server decodes with
-`DisallowUnknownFields`, so a stale controller's push is rejected with a
-clear "unsupported version" error rather than silently dropping fields;
-controller and server roll out together and the periodic re-push
-reconciles any transient skew.
+`DisallowUnknownFields`, so an older server receiving a newer body still
+fails loud on the unknown field even before its version check fires.
+
+**Rollout asymmetry (additive-defaultable carve-out).** The version check is
+deliberately asymmetric so a server-first rollout (newer server, older
+controller still pushing the prior schema) does NOT drop existing policy
+state mid-upgrade:
+
+- A v4 server accepts any body whose `version` is in
+  `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
+  `[3, 4]`. Bodies outside the band are rejected with
+  `unsupported policy snapshot version`.
+- For accepted older bodies, the new field is *normalized* before reaching
+  the store. v3 has no `minimumMatchedTokens` key; JSON decodes the missing
+  field as `0`, which would be indistinguishable from the v4 explicit
+  opt-out and silently disable the floor for every namespace with a CR
+  during the rollout. The server fills in `DefaultMinimumMatchedTokens`
+  (`64`) per policy so the effective floor matches the no-CachePolicy
+  fallback `PolicyStore.MinimumMatchedTokens` applies to tenants without a
+  CR. Every other knob (TTL, prefix gate, timeout, eviction, tenant quota)
+  reaches the store byte-for-byte.
+- v4 bodies are NOT normalized — an operator's explicit `minimumMatchedTokens: 0`
+  opt-out reaches the store as written. The normalization fires only when
+  the version says the new field could not have been present.
+
+The carve-out only applies to **additive, defaultable** schema changes: a
+new field whose absence has a safe well-defined synthesized value. A
+schema change that is load-bearing (removes a field, changes meaning, makes
+an existing field required) MUST be paired with a `PolicyMinimumAcceptedVersion`
+bump so old bodies under that change are rejected rather than silently
+mis-interpreted.
 
 ## Out of scope
 

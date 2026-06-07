@@ -35,11 +35,139 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 // TestPolicyPropagationVersionIsV4 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
 // cap-eviction algorithm); v4 accompanied ResolvedPolicy.MinimumMatchedTokens
-// (result-side floor). A controller/server version mismatch is rejected
-// with a clear "unsupported version" rather than a decode error.
+// (result-side floor). A controller/server version mismatch outside the
+// accepted band is rejected with a clear "unsupported version" rather than a
+// decode error.
 func TestPolicyPropagationVersionIsV4(t *testing.T) {
 	if PolicyPropagationVersion != 4 {
 		t.Fatalf("PolicyPropagationVersion = %d, want 4", PolicyPropagationVersion)
+	}
+	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
+	// v3 must be accepted so a server-first rollout does not drop a v3
+	// controller's policy state mid-upgrade; bodies below v3 are still
+	// rejected — there is no documented path to normalize the older Tenants /
+	// Eviction shapes.
+	if PolicyMinimumAcceptedVersion != 3 {
+		t.Fatalf("PolicyMinimumAcceptedVersion = %d, want 3", PolicyMinimumAcceptedVersion)
+	}
+}
+
+// TestPolicySnapshotV3AcceptedWithFloorDefault is the explicit regression
+// guard for the server-first rollout case Codex flagged: a v4 server MUST
+// accept a v3 controller's snapshot AND normalize the missing
+// minimumMatchedTokens field to DefaultMinimumMatchedTokens on each policy.
+// Without the normalization, the v3 body would decode the missing field as
+// int32(0) — the v4 explicit-opt-out — silently disabling the floor for
+// every namespace with a CR mid-rollout. The all-other-knobs assertion
+// (TTL, eviction, prefix gate, timeout, tenant quota) protects against a
+// regression where v3 itself stops being accepted, which would drop every
+// policy field, not just the new one.
+func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	// A v3 body: no minimumMatchedTokens key on the policy entry, version 3.
+	// Two policies stress the normalization loop, and the rich set of other
+	// fields proves the v3 path still preserves them as-is.
+	v3Body := []byte(`{
+        "version": 3,
+        "policies": [
+            {"namespace": "team-a", "evictionTTL": 900000000000, "minimumPrefixTokens": 32, "lookupTimeoutMs": 25, "eviction": "lfu"},
+            {"namespace": "team-b", "evictionTTL": 3600000000000}
+        ],
+        "tenants": [
+            {"tenantID": "team-a", "maxIndexEntries": 100000, "isolationMode": "Fairness"}
+        ]
+    }`)
+	resp, err := srv.Client().Post(srv.URL, "application/json", bytes.NewReader(v3Body))
+	if err != nil {
+		t.Fatalf("post v3 body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("v3 body status = %d, want 204 (server-first rollout MUST accept the controller's older version)", resp.StatusCode)
+	}
+
+	pA, ok := store.Lookup("team-a")
+	if !ok {
+		t.Fatal("team-a policy missing from store after v3 push")
+	}
+	// The v3-missing field must be normalized to the server-side default —
+	// otherwise a server-first rollout silently disables the floor for every
+	// namespace that already had a CR.
+	if pA.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
+		t.Fatalf("team-a MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d) — v3 normalization missing", pA.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+	}
+	// Every other knob the v3 body carried must reach the store unchanged.
+	if pA.EvictionTTL != 900_000_000_000 || pA.MinimumPrefixTokens != 32 || pA.LookupTimeoutMs != 25 || pA.Eviction != "lfu" {
+		t.Fatalf("team-a non-floor fields disturbed by normalization: %+v", pA)
+	}
+
+	pB, ok := store.Lookup("team-b")
+	if !ok {
+		t.Fatal("team-b policy missing from store after v3 push")
+	}
+	if pB.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
+		t.Fatalf("team-b MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d)", pB.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+	}
+
+	// Tenant quotas survive the version normalization unchanged.
+	if q, ok := store.TenantQuota("team-a"); !ok || q != 100000 {
+		t.Fatalf("team-a quota after v3 push = (%d, %v), want (100000, true)", q, ok)
+	}
+}
+
+// TestPolicySnapshotV4ExplicitZeroPreserved is the complementary guard: a v4
+// controller that EXPLICITLY pushes minimumMatchedTokens=0 (the documented
+// opt-out, useful for raw-recall benchmarks) must NOT have its zero rewritten
+// to the default. The normalization only fires for v3 (and below); v4 bodies
+// reach the store byte-for-byte.
+func TestPolicySnapshotV4ExplicitZeroPreserved(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	body, err := json.Marshal(PolicySnapshot{
+		Version: PolicyPropagationVersion,
+		Policies: []ResolvedPolicy{
+			{Namespace: "raw-recall", MinimumMatchedTokens: 0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp, err := srv.Client().Post(srv.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	if got := store.MinimumMatchedTokens("raw-recall"); got != 0 {
+		t.Fatalf("explicit v4 opt-out got rewritten to %d, want 0 — v4 body must NOT be normalized", got)
+	}
+}
+
+// TestPolicySnapshotVersionTooOldRejected pins the lower edge of the
+// lenience band: a v2 body (or anything below PolicyMinimumAcceptedVersion)
+// MUST still be rejected, so the band does not silently extend backward and
+// admit a controller pushing under a schema this server no longer knows how
+// to interpret.
+func TestPolicySnapshotVersionTooOldRejected(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	resp, err := srv.Client().Post(srv.URL, "application/json", bytes.NewReader([]byte(`{"version":2,"policies":[]}`)))
+	if err != nil {
+		t.Fatalf("post v2 body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("v2 body status = %d, want 400 (below PolicyMinimumAcceptedVersion)", resp.StatusCode)
 	}
 }
 
