@@ -175,7 +175,7 @@ A few details that matter for correctness:
 ### Worked example — 5 blocks, 3 deep
 
 Request asks for the chain `[h1, h2, h3, h4, h5]` with per-block counts
-`[16, 16, 16, 16, 16]`. Index state for the requested
+`[64, 64, 64, 64, 64]`. Index state for the requested
 `(tenant, model, scheme)`:
 
 Block sizes are 64 tokens each so every per-replica run clears the
