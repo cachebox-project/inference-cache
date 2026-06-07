@@ -63,7 +63,7 @@ import (
 // This file ships the server-side machinery and the HTTP /probe handler. The
 // controller wiring — calling /probe from the CacheBackend reconciler and
 // writing the FunctionalProbeOK condition — is a follow-up; the metric
-// (inferencecache_backend_probe_result) ships with the controller wiring too.
+// (inferencecache_backend_probe_result_total) ships with the controller wiring too.
 // Internal types here that are not yet read by anything outside this file's
 // tests are explicitly carved out (per the project's "no inert field" rule —
 // wired today, or names the follow-up that will wire it).
@@ -110,7 +110,7 @@ const (
 )
 
 // Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
-// inferencecache_backend_probe_result metric `stage` label. Stage A's wire
+// inferencecache_backend_probe_result_total metric `stage` label. Stage A's wire
 // name is `ingest` — it exercises in-process index.Ingest, not the wire
 // ReportCacheState handler the real subscriber uses (the handler drops
 // probe-tenant messages by design). See the file-top doc for what a Stage

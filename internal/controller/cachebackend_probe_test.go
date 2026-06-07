@@ -73,6 +73,32 @@ func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest)
 	return f
 }
 
+// TestProbeRateLimiterForgetDropsKey confirms the cleanup hook the
+// reconciler's NotFound branch calls when a CacheBackend is deleted.
+// Without this hook, the per-(namespace, name) sync.Map would
+// accumulate one entry per deleted backend forever on a long-lived
+// controller against a churning fleet.
+func TestProbeRateLimiterForgetDropsKey(t *testing.T) {
+	limiter := &probeRateLimiter{}
+	now := time.Unix(1_000_000, 0)
+	limiter.markCalled("team-a/cb-1", now)
+	limiter.markCalled("team-a/cb-2", now)
+
+	if got := limiter.lastCalled("team-a/cb-1"); got != now {
+		t.Fatalf("cb-1 should be present; got %v", got)
+	}
+	limiter.forget("team-a/cb-1")
+	if got := limiter.lastCalled("team-a/cb-1"); !got.IsZero() {
+		t.Errorf("cb-1 should be removed by forget; got %v", got)
+	}
+	// Untouched siblings remain.
+	if got := limiter.lastCalled("team-a/cb-2"); got != now {
+		t.Errorf("forget(cb-1) must not affect cb-2; got %v", got)
+	}
+	// forget on an unknown key is a no-op.
+	limiter.forget("team-a/cb-never")
+}
+
 // TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits pins the cascade-
 // prevention rule the gate has to honor: when the KV-event verdict already
 // says Ready=False, the probe call is skipped (no metric, no HTTP, no
@@ -258,15 +284,15 @@ func TestEvaluateFunctionalProbeRateLimitedFailurePreservesDowngrade(t *testing.
 	}
 }
 
-// TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure is the
-// regression unit for a Codex round-3 finding (symmetric to the round-1
-// rate-limit blocking): a transient /probe HTTP error after a known
-// stage failure must NOT silently upgrade Ready to True, NOR fade the
-// False condition to Unknown (which would lose the original failure
-// reason and then upgrade on the next reconcile). The fix: when an
-// existing FunctionalProbeOK=False is present, an HTTP error preserves
-// the existing condition (no new write) AND re-applies the Ready
-// downgrade. False stays sticky until a successful probe resolves it.
+// TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure pins the
+// rule that a transient /probe HTTP error after a known stage failure
+// must NOT silently upgrade Ready to True, NOR fade the False condition
+// to Unknown (which would lose the original failure reason and then
+// upgrade on the next reconcile). When an existing FunctionalProbeOK=
+// False is present, an HTTP error preserves the existing condition
+// (no new write) AND re-applies the Ready downgrade — symmetric to the
+// rate-limited path's behavior. False stays sticky until a successful
+// probe call resolves it.
 func TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "outage", http.StatusInternalServerError)
@@ -299,11 +325,12 @@ func TestEvaluateFunctionalProbeHTTPErrorPreservesExistingFailure(t *testing.T) 
 	}
 }
 
-// TestEvaluateFunctionalProbeHTTPErrorSchedulesRequeue is the regression
-// unit for the Codex round-3 should-fix: the HTTP-error path used to omit
-// requeueAfter, so a transient outage could leave FunctionalProbeOK=Unknown
-// on a quiet backend indefinitely. The verdict now always requeues at the
-// rate-limit cadence so recovery doesn't depend on incidental watch events.
+// TestEvaluateFunctionalProbeHTTPErrorSchedulesRequeue pins the requeue
+// behavior on transport failures: without an explicit requeueAfter, a
+// transient outage could leave FunctionalProbeOK=Unknown on a quiet backend
+// indefinitely (recovery depends on watch events that may not fire). The
+// verdict always requeues at the rate-limit cadence so recovery happens
+// on its own.
 func TestEvaluateFunctionalProbeHTTPErrorSchedulesRequeue(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "outage", http.StatusInternalServerError)
@@ -347,13 +374,13 @@ func TestEvaluateFunctionalProbeDisabledClearsExistingCondition(t *testing.T) {
 	}
 }
 
-// TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady is the
-// regression unit for a Codex round-2 finding: the disabled-client cleanup
-// must run BEFORE the upstream-not-Ready short-circuit. Otherwise a backend
-// in RolloutInProgress / AwaitingFirstKVEvent / ReplicasUnavailable would
-// keep its stale FunctionalProbeOK condition indefinitely after
-// --server-probe-url is disabled, because the cascade-short-circuit would
-// return an empty verdict before the cleanup ran.
+// TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady pins
+// the rule that the disabled-client cleanup runs BEFORE the upstream-not-
+// Ready short-circuit. Otherwise a backend in RolloutInProgress /
+// AwaitingFirstKVEvent / ReplicasUnavailable would keep its stale
+// FunctionalProbeOK condition indefinitely after --server-probe-url is
+// disabled, because the cascade-short-circuit would return an empty
+// verdict before the cleanup ran.
 func TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady(t *testing.T) {
 	backend := newProbeBackend("cb")
 	backend.Status.Conditions = []metav1.Condition{{
@@ -584,9 +611,7 @@ func stringPtr(s string) *string { return &s }
 // per-Service one), so the test asserts a +1 delta against the per-label
 // baseline rather than absolute counter values — running this test
 // repeatedly in-process, or having another test reuse the same label
-// tuple, must NOT cause a spurious failure. Per-test-call isolation is
-// preserved by using a unique backend label ("metric-cb-<test name>")
-// so other tests' baselines don't leak in.
+// tuple, must NOT cause a spurious failure.
 func TestProbeResultMetricEmitsPerStage(t *testing.T) {
 	const backendKey = "team-a/cb-metric"
 	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
@@ -625,7 +650,7 @@ func TestProbeResultMetricEmitsPerStage(t *testing.T) {
 	}
 }
 
-// metricCounter reads the inferencecache_backend_probe_result counter for
+// metricCounter reads the inferencecache_backend_probe_result_total counter for
 // one label combination by collecting the metric directly. Avoids pulling
 // in the prometheus/testutil dependency just for one assertion (the
 // pkg/server tests use the same trick).

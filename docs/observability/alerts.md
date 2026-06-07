@@ -564,7 +564,7 @@ metric.
 |---|---|---|
 | `VersionSkewDetected` | `inferencecache_backend_version_skew` gauge — exposed by a follow-up that detects engine-vs-cache-server version skew | The `LMCacheT2NoHits` failure class, but BEFORE it manifests as zero hits — caught proactively by the operator detecting the skew at admit time. |
 | `KvEventsStaleness` | `inferencecache_replica_last_event_at` gauge — exposed by the Ready-on-first-event follow-up | A replica that *was* emitting KV events stopped (engine crash, OOMKill, NetworkPolicy regression, subscriber dead). Distinct from `IndexEmpty` (replica never published) — this catches *post-warmup* silence. |
-| `ServerProbeFail` | `inferencecache_backend_probe_result` counter — exposed by the synthetic end-to-end Ready gate | A managed backend's synthetic publish → index → lookup round-trip is failing. The basic Service-endpoint probe cannot catch this; only the end-to-end probe can. |
+| `ServerProbeFail` | `inferencecache_backend_probe_result_total` counter — exposed by the synthetic end-to-end Ready gate | A managed backend's synthetic publish → index → lookup round-trip is failing. The basic Service-endpoint probe cannot catch this; only the end-to-end probe can. |
 
 ---
 

@@ -82,18 +82,21 @@ The default Kustomize overlay brings up both control-plane components:
 - `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
   HTTP `/healthz`, `/readyz`, `/metrics` probe surface, plus a dedicated
   controller-facing listener carrying `/snapshot` (controller read), `/policy`
-  (controller write), and `/probe` (functional self-test, intended to be
-  controller-driven once the controller-wiring follow-up lands — the
-  server-side endpoint ships here), all gated by ServiceAccount bearer auth
-  + a `NetworkPolicy`. Fronted by a
-  `ClusterIP` Service `inference-cache-server` in the `inference-cache-system`
-  namespace with named ports `grpc:9090` (gRPC API), `http:8080` (probes /
-  metrics), and `snapshot:8081` (controller-only `/snapshot` + `/policy` +
-  `/probe`). The controller's CacheIndex poller scrapes
-  `http://inference-cache-server:8081/snapshot` and the CachePolicy reconciler
-  POSTs to `http://inference-cache-server:8081/policy` by default; both send
-  the projected ServiceAccount token. Once both pods are Ready
-  `kubectl get cacheindex` reports live cluster-wide cache state.
+  (controller write), and `/probe` (functional self-test driven by the
+  CacheBackend reconciler), all gated by ServiceAccount bearer auth + a
+  `NetworkPolicy`. Fronted by a `ClusterIP` Service `inference-cache-server`
+  in the `inference-cache-system` namespace with named ports `grpc:9090`
+  (gRPC API), `http:8080` (probes / metrics), and `snapshot:8081`
+  (controller-only `/snapshot` + `/policy` + `/probe`). The controller's
+  CacheIndex poller scrapes `http://inference-cache-server:8081/snapshot`,
+  the CachePolicy reconciler POSTs to
+  `http://inference-cache-server:8081/policy`, and the CacheBackend
+  reconciler POSTs to `http://inference-cache-server:8081/probe` (default
+  for the `--server-probe-url` flag — set empty to disable the gate); all
+  three send the projected ServiceAccount token. Once both pods are Ready
+  `kubectl get cacheindex` reports live cluster-wide cache state, and
+  `kubectl get cachebackend -o yaml` includes the `FunctionalProbeOK`
+  condition for each managed backend.
 
 ```bash
 kubectl apply -k config/default

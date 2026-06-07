@@ -20,7 +20,7 @@
 # Three more alerts are deferred until the metrics they depend on land —
 # `VersionSkewDetected` (needs inferencecache_backend_version_skew),
 # `KvEventsStaleness` (needs inferencecache_replica_last_event_at), and
-# `ServerProbeFail` (needs inferencecache_backend_probe_result). The placeholder
+# `ServerProbeFail` (needs inferencecache_backend_probe_result_total). The placeholder
 # rules sit at the bottom of this file as comments; enable them in the same
 # change that exposes the corresponding metric.
 
@@ -243,9 +243,9 @@ groups:
   #
   #     - alert: ServerProbeFail
   #       # DEFERRED: blocked on the synthetic end-to-end probe
-  #       # (inferencecache_backend_probe_result). Once the functional Ready
+  #       # (inferencecache_backend_probe_result_total). Once the functional Ready
   #       # gate ships its outcome counter, uncomment.
-  #       expr: inferencecache_backend_probe_result{result="failed"} > 0
+  #       expr: inferencecache_backend_probe_result_total{result="failed"} > 0
   #       for: 1m
   #       labels:
   #         severity: critical

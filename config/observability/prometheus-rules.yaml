@@ -172,9 +172,9 @@ spec:
     #
     #     - alert: ServerProbeFail
     #       # DEFERRED: blocked on the synthetic end-to-end probe
-    #       # (inferencecache_backend_probe_result). Once the functional Ready
+    #       # (inferencecache_backend_probe_result_total). Once the functional Ready
     #       # gate ships its outcome counter, uncomment.
-    #       expr: inferencecache_backend_probe_result{result="failed"} > 0
+    #       expr: inferencecache_backend_probe_result_total{result="failed"} > 0
     #       for: 1m
     #       labels:
     #         severity: critical

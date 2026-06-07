@@ -90,16 +90,17 @@ const (
 	DefaultProbeRateLimit = 30 * time.Second
 )
 
-// probeResultMetric is `inferencecache_backend_probe_result{backend, stage, result}` —
+// probeResultMetric is `inferencecache_backend_probe_result_total{backend, stage, result}` —
 // the per-stage outcome counter the dashboards key off. Label cardinality is
 // O(backends × 3 stages × 3 outcomes), well within Prometheus's comfort zone
-// even on large fleets. Registered on the controller-runtime registry so it
-// shares the controller binary's /metrics endpoint with controller-runtime's
-// own controller_runtime_* series; matches the convention every other
-// controller-side metric in this binary follows.
+// even on large fleets. Name carries the `_total` suffix per Prometheus
+// counter naming convention (every other first-party counter in this repo
+// follows the same shape — see docs/reference/metrics.md). Registered on the
+// controller-runtime registry so it shares the controller binary's /metrics
+// endpoint with controller-runtime's own controller_runtime_* series.
 var probeResultMetric = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
-		Name: "inferencecache_backend_probe_result",
+		Name: "inferencecache_backend_probe_result_total",
 		Help: "Per-stage outcome of the CacheBackend functional probe. One increment per stage per probe call. backend=<namespace>/<name>; stage=ingest|routing|t2; result=ok|failed|skipped.",
 	},
 	[]string{"backend", "stage", "result"},
@@ -162,6 +163,17 @@ func (p *probeRateLimiter) markCalled(key string, now time.Time) {
 		return
 	}
 	p.last.Store(key, now)
+}
+
+// forget removes the recorded timestamp for a deleted CacheBackend so the
+// per-(namespace, name) map doesn't accumulate stale entries forever on a
+// long-running controller against a churning fleet. Called from the
+// reconciler's NotFound branch — see CacheBackendReconciler.Reconcile.
+func (p *probeRateLimiter) forget(key string) {
+	if p == nil {
+		return
+	}
+	p.last.Delete(key)
 }
 
 // functionalProbeVerdict is the gate's output, applied to the running

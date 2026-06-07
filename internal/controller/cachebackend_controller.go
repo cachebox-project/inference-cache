@@ -254,7 +254,16 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	var backend cachev1alpha1.CacheBackend
 	if err := r.Get(ctx, req.NamespacedName, &backend); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// The CR was deleted between the watch event and this reconcile.
+			// Drop the per-backend rate-limit slot so a long-running
+			// controller against a churning fleet doesn't accumulate stale
+			// sync.Map entries forever. Safe to call unconditionally — the
+			// helper no-ops if the key was never recorded.
+			r.probeLimiter.forget(req.NamespacedName.String())
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 	before := snapshotState(&backend)
 
