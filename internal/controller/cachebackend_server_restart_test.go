@@ -914,6 +914,135 @@ func TestReconcileServerInstance_ConvergedScaleUpPersistsBaseline(t *testing.T) 
 	}
 }
 
+// TestReconcileServerInstance_ShadowWinsOverStaleStatusOnScaleUpPersistFailure
+// drives the scenario where a converged scale-up's baseline persist
+// fails: the shadow records the widened pod set ("A:0,B:0") but the
+// K8s-resident status field still holds the pre-scale baseline
+// ("A:0") because the patch never landed. If the prior were taken
+// from the status field (stale) instead of the shadow (current),
+// a subsequent replacement of just the added pod ("A:0,B:0" →
+// "A:0,C:0") would look like a strict superset of "A:0" and miss
+// the cascade — engines that connected to B would be stranded on
+// stale sockets forever.
+func TestReconcileServerInstance_ShadowWinsOverStaleStatusOnScaleUpPersistFailure(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+
+	// Step 1: baseline (1 Ready pod, converged, persists cleanly).
+	if err := setOwnedDeploymentConverged(f, 1); err != nil {
+		t.Fatalf("set baseline Deployment converged: %v", err)
+	}
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := f.backend.Status.ObservedServerInstance
+	if baseline != serverInstanceID(f.serverPod) {
+		t.Fatalf("baseline = %q, want %q", baseline, serverInstanceID(f.serverPod))
+	}
+
+	// Step 2: scale up to replicas=2. New pod becomes Ready. Make the
+	// converged-superset baseline persist FAIL. The shadow should
+	// record "A:0,B:0" while status stays at "A:0".
+	tru := true
+	added := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-added",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-added",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), added); err != nil {
+		t.Fatalf("create added pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), added); err != nil {
+		t.Fatalf("ready added pod: %v", err)
+	}
+	if err := setOwnedDeploymentConverged(f, 2); err != nil {
+		t.Fatalf("set converged at replicas=2: %v", err)
+	}
+
+	failOnce := &statusPatchFailingClient{Client: f.r.Client, remaining: 1}
+	f.r.Client = failOnce
+	time.Sleep(60 * time.Millisecond)
+	// Scale-up reconcile: status patch fails. Shadow should advance.
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait <= 0 {
+		t.Fatalf("scale-up reconcile wait = %v, want positive (persist failed)", wait)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("scale-up status field = %q after FAILED persist, want still %q", got, baseline)
+	}
+	wantShadow := serverInstanceID(f.serverPod) + "," + serverInstanceID(added)
+	key := cascadeKey{namespace: f.backend.Namespace, name: f.backend.Name, uid: string(f.backend.UID)}
+	if got := f.r.serverInstanceCascade.lastAttempt(key); got != wantShadow {
+		t.Fatalf("shadow after scale-up = %q, want %q (shadow must record the widened baseline so a subsequent replacement is detectable)", got, wantShadow)
+	}
+
+	// Step 3: replace the added pod (B → C, e.g. OOM-kill of B).
+	// The shadow holds "A:0,B:0"; if the reconciler trusted the
+	// (stale) status field "A:0" as prior instead, current
+	// "A:0,C:0" would be a strict superset of "A:0" — no cascade.
+	// With the shadow as authoritative prior, prior="A:0,B:0" and
+	// the missing B IS detected as a replacement → cascade fires.
+	if err := f.r.Delete(context.Background(), added); err != nil {
+		t.Fatalf("delete added pod (OOM-kill): %v", err)
+	}
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-pod-replacement-2",
+			Namespace: f.cacheNS,
+			UID:       "cache-pod-uid-replacement-2",
+			Labels:    selectorLabels(f.cacheName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       f.serverRS.Name,
+				UID:        f.serverRS.UID,
+				Controller: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready replacement: %v", err)
+	}
+	// Keep Deployment converged at replicas=2 throughout.
+	if err := setOwnedDeploymentConverged(f, 2); err != nil {
+		t.Fatalf("re-affirm converged at replicas=2: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("post-replacement wait = %v, want 0", wait)
+	}
+	f.reloadEngineDep(t)
+	wantFinal := serverInstanceID(f.serverPod) + "," + serverInstanceID(replacement)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != wantFinal {
+		t.Fatalf("cascade annotation = %q, want %q (shadow must override stale status as prior — without the override the missing-B transition would look like a strict superset and miss the cascade)", got, wantFinal)
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter = %v, want exactly 1", got)
+	}
+}
+
 // TestReconcileServerInstance_StaleDeploymentStatusDoesNotPersistMidpoint
 // drives the race where the Deployment.Status counters lie about
 // convergence: spec.replicas=1, status.readyReplicas=1,

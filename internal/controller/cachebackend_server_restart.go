@@ -414,19 +414,28 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 		uid:       string(backend.UID),
 	}
 
-	// Compute effective prior. The K8s-resident status field is the
-	// authoritative source when populated; if it is empty, fall back
-	// to the in-memory shadow of the last attempted-to-persist
-	// currentID for this backend. The shadow guards against a
-	// transient patchStatus failure swallowing the baseline: without
-	// it, a status-patch failure on first observation followed by a
-	// real cache-server replacement would misclassify the
-	// replacement as another first-observation (empty→set, no
-	// cascade) and strand the engines on stale sockets.
+	// Compute effective prior. The in-memory shadow IS the authority
+	// when set: it records the last currentID the reconciler decided
+	// to persist, whether or not the patch landed. The K8s-resident
+	// status field is the durable projection of that shadow — when
+	// it disagrees, it is because the most recent persist failed and
+	// has not yet retried. Trusting the status field over a non-
+	// empty shadow would re-introduce the round-12 / round-21
+	// regression: a converged scale-up persist that fails would leave
+	// shadow="A:0,B:0" while status still held the pre-scale "A:0";
+	// a subsequent replacement of just the added pod (current
+	// "A:0,C:0") would then look like a strict superset of the
+	// status-derived prior "A:0" and miss the cascade. By contrast,
+	// using the shadow as prior gives prior="A:0,B:0" and the
+	// missing B is correctly detected as a replacement.
+	//
+	// Fallback order: shadow → statusField. Controller restart loses
+	// the shadow (in-memory only), at which point the statusField
+	// takes over for that key on the first reconcile that builds it.
 	statusField := backend.Status.ObservedServerInstance
-	prior := statusField
+	prior := r.serverInstanceCascade.lastAttempt(key)
 	if prior == "" {
-		prior = r.serverInstanceCascade.lastAttempt(key)
+		prior = statusField
 	}
 	if prior == currentID {
 		// Logical state is in sync. If the K8s status field is also
