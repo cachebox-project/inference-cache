@@ -70,20 +70,34 @@ const DefaultMinServerRestartCascadeInterval = 30 * time.Second
 // label set is stable and grep-discoverable.
 const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 
-// backendServerRestartCascadesTotal counts cascade-restart EVENTS the
-// controller has issued (NOT raw cache-server pod restarts). The
-// metric name is "cascades" because the counter only advances when a
-// cascade is actually emitted — after the rate-limit window has
-// elapsed and an engine-Deployment annotate has been issued. A
-// crash-looping cache-server pod that restarts ten times within one
-// cascade window still produces exactly one increment, because the
-// rate limit collapses observations into a single cascade per window
-// (see DefaultMinServerRestartCascadeInterval). For raw restart
-// rate, operators should compose this metric with the engine fleet's
-// re-roll latency or the cache-server pod restartCount metric from
-// kube-state-metrics; this Counter is the controller's record of
-// "how many times did I emit recovery for this backend", not "how
-// many times did the cache-server crash".
+// backendServerRestartCascadesTotal counts cascade-restart DECISIONS
+// the controller has emitted (NOT raw cache-server pod restarts, and
+// NOT engine-Deployment annotate-patch operations). The counter
+// advances exactly once per logical cascade event:
+//
+//   - after the rate-limit window has elapsed for this backend
+//     (DefaultMinServerRestartCascadeInterval),
+//   - after the engine-pod scan + Deployment-annotate phase has
+//     completed without error, and
+//   - after status.observedServerInstance has been successfully
+//     persisted (so a transient persist failure → retry does not
+//     double-count: see reconcileServerInstance for the gating).
+//
+// A cascade with ZERO matched engine Deployments still counts as one
+// event — operators want flapping-server symptoms visible even when
+// no engines happen to be injected today (e.g. before the engine
+// fleet has been deployed, or while the operator is in the middle
+// of rewiring spec.engineSelector and matchedEnginePods is empty).
+//
+// A crash-looping cache-server pod that restarts ten times within
+// one cascade window still produces exactly one increment, because
+// the rate limit collapses repeated observations into a single
+// cascade per window. For raw restart rate, operators should
+// compose this metric with the engine fleet's re-roll latency or
+// the cache-server pod restartCount metric from kube-state-metrics;
+// this Counter is the controller's record of "how many times did I
+// decide to emit recovery for this backend", not "how many times
+// did the cache-server crash".
 //
 // Partitioned by namespaced CacheBackend identity and a short reason
 // code. Registered into the controller-runtime metrics registry on
@@ -987,14 +1001,39 @@ func (r *CacheBackendReconciler) podOwningDeployment(ctx context.Context, reader
 // no-op rollout if the reconciler retries on the same identifier).
 //
 // expectedUID is the Deployment UID observed at owner-chain resolution
-// time. If the live Deployment's UID does not match, the resolved
-// target was deleted and re-created under the same name between
-// resolution and patch (TOCTOU); we skip the patch rather than roll an
-// unrelated workload that happens to share the name. NotFound on the
-// live Deployment is the same case — the target has been GCd.
+// time. The TOCTOU window between resolution and patch is closed at
+// TWO points:
+//
+//  1. The pre-patch Get goes through APIReader (uncached) so the UID
+//     we compare against is the live apiserver value, not a stale
+//     cached object. Without this, a cache that hadn't yet seen a
+//     same-name recreate would pass the UID check against the
+//     pre-recreate object and we would then patch the post-recreate
+//     unrelated Deployment.
+//
+//  2. The Patch carries an optimistic-lock precondition derived from
+//     the resourceVersion read in step 1 (MergeFromWithOptimisticLock).
+//     If the live Deployment has been updated OR deleted-and-recreated
+//     between our Get and the Patch, the apiserver returns Conflict
+//     and the patch is rejected — even though it addresses by name.
+//     We surface the conflict as an error so the cascade retries on
+//     the next reconcile against the freshest view.
+//
+// A NotFound on the live Deployment (the target has been GCd in the
+// resolution-to-patch window) returns (false, nil) — there is
+// nothing to roll. A UID mismatch likewise returns (false, nil) —
+// the same-name workload that exists today is not ours.
 func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Context, namespace, name, expectedUID, serverInstanceID string) (bool, error) {
+	// Use the uncached reader for the UID/resourceVersion read; see
+	// the godoc above. Fall back to the cached client only when
+	// APIReader is unset (unit-test wiring constructs reconcilers
+	// without one).
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
 	var dep appsv1.Deployment
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &dep); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &dep); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -1017,7 +1056,14 @@ func (r *CacheBackendReconciler) annotateDeploymentForCascade(ctx context.Contex
 		dep.Spec.Template.Annotations = map[string]string{}
 	}
 	dep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger] = serverInstanceID
-	if err := r.Patch(ctx, &dep, client.MergeFrom(before)); err != nil {
+	// MergeFromWithOptimisticLock embeds before.ResourceVersion as a
+	// precondition on the merge patch: if the apiserver-side object
+	// has been updated (including delete+recreate, which assigns a
+	// fresh resourceVersion) since the Get above, the patch is
+	// rejected with Conflict. Surface as an error so the next
+	// reconcile retries against the freshest view.
+	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+	if err := r.Patch(ctx, &dep, patch); err != nil {
 		return false, fmt.Errorf("patch engine deployment %s/%s pod-template annotations: %w", namespace, name, err)
 	}
 	return true, nil
