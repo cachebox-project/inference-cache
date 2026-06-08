@@ -139,13 +139,15 @@ with OTEL collectors) without bumping `v1alpha1`.
   See the `reconcileServerInstance` godoc for when a cascade is and is
   not emitted (rate-limit, strict-superset midpoints, converged
   scale-ups, stale-while-unavailable).
-- **`backend_probe_result` writer:** the `CacheBackend` reconciler in
+- **`inferencecache_backend_probe_result_total` writer:** the
+  `CacheBackend` reconciler in
   [`internal/controller/cachebackend_probe.go`](../../internal/controller/cachebackend_probe.go)
   invokes `recordProbeResult(backendKey, result)` after each successful
   `/probe` call (HTTP-level failures emit no increment — they're not a
   per-stage outcome). Three increments per successful call (one per
   stage); skipped stages count so the metric reflects the full probe
-  shape.
+  shape. The Go variable backing it is `probeResultMetric` (a
+  `prometheus.CounterVec`).
 
 ---
 

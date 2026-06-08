@@ -63,10 +63,11 @@ spec:
           capabilities:
             drop:
             - ALL
-        # Audience-bound projected SA token used by BOTH the CacheIndex
-        # poller (GET /snapshot) and the CachePolicy push (POST /policy)
-        # — the two endpoints share one auth middleware identity, so one
-        # projected token serves both.
+        # Audience-bound projected SA token used by ALL THREE controller-
+        # to-server endpoints: the CacheIndex poller (GET /snapshot), the
+        # CachePolicy push (POST /policy), and the CacheBackend functional
+        # probe (POST /probe). All three share one auth middleware
+        # identity on the server, so one projected token serves all three.
         # Kubelet projects the token (calling TokenRequest on behalf of
         # the pod) with audience "inferencecache.io/controller" baked into
         # the JWT, and rewrites the file on rotation; the audience is

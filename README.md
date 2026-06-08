@@ -109,11 +109,15 @@ kubectl get cacheindex cluster-default -o yaml
 
 ## Monitoring
 
-The `inference-cache-server` exposes Prometheus metrics on `:8080/metrics`
-(prefixed `inferencecache_*`). A default alert bundle for the operational
-silent-failure patterns this code has hit in production ships under
-[`config/observability/`](config/observability/) and is **not** included in
-`config/default` — the alerts are opt-in so that installs without
+Both binaries expose Prometheus metrics on their pod's `:8080/metrics`
+(prefixed `inferencecache_*`) — the server binary's series cover the
+in-memory index and gRPC handlers; the controller binary's series cover
+the reconcilers (e.g. `inferencecache_backend_probe_result_total`,
+`inferencecache_backend_server_restart_cascades_total`). A default
+alert bundle for the operational silent-failure patterns this code has
+hit in production ships under
+[`config/observability/`](config/observability/) and is **not** included
+in `config/default` — the alerts are opt-in so that installs without
 prometheus-operator CRDs are not affected by an unknown `apiVersion`.
 
 For prometheus-operator / kube-prometheus installs:
@@ -122,20 +126,22 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
-This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
-`inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
-the alerts.
+This ships THREE resources: a `ServiceMonitor` (so Prometheus scrapes
+`inference-cache-server:8080/metrics`), a `PodMonitor` (so Prometheus
+scrapes the controller pod's `:8080/metrics` — required for the
+controller-side alerts like `ServerProbeFail` to have a series to
+evaluate), and the `PrometheusRule` carrying the alerts.
 
-> **Caveat — Prometheus Operator selectors.** Both CRs carry example
-> labels (`prometheus: k8s`, plus `role: alert-rules` on
-> the PrometheusRule) that match the upstream kube-prometheus stack
+> **Caveat — Prometheus Operator selectors.** All three CRs carry
+> example labels (`prometheus: k8s`, plus `role: alert-rules` on the
+> PrometheusRule) that match the upstream kube-prometheus stack
 > (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
 > Helm chart uses a different convention (`release: <release-name>`,
-> no `prometheus:` label) — its rule/serviceMonitor selectors do not
-> match what's shipped here. If
-> your `Prometheus` CR's `ruleSelector` / `serviceMonitorSelector`
+> no `prometheus:` label) — its rule / serviceMonitor / podMonitor
+> selectors do not match what's shipped here. If your `Prometheus`
+> CR's `ruleSelector` / `serviceMonitorSelector` / `podMonitorSelector`
 > uses a different label set (`release: my-prom`, etc.), `kubectl
-> apply -k` succeeds but Prometheus silently ignores both resources.
+> apply -k` succeeds but Prometheus silently ignores the resources.
 > The YAML comments next to each label spell out the introspection
 > command (`kubectl get prometheus -A -o jsonpath=...`); see
 > [`docs/observability/alerts.md`](docs/observability/alerts.md) for

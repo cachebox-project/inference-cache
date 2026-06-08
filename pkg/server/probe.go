@@ -60,13 +60,15 @@ import (
 // physically traverses, so the operator-facing condition reason cannot be
 // mistaken for a wire-subscriber check.
 //
-// This file ships the server-side machinery and the HTTP /probe handler. The
-// controller wiring — calling /probe from the CacheBackend reconciler and
-// writing the FunctionalProbeOK condition — is a follow-up; the metric
-// (inferencecache_backend_probe_result_total) ships with the controller wiring too.
-// Internal types here that are not yet read by anything outside this file's
-// tests are explicitly carved out (per the project's "no inert field" rule —
-// wired today, or names the follow-up that will wire it).
+// This file ships the server-side machinery and the HTTP /probe handler.
+// The controller wiring lives in internal/controller/cachebackend_probe.go
+// — the CacheBackend reconciler POSTs /probe on each reconcile (rate-
+// limited per backend), writes the FunctionalProbeOK condition off the
+// returned ProbeResult, and increments
+// inferencecache_backend_probe_result_total on the controller-runtime
+// registry. Internal types here that are not yet read by anything outside
+// this file's tests are explicitly carved out (per the project's "no inert
+// field" rule — wired today, or names the follow-up that will wire it).
 
 // ProbeTenantID is the reserved tenant id every probe synthesizes its state
 // under. Real workload tenants (CacheTenant.spec.tenantID) are MinLength=1 and
@@ -191,10 +193,12 @@ type ProbeStageError struct {
 // skipped (every stage has an explicit ok|skipped value, none is failed and
 // none is the zero-value empty string). The HTTP /probe handler ALWAYS
 // returns the full ProbeResult as JSON (HTTP 200 — the call itself
-// succeeded), and the caller reads AllPassed to flip the FunctionalProbeOK
-// condition once the controller wiring follow-up lands. The predicate is
-// exported so that follow-up doesn't have to re-derive the "passed?"
-// definition from the per-stage fields.
+// succeeded), and the CacheBackend reconciler reads AllPassed to flip the
+// FunctionalProbeOK condition (see
+// internal/controller/cachebackend_probe.go). The predicate is exported
+// so the caller doesn't have to re-derive the "passed?" definition from
+// the per-stage fields — keeping the definition single-sourced here means
+// a future stage rename can't drift between server and controller.
 //
 // The zero-value-fails-closed property matters: a partially-decoded result
 // (the JSON envelope was truncated, a future field was renamed, the caller
@@ -212,8 +216,11 @@ func stagePassed(s ProbeStageResult) bool {
 }
 
 // T2Prober drives a put/get round trip against an external tier-2 backend
-// (today: LMCache). It is the seam the controller-wiring follow-up fills
-// with a real LMCache client; this file ships the interface + a test fake.
+// (today: LMCache). The controller-side caller is already wired (see
+// internal/controller/cachebackend_probe.go), but the server boots WITHOUT
+// a real T2Prober today — no LMCache client implementation is plumbed in,
+// so the probe's Stage C reports skipped on every clean install until a
+// follow-up registers one. This file ships the interface + a test fake.
 // Returning nil means the cycle round-tripped cleanly; returning an error
 // means the stage failed. Wrap the error in *T2ProbeError to tell the
 // controller which half (put vs get) broke — the operator-facing condition
