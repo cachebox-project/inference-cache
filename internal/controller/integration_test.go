@@ -1202,6 +1202,11 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		// Drain the initial create/status/owned-child event burst before deleting
 		// the HPA. Otherwise an already-queued parent/Deployment reconcile could
 		// recreate the HPA and make this test pass even if Owns(HPA) were absent.
+		//
+		// The drain waits for a known spec-driven reconcile to reach the HPA, then
+		// waits for HPA reads to go quiet. It deliberately does not require a
+		// status-only parent reconcile; that keeps the test valid if the parent
+		// watch is ever narrowed to generation-changing updates.
 		drainHPAGetEvents()
 		var live cachev1alpha1.CacheBackend
 		if err := k8s.Get(context.Background(), key, &live); err != nil {
@@ -1220,7 +1225,6 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		}
 		waitForObservedGeneration(t, key, live.Generation)
 		waitForHPAGet(t, key, "drain spec update reconcile")
-		waitForHPAGet(t, key, "post-status parent reconcile")
 		waitForQuietHPAGets(t, key, 500*time.Millisecond)
 
 		originalUID := waitForHPA(t, key, "remain after the drain reconcile")
