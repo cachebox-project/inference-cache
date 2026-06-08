@@ -99,16 +99,20 @@ spec:
                   RoutingFloorScore is the per-replica score below which a PREFIX_MATCH
                   response downgrades to NO_HINT. The LookupRoute ranker computes
 
-                    score = matched_tokens × freshness × distinguishing_power
+                    score = matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power
 
                   where distinguishing_power = 1 - (num_replicas_holding_match /
-                  num_replicas_in_scope). Overlaps held by every replica (chat-template
-                  framing, RAG corpus headers, custom system prompts shared across the
-                  deployment) collapse to distinguishing_power=0 → score=0 → caught
-                  by this floor. The default "0.1" catches just the score=0 case while
-                  passing any non-zero distinguishing match through; raise (e.g. "5")
-                  for stricter routing-signal hygiene; "0" disables the floor entirely
-                  (raw-recall benchmarking, ranker debugging).
+                  num_replicas_in_scope), and the other factors collapse to 1 when
+                  their inputs are absent (no stats reported → pressure_factor = 1;
+                  no SLO hint → slo_bias = 1). Overlaps held by every replica
+                  (chat-template framing, RAG corpus headers, custom system prompts
+                  shared across the deployment) collapse to distinguishing_power=0 →
+                  score=0 → caught by this floor. The default "0.1" catches the
+                  score=0 trivial-overlap case and any near-zero scores combining
+                  heavy load (low pressure_factor), near-expired freshness, or
+                  heavy diffusion. Raise (e.g. "5") for stricter routing-signal
+                  hygiene; "0" disables the floor entirely (raw-recall benchmarking,
+                  ranker debugging).
 
                   Distinct from MinimumPrefixTokens: that field is a request-side gate
                   on the request's claimed prefix length BEFORE the index is consulted;
