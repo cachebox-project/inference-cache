@@ -46,6 +46,7 @@ type options struct {
 	probeAddr               string
 	serverSnapshotURL       string
 	serverPolicyURL         string
+	serverProbeURL          string
 	cacheIndexRefreshEvery  time.Duration
 	policyPushEvery         time.Duration
 	subscriberImage         string
@@ -61,6 +62,7 @@ func defaultOptions() options {
 		enableHTTP2:             false,
 		serverSnapshotURL:       "http://inference-cache-server:8081/snapshot",
 		serverPolicyURL:         "http://inference-cache-server:8081/policy",
+		serverProbeURL:          "http://inference-cache-server:8081/probe",
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",
@@ -80,6 +82,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.probeAddr, "health-probe-bind-address", opts.probeAddr, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.serverSnapshotURL, "server-snapshot-url", opts.serverSnapshotURL, "URL of the cache server's /snapshot endpoint, scraped to populate the CacheIndex status.")
 	flag.StringVar(&opts.serverPolicyURL, "server-policy-url", opts.serverPolicyURL, "URL of the cache server's /policy endpoint, the controller PUSHES resolved CachePolicy snapshots to.")
+	flag.StringVar(&opts.serverProbeURL, "server-probe-url", opts.serverProbeURL, "URL of the cache server's /probe endpoint, the controller POSTs per CacheBackend to drive the functional self-test. Empty disables the gate (FunctionalProbeOK condition is not written and the Ready gate is unchanged).")
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
 	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to vLLM engine pods. Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
@@ -141,13 +144,22 @@ func main() {
 	// would cycle. See pkg/adapters/runtime/external/doc.go.
 	adapterRegistry.Register(externaladapter.NewAdapter())
 
+	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
+	// An empty ProbeURL disables the gate — useful for local-dev runs that
+	// don't have a server reachable, and to keep fake-client unit tests from
+	// making real HTTP calls. The bearer-token path matches the snapshot
+	// poller + policy pusher so all three controller↔server channels share
+	// one projected SA token mount.
+	probeClient := &controller.ProbeClient{ProbeURL: opts.serverProbeURL}
+
 	if err := (&controller.CacheBackendReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Log:       ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder:  mgr.GetEventRecorder("cachebackend-controller"),
-		APIReader: mgr.GetAPIReader(),
-		Registry:  adapterRegistry,
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Log:         ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:    mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader:   mgr.GetAPIReader(),
+		Registry:    adapterRegistry,
+		ProbeClient: probeClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)

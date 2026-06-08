@@ -20,17 +20,25 @@ There are two distribution shapes, same rule set, drift-gated by
   kubectl apply -k config/observability
   ```
 
-  Ships TWO CRs together — `kubectl apply -k` applies both:
+  Ships THREE CRs together — `kubectl apply -k` applies all three:
   1. A [`ServiceMonitor`](../../config/observability/servicemonitor.yaml)
      that tells Prometheus to scrape `inference-cache-server:8080/metrics`.
      Without this, kube-prometheus installs will load the rules but
-     never collect the `inferencecache_*` series the rules read —
-     `prometheus.io/scrape` annotations are commonly ignored in favor of
-     explicit `ServiceMonitor` / `PodMonitor` CRs.
-  2. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
+     never collect the server-side `inferencecache_*` series the rules
+     read — `prometheus.io/scrape` annotations are commonly ignored in
+     favor of explicit `ServiceMonitor` / `PodMonitor` CRs.
+  2. A [`PodMonitor`](../../config/observability/podmonitor.yaml) that
+     tells Prometheus to scrape the controller pod's `:8080/metrics`.
+     Required for the controller-side alerts (`ServerProbeFail` reads
+     `inferencecache_backend_probe_result_total`, which the
+     CacheBackend reconciler emits; the existing
+     `inferencecache_backend_server_restart_cascades_total` is also
+     controller-emitted). Without this, those rules load but never
+     have a series to evaluate.
+  3. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
      carrying the alerts.
 
-  Both CRs are pinned to namespace `inference-cache-system`. The
+  All three CRs are pinned to namespace `inference-cache-system`. The
   example selector labels each CR carries are:
   - `PrometheusRule` →
     `prometheus: k8s`, `role: alert-rules` (matched by
@@ -38,16 +46,19 @@ There are two distribution shapes, same rule set, drift-gated by
   - `ServiceMonitor` →
     `prometheus: k8s` (matched by
     `Prometheus.spec.serviceMonitorSelector`).
+  - `PodMonitor` →
+    `prometheus: k8s` (matched by
+    `Prometheus.spec.podMonitorSelector`).
 
-  Both target the **upstream kube-prometheus stack**, whose default
+  All three target the **upstream kube-prometheus stack**, whose default
   `Prometheus` is named `k8s`. The `prometheus-community/kube-prometheus-stack`
   Helm chart uses a DIFFERENT convention — its selector matches
   `release: <helm-release-name>` (no `prometheus:` label). Custom
   Prometheus CRs use whatever their `ruleSelector` /
-  `serviceMonitorSelector` specifies. If your install uses a different
-  label set, edit each CR's labels to match — the YAML comments next
-  to each label spell out the exact `kubectl get prometheus -A -o
-  jsonpath=...` introspection command.
+  `serviceMonitorSelector` / `podMonitorSelector` specifies. If your
+  install uses a different label set, edit each CR's labels to match —
+  the YAML comments next to each label spell out the exact
+  `kubectl get prometheus -A -o jsonpath=...` introspection command.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
@@ -64,27 +75,41 @@ There are two distribution shapes, same rule set, drift-gated by
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
   Prometheus via the `rule_files:` config block, a ConfigMap, or the Helm
   `prometheus.serverFiles` value (depending on your install). You ALSO
-  need a `scrape_configs:` entry — and to keep the alerts' per-install
-  scoping working, that scrape must inject a `namespace` label. Two
-  valid shapes:
+  need `scrape_configs:` entries for BOTH targets — the
+  `inference-cache-server` pod (server-side series: index, lookup, auth)
+  AND the `inference-cache-controller-manager` pod (controller-side
+  series: per-stage probe-result counter, cache-server restart-cascade
+  counter). Server-only scrape leaves the controller-side alerts
+  (`ServerProbeFail` today) loaded but inert — they read
+  `inferencecache_backend_probe_result_total` which is controller-emitted.
+  To keep the alerts' per-install scoping working, both scrapes must
+  inject a `namespace` label. Two valid shapes:
   1. **Recommended** — Kubernetes service discovery
      (`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
      that copies `__meta_kubernetes_namespace` to a `namespace` label.
-     Works in single-install AND shared-Prometheus setups.
+     Select on `app.kubernetes.io/name: inference-cache` and split
+     server vs. controller by `app.kubernetes.io/component`. Works in
+     single-install AND shared-Prometheus setups.
   2. **Single-install only** — a static DNS scrape of
-     `inference-cache-server.inference-cache-system.svc.cluster.local:8080`.
-     Simpler but produces NO `namespace` label, so the alerts collapse
-     into one unlabeled group. Acceptable when one Prometheus only ever
+     `inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+     plus a pod-IP scrape of the controller manager pods (no Service
+     fronts the controller's `:8080`, so a DNS-style static target
+     isn't an option there — pod IPs change on restart, so static
+     pod-IP scrapes are operator-of-last-resort). Simpler but
+     produces NO `namespace` label, so the alerts collapse into one
+     unlabeled group. Acceptable when one Prometheus only ever
      scrapes one inference-cache install; do not use it for shared
      Prometheus deployments.
 
-  ServiceMonitor in the operator bundle is the prometheus-operator
-  equivalent of shape (1); both shapes (1) and (2) require you to wire
-  scrape config explicitly when you are not on prometheus-operator.
+  ServiceMonitor (server) + PodMonitor (controller) in the operator
+  bundle is the prometheus-operator equivalent of shape (1); both
+  shapes (1) and (2) require you to wire BOTH scrape entries
+  explicitly when you are not on prometheus-operator.
 
-Both files contain the same five Stage 1 alerts plus commented-out
-placeholders for three more that depend on metrics not yet exposed (see
-[Deferred alerts](#deferred-alerts) below).
+Both files contain the same six active alerts (five Stage 1 alerts plus
+the controller-side `ServerProbeFail`) plus commented-out placeholders for
+two more that depend on metrics not yet exposed (see [Deferred
+alerts](#deferred-alerts) below).
 
 > **One alert depends on a separate scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](#lmcachet2nohits) reads `vllm:external_prefix_cache_*`,
@@ -133,9 +158,11 @@ placeholders for three more that depend on metrics not yet exposed (see
 >       interval: 30s
 > ```
 >
-> The other four alerts work as-is once this bundle is applied — they
+> The other five alerts work as-is once this bundle is applied — they
 > only read `inferencecache_*` series, which the shipped ServiceMonitor
-> already scopes to `inference-cache-server`.
+> (server-side: `IndexEmpty`, `LookupRouteDegenerate`,
+> `LookupRouteHighTimeout`, `IndexEvictionsSpike`) and PodMonitor
+> (controller-side: `ServerProbeFail`) cover between them.
 >
 > **The alerts rely on a `namespace` label per install.** Both the shipped
 > `ServiceMonitor` for `inference-cache-server` and any prometheus-operator
@@ -551,9 +578,131 @@ sum by (namespace, tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
 
 ---
 
+### `ServerProbeFail`
+
+- **Severity**: `critical`
+- **For**: 5 minutes
+- **Source metric**: `inferencecache_backend_probe_result_total{backend, stage, result}` — **emitted by the controller binary, not the server.** Requires the controller-side `PodMonitor` shipped in this same observability overlay; without it the alert loads but never has a series to evaluate.
+
+The CacheBackend controller drives a synthetic round-trip against each
+managed backend on a 30-second cadence — an `ingest → routing → t2`
+self-test — and records the per-stage outcome (`result="ok"`, `"failed"`,
+`"skipped"`) in this counter. A sustained `result="failed"` rate means
+the cache-plane internal pipeline is broken in a way the basic
+Service-endpoint probe and Ready gate cannot catch:
+
+| `stage` label | What `failed` means |
+|---|---|
+| `ingest` | The probe wrote a synthetic prefix entry through the server's **in-process** `index.Ingest` path and the entry did not land. This pins the index ingest path; it does **NOT** exercise the gRPC `ReportCacheState` handler nor the `kvevent-subscriber` sidecar (subscriber wire bugs are invisible to Stage A by design — see the design doc and `pkg/server/probe.go` lead-in). A failure here means the index itself is dropping writes — a regression in `pkg/index` keying, scheme handling, or eviction. |
+| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from `spec.integration.engine`; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `pkg/server`. |
+| `t2` | (When a `T2Prober` is wired into the server.) The tier-2 put/get cycle against the configured external backend (LMCache today) failed. No `T2Prober` is wired in this revision, so this stage reports `skipped` on every install — an alert here only fires once a follow-up registers a real `T2Prober`. |
+
+The alert uses `increase(...{result="failed"}[5m]) >= 2 for: 5m` — a
+single transient flake (one failed probe that recovers on the next 30s
+tick) does **not** page. The alert requires at least two failed
+increments within a 5-minute window, sustained for another 5 minutes
+before firing. This is calibrated to the controller's 30s probe cadence:
+~10 probes per 5m window, so the `>= 2` threshold is a real signal
+(≥20% failure rate), not a baseline.
+
+A 200 response whose body has empty or unrecognized stage values is also
+recorded as `result="failed"` (the alerting contract MUST match what
+`ProbeResult.AllPassed` considers non-passing) — a malformed `{}` body
+or a future stage outcome the controller doesn't yet recognize will
+page just like a real per-stage failure rather than silently coercing
+to `skipped`. The raw wire string is preserved in the
+`FunctionalProbeOK` condition message for diagnosis.
+
+#### Likely causes
+
+By `stage` label:
+
+- `ingest` — the in-process index ingest path is dropping writes. Check
+  the server's `inferencecache_index_entries` gauge to see if the index
+  is accumulating entries at all; check server logs for `pkg/index`
+  errors; verify `inferencecache_server_up == 1`. (A subscriber → server
+  wire bug is **not** what causes this stage to fail — subscriber bugs
+  show up as a missing-state pattern on real workload, not on this
+  probe. If you suspect the subscriber, scope your investigation to the
+  `kvevent-subscriber` pod logs + gRPC `:9090` reachability instead.)
+- `routing` — the index recorded the probe entry but lookup can't find
+  it. The probe's `hashScheme` is derived from the backend's
+  `spec.integration.engine` (default `"vllm"`); verify it's not being
+  silently dropped on ingest (an empty scheme fails open and produces
+  `NO_HINT` on lookup). Check the server-side lookup-filter logs for
+  `reason_code=NO_HINT` on calls that should match.
+- `t2` — not applicable today; no `T2Prober` is wired into the server.
+  If you're seeing `t2=failed` on a live install, a follow-up has
+  registered a real `T2Prober` and its connection to the configured
+  LMCache server (or its tracking of `external_prefix_cache_*` engine
+  metrics) is broken.
+
+#### First-response runbook
+
+1. Identify which backend(s) and which stage are failing:
+
+   ```promql
+   sum by (backend, stage) (
+     increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
+   )
+   ```
+
+2. Compare to the success rate for the same backend — if `ok` is
+   non-zero, the probe is at least *running*, so the issue is
+   stage-specific, not "controller can't reach server at all":
+
+   ```promql
+   sum by (backend, stage, result) (
+     increase(inferencecache_backend_probe_result_total[5m])
+   )
+   ```
+
+3. Inspect the `CacheBackend.status.conditions[?type=="FunctionalProbeOK"]`
+   on the affected backend — the `reason` field
+   (`ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`) and
+   the `message` payload mirror what the probe handler reported. The
+   condition is the operator-visible signal; the metric is the alerting
+   signal.
+
+4. If the controller is also reporting `Ready=False` on the backend
+   with the same reason, the gate is doing its job — the backend's
+   `Ready=True` posture has been downgraded for as long as the probe
+   keeps failing. Routing-aware clients see a degraded backend; the
+   alert is the operator's signal to investigate.
+
+5. To temporarily suppress the alert during a known-bad investigation
+   without modifying the rule, annotate the affected backend(s) with
+   `inferencecache.io/skip-functional-probe: "true"` — the controller
+   short-circuits before calling `/probe` (reason `ProbeBypassed` on
+   the condition), so **no new per-stage metric increments fire while
+   bypassed** (neither `failed` nor `skipped`). The existing
+   `result="failed"` increments age out of the 5-minute `increase()`
+   window naturally, and the alert clears once the window drains. The
+   bypass writes `FunctionalProbeOK=True/ProbeBypassed`, so Ready is
+   no longer downgraded either — operators should treat the bypassed
+   state as an explicit "I am ignoring the gate," not as "the backend
+   is healthy." **Remove the annotation when you're done**; a bypassed
+   backend with a real regression still ships broken cache state.
+
+Triage queries:
+
+```promql
+# Per-backend, per-stage failure rate over the alert window
+sum by (backend, stage) (
+  increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
+)
+
+# Same backend, all results — sanity-check that the probe is firing at all
+sum by (backend, stage, result) (
+  increase(inferencecache_backend_probe_result_total[5m])
+)
+```
+
+---
+
 ## Deferred alerts
 
-Three more alerts are scoped to ship as part of the same observability
+Two more alerts are scoped to ship as part of the same observability
 bundle, but they depend on metrics not yet exposed on `/metrics`. The
 placeholder rules sit in [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml)
 and the [`PrometheusRule` CR](../../config/observability/prometheus-rules.yaml)
@@ -564,7 +713,6 @@ metric.
 |---|---|---|
 | `VersionSkewDetected` | `inferencecache_backend_version_skew` gauge — exposed by a follow-up that detects engine-vs-cache-server version skew | The `LMCacheT2NoHits` failure class, but BEFORE it manifests as zero hits — caught proactively by the operator detecting the skew at admit time. |
 | `KvEventsStaleness` | `inferencecache_replica_last_event_at` gauge — exposed by the Ready-on-first-event follow-up | A replica that *was* emitting KV events stopped (engine crash, OOMKill, NetworkPolicy regression, subscriber dead). Distinct from `IndexEmpty` (replica never published) — this catches *post-warmup* silence. |
-| `ServerProbeFail` | `inferencecache_backend_probe_result` counter — exposed by the synthetic end-to-end Ready gate | A managed backend's synthetic publish → index → lookup round-trip is failing. The basic Service-endpoint probe cannot catch this; only the end-to-end probe can. |
 
 ---
 

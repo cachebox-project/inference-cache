@@ -22,7 +22,7 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 |---|---|---|---|
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
-| `/probe`    | controller → server | `POST` | CacheBackend reconcile (controller-wiring follow-up) |
+| `/probe`    | controller → server | `POST` | CacheBackend reconcile, rate-limited to ~once per backend per 30s |
 
 All three of `/snapshot`, `/policy`, and `/probe` sit on the server's
 internal `:8081` listener with **three independent gates**, each meant to
@@ -30,12 +30,16 @@ catch a failure mode the others can't. `/healthz`, `/readyz`, and
 `/metrics` stay on the open `:8080` listener — kubelet probes and
 Prometheus scrapes can't present a SA bearer.
 
-`/probe` is the functional self-test the controller will drive per
-CacheBackend at reconcile time (once the controller-wiring follow-up
-lands): the server synthesizes a deterministic round-trip — in-process
+`/probe` is the functional self-test the CacheBackend reconciler
+drives per managed CacheBackend at reconcile time (composed on top of
+the KV-event readiness gate; rate-limited to ~once per backend per 30s,
+see [docs/design/cachebackend-api.md#functional-probe-gate](cachebackend-api.md#functional-probe-gate)).
+The server synthesizes a deterministic round-trip — in-process
 index-ingest → routing → tier-2 — under a reserved tenant id
 (`inferencecache.io/probe`) and replica id (`__probe-<backend>`),
-returning per-stage outcomes. Stage A's wire field name is `ingest` —
+returning per-stage outcomes; the controller translates those into the
+`FunctionalProbeOK` condition (and downgrades `Ready` on a stage
+failure). Stage A's wire field name is `ingest` —
 matching the path the probe physically traverses: it writes through
 in-process `index.Ingest` rather than the gRPC `ReportCacheState`
 handler the real subscriber uses (the handler now drops messages with
@@ -56,7 +60,7 @@ Request — JSON body, `POST /probe`. All fields are case-sensitive.
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
-| `backend` | string | yes | Stable, globally-unique CacheBackend identifier. Canonical form is `<namespace>/<name>` (the controller-wiring follow-up always sends this), but the handler accepts any non-empty string. Interpolated into the reserved replica id (`__probe-<backend>`) and the probe hash, so two CacheBackends with the same `backend` value share a replica id and contention slot. |
+| `backend` | string | yes | Stable, globally-unique CacheBackend identifier. Canonical form is `<namespace>/<name>` (the CacheBackend reconciler always sends this), but the handler accepts any non-empty string. Interpolated into the reserved replica id (`__probe-<backend>`) and the probe hash, so two CacheBackends with the same `backend` value share a replica id and contention slot. |
 | `model` | string | yes | Model identifier the probe synthesizes state under. Must match the model the controller is checking; the reserved tenant id is server-owned and cannot be passed in. |
 | `hashScheme` | string | yes | Engine domain (`vllm` / `sglang` / etc). Pins the engine the probe's synthetic block lives under so a probe for vllm cannot collide with a probe for sglang on the same backend. |
 | `backendType` | string | no | The CacheBackend's `spec.type`. `LMCache` (or empty, matching the CRD default) runs Stage C; `Memory` / `External` skip it. Unknown values fall through to skip. |

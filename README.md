@@ -82,18 +82,24 @@ The default Kustomize overlay brings up both control-plane components:
 - `inference-cache-server` — the gRPC policy server (`InferenceCache`) and the
   HTTP `/healthz`, `/readyz`, `/metrics` probe surface, plus a dedicated
   controller-facing listener carrying `/snapshot` (controller read), `/policy`
-  (controller write), and `/probe` (functional self-test, intended to be
-  controller-driven once the controller-wiring follow-up lands — the
-  server-side endpoint ships here), all gated by ServiceAccount bearer auth
-  + a `NetworkPolicy`. Fronted by a
-  `ClusterIP` Service `inference-cache-server` in the `inference-cache-system`
-  namespace with named ports `grpc:9090` (gRPC API), `http:8080` (probes /
-  metrics), and `snapshot:8081` (controller-only `/snapshot` + `/policy` +
-  `/probe`). The controller's CacheIndex poller scrapes
-  `http://inference-cache-server:8081/snapshot` and the CachePolicy reconciler
-  POSTs to `http://inference-cache-server:8081/policy` by default; both send
-  the projected ServiceAccount token. Once both pods are Ready
+  (controller write), and `/probe` (functional self-test driven by the
+  CacheBackend reconciler), all gated by ServiceAccount bearer auth + a
+  `NetworkPolicy`. Fronted by a `ClusterIP` Service `inference-cache-server`
+  in the `inference-cache-system` namespace with named ports `grpc:9090`
+  (gRPC API), `http:8080` (probes / metrics), and `snapshot:8081`
+  (controller-only `/snapshot` + `/policy` + `/probe`). The controller's
+  CacheIndex poller scrapes `http://inference-cache-server:8081/snapshot`,
+  the CachePolicy reconciler POSTs to
+  `http://inference-cache-server:8081/policy`, and the CacheBackend
+  reconciler POSTs to `http://inference-cache-server:8081/probe` (default
+  for the `--server-probe-url` flag — set empty to disable the gate); all
+  three send the projected ServiceAccount token. Once both pods are Ready
   `kubectl get cacheindex` reports live cluster-wide cache state.
+  `FunctionalProbeOK` appears on each managed `CacheBackend` only after it
+  clears the upstream KV-event readiness gate (i.e. real engine pods have
+  published at least one KV event for it) — see
+  [docs/design/cachebackend-api.md#functional-probe-gate](docs/design/cachebackend-api.md#functional-probe-gate);
+  it is intentionally not visible on a default install with no engine workload.
 
 ```bash
 kubectl apply -k config/default
@@ -103,11 +109,15 @@ kubectl get cacheindex cluster-default -o yaml
 
 ## Monitoring
 
-The `inference-cache-server` exposes Prometheus metrics on `:8080/metrics`
-(prefixed `inferencecache_*`). A default alert bundle for the operational
-silent-failure patterns this code has hit in production ships under
-[`config/observability/`](config/observability/) and is **not** included in
-`config/default` — the alerts are opt-in so that installs without
+Both binaries expose Prometheus metrics on their pod's `:8080/metrics`
+(prefixed `inferencecache_*`) — the server binary's series cover the
+in-memory index and gRPC handlers; the controller binary's series cover
+the reconcilers (e.g. `inferencecache_backend_probe_result_total`,
+`inferencecache_backend_server_restart_cascades_total`). A default
+alert bundle for the operational silent-failure patterns this code has
+hit in production ships under
+[`config/observability/`](config/observability/) and is **not** included
+in `config/default` — the alerts are opt-in so that installs without
 prometheus-operator CRDs are not affected by an unknown `apiVersion`.
 
 For prometheus-operator / kube-prometheus installs:
@@ -116,20 +126,22 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
-This ships BOTH a `ServiceMonitor` (so Prometheus scrapes
-`inference-cache-server:8080/metrics`) AND the `PrometheusRule` carrying
-the alerts.
+This ships THREE resources: a `ServiceMonitor` (so Prometheus scrapes
+`inference-cache-server:8080/metrics`), a `PodMonitor` (so Prometheus
+scrapes the controller pod's `:8080/metrics` — required for the
+controller-side alerts like `ServerProbeFail` to have a series to
+evaluate), and the `PrometheusRule` carrying the alerts.
 
-> **Caveat — Prometheus Operator selectors.** Both CRs carry example
-> labels (`prometheus: k8s`, plus `role: alert-rules` on
-> the PrometheusRule) that match the upstream kube-prometheus stack
+> **Caveat — Prometheus Operator selectors.** All three CRs carry
+> example labels (`prometheus: k8s`, plus `role: alert-rules` on the
+> PrometheusRule) that match the upstream kube-prometheus stack
 > (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
 > Helm chart uses a different convention (`release: <release-name>`,
-> no `prometheus:` label) — its rule/serviceMonitor selectors do not
-> match what's shipped here. If
-> your `Prometheus` CR's `ruleSelector` / `serviceMonitorSelector`
+> no `prometheus:` label) — its rule / serviceMonitor / podMonitor
+> selectors do not match what's shipped here. If your `Prometheus`
+> CR's `ruleSelector` / `serviceMonitorSelector` / `podMonitorSelector`
 > uses a different label set (`release: my-prom`, etc.), `kubectl
-> apply -k` succeeds but Prometheus silently ignores both resources.
+> apply -k` succeeds but Prometheus silently ignores the resources.
 > The YAML comments next to each label spell out the introspection
 > command (`kubectl get prometheus -A -o jsonpath=...`); see
 > [`docs/observability/alerts.md`](docs/observability/alerts.md) for
@@ -153,15 +165,27 @@ expressions) and only fire when the conditions are met.
 
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
-**You must also configure scraping yourself.** For multi-install or
-per-install isolation, use Kubernetes service discovery
-(`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
-that copies `__meta_kubernetes_namespace` to `namespace` — the alerts
-scope per install by that label. A static DNS scrape (e.g. just
-`inference-cache-server.inference-cache-system.svc.cluster.local:8080`)
-is acceptable for a single install but loses per-install isolation; do
-NOT use it if you scrape multiple inference-cache installs into one
-Prometheus. Without a working scrape, the rules load but fire on nothing.
+**You must also configure scraping yourself, for BOTH the server AND
+the controller pod.** The server's `:8080` exposes the index, lookup,
+and auth series; the controller pod's `:8080` exposes the per-stage
+probe-result counter (`inferencecache_backend_probe_result_total`)
+and the cache-server restart-cascade counter — the controller-side
+alerts (`ServerProbeFail` today) load against the controller's
+series, so a server-only scrape leaves them inert.
+
+For multi-install or per-install isolation, use Kubernetes service
+discovery (`kubernetes_sd_configs: pod` or `endpoints`) with
+`relabel_configs:` that copies `__meta_kubernetes_namespace` to
+`namespace` — the alerts scope per install by that label. A pair of
+static DNS scrapes (e.g.
+`inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+PLUS pod-IP discovery for the controller manager pods, which have no
+Service in front of them) is acceptable for a single install but
+loses per-install isolation; do NOT use it if you scrape multiple
+inference-cache installs into one Prometheus. Without a working
+scrape on both endpoints, the rules load but fire on nothing (server
+alerts) or load but never have a series to evaluate (controller
+alerts like `ServerProbeFail`).
 
 Per-alert runbooks (causes, triage steps, example PromQL): see
 [`docs/observability/alerts.md`](docs/observability/alerts.md). For the

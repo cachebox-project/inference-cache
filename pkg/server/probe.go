@@ -60,13 +60,15 @@ import (
 // physically traverses, so the operator-facing condition reason cannot be
 // mistaken for a wire-subscriber check.
 //
-// This file ships the server-side machinery and the HTTP /probe handler. The
-// controller wiring — calling /probe from the CacheBackend reconciler and
-// writing the FunctionalProbeOK condition — is a follow-up; the metric
-// (inferencecache_backend_probe_result) ships with the controller wiring too.
-// Internal types here that are not yet read by anything outside this file's
-// tests are explicitly carved out (per the project's "no inert field" rule —
-// wired today, or names the follow-up that will wire it).
+// This file ships the server-side machinery and the HTTP /probe handler.
+// The controller wiring lives in internal/controller/cachebackend_probe.go
+// — the CacheBackend reconciler POSTs /probe on each reconcile (rate-
+// limited per backend), writes the FunctionalProbeOK condition off the
+// returned ProbeResult, and increments
+// inferencecache_backend_probe_result_total on the controller-runtime
+// registry. Internal types here that are not yet read by anything outside
+// this file's tests are explicitly carved out (per the project's "no inert
+// field" rule — wired today, or names the follow-up that will wire it).
 
 // ProbeTenantID is the reserved tenant id every probe synthesizes its state
 // under. Real workload tenants (CacheTenant.spec.tenantID) are MinLength=1 and
@@ -110,7 +112,7 @@ const (
 )
 
 // Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
-// inferencecache_backend_probe_result metric `stage` label. Stage A's wire
+// inferencecache_backend_probe_result_total metric `stage` label. Stage A's wire
 // name is `ingest` — it exercises in-process index.Ingest, not the wire
 // ReportCacheState handler the real subscriber uses (the handler drops
 // probe-tenant messages by design). See the file-top doc for what a Stage
@@ -132,8 +134,8 @@ const (
 // An empty BackendType on a ProbeRequest is treated as LMCache to match the
 // CacheBackend CRD's defaulter (spec.type defaults to LMCache via the
 // kubebuilder marker). Operators who run the probe by hand against a non-
-// LMCache backend must set BackendType explicitly; the controller-wiring
-// follow-up always reads spec.type from the CR and never sends empty.
+// LMCache backend must set BackendType explicitly; the CacheBackend
+// reconciler always reads spec.type from the CR and never sends empty.
 const BackendTypeLMCache = "LMCache"
 
 // ProbeRequest carries the parameters the probe needs to synthesize a
@@ -146,7 +148,7 @@ const BackendTypeLMCache = "LMCache"
 // same-name CacheBackends in different namespaces from colliding in the
 // reserved replica id, callers MUST pass a globally-unique form — the
 // canonical shape is `<namespace>/<name>` (matching K8s resource identity).
-// The controller-wiring follow-up always sends `<namespace>/<name>`; the
+// The CacheBackend reconciler always sends `<namespace>/<name>`; the
 // HTTP handler validates that the field is non-empty but does not enforce
 // the slash format, since hand-invoked probes on a single-namespace
 // install can use any unique string.
@@ -163,8 +165,8 @@ type ProbeRequest struct {
 }
 
 // ProbeResult is the per-stage outcome returned to the controller. The
-// controller maps a stage's failed result onto the corresponding
-// FunctionalProbeOK condition reason (controller-wiring follow-up):
+// CacheBackend reconciler maps a stage's failed result onto the
+// corresponding FunctionalProbeOK condition reason:
 //
 //	ingest  failed → ProbeIngestFailed
 //	routing failed → ProbeRoutingFailed
@@ -191,10 +193,12 @@ type ProbeStageError struct {
 // skipped (every stage has an explicit ok|skipped value, none is failed and
 // none is the zero-value empty string). The HTTP /probe handler ALWAYS
 // returns the full ProbeResult as JSON (HTTP 200 — the call itself
-// succeeded), and the caller reads AllPassed to flip the FunctionalProbeOK
-// condition once the controller wiring follow-up lands. The predicate is
-// exported so that follow-up doesn't have to re-derive the "passed?"
-// definition from the per-stage fields.
+// succeeded), and the CacheBackend reconciler reads AllPassed to flip the
+// FunctionalProbeOK condition (see
+// internal/controller/cachebackend_probe.go). The predicate is exported
+// so the caller doesn't have to re-derive the "passed?" definition from
+// the per-stage fields — keeping the definition single-sourced here means
+// a future stage rename can't drift between server and controller.
 //
 // The zero-value-fails-closed property matters: a partially-decoded result
 // (the JSON envelope was truncated, a future field was renamed, the caller
@@ -212,8 +216,11 @@ func stagePassed(s ProbeStageResult) bool {
 }
 
 // T2Prober drives a put/get round trip against an external tier-2 backend
-// (today: LMCache). It is the seam the controller-wiring follow-up fills
-// with a real LMCache client; this file ships the interface + a test fake.
+// (today: LMCache). The controller-side caller is already wired (see
+// internal/controller/cachebackend_probe.go), but the server boots WITHOUT
+// a real T2Prober today — no LMCache client implementation is plumbed in,
+// so the probe's Stage C reports skipped on every clean install until a
+// follow-up registers one. This file ships the interface + a test fake.
 // Returning nil means the cycle round-tripped cleanly; returning an error
 // means the stage failed. Wrap the error in *T2ProbeError to tell the
 // controller which half (put vs get) broke — the operator-facing condition
@@ -255,10 +262,12 @@ func (e *T2ProbeError) Unwrap() error {
 // CacheEvent_ALL_CLEARED for its reserved replica id so the probe leaves
 // the index empty of its own state.
 //
-// This file ships Prober with t2=nil — every backend reports T2=skipped until
-// the controller wiring follow-up plumbs a real T2Prober through. The
-// controller integration is the only consumer that's not yet present; the
-// HTTP /probe handler + the tests in this package are the live callers today.
+// This file ships Prober with t2=nil — every backend reports T2=skipped
+// until a follow-up plumbs a real T2Prober through (e.g. an LMCache
+// put/get client). The controller integration IS live (see
+// internal/controller/cachebackend_probe.go); the HTTP /probe handler is
+// hit on every reconcile + the tests in this package are the other live
+// callers today.
 type Prober struct {
 	index *index.Index
 	t2    T2Prober
@@ -270,9 +279,10 @@ type Prober struct {
 	// race — probes for DIFFERENT backends synthesize under DIFFERENT
 	// __probe- replica ids and never collide. Without this, two overlapping
 	// runs could see one's cleanup wipe the other's just-ingested entry mid-
-	// flight and report a false subscriber/routing failure. The controller-
-	// wiring follow-up additionally rate-limits to ~once per backend per 30s,
-	// so contention here is rare in practice — the lock is the correctness
+	// flight and report a false subscriber/routing failure. The CacheBackend
+	// reconciler additionally rate-limits to ~once per backend per 30s
+	// (see internal/controller/cachebackend_probe.go probeRateLimiter), so
+	// contention here is rare in practice — the lock is the correctness
 	// backstop for the no-rate-limit case (tests, hand-invoked probes,
 	// future fast reconcile cycles).
 	//
@@ -301,7 +311,9 @@ type Prober struct {
 
 // NewProber wires a probe orchestrator to the live index + an optional
 // T2Prober. Passing nil for t2 disables Stage C (the probe always reports
-// T2=skipped); the controller-wiring follow-up passes a real implementation.
+// T2=skipped); the server boots with t2=nil today and a follow-up that
+// implements a real T2Prober (e.g. an LMCache put/get client) will pass
+// one in.
 //
 // The probe routes through idx.Ingest like every other writer; the
 // "no real-workload eviction" invariant is upheld by configuring the
@@ -332,10 +344,11 @@ func (p *Prober) lockForRun(backend, model string) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
-// ProbeReplicaID is the reserved replica id the probe synthesizes its state
-// under for a given backend. Exposed so the controller (when the wiring
-// follow-up lands) can construct the same id when asserting "no probe
-// entries leaked into a real lookup" in envtest integration tests.
+// ProbeReplicaID is the reserved replica id the probe synthesizes its
+// state under for a given backend. Exposed so the controller — or any
+// envtest / smoke harness that asserts "no probe entries leaked into a
+// real lookup" — can construct the same id without re-deriving the
+// prefix-plus-backend rule.
 func ProbeReplicaID(backend string) string {
 	return ProbeReplicaPrefix + backend
 }
