@@ -92,9 +92,12 @@ func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 			Prefixes: []index.PrefixRef{{PrefixHash: []byte("other"), TokenCount: 32}},
 		})
 	}
-	resp, _ := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "m", TenantId: "strict", HashScheme: "vllm", PrefixHash: []byte("unique"),
 	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v (the hot path must fail open with an empty result, not an RPC error)", err)
+	}
 	if resp.GetReasonCode() != "NO_HINT" {
 		t.Fatalf("reason = %q, want NO_HINT (strict floor 100 > unique-match score)", resp.GetReasonCode())
 	}
@@ -114,9 +117,12 @@ func TestLookupRouteRoutingFloorScoreZeroDisablesFloor(t *testing.T) {
 			Prefixes: []index.PrefixRef{{PrefixHash: []byte("chat"), TokenCount: 16}},
 		})
 	}
-	resp, _ := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "m", TenantId: "raw", HashScheme: "vllm", PrefixHash: []byte("chat"),
 	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v (hot path must fail open, not error)", err)
+	}
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
 		t.Fatalf("reason = %q, want PREFIX_MATCH (floor opt-out — every match surfaces)", resp.GetReasonCode())
 	}
@@ -135,9 +141,12 @@ func TestLookupRouteRoutingFloorScoreSingleReplicaSurvives(t *testing.T) {
 		ReplicaID: "solo", Model: "m", Tenant: "no-policy", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
 	})
-	resp, _ := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "m", TenantId: "no-policy", HashScheme: "vllm", PrefixHash: []byte("p"),
 	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v (hot path must fail open, not error)", err)
+	}
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
 		t.Fatalf("reason = %q, want PREFIX_MATCH (single-replica must preserve baseline)", resp.GetReasonCode())
 	}

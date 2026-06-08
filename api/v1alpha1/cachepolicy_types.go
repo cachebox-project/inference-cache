@@ -97,11 +97,20 @@ type CachePolicySpec struct {
 	// Encoded as a stringified float to avoid introducing the first
 	// float-typed field into the CachePolicy schema (the others are
 	// int32 / duration). Validated by the +kubebuilder:validation:Pattern
-	// marker: digits with an optional decimal part, no sign.
+	// marker: digits with an optional decimal part, no sign. The pattern
+	// caps the integer part at 8 digits (up to 99,999,999) and the
+	// decimal part at 6 digits — both well inside float32 representable
+	// range (~3.4e38) and within float32 precision (~7 significant
+	// digits), so a value the apiserver admits CANNOT overflow the
+	// controller's strconv.ParseFloat(..., 32) parser. An overflow at
+	// admission would either silently fall back to the safety default
+	// (changing the operator's setting) or look like a parse bug —
+	// rejecting at the API boundary keeps the error visible to the
+	// operator instead.
 	//
 	// +optional
 	// +kubebuilder:default="0.1"
-	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(\.[0-9]+)?$`
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]{0,7})(\.[0-9]{1,6})?$`
 	RoutingFloorScore *string `json:"routingFloorScore,omitempty"`
 
 	// LookupTimeoutMs bounds cache lookup latency in milliseconds.
