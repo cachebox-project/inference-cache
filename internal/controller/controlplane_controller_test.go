@@ -508,8 +508,12 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	}
 	// RoutingFloorScore flows through the resolver the server reads — guards
 	// against a future refactor that drops the field on the flatten path
-	// without anyone noticing.
-	if got, want := p.RoutingFloorScore, float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
+	// without anyone noticing. Pointer because the wire schema distinguishes
+	// "absent" (nil — apply default) from "explicit 0" (&0 — opt-out).
+	if p.RoutingFloorScore == nil {
+		t.Fatalf("RoutingFloorScore is nil after round-trip, want &2.5")
+	}
+	if got, want := *p.RoutingFloorScore, float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
 		t.Fatalf("RoutingFloorScore on round-trip = %v, want 2.5", got)
 	}
 	if got, want := store.RoutingFloorScore("team-a"), float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
@@ -609,9 +613,35 @@ func TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput(t *testing.T) {
 				Spec:       cachev1alpha1.CachePolicySpec{RoutingFloorScore: strPtr(c.spec)},
 			}
 			rp := resolveOnePolicy(cp)
-			if d := rp.RoutingFloorScore - c.want; d > 1e-3 || d < -1e-3 {
-				t.Fatalf("RoutingFloorScore for %q = %v, want %v", c.spec, rp.RoutingFloorScore, c.want)
+			// resolveOnePolicy must always produce a non-nil pointer when
+			// the CR carried a value — the pointer-on-the-wire scheme
+			// reserves nil for "field omitted on the wire body" only.
+			if rp.RoutingFloorScore == nil {
+				t.Fatalf("RoutingFloorScore is nil for %q; resolveOnePolicy must produce a non-nil pointer when the CR carries a value", c.spec)
+			}
+			if d := *rp.RoutingFloorScore - c.want; d > 1e-3 || d < -1e-3 {
+				t.Fatalf("RoutingFloorScore for %q = %v, want %v", c.spec, *rp.RoutingFloorScore, c.want)
 			}
 		})
+	}
+}
+
+// TestResolveOnePolicyRoutingFloorScoreNilWhenAbsent pins the other side of
+// the pointer-disambiguation contract: a CR that does NOT carry the
+// RoutingFloorScore field at all (Spec.RoutingFloorScore == nil) must
+// produce a nil ResolvedPolicy.RoutingFloorScore so the server-side
+// resolver can apply DefaultRoutingFloorScore. The kubebuilder default
+// normally materializes "0.1" on every admitted CR, so this path fires
+// only for legacy CRs predating the field — but those CRs MUST get the
+// safety floor, not silent opt-out.
+func TestResolveOnePolicyRoutingFloorScoreNilWhenAbsent(t *testing.T) {
+	cp := &cachev1alpha1.CachePolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		Spec:       cachev1alpha1.CachePolicySpec{}, // RoutingFloorScore deliberately absent
+	}
+	rp := resolveOnePolicy(cp)
+	if rp.RoutingFloorScore != nil {
+		t.Fatalf("RoutingFloorScore = %v, want nil when Spec.RoutingFloorScore is absent — silent default-substitution would defeat the absent-vs-zero disambiguation",
+			*rp.RoutingFloorScore)
 	}
 }

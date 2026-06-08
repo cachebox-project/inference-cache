@@ -97,12 +97,20 @@ const DefaultRoutingFloorScore float32 = 0.1
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
 //   - Eviction == ""         → LRU (the index default and the kubebuilder default).
 //
-// RoutingFloorScore is the EXCEPTION: a zero value here means "explicit
-// opt-out for THIS namespace" (the operator wanted no floor — typically for
-// raw-recall benchmarking). The server-wide DefaultRoutingFloorScore is the
-// fallback ONLY for tenants with NO CachePolicy at all; a CachePolicy that
-// reaches this struct as RoutingFloorScore=0 is honoring the operator's
-// explicit choice. See PolicyStore.RoutingFloorScore for the resolver.
+// RoutingFloorScore is the EXCEPTION and uses a pointer to distinguish three
+// distinct shapes on the wire:
+//   - nil  → field was OMITTED on the wire body (legacy / hand-crafted /
+//     un-defaulted CR). Server applies DefaultRoutingFloorScore for safety.
+//   - &0   → operator EXPLICITLY set "0" (the opt-out — raw-recall
+//     benchmarking, ranker debugging). Server applies no floor for this
+//     namespace.
+//   - &x   → operator set a specific threshold. Server applies x as-is.
+//
+// A flat float32 field with omitempty would conflate nil and &0 (both
+// produce no field on the wire), so a controller pushing a CR whose
+// kubebuilder-defaulted value was overridden to "0" by the operator would
+// be indistinguishable from a hand-crafted body that simply omitted the
+// field — the safe interpretation differs between those two cases.
 type ResolvedPolicy struct {
 	// Namespace identifies the CachePolicy's namespace, which in phase-1 is
 	// the tenant boundary: a LookupRoute carrying tenant_id="foo" resolves
@@ -114,14 +122,15 @@ type ResolvedPolicy struct {
 	MinimumMatchedTokens int32         `json:"minimumMatchedTokens,omitempty"`
 	// RoutingFloorScore is the per-namespace post-score floor: a PREFIX_MATCH
 	// whose best replica score falls below this threshold downgrades to
-	// NO_HINT. The server-side resolver falls back to
-	// DefaultRoutingFloorScore for tenants WITHOUT a CachePolicy; with a
-	// CachePolicy installed, the configured value wins (including an
-	// explicit 0 — the operator opt-out). Negative values clamp to 0 in
+	// NO_HINT. Pointer because the wire schema must distinguish "field
+	// omitted" (nil — server uses DefaultRoutingFloorScore for safety)
+	// from "operator explicitly set 0" (&0 — opt-out for this namespace).
+	// With a CachePolicy installed AND the field present, the configured
+	// value wins (including an explicit 0). Negative values clamp to 0 in
 	// the resolver. Wired inline in inferenceCacheService.buildLookupResponse
 	// via the PolicyStore.RoutingFloorScore resolver.
-	RoutingFloorScore float32 `json:"routingFloorScore,omitempty"`
-	LookupTimeoutMs   int32   `json:"lookupTimeoutMs,omitempty"`
+	RoutingFloorScore *float32 `json:"routingFloorScore,omitempty"`
+	LookupTimeoutMs   int32    `json:"lookupTimeoutMs,omitempty"`
 	// Eviction is the eviction algorithm in lower-case canonical form
 	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
 	// flattening. Empty means the server default (LRU). The index consults it on
@@ -312,11 +321,18 @@ func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
 }
 
 // RoutingFloorScore returns the per-namespace post-score floor applied to
-// the distinguishing-power-aware LookupRoute ranking. A namespace WITHOUT a
-// CachePolicy falls back to DefaultRoutingFloorScore — the safety floor
-// fires for the common unconfigured-tenant case. A namespace WITH a
-// CachePolicy returns its configured value as-is, including an explicit 0
-// (the operator opt-out for raw-recall benchmarking and ranker debugging).
+// the distinguishing-power-aware LookupRoute ranking. Resolution rules:
+//
+//   - No CachePolicy at all for this namespace  → DefaultRoutingFloorScore
+//     (the safety floor fires for the common unconfigured-tenant case).
+//   - CachePolicy present but RoutingFloorScore field absent on the wire
+//     (nil pointer)                              → DefaultRoutingFloorScore
+//     (a legacy / hand-crafted body that didn't carry the field falls back
+//     to the safety floor, NOT to opt-out — silent opt-out would be the
+//     wrong inference from "field missing").
+//   - CachePolicy present, RoutingFloorScore == &0 → 0 (the operator
+//     EXPLICITLY opted out — raw-recall benchmarking, ranker debugging).
+//   - CachePolicy present, RoutingFloorScore == &x → x as-is.
 //
 // Negative values clamp to 0: a hand-crafted /policy POST that bypassed the
 // CRD pattern validator could carry a negative threshold, which the
@@ -329,10 +345,15 @@ func (s *PolicyStore) RoutingFloorScore(tenant string) float32 {
 	if !ok {
 		return DefaultRoutingFloorScore
 	}
-	if p.RoutingFloorScore < 0 {
+	if p.RoutingFloorScore == nil {
+		// Policy is installed but did not carry this field (legacy / hand-
+		// crafted body). Apply the safety floor, not the opt-out.
+		return DefaultRoutingFloorScore
+	}
+	if *p.RoutingFloorScore < 0 {
 		return 0
 	}
-	return p.RoutingFloorScore
+	return *p.RoutingFloorScore
 }
 
 // LookupTimeout returns the per-namespace LookupRoute deadline as a
@@ -481,9 +502,16 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 		}
 	}
 	if snap.Version < 5 {
+		// A v3 or v4 body has no routingFloorScore key, so the decoded pointer
+		// is nil. Synthesize the safety default so a server-first rollout does
+		// not silently disable the floor for every namespace with a CR. An
+		// operator's explicit `routingFloorScore: 0` opt-out is already a
+		// non-nil pointer (= &0) and reaches the store as written; the nil
+		// branch only fires for the missing-field case.
 		for i := range snap.Policies {
-			if snap.Policies[i].RoutingFloorScore == 0 {
-				snap.Policies[i].RoutingFloorScore = DefaultRoutingFloorScore
+			if snap.Policies[i].RoutingFloorScore == nil {
+				v := DefaultRoutingFloorScore
+				snap.Policies[i].RoutingFloorScore = &v
 			}
 		}
 	}

@@ -81,7 +81,7 @@ func TestLookupRouteRoutingFloorScoreKeepsUniqueMatch(t *testing.T) {
 // would still pass.
 func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: 100}})
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: f32Ptr(100)}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r0", Model: "m", Tenant: "strict", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unique"), TokenCount: 64}},
@@ -110,7 +110,7 @@ func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 // without the floor masking the result.
 func TestLookupRouteRoutingFloorScoreZeroDisablesFloor(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "raw", RoutingFloorScore: 0}})
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "raw", RoutingFloorScore: f32Ptr(0)}})
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
 			ReplicaID: rid, Model: "m", Tenant: "raw", HashScheme: "vllm",

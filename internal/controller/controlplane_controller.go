@@ -304,26 +304,28 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	}
 	if cp.Spec.RoutingFloorScore != nil {
 		// The CRD's +kubebuilder:validation:Pattern marker guarantees a
-		// well-formed unsigned decimal at admission, so ParseFloat should
-		// succeed for any value the apiserver accepted. Pathological cases
-		// the validator does not catch — a parse failure (corrupt CR / future
-		// schema drift / hand-crafted /policy POST), an overflowing literal
-		// that exceeds float32 range, or a negative slip-through — fall back
-		// to the safety default rather than 0: a zero would disable the
+		// well-formed unsigned decimal at admission AND caps the integer
+		// part at 8 digits / decimal at 6, so ParseFloat(_, 32) cannot
+		// overflow on an admitted value. Pathological cases the validator
+		// does not catch — a parse failure (corrupt CR / future schema
+		// drift / hand-crafted /policy POST), an overflowing literal that
+		// bypassed admission, or a negative slip-through — fall back to
+		// the safety default rather than 0: a zero would disable the
 		// floor for that namespace silently, which is the OPPOSITE of the
 		// safe interpretation. The CRD-side validator is the authoritative
-		// gate; this clamp is the second line of defence.
+		// gate; this clamp is the second line of defence. The result is
+		// always a non-nil pointer so the server can distinguish "CR did
+		// not carry this field" (nil — apply default) from "operator
+		// explicitly set 0" (&0 — opt-out).
 		f, err := strconv.ParseFloat(*cp.Spec.RoutingFloorScore, 32)
+		var v float32
 		switch {
-		case err != nil:
-			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
-		case f < 0:
-			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
-		case math.IsInf(f, 0) || math.IsNaN(f):
-			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
+		case err != nil, math.IsInf(f, 0), math.IsNaN(f), f < 0:
+			v = cacheserver.DefaultRoutingFloorScore
 		default:
-			rp.RoutingFloorScore = float32(f)
+			v = float32(f)
 		}
+		rp.RoutingFloorScore = &v
 	}
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs

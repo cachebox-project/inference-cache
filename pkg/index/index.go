@@ -818,8 +818,16 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 	return i.lookupExact(req)
 }
 
-// lookupExact is the legacy single-blob exact-match path. Preserved
-// unchanged so existing callers (no block-hash chain) keep their behavior.
+// lookupExact is the legacy single-blob exact-match path. The wire shape
+// is unchanged for existing callers (no block-hash chain), but the
+// per-replica score now folds in the replica-distinguishing-power factor on
+// top of the matched_tokens × freshness × pressure × slo_bias baseline. The
+// service layer can also downgrade an exact-match response to NO_HINT when
+// the top score falls below the per-namespace routingFloorScore OR when
+// every replica's matched_tokens falls below the per-namespace
+// minimumMatchedTokens floor — see pkg/server/inferencecache_service.go
+// buildLookupResponse. Old gateway clients that only inspect reason_code
+// continue to fail open on a downgrade.
 func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
