@@ -32,21 +32,24 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 	}
 }
 
-// TestPolicyPropagationVersionIsV4 pins the wire-format version. v2 accompanied
+// TestPolicyPropagationVersionIsV5 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
 // cap-eviction algorithm); v4 accompanied ResolvedPolicy.MinimumMatchedTokens
-// (result-side floor). A controller/server version mismatch outside the
-// accepted band is rejected with a clear "unsupported version" rather than a
-// decode error.
-func TestPolicyPropagationVersionIsV4(t *testing.T) {
-	if PolicyPropagationVersion != 4 {
-		t.Fatalf("PolicyPropagationVersion = %d, want 4", PolicyPropagationVersion)
+// (the result-side matched-tokens floor); v5 accompanied
+// ResolvedPolicy.RoutingFloorScore (the per-namespace post-score floor for
+// the distinguishing-power-aware LookupRoute ranker). A controller/server
+// version mismatch outside the accepted band is rejected with a clear
+// "unsupported version" rather than a decode error.
+func TestPolicyPropagationVersionIsV5(t *testing.T) {
+	if PolicyPropagationVersion != 5 {
+		t.Fatalf("PolicyPropagationVersion = %d, want 5", PolicyPropagationVersion)
 	}
 	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
-	// v3 must be accepted so a server-first rollout does not drop a v3
-	// controller's policy state mid-upgrade; bodies below v3 are still
-	// rejected — there is no documented path to normalize the older Tenants /
-	// Eviction shapes.
+	// v3 and v4 must be accepted so a server-first rollout does not drop a
+	// v3/v4 controller's policy state mid-upgrade (normalizePolicySnapshotForVersion
+	// fills the missing fields with their server-side defaults); bodies below
+	// v3 are still rejected — there is no documented path to normalize the
+	// older Tenants / Eviction shapes.
 	if PolicyMinimumAcceptedVersion != 3 {
 		t.Fatalf("PolicyMinimumAcceptedVersion = %d, want 3", PolicyMinimumAcceptedVersion)
 	}
