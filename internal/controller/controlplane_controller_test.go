@@ -584,9 +584,13 @@ func TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput(t *testing.T) {
 		spec string
 		want float32
 	}
-	// A literal so large it overflows float32 max (~3.4e38). The CRD pattern
-	// allows arbitrarily long digit-only strings (no upper bound), so this is
-	// the realistic "operator accidentally pasted a huge number" shape.
+	// A literal that overflows float32 max (~3.4e38). The CRD pattern caps
+	// the integer part at 8 digits today, so the apiserver would normally
+	// reject a string this long at admission — this case exercises the
+	// defense-in-depth path where the CR reaches resolveOnePolicy with a
+	// corrupted spec (CR predating the tightened pattern, hand-crafted
+	// /policy POST that bypasses admission, schema drift, etc.). The
+	// controller must still fall back to the safety default rather than 0.
 	overflowing := "999999999999999999999999999999999999999999999999"
 	cases := []tc{
 		{name: "overflowing literal", spec: overflowing, want: cacheserver.DefaultRoutingFloorScore},
