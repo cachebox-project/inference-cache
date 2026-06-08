@@ -48,10 +48,13 @@ module — until then, treat `NO_HINT` as the only `LookupPDRoute` answer.
 
 ### Ranking inputs beyond `matched_tokens × freshness`
 
-The server-side ranker (`pkg/index`) is configurable via `RankerConfig`. Every
+The server-side ranker (`pkg/index`) is configurable via `RankerConfig` (in-
+binary knobs) and `CachePolicy.spec` (per-namespace knobs). Each in-binary
 knob defaults to a value that reduces the score to the baseline when its
 supporting signal is absent — so a deployment without replica stats or SLO
-hints behaves exactly like the original B6 ranker.
+hints behaves exactly like the original B6 ranker. The cardinality-aware
+distinguishing-power factor is always on for multi-replica deployments and
+degrades to 1.0 for single-replica deployments (no per-knob disable).
 
 | Knob | What it does | Default | Off switch |
 |---|---|---|---|
@@ -60,6 +63,9 @@ hints behaves exactly like the original B6 ranker.
 | `SLOTightBias` | Coefficient in the freshness boost: `slo_bias = 1 + freshness × SLOTightBias` when the request is tight. Higher → fresher candidates are favored more aggressively. | `1.0` | `0` → no boost |
 | `TenantHotMinHitRate` | Minimum `hit_rate` for a replica to count as "warm" for the `TENANT_HOT` fallback. | `0.1` | n/a (use `TenantHotMaxAge = 0` to disable the fallback) |
 | `TenantHotMaxAge` | Maximum stats age for a replica to count as "warm". | `5m` | `0` → fallback disabled (a prefix miss whose contract keys all populate the index lands at `NO_HINT`; mismatched-key misses still diagnose as `UNKNOWN_*` via the miss-classifier) |
+| `distinguishing_power` factor | Cardinality-aware multiplier: `1 − num_matching_replicas / total_replicas`, per-replica depth-aware for chain matches. Discounts overlaps every replica holds (chat-template framing, RAG corpus headers, custom system prompts). Always on for multi-replica deployments; degrades to `1.0` for single-replica deployments. See [`../design/lookuproute-ranking.md` §2.7](../design/lookuproute-ranking.md#27-the-replica-distinguishing-power-factor). | always on for multi-replica; `1.0` for single-replica | none (operators disable the *floor* it feeds via `CachePolicy.spec.routingFloorScore: "0"`, not the factor itself) |
+| `CachePolicy.spec.minimumMatchedTokens` | Per-replica matched-tokens floor: filters replicas whose realized `matched_tokens` falls below the threshold. If no replica survives, the response downgrades to `NO_HINT`. | `64` (4 KV blocks) | `0` on the CR → opt-out for that namespace |
+| `CachePolicy.spec.routingFloorScore` | Per-response score floor on the top surviving replica's score (after the distinguishing-power factor multiplies in). Below the floor → whole response downgrades to `NO_HINT`. | `"0.1"` | `"0"` on the CR → opt-out for that namespace |
 
 ---
 

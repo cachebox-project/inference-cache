@@ -58,30 +58,56 @@ A copy-pasteable starting point ships at
 [`config/samples/cache_v1alpha1_cachepolicy.yaml`](../../config/samples/cache_v1alpha1_cachepolicy.yaml)
 (it omits `eviction` to exercise the `LRU` default).
 
-## Two minimums, one role each
+## Three lookup-filter knobs, one role each
 
-The policy carries **two** minimum-token knobs and they enforce at different
-stages of the lookup path. They're orthogonal — a single misconfigured value
-on either side can silently inflate `PREFIX_MATCH` rates without an
-operator-visible signal.
+The policy carries **three** lookup-filter knobs and they enforce at
+different stages of the lookup path. They're orthogonal — a single
+misconfigured value on any one of them can silently inflate `PREFIX_MATCH`
+rates without an operator-visible signal.
 
 | Knob | Stage | Compared against | Default | Sub-floor outcome |
 |---|---|---|---|---|
 | `minimumPrefixTokens` | BEFORE the index lookup | the *request's* claimed prefix token count (chain sum wins over the legacy single-blob count) | unset = no threshold | Short-circuit to `NO_HINT` — the index is never touched. Saves work on requests that wouldn't usefully hit the cache anyway. |
 | `minimumMatchedTokens` | AFTER the index lookup | each replica's *realized* matched-token overlap | `64` (4 KV blocks at the typical 16-token block size) | Filter that replica from the response. If no replica survives, the reason code downgrades to `NO_HINT`. Stops trivial chat-template-only matches from being counted as routing hits. |
+| `routingFloorScore` | AFTER the index lookup, after `minimumMatchedTokens` | the *top* surviving replica's score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`) | `"0.1"` | Downgrade the entire response to `NO_HINT` (drop all surviving rows). Catches the "every replica has the prefix" shape that `minimumMatchedTokens` can't catch when the shared prefix is long (RAG headers, custom system prompts, few-shot examples). |
 
-**Why both?** A 5000-token request can still produce a 16-token match (only
-the chat-template framing overlaps). `minimumPrefixTokens` can't catch that
-— the *request* is long enough; it's the *overlap* that's trivial.
-`minimumMatchedTokens` exists for exactly that case (the cache-stress harness
-benchmark showed ~70% of `PREFIX_MATCH` responses were 1-block trivial
-overlaps before this floor landed).
+**Why all three?**
 
-**Setting `minimumMatchedTokens: 0` is the explicit opt-out** — useful when
-you want to measure raw recall, debug the ranker, or pin pre-floor
-behavior in a regression test. With a `CachePolicy` installed the field
-value wins as-is (zero included); with no `CachePolicy` installed the
-server applies the `64` default for the safety floor.
+- **`minimumPrefixTokens` is per-request.** A 5000-token request can still
+  produce a 16-token match (only the chat-template framing overlaps).
+  `minimumPrefixTokens` can't catch that — the *request* is long enough;
+  it's the *overlap* that's trivial.
+- **`minimumMatchedTokens` is per-replica matched-tokens.** It catches
+  Llama-style chat-template overlaps (~16 tokens) cleanly. It does NOT
+  generalize to long shared prefixes — a RAG corpus header of 1500
+  tokens or a custom system prompt of 250 tokens easily clears any
+  reasonable fixed floor, even though every replica holds them
+  identically.
+- **`routingFloorScore` is per-response score.** The score includes the
+  distinguishing-power factor `1 − num_matching_replicas / total_replicas`,
+  which collapses to 0 for every-replica-has-it overlaps *regardless of
+  length*. Catches RAG headers and custom system prompts; the
+  `routingFloorScore` floor (default `0.1`) is what downgrades that
+  score=0 case to `NO_HINT`. See
+  [`docs/design/lookuproute-ranking.md` §2.7](../design/lookuproute-ranking.md#27-the-replica-distinguishing-power-factor).
+
+**Composition order:**
+1. `minimumPrefixTokens` runs BEFORE the index lookup. Below threshold →
+   short-circuit `NO_HINT`, the index is never touched.
+2. `minimumMatchedTokens` runs AFTER the index returns. Per-replica
+   filter via `LookupResult.RetainReplicas`. If no replica survives →
+   `NO_HINT`.
+3. `routingFloorScore` runs LAST. Whole-response gate: if the top
+   surviving replica's score is below the floor → downgrade to
+   `NO_HINT` with empty scores.
+
+**Opt-out values.** Setting `minimumMatchedTokens: 0` AND
+`routingFloorScore: "0"` simultaneously reproduces the pre-floor
+"every non-zero match is `PREFIX_MATCH`" baseline — useful for
+raw-recall benchmarking and ranker debugging. Either floor can be
+disabled independently; the other still fires. With a `CachePolicy`
+installed each field value wins as-is (zero included); with no
+`CachePolicy` installed the server applies both safety defaults.
 
 ## Two gotchas
 
@@ -126,13 +152,14 @@ For the wire schema, auth posture, and the one-policy-per-namespace dedup backst
 ## When NOT to use it
 
 - **Empty or default-happy cluster.** Server defaults (TTL 30m, LRU, **no request-side
-  prefix threshold**, **result-side `minimumMatchedTokens` floor of 64**, no lookup
-  deadline) are deliberately sane — a fresh cluster needs no `CachePolicy`. Note
-  that the result-side floor IS enabled by default (it filters trivial
-  chat-template-only overlaps even without a CR), so "no CachePolicy" is not the
-  same as "no token enforcement at all" — only the request-side gate is unset.
-  Install a CR with `minimumMatchedTokens: 0` if you specifically want the
-  pre-floor behavior (raw-recall benchmarking, ranker debugging).
+  prefix threshold**, **result-side `minimumMatchedTokens` floor of 64**,
+  **result-side `routingFloorScore` floor of `0.1`**, no lookup deadline) are
+  deliberately sane — a fresh cluster needs no `CachePolicy`. Note that BOTH
+  result-side floors are enabled by default (they filter trivial chat-template-only
+  matches AND every-replica-has-it overlaps even without a CR), so "no CachePolicy"
+  is not the same as "no enforcement at all" — only the request-side gate is unset.
+  Install a CR with `minimumMatchedTokens: 0` AND `routingFloorScore: "0"` if you
+  specifically want the pre-floor behavior (raw-recall benchmarking, ranker debugging).
 - **No measured SLO.** Don't set `lookupTimeoutMs` unless you have a real latency budget
   — and never set it to `0` expecting a timeout (see [Gotcha 1](#1-lookuptimeoutms-0-means-unbounded-not-fail-instantly)).
 - **Per-tenant quotas.** `CachePolicy` tunes lookup/eviction behavior per namespace; it

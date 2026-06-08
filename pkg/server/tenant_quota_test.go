@@ -56,15 +56,16 @@ func TestPolicyPropagationVersionIsV5(t *testing.T) {
 }
 
 // TestPolicySnapshotV3AcceptedWithFloorDefault pins the server-first rollout
-// invariant: a v4 server MUST accept a v3 controller's snapshot AND normalize
-// the missing minimumMatchedTokens field to DefaultMinimumMatchedTokens on
-// each policy.
-// Without the normalization, the v3 body would decode the missing field as
-// int32(0) — the v4 explicit-opt-out — silently disabling the floor for
-// every namespace with a CR mid-rollout. The all-other-knobs assertion
-// (TTL, eviction, prefix gate, timeout, tenant quota) protects against a
-// regression where v3 itself stops being accepted, which would drop every
-// policy field, not just the new one.
+// invariant: a v5 server MUST accept a v3 controller's snapshot AND normalize
+// BOTH missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens
+// and routingFloorScore to DefaultRoutingFloorScore — on each policy.
+// Without those normalizations, the v3 body would decode the missing fields
+// as their zero values (`int32(0)` / `nil` pointer) — the v4 / v5 explicit-
+// opt-outs — silently disabling both floors for every namespace with a CR
+// mid-rollout. The all-other-knobs assertion (TTL, eviction, prefix gate,
+// timeout, tenant quota) protects against a regression where v3 itself
+// stops being accepted, which would drop every policy field, not just the
+// new ones.
 func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
@@ -96,11 +97,17 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	if !ok {
 		t.Fatal("team-a policy missing from store after v3 push")
 	}
-	// The v3-missing field must be normalized to the server-side default —
-	// otherwise a server-first rollout silently disables the floor for every
+	// The v3-missing fields must be normalized to their server-side defaults —
+	// otherwise a server-first rollout silently disables the floors for every
 	// namespace that already had a CR.
 	if pA.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
-		t.Fatalf("team-a MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d) — v3 normalization missing", pA.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+		t.Fatalf("team-a MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d) — v3 → v4 matched-tokens normalization missing", pA.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+	}
+	if pA.RoutingFloorScore == nil {
+		t.Fatalf("team-a RoutingFloorScore after v3 push is nil — v3 → v5 routing-floor normalization missing (must synthesize DefaultRoutingFloorScore)")
+	}
+	if *pA.RoutingFloorScore != DefaultRoutingFloorScore {
+		t.Fatalf("team-a RoutingFloorScore after v3 push = %v, want DefaultRoutingFloorScore (%v) — v3 → v5 routing-floor normalization synthesized the wrong value", *pA.RoutingFloorScore, DefaultRoutingFloorScore)
 	}
 	// Every other knob the v3 body carried must reach the store unchanged.
 	if pA.EvictionTTL != 900_000_000_000 || pA.MinimumPrefixTokens != 32 || pA.LookupTimeoutMs != 25 || pA.Eviction != "lfu" {
@@ -114,6 +121,9 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	if pB.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
 		t.Fatalf("team-b MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d)", pB.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
 	}
+	if pB.RoutingFloorScore == nil || *pB.RoutingFloorScore != DefaultRoutingFloorScore {
+		t.Fatalf("team-b RoutingFloorScore after v3 push = %v, want &DefaultRoutingFloorScore (%v)", pB.RoutingFloorScore, DefaultRoutingFloorScore)
+	}
 
 	// Tenant quotas survive the version normalization unchanged.
 	if q, ok := store.TenantQuota("team-a"); !ok || q != 100000 {
@@ -121,20 +131,81 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	}
 }
 
-// TestPolicySnapshotV4ExplicitZeroPreserved is the complementary guard: a v4
-// controller that EXPLICITLY pushes minimumMatchedTokens=0 (the documented
-// opt-out, useful for raw-recall benchmarks) must NOT have its zero rewritten
-// to the default. The normalization only fires for v3 (and below); v4 bodies
-// reach the store byte-for-byte.
-func TestPolicySnapshotV4ExplicitZeroPreserved(t *testing.T) {
+// TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized pins
+// two complementary v4 rollout invariants:
+//
+//  1. An EXPLICIT minimumMatchedTokens=0 on a v4 body (the documented
+//     opt-out, useful for raw-recall benchmarks) must NOT have its zero
+//     rewritten to the default. The matched-tokens normalization only fires
+//     for v3 (and below); v4 bodies reach the store byte-for-byte for that
+//     field.
+//  2. The missing routingFloorScore on the same v4 body MUST be normalized
+//     to DefaultRoutingFloorScore. v4 predates the routing-floor field, so
+//     a v5 server receiving a v4 body must synthesize the default the same
+//     way it does for v3 — otherwise a v4 controller pushing to a v5 server
+//     during a server-first rollout silently disables the new floor for
+//     every namespace.
+//
+// Written against a literal v4 body (not PolicyPropagationVersion, which is
+// now v5) so the v4-specific behavior under v3→v4→v5 server stays pinned
+// even after the constant advances.
+func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
 	defer srv.Close()
 
+	// Literal v4 body: minimumMatchedTokens explicitly 0, routingFloorScore
+	// absent (v4 did not have the field).
+	v4Body := []byte(`{
+        "version": 4,
+        "policies": [
+            {"namespace": "raw-recall", "minimumMatchedTokens": 0}
+        ]
+    }`)
+	resp, err := srv.Client().Post(srv.URL, "application/json", bytes.NewReader(v4Body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (v4 body must be accepted by v5 server)", resp.StatusCode)
+	}
+
+	if got := store.MinimumMatchedTokens("raw-recall"); got != 0 {
+		t.Fatalf("explicit v4 opt-out got rewritten to %d, want 0 — v4 body must NOT be normalized on minimumMatchedTokens", got)
+	}
+
+	// The v4 body did not carry routingFloorScore. The v4 → v5 normalization
+	// must synthesize the default; otherwise a server-first rollout silently
+	// disables the routing floor for this namespace.
+	p, ok := store.Lookup("raw-recall")
+	if !ok {
+		t.Fatal("raw-recall policy missing from store after v4 push")
+	}
+	if p.RoutingFloorScore == nil {
+		t.Fatal("RoutingFloorScore after v4 push is nil — v4 → v5 routing-floor normalization missing")
+	}
+	if *p.RoutingFloorScore != DefaultRoutingFloorScore {
+		t.Fatalf("RoutingFloorScore after v4 push = %v, want DefaultRoutingFloorScore (%v) — v4 → v5 routing-floor normalization synthesized the wrong value", *p.RoutingFloorScore, DefaultRoutingFloorScore)
+	}
+}
+
+// TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved pins the v5-side
+// invariant complementary to the v3/v4 normalization tests above: a v5
+// controller that EXPLICITLY pushes routingFloorScore=0 (the documented
+// opt-out, useful for raw-recall benchmarks) must NOT have its zero
+// rewritten to the default. The normalization only fires for v3 / v4
+// bodies; v5 bodies reach the store byte-for-byte for routingFloorScore.
+func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	zero := float32(0)
 	body, err := json.Marshal(PolicySnapshot{
 		Version: PolicyPropagationVersion,
 		Policies: []ResolvedPolicy{
-			{Namespace: "raw-recall", MinimumMatchedTokens: 0},
+			{Namespace: "raw-recall", RoutingFloorScore: &zero},
 		},
 	})
 	if err != nil {
@@ -149,8 +220,8 @@ func TestPolicySnapshotV4ExplicitZeroPreserved(t *testing.T) {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
 
-	if got := store.MinimumMatchedTokens("raw-recall"); got != 0 {
-		t.Fatalf("explicit v4 opt-out got rewritten to %d, want 0 — v4 body must NOT be normalized", got)
+	if got := store.RoutingFloorScore("raw-recall"); got != 0 {
+		t.Fatalf("explicit v5 opt-out got rewritten to %v, want 0 — v5 body must NOT be normalized", got)
 	}
 }
 
