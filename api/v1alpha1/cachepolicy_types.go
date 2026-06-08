@@ -64,6 +64,42 @@ type CachePolicySpec struct {
 	// +kubebuilder:validation:Minimum=0
 	MinimumMatchedTokens *int32 `json:"minimumMatchedTokens,omitempty"`
 
+	// RoutingFloorScore is the per-replica score below which a PREFIX_MATCH
+	// response downgrades to NO_HINT. The LookupRoute ranker computes
+	//
+	//   score = matched_tokens × freshness × distinguishing_power
+	//
+	// where distinguishing_power = 1 - (num_replicas_holding_match /
+	// num_replicas_in_scope). Overlaps held by every replica (chat-template
+	// framing, RAG corpus headers, custom system prompts shared across the
+	// deployment) collapse to distinguishing_power=0 → score=0 → caught
+	// by this floor. The default "0.1" catches just the score=0 case while
+	// passing any non-zero distinguishing match through; raise (e.g. "5")
+	// for stricter routing-signal hygiene; "0" disables the floor entirely
+	// (raw-recall benchmarking, ranker debugging).
+	//
+	// Distinct from MinimumPrefixTokens: that field is a request-side gate
+	// on the request's claimed prefix length BEFORE the index is consulted;
+	// this is a result-side floor on the per-replica score AFTER the
+	// distinguishing-power-aware ranker has scored every candidate.
+	//
+	// Composes with MinimumMatchedTokens (above): the MatchedTokens floor is
+	// applied first (filters sub-floor replicas per-replica), then the
+	// RoutingFloorScore floor is applied to the top-ranked survivor's
+	// score. Both floors can downgrade a PREFIX_MATCH to NO_HINT
+	// independently; an operator can disable either by setting it to its
+	// opt-out value (0 / "0").
+	//
+	// Encoded as a stringified float to avoid introducing the first
+	// float-typed field into the CachePolicy schema (the others are
+	// int32 / duration). Validated by the +kubebuilder:validation:Pattern
+	// marker: digits with an optional decimal part, no sign.
+	//
+	// +optional
+	// +kubebuilder:default="0.1"
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(\.[0-9]+)?$`
+	RoutingFloorScore *string `json:"routingFloorScore,omitempty"`
+
 	// LookupTimeoutMs bounds cache lookup latency in milliseconds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
