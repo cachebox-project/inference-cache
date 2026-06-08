@@ -269,7 +269,15 @@ type functionalProbeVerdict struct {
 //	call /probe →
 //	    AllPassed? → write FunctionalProbeOK=True, reason=ProbeOK; mark called
 //	    per-stage failed? → write FunctionalProbeOK=False, reason=Probe<Stage>Failed; downgrade Ready; mark called
-//	    HTTP error? → write FunctionalProbeOK=Unknown, reason=ProbeError; LEAVE Ready alone; DO NOT mark called (retry next reconcile)
+//	    HTTP error?
+//	        existing FunctionalProbeOK=False? → preserve the prior False (do
+//	            not write); re-apply Ready downgrade with the prior failure's
+//	            reason; requeue at rate-limit cadence; DO NOT mark called.
+//	            Sticky-False — a transient server outage MUST NOT fade a
+//	            known per-stage failure back to Unknown and then to Ready=True.
+//	        otherwise → write FunctionalProbeOK=Unknown, reason=ProbeError;
+//	            LEAVE Ready alone; requeue; DO NOT mark called (retry next
+//	            reconcile)
 func evaluateFunctionalProbe(
 	ctx context.Context,
 	backend *cachev1alpha1.CacheBackend,

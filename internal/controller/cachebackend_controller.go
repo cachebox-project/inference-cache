@@ -736,10 +736,19 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 
 	logger.V(1).Info("reconciled managed CacheBackend",
 		"namespace", backend.Namespace, "name", backend.Name, "endpoint", endpoint)
-	// requeueAfter is non-zero only while the KV-event gate is in the
-	// AwaitingFirstKVEvent window — it schedules the automatic Degraded flip
-	// when firstEventTimeout elapses with no event, without waiting for the
-	// next periodic resync.
+	// requeueAfter is the tighter of two gate-driven schedules (see
+	// minNonZero in updateManagedStatus):
+	//   * KV-event gate: non-zero while in the AwaitingFirstKVEvent window,
+	//     so the automatic Degraded flip fires when firstEventTimeout
+	//     elapses without an event — without waiting for the next periodic
+	//     resync.
+	//   * Functional-probe gate: non-zero on every probe path that did NOT
+	//     advance the rate-limit window (rate-limited, HTTP-error) AND on
+	//     the success/per-stage-failure paths that DID — schedules the next
+	//     /probe call at the rate-limit-window expiry so a quiet stuck
+	//     backend re-probes without relying on incidental external watch
+	//     events.
+	// Either gate's non-zero value (or the smaller of both) lands here.
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
