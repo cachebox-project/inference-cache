@@ -66,8 +66,19 @@ func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		result := respond(req)
+		// Mirror the real handler's contract: the response echoes the
+		// caller-supplied backend. The ProbeClient rejects a mismatch
+		// (probe_client.go Run), so test callbacks that omit Backend
+		// (the common case here — they only set per-stage fields)
+		// would otherwise hit the mismatch check. Callbacks that
+		// explicitly set Backend to forge a mismatch should construct
+		// their own httptest.Server (see TestProbeClientRunRejectsBackendMismatch).
+		if result.Backend == "" {
+			result.Backend = req.Backend
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(respond(req))
+		_ = json.NewEncoder(w).Encode(result)
 	}))
 	t.Cleanup(f.Close)
 	return f
@@ -107,7 +118,7 @@ func TestProbeRateLimiterForgetDropsKey(t *testing.T) {
 // pure noise.
 func TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits(t *testing.T) {
 	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -157,7 +168,7 @@ func TestEvaluateFunctionalProbeBypassAnnotation(t *testing.T) {
 // fat-fingered annotation can't quietly disable the gate.
 func TestEvaluateFunctionalProbeBypassParserIsStrict(t *testing.T) {
 	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -515,13 +526,23 @@ func TestEvaluateFunctionalProbeHTTPErrorIsUnknown(t *testing.T) {
 func TestEvaluateFunctionalProbeHTTPErrorDoesNotRateLimit(t *testing.T) {
 	fail := atomic.Bool{}
 	fail.Store(true)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fail.Load() {
 			http.Error(w, "down", http.StatusInternalServerError)
 			return
 		}
+		// Echo the backend from the request so the ProbeClient's
+		// mismatch check passes — same contract the newFakeProbeServer
+		// helper enforces. Inline httptest server here (not the
+		// helper) because the test toggles between failing and
+		// succeeding responses across probe calls.
+		var req cacheserver.ProbeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{Backend: "x", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped})
+		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{Backend: req.Backend, Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped})
 	}))
 	defer srv.Close()
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}

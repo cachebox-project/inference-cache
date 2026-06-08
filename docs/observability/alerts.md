@@ -75,23 +75,36 @@ There are two distribution shapes, same rule set, drift-gated by
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
   Prometheus via the `rule_files:` config block, a ConfigMap, or the Helm
   `prometheus.serverFiles` value (depending on your install). You ALSO
-  need a `scrape_configs:` entry — and to keep the alerts' per-install
-  scoping working, that scrape must inject a `namespace` label. Two
-  valid shapes:
+  need `scrape_configs:` entries for BOTH targets — the
+  `inference-cache-server` pod (server-side series: index, lookup, auth)
+  AND the `inference-cache-controller-manager` pod (controller-side
+  series: per-stage probe-result counter, cache-server restart-cascade
+  counter). Server-only scrape leaves the controller-side alerts
+  (`ServerProbeFail` today) loaded but inert — they read
+  `inferencecache_backend_probe_result_total` which is controller-emitted.
+  To keep the alerts' per-install scoping working, both scrapes must
+  inject a `namespace` label. Two valid shapes:
   1. **Recommended** — Kubernetes service discovery
      (`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
      that copies `__meta_kubernetes_namespace` to a `namespace` label.
-     Works in single-install AND shared-Prometheus setups.
+     Select on `app.kubernetes.io/name: inference-cache` and split
+     server vs. controller by `app.kubernetes.io/component`. Works in
+     single-install AND shared-Prometheus setups.
   2. **Single-install only** — a static DNS scrape of
-     `inference-cache-server.inference-cache-system.svc.cluster.local:8080`.
-     Simpler but produces NO `namespace` label, so the alerts collapse
-     into one unlabeled group. Acceptable when one Prometheus only ever
+     `inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+     plus a pod-IP scrape of the controller manager pods (no Service
+     fronts the controller's `:8080`, so a DNS-style static target
+     isn't an option there — pod IPs change on restart, so static
+     pod-IP scrapes are operator-of-last-resort). Simpler but
+     produces NO `namespace` label, so the alerts collapse into one
+     unlabeled group. Acceptable when one Prometheus only ever
      scrapes one inference-cache install; do not use it for shared
      Prometheus deployments.
 
-  ServiceMonitor in the operator bundle is the prometheus-operator
-  equivalent of shape (1); both shapes (1) and (2) require you to wire
-  scrape config explicitly when you are not on prometheus-operator.
+  ServiceMonitor (server) + PodMonitor (controller) in the operator
+  bundle is the prometheus-operator equivalent of shape (1); both
+  shapes (1) and (2) require you to wire BOTH scrape entries
+  explicitly when you are not on prometheus-operator.
 
 Both files contain the same six active alerts (five Stage 1 alerts plus
 the controller-side `ServerProbeFail`) plus commented-out placeholders for

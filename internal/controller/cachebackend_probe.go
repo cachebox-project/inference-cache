@@ -110,6 +110,17 @@ func init() {
 	crmetrics.Registry.MustRegister(probeResultMetric)
 }
 
+// resetProbeResultMetricForTest resets the per-stage probe-result counter
+// to zero for every label combination. Package-private so tests in this
+// package can assert on per-test counts without leaking state across
+// runs; intentionally not exported because production callers have no
+// reason to zero an operator-visible metric. Mirrors the helper next to
+// backendServerRestartCascadesTotal in cachebackend_server_restart.go
+// (the package convention for controller-runtime-registered counters).
+func resetProbeResultMetricForTest() {
+	probeResultMetric.Reset()
+}
+
 // probeRateLimiter is the per-(namespace, name) "last successfully-called-at"
 // map the reconciler uses to gate the probe call. *sync.Map is the right
 // shape: each CacheBackend Reconcile is single-flighted by controller-

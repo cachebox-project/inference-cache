@@ -211,6 +211,45 @@ func TestProbeClientRunTokenFileUnreadable(t *testing.T) {
 	}
 }
 
+// TestProbeClientRunRejectsBackendMismatch pins the wire-contract
+// defense in depth: the server echoes the caller-supplied backend in
+// the response, and the client MUST reject a response that names a
+// different backend. Without this, a miswired endpoint (operator
+// pointed --server-probe-url at a different cluster's server, or a
+// hand-edited proxy in the way) could land a probe call for backend A
+// on a server whose response describes backend B — and the reconciler
+// would happily publish FunctionalProbeOK=True on A based on B's
+// per-stage outcomes.
+func TestProbeClientRunRejectsBackendMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Respond with a backend echo that DOES NOT match the request.
+		// All per-stage outcomes are healthy to ensure the test fails
+		// for the right reason (mismatch detection, not stage failure).
+		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{
+			Backend: "team-b/other",
+			Ingest:  cacheserver.ProbeStageOK,
+			Routing: cacheserver.ProbeStageOK,
+			T2:      cacheserver.ProbeStageSkipped,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
+	_, err := client.Run(context.Background(), cacheserver.ProbeRequest{
+		Backend: "team-a/cache", Model: "m", HashScheme: "vllm",
+	})
+	if err == nil {
+		t.Fatalf("Run with mismatched backend echo must error; got nil")
+	}
+	if !strings.Contains(err.Error(), "backend mismatch") {
+		t.Errorf("expected error to mention backend mismatch; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "team-a/cache") || !strings.Contains(err.Error(), "team-b/other") {
+		t.Errorf("expected error to include both backend identifiers; got: %v", err)
+	}
+}
+
 // writeTokenFile writes a token into a tempdir and returns the path,
 // matching the production mount-path shape.
 func writeTokenFile(t *testing.T, token string) string {

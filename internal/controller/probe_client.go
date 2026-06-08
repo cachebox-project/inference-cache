@@ -125,6 +125,19 @@ func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (ca
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: decode response: %w", err)
 	}
+	// Verify the backend echo matches the request. The wire contract
+	// (pkg/server/probe.go ProbeResult) says the server echoes the
+	// caller-supplied backend in the response. Without this check a
+	// miswired endpoint (operator pointed --server-probe-url at a
+	// different cluster's server, or a hand-edited proxy in the way)
+	// could land a probe call for backend A on a server whose
+	// response describes backend B — and the reconciler would happily
+	// publish FunctionalProbeOK=True/ProbeOK on A based on B's
+	// per-stage outcomes. Defence in depth: HTTP succeeded, but the
+	// payload IS NOT the answer we asked about.
+	if result.Backend != req.Backend {
+		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: backend mismatch — requested %q, server returned %q", req.Backend, result.Backend)
+	}
 	return result, nil
 }
 

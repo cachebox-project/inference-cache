@@ -17,8 +17,13 @@
 #   kubectl apply -k config/observability
 #
 # For non-operator installs, see config/observability/alerting-rules.yaml
-# (flat Prometheus rules file) plus your own scrape config pointing at
-# `inference-cache-server.inference-cache-system.svc.cluster.local:8080`.
+# (flat Prometheus rules file) plus your own scrape config covering BOTH
+# pods: `inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+# (server-side series — index, lookup, auth) AND the
+# `inference-cache-controller-manager` pod's `:8080` (controller-side
+# series — per-stage probe-result counter, cache-server restart-cascade
+# counter). The controller-side alerts (ServerProbeFail today) read
+# controller-emitted series, so a server-only scrape leaves them inert.
 #
 # Deliberately not aggregated into `config/default` so the default install
 # stays usable on clusters without prometheus-operator CRDs installed.

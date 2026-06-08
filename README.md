@@ -165,15 +165,27 @@ expressions) and only fire when the conditions are met.
 
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
-**You must also configure scraping yourself.** For multi-install or
-per-install isolation, use Kubernetes service discovery
-(`kubernetes_sd_configs: pod` or `endpoints`) with `relabel_configs:`
-that copies `__meta_kubernetes_namespace` to `namespace` — the alerts
-scope per install by that label. A static DNS scrape (e.g. just
-`inference-cache-server.inference-cache-system.svc.cluster.local:8080`)
-is acceptable for a single install but loses per-install isolation; do
-NOT use it if you scrape multiple inference-cache installs into one
-Prometheus. Without a working scrape, the rules load but fire on nothing.
+**You must also configure scraping yourself, for BOTH the server AND
+the controller pod.** The server's `:8080` exposes the index, lookup,
+and auth series; the controller pod's `:8080` exposes the per-stage
+probe-result counter (`inferencecache_backend_probe_result_total`)
+and the cache-server restart-cascade counter — the controller-side
+alerts (`ServerProbeFail` today) load against the controller's
+series, so a server-only scrape leaves them inert.
+
+For multi-install or per-install isolation, use Kubernetes service
+discovery (`kubernetes_sd_configs: pod` or `endpoints`) with
+`relabel_configs:` that copies `__meta_kubernetes_namespace` to
+`namespace` — the alerts scope per install by that label. A pair of
+static DNS scrapes (e.g.
+`inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+PLUS pod-IP discovery for the controller manager pods, which have no
+Service in front of them) is acceptable for a single install but
+loses per-install isolation; do NOT use it if you scrape multiple
+inference-cache installs into one Prometheus. Without a working
+scrape on both endpoints, the rules load but fire on nothing (server
+alerts) or load but never have a series to evaluate (controller
+alerts like `ServerProbeFail`).
 
 Per-alert runbooks (causes, triage steps, example PromQL): see
 [`docs/observability/alerts.md`](docs/observability/alerts.md). For the
