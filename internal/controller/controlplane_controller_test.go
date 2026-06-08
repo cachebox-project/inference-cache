@@ -80,6 +80,7 @@ func newPolicyTestScheme(t *testing.T) *runtime.Scheme {
 func ttlPtr(d time.Duration) *metav1.Duration { x := metav1.Duration{Duration: d}; return &x }
 func i32Ptr(v int32) *int32                   { return &v }
 func i64Ptr(v int64) *int64                   { return &v }
+func strPtr(s string) *string                 { return &s }
 
 // TestPushSnapshotFlattensPoliciesAndTenants proves the single reconciler emits
 // one combined snapshot from BOTH CR types: policies keyed by namespace, tenant
@@ -486,6 +487,7 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 				EvictionTTL:          ttlPtr(12 * time.Minute),
 				MinimumPrefixTokens:  i32Ptr(64),
 				MinimumMatchedTokens: i32Ptr(128),
+				RoutingFloorScore:    strPtr("2.5"),
 				LookupTimeoutMs:      i32Ptr(10),
 			},
 		}).
@@ -503,6 +505,15 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	}
 	if p.EvictionTTL != 12*time.Minute || p.MinimumPrefixTokens != 64 || p.MinimumMatchedTokens != 128 || p.LookupTimeoutMs != 10 {
 		t.Fatalf("round-trip mismatch: %+v", p)
+	}
+	// RoutingFloorScore flows through the resolver the server reads — guards
+	// against a future refactor that drops the field on the flatten path
+	// without anyone noticing.
+	if got, want := p.RoutingFloorScore, float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
+		t.Fatalf("RoutingFloorScore on round-trip = %v, want 2.5", got)
+	}
+	if got, want := store.RoutingFloorScore("team-a"), float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
+		t.Fatalf("store.RoutingFloorScore = %v, want 2.5 (resolver returns the configured value)", got)
 	}
 	if d := store.TTL("team-a"); d != 12*time.Minute {
 		t.Fatalf("store.TTL = %v", d)

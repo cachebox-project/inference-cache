@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -299,6 +300,21 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	}
 	if cp.Spec.MinimumMatchedTokens != nil {
 		rp.MinimumMatchedTokens = *cp.Spec.MinimumMatchedTokens
+	}
+	if cp.Spec.RoutingFloorScore != nil {
+		// The CRD's +kubebuilder:validation:Pattern marker guarantees a
+		// well-formed unsigned decimal at admission, so ParseFloat should
+		// succeed for any value the apiserver accepted. The fallback is
+		// defensive against a hand-crafted /policy POST or a future schema
+		// drift: a parse error leaves rp.RoutingFloorScore at its zero
+		// value, which the server treats as the explicit opt-out for
+		// namespaces with a CachePolicy installed (different from the
+		// no-policy default that fires DefaultRoutingFloorScore). The
+		// CRD-side validator is the authoritative gate here; this clamp
+		// is purely the second line of defence.
+		if f, err := strconv.ParseFloat(*cp.Spec.RoutingFloorScore, 32); err == nil && f >= 0 {
+			rp.RoutingFloorScore = float32(f)
+		}
 	}
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
