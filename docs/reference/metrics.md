@@ -126,15 +126,6 @@ with OTEL collectors) without bumping `v1alpha1`.
   endpoints share the controller-auth profile but emit per-endpoint counters
   so a dashboard can distinguish read-side, write-side, and probe-side
   failures.
-- **`backend_probe_result` writer:** the CacheBackend reconciler in
-  [`internal/controller/cachebackend_probe.go`](../../internal/controller/cachebackend_probe.go)
-  invokes `recordProbeResult(backendKey, result)` after each successful
-  `/probe` call (HTTP-level failures emit no increment — they're not a
-  per-stage outcome). The counter is registered on the controller-runtime
-  registry, so it lives on the **controller** binary's `/metrics` endpoint
-  (separate from the server's). Three increments per successful call (one
-  per stage); skipped stages count so the metric reflects the full probe
-  shape.
 
 ### Controller binary (`cmd/controller`)
 
@@ -148,6 +139,13 @@ with OTEL collectors) without bumping `v1alpha1`.
   See the `reconcileServerInstance` godoc for when a cascade is and is
   not emitted (rate-limit, strict-superset midpoints, converged
   scale-ups, stale-while-unavailable).
+- **`backend_probe_result` writer:** the `CacheBackend` reconciler in
+  [`internal/controller/cachebackend_probe.go`](../../internal/controller/cachebackend_probe.go)
+  invokes `recordProbeResult(backendKey, result)` after each successful
+  `/probe` call (HTTP-level failures emit no increment — they're not a
+  per-stage outcome). Three increments per successful call (one per
+  stage); skipped stages count so the metric reflects the full probe
+  shape.
 
 ---
 

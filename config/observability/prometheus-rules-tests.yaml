@@ -376,3 +376,66 @@ tests:
       - eval_time: 22m
         alertname: IndexEvictionsSpike
         exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # ServerProbeFail (for: 5m, critical)
+  #
+  # The controller's CacheBackend functional probe records result="failed"
+  # per stage when the synthetic round-trip fails. The alert fires only on
+  # SUSTAINED failure: `increase(failed[5m]) >= 2 for: 5m` — at least two
+  # failed increments in a 5-minute window, held for another 5 minutes.
+  # A single transient flake (one failed call that recovers on the next
+  # 30s tick) MUST NOT page.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: ServerProbeFail fires on sustained failures
+    input_series:
+      # Counter increments by 1 every 30s → 10 failed increments per 5m,
+      # well above the >= 2 threshold. Sustained → for: 5m dwell satisfied.
+      - series: 'inferencecache_backend_probe_result_total{namespace="inference-cache-system",backend="inference-cache-system/sample",stage="ingest",result="failed"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ServerProbeFail
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: inference-cache
+              backend: inference-cache-system/sample
+              stage: ingest
+            exp_annotations:
+              summary: "Synthetic CacheBackend probe failing on inference-cache-system/sample (stage=ingest)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
+
+  - interval: 30s
+    # Single failed increment then the counter stays flat (the probe
+    # recovered on the next tick). increase[5m] caps at 1 during the
+    # window containing the bump, then drops to 0. Never reaches >= 2,
+    # so the alert MUST NOT fire — the threshold's whole purpose.
+    name: ServerProbeFail does not fire on a single transient flake
+    input_series:
+      - series: 'inferencecache_backend_probe_result_total{namespace="inference-cache-system",backend="inference-cache-system/sample",stage="ingest",result="failed"}'
+        values: '0+0x4 1+0x40'   # 0, 0, 0, 0, 0, 1, 1, 1, ... — one bump, then flat
+      # Successful ticks continuing — proves the probe is recovering.
+      - series: 'inferencecache_backend_probe_result_total{namespace="inference-cache-system",backend="inference-cache-system/sample",stage="ingest",result="ok"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ServerProbeFail
+        exp_alerts: []
+
+  - interval: 30s
+    # All probes succeed — no failed series at all. The alert MUST NOT
+    # fire on a healthy install. (A regression that dropped the
+    # `result="failed"` selector would otherwise page on ok-only
+    # traffic.)
+    name: ServerProbeFail does not fire when every probe succeeds
+    input_series:
+      - series: 'inferencecache_backend_probe_result_total{namespace="inference-cache-system",backend="inference-cache-system/sample",stage="ingest",result="ok"}'
+        values: '0+1x40'
+      - series: 'inferencecache_backend_probe_result_total{namespace="inference-cache-system",backend="inference-cache-system/sample",stage="routing",result="ok"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ServerProbeFail
+        exp_alerts: []

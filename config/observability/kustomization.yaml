@@ -1,10 +1,14 @@
-# Optional observability overlay — applies BOTH the scrape config (a
-# `ServiceMonitor` for the inference-cache-server) AND the alerting
-# rules (a `PrometheusRule`) for the inference-cache alert bundle.
-# Shipping them together means a single `kubectl apply -k` wires
-# the cache plane into a prometheus-operator install end-to-end —
-# Prometheus starts scraping `inferencecache_*` AND has the rules
-# loaded to fire on degenerate patterns.
+# Optional observability overlay — applies BOTH scrape configs (a
+# `ServiceMonitor` for the inference-cache-server and a `PodMonitor`
+# for the inference-cache-controller) AND the alerting rules (a
+# `PrometheusRule`) for the inference-cache alert bundle. Shipping
+# them together means a single `kubectl apply -k` wires the cache
+# plane into a prometheus-operator install end-to-end — Prometheus
+# starts scraping every `inferencecache_*` series (server- and
+# controller-side) AND has the rules loaded to fire on degenerate
+# patterns. The controller PodMonitor is required for the
+# ServerProbeFail and other controller-owned alerts to have a series
+# to evaluate.
 #
 # Requires prometheus-operator / kube-prometheus CRDs to be present in
 # the cluster (`monitoring.coreos.com/v1`).
@@ -38,4 +42,5 @@ kind: Kustomization
 namespace: inference-cache-system
 resources:
   - servicemonitor.yaml
+  - podmonitor.yaml
   - prometheus-rules.yaml

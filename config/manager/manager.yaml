@@ -32,6 +32,19 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 20
         name: manager
+        # Container ports are advertised for the optional observability
+        # PodMonitor (config/observability/podmonitor.yaml) — the
+        # controller-runtime manager already binds these regardless of
+        # whether they're declared here, but the PodMonitor selects by
+        # port-NAME (not number) so the declaration must exist. Declaring
+        # ports does not open them in any way; they're purely metadata.
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: probe
+          containerPort: 8081
+          protocol: TCP
         readinessProbe:
           httpGet:
             path: /readyz

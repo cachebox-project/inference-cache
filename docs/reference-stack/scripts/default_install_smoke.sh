@@ -786,31 +786,25 @@ if ! grep -Eq '^inferencecache_server_up[[:space:]]+1([[:space:]]|$)' "$LOG_DIR/
 fi
 log "server HTTP surface OK: /readyz returned 200 and /metrics exposes inferencecache_server_up 1"
 
-# --- functional-probe gate (Stage 2): smoke coverage deferred to Stage 4 ----
-# Stage 1 smoke (above) covers the server's /probe endpoint end-to-end. The
-# Stage 2 controller-side caller publishes the FunctionalProbeOK condition on
-# managed CacheBackends, but no condition is actually written by this smoke
-# install:
-#
-#   1. The seeded CacheBackends here never reach Ready=True (no real engine
-#      pods publish KV events, so the KV-event readiness gate keeps them
-#      Ready=False). The functional-probe gate is cascade-prevented from
-#      firing while any upstream gate says not-Ready, so no probe HTTP call
-#      ever lands and FunctionalProbeOK is never published.
-#   2. The Prometheus client_golang CounterVec used for
-#      inferencecache_backend_probe_result_total exposes no HELP/TYPE/data
-#      lines on /metrics until at least one WithLabelValues child has been
-#      instantiated. On a smoke install where no probe call ever fires, the
-#      metric is invisible to /metrics — so a "registered the metric" check
-#      via /metrics scrape can't tell the bundle apart.
-#
-# Neither signal is testable from this smoke without standing up real engine
-# pods. The proper operator-facing assertion (a CacheBackend showing
-# FunctionalProbeOK=True with the updated sample manifest) is scoped to
-# Stage 4 of the ticket, which lands the CRD sample update + the engine-pod
-# fixture together. Stage 2's controller-side wiring is already covered by
-# 20+ unit tests and an envtest integration sub-test that drives a real
-# CacheBackend reconciler against an httptest /probe server.
+# --- functional-probe gate: positive-case coverage scoped to a later phase --
+# The controller-side caller publishes the FunctionalProbeOK condition on
+# managed CacheBackends. This smoke asserts the NEGATIVE case directly
+# (FunctionalProbeOK absent while the upstream KV-event gate holds
+# Ready=False) inline in the paired-sample phase below, alongside the
+# KV-event gate assertion it cascades off of — see the
+# "functional-probe gate (downstream of KV-event gate)" block after the
+# AwaitingFirstKVEvent assertion. The positive case (FunctionalProbeOK
+# appearing once the upstream gate clears) requires an engine workload
+# that actually publishes KV events, which this smoke does not stand up;
+# that assertion lands with a follow-up that ships an engine-pod fixture.
+# The metric inferencecache_backend_probe_result_total is similarly not
+# /metrics-visible on this install because Prometheus client_golang's
+# CounterVec exposes no HELP/TYPE/data lines until a WithLabelValues
+# child is instantiated, and that requires a real probe call to fire —
+# which only happens after the upstream gate clears. Stage 2's
+# controller-side wiring is otherwise covered by 20+ unit tests and an
+# envtest integration sub-test driving a real CacheBackend reconciler
+# against an httptest /probe server.
 
 # --- gRPC default posture assertion (plaintext) ----------------------------
 # config/default serves :9090 plaintext. Assert a plaintext client can list the
@@ -1148,6 +1142,34 @@ if [ -n "$gate_latch" ]; then
   fail "status.firstKVEventObservedAt=$gate_latch, want unset (no KV event source exists, so the gate latch must never be written)"
 fi
 log "KV-event gate engaged: firstEventTimeout=$fet, Ready=False/AwaitingFirstKVEvent, firstKVEventObservedAt unset"
+
+# --- functional-probe gate (downstream of KV-event gate) -------------------
+# The functional-probe gate is cascade-prevented from running while any
+# upstream gate keeps Ready=False — there is no point in driving a
+# synthetic round-trip against a backend the operator has not yet
+# declared "is supposed to be working." This asserts that
+# operator-visible behavior on the live install:
+#   - The FunctionalProbeOK condition MUST be ABSENT on a backend the
+#     upstream KV-event gate is holding at Ready=False/AwaitingFirstKVEvent.
+#     Its presence here would be a regression: the controller is firing
+#     the probe loop on a backend that's still warming up, paging
+#     operators on a known-not-ready state.
+#   - The Ready condition's status+reason still reflect the upstream gate
+#     (False/AwaitingFirstKVEvent), not a downstream probe verdict —
+#     proving cascade-prevention is on, not just "no probe call yet."
+# A positive-case assertion (FunctionalProbeOK appearing once the
+# upstream gate clears) requires an engine workload that actually
+# publishes KV events; not feasible from this smoke without a real GPU
+# or the CPU vLLM image. That's deferred to a Stage 4 follow-up that
+# lands an engine-pod fixture; this negative case still locks the
+# operator-facing cascade behavior in place.
+fp_status="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.conditions[?(@.type=="FunctionalProbeOK")].status}' 2>/dev/null || true)"
+if [ -n "$fp_status" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "FunctionalProbeOK condition present (status=$fp_status) while Ready=$gate_status/$gate_reason; cascade-prevention regressed — downstream probe gate must not fire while upstream KV-event gate is False"
+fi
+log "functional-probe cascade-prevention holds: FunctionalProbeOK absent while Ready=False/AwaitingFirstKVEvent"
 
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the

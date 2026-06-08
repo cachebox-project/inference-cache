@@ -138,19 +138,25 @@ spec:
       interval: 30s
       rules:
         - alert: ServerProbeFail
-          # Per-stage outcome of the CacheBackend functional probe. A
-          # non-zero rate of result="failed" means the controller's
-          # synthetic round-trip against a managed backend is failing:
-          # subscriber-ingest, routing, or tier-2. The `backend` label is
-          # the canonical <namespace>/<name>; the `stage` label points at
-          # which layer broke. rate() over a 10m window so a single
-          # transient failure doesn't pin the alert active forever (the
-          # underlying metric is a counter; a raw `> 0` comparison would
-          # never reset). The 5m for: caps a brief outage from paging.
+          # Per-stage outcome of the CacheBackend functional probe. The
+          # controller drives a synthetic round-trip (ingest → routing →
+          # tier-2) against each managed backend on a 30s rate-limit
+          # cadence, recording result="ok" / "failed" / "skipped" per
+          # stage. The `backend` label is the canonical <namespace>/<name>;
+          # the `stage` label points at which layer broke.
+          #
+          # We use `increase(...[5m]) >= 2` (not `rate(...) > 0`) so the
+          # alert requires at least two failed increments inside a
+          # 5-minute window before paging — one transient flake recovers
+          # within the 30s cadence and must not page. With `for: 5m` the
+          # alert needs both the 2-failure threshold AND continuous breach
+          # for 5 minutes (so the increase window must stay ≥2 for the
+          # whole dwell), so a real sustained breakage pages while a
+          # one-off does not.
           expr: |
             sum by (backend, stage) (
-              rate(inferencecache_backend_probe_result_total{result="failed"}[10m])
-            ) > 0
+              increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
+            ) >= 2
           for: 5m
           labels:
             severity: critical

@@ -82,9 +82,10 @@ There are two distribution shapes, same rule set, drift-gated by
   equivalent of shape (1); both shapes (1) and (2) require you to wire
   scrape config explicitly when you are not on prometheus-operator.
 
-Both files contain the same five Stage 1 alerts plus commented-out
-placeholders for three more that depend on metrics not yet exposed (see
-[Deferred alerts](#deferred-alerts) below).
+Both files contain the same six active alerts (five Stage 1 alerts plus
+the controller-side `ServerProbeFail`) plus commented-out placeholders for
+two more that depend on metrics not yet exposed (see [Deferred
+alerts](#deferred-alerts) below).
 
 > **One alert depends on a separate scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](#lmcachet2nohits) reads `vllm:external_prefix_cache_*`,
@@ -551,9 +552,113 @@ sum by (namespace, tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
 
 ---
 
+### `ServerProbeFail`
+
+- **Severity**: `critical`
+- **For**: 5 minutes
+- **Source metric**: `inferencecache_backend_probe_result_total{backend, stage, result}` — **emitted by the controller binary, not the server.** Requires the controller-side `PodMonitor` shipped in this same observability overlay; without it the alert loads but never has a series to evaluate.
+
+The CacheBackend controller drives a synthetic round-trip against each
+managed backend on a 30-second cadence — an `ingest → routing → tier-2`
+self-test — and records the per-stage outcome (`result="ok"`, `"failed"`,
+`"skipped"`) in this counter. A sustained `result="failed"` rate means the
+cache-plane internal pipeline is broken in a way the basic Service-endpoint
+probe and Ready gate cannot catch:
+
+| `stage` label | What `failed` means |
+|---|---|
+| `ingest` | The probe published a synthetic prefix entry but the index did not record it. The KV-event subscriber → server → index path is silently dropping state — exactly the class of regression that motivated this probe. |
+| `routing` | The probe published, the index recorded, but `LookupRoute` returned `NO_HINT` for a hash that should match. Likely an index-key-scheme mismatch (e.g. `hash_scheme` empty / wrong / dropped on ingest) or a lookup-filter regression. |
+| `tier-2` | (When a T2Prober is wired into the server.) The tier-2 fetch path is failing — engine `external_prefix_cache_*` is reporting hits below threshold. Not wired into the server today, so this stage reports `skipped` on every clean install; an alert here only fires once a follow-up plumbs a real T2Prober. |
+
+The alert uses `increase(...{result="failed"}[5m]) >= 2 for: 5m` — a
+single transient flake (one failed probe that recovers on the next 30s
+tick) does **not** page. The alert requires at least two failed
+increments within a 5-minute window, sustained for another 5 minutes
+before firing. This is calibrated to the controller's 30s probe cadence:
+~10 probes per 5m window, so the `>= 2` threshold is a real signal
+(≥20% failure rate), not a baseline.
+
+#### Likely causes
+
+By `stage` label:
+
+- `ingest` — the `kvevent-subscriber` sidecar is not delivering events
+  to the server. Check the subscriber pod's logs for ZMQ connection
+  errors. Verify the server is up (`inferencecache_server_up == 1`),
+  the controller `/policy` push is reaching it, and no NetworkPolicy
+  regression is blocking the subscriber → server gRPC path on `:9090`.
+- `routing` — the index is recording entries but lookup can't find
+  them. Check that the probe's `hash_scheme` (currently
+  `"functional-self-test"`) is not being silently dropped (an empty
+  scheme fails open in the index). Check the lookup-filter logs on the
+  server side for `reason_code=NO_HINT` on calls that should match.
+- `tier-2` — not applicable today; no T2Prober is wired into the
+  server. If you're seeing `t2=failed` on a live install, a follow-up
+  has shipped a T2Prober and its connection to vLLM
+  `external_prefix_cache_*` is broken (engine pod selector, port,
+  scrape labels).
+
+#### First-response runbook
+
+1. Identify which backend(s) and which stage are failing:
+
+   ```promql
+   sum by (backend, stage) (
+     increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
+   )
+   ```
+
+2. Compare to the success rate for the same backend — if `ok` is
+   non-zero, the probe is at least *running*, so the issue is
+   stage-specific, not "controller can't reach server at all":
+
+   ```promql
+   sum by (backend, stage, result) (
+     increase(inferencecache_backend_probe_result_total[5m])
+   )
+   ```
+
+3. Inspect the `CacheBackend.status.conditions[?type=="FunctionalProbeOK"]`
+   on the affected backend — the `reason` field
+   (`ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`) and
+   the `message` payload mirror what the probe handler reported. The
+   condition is the operator-visible signal; the metric is the alerting
+   signal.
+
+4. If the controller is also reporting `Ready=False` on the backend
+   with the same reason, the gate is doing its job — the backend's
+   `Ready=True` posture has been downgraded for as long as the probe
+   keeps failing. Routing-aware clients see a degraded backend; the
+   alert is the operator's signal to investigate.
+
+5. To temporarily suppress the alert during a known-bad investigation
+   without modifying the rule, annotate the affected backend(s) with
+   `inferencecache.io/skip-functional-probe: "true"` — the probe is
+   bypassed (`reason=ProbeBypassed`, `result="skipped"`) and the
+   `result="failed"` rate drains within the 5-minute window. **Remove
+   the annotation when you're done**; a bypassed backend with a real
+   regression still ships broken cache state.
+
+Triage queries:
+
+```promql
+# Per-backend, per-stage failure rate over the alert window
+sum by (backend, stage) (
+  increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
+)
+
+# Same backend, all results — sanity-check that the probe is firing at all
+sum by (backend, stage, result) (
+  increase(inferencecache_backend_probe_result_total[5m])
+)
+```
+
+---
+
 ## Deferred alerts
 
-Three more alerts are scoped to ship as part of the same observability
+Two more alerts are scoped to ship as part of the same observability
 bundle, but they depend on metrics not yet exposed on `/metrics`. The
 placeholder rules sit in [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml)
 and the [`PrometheusRule` CR](../../config/observability/prometheus-rules.yaml)
@@ -564,7 +669,6 @@ metric.
 |---|---|---|
 | `VersionSkewDetected` | `inferencecache_backend_version_skew` gauge — exposed by a follow-up that detects engine-vs-cache-server version skew | The `LMCacheT2NoHits` failure class, but BEFORE it manifests as zero hits — caught proactively by the operator detecting the skew at admit time. |
 | `KvEventsStaleness` | `inferencecache_replica_last_event_at` gauge — exposed by the Ready-on-first-event follow-up | A replica that *was* emitting KV events stopped (engine crash, OOMKill, NetworkPolicy regression, subscriber dead). Distinct from `IndexEmpty` (replica never published) — this catches *post-warmup* silence. |
-| `ServerProbeFail` | `inferencecache_backend_probe_result_total` counter — exposed by the synthetic end-to-end Ready gate | A managed backend's synthetic publish → index → lookup round-trip is failing. The basic Service-endpoint probe cannot catch this; only the end-to-end probe can. |
 
 ---
 
