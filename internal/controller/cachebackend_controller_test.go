@@ -618,6 +618,78 @@ func TestReconcileSwitchToInvalidStorageClearsObservedServerInstance(t *testing.
 	}
 }
 
+// TestReconcileLifecycleExitsClearProbeRateLimiter pins the cleanup hook
+// every lifecycle-exit path must call — without it, a CR that returns to
+// the managed path within the prior 30s window keeps a stale lastCalled
+// timestamp on r.probeLimiter, the very first reconcile on re-entry skips
+// the /probe call entirely (rate-limited), and Ready=True is published
+// with no fresh FunctionalProbeOK verdict to back it. One table-driven
+// test for the three places that must call probeLimiter.forget:
+// reconcileExternal, reconcileUnmanaged, reconcileInvalidStorage.
+func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+	}{
+		{
+			name: "managed → External",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+				cb.Spec.Endpoint = "external.ns1.svc:8080"
+			},
+		},
+		{
+			name: "managed → Unmanaged (StatefulSet kind)",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+			},
+		},
+		{
+			name: "managed → InvalidStorage gate",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				two := int32(2)
+				cb.Spec.Replicas = &two
+				cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+					PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+			reconcile(t, r, "cache", "ns1")
+
+			// Plant a rate-limit entry so the clearing assertion is not
+			// vacuous on an empty map. The key matches what
+			// evaluateFunctionalProbe + the lifecycle exits use:
+			// "namespace/name".
+			key := "ns1/cache"
+			now := time.Unix(2_000_000, 0)
+			r.probeLimiter.markCalled(key, now)
+			if got := r.probeLimiter.lastCalled(key); got != now {
+				t.Fatalf("planted rate-limit precondition failed: lastCalled = %v, want %v (test would be vacuous without a planted value)", got, now)
+			}
+
+			// Trigger the lifecycle exit.
+			switching := getBackend(t, r, "cache", "ns1")
+			tc.mutate(switching)
+			if err := r.Update(context.Background(), switching); err != nil {
+				t.Fatalf("apply lifecycle-exit spec change: %v", err)
+			}
+			reconcile(t, r, "cache", "ns1")
+
+			// The rate-limit entry MUST be cleared. A retained entry would
+			// suppress the first /probe call on the managed → exit → managed
+			// return path inside the 30s window.
+			if got := r.probeLimiter.lastCalled(key); !got.IsZero() {
+				t.Fatalf("probeLimiter.lastCalled(%q) = %v after lifecycle exit; want zero (forget) — re-entry inside the 30s window would skip the first probe call", key, got)
+			}
+		})
+	}
+}
+
 func TestReconcileStatefulSetKindDeferred(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")

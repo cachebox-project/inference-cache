@@ -93,10 +93,12 @@
 #      shape against the functional-self-test endpoint. /probe shares the
 #      controller-auth profile with /snapshot and /policy, so a regression
 #      that wired /probe outside that profile would let any pod that can
-#      reach :8081 drive a synthetic round-trip (and, once the controller-
-#      wiring follow-up lands, observe the resulting Ready transitions).
-#      Sends a valid ProbeRequest body so the rejection cannot be
-#      misattributed to a 400; valid outcomes are 401 / NetworkPolicy drop.
+#      reach :8081 drive a synthetic round-trip AND, since the CacheBackend
+#      reconciler now consumes the result to publish FunctionalProbeOK and
+#      downgrade Ready, observe or trigger forged Ready transitions on
+#      every managed backend. Sends a valid ProbeRequest body so the
+#      rejection cannot be misattributed to a 400; valid outcomes are
+#      401 / NetworkPolicy drop.
 #  12. The audience binding holds on /snapshot, /policy, AND /probe: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)

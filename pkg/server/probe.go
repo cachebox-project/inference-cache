@@ -344,10 +344,11 @@ func (p *Prober) lockForRun(backend, model string) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
-// ProbeReplicaID is the reserved replica id the probe synthesizes its state
-// under for a given backend. Exposed so the controller (when the wiring
-// follow-up lands) can construct the same id when asserting "no probe
-// entries leaked into a real lookup" in envtest integration tests.
+// ProbeReplicaID is the reserved replica id the probe synthesizes its
+// state under for a given backend. Exposed so the controller — or any
+// envtest / smoke harness that asserts "no probe entries leaked into a
+// real lookup" — can construct the same id without re-deriving the
+// prefix-plus-backend rule.
 func ProbeReplicaID(backend string) string {
 	return ProbeReplicaPrefix + backend
 }

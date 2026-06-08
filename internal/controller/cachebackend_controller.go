@@ -430,6 +430,15 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 	// clearServerInstanceLatchShadow for why a lingering shadow
 	// across managed→External→managed would false-cascade.
 	r.clearServerInstanceLatchShadow(backend)
+	// Wipe the functional-probe rate-limit entry alongside removing
+	// the FunctionalProbeOK condition below. Without this, a CR that
+	// flips managed → External → managed within the 30s rate-limit
+	// window would have a stale lastCalled timestamp on re-entry, so
+	// the first reconcile under the managed path would skip the /probe
+	// call (and, because we just removed the condition, find no prior
+	// FunctionalProbeOK to re-apply downgrade off of) — Ready=True
+	// would be published with no fresh probe verdict.
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	return r.patchStatus(ctx, backend, func() {
 		// TrimSpace before every decision. Admission rejects a
 		// whitespace-only endpoint at write time, but a pre-existing
@@ -517,6 +526,13 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	// Wipe the in-memory cascade shadow + rate-limit timestamp
 	// alongside the on-cluster status clearing below.
 	r.clearServerInstanceLatchShadow(backend)
+	// Wipe the functional-probe rate-limit entry alongside removing
+	// the FunctionalProbeOK condition below. Same reasoning as in
+	// reconcileExternal — without this, a managed → Unmanaged →
+	// managed cycle inside the 30s rate-limit window would suppress
+	// the first /probe call on re-entry and publish Ready=True with
+	// no fresh probe verdict.
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
@@ -1133,6 +1149,14 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 	// when the operator fixes the storage/replicas configuration
 	// and the controller flips back to the managed path.
 	r.clearServerInstanceLatchShadow(backend)
+	// Wipe the functional-probe rate-limit entry too. Same reasoning
+	// as in reconcileExternal / reconcileUnmanaged: a managed →
+	// InvalidStorage → managed cycle within the 30s rate-limit window
+	// would otherwise have a stale lastCalled timestamp on re-entry
+	// and the first reconcile under the managed path would skip the
+	// /probe call, leaving any prior FunctionalProbeOK=True (or
+	// absent) unchallenged.
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
