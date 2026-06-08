@@ -99,12 +99,22 @@ spec:
   # Request-side gate: skip lookups for very short prompts where a prefix hit
   # saves little. Matched against the request's claimed prefix token count.
   minimumPrefixTokens: 256
-  # Result-side floor on the REALIZED matched-tokens overlap. A production
+  # Result-side floor on REALIZED matched-tokens overlap. A production
   # workload sees a fair amount of small chat-template-only overlaps —
   # raising the floor above the 64 default to 256 keeps only substantial
   # prefix matches counted as PREFIX_MATCH, so dashboards/SLOs read a clean
   # signal. Set to 0 to disable.
   minimumMatchedTokens: 256
+  # Result-side floor on the per-replica SCORE from the distinguishing-power-
+  # aware ranker. Composes with minimumMatchedTokens above: the matched-tokens
+  # floor filters per-replica, then this score floor gates the response's top
+  # surviving score. A production workload with long shared prefixes (custom
+  # system prompts, RAG corpus headers, few-shot examples) sees marginal
+  # partial-diffusion matches even after the distinguishing-power factor
+  # zeroes the all-replicas-hold-it case; "5" keeps only substantial routing-
+  # useful matches counted as PREFIX_MATCH. Set to "0" to disable (raw-recall
+  # benchmarking).
+  routingFloorScore: "5"
   # Lookup deadline. A timed-out lookup fails open — it returns reason_code
   # TIMEOUT with empty scores and never fails the serving request. NOTE: 0 means
   # UNBOUNDED, not "instant"; keep a real budget here in production.

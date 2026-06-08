@@ -204,21 +204,34 @@ Walking the chain:
 | at `h4`   | *(empty — A doesn't hold h4)* → stop walking          | `+ A: {tok=192, oldest=1m}`                |
 
 Scoring each finalized replica (no pressure/SLO, TTL = 30 min, so
-`freshness = 1 − age/30m`):
+`freshness = 1 − age/30m`). The §2.7 depth-aware distinguishing-power
+factor also multiplies in: `num_matching_at_R's_depth` counts replicas
+whose `matched_tokens >= R.matched_tokens`. A is the only replica at
+192 tokens (factor `1 − 1/3 = 2/3`); B shares its 128-token depth with
+A (factor `1 − 2/3 = 1/3`); C's 64-token depth is reached by all three
+(factor `1 − 3/3 = 0`).
 
-| Replica | matched_tokens | freshness | score  | rank |
-|---------|----------------|-----------|--------|------|
-| `A`     | 192            | 0.97      | 186.2  | 1    |
-| `B`     | 128            | 0.93      | 119.5  | 2    |
-| `C`     | 64             | 0.87      | 55.7   | 3    |
+| Replica | matched_tokens | freshness | distinguishing_power | score  | rank |
+|---------|----------------|-----------|----------------------|--------|------|
+| `A`     | 192            | 0.97      | 2/3 ≈ 0.667          | 124.1  | 1    |
+| `B`     | 128            | 0.93      | 1/3 ≈ 0.333          | 39.7   | 2    |
+| `C`     | 64             | 0.87      | 0                    | 0      | 3    |
 
-Response: `reason_code: PREFIX_MATCH`, scores `[A (186), B (119),
-C (55)]` — the gateway routes to A for the deepest cache hit, with B as
-a hot backup if A is overloaded. Under the default §2.6 floor of 64 all
-three clear (A and B by a comfortable margin, C exactly at the
-boundary); raising `minimumMatchedTokens` to 128 would filter C out of
-the response and leave just `[A, B]`, illustrating the per-replica
-floor filter without changing the chain-walk numbers.
+Response: `reason_code: PREFIX_MATCH`, scores `[A (124), B (40), C (0)]`
+— the gateway routes to A for the deepest unique-hit, with B as a hot
+backup if A is overloaded. C's score is zero because every replica in
+the cluster matched at C's depth (the shared head block) — the
+distinguishing-power factor correctly identifies that C's contribution
+is uninformative for routing.
+
+Under the default §2.6 matched-tokens floor of 64, all three clear (A
+and B by a comfortable margin, C exactly at the boundary), so the §2.6
+filter doesn't drop anyone here. Under the default §2.7 routing-floor
+of `"0.1"`, A's top score 124 clears comfortably so the response ships
+as `PREFIX_MATCH`. Raising `minimumMatchedTokens: 128` would filter C
+out via the per-replica §2.6 filter (leaving `[A, B]`); raising
+`routingFloorScore: "200"` would downgrade the whole response to
+`NO_HINT` via the §2.7 whole-response gate (A's 124 falls below 200).
 
 ### Backward-compat — what an unmigrated producer or client sees
 
@@ -269,11 +282,11 @@ the production-grade ranking answer: workloads with long shared prefixes
 (RAG corpus headers, custom system prompts, few-shot examples) routinely
 match well above any reasonable fixed token floor on content every replica
 has — so the floor lets them through unchanged and the inflated-`PREFIX_MATCH`
-signal returns. The proper fix is a replica-*distinguishing-power* ranker —
-one that measures how rare an overlap is across replicas, not just how
-long — and is tracked as separate follow-up work. Ship the floor as a
-clean stopgap that fixes the visible Phase-2 benchmark inflation; revisit
-when the distinguishing-power algorithm lands.
+signal returns. The production-grade fix is the replica-distinguishing-power
+factor shipped in [§2.7](#27-the-replica-distinguishing-power-factor) below,
+which weighs an overlap by how rare it is across replicas rather than how
+long it is in tokens. The matched-tokens floor stays as a complementary
+per-replica filter and a redundant safety net.
 
 The baseline returned `PREFIX_MATCH` for *any* non-zero overlap, which gave
 operators an inflated routing signal: the cache-stress harness benchmarks
@@ -333,6 +346,195 @@ any useful real-prompt prefix overlap. Tune up (`minimumMatchedTokens: 256`)
 when a deployment runs especially long system prompts and you want only
 substantial overlaps to count as routing wins; tune down to `0` when
 debugging the ranker or measuring raw recall.
+
+## 2.7 The replica-distinguishing-power factor
+
+### Why the matched-tokens-alone score over-credits trivial overlaps
+
+The baseline score (`matched_tokens × freshness`) silently makes a strong
+assumption: that an overlap *distinguishes* one replica from its siblings.
+For Llama-style chat-template framing — every replica identically holds a
+~16-token system header — that assumption breaks. Every replica matches the
+prefix; the response says `PREFIX_MATCH` on a match that any replica could
+equally serve; the routing layer gets credited with a decision it didn't
+make. Production logs from a cache-stress benchmark showed roughly ~70%
+of `PREFIX_MATCH` responses were this 1-block trivial-overlap shape.
+
+The §2.6 fixed-token floor solves it for the chat-template framing case
+but **does not generalize** to long shared prefixes — a RAG corpus header
+of 1500 tokens or a custom system prompt of 250 tokens easily clears any
+reasonable fixed floor, even though every replica holds them identically.
+The right signal is not "how many tokens matched" but "does this match
+distinguish replicas, or do they all have it?"
+
+### The factor
+
+For each scored replica `R`, the ranker multiplies the score by
+
+```
+distinguishing_power_R = 1 - num_matching_at_R's_depth / total_replicas
+```
+
+- **`total_replicas`** is the count of replicas with **at least one
+  prefix entry observed** in the request's engine domain (`tenant`,
+  `model`, `hash_scheme`), captured from the per-scope serving counter
+  under the index read lock so it stays consistent with the prefixes
+  view the lookup just observed. **Important definition caveat:** a
+  replica that's running in the cluster but has not (yet) reported any
+  prefix in this scope — just started, just cleared its cache, or
+  serves a different scope — is invisible to the index and therefore
+  absent from this denominator. Consequence: a 2-of-3 partial-diffusion
+  case where two replicas hold the prefix and the third has reported no
+  prefix in scope is scored as 2-of-2 (factor `0`) and downgrades; the
+  cache plane has no evidence the third replica is a peer. This matches
+  the rest of the index — `TENANT_HOT` warmth, `servingByScope` scope
+  checks, and the `UNKNOWN_*` miss classifier all use the same
+  "observed via reported state" definition. Production engines (the C1
+  KV-event subscriber reports prefix and stats together on
+  `ReportCacheState`) appear in the denominator within one TTL cycle;
+  the visible-only edge case matters only briefly at cold start and
+  cache reset.
+- **`num_matching_at_R's_depth`** is per-replica:
+  - For exact-match (single-blob path), every scored replica matched the
+    same prefix hash so the value is `len(scores)` and the factor is
+    uniform across the response.
+  - For chain lookups (§2.5), it's the count of replicas whose
+    `matched_tokens` is at least R's `matched_tokens` — R itself plus
+    every replica that went at least as deep. A uniquely-deepest replica
+    sees the strongest factor `(1 − 1/N)`; a shallow-only sibling sees a
+    much weaker one (or `0` when every replica reached the same depth).
+- **`total_replicas ≤ 1` degrades the factor to `1.0`** so a
+  single-replica deployment preserves the baseline ranking exactly —
+  there's nothing to distinguish among; the factor would otherwise be
+  definitionally `0` and downgrade every hint to `NO_HINT`.
+
+The full ranker formula composing all factors today:
+
+```
+score = matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power
+```
+
+The other factors compose unchanged; this is one more multiplicative term,
+the same way `pressure_factor` and `slo_bias` were added on top of the §2
+baseline.
+
+### Workload-shape behavior
+
+| Workload shape (3-replica deployment) | num_matching | total | factor | Behavior |
+|---|---|---|---|---|
+| Chat-template framing — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
+| RAG corpus header — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
+| Custom shared system prompt — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
+| Specific RAG context — only 1 replica holds it | 1 | 3 | 0.67 | Strong score → `PREFIX_MATCH` |
+| Partial-diffusion overlap (2 of 3) | 2 | 3 | 0.33 | Weaker score, still `PREFIX_MATCH` if it clears the floor |
+| Uniquely-deep chain match (chain §2.5) | 1 at depth 4 | 3 | 0.67 at depth 4, 0 at depth 1 | Deep matcher dominates ranking |
+| Single-replica deployment | 1 | 1 | 1.0 (degraded) | Distinguishing-power factor preserved at baseline; the matched-tokens (§2.6) and routing-floor (§2.7) floors still run, so a single-replica match below `minimumMatchedTokens` (default 64) still downgrades to `NO_HINT`. Set both floors to their opt-outs to reproduce pre-floor every-match-surfaces behavior. |
+
+### The post-score floor — `CachePolicy.spec.routingFloorScore`
+
+The factor zeroes the score for trivial overlaps; the **routing floor
+score** decides how much "near-zero score" still counts as a useful
+routing hint. A `PREFIX_MATCH` whose top score falls below the
+per-namespace `routingFloorScore` is downgraded to `NO_HINT` so the
+gateway round-robins honestly. Applied in the service layer (after the
+index ranks), BEFORE the LFU `CreditHits` step, so a non-delivered hint
+never bumps an LFU counter.
+
+- Default value: `0.1` (server-wide `DefaultRoutingFloorScore`, effective
+  for tenants with no `CachePolicy`). A near-zero floor: catches the
+  score=0 trivial-overlap case AND the next slice of near-zero scores
+  produced by heavy diffusion × small matched_tokens, high pressure
+  (pressure_factor near 0), and near-expired freshness.
+- Operator tunes via `CachePolicy.spec.routingFloorScore` (stringified
+  float; CRD pattern validation enforces the format). Raise (e.g. `"5"`)
+  for stricter routing-signal hygiene; `"0"` disables the floor entirely.
+- A namespace WITH a `CachePolicy` returns its configured value as-is,
+  including an explicit `"0"` (the operator opt-out).
+- Negative values clamp to 0 in the resolver — defensive against a
+  hand-crafted `/policy` POST that bypassed the CRD validator.
+
+### Composition with the §2.6 matched-tokens floor
+
+The §2.6 matched-tokens floor and the §2.7 score floor compose
+deliberately, applied in order in the service handler:
+
+1. **§2.6 first — per-replica filter.** Replicas whose `matched_tokens`
+   falls below `minimumMatchedTokens` are dropped from the scored set
+   via `LookupResult.RetainReplicas` (LFU hits pruned in lockstep). A
+   surviving long-prefix replica still ships; only sub-floor siblings
+   are dropped. If no replica survives, the whole response downgrades
+   to `NO_HINT`.
+2. **§2.7 second — whole-response gate.** If at least one replica
+   survived §2.6, the top score (post-distinguishing-power) is
+   compared to `routingFloorScore`. Below the floor → downgrade the
+   whole response to `NO_HINT` and ship empty scores.
+
+Both downgrades run **before** `CreditHits`, so neither pathway bumps an
+LFU counter for an undelivered hint. The two floors are orthogonal: an
+operator can disable either via its opt-out value (`0` / `"0"`) and the
+other still fires. A namespace with `minimumMatchedTokens: 0` and
+`routingFloorScore: "0"` reproduces the pre-floor every-non-zero-match-
+is-`PREFIX_MATCH` behavior — useful for raw-recall benchmarking and
+debugging the ranker.
+
+### Worked example — chain match against three replicas at different depths
+
+Index state, all replicas in `(tenant=t, model=m, scheme=vllm)`:
+
+| Replica | Holds blocks (in order) | Matched tokens |
+|---|---|---|
+| `r0`    | `b1, b2, b3, b4`        | 256 |
+| `r1`    | `b1, b2`                | 128 |
+| `r2`    | `b1`                    |  64 |
+
+Request: chain `[b1, b2, b3, b4]`, freshness ≈ 1, no pressure / no SLO.
+`total_replicas = 3`.
+
+Per-replica factor (depth-aware):
+- `r0` is the only replica at depth 4 → `1 − 1/3 = 0.667`
+- `r1` shares its depth (128 tokens) with `r0` (whose depth covers it)
+  → 2 replicas at depth-2-or-deeper → `1 − 2/3 = 0.333`
+- `r2`'s depth (64 tokens) is reached by all three → `1 − 3/3 = 0`
+
+Final scores: `r0 = 256 × 0.667 ≈ 170.7`, `r1 = 128 × 0.333 ≈ 42.7`,
+`r2 = 64 × 0 = 0`.
+
+With default thresholds (`minimumMatchedTokens: 64`,
+`routingFloorScore: "0.1"`):
+
+- **§2.6 pass:** `r0` (256), `r1` (128), `r2` (64) all clear 64 — no
+  replicas dropped.
+- **§2.7 pass:** top score is `r0` at 170.7, clears 0.1 → ship the full
+  ranked list `[r0, r1, r2]` with `reason_code = PREFIX_MATCH`.
+
+If the operator raises `routingFloorScore: "200"`, `r0`'s 170.7 falls
+below; the top score doesn't clear, the response downgrades to
+`NO_HINT` with empty scores (whole-response gate, not per-replica
+filtering — even `r0`'s scored row is dropped).
+
+If `r0` had not held the deeper chain — i.e. all three replicas only
+matched `[b1]` — every score would collapse to 0 (all-three-at-depth-1
+→ factor 0) and the response downgrades to `NO_HINT` entirely.
+
+### Scope caveat — what this factor does NOT handle
+
+- **Single-replica deployments.** The factor degrades to 1.0 so the
+  cluster shape preserves baseline ranking. There's nothing to
+  distinguish among; a separate signal would be needed to dampen
+  trivial matches in this shape, and is not in scope.
+- **Cross-engine domain comparisons.** `total_replicas` is scoped to
+  `(tenant, model, hash_scheme)` — replicas serving a different engine
+  domain don't enter the denominator. This matches §2.5's chain-walk
+  scope and the existing `TENANT_HOT` engine-domain guard.
+- **Time-varying cardinality.** Each lookup uses the cardinality at
+  read time. A replica that joined the scope a millisecond after the
+  lookup ran isn't counted. Soft-state semantics: a transient miscount
+  is a missed hint at worst, never a wrong answer. The TTL-sweep
+  window between an entry going stale and the eviction loop sweeping
+  it can briefly inflate the denominator; the resulting factor stays
+  slightly above 0 instead of exactly 0 for an overlap all currently-
+  fresh replicas share, which the post-score floor still catches on
+  the next sweep tick.
 
 ## 3. Pressure-aware scoring — locality vs. load
 
@@ -526,21 +728,30 @@ never invents a budget on its own.
 A single score expression covers both shipped scoring paths:
 
 ```
-score (PREFIX_MATCH path) = matched_tokens × freshness × pressure_factor × slo_bias
+score (PREFIX_MATCH path) = matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power
 score (TENANT_HOT  path) = hit_rate       × recency    × pressure_factor × slo_bias
 ```
+
+(The TENANT_HOT path carries `matched_tokens = 0` — no prefix overlap — so
+the distinguishing-power factor would always multiply by `1.0` there and is
+omitted from the formula for clarity.)
 
 with
 
 ```
-pressure_factor = max(0, 1 − PressureWeight × pressure)
-slo_bias        = 1 + decay × SLOTightBias           (when TTFT is tight)
-                = 1                                  (otherwise)
+pressure_factor      = max(0, 1 − PressureWeight × pressure)
+slo_bias             = 1 + decay × SLOTightBias                  (when TTFT is tight)
+                     = 1                                         (otherwise)
+distinguishing_power = 1 − num_matching_at_depth / total_replicas (when total_replicas ≥ 2)
+                     = 1                                         (otherwise — single-replica)
 
 where `decay` is:
   - `freshness` in the PREFIX_MATCH path (prefix entry's lastSeen vs. TTL)
   - `recency`   in the TENANT_HOT  path (stats entry's statsReported vs. TenantHotMaxAge)
 ```
+
+The distinguishing-power factor applies only on the PREFIX_MATCH path
+(see §2.7) and is per-replica depth-aware for chain matches.
 
 And the strategies compose into a single orchestrator:
 
@@ -549,8 +760,9 @@ LookupRoute(req):
    if hash_scheme is empty            → NO_HINT             (engine domain unknown — fail open)
    if there is an exact or chain match:
        drop replicas whose matched_tokens < §2.6 floor      (per-namespace minimumMatchedTokens; default 64)
-       if any survive                 → PREFIX_MATCH        (ranked by the full score over the survivors)
-       else                            → NO_HINT             (trivial overlap only — gateway round-robins honestly)
+       if no replica survives          → NO_HINT             (trivial overlap only — gateway round-robins honestly)
+       else if top survivor's score < §2.7 floor → NO_HINT  (per-namespace routingFloorScore; default 0.1 — distinguishing-power = 0 catches every-replica-has-it overlaps regardless of token count)
+       else                            → PREFIX_MATCH        (ranked by the full score over the survivors)
    else if any tenant-warm replicas   → TENANT_HOT          (ranked by the full score, soft hint)
    else (miss-classifier runs):
        if index is globally empty     → NO_HINT             (cold start — no data to compare against)
@@ -563,30 +775,35 @@ LookupRoute(req):
 See [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md) for the
 full design behind the `UNKNOWN_*` codes.
 
-Every factor and threshold is tunable through a `RankerConfig`. Defaults
-are set so that:
+Every factor and threshold is tunable through a `RankerConfig` (in-binary
+defaults) or a `CachePolicy` CR (per-namespace overrides). Defaults are
+set so that:
 
 - A deployment with **no stats reported** sees pressure factor 1 and no
   `TENANT_HOT` candidates qualify — those two strategies collapse to the
-  pre-PR baseline. The §2.6 matched-tokens floor still applies on top
-  (default 64), so a sub-floor prefix match downgrades to `NO_HINT`
-  whether stats are reported or not; set `minimumMatchedTokens: 0` to
-  reproduce the strict pre-floor every-overlap-is-`PREFIX_MATCH` ranker
-  behavior end-to-end.
-- A request with **no SLO hint** sees no freshness boost (slo bias 1).
-- Setting `PressureWeight = 0`, `SLOTightBias = 0`, and
-  `TenantHotMaxAge = 0` simultaneously is equivalent to the original B6
-  `matched_tokens × freshness` ranker over the strategies in this doc.
-  Combine with `minimumMatchedTokens: 0` on the `CachePolicy` to also
-  disable the §2.6 floor for the namespace.
+  pre-PR baseline. The §2.6 matched-tokens floor and the §2.7
+  routing-floor-score still apply on top (defaults 64 and `"0.1"`); set
+  both to their opt-outs to reproduce the strict pre-floor
+  every-overlap-is-`PREFIX_MATCH` ranker behavior end-to-end.
+- A request with **no SLO hint** sees `slo_bias = 1` (no freshness boost).
+- A **single-replica deployment** sees `distinguishing_power = 1.0` so the
+  factor never demotes a hint on the simplest cluster shape.
+- Setting `PressureWeight = 0`, `SLOTightBias = 0`,
+  `TenantHotMaxAge = 0`, AND `routingFloorScore: "0"`,
+  `minimumMatchedTokens: 0` simultaneously collapses the pressure / SLO /
+  TENANT_HOT layers AND both result-side floors — but NOT the
+  cardinality factor. For single-replica deployments this *is* the
+  original B6 `matched_tokens × freshness` ranker (distinguishing-power
+  degenerates to 1.0 with one replica); for multi-replica deployments
+  it is "pre-floor raw recall with cardinality-adjusted scores."
 
 ## 7. The reason-code summary
 
 | Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64). Sub-floor matches are filtered per-replica; if no replica clears, the response downgrades to `NO_HINT`.                                                                            | Strongest hint — route to top-ranked    |
+| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64) AND the top surviving replica's score (after the §2.7 distinguishing-power factor multiplies in) clears the per-namespace `routingFloorScore` floor (default `"0.1"`). Sub-floor matched-tokens are filtered per-replica; sub-floor score downgrades the whole response. | Strongest hint — route to top-ranked    |
 | `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
-| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), or any other unspecified outcome                  | Default routing; cache plane invisible  |
+| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), the top per-replica score falls below the per-namespace §2.7 `routingFloorScore` floor (default `"0.1"`) — the every-replica-has-it case that drives distinguishing_power to 0 — or any other unspecified outcome | Default routing; cache plane invisible  |
 | `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |
 | `UNKNOWN_MODEL`       | Prefix miss + `TENANT_HOT` miss + the tenant has entries but the requested `(tenant, model)` does not                                                                                                                                | Same — fail-open; configuration error   |
 | `UNKNOWN_HASH_SCHEME` | Prefix miss + `TENANT_HOT` miss + `(tenant, model)` has entries but the requested `hash_scheme` is absent for it                                                                                                                     | Same — fail-open; configuration error   |

@@ -15,32 +15,35 @@ import (
 // v2 added the Tenants slice (CacheTenant quota propagation). v3 added
 // ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
 // ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
+// v5 added ResolvedPolicy.RoutingFloorScore (the per-namespace post-score
+// floor for the distinguishing-power-aware LookupRoute ranker).
 //
 // Rollout asymmetry — the bump is "additive when the new field can be
 // defaulted; rejected when it can't":
 //
-//   - **Newer server / older body.** A v4 server accepts a v3 body and
-//     normalizes each policy's missing MinimumMatchedTokens to the
-//     server-wide DefaultMinimumMatchedTokens — so a server-first rollout
-//     (v4 server while controller is still v3) does NOT drop existing
-//     CachePolicy state (TTL, timeouts, eviction, prefix gates, quotas).
-//     The normalized result is identical to a no-CachePolicy fallback for
-//     the new field while every prior knob stays enforced. The lenience
-//     window is bounded by PolicyMinimumAcceptedVersion (the oldest body
-//     this server still understands); bodies older than that are still
-//     rejected as "unsupported".
-//   - **Older server / newer body.** The reverse — a v3 server receiving a
-//     v4 push — still hard-fails. Because the handler decodes the body
+//   - **Newer server / older body.** A v5 server accepts a v3 or v4 body and
+//     normalizes each policy's missing MinimumMatchedTokens to
+//     DefaultMinimumMatchedTokens and missing RoutingFloorScore to
+//     DefaultRoutingFloorScore — so a server-first rollout (v5 server while
+//     controller is still v3 or v4) does NOT drop existing CachePolicy
+//     state (TTL, timeouts, eviction, prefix gates, quotas). The normalized
+//     result is identical to a no-CachePolicy fallback for the new fields
+//     while every prior knob stays enforced. The lenience window is bounded
+//     by PolicyMinimumAcceptedVersion (the oldest body this server still
+//     understands); bodies older than that are still rejected as
+//     "unsupported".
+//   - **Older server / newer body.** The reverse — a v4 server receiving a
+//     v5 push — still hard-fails. Because the handler decodes the body
 //     before checking version, DisallowUnknownFields is the FIRST line of
-//     defense: the new minimumMatchedTokens field on each policy is unknown
-//     to the v3 Go struct, so decode rejects the body with
-//     `decode policy snapshot: json: unknown field "minimumMatchedTokens"`.
+//     defense: the new routingFloorScore field on each policy is unknown
+//     to the v4 Go struct, so decode rejects the body with
+//     `decode policy snapshot: json: unknown field "routingFloorScore"`.
 //     Even on a hypothetical breaking change where the field rename or
 //     removal slips past DisallowUnknownFields, the explicit version-band
 //     check below catches it with `unsupported policy snapshot version`.
 //     Both diagnostics are fail-loud; the operator sees one specific message,
 //     not silent state loss.
-const PolicyPropagationVersion = 4
+const PolicyPropagationVersion = 5
 
 // PolicyMinimumAcceptedVersion is the oldest /policy schema this server
 // understands. Bodies below this version are rejected outright; bodies at
@@ -60,12 +63,28 @@ const PolicyMinimumAcceptedVersion = 3
 // useful real-prompt overlap.
 const DefaultMinimumMatchedTokens int32 = 64
 
+// DefaultRoutingFloorScore is the server-wide fallback the LookupRoute
+// handler applies to PREFIX_MATCH responses when no CachePolicy is installed
+// for the requesting tenant. Calibrated as a near-zero floor: the
+// distinguishing-power factor collapses to 0 for the trivial-overlap shape
+// (every replica holds the prefix), producing score=0; the floor also
+// catches the next slice of near-zero scores — heavy diffusion combined
+// with low matched_tokens (small partial overlaps), high pressure
+// (pressure_factor near 0), or near-expired freshness — which the gateway
+// gains little from routing on. Any substantive routing decision (a
+// uniquely-held prefix of any meaningful token count and freshness) sees a
+// score well above 0.1. Without this default the trivial-match-as-
+// PREFIX_MATCH bug would persist for every namespace that has not
+// installed a policy CR. Tunable per-namespace via
+// CachePolicy.spec.routingFloorScore.
+const DefaultRoutingFloorScore float32 = 0.1
+
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
 // types live in api/v1alpha1; the controller flattens them into this shape
 // before pushing so pkg/server has no dependency on the CRD package.
 //
-// Zero values mean "unset / use server default":
+// Zero values mean "unset / use server default" for most fields:
 //   - EvictionTTL <= 0       → fall back to index.DefaultTTL (via the global
 //     WithTTL the binary configured).
 //   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
@@ -77,6 +96,21 @@ const DefaultMinimumMatchedTokens int32 = 64
 //     floor) via PolicyStore.MinimumMatchedTokens.
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
 //   - Eviction == ""         → LRU (the index default and the kubebuilder default).
+//
+// RoutingFloorScore is the EXCEPTION and uses a pointer to distinguish three
+// distinct shapes on the wire:
+//   - nil  → field was OMITTED on the wire body (legacy / hand-crafted /
+//     un-defaulted CR). Server applies DefaultRoutingFloorScore for safety.
+//   - &0   → operator EXPLICITLY set "0" (the opt-out — raw-recall
+//     benchmarking, ranker debugging). Server applies no floor for this
+//     namespace.
+//   - &x   → operator set a specific threshold. Server applies x as-is.
+//
+// A flat float32 field with omitempty would conflate nil and &0 (both
+// produce no field on the wire), so a controller pushing a CR whose
+// kubebuilder-defaulted value was overridden to "0" by the operator would
+// be indistinguishable from a hand-crafted body that simply omitted the
+// field — the safe interpretation differs between those two cases.
 type ResolvedPolicy struct {
 	// Namespace identifies the CachePolicy's namespace, which in phase-1 is
 	// the tenant boundary: a LookupRoute carrying tenant_id="foo" resolves
@@ -86,7 +120,17 @@ type ResolvedPolicy struct {
 	EvictionTTL          time.Duration `json:"evictionTTL,omitempty"`
 	MinimumPrefixTokens  int32         `json:"minimumPrefixTokens,omitempty"`
 	MinimumMatchedTokens int32         `json:"minimumMatchedTokens,omitempty"`
-	LookupTimeoutMs      int32         `json:"lookupTimeoutMs,omitempty"`
+	// RoutingFloorScore is the per-namespace post-score floor: a PREFIX_MATCH
+	// whose best replica score falls below this threshold downgrades to
+	// NO_HINT. Pointer because the wire schema must distinguish "field
+	// omitted" (nil — server uses DefaultRoutingFloorScore for safety)
+	// from "operator explicitly set 0" (&0 — opt-out for this namespace).
+	// With a CachePolicy installed AND the field present, the configured
+	// value wins (including an explicit 0). Negative values clamp to 0 in
+	// the resolver. Wired inline in inferenceCacheService.buildLookupResponse
+	// via the PolicyStore.RoutingFloorScore resolver.
+	RoutingFloorScore *float32 `json:"routingFloorScore,omitempty"`
+	LookupTimeoutMs   int32    `json:"lookupTimeoutMs,omitempty"`
 	// Eviction is the eviction algorithm in lower-case canonical form
 	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
 	// flattening. Empty means the server default (LRU). The index consults it on
@@ -276,6 +320,56 @@ func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
 	return DefaultMinimumMatchedTokens
 }
 
+// RoutingFloorScore returns the per-namespace post-score floor applied to
+// the distinguishing-power-aware LookupRoute ranking. Resolution rules:
+//
+//   - No CachePolicy at all for this namespace  → DefaultRoutingFloorScore
+//     (the safety floor fires for the common unconfigured-tenant case).
+//   - CachePolicy present but RoutingFloorScore field absent on the wire
+//     (nil pointer)                              → DefaultRoutingFloorScore
+//     (a legacy / hand-crafted body that didn't carry the field falls back
+//     to the safety floor, NOT to opt-out — silent opt-out would be the
+//     wrong inference from "field missing").
+//   - CachePolicy present, RoutingFloorScore == &0 → 0 (the operator
+//     EXPLICITLY opted out — raw-recall benchmarking, ranker debugging).
+//   - CachePolicy present, RoutingFloorScore == &x → x as-is.
+//
+// Negative values clamp to 0 — the same effective behavior as the operator
+// opt-out, NOT the safety default. The choice between "clamp negative to 0"
+// (current) and "clamp negative to DefaultRoutingFloorScore" (alternative)
+// is a judgment call on truly malformed wire input:
+//   - Clamp to 0: the buildLookupResponse check `floor > 0` short-circuits,
+//     no replicas are downgraded. Equivalent to the explicit opt-out.
+//   - Clamp to default: replicas below DefaultRoutingFloorScore would be
+//     downgraded as if the operator had said nothing.
+//
+// Both are defensible. We pick the clamp-to-0 path because the CRD pattern
+// validator already rejects negatives at admission, AND the controller-side
+// flatten path (resolveOnePolicy) ALSO falls back to default on parse
+// failure / negative. So the only path that lands a negative here is a
+// hand-crafted /policy POST that bypassed both gates — at which point
+// "treat as opt-out and don't enforce" is the same kind of fail-open
+// behavior the rest of the hot path uses for unknown / malformed input.
+// The defensive behavior of preventing a negative threshold from
+// silently disabling enforcement (which `score < negative` would, since
+// no score is less than a negative number) is still satisfied — the
+// clamp is what prevents that pathology.
+func (s *PolicyStore) RoutingFloorScore(tenant string) float32 {
+	p, ok := s.Lookup(tenant)
+	if !ok {
+		return DefaultRoutingFloorScore
+	}
+	if p.RoutingFloorScore == nil {
+		// Policy is installed but did not carry this field (legacy / hand-
+		// crafted body). Apply the safety floor, not the opt-out.
+		return DefaultRoutingFloorScore
+	}
+	if *p.RoutingFloorScore < 0 {
+		return 0
+	}
+	return *p.RoutingFloorScore
+}
+
 // LookupTimeout returns the per-namespace LookupRoute deadline as a
 // time.Duration. Zero means no deadline.
 func (s *PolicyStore) LookupTimeout(tenant string) time.Duration {
@@ -374,12 +468,17 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Normalize older bodies so server-first rollouts (newer server, older
-		// controller still pushing v3) preserve every other knob a CR carries.
-		// v3 bodies have no minimumMatchedTokens on policies — JSON decodes the
-		// missing field to int32(0), which is indistinguishable from the v4
-		// explicit-zero opt-out. Fill in DefaultMinimumMatchedTokens so the
-		// post-rollout effective floor on a v3-carrying policy matches the
-		// no-CachePolicy fallback path PolicyStore.MinimumMatchedTokens uses.
+		// controller still pushing v3 or v4) preserve every other knob a CR
+		// carries. Today: v3 bodies have neither minimumMatchedTokens nor
+		// routingFloorScore; v4 bodies have the former but not the latter.
+		// JSON decodes the missing fields to their zero values
+		// (int32(0) / nil *float32), which would be indistinguishable from
+		// the v4/v5 explicit opt-outs. Fill in DefaultMinimumMatchedTokens
+		// and DefaultRoutingFloorScore so the post-rollout effective floors
+		// on a v3/v4-carrying policy match the no-CachePolicy fallback paths
+		// PolicyStore.MinimumMatchedTokens / PolicyStore.RoutingFloorScore
+		// use. See normalizePolicySnapshotForVersion below for the
+		// version-by-version field-by-field details.
 		normalizePolicySnapshotForVersion(&snap)
 		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
 		w.WriteHeader(http.StatusNoContent)
@@ -388,17 +487,28 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 
 // normalizePolicySnapshotForVersion rewrites an accepted body so the
 // in-memory store sees the same shape regardless of which (supported) wire
-// version the controller pushed. Today the only normalization is the v3 →
-// v4 minimumMatchedTokens default: a v3 body's missing field would otherwise
-// land as 0 (the v4 explicit opt-out), silently disabling the floor for
-// every namespace with a CR during a server-first rollout. Filling in
-// DefaultMinimumMatchedTokens makes a v3-carrying policy effective-floor
-// match the no-CachePolicy fallback PolicyStore.MinimumMatchedTokens applies
-// to tenants without a CR — so existing policies' floor behavior is
-// preserved until the controller upgrades and starts pushing the explicit
-// field. Bodies already at PolicyPropagationVersion are returned untouched
-// so an operator's explicit `minimumMatchedTokens: 0` opt-out reaches the
-// store as written.
+// version the controller pushed.
+//
+// Two normalizations today:
+//
+//   - **v3 → v4 minimumMatchedTokens default.** A v3 body's missing field
+//     would otherwise land as 0 (the v4 explicit opt-out), silently
+//     disabling the matched-tokens floor for every namespace with a CR
+//     during a server-first rollout. Filling in DefaultMinimumMatchedTokens
+//     makes a v3-carrying policy's effective floor match the no-CachePolicy
+//     fallback PolicyStore.MinimumMatchedTokens applies to tenants without
+//     a CR.
+//   - **v3/v4 → v5 routingFloorScore default.** Same pattern, one field
+//     later: a v3 or v4 body has no routingFloorScore key, which the v5
+//     server would otherwise decode as float32(0) — the explicit opt-out
+//     for the distinguishing-power floor — silently disabling that floor
+//     for every namespace with a CR during a server-first rollout. Filling
+//     in DefaultRoutingFloorScore matches the no-CachePolicy fallback
+//     PolicyStore.RoutingFloorScore applies.
+//
+// Bodies already at PolicyPropagationVersion are returned untouched so an
+// operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall
+// benchmarking) reaches the store as written.
 func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 	if snap.Version >= PolicyPropagationVersion {
 		return
@@ -407,6 +517,20 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 		for i := range snap.Policies {
 			if snap.Policies[i].MinimumMatchedTokens == 0 {
 				snap.Policies[i].MinimumMatchedTokens = DefaultMinimumMatchedTokens
+			}
+		}
+	}
+	if snap.Version < 5 {
+		// A v3 or v4 body has no routingFloorScore key, so the decoded pointer
+		// is nil. Synthesize the safety default so a server-first rollout does
+		// not silently disable the floor for every namespace with a CR. An
+		// operator's explicit `routingFloorScore: 0` opt-out is already a
+		// non-nil pointer (= &0) and reaches the store as written; the nil
+		// branch only fires for the missing-field case.
+		for i := range snap.Policies {
+			if snap.Policies[i].RoutingFloorScore == nil {
+				v := DefaultRoutingFloorScore
+				snap.Policies[i].RoutingFloorScore = &v
 			}
 		}
 	}

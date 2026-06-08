@@ -64,6 +64,58 @@ type CachePolicySpec struct {
 	// +kubebuilder:validation:Minimum=0
 	MinimumMatchedTokens *int32 `json:"minimumMatchedTokens,omitempty"`
 
+	// RoutingFloorScore is the per-replica score below which a PREFIX_MATCH
+	// response downgrades to NO_HINT. The LookupRoute ranker computes
+	//
+	//   score = matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power
+	//
+	// where distinguishing_power = 1 - (num_replicas_holding_match /
+	// num_replicas_in_scope), and the other factors collapse to 1 when
+	// their inputs are absent (no stats reported → pressure_factor = 1;
+	// no SLO hint → slo_bias = 1). Overlaps held by every replica
+	// (chat-template framing, RAG corpus headers, custom system prompts
+	// shared across the deployment) collapse to distinguishing_power=0 →
+	// score=0 → caught by this floor. The default "0.1" catches the
+	// score=0 trivial-overlap case and any near-zero scores combining
+	// heavy load (low pressure_factor), near-expired freshness, or
+	// heavy diffusion. Raise (e.g. "5") for stricter routing-signal
+	// hygiene; "0" disables the floor entirely (raw-recall benchmarking,
+	// ranker debugging).
+	//
+	// Distinct from MinimumPrefixTokens: that field is a request-side gate
+	// on the request's claimed prefix length BEFORE the index is consulted;
+	// this is a result-side floor on the per-replica score AFTER the
+	// distinguishing-power-aware ranker has scored every candidate.
+	//
+	// Composes with MinimumMatchedTokens (above): the MatchedTokens floor is
+	// applied first (filters sub-floor replicas per-replica), then the
+	// RoutingFloorScore floor is applied to the top-ranked survivor's
+	// score. Both floors can downgrade a PREFIX_MATCH to NO_HINT
+	// independently; an operator can disable either by setting it to its
+	// opt-out value (0 / "0").
+	//
+	// Encoded as a stringified float to avoid introducing the first
+	// float-typed field into the CachePolicy schema (the others are
+	// int32 / duration). Validated by the +kubebuilder:validation:Pattern
+	// marker: digits with an optional decimal part, no sign. The pattern
+	// caps the integer part at 8 digits (up to 99,999,999) and the
+	// decimal part at 6 digits — well inside float32 representable
+	// range (~3.4e38), so a value the apiserver admits CANNOT overflow
+	// the controller's strconv.ParseFloat(..., 32) parser. The pattern
+	// admits up to ~8 digits, slightly exceeding float32's ~7
+	// significant-digit precision floor; values at that edge round to
+	// the nearest representable float32 (no overflow), which is the
+	// expected and harmless behavior for a tunable score threshold.
+	// Without this bound an overflow at admission would silently fall
+	// back to the safety default (changing the operator's setting) or
+	// look like a parse bug — rejecting at the API boundary keeps the
+	// error visible to the operator instead.
+	//
+	// +optional
+	// +kubebuilder:default="0.1"
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]{0,7})(\.[0-9]{1,6})?$`
+	RoutingFloorScore *string `json:"routingFloorScore,omitempty"`
+
 	// LookupTimeoutMs bounds cache lookup latency in milliseconds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0

@@ -96,6 +96,15 @@ func TestIngestAndLookupRanksByTokensAndFreshness(t *testing.T) {
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 100}}})
 	idx.Ingest(Update{ReplicaID: "replica-b", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 50}}})
+	// Decoy: a third replica serves the same engine domain (tenant, model,
+	// hash_scheme) but holds a DIFFERENT prefix. It populates the
+	// distinguishing-power denominator (total_replicas=3) without showing
+	// up in the scored result for hash("p1"). Without it both holders of
+	// the queried prefix would have factor (1 - 2/2)=0, zeroing every
+	// score and replacing the freshness-vs-tokens story this test
+	// asserts with a lexicographic-ID tiebreak.
+	idx.Ingest(Update{ReplicaID: "replica-c-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p1")})
 	if len(got) != 2 {
@@ -589,13 +598,15 @@ func TestIngestSanitizesNegativeInfinity(t *testing.T) {
 // Ranking v2 — pressure / SLO / TENANT_HOT fallback
 // ---------------------------------------------------------------------------
 
-// TestLookupBaselinePreservedWhenSignalsAbsent locks in the contract that the
-// new ranker reduces to the matched_tokens × freshness baseline (B6)
-// when (a) no replica stats are reported (pressure=0) and (b) the request
-// carries no SLO hint (TTFT=0). The whole reason the new score factors compose
-// multiplicatively: this property has to hold so existing ranking tests stay
-// authoritative for the baseline.
-func TestLookupBaselinePreservedWhenSignalsAbsent(t *testing.T) {
+// TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent locks in the
+// contract that the pressure and SLO score factors collapse to 1 when (a) no
+// replica stats are reported (pressure=0) and (b) the request carries no SLO
+// hint (TTFT=0). The distinguishing-power factor still applies (it depends on
+// cluster cardinality, not on these signals), so the expected scores below
+// fold it in (1 - 2/3 = 1/3 with the decoy replica below) — the test is about
+// the pressure/SLO contribution being 1, not about the score being equal to
+// matched_tokens × freshness alone.
+func TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(6_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))
 
@@ -603,18 +614,23 @@ func TestLookupBaselinePreservedWhenSignalsAbsent(t *testing.T) {
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 80}}})
 	idx.Ingest(Update{ReplicaID: "r2", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 40}}})
+	// Decoy replica holds a different prefix in the same engine domain so
+	// the distinguishing-power factor is not zero (matching=2 < total=3).
+	// Factor = 1 - 2/3 = 1/3, so expected scores are 80/3 and 40/3.
+	idx.Ingest(Update{ReplicaID: "r3-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 scores, got %d", len(got))
 	}
-	// At ingest time freshness == 1 for both, no pressure, no SLO → score
-	// must equal tokenCount exactly. Floats are exact here (whole ints × 1).
-	if got[0].ReplicaID != "r1" || got[0].Score != 80 {
-		t.Fatalf("r1 baseline score = %v (id %q), want 80", got[0].Score, got[0].ReplicaID)
+	// freshness == 1, no pressure, no SLO, distinguishing_power = 1/3.
+	approxEq := func(got, want float32) bool { return got-want > -1e-3 && got-want < 1e-3 }
+	if got[0].ReplicaID != "r1" || !approxEq(got[0].Score, 80.0/3.0) {
+		t.Fatalf("r1 baseline score = %v (id %q), want 80/3 (~26.67) — matched_tokens × freshness × distinguishing_power(2,3)", got[0].Score, got[0].ReplicaID)
 	}
-	if got[1].ReplicaID != "r2" || got[1].Score != 40 {
-		t.Fatalf("r2 baseline score = %v (id %q), want 40", got[1].Score, got[1].ReplicaID)
+	if got[1].ReplicaID != "r2" || !approxEq(got[1].Score, 40.0/3.0) {
+		t.Fatalf("r2 baseline score = %v (id %q), want 40/3 (~13.33)", got[1].Score, got[1].ReplicaID)
 	}
 }
 
@@ -696,6 +712,14 @@ func TestLookupPressureAwareRanking(t *testing.T) {
 					Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: r.tokenCount}},
 					Stats:    &ReplicaStats{Pressure: r.pressure}})
 			}
+			// Decoy replica with a different prefix in the same engine
+			// domain keeps the distinguishing-power factor strictly
+			// positive (matching < total). Without it, when EVERY
+			// replica in the test holds hash("p"), the factor zeroes
+			// every score and the ordering this test asserts collapses
+			// to a meaningless lexicographic tiebreak.
+			idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+				Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 			got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
 			if len(got) != len(tc.wantOrder) {
@@ -734,6 +758,12 @@ func TestLookupSLOAwareRankingBiasesFreshness(t *testing.T) {
 	clk.add(20 * time.Minute)
 	idx.Ingest(Update{ReplicaID: "small-fresh", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}, Timestamp: clk.t})
+	// Decoy: holds a different prefix in the same engine domain so the
+	// distinguishing-power factor stays > 0 (matching=2 < total=3). The
+	// factor multiplies both replicas' scores by the same constant, so
+	// the SLO-bias ordering this test asserts is preserved.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}, Timestamp: clk.t})
 
 	tests := []struct {
 		name      string
@@ -776,6 +806,11 @@ func TestLookupSLOBiasDisabledWhenKnobsZero(t *testing.T) {
 	clk.add(20 * time.Minute)
 	idx.Ingest(Update{ReplicaID: "small-fresh", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}, Timestamp: clk.t})
+	// Decoy in the same engine domain (different prefix) keeps the
+	// distinguishing-power factor > 0 so the disabled-SLO ordering this
+	// test asserts isn't masked by a lexicographic tiebreak.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}, Timestamp: clk.t})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("p"), TTFTBudgetMs: 50})
@@ -1667,15 +1702,26 @@ func TestChainLookupSharesPressureAndSLOFactorsWithExact(t *testing.T) {
 	idx.Ingest(Update{ReplicaID: "small-cool", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{BlockHashes: hashes[:2], BlockTokenCounts: counts[:2]}},
 		Stats:    &ReplicaStats{Pressure: 0.0}})
+	// Decoy replica in the same engine domain (different prefix) keeps the
+	// distinguishing-power denominator above the per-depth matching count,
+	// so the chain factor for small-cool is 1 - 2/3 = 1/3 (not 0). Without
+	// it small-cool's score would collapse to 0 (matching at its depth ==
+	// total) and big-but-hot's pressure-discounted score would dominate by
+	// default, masking the pressure-flips-ranking property this test
+	// asserts.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		BlockHashes: hashes, BlockTokenCounts: counts})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 chain scores, got %+v", got)
 	}
-	// big-but-hot: matched=48, fresh=1, pressureFactor=(1-1*0.9)=0.1, sloBias=1 → 4.8
-	// small-cool:  matched=32, fresh=1, pressureFactor=(1-1*0.0)=1.0, sloBias=1 → 32
-	// Without pressure folding, big-but-hot's 48 would beat small-cool's 32.
+	// With totalReplicas = 3 (big-but-hot + small-cool + decoy):
+	// big-but-hot: matched=48, pressureFactor=0.1, dp=1-1/3=2/3 → 48 × 0.1 × 2/3 = 3.2
+	// small-cool:  matched=32, pressureFactor=1.0, dp=1-2/3=1/3 → 32 × 1.0 × 1/3 ≈ 10.67
+	// Without pressure folding (pressureFactor=1.0 for both),
+	// big-but-hot's 48×2/3=32 would tie or beat small-cool's 32×1/3≈10.67.
 	if got[0].ReplicaID != "small-cool" {
 		t.Fatalf("pressure factor missing from chain score: ranked %+v first (want small-cool)", got[0])
 	}

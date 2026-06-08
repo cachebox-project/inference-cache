@@ -570,6 +570,11 @@ func (in *CachePolicySpec) DeepCopyInto(out *CachePolicySpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.RoutingFloorScore != nil {
+		in, out := &in.RoutingFloorScore, &out.RoutingFloorScore
+		*out = new(string)
+		**out = **in
+	}
 	if in.LookupTimeoutMs != nil {
 		in, out := &in.LookupTimeoutMs, &out.LookupTimeoutMs
 		*out = new(int32)

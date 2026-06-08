@@ -307,15 +307,20 @@ func (r *LookupResult) RetainReplicas(keep map[string]bool) {
 
 // RankerConfig tunes the pressure / SLO / tenant-hot strategies layered on
 // the baseline matchedTokens × freshness score. Zero-valued knobs collapse
-// the formula back to the baseline — so the new ranker is safe to leave
-// enabled even when stats are absent or SLO is unspecified.
+// those layers back to the baseline — so they're safe to leave enabled
+// even when stats are absent or SLO is unspecified. The cardinality-aware
+// distinguishingPower factor (PREFIX_MATCH path only) is always on for
+// multi-replica deployments and degrades to 1.0 for single-replica
+// deployments; no per-knob disable. See lookuproute-ranking.md §2.7.
 //
-// Concretely:
+// Concretely (PREFIX_MATCH path):
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
-//	pressureFactor = max(0, 1 - PressureWeight × pressure)         // 1 when no stats
-//	sloBias        = 1 + freshness × SLOTightBias                  // when TTFT tight
-//	               = 1                                              // otherwise
+//	score              = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
+//	pressureFactor     = max(0, 1 - PressureWeight × pressure)             // 1 when no stats
+//	sloBias            = 1 + freshness × SLOTightBias                      // when TTFT tight
+//	                   = 1                                                  // otherwise
+//	distinguishingPower = 1 - num_matching_at_depth / total_replicas        // when total_replicas ≥ 2
+//	                   = 1                                                  // single-replica deployment
 //
 // PressureWeight = 0 disables the penalty (pressureFactor=1). SLOTightBias
 // = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables only
@@ -770,8 +775,11 @@ func (i *Index) ApplyEvent(ev Event) {
 // Lookup returns replicas holding the requested prefix, ranked by the
 // ranking-v2 score:
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
+//	score = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
 //
+// distinguishingPower is `1 - num_matching_at_depth / total_replicas` for
+// multi-replica deployments (per-replica depth-aware for chain matches —
+// see lookuproute-ranking.md §2.7), `1.0` for single-replica.
 // pressureFactor folds in ReplicaStats.Pressure when the replica has stats
 // reported in this (tenant, model) (otherwise 1 — a replica with no stats
 // is treated as unloaded). sloBias kicks in when the request's TTFT budget
@@ -818,8 +826,16 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 	return i.lookupExact(req)
 }
 
-// lookupExact is the legacy single-blob exact-match path. Preserved
-// unchanged so existing callers (no block-hash chain) keep their behavior.
+// lookupExact is the legacy single-blob exact-match path. The wire shape
+// is unchanged for existing callers (no block-hash chain), but the
+// per-replica score now folds in the replica-distinguishing-power factor on
+// top of the matched_tokens × freshness × pressure × slo_bias baseline. The
+// service layer can also downgrade an exact-match response to NO_HINT when
+// the top score falls below the per-namespace routingFloorScore OR when
+// every replica's matched_tokens falls below the per-namespace
+// minimumMatchedTokens floor — see pkg/server/inferencecache_service.go
+// buildLookupResponse. Old gateway clients that only inspect reason_code
+// continue to fail open on a downgrade.
 func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
@@ -833,6 +849,62 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
+	// totalReplicas counts every replica known to be serving this engine
+	// domain (tenant, model, hash_scheme), not just the holders of THIS
+	// prefix. That's the denominator the distinguishing-power factor wants:
+	// "out of the replicas that could hold the content, how many do?"
+	// Captured under the read lock so it's consistent with the prefixes
+	// view this lookup observes.
+	//
+	// Definition caveat — "total replicas" means "replicas with at least
+	// one prefix entry in the requested scope," not "replicas serving the
+	// scope." servingByScope is incremented by upsertReplicaLocked when a
+	// replica's first prefix entry lands in the scope; it tracks the set
+	// of replicas the index has observed reporting state in the scope.
+	// A replica that's part of the cluster but has not reported a prefix
+	// in this (tenant, model, hash_scheme) — e.g. just started, just
+	// cleared its cache, or is serving a different scope — is invisible
+	// to the index and so absent from the denominator. Two consequences:
+	//   - 2-of-3 partial-diffusion case (replicas r0, r1 hold the prefix;
+	//     r2 has reported no prefix in scope) is scored 2-of-2 → factor
+	//     0 → downgrade. This is the right answer from the cache plane's
+	//     limited view: r2 is invisible, so the cache plane has no
+	//     evidence r2 is a peer. Treating r2 as a peer (factor 0.33)
+	//     would require speculating about replicas the cache plane has
+	//     not observed.
+	//   - "Total replicas in scope" semantics are eventually consistent
+	//     with the engine reporting state. The C1 kvevent subscriber
+	//     reports prefix and stats together on ReportCacheState, so a
+	//     production engine that's been running for one TTL cycle will
+	//     appear in servingByScope reliably. The visible-only edge case
+	//     is benign for the steady-state regime and explicitly tested
+	//     by TestLookupExactNonZeroDistinguishingWhenOneOfThreeHoldsPrefix
+	//     (the "decoy replica holds OTHER prefix in scope" shape).
+	//
+	// Soft-state caveat — KNOWN bounded limitation. servingByScope is
+	// decremented at TTL-sweep time (removeReplicaLocked /
+	// scopeDecLocked), not at every freshness check. A replica that has
+	// gone stale (no recent report) stays in the denominator until the
+	// next sweep — bounded above by DefaultSweepInterval (1 min by
+	// default). During that window the denominator (servingByScope)
+	// counts the stale entry; the numerator (post-freshness `scores`
+	// below) does not. A trivial overlap held by every CURRENTLY-FRESH
+	// replica can briefly surface a small but non-zero distinguishing-
+	// power factor instead of the intended 0 — so a sub-trivial
+	// PREFIX_MATCH can ship from this lookup before the next sweep
+	// collapses the denominator. Net: at worst one DefaultSweepInterval
+	// of inflated PREFIX_MATCH rate on a workload that's already trivial,
+	// never a wrong routing answer. The resulting hint is "route to one
+	// of the replicas that all hold the same trivial overlap," which the
+	// gateway serves equivalently regardless of which it picks; the next
+	// sweep tick removes the stale denominator entry and the routing-
+	// floor catches the next-tick lookup. A correct-by-construction fix
+	// would maintain a separate per-scope fresh-replica counter updated
+	// lazily on the sweep; the bookkeeping is out of scope for this PR,
+	// the soft-state behavior matches the rest of the index, and the
+	// window is short enough that operators see the steady-state
+	// behavior.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	scores := make([]ReplicaScore, 0, len(replicas))
 	var hitsByReplica map[string][]*replicaEntry
 	for id, e := range replicas {
@@ -878,6 +950,21 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 		})
 	}
 	i.mu.RUnlock()
+
+	// Replica-distinguishing-power factor: every score in an exact-match
+	// response shares the same prefix-hash, so num_matching = len(scores)
+	// (after the staleness filter) and the factor is uniform. A factor of
+	// 0 (every replica holds the prefix — the trivial-overlap case) zeroes
+	// every Score so the service-layer post-score floor can downgrade the
+	// response to NO_HINT. totalReplicas <= 1 degrades to factor 1.0 so
+	// single-replica deployments preserve their baseline ranking.
+	//
+	if dp := distinguishingPower(len(scores), totalReplicas); dp != 1.0 {
+		f := float32(dp)
+		for k := range scores {
+			scores[k].Score *= f
+		}
+	}
 
 	sortScoresDescByScoreThenID(scores)
 	return scores, hitsByReplica
@@ -1001,10 +1088,94 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			EstimatedCacheHitProb: fresh,
 		})
 	}
+	// Cardinality denominator for the distinguishing-power factor: every
+	// replica with at least one prefix entry in this engine domain
+	// (tenant, model, hash_scheme) — see the definition + soft-state
+	// caveats on lookupExact's totalReplicas declaration above for the
+	// full discussion of (a) replicas that are in the cluster but have
+	// not reported any prefix in scope being invisible to this counter,
+	// and (b) the TTL-sweep-window soft-state behavior.
+	// Captured BEFORE releasing the read lock so it stays consistent with
+	// the prefix view the chain walk just observed.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
+
+	// Per-replica depth-aware distinguishing-power: a replica that reached
+	// deeper into the chain than its siblings holds something unique to it.
+	// For each scored replica R, num_matching_at_R's_depth = count of
+	// replicas whose matched_tokens >= R.matched_tokens (R plus every
+	// replica that went at least as deep). Sort-and-group walk is
+	// O(N log N) — pure arithmetic, no locking needed.
+	applyChainDistinguishingPower(scores, totalReplicas)
 
 	sortScoresDescByScoreThenID(scores)
 	return scores, hitsByReplica
+}
+
+// applyChainDistinguishingPower folds the depth-aware distinguishing-power
+// factor into a chain-lookup's per-replica scores in place. Unlike the
+// exact-match path — where every scored replica shares the same prefix
+// hash and the factor is uniform — a chain match can have replicas at
+// different depths (some reached more blocks than others). For each
+// replica R the factor is computed from
+//
+//	matching_at_R = count of replicas with matched_tokens >= R.matched_tokens
+//
+// so a uniquely-deepest replica sees the strongest factor (1 - 1/N) and a
+// shallow-only sibling sees a much smaller one (or 0 when every replica
+// reached the same depth). Without this, naïve shared-factor scoring would
+// zero a uniquely-deep replica's score whenever a sibling held the head
+// — the very routing decision the cache plane wants to surface.
+//
+// Sort-then-group walk is O(N log N) in the number of scored replicas;
+// pure arithmetic, no locking needed (caller releases the read lock first).
+// No-op when totalReplicas <= 1 (single-replica deployment) or len(scores)
+// == 0; the inner distinguishingPower call also degrades gracefully on
+// those branches but the guard saves an unnecessary sort.
+//
+// Grouping is by `MatchedTokens`, not by raw block depth: two replicas at
+// different block-counts that happen to sum to the same matched-tokens
+// total are treated as the same "depth" for cardinality. This is
+// intentional and consistent with the ranking score (which is also based
+// on matched_tokens, not block count): a 0-token block contributes 0 to
+// the score AND 0 to the depth tie-break, so two replicas separated only
+// by 0-token blocks get the same factor. If two replicas have the same
+// matched_tokens but different per-block compositions, they are
+// indistinguishable from the gateway's perspective anyway — the score is
+// the only routing input.
+func applyChainDistinguishingPower(scores []ReplicaScore, totalReplicas int) {
+	if totalReplicas <= 1 || len(scores) == 0 {
+		return
+	}
+	// Sort by matched_tokens descending, ID ascending for deterministic
+	// grouping when several replicas reach the same depth. The caller's
+	// sortScoresDescByScoreThenID will re-sort by the final Score
+	// afterwards, so this intermediate order is internal.
+	sort.Slice(scores, func(a, b int) bool {
+		if scores[a].MatchedTokens != scores[b].MatchedTokens {
+			return scores[a].MatchedTokens > scores[b].MatchedTokens
+		}
+		return scores[a].ReplicaID < scores[b].ReplicaID
+	})
+	// Walk in groups of equal matched_tokens. Every replica in a group
+	// shares the same num_matching_at_depth = right (the count of
+	// replicas at this depth or deeper), so the factor is the same for
+	// the group. Tied replicas keep their relative score because they
+	// land in the same group.
+	for left := 0; left < len(scores); {
+		right := left
+		for right < len(scores) && scores[right].MatchedTokens == scores[left].MatchedTokens {
+			right++
+		}
+		dp := distinguishingPower(right, totalReplicas)
+		if dp != 1.0 {
+			f := float32(dp)
+			for k := left; k < right; k++ {
+				scores[k].Score *= f
+			}
+		}
+		left = right
+	}
 }
 
 // sortScoresDescByScoreThenID gives both lookup paths the same deterministic
@@ -1690,6 +1861,44 @@ func (i *Index) evictionFor(tenant string) string {
 		}
 	}
 	return EvictionLRU
+}
+
+// distinguishingPower returns the multiplier the LookupRoute ranker uses to
+// discount prefix matches that don't distinguish between replicas. Defined as
+//
+//	distinguishingPower = 1 - matching/total   (for total >= 2)
+//
+// so every-replica-holds-it overlaps (chat-template framing, RAG corpus
+// headers, custom system prompts shared across the deployment) collapse to
+// zero — the per-namespace post-score floor (CachePolicy.spec.routingFloorScore)
+// then downgrades the response to NO_HINT and the gateway round-robins
+// honestly instead of being credited with a trivial routing decision. A
+// uniquely-held match (matching=1, total=N) sees the strongest factor
+// (1 - 1/N), proportional to how diluted the prefix is in the cluster.
+//
+// total <= 1 degrades to 1.0: a single-replica deployment has nothing to
+// distinguish among, so a naïve factor of 0 would zero EVERY score and
+// downgrade every hint. Returning 1 preserves the baseline ranking on that
+// shape (matched_tokens × freshness × pressure × slo_bias), which is the
+// only useful answer.
+//
+// Negative `matching` (only possible from a buggy caller — production paths
+// derive it from len(...)) clamps to 1.0 — same shape as total <= 1 — so a
+// bug never amplifies a score above its baseline. matching > total clamps
+// to 0 — same conservative interpretation as "every replica has it" — so a
+// transient over-count (e.g. a stale total from a concurrent ingest) fails
+// safe rather than inverting ranking with a negative factor.
+//
+// Pure function: no allocation, no locking. Cheap enough that the lookup
+// path multiplies it in per replica without flinching.
+func distinguishingPower(matching, total int) float64 {
+	if total <= 1 || matching < 0 {
+		return 1.0
+	}
+	if matching >= total {
+		return 0.0
+	}
+	return 1.0 - float64(matching)/float64(total)
 }
 
 // freshnessAt decays linearly from 1 (just seen) to 0 (>= ttl old). Pure

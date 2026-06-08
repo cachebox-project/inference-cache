@@ -17,12 +17,15 @@
 #      columns.
 #   4. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
-#      server's `/policy` endpoint, and `LookupRoute` observes BOTH the pushed
-#      `minimumPrefixTokens` request-side gate AND the pushed
-#      `minimumMatchedTokens` result-side floor without engine pods or
-#      inference traffic — three orthogonal lookups (above both, below the
-#      request-side gate, sub-floor realized match) carry the three policy
-#      enforcement paths end-to-end. The installed validating webhook also
+#      server's `/policy` endpoint, and `LookupRoute` observes ALL THREE
+#      policy enforcement paths without engine pods or inference traffic:
+#      the pushed `minimumPrefixTokens` request-side gate, the pushed
+#      `minimumMatchedTokens` per-replica result-side floor, and the
+#      pushed `routingFloorScore` whole-response score floor. Three
+#      orthogonal lookups exercise the first two (above both, below the
+#      request-side gate, sub-floor realized match); a follow-up patch +
+#      re-lookup pair exercises the routingFloorScore propagation and
+#      replace-on-write semantics. The installed validating webhook also
 #      rejects a SECOND CachePolicy in the namespace (one-per-namespace),
 #      proving the bundle's webhook Service + cert-manager CA-injection
 #      path — not just envtest handler logic.
@@ -971,6 +974,58 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
   sleep 2
 done
 log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned NO_HINT; trivial-match (matched_tokens<floor) lookup returned NO_HINT — both minimum-token policy knobs enforced end-to-end"
+
+# --- routingFloorScore end-to-end probe ------------------------------------
+# Proves the new field flows CR → controller flatten → /policy push → server
+# resolver → buildLookupResponse downgrade. The same 64-token prefix that
+# returned PREFIX_MATCH above goes to NO_HINT after we patch the live
+# CachePolicy to routingFloorScore="1000" (well above any plausible score:
+# matched_tokens (64) × freshness (~1) × distinguishing_power (1.0 — only
+# one replica was seeded, so the factor degenerates) = ~64, which is below
+# the strict 1000 floor). Restoring "0.1" must flip the response back to
+# PREFIX_MATCH — proving replace-on-write semantics carry the new field too.
+# Without engine pods or model traffic, this is the minimum end-to-end
+# exercise of the new operator-facing knob.
+log "asserting CachePolicy.spec.routingFloorScore is propagated and gates LookupRoute"
+
+apply_floor() {
+  local floor="$1"
+  kubectl -n "$POLICY_SMOKE_NS" patch cachepolicy cachepolicy-sample \
+    --type=merge -p "{\"spec\":{\"routingFloorScore\":\"$floor\"}}" >/dev/null \
+    || fail "kubectl patch cachepolicy routingFloorScore=$floor failed"
+}
+
+wait_floor_reason() {
+  local payload="$1" want="$2" err_file="$3" label="$4"
+  local deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+  local resp=""
+  until has_reason_code "$resp" "$want"; do
+    resp="$(grpcurl_lookup_route "$payload" "$err_file")" || true
+    if has_reason_code "$resp" "$want"; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
+      echo "$label response (want $want):" >&2
+      echo "$resp" >&2
+      if [ -s "$err_file" ]; then
+        echo "$(basename "$err_file"):" >&2
+        cat "$err_file" >&2
+      fi
+      fail "server did not adopt routingFloorScore patch within ${POLICY_PUSH_TIMEOUT}s ($label, want $want)"
+    fi
+    sleep 2
+  done
+}
+
+apply_floor "1000"
+wait_floor_reason "$policy_high_payload" "NO_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
+log "routingFloorScore=1000 enforced: same 64-token match now NO_HINT (score below floor)"
+
+apply_floor "0.1"
+wait_floor_reason "$policy_high_payload" "PREFIX_MATCH" "$LOG_DIR/grpcurl-policy-floor-restored.err" "routingFloorScore=0.1 high-token lookup"
+log "routingFloorScore=0.1 restored: same 64-token match flipped back to PREFIX_MATCH (replace-on-write OK)"
+
 kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --- paired-sample smoke ---------------------------------------------------

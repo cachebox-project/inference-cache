@@ -38,9 +38,12 @@ const (
 // RPCs (RenderTemplate, LookupPDRoute, streams) stay fail-open stubs until their
 // modules land. All lookups remain side-effect-free apart from emitting metrics
 // and fail open — an empty result with NO_HINT (no match; below the configured
-// minimumPrefixTokens request-side gate; or every replica's realized
+// minimumPrefixTokens request-side gate; every replica's realized
 // matched_tokens fell below the per-namespace minimumMatchedTokens
-// result-side floor — see docs/design/lookuproute-ranking.md §2.6), with
+// result-side floor — see docs/design/lookuproute-ranking.md §2.6; or the
+// top per-replica score fell below the per-namespace routingFloorScore
+// post-score floor on the distinguishing-power-aware ranker — see
+// docs/design/lookuproute-ranking.md §2.7), with
 // TIMEOUT (lookupTimeoutMs budget breach), or with
 // one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
 // when the lookup misses AND the index can identify which contract key did not
@@ -231,17 +234,46 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // TENANT_HOT / NO_HINT / UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME)
 // via reasonForStrategy.
 func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
-	// Result-side floor on matched_tokens. The index returned
-	// PREFIX_MATCH because at least one replica held the requested prefix; that
-	// holds even when the realized overlap is the 1-block chat-template framing
-	// every replica has identically — which inflates operator-visible routing
-	// metrics by ~3× without changing routing quality (the proxy round-robins
-	// among equally-trivial holders). Filter replicas whose match falls below
-	// the policy floor; when none survive, downgrade to NO_HINT so the gateway
-	// rounds robin honestly. The downgrade happens BEFORE CreditHits so a
-	// non-delivered hint never bumps an LFU counter.
+	// Two-stage result-side floor on PREFIX_MATCH responses. Both happen
+	// BEFORE CreditHits below so a non-delivered hint never bumps an LFU
+	// counter — the no-credit-on-non-delivery invariant.
+	//
+	// Stage 1 — matched-tokens floor (per-replica). Filters individual
+	// replicas whose realized matched_tokens count falls below the
+	// per-namespace minimumMatchedTokens floor. The chat-template-only
+	// 1-block match (~16 tokens) is the canonical case this catches:
+	// a sibling replica that genuinely went deeper on the prefix is kept
+	// while the sub-floor sibling is dropped. If no replica clears the
+	// floor, the whole response downgrades to NO_HINT.
+	//
+	// Stage 2 — routing-floor-score (whole-response). Compares the top
+	// surviving replica's *score* (matched_tokens × freshness × pressure ×
+	// slo_bias × distinguishing_power) against the per-namespace
+	// routingFloorScore. The canonical case this catches is the trivial-
+	// overlap shape where every replica holds the prefix:
+	// distinguishing_power=0 → score=0 → downgrade. Workload-agnostic
+	// (works for RAG headers and custom system prompts that the fixed-
+	// token-count Stage 1 cannot catch).
+	//
+	// Order matters: Stage 1 may itself reduce the scored set or downgrade
+	// to NO_HINT, in which case Stage 2 naturally skips (StrategyPrefixMatch
+	// no longer holds, OR no scores remain). When both fire on the same
+	// response Stage 1 takes precedence for per-replica filtering and
+	// Stage 2 then re-checks the survivor's score.
 	if result.Strategy == index.StrategyPrefixMatch {
 		result = s.applyMatchedTokensFloor(result, tenant)
+	}
+	if result.Strategy == index.StrategyPrefixMatch {
+		if floor := s.policyRoutingFloorScore(tenant); floor > 0 && len(result.Scores) > 0 {
+			// Scores are sorted descending by Score (see
+			// sortScoresDescByScoreThenID in pkg/index), so the first
+			// element is the best surviving replica.
+			if result.Scores[0].Score < floor {
+				// Drop the hits map by constructing a fresh result —
+				// the dropped scores must not credit any LFU counter.
+				result = index.LookupResult{Strategy: index.StrategyNone}
+			}
+		}
 	}
 	// Credit the LFU access counters for the entries this response actually
 	// delivers. buildLookupResponse runs on every DELIVERED response (including
@@ -346,6 +378,18 @@ func (s *inferenceCacheService) applyMatchedTokensFloor(result index.LookupResul
 	// replicas' LFU entries are not credited at CreditHits time.
 	result.RetainReplicas(keep)
 	return result
+}
+
+// policyRoutingFloorScore returns the per-tenant routing floor applied to
+// PREFIX_MATCH responses. A nil store skips the floor entirely (the test
+// scaffolding that wires a service without a PolicyStore); otherwise the
+// resolver returns the tenant's configured value (including the explicit 0
+// opt-out) or DefaultRoutingFloorScore when no CachePolicy is set.
+func (s *inferenceCacheService) policyRoutingFloorScore(tenant string) float32 {
+	if s.policies == nil {
+		return 0
+	}
+	return s.policies.RoutingFloorScore(tenant)
 }
 
 // reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's
