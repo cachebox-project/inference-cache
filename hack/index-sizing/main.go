@@ -27,7 +27,7 @@ import (
 func main() {
 	keys := flag.Int("keys", 1_000_000, "distinct prefix keys to ingest")
 	replicas := flag.Int("replicas", 1, "replicas reporting each prefix (entries = keys × replicas)")
-	hashSize := flag.Int("hash-bytes", 32, "prefix-hash bytes per entry (vLLM block-v1 default = 32)")
+	hashSize := flag.Int("hash-bytes", 32, "prefix-hash bytes per entry. Conservative default representing LMCache-style SHA hashes; the in-tree vLLM adapter normalizes integer block hashes to 8 bytes big-endian (see pkg/adapters/engine/events.go uint64BE). Minimum 8 to guarantee uniqueness across the keys range.")
 	tenants := flag.Int("tenants", 1, "distinct tenant IDs (keys are split evenly across tenants×models)")
 	models := flag.Int("models", 1, "distinct model IDs")
 	batchSize := flag.Int("batch", 1_000, "prefixes per Ingest call")
@@ -35,11 +35,16 @@ func main() {
 
 	// Reject inputs that would divide-by-zero (`tenants=0`/`models=0`), corrupt
 	// the per-entry denominator (`keys`/`replicas` ≤ 0), or panic deep in the
-	// loop (`hash-bytes`/`batch` ≤ 0). The harness is operator tooling — fail
-	// loud at the boundary, don't silently produce nonsense numbers.
-	if *keys <= 0 || *replicas <= 0 || *tenants <= 0 || *models <= 0 || *hashSize <= 0 || *batchSize <= 0 {
-		fmt.Fprintf(os.Stderr, "all flags must be strictly positive: keys=%d replicas=%d tenants=%d models=%d hash-bytes=%d batch=%d\n",
-			*keys, *replicas, *tenants, *models, *hashSize, *batchSize)
+	// loop (`batch` ≤ 0). hash-bytes < 8 would let encodeHash silently produce
+	// duplicate hashes (it packs the key index into the first 8 bytes), so the
+	// floor is 8 — enough to encode any practical -keys value uniquely.
+	if *keys <= 0 || *replicas <= 0 || *tenants <= 0 || *models <= 0 || *batchSize <= 0 {
+		fmt.Fprintf(os.Stderr, "keys, replicas, tenants, models, batch must be strictly positive: keys=%d replicas=%d tenants=%d models=%d batch=%d\n",
+			*keys, *replicas, *tenants, *models, *batchSize)
+		os.Exit(2)
+	}
+	if *hashSize < 8 {
+		fmt.Fprintf(os.Stderr, "hash-bytes must be >= 8 (encodeHash packs the key index into the first 8 bytes; narrower widths collide). got %d\n", *hashSize)
 		os.Exit(2)
 	}
 
@@ -47,8 +52,15 @@ func main() {
 	// when (tenants × models) doesn't divide. Compute the actually-ingested
 	// total here and use that as the denominator for every bytes-per-entry
 	// number below — otherwise the report would inflate the denominator and
-	// under-state per-entry cost.
+	// under-state per-entry cost. If the rounding leaves a zero per-bucket
+	// count, the run would ingest nothing — fail rather than divide by zero
+	// in the report.
 	keysPerBucket := *keys / ((*tenants) * (*models))
+	if keysPerBucket == 0 {
+		fmt.Fprintf(os.Stderr, "keys=%d < tenants×models=%d; need at least one key per bucket. raise -keys or lower -tenants/-models.\n",
+			*keys, (*tenants)*(*models))
+		os.Exit(2)
+	}
 	ingestedKeys := keysPerBucket * (*tenants) * (*models)
 	totalEntries := ingestedKeys * (*replicas)
 	if ingestedKeys != *keys {

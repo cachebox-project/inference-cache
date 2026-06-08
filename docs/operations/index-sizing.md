@@ -48,12 +48,14 @@ Measured footprint after GC + `debug.FreeOSMemory()` (peak RSS via `getrusage.Ma
 | 1,500,000 | 641 MiB | 701 MiB | 448 | 490 |
 
 Scaling is linear in the number of entries above ~100K (the per-entry RSS share drops as
-the fixed Go-runtime overhead — ~30–50 MiB — amortizes). A working model that fits the
-measurements within ~5 %:
+the fixed Go-runtime overhead — ~30–50 MiB — amortizes). Per-entry heap cost trends
+slightly *down* as the index grows (504 B at 500K-1M, 448 B at 1.5M) — likely Go map
+bucket-fill effects. A rule-of-thumb pod sizing model good to ~10 % conservative on the
+peak RSS, with peak RSS adding ~10–15 % over heap:
 
 ```
-heap_bytes      ≈  50 MiB  +  500 × distinct_prefix_keys  +  50 × additional_replica_holdings
-peak_RSS_bytes  ≈  heap_bytes × 1.10
+heap_bytes      ≈  30 MiB  +  450 × distinct_prefix_keys  +  50 × additional_replica_holdings
+peak_RSS_bytes  ≈  heap_bytes × 1.15
 ```
 
 Where:
@@ -62,7 +64,10 @@ Where:
   This is the unit `tenants[].indexEntries` reports and `CacheTenant.spec.quota.maxIndexEntries`
   bounds.
 - *additional replica holdings* — every replica beyond the first that reports the same
-  key. Holding the same prefix on R replicas costs ~500 + (R-1) × 50 bytes, not R × 500.
+  key. Holding the same prefix on R replicas costs ~450 + (R-1) × 50 bytes, not R × 450.
+
+Verify against the measured table when sizing critically; the formula is a planning
+heuristic, not a tight predictor.
 
 ### Where the bytes go
 
@@ -79,8 +84,12 @@ Stats are tracked separately (`map[statsKey]statEntry`, one row per
 hundreds of bytes per replica, vs. hundreds of bytes per prefix entry.
 
 **The prefix-hash byte width does NOT dominate.** Going from 32-byte hashes (LMCache /
-SHA-256-style) to 16-byte hashes (vLLM-native xxhash) shaved only ~16 B/entry on the heap.
-The map machinery and `time.Time` are the bulk of the cost.
+SHA-256-style) to 16-byte hashes shaved only ~16 B/entry on the heap. The in-tree vLLM
+adapter ([`pkg/adapters/engine/events.go`](../../pkg/adapters/engine/events.go) —
+`uint64BE`) normalizes integer block hashes to **8-byte big-endian** under the `vllm`
+hash_scheme, which would shave a few more bytes. The map machinery and `time.Time` are
+the bulk of the cost, not the hash bytes — narrower hashes don't materially change pod
+sizing.
 
 ---
 
@@ -188,8 +197,12 @@ Every signal below is exported on `/metrics` (port 8080) — no code change need
 3. Set `evictionTTL` (per CachePolicy) to the smallest value that keeps the typical
    re-use window inside the TTL — see the [TTL choice table](#ttl-trade-offs).
 4. If the workload is multi-tenant, set `CacheTenant.spec.quota.maxIndexEntries` per
-   tenant to roughly `cluster_cap × tenant_share`. Leave it unset for single-tenant
-   clusters.
+   tenant. **Mind the unit mismatch:** `maxIndexEntries` is distinct prefix keys per
+   tenant; the global cap is total replica×prefix entries. Starting heuristic:
+   `(cluster_cap / R_replicas) × tenant_share`, where `R_replicas` is the typical
+   number of cache replicas reporting each prefix. Without the `/ R_replicas` divisor,
+   per-tenant quotas summed across tenants can exceed what the global cap admits.
+   Leave it unset for single-tenant clusters.
 
 ### 3. Watch and adjust
 
@@ -208,8 +221,13 @@ After a representative workload window (typically one peak hour + one trough):
   population in `/snapshot`).
 - `tenant_evictions_total` non-zero on a tenant whose `status.indexEntries` is well
   below their quota → racing/stale CR. Reconcile.
-- RSS climbing without `index_entries` climbing → not the index. Check the metrics
-  registry, snapshot cache, or a recent code change.
+- RSS climbing with `index_entries` flat → could still be the index, in two ways:
+  (1) a new replica started reporting an existing prefix set (each replica adds ~50 B
+  per shared prefix, undetected by the per-distinct-prefix gauge), or (2) `index_entries`
+  is unchanged but per-tenant distribution shifted. Confirm by reading `/snapshot` and
+  summing `replicas[].prefixCount` — if the sum grew, it's the index. Only rule out the
+  index after that check; otherwise look at metrics registry, snapshot cache, or recent
+  code changes.
 
 ### 4. The escape hatch (today, until the cap is a flag)
 
