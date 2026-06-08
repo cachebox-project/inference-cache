@@ -1692,6 +1692,44 @@ func (i *Index) evictionFor(tenant string) string {
 	return EvictionLRU
 }
 
+// distinguishingPower returns the multiplier the LookupRoute ranker uses to
+// discount prefix matches that don't distinguish between replicas. Defined as
+//
+//	distinguishingPower = 1 - matching/total   (for total >= 2)
+//
+// so every-replica-holds-it overlaps (chat-template framing, RAG corpus
+// headers, custom system prompts shared across the deployment) collapse to
+// zero — the per-namespace post-score floor (CachePolicy.spec.routingFloorScore)
+// then downgrades the response to NO_HINT and the gateway round-robins
+// honestly instead of being credited with a trivial routing decision. A
+// uniquely-held match (matching=1, total=N) sees the strongest factor
+// (1 - 1/N), proportional to how diluted the prefix is in the cluster.
+//
+// total <= 1 degrades to 1.0: a single-replica deployment has nothing to
+// distinguish among, so a naïve factor of 0 would zero EVERY score and
+// downgrade every hint. Returning 1 preserves the baseline ranking on that
+// shape (matched_tokens × freshness × pressure × slo_bias), which is the
+// only useful answer.
+//
+// Negative `matching` (only possible from a buggy caller — production paths
+// derive it from len(...)) clamps to 1.0 — same shape as total <= 1 — so a
+// bug never amplifies a score above its baseline. matching > total clamps
+// to 0 — same conservative interpretation as "every replica has it" — so a
+// transient over-count (e.g. a stale total from a concurrent ingest) fails
+// safe rather than inverting ranking with a negative factor.
+//
+// Pure function: no allocation, no locking. Cheap enough that the lookup
+// path multiplies it in per replica without flinching.
+func distinguishingPower(matching, total int) float64 {
+	if total <= 1 || matching < 0 {
+		return 1.0
+	}
+	if matching >= total {
+		return 0.0
+	}
+	return 1.0 - float64(matching)/float64(total)
+}
+
 // freshnessAt decays linearly from 1 (just seen) to 0 (>= ttl old). Pure
 // function so the index can compute it under per-tenant TTL without taking
 // the resolver lock inside the per-entry loop.
