@@ -94,9 +94,12 @@ The default Kustomize overlay brings up both control-plane components:
   reconciler POSTs to `http://inference-cache-server:8081/probe` (default
   for the `--server-probe-url` flag — set empty to disable the gate); all
   three send the projected ServiceAccount token. Once both pods are Ready
-  `kubectl get cacheindex` reports live cluster-wide cache state, and
-  `kubectl get cachebackend -o yaml` includes the `FunctionalProbeOK`
-  condition for each managed backend.
+  `kubectl get cacheindex` reports live cluster-wide cache state.
+  `FunctionalProbeOK` appears on each managed `CacheBackend` only after it
+  clears the upstream KV-event readiness gate (i.e. real engine pods have
+  published at least one KV event for it) — see
+  [docs/design/cachebackend-api.md#functional-probe-gate](docs/design/cachebackend-api.md#functional-probe-gate);
+  it is intentionally not visible on a default install with no engine workload.
 
 ```bash
 kubectl apply -k config/default

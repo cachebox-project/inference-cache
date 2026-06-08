@@ -130,6 +130,36 @@ spec:
             runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#indexevictionsspike"
 
     # ------------------------------------------------------------------------
+    # CacheBackend functional-probe gate — the controller-driven synthetic
+    # round-trip catches silent-failure modes the existing Ready gate
+    # cannot.
+    # ------------------------------------------------------------------------
+    - name: inferencecache-cachebackend
+      interval: 30s
+      rules:
+        - alert: ServerProbeFail
+          # Per-stage outcome of the CacheBackend functional probe. A
+          # non-zero rate of result="failed" means the controller's
+          # synthetic round-trip against a managed backend is failing:
+          # subscriber-ingest, routing, or tier-2. The `backend` label is
+          # the canonical <namespace>/<name>; the `stage` label points at
+          # which layer broke. rate() over a 10m window so a single
+          # transient failure doesn't pin the alert active forever (the
+          # underlying metric is a counter; a raw `> 0` comparison would
+          # never reset). The 5m for: caps a brief outage from paging.
+          expr: |
+            sum by (backend, stage) (
+              rate(inferencecache_backend_probe_result_total{result="failed"}[10m])
+            ) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: inference-cache
+          annotations:
+            summary: "Synthetic CacheBackend probe failing on {{ $labels.backend }} (stage={{ $labels.stage }})."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
+
+    # ------------------------------------------------------------------------
     # DEFERRED — the metrics these alerts consume are not yet exposed on
     # /metrics. Enable each rule in the same change that ships its metric.
     #
@@ -170,15 +200,3 @@ spec:
     #         summary: "Replica {{ $labels.replica_id }} has not emitted a KV event in over 60s."
     #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#kveventsstaleness"
     #
-    #     - alert: ServerProbeFail
-    #       # DEFERRED: blocked on the synthetic end-to-end probe
-    #       # (inferencecache_backend_probe_result_total). Once the functional Ready
-    #       # gate ships its outcome counter, uncomment.
-    #       expr: inferencecache_backend_probe_result_total{result="failed"} > 0
-    #       for: 1m
-    #       labels:
-    #         severity: critical
-    #         component: inference-cache
-    #       annotations:
-    #         summary: "Synthetic CacheBackend probe failing on {{ $labels.cachebackend }}."
-    #         runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"

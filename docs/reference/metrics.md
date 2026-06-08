@@ -13,10 +13,16 @@ silently.
 ## Surface conventions
 
 - **Namespace.** Every metric the cache plane owns is prefixed
-  `inferencecache_*` (constant `metricNamespace` in
-  [`pkg/server/metrics.go`](../../pkg/server/metrics.go)). Anything not
-  matching that prefix is from a standard collector (see below) and not part
-  of the §4.3 schema.
+  `inferencecache_*`, in both binaries. Server-binary metrics derive
+  the prefix from the `metricNamespace` constant in
+  [`pkg/server/metrics.go`](../../pkg/server/metrics.go); controller-
+  binary metrics declare it inline on each `prometheus.NewXVec`
+  declaration in `internal/controller/` (see
+  `backendServerRestartCascadesTotal` for the pattern) — the two
+  processes use separate Prometheus registries, so no shared
+  package-level constant is used to enforce the prefix today.
+  Anything not matching that prefix is from a standard collector
+  (see below) and not part of the §4.3 schema.
 - **Registry isolation.** The server uses a **per-`Service` Prometheus
   registry**, not the global default. This keeps the server binary's metrics
   separate from the controller binary's controller-runtime registry, and lets
@@ -54,13 +60,25 @@ silently.
 | `inferencecache_probe_auth_total` | `result` | One increment per `/probe` request reaching the auth middleware, labeled by outcome. Third controller↔server endpoint on the snapshot listener; this counter mirrors the snapshot/policy pair so dashboards distinguish probe-side auth failures from read-side (`/snapshot`) and write-side (`/policy`) ones. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat. The probe-specific alarming signal is a non-trivial `unauth` rate without a paired `ok` rate: the CacheBackend reconciler drives `/probe` once per CacheBackend per ~30s, so silent `unauth` here means probe results never reach the reconciler and the `FunctionalProbeOK` condition degrades to unknown — invisible to operators unless this metric is on the dashboard. `forbidden` mirrors the policy-write semantics (some other workload is trying to drive a probe — alarming). All three caches are independent. |
 | `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 | `inferencecache_index_evictions_total` | `algorithm`, `reason` | One increment per **replica×prefix entry** removed by the index's own sweeps (distinct from the quota path above). | `algorithm` ∈ `lru` / `lfu` — the namespace's resolved `CachePolicy.spec.eviction`. `reason` ∈ `cap` (global `MaxEntries` exceeded — victims chosen by the algorithm: oldest-`lastSeen` for `lru`, lowest-access-count for `lfu`) / `ttl` (freshness sweep; algorithm-independent removal, but labeled with the namespace algorithm for attribution). Series are created lazily on the first eviction. A rising `reason="cap"` rate means the index is sustainably above `MaxEntries`; `lfu` keeps frequently-hit prefixes longer than `lru` under the same pressure. |
-| `inferencecache_backend_probe_result_total` | `backend`, `stage`, `result` | **Owned by the controller binary**, not the server. One increment per stage per probe call the CacheBackend reconciler issues to `/probe`. `backend` is the canonical `<namespace>/<name>`; `stage` ∈ `ingest` / `routing` / `t2`; `result` ∈ `ok` / `failed` / `skipped`. A successful probe call emits three increments (one per stage); an HTTP-level failure emits zero (no per-stage outcome was observed). Skipped stages count too — the metric reflects "what the probe round-trip looked like," not "what was exercised." | `backend × stage × result` cardinality is bounded by the size of the CacheBackend fleet × 3 × 3, comfortably small. Probe rate (~once per backend per 30s) keeps total emission tame. Dashboards key off the `result="failed"` slice for the alerting signal — a steady rate means the cache plane has a known regression for that backend; the `stage` label points at which layer broke. See `docs/design/cachebackend-api.md#functional-probe-gate` for the semantics. Registered on the controller-runtime registry in `internal/controller/cachebackend_probe.go`, so it lives in the **controller** `/metrics` endpoint, not the server's. |
 
 ### Histograms
 
 | Metric | Labels | Meaning | Buckets |
 |---|---|---|---|
 | `inferencecache_lookup_route_latency_seconds` | `model` | Server-side `LookupRoute` latency: from handler entry to response, including ranking. | `[100µs, 250µs, 500µs, 1ms, 2.5ms, 5ms, 10ms, 25ms, 50ms, 100ms]`. Targets sub-ms (cache-hot path); buckets exist up to 100 ms to catch tail/regression. |
+
+---
+
+## Controller metrics (`inferencecache_*`) — exposed today
+
+Emitted by the `cmd/controller` binary, registered into the controller-runtime metrics registry (`sigs.k8s.io/controller-runtime/pkg/metrics`), and served at the manager's `--metrics-bind-address` (default `:8080` on the controller binary — separate process from the server binary's `:8080`). This is a deliberately separate registry from the server's `pkg/server/metrics.go` one; the two processes have disjoint scrape targets.
+
+### Counters
+
+| Metric | Labels | Meaning | Notes |
+|---|---|---|---|
+| `inferencecache_backend_probe_result_total` | `backend`, `stage`, `result` | One increment per stage per probe call the CacheBackend reconciler issues to the server's `/probe` endpoint. `backend` is the canonical `<namespace>/<name>`; `stage` ∈ `ingest` / `routing` / `t2`; `result` ∈ `ok` / `failed` / `skipped`. A successful probe call emits three increments (one per stage); an HTTP-level failure to reach `/probe` emits zero (no per-stage outcome was observed — the call itself failed). Skipped stages count too — the metric reflects "what the probe round-trip looked like," not "what was exercised." | `backend × stage × result` cardinality is bounded by the size of the CacheBackend fleet × 3 × 3, comfortably small. Probe rate (~once per backend per 30s) keeps total emission tame. Dashboards key off the `result="failed"` slice for the alerting signal — a steady rate means the cache plane has a known regression for that backend; the `stage` label points at which layer broke. See [`docs/design/cachebackend-api.md#functional-probe-gate`](../design/cachebackend-api.md#functional-probe-gate) for the semantics. The `ServerProbeFail` alert in `config/observability/{alerting-rules,prometheus-rules}.yaml` is wired off this metric. |
+| `inferencecache_backend_server_restart_cascades_total` | `namespace`, `backend`, `reason` | One increment per cascade-restart **decision** the `CacheBackend` reconciler emits when it observes a cache-server-pod replacement that warrants engine recovery. **The counter advances per cascade EVENT, not per Deployment patched** — a cascade that matches zero injected engine `Deployment`s today still counts as one event (the controller decided recovery was needed; the engine fleet may simply not be deployed yet, or `spec.engineSelector` is being rewired). The decision fires after the rate-limit window has elapsed and after the engine-Deployment annotates succeed — BEFORE the subsequent `status.observedServerInstance` patch. The metric reflects the cascade decision the moment it commits — any matched engine `Deployment`s have already been annotated and the rollout that drives the recovery is in flight — rather than lagging behind a transient status-write failure. A zero-match cascade (no engines injected yet, or `spec.engineSelector` is being rewired) still increments because the controller's "decided to recover" state is operator-actionable even when no engine rolled. Double-counting on retry is prevented by an in-process `(key, currentID)` ledger: a subsequent reconcile that re-enters the cascade branch with the same identifier does not advance the counter. | NOT a raw restart count: the cascade is rate-limited to at most once per ~30s per backend (see `DefaultMinServerRestartCascadeInterval`), so a crash-looping cache-server that restarts 10× inside one window still increments this counter once. For raw cache-server pod restart rate, scrape `kube_pod_container_status_restarts_total` from kube-state-metrics instead. Today `reason` is always `server_instance_changed`; future operator-initiated "force cascade" surfaces would add their own value. A series is created lazily on the first cascade — a backend that never cascades emits nothing. The cascade itself is the operator-side recovery for the upstream LMCache `LMServerConnector` EPIPE-on-restart bug ([LMCache/LMCache#3565](https://github.com/LMCache/LMCache/issues/3565)); see [`docs/design/cachebackend-api.md` `observedServerInstance`](../design/cachebackend-api.md). |
 
 ---
 
@@ -78,6 +96,8 @@ with OTEL collectors) without bumping `v1alpha1`.
 ---
 
 ## Where each metric is owned in code
+
+### Server binary (`cmd/server`)
 
 - **Definitions:** [`pkg/server/metrics.go`](../../pkg/server/metrics.go) (the
   `serverMetrics` struct + `newServerMetrics`).
@@ -116,9 +136,26 @@ with OTEL collectors) without bumping `v1alpha1`.
   per stage); skipped stages count so the metric reflects the full probe
   shape.
 
+### Controller binary (`cmd/controller`)
+
+- **Definitions:** package-level vars in the relevant reconciler files,
+  registered into the controller-runtime metrics registry on `init()`.
+  This is a separate `prometheus.Registry` from the server binary's per-
+  Service registry.
+- **`backendServerRestartCascadesTotal` writer:** the `CacheBackend`
+  reconciler increments it once per cascade in
+  [`internal/controller/cachebackend_server_restart.go`](../../internal/controller/cachebackend_server_restart.go).
+  See the `reconcileServerInstance` godoc for when a cascade is and is
+  not emitted (rate-limit, strict-superset midpoints, converged
+  scale-ups, stale-while-unavailable).
+
 ---
 
 ## How `/metrics` is served
+
+Two binaries each expose their own `/metrics` endpoint — separate processes, separate Prometheus registries, separate scrape targets.
+
+### Server binary (`cmd/server`)
 
 - HTTP endpoint **`/metrics`** on the server's public HTTP listener (default
   `:8080`, flag `--http-bind-address`). Format: Prometheus exposition.
@@ -164,6 +201,22 @@ with OTEL collectors) without bumping `v1alpha1`.
   chasing a binding regression should grep for
   `token audiences [...] is invalid for the target audiences`.
 
+### Controller binary (`cmd/controller`)
+
+- HTTP endpoint **`/metrics`** on the controller-runtime manager's metrics
+  listener (default `:8080`, flag `--metrics-bind-address`). This is a
+  different process from the server binary's `:8080`, so the two can
+  share the same port number on different pods without conflict.
+- Format: Prometheus exposition. Includes both the
+  `inferencecache_backend_*` controller metrics (defined in this repo)
+  and the standard controller-runtime metrics (`controller_runtime_*`,
+  `workqueue_*`, `rest_client_*`, …) that controller-runtime registers
+  by default.
+- Unauthenticated by default (`secureMetrics=false`); operators who
+  want a bearer-gated controller metrics surface should set
+  `--metrics-secure` and front it with the same TokenReview pattern
+  the server's `:8081` listener uses.
+
 ---
 
 ## How to add a new metric
@@ -176,23 +229,49 @@ with OTEL collectors) without bumping `v1alpha1`.
      existing one?
    - Will an operator dashboard care, or is this a debug-only counter? (Debug
      counters belong in logs, not `/metrics`.)
-2. **Define the collector** in `pkg/server/metrics.go`: add a field to
-   `serverMetrics`, construct it in `newServerMetrics`, and register it on the
-   `prometheus.NewRegistry()` block. Use the `metricNamespace` constant so
-   the name is consistently prefixed `inferencecache_*`.
-3. **Add a typed writer method** on `*serverMetrics` (e.g.
-   `observeLookup`, `SetIndexEntries`) and call it from the relevant handler
-   or index path. Don't let handlers touch the prometheus collector directly
-   — keeping the surface narrow makes it test-mockable.
-4. **Update the table above** in the correct sub-section (Gauges / Counters /
-   Histograms). Include labels, meaning, and what makes it move. If the metric
-   is histogram, document the bucket array and *why* those buckets.
-5. **Wire test coverage.** Add an assertion in `pkg/server/metrics_test.go`
-   that the new metric appears in `/metrics` output with the expected name
-   and labels.
-6. **Flag the schema impact in the PR description.** If the metric is a
+2. **Decide which binary owns the metric.** Pick by where the work that
+   moves it actually runs — server-side request handling and the in-memory
+   index belong in the server binary; reconciler / webhook / controller-
+   loop behaviors belong in the controller binary. The two processes use
+   separate Prometheus registries and serve different `/metrics` endpoints
+   (see "How `/metrics` is served"); pick the wrong one and operators
+   scrape the wrong target. Each binary has its own definition and
+   registration pattern:
+
+   - **Server binary (`cmd/server`)**: add a field to `serverMetrics` in
+     `pkg/server/metrics.go`, construct it in `newServerMetrics`, and
+     register it on the `prometheus.NewRegistry()` block. Add a typed
+     writer method on `*serverMetrics` (e.g. `observeLookup`,
+     `SetIndexEntries`) and call it from the relevant handler or index
+     path. Don't let handlers touch the prometheus collector directly —
+     keeping the surface narrow makes it test-mockable.
+   - **Controller binary (`cmd/controller`)**: declare a package-level
+     `prometheus.NewCounterVec` / `NewGaugeVec` / etc. var in the
+     reconciler / webhook file that uses it (e.g.
+     `backendServerRestartCascadesTotal` in
+     `internal/controller/cachebackend_server_restart.go`); register it
+     into `sigs.k8s.io/controller-runtime/pkg/metrics.Registry` from
+     an `init()` so it appears on the manager's `/metrics` endpoint
+     without a separate plumbing path. Add a package-private
+     `reset*ForTest()` helper so unit tests can clear state between
+     runs.
+
+   In both cases use the `inferencecache_*` prefix so the surface stays
+   consistently namespaced.
+3. **Update the relevant table above** in the correct binary section
+   (Server / Controller) and sub-section (Gauges / Counters / Histograms).
+   Include labels, meaning, and what makes it move. If the metric is a
+   histogram, document the bucket array and *why* those buckets.
+4. **Wire test coverage.** Server-binary metrics: add an assertion in
+   `pkg/server/metrics_test.go`. Controller-binary metrics: add an
+   assertion in a `_test.go` file alongside the reconciler that increments
+   them (e.g. `cachebackend_server_restart_test.go` — see the
+   `cascadeRestartsCount` helper for the pattern). In both cases verify
+   the metric appears in `/metrics` output with the expected name and
+   labels.
+5. **Flag the schema impact in the PR description.** If the metric is a
    candidate for the §4.3 public schema (F3 owns that effort), say so —
    F3 tracks which `inferencecache_*` series are promoted to the public
    contract vs which remain internal/advisory.
-7. **Dashboards.** If you have a Grafana panel in mind, drop the PromQL in the
+6. **Dashboards.** If you have a Grafana panel in mind, drop the PromQL in the
    PR description so F4 (dashboards + CLI) can pick it up cleanly.

@@ -42,7 +42,12 @@
 #      injected-by annotation on the engine pod, and surfaces the
 #      InjectedByCacheBackend Event (with the persisted pod UID — the
 #      regression that hides events from `kubectl describe pod`). Then
-#      scaling the engine to 0 drives status.matchedEnginePods=0 via the
+#      the cache-server restart cascade: force-deleting the
+#      cache-server pod flips status.observedServerInstance to the
+#      replacement's server-instance identifier and patches the cascade-restart-trigger
+#      annotation onto the engine Deployment's pod template (the
+#      mechanism that drives the rolling restart). Finally scaling the
+#      engine to 0 drives status.matchedEnginePods=0 via the
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
@@ -112,10 +117,11 @@
 #  12b. The authenticated /probe handler returns the expected default
 #       posture on a clean install: a controller-SA-authenticated POST
 #       gets HTTP 200 AND the parsed JSON body asserts ingest=ok,
-#       routing=ok, t2=skipped (the Stage-1 default — no T2Prober wired
-#       yet). A regression where the handler returns 200 with a
-#       per-stage "failed" would otherwise slip past the audience-binding
-#       phase above (which only checks HTTP status).
+#       routing=ok, t2=skipped (no T2Prober is wired into the server
+#       today, so Stage C always reports skipped). A regression where
+#       the handler returns 200 with a per-stage "failed" would
+#       otherwise slip past the audience-binding phase above (which only
+#       checks HTTP status).
 #  12c. The CacheTenant admission webhook rejects a CR claiming the
 #       server-reserved probe tenantID (inferencecache.io/probe). Pairs
 #       with the existing duplicate-tenantID assertion to pin BOTH
@@ -174,7 +180,8 @@
 #           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
 #           GRPC_LOCAL_PORT, LOG_DIR, POLICY_SMOKE_NS, SAMPLE_NS,
 #           PROMPT_TOPOLOGY_SMOKE_NS, SAMPLE_ENDPOINT_TIMEOUT,
-#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
+#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
+#           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS, STORAGE_SMOKE_NS.
 
@@ -219,6 +226,14 @@ SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
 # engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
 # terminate round-trip.
 SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
+# Cache-server restart cascade. Each wait covers a different leg of
+# the loop: the controller observing the replacement cache-server pod
+# and computing its server-instance identifier
+# (`<pod-uid>:<restart-sum>`), then patching the engine Deployment's
+# pod template annotations. 60s absorbs the cache-server pod's
+# recreate-and-Ready cycle (the busybox stand-in starts in a few
+# seconds; the wait dominates on a cold node).
+SAMPLE_CASCADE_TIMEOUT="${SAMPLE_CASCADE_TIMEOUT:-60}"
 # KV-event gate: time budget for the managed cache-server Deployment to pull
 # its image and reach Available, then for the gate to publish
 # AwaitingFirstKVEvent. The image pull dominates on a cold node, hence the
@@ -1177,6 +1192,108 @@ if [ -z "$seen" ]; then
 fi
 log "InjectedByCacheBackend Event present on the engine pod (UID matches the persisted pod)"
 
+# --- cache-server restart cascade ------------------------------------------
+# When the cache-server pod is replaced (OOM-kill, eviction, image roll,
+# operator-initiated restart, …), every injected engine pod holds a stale
+# LMCache client socket — the upstream LMServerConnector opens its TCP
+# socket in __init__ only and silently fails every subsequent PUT with
+# EPIPE until the engine pod itself rolls. The controller's
+# observedServerInstance latch detects the cache-server UID transition
+# and cascade-restarts every engine Deployment that owns pods carrying
+# this backend's inferencecache.io/injected-by annotation AND the
+# matching inferencecache.io/injected-by-uid (the UID half rejects
+# forgeries and stale name-reuse), by patching
+# AnnotationCacheServerRestartTrigger onto the Deployment's pod template
+# (the same mechanism kubectl rollout restart uses).
+#
+# This phase asserts the end-to-end loop on the real install:
+#   - status.observedServerInstance picks up the current cache-server
+#     server-instance identifier (`<pod-uid>:<restart-sum>`) after the
+#     initial rollout (no cascade — first observation never cascades).
+#   - Forcing a cache-server pod restart flips observedServerInstance
+#     to the replacement's server-instance identifier.
+#   - The engine Deployment's spec.template.metadata.annotations gets
+#     the cascade trigger set to that new identifier — proving the
+#     loop closed against the installed RBAC + actual apiserver Patch,
+#     not just envtest.
+#
+# Must run BEFORE the drift case below, which scales the engine to 0:
+# with no engine pod present, no injected-by annotations remain in the
+# namespace, so the cascade would find no Deployments to annotate.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the initial cache-server pod to publish status.observedServerInstance"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+baseline_server_instance=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  baseline_server_instance=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
+  if [ -n "$baseline_server_instance" ]; then break; fi
+  sleep 2
+done
+if [ -z "$baseline_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "status.observedServerInstance not populated within ${SAMPLE_CASCADE_TIMEOUT}s; cannot exercise the cache-server restart cascade"
+fi
+log "baseline status.observedServerInstance=$baseline_server_instance"
+
+# Force-delete the cache-server pod to simulate the OOM / restart trigger.
+# The Deployment controller recreates it with a fresh UID.
+cache_pod=$(kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [ -z "$cache_pod" ]; then
+  fail "no cache-server pod labeled app.kubernetes.io/instance=qwen-demo-cache found in $SAMPLE_NS"
+fi
+log "deleting cache-server pod $cache_pod to simulate restart"
+# Don't mask the delete with `|| true` — a failed trigger here would
+# silently look like the cascade isn't firing, which would be
+# diagnosed as a controller bug instead of a smoke-script failure.
+if ! kubectl -n "$SAMPLE_NS" delete pod "$cache_pod" \
+     --force --grace-period=0 >/dev/null 2>&1; then
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "failed to delete cache-server pod $cache_pod to simulate restart"
+fi
+
+# Wait for the controller to observe the new pod and update the latch.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for status.observedServerInstance to flip to the replacement's server-instance identifier"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+new_server_instance=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  cur=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
+  if [ -n "$cur" ] && [ "$cur" != "$baseline_server_instance" ]; then
+    new_server_instance="$cur"
+    break
+  fi
+  sleep 2
+done
+if [ -z "$new_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "status.observedServerInstance did not advance past $baseline_server_instance within ${SAMPLE_CASCADE_TIMEOUT}s"
+fi
+log "status.observedServerInstance flipped: $baseline_server_instance → $new_server_instance"
+
+# Assert the engine Deployment's pod template carries the cascade trigger
+# annotation set to the new server-instance identifier (the same value the
+# controller wrote to status.observedServerInstance). The annotation is
+# the mechanism that drives the rolling restart, so its absence here is
+# a missed cascade.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the engine Deployment to receive the cascade trigger annotation"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+trigger=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  trigger=$(kubectl -n "$SAMPLE_NS" get deploy qwen-engine \
+    -o jsonpath='{.spec.template.metadata.annotations.inferencecache\.io/cache-server-restart-trigger}' \
+    2>/dev/null || true)
+  if [ "$trigger" = "$new_server_instance" ]; then break; fi
+  sleep 2
+done
+if [ "$trigger" != "$new_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-engine -o yaml || true
+  fail "engine Deployment cascade trigger=$trigger, want $new_server_instance (the cache-server restart did not cascade)"
+fi
+log "engine Deployment qwen-engine carries inferencecache.io/cache-server-restart-trigger=$trigger"
+
 # --- drift case: cadence-driven Matched → 0 --------------------------------
 # Scale engine to 0; force-delete to avoid the (terminating) pod still
 # being label-visible to the reconciler's pod List for an extended
@@ -1886,12 +2003,13 @@ esac
 # The audience-binding section above asserts /probe returned HTTP 200 with the
 # controller-audience token, but a deployed handler can also return 200 with a
 # per-stage `failed`. This section drives one authenticated /probe call,
-# captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped
-# (the default Stage-1 posture — no T2Prober is wired, so Stage C is always
-# skipped until the controller-wiring follow-up plumbs a real one). A
-# regression that flips ingest or routing to failed on a clean install
-# would be a clear signal that the cache-plane internal round-trip itself is
-# broken — exactly the class of bug the probe exists to catch.
+# captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped.
+# No T2Prober is wired into the server today, so Stage C always reports
+# skipped on a clean install — when one is plumbed in, this assertion
+# tightens to t2=ok. A regression that flips ingest or routing to failed
+# on a clean install would be a clear signal that the cache-plane
+# internal round-trip itself is broken — exactly the class of bug the
+# probe exists to catch.
 log "asserting authenticated /probe returns ingest=ok, routing=ok, t2=skipped"
 PROBE_RESULT_POD="ic-probe-result"
 kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true

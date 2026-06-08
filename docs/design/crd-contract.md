@@ -47,7 +47,7 @@ Every **spec-reconciled** CRD that carries a status follows the same three rules
 
 | Status | Field(s) | Writer |
 |---|---|---|
-| `CacheBackend.status` | `matchedEnginePods`, `conditions`, `firstKVEventObservedAt`, `firstAvailableAt`, `endpoint`, `failOpen` | CacheBackend reconciler |
+| `CacheBackend.status` | `matchedEnginePods`, `conditions`, `firstKVEventObservedAt`, `firstAvailableAt`, `observedServerInstance`, `endpoint`, `failOpen`, `capacity`, `observedGeneration` | CacheBackend reconciler |
 | `CacheBackend.status` | `indexParticipation` | CacheIndex snapshot poller |
 | `CachePolicy.status` | `conditions`, `observedGeneration` (reserved) | — (see note) |
 | `CacheTenant.status` | `indexEntries`, `conditions`, `observedGeneration` | CacheIndex snapshot poller (per-tenant projection of `/snapshot`) |

@@ -640,6 +640,34 @@ type CacheBackendStatus struct {
 	// +optional
 	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
 
+	// ObservedServerInstance is the controller's cascade-decision
+	// baseline — a stable identifier for the Ready cache-server pod
+	// set the controller last anchored against. NOT a live current-
+	// pod-set view: the controller intentionally pins this through
+	// transient rolling-update midpoints and through no-Ready
+	// windows so the cascade does not fire on rollbacks or transient
+	// outages. For the live pod inventory, operators should consult
+	// status.matchedEnginePods (engine side) and `kubectl get pod`
+	// (cache-server side).
+	//
+	// Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
+	// and lex-sorted by pod name. restart-sum is the per-pod
+	// containerStatuses[].RestartCount summed across cache-server
+	// containers (the names from the owned Deployment's pod
+	// template; foreign sidecars are excluded). Inert and cleared
+	// for External backends, unsupported-runtime backends, and on
+	// the InvalidStorageConfiguration gate (a persistent
+	// multi-replica spec the controller refuses to provision until
+	// the operator scales to 1 or removes spec.storage.pvc).
+	//
+	// Operator-side recovery for the upstream LMCache
+	// LMServerConnector EPIPE-on-restart bug. See
+	// docs/design/cachebackend-api.md for the cascade contract,
+	// transition rules (which changes do / do not cascade), and
+	// rate-limit / no-Ready / rollback / scale-up rationale.
+	// +optional
+	ObservedServerInstance string `json:"observedServerInstance,omitempty"`
+
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups
 	// the server's /snapshot replicas by the owning CacheBackend and projects
