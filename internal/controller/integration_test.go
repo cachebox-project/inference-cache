@@ -125,7 +125,9 @@ type getObservingClient struct {
 
 func (c *getObservingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	err := c.Client.Get(ctx, key, obj, opts...)
-	if err == nil && c.onGet != nil {
+	if c.onGet != nil {
+		// Record attempts, including NotFound, so the watch drain sees stale
+		// queued reconciles that would recreate a deleted child.
 		c.onGet(types.NamespacedName(key), obj)
 	}
 	return err
