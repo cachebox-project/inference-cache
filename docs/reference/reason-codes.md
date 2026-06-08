@@ -49,12 +49,17 @@ module — until then, treat `NO_HINT` as the only `LookupPDRoute` answer.
 ### Ranking inputs beyond `matched_tokens × freshness`
 
 The server-side ranker (`pkg/index`) is configurable via `RankerConfig` (in-
-binary knobs) and `CachePolicy.spec` (per-namespace knobs). Each in-binary
-knob defaults to a value that reduces the score to the baseline when its
-supporting signal is absent — so a deployment without replica stats or SLO
-hints behaves exactly like the original B6 ranker. The cardinality-aware
-distinguishing-power factor is always on for multi-replica deployments and
-degrades to 1.0 for single-replica deployments (no per-knob disable).
+binary knobs) and `CachePolicy.spec` (per-namespace knobs). Each `RankerConfig`
+knob defaults to a value that reduces the **pressure / SLO** layers to the
+baseline when its supporting signal is absent — so a deployment without replica
+stats or SLO hints sees `pressure_factor = 1` and `slo_bias = 1`. The
+cardinality-aware distinguishing-power factor is always on for multi-replica
+deployments (no per-knob disable; degrades to `1.0` only for single-replica
+deployments), and the two result-side floors (`minimumMatchedTokens`,
+`routingFloorScore`) still apply on top — see the `CachePolicy.spec` rows
+below for their opt-outs. So a deployment without replica stats or SLO hints
+behaves like the original B6 baseline **on the pressure/SLO factors only**;
+the cardinality factor and both floors still run.
 
 | Knob | What it does | Default | Off switch |
 |---|---|---|---|

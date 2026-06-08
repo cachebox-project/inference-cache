@@ -856,6 +856,31 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// Captured under the read lock so it's consistent with the prefixes
 	// view this lookup observes.
 	//
+	// Definition caveat — "total replicas" means "replicas with at least
+	// one prefix entry in the requested scope," not "replicas serving the
+	// scope." servingByScope is incremented by upsertReplicaLocked when a
+	// replica's first prefix entry lands in the scope; it tracks the set
+	// of replicas the index has observed reporting state in the scope.
+	// A replica that's part of the cluster but has not reported a prefix
+	// in this (tenant, model, hash_scheme) — e.g. just started, just
+	// cleared its cache, or is serving a different scope — is invisible
+	// to the index and so absent from the denominator. Two consequences:
+	//   - 2-of-3 partial-diffusion case (replicas r0, r1 hold the prefix;
+	//     r2 has reported no prefix in scope) is scored 2-of-2 → factor
+	//     0 → downgrade. This is the right answer from the cache plane's
+	//     limited view: r2 is invisible, so the cache plane has no
+	//     evidence r2 is a peer. Treating r2 as a peer (factor 0.33)
+	//     would require speculating about replicas the cache plane has
+	//     not observed.
+	//   - "Total replicas in scope" semantics are eventually consistent
+	//     with the engine reporting state. The C1 kvevent subscriber
+	//     reports prefix and stats together on ReportCacheState, so a
+	//     production engine that's been running for one TTL cycle will
+	//     appear in servingByScope reliably. The visible-only edge case
+	//     is benign for the steady-state regime and explicitly tested
+	//     by TestLookupExactNonZeroDistinguishingWhenOneOfThreeHoldsPrefix
+	//     (the "decoy replica holds OTHER prefix in scope" shape).
+	//
 	// Soft-state caveat — KNOWN bounded limitation. servingByScope is
 	// decremented at TTL-sweep time (removeReplicaLocked /
 	// scopeDecLocked), not at every freshness check. A replica that has
@@ -1064,24 +1089,14 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 		})
 	}
 	// Cardinality denominator for the distinguishing-power factor: every
-	// replica serving this engine domain (tenant, model, hash_scheme).
+	// replica with at least one prefix entry in this engine domain
+	// (tenant, model, hash_scheme) — see the definition + soft-state
+	// caveats on lookupExact's totalReplicas declaration above for the
+	// full discussion of (a) replicas that are in the cluster but have
+	// not reported any prefix in scope being invisible to this counter,
+	// and (b) the TTL-sweep-window soft-state behavior.
 	// Captured BEFORE releasing the read lock so it stays consistent with
 	// the prefix view the chain walk just observed.
-	//
-	// Same KNOWN BOUNDED soft-state caveat as lookupExact (see the long
-	// comment there): servingByScope is decremented at TTL-sweep time, not
-	// at every freshness check, so a recently-stale replica can briefly
-	// inflate the denominator for up to one DefaultSweepInterval. The
-	// depth-aware factor for an overlap held by every currently-fresh
-	// replica can stay slightly above 0 instead of collapsing cleanly to
-	// 0 during that window, so a sub-trivial PREFIX_MATCH can briefly
-	// ship. Net: at worst one DefaultSweepInterval of inflated PREFIX_MATCH
-	// rate on a workload that's already trivial; never a wrong routing
-	// answer. Eventually consistent: the next sweep tick removes the stale
-	// denominator entry and the routing-floor catches the next-tick
-	// lookup. A correct-by-construction fix would maintain a separate
-	// per-scope fresh-replica counter updated lazily on the sweep; out of
-	// scope for this PR.
 	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
 

@@ -222,10 +222,25 @@ intervention.
 - `policies[].routingFloorScore` — float32 pointer (omitempty). Optional.
   A nil/missing field is normalized to `DefaultRoutingFloorScore` (`0.1`)
   for v3 and v4 bodies (see Rollout asymmetry below). v5 bodies are NOT
-  normalized — a v5 controller that wants the safety floor leaves the
-  field nil and the server-side resolver `PolicyStore.RoutingFloorScore`
-  falls back to `DefaultRoutingFloorScore`; a v5 controller that wants
-  the explicit opt-out sends `&0` and the store records 0 byte-for-byte.
+  normalized; the v5 wire field can take three shapes:
+  - **Normal CRD-defaulted shape (the common case).** The CRD has a
+    `+kubebuilder:default="0.1"` marker, so an admitted CachePolicy
+    always carries a non-nil `spec.routingFloorScore`. The controller
+    flattens that to a non-nil `*float32` (e.g. `&0.1`) and sends it on
+    the wire. v5 bodies in production traffic look like this.
+  - **Explicit opt-out.** An operator setting
+    `spec.routingFloorScore: "0"` reaches the wire as `&0` (omitempty
+    on float32 *pointer* preserves `&0`; the zero-value case it
+    suppresses is the nil pointer). The store records `0` byte-for-byte
+    and the resolver returns `0`, disabling the floor.
+  - **Bare/manual body.** A hand-crafted /policy POST, a legacy CR that
+    predates the field, or any path that omits the field altogether
+    reaches the store as nil. The resolver `PolicyStore.RoutingFloorScore`
+    treats nil as the safety-default case and returns
+    `DefaultRoutingFloorScore`. This is the same effective behavior as
+    no CachePolicy at all, just routed through the
+    "CachePolicy-installed-but-field-absent" branch.
+
   A namespace that does NOT have a `CachePolicy` at all falls back to
   `DefaultRoutingFloorScore`.
   Distinct from `minimumMatchedTokens`: that's a result-side filter on
