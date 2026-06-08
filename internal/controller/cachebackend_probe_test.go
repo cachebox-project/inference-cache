@@ -752,6 +752,50 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 	}
 }
 
+// TestStageReasonAndMessageUnrecognizedIncludesRawValues pins the
+// alerting-contract symmetry: when the per-stage outcomes are empty or a
+// future unrecognized string, the operator-facing condition message MUST
+// embed the raw per-stage strings verbatim. recordProbeResult coerces
+// such values to result="failed" on the metric side, so ServerProbeFail
+// pages; the docs (recordProbeResult godoc, alerts.md runbook) claim
+// the raw wire string is preserved on the condition for diagnosis. This
+// test pins that claim.
+func TestStageReasonAndMessageUnrecognizedIncludesRawValues(t *testing.T) {
+	cases := []struct {
+		name           string
+		ingest         cacheserver.ProbeStageResult
+		routing        cacheserver.ProbeStageResult
+		t2             cacheserver.ProbeStageResult
+		expectContains []string // substrings the operator-facing message MUST include
+	}{
+		{
+			name:   "empty body — all three stages",
+			ingest: "", routing: "", t2: "",
+			expectContains: []string{`ingest=""`, `routing=""`, `t2=""`, "unrecognized"},
+		},
+		{
+			name:   "unrecognized future outcome on one stage",
+			ingest: cacheserver.ProbeStageResult("throttled"), routing: cacheserver.ProbeStageOK, t2: cacheserver.ProbeStageSkipped,
+			expectContains: []string{`ingest="throttled"`, `routing="ok"`, `t2="skipped"`, "unrecognized"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, msg := stageReasonAndMessage(cacheserver.ProbeResult{
+				Ingest: tc.ingest, Routing: tc.routing, T2: tc.t2,
+			})
+			if reason != reasonProbeError {
+				t.Errorf("reason = %q, want %q", reason, reasonProbeError)
+			}
+			for _, want := range tc.expectContains {
+				if !strings.Contains(msg, want) {
+					t.Errorf("message does not contain %q; got: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
 // TestEvaluateFunctionalProbeContextCancellation pins ctx propagation: a
 // cancelled context surfaces as an HTTP error (Unknown), not a panic or a
 // silent True.

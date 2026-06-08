@@ -262,10 +262,12 @@ func (e *T2ProbeError) Unwrap() error {
 // CacheEvent_ALL_CLEARED for its reserved replica id so the probe leaves
 // the index empty of its own state.
 //
-// This file ships Prober with t2=nil — every backend reports T2=skipped until
-// the controller wiring follow-up plumbs a real T2Prober through. The
-// controller integration is the only consumer that's not yet present; the
-// HTTP /probe handler + the tests in this package are the live callers today.
+// This file ships Prober with t2=nil — every backend reports T2=skipped
+// until a follow-up plumbs a real T2Prober through (e.g. an LMCache
+// put/get client). The controller integration IS live (see
+// internal/controller/cachebackend_probe.go); the HTTP /probe handler is
+// hit on every reconcile + the tests in this package are the other live
+// callers today.
 type Prober struct {
 	index *index.Index
 	t2    T2Prober
@@ -277,9 +279,10 @@ type Prober struct {
 	// race — probes for DIFFERENT backends synthesize under DIFFERENT
 	// __probe- replica ids and never collide. Without this, two overlapping
 	// runs could see one's cleanup wipe the other's just-ingested entry mid-
-	// flight and report a false subscriber/routing failure. The controller-
-	// wiring follow-up additionally rate-limits to ~once per backend per 30s,
-	// so contention here is rare in practice — the lock is the correctness
+	// flight and report a false subscriber/routing failure. The CacheBackend
+	// reconciler additionally rate-limits to ~once per backend per 30s
+	// (see internal/controller/cachebackend_probe.go probeRateLimiter), so
+	// contention here is rare in practice — the lock is the correctness
 	// backstop for the no-rate-limit case (tests, hand-invoked probes,
 	// future fast reconcile cycles).
 	//
@@ -308,7 +311,9 @@ type Prober struct {
 
 // NewProber wires a probe orchestrator to the live index + an optional
 // T2Prober. Passing nil for t2 disables Stage C (the probe always reports
-// T2=skipped); the controller-wiring follow-up passes a real implementation.
+// T2=skipped); the server boots with t2=nil today and a follow-up that
+// implements a real T2Prober (e.g. an LMCache put/get client) will pass
+// one in.
 //
 // The probe routes through idx.Ingest like every other writer; the
 // "no real-workload eviction" invariant is upheld by configuring the

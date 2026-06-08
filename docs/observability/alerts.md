@@ -20,17 +20,25 @@ There are two distribution shapes, same rule set, drift-gated by
   kubectl apply -k config/observability
   ```
 
-  Ships TWO CRs together — `kubectl apply -k` applies both:
+  Ships THREE CRs together — `kubectl apply -k` applies all three:
   1. A [`ServiceMonitor`](../../config/observability/servicemonitor.yaml)
      that tells Prometheus to scrape `inference-cache-server:8080/metrics`.
      Without this, kube-prometheus installs will load the rules but
-     never collect the `inferencecache_*` series the rules read —
-     `prometheus.io/scrape` annotations are commonly ignored in favor of
-     explicit `ServiceMonitor` / `PodMonitor` CRs.
-  2. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
+     never collect the server-side `inferencecache_*` series the rules
+     read — `prometheus.io/scrape` annotations are commonly ignored in
+     favor of explicit `ServiceMonitor` / `PodMonitor` CRs.
+  2. A [`PodMonitor`](../../config/observability/podmonitor.yaml) that
+     tells Prometheus to scrape the controller pod's `:8080/metrics`.
+     Required for the controller-side alerts (`ServerProbeFail` reads
+     `inferencecache_backend_probe_result_total`, which the
+     CacheBackend reconciler emits; the existing
+     `inferencecache_backend_server_restart_cascades_total` is also
+     controller-emitted). Without this, those rules load but never
+     have a series to evaluate.
+  3. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
      carrying the alerts.
 
-  Both CRs are pinned to namespace `inference-cache-system`. The
+  All three CRs are pinned to namespace `inference-cache-system`. The
   example selector labels each CR carries are:
   - `PrometheusRule` →
     `prometheus: k8s`, `role: alert-rules` (matched by
@@ -38,16 +46,19 @@ There are two distribution shapes, same rule set, drift-gated by
   - `ServiceMonitor` →
     `prometheus: k8s` (matched by
     `Prometheus.spec.serviceMonitorSelector`).
+  - `PodMonitor` →
+    `prometheus: k8s` (matched by
+    `Prometheus.spec.podMonitorSelector`).
 
-  Both target the **upstream kube-prometheus stack**, whose default
+  All three target the **upstream kube-prometheus stack**, whose default
   `Prometheus` is named `k8s`. The `prometheus-community/kube-prometheus-stack`
   Helm chart uses a DIFFERENT convention — its selector matches
   `release: <helm-release-name>` (no `prometheus:` label). Custom
   Prometheus CRs use whatever their `ruleSelector` /
-  `serviceMonitorSelector` specifies. If your install uses a different
-  label set, edit each CR's labels to match — the YAML comments next
-  to each label spell out the exact `kubectl get prometheus -A -o
-  jsonpath=...` introspection command.
+  `serviceMonitorSelector` / `podMonitorSelector` specifies. If your
+  install uses a different label set, edit each CR's labels to match —
+  the YAML comments next to each label spell out the exact
+  `kubectl get prometheus -A -o jsonpath=...` introspection command.
 
   > **Heads-up — Prometheus may scope rule discovery by namespace.** Most
   > prometheus-operator installs run a `Prometheus` CR with both a
@@ -134,9 +145,11 @@ alerts](#deferred-alerts) below).
 >       interval: 30s
 > ```
 >
-> The other four alerts work as-is once this bundle is applied — they
+> The other five alerts work as-is once this bundle is applied — they
 > only read `inferencecache_*` series, which the shipped ServiceMonitor
-> already scopes to `inference-cache-server`.
+> (server-side: `IndexEmpty`, `LookupRouteDegenerate`,
+> `LookupRouteHighTimeout`, `IndexEvictionsSpike`) and PodMonitor
+> (controller-side: `ServerProbeFail`) cover between them.
 >
 > **The alerts rely on a `namespace` label per install.** Both the shipped
 > `ServiceMonitor` for `inference-cache-server` and any prometheus-operator

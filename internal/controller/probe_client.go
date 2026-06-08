@@ -16,16 +16,31 @@ import (
 	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
 )
 
-// ProbeClient is the controller's POST /probe wrapper. It mirrors the
-// CacheIndexPoller/ControlPlaneReconciler bearer-token + HTTP shape so all three
-// controller↔server bridge calls share one identity, one token source, and one
-// error posture. Unlike those two, /probe is per-CacheBackend rather than
-// cluster-wide, so this client is invoked from inside the CacheBackend reconciler
-// (not a separate Runnable/Reconciler loop).
+// ProbeClient is the controller's POST /probe wrapper. It shares the
+// bearer-token + HTTP shape used by CacheIndexPoller and ControlPlaneReconciler
+// so all three controller↔server bridge calls have one identity, one token
+// source, and the same auth profile on the server side. Two intentional
+// differences from those two siblings:
 //
-// All fields are optional. A zero value (nil/empty) is treated as the local-dev
-// default — no probe call is issued and the caller skips the gate. The
-// production binary wires every field via cmd/controller/main.go.
+//   - /probe is per-CacheBackend rather than cluster-wide, so this client is
+//     invoked from inside the CacheBackend reconciler (not a separate
+//     Runnable/Reconciler loop).
+//   - An unreadable token file (mounted but ReadFile fails — corrupted secret,
+//     permission flip) returns an error from Run instead of being logged and
+//     proceeding unauthenticated. The reconciler surfaces that error as
+//     FunctionalProbeOK=Unknown/ProbeError on the affected CR (operator-
+//     visible), where the sibling clients' log-and-continue posture would
+//     leave the bad-token symptom invisible until an unrelated 401 burst
+//     appears in /metrics. An absent token file (the local-dev case) still
+//     matches the siblings — empty Authorization header, server's 401
+//     surfaces as the same non-2xx path.
+//
+// All fields are optional and have sensible defaults; the production binary
+// only sets ProbeURL via cmd/controller/main.go's --server-probe-url flag —
+// BearerTokenPath falls back to DefaultBearerTokenPath and HTTPClient falls
+// back to a 5s-timeout default. A zero value (ProbeURL=="") is treated as
+// the local-dev default — no probe call is issued and the caller skips the
+// gate.
 type ProbeClient struct {
 	// ProbeURL is the fully-qualified URL of the server's /probe endpoint,
 	// e.g. http://inference-cache-server:8081/probe. An empty value disables

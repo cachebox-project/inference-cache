@@ -485,9 +485,21 @@ func stageReasonAndMessage(result cacheserver.ProbeResult) (string, string) {
 		return reasonProbeT2Failed, errorMessageForStage(result, cacheserver.ProbeStageT2, "tier-2 put/get cycle failed")
 	}
 	// Defensive: AllPassed already returned false but no individual stage
-	// is `failed` — a future addition (a fourth stage) would hit this
-	// branch until the switch is updated.
-	return reasonProbeError, "probe reported a failure with no recognized stage"
+	// is `failed`. Two ways this happens in practice:
+	//   1. An empty/malformed 200 body (every stage is the zero-value
+	//      empty string — AllPassed treats that as non-passing).
+	//   2. A future server emits a stage outcome string this controller
+	//      hasn't learned yet (e.g. "throttled") on one or more stages.
+	//
+	// The metric path coerces both into result="failed" so ServerProbeFail
+	// pages, but the operator-visible message needs the raw per-stage
+	// strings — those are the only diagnostic the controller has when
+	// the server didn't populate the Errors slice. Format mirrors the
+	// stage-name ordering in cacheserver.ProbeResult.
+	return reasonProbeError, fmt.Sprintf(
+		"probe returned an unrecognized stage outcome (ingest=%q routing=%q t2=%q); upgrade the controller if a newer server has added stages",
+		string(result.Ingest), string(result.Routing), string(result.T2),
+	)
 }
 
 // errorMessageForStage looks up the stage's diagnostic message in the

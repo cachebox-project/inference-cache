@@ -229,7 +229,7 @@ groups:
         # (so the increase window must stay ≥2 for the whole dwell), so a
         # real sustained breakage pages while a one-off does not.
         expr: |
-          sum by (backend, stage) (
+          sum by (namespace, backend, stage) (
             increase(inferencecache_backend_probe_result_total{result="failed"}[5m])
           ) >= 2
         for: 5m
@@ -237,7 +237,7 @@ groups:
           severity: critical
           component: inference-cache
         annotations:
-          summary: "Synthetic CacheBackend probe failing on {{ $labels.backend }} (stage={{ $labels.stage }})."
+          summary: "Synthetic CacheBackend probe failing on {{ $labels.backend }} in namespace {{ $labels.namespace }} (stage={{ $labels.stage }})."
           runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
 
   # ----------------------------------------------------------------------------

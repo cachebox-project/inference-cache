@@ -23,16 +23,17 @@
 # Deliberately not aggregated into `config/default` so the default install
 # stays usable on clusters without prometheus-operator CRDs installed.
 #
-# Both CRs are pinned to `inference-cache-system` (the operator namespace)
-# so they land somewhere a typical prometheus-operator install's
-# `ruleNamespaceSelector` / `serviceMonitorNamespaceSelector` already
-# scans. If your Prometheus CR watches a different namespace (e.g.
-# `monitoring`), override here:
+# All three CRs are pinned to `inference-cache-system` (the operator
+# namespace) so they land somewhere a typical prometheus-operator
+# install's `ruleNamespaceSelector` / `serviceMonitorNamespaceSelector`
+# / `podMonitorNamespaceSelector` already scans. If your Prometheus CR
+# watches a different namespace (e.g. `monitoring`), override here:
 #
 #   namespace: monitoring
 #
-# Note on the LMCacheT2NoHits alert: this overlay scrapes only the
-# inference-cache-server. That alert ALSO reads vLLM's
+# Note on the LMCacheT2NoHits alert: this overlay scrapes
+# inference-cache-server (via servicemonitor.yaml) and the controller
+# pod (via podmonitor.yaml). The LMCacheT2NoHits alert ALSO reads vLLM's
 # `vllm:external_prefix_cache_*` series, which live on engine pods.
 # Operators must wire a separate ServiceMonitor / PodMonitor for vLLM
 # pods, or rely on Prometheus's `kubernetes_sd_configs: pod`, for that

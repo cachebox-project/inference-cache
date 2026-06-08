@@ -401,10 +401,50 @@ tests:
           - exp_labels:
               severity: critical
               component: inference-cache
+              # `namespace` MUST be preserved — it scopes per install in a
+              # shared Prometheus. Dropping it (sum by (backend, stage)
+              # alone) would collapse identical backend names across
+              # installs into one series, matching the other alerts'
+              # per-install isolation contract.
+              namespace: inference-cache-system
               backend: inference-cache-system/sample
               stage: ingest
             exp_annotations:
-              summary: "Synthetic CacheBackend probe failing on inference-cache-system/sample (stage=ingest)."
+              summary: "Synthetic CacheBackend probe failing on inference-cache-system/sample in namespace inference-cache-system (stage=ingest)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
+
+  - interval: 30s
+    # Two installs with the SAME backend name in different namespaces
+    # MUST produce two distinct alerts when both fail — collapsing them
+    # would lose the per-install isolation the other alerts already
+    # honor (regression-test for the `namespace` label preservation).
+    name: ServerProbeFail keeps installs separate when backend names collide
+    input_series:
+      - series: 'inferencecache_backend_probe_result_total{namespace="install-a",backend="inference-cache-system/sample",stage="ingest",result="failed"}'
+        values: '0+1x40'
+      - series: 'inferencecache_backend_probe_result_total{namespace="install-b",backend="inference-cache-system/sample",stage="ingest",result="failed"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ServerProbeFail
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: inference-cache
+              namespace: install-a
+              backend: inference-cache-system/sample
+              stage: ingest
+            exp_annotations:
+              summary: "Synthetic CacheBackend probe failing on inference-cache-system/sample in namespace install-a (stage=ingest)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
+          - exp_labels:
+              severity: critical
+              component: inference-cache
+              namespace: install-b
+              backend: inference-cache-system/sample
+              stage: ingest
+            exp_annotations:
+              summary: "Synthetic CacheBackend probe failing on inference-cache-system/sample in namespace install-b (stage=ingest)."
               runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
 
   - interval: 30s

@@ -1827,11 +1827,13 @@ esac
 # controller-auth profile as /snapshot and /policy. The complementary
 # UNAUTHENTICATED-rejection half is what this section checks — a regression
 # that wired /probe outside the shared auth profile would let any pod that
-# can reach :8081 drive a synthetic round-trip (and, once the controller-
-# wiring follow-up lands, observe the resulting Ready transitions). Sends a
-# valid ProbeRequest body so the rejection cannot be misattributed to a 400;
-# the only valid outcomes are 401 (auth) or curl_failed:28 (NetworkPolicy
-# drop under an enforcing CNI). Mirror of the /policy probe above.
+# can reach :8081 drive a synthetic round-trip AND, since the CacheBackend
+# reconciler now consumes the result to publish FunctionalProbeOK and
+# downgrade Ready, observe (or trigger forged) Ready transitions on every
+# managed backend. Sends a valid ProbeRequest body so the rejection cannot
+# be misattributed to a 400; the only valid outcomes are 401 (auth) or
+# curl_failed:28 (NetworkPolicy drop under an enforcing CNI). Mirror of the
+# /policy probe above.
 log "asserting unauthenticated /probe POST from a side pod is rejected"
 SIDE_POD_PROBE="ic-probe-probe"
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
