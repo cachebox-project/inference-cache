@@ -375,10 +375,25 @@ For each scored replica `R`, the ranker multiplies the score by
 distinguishing_power_R = 1 - num_matching_at_R's_depth / total_replicas
 ```
 
-- **`total_replicas`** is the count of replicas serving the request's
-  engine domain (`tenant`, `model`, `hash_scheme`), captured from the
-  per-scope serving counter under the index read lock so it stays
-  consistent with the prefixes view the lookup just observed.
+- **`total_replicas`** is the count of replicas with **at least one
+  prefix entry observed** in the request's engine domain (`tenant`,
+  `model`, `hash_scheme`), captured from the per-scope serving counter
+  under the index read lock so it stays consistent with the prefixes
+  view the lookup just observed. **Important definition caveat:** a
+  replica that's running in the cluster but has not (yet) reported any
+  prefix in this scope — just started, just cleared its cache, or
+  serves a different scope — is invisible to the index and therefore
+  absent from this denominator. Consequence: a 2-of-3 partial-diffusion
+  case where two replicas hold the prefix and the third has reported no
+  prefix in scope is scored as 2-of-2 (factor `0`) and downgrades; the
+  cache plane has no evidence the third replica is a peer. This matches
+  the rest of the index — `TENANT_HOT` warmth, `servingByScope` scope
+  checks, and the `UNKNOWN_*` miss classifier all use the same
+  "observed via reported state" definition. Production engines (the C1
+  KV-event subscriber reports prefix and stats together on
+  `ReportCacheState`) appear in the denominator within one TTL cycle;
+  the visible-only edge case matters only briefly at cold start and
+  cache reset.
 - **`num_matching_at_R's_depth`** is per-replica:
   - For exact-match (single-blob path), every scored replica matched the
     same prefix hash so the value is `len(scores)` and the factor is

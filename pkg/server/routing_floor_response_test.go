@@ -13,29 +13,42 @@ import (
 // observable wire-side behavior the gateway sees: which reason_code
 // surfaces for the operator-meaningful workload shapes.
 
-// TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix is the
-// canonical case the design targets: three replicas all hold the
-// chat-template head, distinguishing_power = 0, every Score = 0. The
-// default floor catches the score=0 case and downgrades to NO_HINT — the
-// gateway sees an honest "no useful routing decision" instead of a
-// PREFIX_MATCH credit on content every replica already had.
+// TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix is
+// the canonical case the routing-floor-score design targets — the case
+// the matched-tokens floor CANNOT catch: three replicas all hold the
+// SAME LONG shared prefix (1500 tokens, e.g. a RAG corpus header or a
+// custom system prompt). With matched_tokens=1500, the per-replica
+// matched-tokens floor (default 64) is cleared by every replica — so
+// none get filtered. But distinguishing_power = 1 - 3/3 = 0, every score
+// = 0, and the post-score floor (DefaultRoutingFloorScore = 0.1) is what
+// downgrades the response to NO_HINT.
+//
+// This is the test that proves the new floor catches the workload shape
+// the existing matched-tokens floor was scoped to miss. Using a 1500-
+// token prefix (above the default 64-token matched-tokens floor) is
+// load-bearing here — a shorter prefix would be downgraded by the
+// matched-tokens floor before this code path runs, and the assertion
+// would pass for the wrong reason.
 func TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix(t *testing.T) {
 	svc := newTestService()
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
 			ReplicaID: rid, Model: "m", Tenant: "no-policy", HashScheme: "vllm",
-			Prefixes: []index.PrefixRef{{PrefixHash: []byte("chat"), TokenCount: 16}},
+			// 1500 tokens — clears the default matched-tokens floor (64)
+			// comfortably; the only thing that can downgrade now is the
+			// distinguishing-power → score → routing-floor path.
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("rag-corpus-header"), TokenCount: 1500}},
 		})
 	}
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "m", TenantId: "no-policy", HashScheme: "vllm",
-		PrefixHash: []byte("chat"),
+		PrefixHash: []byte("rag-corpus-header"),
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() != "NO_HINT" {
-		t.Fatalf("reason = %q, want NO_HINT — all replicas hold the prefix, distinguishing_power=0, score=0 < default floor", resp.GetReasonCode())
+		t.Fatalf("reason = %q, want NO_HINT — all replicas hold the prefix, 1500 tokens clears the matched-tokens floor, distinguishing_power=0, score=0 < routing floor (so ONLY the routing-floor-score path can produce this downgrade)", resp.GetReasonCode())
 	}
 	if len(resp.GetReplicaScores()) != 0 {
 		t.Fatalf("scores must be empty on downgrade, got %+v", resp.GetReplicaScores())
