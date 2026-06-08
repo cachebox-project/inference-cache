@@ -307,15 +307,20 @@ func (r *LookupResult) RetainReplicas(keep map[string]bool) {
 
 // RankerConfig tunes the pressure / SLO / tenant-hot strategies layered on
 // the baseline matchedTokens × freshness score. Zero-valued knobs collapse
-// the formula back to the baseline — so the new ranker is safe to leave
-// enabled even when stats are absent or SLO is unspecified.
+// those layers back to the baseline — so they're safe to leave enabled
+// even when stats are absent or SLO is unspecified. The cardinality-aware
+// distinguishingPower factor (PREFIX_MATCH path only) is always on for
+// multi-replica deployments and degrades to 1.0 for single-replica
+// deployments; no per-knob disable. See lookuproute-ranking.md §2.7.
 //
-// Concretely:
+// Concretely (PREFIX_MATCH path):
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
-//	pressureFactor = max(0, 1 - PressureWeight × pressure)         // 1 when no stats
-//	sloBias        = 1 + freshness × SLOTightBias                  // when TTFT tight
-//	               = 1                                              // otherwise
+//	score              = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
+//	pressureFactor     = max(0, 1 - PressureWeight × pressure)             // 1 when no stats
+//	sloBias            = 1 + freshness × SLOTightBias                      // when TTFT tight
+//	                   = 1                                                  // otherwise
+//	distinguishingPower = 1 - num_matching_at_depth / total_replicas        // when total_replicas ≥ 2
+//	                   = 1                                                  // single-replica deployment
 //
 // PressureWeight = 0 disables the penalty (pressureFactor=1). SLOTightBias
 // = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables only
@@ -770,8 +775,11 @@ func (i *Index) ApplyEvent(ev Event) {
 // Lookup returns replicas holding the requested prefix, ranked by the
 // ranking-v2 score:
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
+//	score = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
 //
+// distinguishingPower is `1 - num_matching_at_depth / total_replicas` for
+// multi-replica deployments (per-replica depth-aware for chain matches —
+// see lookuproute-ranking.md §2.7), `1.0` for single-replica.
 // pressureFactor folds in ReplicaStats.Pressure when the replica has stats
 // reported in this (tenant, model) (otherwise 1 — a replica with no stats
 // is treated as unloaded). sloBias kicks in when the request's TTFT budget

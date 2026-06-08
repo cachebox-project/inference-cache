@@ -50,11 +50,12 @@ kind: CachePolicy
 metadata:
   name: cachepolicy-sample
 spec:
-  eviction: LFU             # keep frequently-used prefixes under cap pressure
-  evictionTTL: 30m          # drop entries older than 30m since last REPORT
-  minimumPrefixTokens: 32   # short prompts short-circuit to NO_HINT (request-side gate)
-  minimumMatchedTokens: 64  # downgrade trivial overlaps to NO_HINT (result-side floor, default 64)
-  lookupTimeoutMs: 20       # positive => a real 20ms deadline (NOT 0 — see Gotchas)
+  eviction: LFU              # keep frequently-used prefixes under cap pressure
+  evictionTTL: 30m           # drop entries older than 30m since last REPORT
+  minimumPrefixTokens: 32    # short prompts short-circuit to NO_HINT (request-side gate)
+  minimumMatchedTokens: 64   # filter sub-floor replicas per-replica; NO_HINT if all drop (result-side matched-tokens floor, default 64)
+  routingFloorScore: "0.1"   # downgrade whole response to NO_HINT when top score is below floor (result-side score floor, default "0.1")
+  lookupTimeoutMs: 20        # positive => a real 20ms deadline (NOT 0 — see Gotchas)
 ```
 
 A copy-pasteable starting point ships at

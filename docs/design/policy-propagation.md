@@ -4,8 +4,8 @@ Status: implemented · Owners: controller (push) + server (apply)
 
 `CachePolicy` is a namespaced CRD reconciled by the controller, but its
 enforcement (eviction TTL, eviction algorithm, request-side prefix-length
-gate, result-side matched-tokens floor, lookup deadline) lives in the
-policy server. This document describes how the controller PROPAGATES the
+gate, result-side matched-tokens floor, result-side routing-floor score,
+lookup deadline) lives in the policy server. This document describes how the controller PROPAGATES the
 declarative CRs into the server's runtime so the configuration surface
 actually changes server behavior.
 
