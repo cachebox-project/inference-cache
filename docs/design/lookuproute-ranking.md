@@ -204,21 +204,34 @@ Walking the chain:
 | at `h4`   | *(empty — A doesn't hold h4)* → stop walking          | `+ A: {tok=192, oldest=1m}`                |
 
 Scoring each finalized replica (no pressure/SLO, TTL = 30 min, so
-`freshness = 1 − age/30m`):
+`freshness = 1 − age/30m`). The §2.7 depth-aware distinguishing-power
+factor also multiplies in: `num_matching_at_R's_depth` counts replicas
+whose `matched_tokens >= R.matched_tokens`. A is the only replica at
+192 tokens (factor `1 − 1/3 = 2/3`); B shares its 128-token depth with
+A (factor `1 − 2/3 = 1/3`); C's 64-token depth is reached by all three
+(factor `1 − 3/3 = 0`).
 
-| Replica | matched_tokens | freshness | score  | rank |
-|---------|----------------|-----------|--------|------|
-| `A`     | 192            | 0.97      | 186.2  | 1    |
-| `B`     | 128            | 0.93      | 119.5  | 2    |
-| `C`     | 64             | 0.87      | 55.7   | 3    |
+| Replica | matched_tokens | freshness | distinguishing_power | score  | rank |
+|---------|----------------|-----------|----------------------|--------|------|
+| `A`     | 192            | 0.97      | 2/3 ≈ 0.667          | 124.1  | 1    |
+| `B`     | 128            | 0.93      | 1/3 ≈ 0.333          | 39.7   | 2    |
+| `C`     | 64             | 0.87      | 0                    | 0      | 3    |
 
-Response: `reason_code: PREFIX_MATCH`, scores `[A (186), B (119),
-C (55)]` — the gateway routes to A for the deepest cache hit, with B as
-a hot backup if A is overloaded. Under the default §2.6 floor of 64 all
-three clear (A and B by a comfortable margin, C exactly at the
-boundary); raising `minimumMatchedTokens` to 128 would filter C out of
-the response and leave just `[A, B]`, illustrating the per-replica
-floor filter without changing the chain-walk numbers.
+Response: `reason_code: PREFIX_MATCH`, scores `[A (124), B (40), C (0)]`
+— the gateway routes to A for the deepest unique-hit, with B as a hot
+backup if A is overloaded. C's score is zero because every replica in
+the cluster matched at C's depth (the shared head block) — the
+distinguishing-power factor correctly identifies that C's contribution
+is uninformative for routing.
+
+Under the default §2.6 matched-tokens floor of 64, all three clear (A
+and B by a comfortable margin, C exactly at the boundary), so the §2.6
+filter doesn't drop anyone here. Under the default §2.7 routing-floor
+of `"0.1"`, A's top score 124 clears comfortably so the response ships
+as `PREFIX_MATCH`. Raising `minimumMatchedTokens: 128` would filter C
+out via the per-replica §2.6 filter (leaving `[A, B]`); raising
+`routingFloorScore: "200"` would downgrade the whole response to
+`NO_HINT` via the §2.7 whole-response gate (A's 124 falls below 200).
 
 ### Backward-compat — what an unmigrated producer or client sees
 

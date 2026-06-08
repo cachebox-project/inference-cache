@@ -454,12 +454,17 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Normalize older bodies so server-first rollouts (newer server, older
-		// controller still pushing v3) preserve every other knob a CR carries.
-		// v3 bodies have no minimumMatchedTokens on policies — JSON decodes the
-		// missing field to int32(0), which is indistinguishable from the v4
-		// explicit-zero opt-out. Fill in DefaultMinimumMatchedTokens so the
-		// post-rollout effective floor on a v3-carrying policy matches the
-		// no-CachePolicy fallback path PolicyStore.MinimumMatchedTokens uses.
+		// controller still pushing v3 or v4) preserve every other knob a CR
+		// carries. Today: v3 bodies have neither minimumMatchedTokens nor
+		// routingFloorScore; v4 bodies have the former but not the latter.
+		// JSON decodes the missing fields to their zero values
+		// (int32(0) / nil *float32), which would be indistinguishable from
+		// the v4/v5 explicit opt-outs. Fill in DefaultMinimumMatchedTokens
+		// and DefaultRoutingFloorScore so the post-rollout effective floors
+		// on a v3/v4-carrying policy match the no-CachePolicy fallback paths
+		// PolicyStore.MinimumMatchedTokens / PolicyStore.RoutingFloorScore
+		// use. See normalizePolicySnapshotForVersion below for the
+		// version-by-version field-by-field details.
 		normalizePolicySnapshotForVersion(&snap)
 		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
 		w.WriteHeader(http.StatusNoContent)
