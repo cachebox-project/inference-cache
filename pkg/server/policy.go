@@ -65,12 +65,18 @@ const DefaultMinimumMatchedTokens int32 = 64
 
 // DefaultRoutingFloorScore is the server-wide fallback the LookupRoute
 // handler applies to PREFIX_MATCH responses when no CachePolicy is installed
-// for the requesting tenant. Set just above zero — the distinguishing-power
-// factor collapses to 0 for the trivial-overlap shape (every replica holds
-// the prefix), producing score=0; any non-trivial routing decision sees a
-// score >> 1. Without this default the trivial-match-as-PREFIX_MATCH bug
-// would persist for every namespace that has not installed a policy CR.
-// Tunable per-namespace via CachePolicy.spec.routingFloorScore.
+// for the requesting tenant. Calibrated as a near-zero floor: the
+// distinguishing-power factor collapses to 0 for the trivial-overlap shape
+// (every replica holds the prefix), producing score=0; the floor also
+// catches the next slice of near-zero scores — heavy diffusion combined
+// with low matched_tokens (small partial overlaps), high pressure
+// (pressure_factor near 0), or near-expired freshness — which the gateway
+// gains little from routing on. Any substantive routing decision (a
+// uniquely-held prefix of any meaningful token count and freshness) sees a
+// score well above 0.1. Without this default the trivial-match-as-
+// PREFIX_MATCH bug would persist for every namespace that has not
+// installed a policy CR. Tunable per-namespace via
+// CachePolicy.spec.routingFloorScore.
 const DefaultRoutingFloorScore float32 = 0.1
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
@@ -78,7 +84,7 @@ const DefaultRoutingFloorScore float32 = 0.1
 // types live in api/v1alpha1; the controller flattens them into this shape
 // before pushing so pkg/server has no dependency on the CRD package.
 //
-// Zero values mean "unset / use server default":
+// Zero values mean "unset / use server default" for most fields:
 //   - EvictionTTL <= 0       → fall back to index.DefaultTTL (via the global
 //     WithTTL the binary configured).
 //   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
@@ -90,6 +96,13 @@ const DefaultRoutingFloorScore float32 = 0.1
 //     floor) via PolicyStore.MinimumMatchedTokens.
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
 //   - Eviction == ""         → LRU (the index default and the kubebuilder default).
+//
+// RoutingFloorScore is the EXCEPTION: a zero value here means "explicit
+// opt-out for THIS namespace" (the operator wanted no floor — typically for
+// raw-recall benchmarking). The server-wide DefaultRoutingFloorScore is the
+// fallback ONLY for tenants with NO CachePolicy at all; a CachePolicy that
+// reaches this struct as RoutingFloorScore=0 is honoring the operator's
+// explicit choice. See PolicyStore.RoutingFloorScore for the resolver.
 type ResolvedPolicy struct {
 	// Namespace identifies the CachePolicy's namespace, which in phase-1 is
 	// the tenant boundary: a LookupRoute carrying tenant_id="foo" resolves

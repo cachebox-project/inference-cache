@@ -839,6 +839,19 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// "out of the replicas that could hold the content, how many do?"
 	// Captured under the read lock so it's consistent with the prefixes
 	// view this lookup observes.
+	//
+	// Soft-state caveat: servingByScope is decremented at TTL-sweep time,
+	// not at every freshness check, so a replica that has gone stale (no
+	// recent report) can still be in the denominator for up to one
+	// DefaultSweepInterval before the eviction loop removes it. During
+	// that window the denominator is inflated by the stale entry while the
+	// numerator (the post-freshness-filter scored set below) is not, so a
+	// trivial overlap held by all-currently-fresh replicas can briefly
+	// surface a small but non-zero factor instead of the intended 0. The
+	// resulting hint is at worst "route to one of the replicas that all
+	// hold the same trivial overlap," which the gateway serves equivalently
+	// — soft-state semantics: a stale hint is acceptable; a wrong answer
+	// is not.
 	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	scores := make([]ReplicaScore, 0, len(replicas))
 	var hitsByReplica map[string][]*replicaEntry
@@ -893,6 +906,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// every Score so the service-layer post-score floor can downgrade the
 	// response to NO_HINT. totalReplicas <= 1 degrades to factor 1.0 so
 	// single-replica deployments preserve their baseline ranking.
+	//
 	if dp := distinguishingPower(len(scores), totalReplicas); dp != 1.0 {
 		f := float32(dp)
 		for k := range scores {
@@ -1026,6 +1040,14 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// replica serving this engine domain (tenant, model, hash_scheme).
 	// Captured BEFORE releasing the read lock so it stays consistent with
 	// the prefix view the chain walk just observed.
+	//
+	// Same soft-state caveat as lookupExact: servingByScope tracks the
+	// post-eviction view, so during the TTL-sweep window a recently-stale
+	// replica can briefly remain in the denominator. The cap, applied to a
+	// chain match, can leave a depth-aware factor slightly above 0 for an
+	// overlap that ALL currently-fresh replicas share. Eventually consistent;
+	// the gateway sees only a near-trivial PREFIX_MATCH that the floor will
+	// also catch once the score collapses on the next sweep tick.
 	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
 
@@ -1061,6 +1083,17 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 // No-op when totalReplicas <= 1 (single-replica deployment) or len(scores)
 // == 0; the inner distinguishingPower call also degrades gracefully on
 // those branches but the guard saves an unnecessary sort.
+//
+// Grouping is by `MatchedTokens`, not by raw block depth: two replicas at
+// different block-counts that happen to sum to the same matched-tokens
+// total are treated as the same "depth" for cardinality. This is
+// intentional and consistent with the ranking score (which is also based
+// on matched_tokens, not block count): a 0-token block contributes 0 to
+// the score AND 0 to the depth tie-break, so two replicas separated only
+// by 0-token blocks get the same factor. If two replicas have the same
+// matched_tokens but different per-block compositions, they are
+// indistinguishable from the gateway's perspective anyway — the score is
+// the only routing input.
 func applyChainDistinguishingPower(scores []ReplicaScore, totalReplicas int) {
 	if totalReplicas <= 1 || len(scores) == 0 {
 		return

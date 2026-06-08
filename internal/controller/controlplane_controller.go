@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -304,15 +305,23 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	if cp.Spec.RoutingFloorScore != nil {
 		// The CRD's +kubebuilder:validation:Pattern marker guarantees a
 		// well-formed unsigned decimal at admission, so ParseFloat should
-		// succeed for any value the apiserver accepted. The fallback is
-		// defensive against a hand-crafted /policy POST or a future schema
-		// drift: a parse error leaves rp.RoutingFloorScore at its zero
-		// value, which the server treats as the explicit opt-out for
-		// namespaces with a CachePolicy installed (different from the
-		// no-policy default that fires DefaultRoutingFloorScore). The
-		// CRD-side validator is the authoritative gate here; this clamp
-		// is purely the second line of defence.
-		if f, err := strconv.ParseFloat(*cp.Spec.RoutingFloorScore, 32); err == nil && f >= 0 {
+		// succeed for any value the apiserver accepted. Pathological cases
+		// the validator does not catch — a parse failure (corrupt CR / future
+		// schema drift / hand-crafted /policy POST), an overflowing literal
+		// that exceeds float32 range, or a negative slip-through — fall back
+		// to the safety default rather than 0: a zero would disable the
+		// floor for that namespace silently, which is the OPPOSITE of the
+		// safe interpretation. The CRD-side validator is the authoritative
+		// gate; this clamp is the second line of defence.
+		f, err := strconv.ParseFloat(*cp.Spec.RoutingFloorScore, 32)
+		switch {
+		case err != nil:
+			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
+		case f < 0:
+			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
+		case math.IsInf(f, 0) || math.IsNaN(f):
+			rp.RoutingFloorScore = cacheserver.DefaultRoutingFloorScore
+		default:
 			rp.RoutingFloorScore = float32(f)
 		}
 	}

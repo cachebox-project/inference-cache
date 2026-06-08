@@ -568,3 +568,46 @@ func TestReconcilerFlattensEvictionAlgorithm(t *testing.T) {
 func policyHandlerForTest(s *cacheserver.PolicyStore) http.HandlerFunc {
 	return cacheserver.NewPolicyHTTPHandler(s)
 }
+
+// TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput pins the
+// defensive behavior of the controller-side parser: a value the CRD validator
+// would have rejected (overflowing literal, +Inf, NaN, negative leak) must
+// fall back to the server-wide DefaultRoutingFloorScore rather than zero. A
+// zero would silently disable the floor for that namespace — the OPPOSITE
+// of the safe interpretation — and the CRD validator is normally the gate
+// against this class of bug, so the test exercises hand-crafted CRs that
+// bypass admission (the same shape a corrupted store or future schema drift
+// could produce).
+func TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput(t *testing.T) {
+	type tc struct {
+		name string
+		spec string
+		want float32
+	}
+	// A literal so large it overflows float32 max (~3.4e38). The CRD pattern
+	// allows arbitrarily long digit-only strings (no upper bound), so this is
+	// the realistic "operator accidentally pasted a huge number" shape.
+	overflowing := "999999999999999999999999999999999999999999999999"
+	cases := []tc{
+		{name: "overflowing literal", spec: overflowing, want: cacheserver.DefaultRoutingFloorScore},
+		{name: "malformed", spec: "not-a-number", want: cacheserver.DefaultRoutingFloorScore},
+		// A negative leak — bypasses the CRD pattern but flows through to
+		// the parser. Must fall back, not be honored.
+		{name: "negative", spec: "-1.5", want: cacheserver.DefaultRoutingFloorScore},
+		// Sanity: a well-formed value parses cleanly.
+		{name: "valid", spec: "2.5", want: 2.5},
+		{name: "explicit zero opt-out", spec: "0", want: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cp := &cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+				Spec:       cachev1alpha1.CachePolicySpec{RoutingFloorScore: strPtr(c.spec)},
+			}
+			rp := resolveOnePolicy(cp)
+			if d := rp.RoutingFloorScore - c.want; d > 1e-3 || d < -1e-3 {
+				t.Fatalf("RoutingFloorScore for %q = %v, want %v", c.spec, rp.RoutingFloorScore, c.want)
+			}
+		})
+	}
+}

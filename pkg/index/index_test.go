@@ -598,13 +598,15 @@ func TestIngestSanitizesNegativeInfinity(t *testing.T) {
 // Ranking v2 — pressure / SLO / TENANT_HOT fallback
 // ---------------------------------------------------------------------------
 
-// TestLookupBaselinePreservedWhenSignalsAbsent locks in the contract that the
-// pressure and SLO score factors collapse to 1 when (a) no replica stats are
-// reported (pressure=0) and (b) the request carries no SLO hint (TTFT=0).
-// With the distinguishing-power factor in place the formula reduces to
-// matched_tokens × freshness × distinguishing_power — expected scores below
-// fold that factor in (1 - 2/3 = 1/3 with the decoy replica below).
-func TestLookupBaselinePreservedWhenSignalsAbsent(t *testing.T) {
+// TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent locks in the
+// contract that the pressure and SLO score factors collapse to 1 when (a) no
+// replica stats are reported (pressure=0) and (b) the request carries no SLO
+// hint (TTFT=0). The distinguishing-power factor still applies (it depends on
+// cluster cardinality, not on these signals), so the expected scores below
+// fold it in (1 - 2/3 = 1/3 with the decoy replica below) — the test is about
+// the pressure/SLO contribution being 1, not about the score being equal to
+// matched_tokens × freshness alone.
+func TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(6_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))
 
