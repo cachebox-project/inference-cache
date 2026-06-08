@@ -508,6 +508,18 @@ func errorMessageForStage(result cacheserver.ProbeResult, stage string, fallback
 // the server actually exercised report ok/failed. Match the server's
 // per-stage names so the metric's `stage` label aligns with the JSON
 // body's stage names.
+//
+// Empty AND unknown stage values are coerced to "failed" — the alerting
+// contract MUST match what `cacheserver.ProbeResult.AllPassed` /
+// `stagePassed` consider non-passing. If a malformed `{}` body, a future
+// server emitting a stage name this controller hasn't learned yet, or any
+// other non-"ok"/non-"skipped" value reaches us, `AllPassed` returns false
+// (the gate downgrades Ready with `ProbeError`), so the per-stage metric
+// MUST also record "failed" — otherwise `ServerProbeFail` silently misses
+// the regression even though the operator-facing condition surfaces it.
+// The forward-compat info (the actual wire string) is preserved in the
+// `FunctionalProbeOK` condition message, not in the metric label set
+// (keeping metric cardinality bounded).
 func recordProbeResult(backendKey string, result cacheserver.ProbeResult) {
 	for _, s := range []struct {
 		stage  string
@@ -517,10 +529,13 @@ func recordProbeResult(backendKey string, result cacheserver.ProbeResult) {
 		{cacheserver.ProbeStageRouting, result.Routing},
 		{cacheserver.ProbeStageT2, result.T2},
 	} {
-		if s.result == "" {
-			// Empty wire value: defensive — count as skipped so the metric
-			// stays accurate at three increments per call.
-			s.result = cacheserver.ProbeStageSkipped
+		switch s.result {
+		case cacheserver.ProbeStageOK, cacheserver.ProbeStageSkipped, cacheserver.ProbeStageFailed:
+			// Recognized value — emit verbatim.
+		default:
+			// Empty wire value OR a future/unknown outcome — coerce to
+			// "failed" so the alert path is honest about the unknown state.
+			s.result = cacheserver.ProbeStageFailed
 		}
 		probeResultMetric.WithLabelValues(backendKey, s.stage, string(s.result)).Inc()
 	}

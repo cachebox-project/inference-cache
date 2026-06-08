@@ -667,6 +667,91 @@ func metricCounter(t *testing.T, backend, stage, result string) float64 {
 	return dtoMetric.GetCounter().GetValue()
 }
 
+// TestRecordProbeResultCoercesEmptyAndUnknownToFailed pins the
+// alerting-contract invariant: any stage value that
+// cacheserver.ProbeResult.AllPassed considers non-passing (empty wire
+// value, or an unrecognized future outcome) MUST land on the metric as
+// result="failed", NOT result="skipped". A malformed 200 {} response
+// would otherwise be invisible to ServerProbeFail even though
+// AllPassed=false and the controller downgrades Ready with ProbeError.
+func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
+	// Use a unique backend key per case so the test stays isolated from
+	// other metric tests in this package (probeResultMetric is process-
+	// wide, so absolute counter values are not stable across tests).
+	cases := []struct {
+		name     string
+		backend  string
+		ingest   cacheserver.ProbeStageResult
+		routing  cacheserver.ProbeStageResult
+		t2       cacheserver.ProbeStageResult
+		expected map[string]string // stage → recorded result label
+	}{
+		{
+			name:    "empty body coerces every stage to failed",
+			backend: "team-a/cb-empty-coerce",
+			ingest:  "", routing: "", t2: "",
+			expected: map[string]string{
+				cacheserver.ProbeStageIngest:  "failed",
+				cacheserver.ProbeStageRouting: "failed",
+				cacheserver.ProbeStageT2:      "failed",
+			},
+		},
+		{
+			name:    "unknown future outcome coerces to failed",
+			backend: "team-a/cb-unknown-coerce",
+			ingest:  cacheserver.ProbeStageResult("throttled"), routing: cacheserver.ProbeStageOK, t2: cacheserver.ProbeStageSkipped,
+			expected: map[string]string{
+				cacheserver.ProbeStageIngest:  "failed", // coerced
+				cacheserver.ProbeStageRouting: "ok",
+				cacheserver.ProbeStageT2:      "skipped",
+			},
+		},
+		{
+			name:    "recognized failed passes through verbatim",
+			backend: "team-a/cb-failed-passthrough",
+			ingest:  cacheserver.ProbeStageOK, routing: cacheserver.ProbeStageFailed, t2: cacheserver.ProbeStageSkipped,
+			expected: map[string]string{
+				cacheserver.ProbeStageIngest:  "ok",
+				cacheserver.ProbeStageRouting: "failed",
+				cacheserver.ProbeStageT2:      "skipped",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Snapshot all (ok|skipped|failed) baselines per stage so we
+			// can assert both "the expected label incremented by 1" AND
+			// "the other two labels did NOT" — the regression Codex
+			// flagged was the wrong label increment, not a missed one.
+			stages := []string{cacheserver.ProbeStageIngest, cacheserver.ProbeStageRouting, cacheserver.ProbeStageT2}
+			results := []string{"ok", "skipped", "failed"}
+			before := make(map[string]float64, len(stages)*len(results))
+			for _, stg := range stages {
+				for _, res := range results {
+					before[stg+"/"+res] = metricCounter(t, tc.backend, stg, res)
+				}
+			}
+
+			recordProbeResult(tc.backend, cacheserver.ProbeResult{
+				Ingest: tc.ingest, Routing: tc.routing, T2: tc.t2,
+			})
+
+			for _, stg := range stages {
+				for _, res := range results {
+					got := metricCounter(t, tc.backend, stg, res)
+					want := before[stg+"/"+res]
+					if tc.expected[stg] == res {
+						want++ // this is the label that should have incremented
+					}
+					if got != want {
+						t.Errorf("stage=%s result=%s: got %v, want %v (expected[%s]=%s)", stg, res, got, want, stg, tc.expected[stg])
+					}
+				}
+			}
+		})
+	}
+}
+
 // TestEvaluateFunctionalProbeContextCancellation pins ctx propagation: a
 // cancelled context surfaces as an HTTP error (Unknown), not a panic or a
 // silent True.

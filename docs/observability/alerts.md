@@ -559,17 +559,17 @@ sum by (namespace, tenant_id) (rate(inferencecache_tenant_evictions_total[10m]))
 - **Source metric**: `inferencecache_backend_probe_result_total{backend, stage, result}` — **emitted by the controller binary, not the server.** Requires the controller-side `PodMonitor` shipped in this same observability overlay; without it the alert loads but never has a series to evaluate.
 
 The CacheBackend controller drives a synthetic round-trip against each
-managed backend on a 30-second cadence — an `ingest → routing → tier-2`
+managed backend on a 30-second cadence — an `ingest → routing → t2`
 self-test — and records the per-stage outcome (`result="ok"`, `"failed"`,
-`"skipped"`) in this counter. A sustained `result="failed"` rate means the
-cache-plane internal pipeline is broken in a way the basic Service-endpoint
-probe and Ready gate cannot catch:
+`"skipped"`) in this counter. A sustained `result="failed"` rate means
+the cache-plane internal pipeline is broken in a way the basic
+Service-endpoint probe and Ready gate cannot catch:
 
 | `stage` label | What `failed` means |
 |---|---|
-| `ingest` | The probe published a synthetic prefix entry but the index did not record it. The KV-event subscriber → server → index path is silently dropping state — exactly the class of regression that motivated this probe. |
-| `routing` | The probe published, the index recorded, but `LookupRoute` returned `NO_HINT` for a hash that should match. Likely an index-key-scheme mismatch (e.g. `hash_scheme` empty / wrong / dropped on ingest) or a lookup-filter regression. |
-| `tier-2` | (When a T2Prober is wired into the server.) The tier-2 fetch path is failing — engine `external_prefix_cache_*` is reporting hits below threshold. Not wired into the server today, so this stage reports `skipped` on every clean install; an alert here only fires once a follow-up plumbs a real T2Prober. |
+| `ingest` | The probe wrote a synthetic prefix entry through the server's **in-process** `index.Ingest` path and the entry did not land. This pins the index ingest path; it does **NOT** exercise the gRPC `ReportCacheState` handler nor the `kvevent-subscriber` sidecar (subscriber wire bugs are invisible to Stage A by design — see the design doc and `pkg/server/probe.go` lead-in). A failure here means the index itself is dropping writes — a regression in `pkg/index` keying, scheme handling, or eviction. |
+| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from `spec.integration.engine`; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `pkg/server`. |
+| `t2` | (When a `T2Prober` is wired into the server.) The tier-2 put/get cycle against the configured external backend (LMCache today) failed. No `T2Prober` is wired in this revision, so this stage reports `skipped` on every install — an alert here only fires once a follow-up registers a real `T2Prober`. |
 
 The alert uses `increase(...{result="failed"}[5m]) >= 2 for: 5m` — a
 single transient flake (one failed probe that recovers on the next 30s
@@ -579,25 +579,37 @@ before firing. This is calibrated to the controller's 30s probe cadence:
 ~10 probes per 5m window, so the `>= 2` threshold is a real signal
 (≥20% failure rate), not a baseline.
 
+A 200 response whose body has empty or unrecognized stage values is also
+recorded as `result="failed"` (the alerting contract MUST match what
+`ProbeResult.AllPassed` considers non-passing) — a malformed `{}` body
+or a future stage outcome the controller doesn't yet recognize will
+page just like a real per-stage failure rather than silently coercing
+to `skipped`. The raw wire string is preserved in the
+`FunctionalProbeOK` condition message for diagnosis.
+
 #### Likely causes
 
 By `stage` label:
 
-- `ingest` — the `kvevent-subscriber` sidecar is not delivering events
-  to the server. Check the subscriber pod's logs for ZMQ connection
-  errors. Verify the server is up (`inferencecache_server_up == 1`),
-  the controller `/policy` push is reaching it, and no NetworkPolicy
-  regression is blocking the subscriber → server gRPC path on `:9090`.
-- `routing` — the index is recording entries but lookup can't find
-  them. Check that the probe's `hash_scheme` (currently
-  `"functional-self-test"`) is not being silently dropped (an empty
-  scheme fails open in the index). Check the lookup-filter logs on the
-  server side for `reason_code=NO_HINT` on calls that should match.
-- `tier-2` — not applicable today; no T2Prober is wired into the
-  server. If you're seeing `t2=failed` on a live install, a follow-up
-  has shipped a T2Prober and its connection to vLLM
-  `external_prefix_cache_*` is broken (engine pod selector, port,
-  scrape labels).
+- `ingest` — the in-process index ingest path is dropping writes. Check
+  the server's `inferencecache_index_entries` gauge to see if the index
+  is accumulating entries at all; check server logs for `pkg/index`
+  errors; verify `inferencecache_server_up == 1`. (A subscriber → server
+  wire bug is **not** what causes this stage to fail — subscriber bugs
+  show up as a missing-state pattern on real workload, not on this
+  probe. If you suspect the subscriber, scope your investigation to the
+  `kvevent-subscriber` pod logs + gRPC `:9090` reachability instead.)
+- `routing` — the index recorded the probe entry but lookup can't find
+  it. The probe's `hashScheme` is derived from the backend's
+  `spec.integration.engine` (default `"vllm"`); verify it's not being
+  silently dropped on ingest (an empty scheme fails open and produces
+  `NO_HINT` on lookup). Check the server-side lookup-filter logs for
+  `reason_code=NO_HINT` on calls that should match.
+- `t2` — not applicable today; no `T2Prober` is wired into the server.
+  If you're seeing `t2=failed` on a live install, a follow-up has
+  registered a real `T2Prober` and its connection to the configured
+  LMCache server (or its tracking of `external_prefix_cache_*` engine
+  metrics) is broken.
 
 #### First-response runbook
 
@@ -634,11 +646,17 @@ By `stage` label:
 
 5. To temporarily suppress the alert during a known-bad investigation
    without modifying the rule, annotate the affected backend(s) with
-   `inferencecache.io/skip-functional-probe: "true"` — the probe is
-   bypassed (`reason=ProbeBypassed`, `result="skipped"`) and the
-   `result="failed"` rate drains within the 5-minute window. **Remove
-   the annotation when you're done**; a bypassed backend with a real
-   regression still ships broken cache state.
+   `inferencecache.io/skip-functional-probe: "true"` — the controller
+   short-circuits before calling `/probe` (reason `ProbeBypassed` on
+   the condition), so **no new per-stage metric increments fire while
+   bypassed** (neither `failed` nor `skipped`). The existing
+   `result="failed"` increments age out of the 5-minute `increase()`
+   window naturally, and the alert clears once the window drains. The
+   bypass writes `FunctionalProbeOK=True/ProbeBypassed`, so Ready is
+   no longer downgraded either — operators should treat the bypassed
+   state as an explicit "I am ignoring the gate," not as "the backend
+   is healthy." **Remove the annotation when you're done**; a bypassed
+   backend with a real regression still ships broken cache state.
 
 Triage queries:
 
