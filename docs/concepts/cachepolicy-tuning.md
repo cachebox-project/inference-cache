@@ -20,7 +20,7 @@ snapshot. The CR is purely declarative: the controller pushes its resolved field
 server, which is where enforcement actually happens (see
 [Propagation](#propagation-controller--server) below).
 
-## The five spec knobs
+## The six spec knobs
 
 | Field | Type | Default | When to tune |
 |---|---|---|---|
@@ -28,6 +28,7 @@ server, which is where enforcement actually happens (see
 | `evictionTTL` | duration | server default `30m` | Maximum usable lifetime of a cache entry. The freshness sweep removes entries older than this regardless of eviction algorithm. Must be strictly positive when set (admission rejects `0`/negative). |
 | `minimumPrefixTokens` | int32 (min `0`) | unset = no threshold | Minimum *requested* prefix token count before a lookup is attempted. A request shorter than this short-circuits to `NO_HINT` **without touching the index** — saves work when short prompts can't usefully hit the cache. Applied BEFORE the lookup runs, against the *request's* claimed prefix length. |
 | `minimumMatchedTokens` | int32 (min `0`) | `64` (4 KV blocks) | Minimum *realized* matched-token count for a response to surface as `PREFIX_MATCH`. Applied AFTER the lookup runs, against the *actual* per-replica overlap. Replicas whose match falls below the floor are filtered; if none survive, the reason code downgrades to `NO_HINT` so the gateway round-robins honestly instead of being credited with a trivial chat-template-only match. Set to `0` to disable entirely (e.g. raw-recall benchmarking). Distinct from `minimumPrefixTokens` — see [Two minimums, one role each](#two-minimums-one-role-each) below. |
+| `routingFloorScore` | stringified float, e.g. `"0.1"`, `"5"`, `"0"` | `"0.1"` | Per-replica *score* floor below which a `PREFIX_MATCH` response downgrades to `NO_HINT`. Applied AFTER the lookup runs, against the per-replica score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`). Overlaps held by every replica (chat-template framing, RAG corpus headers, custom system prompts shared across the deployment) produce `distinguishing_power = 0` and score = 0 — this floor catches them. Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica), then this score floor gates the top survivor. Set to `"0"` to disable entirely (raw-recall benchmarking / debug). |
 | `lookupTimeoutMs` | int32 (min `0`) | unset = no deadline | Per-lookup latency budget in milliseconds. A breach returns reason code `TIMEOUT` (still fail-open — empty result, never an error to the gateway). See the foot-gun in [Gotchas](#two-gotchas). |
 
 `status` carries only `observedGeneration` + `conditions`, and both are **reserved** — the
