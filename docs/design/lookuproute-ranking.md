@@ -413,7 +413,7 @@ baseline.
 | Specific RAG context — only 1 replica holds it | 1 | 3 | 0.67 | Strong score → `PREFIX_MATCH` |
 | Partial-diffusion overlap (2 of 3) | 2 | 3 | 0.33 | Weaker score, still `PREFIX_MATCH` if it clears the floor |
 | Uniquely-deep chain match (chain §2.5) | 1 at depth 4 | 3 | 0.67 at depth 4, 0 at depth 1 | Deep matcher dominates ranking |
-| Single-replica deployment | 1 | 1 | 1.0 (degraded) | Baseline preserved — every match surfaces |
+| Single-replica deployment | 1 | 1 | 1.0 (degraded) | Distinguishing-power factor preserved at baseline; the matched-tokens (§2.6) and routing-floor (§2.7) floors still run, so a single-replica match below `minimumMatchedTokens` (default 64) still downgrades to `NO_HINT`. Set both floors to their opt-outs to reproduce pre-floor every-match-surfaces behavior. |
 
 ### The post-score floor — `CachePolicy.spec.routingFloorScore`
 
