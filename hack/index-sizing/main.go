@@ -1,8 +1,10 @@
 // Package main is the index-sizing measurement helper used to characterize the
 // inferencecache-server in-memory index footprint at various entry counts. It
 // ingests N synthetic prefix entries, forces GC + returns memory to the OS, and
-// prints heap + RSS so operators can pick CachePolicy.maxIndexEntries and
-// container memory limits with real numbers instead of a guess.
+// prints heap + peak RSS so operators can pick CacheTenant.spec.quota.maxIndexEntries,
+// the per-namespace CachePolicy.spec.evictionTTL, and pod memory limits with
+// real numbers instead of a guess. The global server cap is the compile-time
+// constant pkg/index.DefaultMaxEntries.
 //
 // Not a shipping binary; not built by `make build`. Run with:
 //
@@ -31,7 +33,28 @@ func main() {
 	batchSize := flag.Int("batch", 1_000, "prefixes per Ingest call")
 	flag.Parse()
 
-	totalEntries := (*keys) * (*replicas)
+	// Reject inputs that would divide-by-zero (`tenants=0`/`models=0`), corrupt
+	// the per-entry denominator (`keys`/`replicas` ≤ 0), or panic deep in the
+	// loop (`hash-bytes`/`batch` ≤ 0). The harness is operator tooling — fail
+	// loud at the boundary, don't silently produce nonsense numbers.
+	if *keys <= 0 || *replicas <= 0 || *tenants <= 0 || *models <= 0 || *hashSize <= 0 || *batchSize <= 0 {
+		fmt.Fprintf(os.Stderr, "all flags must be strictly positive: keys=%d replicas=%d tenants=%d models=%d hash-bytes=%d batch=%d\n",
+			*keys, *replicas, *tenants, *models, *hashSize, *batchSize)
+		os.Exit(2)
+	}
+
+	// keysPerBucket rounds DOWN, so the requested -keys may not all be ingested
+	// when (tenants × models) doesn't divide. Compute the actually-ingested
+	// total here and use that as the denominator for every bytes-per-entry
+	// number below — otherwise the report would inflate the denominator and
+	// under-state per-entry cost.
+	keysPerBucket := *keys / ((*tenants) * (*models))
+	ingestedKeys := keysPerBucket * (*tenants) * (*models)
+	totalEntries := ingestedKeys * (*replicas)
+	if ingestedKeys != *keys {
+		fmt.Fprintf(os.Stderr, "warning: keys=%d not divisible by tenants×models=%d; ingesting %d keys (per-bucket=%d)\n",
+			*keys, (*tenants)*(*models), ingestedKeys, keysPerBucket)
+	}
 
 	// No eviction during the run: we want steady-state population, not a
 	// post-sweep slice of it. TTL + sweep are pushed past any reasonable
@@ -46,14 +69,8 @@ func main() {
 	defer cancel()
 	idx.Start(ctx)
 
-	if *keys%(*tenants**models) != 0 {
-		fmt.Fprintf(os.Stderr, "warning: keys=%d not divisible by tenants×models=%d; per-bucket count rounded down\n",
-			*keys, (*tenants)*(*models))
-	}
-	keysPerBucket := *keys / ((*tenants) * (*models))
-
 	fmt.Printf("Ingesting %d keys × %d replicas = %d entries (%d tenants, %d models, %d-byte hash, batch=%d)\n",
-		*keys, *replicas, totalEntries, *tenants, *models, *hashSize, *batchSize)
+		ingestedKeys, *replicas, totalEntries, *tenants, *models, *hashSize, *batchSize)
 
 	start := time.Now()
 	const hashScheme = "vllm-block-v1"
@@ -124,11 +141,19 @@ func main() {
 
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	rss := uint64(ru.Maxrss)
+	// Maxrss is a high-water mark, NOT current RSS — it records the largest
+	// resident-set size the process ever reached, even if pages have since
+	// been returned to the OS by debug.FreeOSMemory. For a one-shot bulk
+	// ingest like this harness the peak is dominated by the steady-state
+	// index footprint plus transient batch/PrefixRef allocations, so it
+	// over-states the post-GC working set. We report it as peak_rss and
+	// the doc treats it as a conservative pod-budget number, not a
+	// steady-state RSS reading.
+	peakRSS := uint64(ru.Maxrss)
 	// macOS Maxrss is bytes; Linux is KiB. The harness is documented to run
 	// on either, so normalize before reporting.
 	if runtime.GOOS == "linux" {
-		rss *= 1024
+		peakRSS *= 1024
 	}
 
 	snap := idx.Snapshot()
@@ -145,7 +170,7 @@ func main() {
 	fmt.Printf("heap_inuse              %s\n", humanBytes(ms.HeapInuse))
 	fmt.Printf("heap_sys                %s\n", humanBytes(ms.HeapSys))
 	fmt.Printf("sys (Go total)          %s\n", humanBytes(ms.Sys))
-	fmt.Printf("rss                     %s  (%.0f bytes/entry)\n", humanBytes(rss), float64(rss)/float64(totalEntries))
+	fmt.Printf("peak_rss                %s  (%.0f bytes/entry; high-water mark, not current)\n", humanBytes(peakRSS), float64(peakRSS)/float64(totalEntries))
 	fmt.Printf("num_gc                  %d\n", ms.NumGC)
 }
 

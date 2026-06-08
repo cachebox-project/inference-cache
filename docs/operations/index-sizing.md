@@ -18,12 +18,14 @@ need same-arch numbers — the harness is documented at the top of `main.go`.
 
 ## TL;DR
 
-| Workload shape | Steady-state RSS | Pod memory budget |
+| Workload shape | Peak RSS (process high-water mark) | Pod memory budget |
 |---|---|---|
 | 100K distinct prefix entries | ~110 MiB | 256 MiB |
 | 500K entries | ~300 MiB | 512 MiB |
 | 1M entries (`DefaultMaxEntries`) | ~540 MiB | **1 GiB (recommended floor)** |
 | 1.5M entries | ~700 MiB | 1.5 GiB |
+
+The "peak RSS" column is `Maxrss` from the harness run — the high-water mark the process ever reached, not current RSS. For a one-shot bulk ingest the peak ≈ steady-state + transient ingest allocations; in production the steady-state is somewhat lower. Treat the column as a **conservative pod-budget figure**: if you provision for the peak, the steady-state has headroom built in.
 
 The default global entry cap of `DefaultMaxEntries = 1,000,000` (see [`pkg/index/index.go`](../../pkg/index/index.go))
 is sized for a **1 GiB server pod**. Raise either both (memory + cap) or neither —
@@ -37,21 +39,21 @@ so reaching for a larger footprint needs a recompile today.
 One index entry is one `(tenant, model, hash_scheme, prefix_hash) → replica_id` tuple.
 A prefix held by two replicas is two entries; a prefix held by one replica is one.
 
-Measured footprint at steady state (after GC + `debug.FreeOSMemory()`):
+Measured footprint after GC + `debug.FreeOSMemory()` (peak RSS via `getrusage.Maxrss`):
 
-| Total entries | `heap_alloc` | RSS | bytes / entry (heap) | bytes / entry (RSS) |
+| Total entries | `heap_alloc` | Peak RSS | bytes / entry (heap) | bytes / entry (peak RSS) |
 |---:|---:|---:|---:|---:|
-| 500,000 | 241 MiB | 300 MiB | 504 | 630 |
-| 1,000,000 | 481 MiB | 541 MiB | 504 | 568 |
-| 1,500,000 | 641 MiB | 693 MiB | 448 | 484 |
+| 500,000 | 241 MiB | 299 MiB | 504 | 628 |
+| 1,000,000 | 481 MiB | 544 MiB | 504 | 570 |
+| 1,500,000 | 641 MiB | 701 MiB | 448 | 490 |
 
 Scaling is linear in the number of entries above ~100K (the per-entry RSS share drops as
 the fixed Go-runtime overhead — ~30–50 MiB — amortizes). A working model that fits the
 measurements within ~5 %:
 
 ```
-heap_bytes  ≈  50 MiB  +  500 × distinct_prefix_keys  +  50 × additional_replica_holdings
-RSS_bytes   ≈  heap_bytes × 1.10
+heap_bytes      ≈  50 MiB  +  500 × distinct_prefix_keys  +  50 × additional_replica_holdings
+peak_RSS_bytes  ≈  heap_bytes × 1.10
 ```
 
 Where:
@@ -173,8 +175,8 @@ Every signal below is exported on `/metrics` (port 8080) — no code change need
 
 | Signal | Series | What it tells you |
 |---|---|---|
-| Steady-state size | `inferencecache_index_entries{model}` | How close you are to the global cap, per model. Sum across models to get the whole. |
-| Cap pressure | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | Anything sustained > 0 means the global cap is the binding constraint. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
+| Steady-state size | `inferencecache_index_entries{model}` | **Distinct prefix keys per model** — not total replica×prefix entries. A prefix held by R replicas counts once here. Use this for trend / hit-rate work; it is **not** a direct cap-closeness signal in multi-replica setups (see next row). |
+| Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
 | Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | A tenant is exceeding `spec.quota.maxIndexEntries`. Usually fine (Fairness), but a sustained signal means the quota is too tight for the workload. |
 | TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `index_entries` falling = the workload is shrinking. |
 | Pod RSS | `container_memory_working_set_bytes{pod="inference-cache-server-..."}` | What you'd compare against the model in [Per-entry footprint](#per-entry-memory-footprint). |
@@ -193,9 +195,12 @@ Every signal below is exported on `/metrics` (port 8080) — no code change need
 
 After a representative workload window (typically one peak hour + one trough):
 
-- `index_entries` stuck at the cap and `index_evictions_total{reason="cap"}` non-zero
-  → the workload exceeds the global cap. Choices: shorten `evictionTTL` (cheap), tighten
-  per-tenant quotas (operator-controlled), or raise the cap (requires the follow-up flag).
+- `index_evictions_total{reason="cap"}` non-zero → the workload exceeds the global cap.
+  (Do not rely on `index_entries` alone to detect this — that gauge counts distinct
+  prefix keys per model, but the cap is on total replica×prefix entries, so on a
+  multi-replica deployment the gauge can sit well below 1M while the cap is firing.)
+  Choices: shorten `evictionTTL` (cheap), tighten per-tenant quotas (operator-controlled),
+  or raise the cap (requires the follow-up flag).
 - `index_evictions_total{reason="ttl"}` ≈ 0 *and* the gateway's prefix-cache hit rate is
   low → TTL is set so high that nothing ever ages out, but routing isn't paying off.
   Either the workload doesn't reuse prefixes (no fix needed at the cache plane) or the
@@ -223,7 +228,7 @@ If you genuinely need more than 1M entries before the cap flag lands:
 |---|---|---|
 | `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries; the cap is comfortably above realistic single-tenant load and gives multi-tenant clusters a 10× headroom before they need to think about it. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
 | `DefaultTTL` | 30 minutes | Matches typical chat-style prefix reuse windows. Long enough that the same conversation's continuation lands on the same replica; short enough that a half-hour of cold prefixes don't bloat the index. CachePolicy lets per-namespace workloads override (raise for long-context, lower for tight memory). |
-| `DefaultSweepInterval` | 1 minute | The sweep is a full-walk over expired entries; once-per-minute keeps it cheap on a 1M-entry index (sub-millisecond) and bounds memory lag. |
+| `DefaultSweepInterval` | 1 minute | The sweep is a full-walk over the prefix map looking for expired entries; CPU cost scales linearly with index size, but it runs on its own goroutine off the request path. One minute bounds memory lag without being noticeably hot on a 1M-entry index. Not yet directly benchmarked — file an issue if you observe sweep contention on the hot path. |
 
 None of these are tuned per workload-shape because the realistic spread (chat at the low
 end, RAG / long-context at the high end) needs more knobs than one cluster-global default
