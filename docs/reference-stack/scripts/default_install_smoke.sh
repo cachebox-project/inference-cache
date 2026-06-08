@@ -771,45 +771,31 @@ if ! grep -Eq '^inferencecache_server_up[[:space:]]+1([[:space:]]|$)' "$LOG_DIR/
 fi
 log "server HTTP surface OK: /readyz returned 200 and /metrics exposes inferencecache_server_up 1"
 
-# --- controller binary registers the per-stage probe-result metric ----------
-# Stage-1 smoke (above) covers the server's /probe endpoint end-to-end. Stage-2
-# adds the controller-side caller that drives that endpoint and translates per-
-# stage outcomes into the FunctionalProbeOK condition. The smoke gate has no
-# easy way to assert the condition itself (the seeded CacheBackends here never
-# reach Ready=True because no real engine pods publish KV events; cascade
-# prevention then suppresses the probe call). But ONE structural signal IS
-# trivially observable: the new metric
-# inferencecache_backend_probe_result_total is registered on the controller's
-# controller-runtime /metrics endpoint at startup. Registration alone proves
-# the binary was built with the Stage-2 controller wiring — a regression that
-# shipped the bundle without the new code would fail this check.
-# Operator-facing CRD-sample + condition-presence assertions are deferred
-# to Stage 4.
-log "asserting controller binary registers inferencecache_backend_probe_result_total"
-CONTROLLER_METRICS_LOCAL_PORT=$(awk -v min=42000 -v max=42999 'BEGIN { srand(); print int(min + rand() * (max - min + 1)) }')
-kubectl -n "$NAMESPACE" port-forward deployment/inference-cache-controller-manager \
-  "${CONTROLLER_METRICS_LOCAL_PORT}:8080" >"$LOG_DIR/port-forward-controller-metrics.log" 2>&1 &
-controller_metrics_pf_pid=$!
-# Give the port-forward a moment to come up; fail-fast if it didn't.
-sleep 2
-if ! kill -0 "$controller_metrics_pf_pid" 2>/dev/null; then
-  cat "$LOG_DIR/port-forward-controller-metrics.log" >&2 || true
-  fail "controller metrics port-forward died immediately"
-fi
-controller_metrics_status=0
-curl -fsS --max-time 5 "http://localhost:$CONTROLLER_METRICS_LOCAL_PORT/metrics" \
-  >"$LOG_DIR/controller-metrics.out" 2>"$LOG_DIR/controller-metrics.err" || controller_metrics_status=$?
-kill "$controller_metrics_pf_pid" 2>/dev/null || true
-wait "$controller_metrics_pf_pid" 2>/dev/null || true
-if [ "$controller_metrics_status" -ne 0 ]; then
-  cat "$LOG_DIR/controller-metrics.err" >&2 || true
-  fail "controller /metrics scrape failed (exit $controller_metrics_status)"
-fi
-if ! grep -Eq '^# (HELP|TYPE) inferencecache_backend_probe_result_total' "$LOG_DIR/controller-metrics.out"; then
-  grep -n 'inferencecache_backend_probe_result' "$LOG_DIR/controller-metrics.out" >&2 || true
-  fail "controller /metrics does not register inferencecache_backend_probe_result_total (Stage-2 controller wiring not deployed)"
-fi
-log "controller /metrics registers inferencecache_backend_probe_result_total"
+# --- functional-probe gate (Stage 2): smoke coverage deferred to Stage 4 ----
+# Stage 1 smoke (above) covers the server's /probe endpoint end-to-end. The
+# Stage 2 controller-side caller publishes the FunctionalProbeOK condition on
+# managed CacheBackends, but no condition is actually written by this smoke
+# install:
+#
+#   1. The seeded CacheBackends here never reach Ready=True (no real engine
+#      pods publish KV events, so the KV-event readiness gate keeps them
+#      Ready=False). The functional-probe gate is cascade-prevented from
+#      firing while any upstream gate says not-Ready, so no probe HTTP call
+#      ever lands and FunctionalProbeOK is never published.
+#   2. The Prometheus client_golang CounterVec used for
+#      inferencecache_backend_probe_result_total exposes no HELP/TYPE/data
+#      lines on /metrics until at least one WithLabelValues child has been
+#      instantiated. On a smoke install where no probe call ever fires, the
+#      metric is invisible to /metrics — so a "registered the metric" check
+#      via /metrics scrape can't tell the bundle apart.
+#
+# Neither signal is testable from this smoke without standing up real engine
+# pods. The proper operator-facing assertion (a CacheBackend showing
+# FunctionalProbeOK=True with the updated sample manifest) is scoped to
+# Stage 4 of the ticket, which lands the CRD sample update + the engine-pod
+# fixture together. Stage 2's controller-side wiring is already covered by
+# 20+ unit tests and an envtest integration sub-test that drives a real
+# CacheBackend reconciler against an httptest /probe server.
 
 # --- gRPC default posture assertion (plaintext) ----------------------------
 # config/default serves :9090 plaintext. Assert a plaintext client can list the
