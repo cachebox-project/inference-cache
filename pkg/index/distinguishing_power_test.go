@@ -10,8 +10,8 @@ import (
 // helper is the math leaf — its four boundary branches are tested here in
 // isolation so the lookup-path tests can stay focused on the scoring
 // composition rather than re-asserting the formula. See docs/design/
-// lookuproute-ranking.md (§2.6 distinguishing-power factor) for the design
-// rationale.
+// lookuproute-ranking.md §2.7 (the replica-distinguishing-power factor) for
+// the design rationale.
 
 func TestDistinguishingPowerSingleReplica(t *testing.T) {
 	// total <= 1: ratio is ill-defined; degrade gracefully to 1.0 so a

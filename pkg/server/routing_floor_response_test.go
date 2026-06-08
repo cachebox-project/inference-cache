@@ -104,12 +104,23 @@ func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 }
 
 // TestLookupRouteRoutingFloorScoreZeroDisablesFloor exercises the explicit
-// opt-out: an operator setting RoutingFloorScore=0 wants raw recall back
-// — every match surfaces as PREFIX_MATCH, regardless of how trivial. This
-// is the primitive operators need for regression testing the ranker
-// without the floor masking the result.
+// opt-out: an operator setting RoutingFloorScore=0 disables this floor.
+// The test scaffolding constructs a ResolvedPolicy directly with both
+// RoutingFloorScore=0 AND the implicit MinimumMatchedTokens=0 (the struct
+// zero value, since Replace doesn't go through the apiserver and so
+// doesn't get the kubebuilder default-64 fill), so BOTH floors are off
+// here — every match surfaces as PREFIX_MATCH regardless of how trivial.
+// In production a real CR would still default `minimumMatchedTokens: 64`
+// at admission, so disabling the routing-floor alone would not suffice
+// to surface every trivial match — the operator would have to set both
+// to 0 / "0". The point of the assertion here is the routing-floor opt-
+// out semantics in isolation; the matched-tokens opt-out is tested by
+// the matched-tokens floor suite (pkg/server/matched_tokens_floor_test.go).
 func TestLookupRouteRoutingFloorScoreZeroDisablesFloor(t *testing.T) {
 	svc := newTestService()
+	// MinimumMatchedTokens defaults to 0 in the struct, so this Replace
+	// installs a policy with both floors off — exercising the routing-
+	// floor opt-out in isolation.
 	svc.policies.Replace([]ResolvedPolicy{{Namespace: "raw", RoutingFloorScore: f32Ptr(0)}})
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
