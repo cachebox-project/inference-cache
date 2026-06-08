@@ -9,17 +9,56 @@ import (
 )
 
 // PolicyPropagationVersion identifies the schema of the /policy snapshot the
-// server accepts. Bumped on a breaking schema change so a stale controller
-// can refuse to push (the controller writes the same constant on each push).
+// server accepts. Bumped on a schema change so version skew is observable
+// (the controller writes the same constant on each push).
 //
 // v2 added the Tenants slice (CacheTenant quota propagation). v3 added
-// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). The version
-// field is the forward-looking guard: a server rejects a body whose version it
-// does not recognize, so a mismatched controller/server pair fails loudly with a
-// clear "unsupported version" rather than silently losing fields. (An older
-// server would instead reject a newer body's unknown field at decode time under
-// DisallowUnknownFields — also a hard failure, just a less descriptive one.)
-const PolicyPropagationVersion = 3
+// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
+// ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
+//
+// Rollout asymmetry — the bump is "additive when the new field can be
+// defaulted; rejected when it can't":
+//
+//   - **Newer server / older body.** A v4 server accepts a v3 body and
+//     normalizes each policy's missing MinimumMatchedTokens to the
+//     server-wide DefaultMinimumMatchedTokens — so a server-first rollout
+//     (v4 server while controller is still v3) does NOT drop existing
+//     CachePolicy state (TTL, timeouts, eviction, prefix gates, quotas).
+//     The normalized result is identical to a no-CachePolicy fallback for
+//     the new field while every prior knob stays enforced. The lenience
+//     window is bounded by PolicyMinimumAcceptedVersion (the oldest body
+//     this server still understands); bodies older than that are still
+//     rejected as "unsupported".
+//   - **Older server / newer body.** The reverse — a v3 server receiving a
+//     v4 push — still hard-fails. Because the handler decodes the body
+//     before checking version, DisallowUnknownFields is the FIRST line of
+//     defense: the new minimumMatchedTokens field on each policy is unknown
+//     to the v3 Go struct, so decode rejects the body with
+//     `decode policy snapshot: json: unknown field "minimumMatchedTokens"`.
+//     Even on a hypothetical breaking change where the field rename or
+//     removal slips past DisallowUnknownFields, the explicit version-band
+//     check below catches it with `unsupported policy snapshot version`.
+//     Both diagnostics are fail-loud; the operator sees one specific message,
+//     not silent state loss.
+const PolicyPropagationVersion = 4
+
+// PolicyMinimumAcceptedVersion is the oldest /policy schema this server
+// understands. Bodies below this version are rejected outright; bodies at
+// or above are accepted with the new-field normalization described on
+// PolicyPropagationVersion. Bump this in lockstep with PolicyPropagationVersion
+// whenever a schema change is NOT additive-defaultable — anything load-bearing
+// for a tenant, anything whose missing value cannot be safely synthesized.
+const PolicyMinimumAcceptedVersion = 3
+
+// DefaultMinimumMatchedTokens is the server-side fallback floor on
+// MATCHED prefix tokens applied when a tenant has no CachePolicy at all.
+// Mirrors the +kubebuilder:default on CachePolicySpec.MinimumMatchedTokens
+// so the "no policy" and "policy with default value" paths both behave
+// identically — see PolicyStore.MinimumMatchedTokens. 64 ≈ 4 KV blocks at
+// the typical 16-token block size: substantially above the chat-template
+// framing tokens identical across every replica, well below any
+// useful real-prompt overlap.
+const DefaultMinimumMatchedTokens int32 = 64
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -30,6 +69,12 @@ const PolicyPropagationVersion = 3
 //   - EvictionTTL <= 0       → fall back to index.DefaultTTL (via the global
 //     WithTTL the binary configured).
 //   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
+//   - MinimumMatchedTokens <= 0 → floor disabled for THIS namespace (every
+//     matched_tokens count, even 1-block trivial overlap, is reported as
+//     PREFIX_MATCH). A negative pointer round-trips as 0, which is the
+//     intentional opt-out. A tenant with no ResolvedPolicy at all instead
+//     falls back to DefaultMinimumMatchedTokens (the server-side default
+//     floor) via PolicyStore.MinimumMatchedTokens.
 //   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
 //   - Eviction == ""         → LRU (the index default and the kubebuilder default).
 type ResolvedPolicy struct {
@@ -38,9 +83,10 @@ type ResolvedPolicy struct {
 	// against the CachePolicy in namespace "foo".
 	Namespace string `json:"namespace"`
 
-	EvictionTTL         time.Duration `json:"evictionTTL,omitempty"`
-	MinimumPrefixTokens int32         `json:"minimumPrefixTokens,omitempty"`
-	LookupTimeoutMs     int32         `json:"lookupTimeoutMs,omitempty"`
+	EvictionTTL          time.Duration `json:"evictionTTL,omitempty"`
+	MinimumPrefixTokens  int32         `json:"minimumPrefixTokens,omitempty"`
+	MinimumMatchedTokens int32         `json:"minimumMatchedTokens,omitempty"`
+	LookupTimeoutMs      int32         `json:"lookupTimeoutMs,omitempty"`
 	// Eviction is the eviction algorithm in lower-case canonical form
 	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
 	// flattening. Empty means the server default (LRU). The index consults it on
@@ -202,13 +248,32 @@ func (s *PolicyStore) Eviction(tenant string) string {
 	return ""
 }
 
-// MinimumPrefixTokens returns the per-namespace minimum matched-token
-// threshold for LookupRoute. 0 means no threshold.
+// MinimumPrefixTokens returns the per-namespace minimum REQUESTED prefix
+// token threshold for LookupRoute (the request-side pre-lookup gate). 0 means
+// no threshold. Distinct from MinimumMatchedTokens, which gates the realized
+// match AFTER the lookup runs.
 func (s *PolicyStore) MinimumPrefixTokens(tenant string) int32 {
 	if p, ok := s.Lookup(tenant); ok {
 		return p.MinimumPrefixTokens
 	}
 	return 0
+}
+
+// MinimumMatchedTokens returns the per-namespace MATCHED prefix token floor
+// applied to LookupRoute responses. When a tenant has a CachePolicy the field
+// value wins as-is (including the explicit 0 opt-out — "I want every match
+// reported, even trivial ones"); when no policy exists the server-wide
+// DefaultMinimumMatchedTokens applies so the safety floor still fires for
+// unconfigured tenants. <0 round-trips to 0 (no enforcement) — the resolver
+// never returns a negative threshold to callers.
+func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
+	if p, ok := s.Lookup(tenant); ok {
+		if p.MinimumMatchedTokens < 0 {
+			return 0
+		}
+		return p.MinimumMatchedTokens
+	}
+	return DefaultMinimumMatchedTokens
 }
 
 // LookupTimeout returns the per-namespace LookupRoute deadline as a
@@ -296,11 +361,53 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			http.Error(w, "decode policy snapshot: "+err.Error()+"\n", http.StatusBadRequest)
 			return
 		}
-		if snap.Version != PolicyPropagationVersion {
+		// Accept any version in [PolicyMinimumAcceptedVersion, PolicyPropagationVersion].
+		// Anything outside that range is a hard 400: a controller too old for
+		// fields the server now load-bears on (`unsupported policy snapshot
+		// version` here), or a controller too new for the server to recognize
+		// (typically caught one layer earlier by DisallowUnknownFields above,
+		// which surfaces as a `decode policy snapshot: json: unknown field "..."`
+		// — also fail-loud, just attributed to the decoder rather than this
+		// branch). Both outcomes give the operator a specific diagnostic.
+		if snap.Version < PolicyMinimumAcceptedVersion || snap.Version > PolicyPropagationVersion {
 			http.Error(w, "unsupported policy snapshot version\n", http.StatusBadRequest)
 			return
 		}
+		// Normalize older bodies so server-first rollouts (newer server, older
+		// controller still pushing v3) preserve every other knob a CR carries.
+		// v3 bodies have no minimumMatchedTokens on policies — JSON decodes the
+		// missing field to int32(0), which is indistinguishable from the v4
+		// explicit-zero opt-out. Fill in DefaultMinimumMatchedTokens so the
+		// post-rollout effective floor on a v3-carrying policy matches the
+		// no-CachePolicy fallback path PolicyStore.MinimumMatchedTokens uses.
+		normalizePolicySnapshotForVersion(&snap)
 		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// normalizePolicySnapshotForVersion rewrites an accepted body so the
+// in-memory store sees the same shape regardless of which (supported) wire
+// version the controller pushed. Today the only normalization is the v3 →
+// v4 minimumMatchedTokens default: a v3 body's missing field would otherwise
+// land as 0 (the v4 explicit opt-out), silently disabling the floor for
+// every namespace with a CR during a server-first rollout. Filling in
+// DefaultMinimumMatchedTokens makes a v3-carrying policy effective-floor
+// match the no-CachePolicy fallback PolicyStore.MinimumMatchedTokens applies
+// to tenants without a CR — so existing policies' floor behavior is
+// preserved until the controller upgrades and starts pushing the explicit
+// field. Bodies already at PolicyPropagationVersion are returned untouched
+// so an operator's explicit `minimumMatchedTokens: 0` opt-out reaches the
+// store as written.
+func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
+	if snap.Version >= PolicyPropagationVersion {
+		return
+	}
+	if snap.Version < 4 {
+		for i := range snap.Policies {
+			if snap.Policies[i].MinimumMatchedTokens == 0 {
+				snap.Policies[i].MinimumMatchedTokens = DefaultMinimumMatchedTokens
+			}
+		}
 	}
 }

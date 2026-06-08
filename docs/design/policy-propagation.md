@@ -3,9 +3,9 @@
 Status: implemented · Owners: controller (push) + server (apply)
 
 `CachePolicy` is a namespaced CRD reconciled by the controller, but its
-enforcement (eviction TTL, eviction algorithm, lookup threshold, lookup
-deadline) lives in the policy server. This document describes how the controller
-PROPAGATES the
+enforcement (eviction TTL, eviction algorithm, request-side prefix-length
+gate, result-side matched-tokens floor, lookup deadline) lives in the
+policy server. This document describes how the controller PROPAGATES the
 declarative CRs into the server's runtime so the configuration surface
 actually changes server behavior.
 
@@ -151,22 +151,24 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v3)
+## Wire schema (v4)
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "policies": [
     {
       "namespace": "team-a",
       "evictionTTL": 900000000000,
       "minimumPrefixTokens": 32,
+      "minimumMatchedTokens": 128,
       "lookupTimeoutMs": 25,
       "eviction": "lfu"
     },
     {
       "namespace": "team-b",
-      "evictionTTL": 3600000000000
+      "evictionTTL": 3600000000000,
+      "minimumMatchedTokens": 64
     }
   ],
   "tenants": [
@@ -179,10 +181,17 @@ intervention.
 }
 ```
 
-- `version` — schema version. Bumped on a breaking change. The server
-  rejects any value it does not recognize (HTTP 400). Currently `3`
-  (bumped from `1` to `2` when `tenants` was added, then to `3` when
-  `policies[].eviction` was added).
+- `version` — schema version. Bumped on every schema change so version
+  skew is observable; **whether the bump is rejected at decode is set
+  separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
+  Rollout asymmetry note in §Versioning and forward-compat below. v4
+  in particular is additive and defaultable, so the v4 server still
+  accepts v3 bodies; a hypothetical breaking change would bump
+  `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
+  value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
+  (HTTP 400). Currently `4` (bumped from `1` to `2` when `tenants` was
+  added, to `3` when `policies[].eviction` was added, and to `4` when
+  `policies[].minimumMatchedTokens` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -196,7 +205,17 @@ intervention.
   defensive default for an unset field and for any legacy/raced data that
   predates the webhook.
 - `policies[].minimumPrefixTokens` — int32. Optional. `<=0` ⇒ "no
-  threshold".
+  threshold". A request-side gate against `LookupRouteRequest`'s claimed
+  prefix length BEFORE the index is touched.
+- `policies[].minimumMatchedTokens` — int32. Optional. `<=0` ⇒ "no floor for
+  this namespace" (the explicit opt-out). A namespace that does NOT have a
+  `CachePolicy` at all instead falls back to `DefaultMinimumMatchedTokens`
+  (= 64) — the server-wide safety floor. Distinct from
+  `minimumPrefixTokens`: this is a result-side filter applied AFTER the
+  index returns, against each replica's realized matched-token overlap.
+  Replicas whose match falls below the floor are filtered from the
+  response; when none survive, the reason code downgrades to `NO_HINT`.
+  See [`lookuproute-ranking.md`](./lookuproute-ranking.md#26-the-matched-tokens-floor).
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒
   "no deadline".
 - `policies[].eviction` — lower-cased cap-eviction algorithm (`"lru"` /
@@ -281,7 +300,8 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 |---|---|
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
 | `eviction` | `pkg/index` `EvictionResolver` — selects the per-namespace cap-based eviction algorithm. `lru` evicts oldest-by-`lastSeen`; `lfu` evicts the lowest per-entry access count, tie-broken on oldest `lastSeen`. The cap sweep (over `MaxEntries`) consults it to order victims. In `lfu` namespaces the lookup path also reads it to record which entries a *delivered* `LookupRoute` hint credits — the bump is lock-free and applied only when the response is actually returned (a `TIMEOUT`'d lookup credits nothing) and never changes a lookup result. The TTL sweep is algorithm-independent. Emitted as `inferencecache_index_evictions_total{algorithm,reason}`. |
-| `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
+| `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest`'s effective prefix token count: chain-bearing requests use `sum(block_token_counts)` and fall back to `prefix_token_count` only when the chain is empty (`effectivePrefixTokens` in the handler). A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics — gateway authors should size the gate against the chain budget they actually send. |
+| `minimumMatchedTokens` | Post-lookup floor on each replica's realized `matched_tokens`. The handler resolves the per-tenant floor via `PolicyStore.MinimumMatchedTokens`, which falls back to `DefaultMinimumMatchedTokens` (= 64) for tenants with no `CachePolicy`. Replicas whose `matched_tokens` falls below the floor are filtered from the scored result; if none survive, the response downgrades to `reason_code: NO_HINT` with empty scores. The downgrade runs **before** the LFU `CreditHits` step so a non-delivered hint never bumps the per-entry access counter. See [`lookuproute-ranking.md §2.6`](./lookuproute-ranking.md#26-the-matched-tokens-floor). |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 
@@ -317,13 +337,41 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
-`version` is `3`: it was bumped from `1` to `2` when the `tenants` slice
-was added, then to `3` when `policies[].eviction` (the per-namespace
-cap-eviction algorithm) was added. The server decodes with
-`DisallowUnknownFields`, so a stale controller's push is rejected with a
-clear "unsupported version" error rather than silently dropping fields;
-controller and server roll out together and the periodic re-push
-reconciles any transient skew.
+`version` is `4`: it was bumped from `1` to `2` when the `tenants` slice
+was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
+algorithm) was added, and to `4` when `policies[].minimumMatchedTokens`
+(the result-side matched-tokens floor) was added. The server decodes with
+`DisallowUnknownFields`, so an older server receiving a newer body still
+fails loud on the unknown field even before its version check fires.
+
+**Rollout asymmetry (additive-defaultable carve-out).** The version check is
+deliberately asymmetric so a server-first rollout (newer server, older
+controller still pushing the prior schema) does NOT drop existing policy
+state mid-upgrade:
+
+- A v4 server accepts any body whose `version` is in
+  `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
+  `[3, 4]`. Bodies outside the band are rejected with
+  `unsupported policy snapshot version`.
+- For accepted older bodies, the new field is *normalized* before reaching
+  the store. v3 has no `minimumMatchedTokens` key; JSON decodes the missing
+  field as `0`, which would be indistinguishable from the v4 explicit
+  opt-out and silently disable the floor for every namespace with a CR
+  during the rollout. The server fills in `DefaultMinimumMatchedTokens`
+  (`64`) per policy so the effective floor matches the no-CachePolicy
+  fallback `PolicyStore.MinimumMatchedTokens` applies to tenants without a
+  CR. Every other knob (TTL, prefix gate, timeout, eviction, tenant quota)
+  reaches the store byte-for-byte.
+- v4 bodies are NOT normalized — an operator's explicit `minimumMatchedTokens: 0`
+  opt-out reaches the store as written. The normalization fires only when
+  the version says the new field could not have been present.
+
+The carve-out only applies to **additive, defaultable** schema changes: a
+new field whose absence has a safe well-defined synthesized value. A
+schema change that is load-bearing (removes a field, changes meaning, makes
+an existing field required) MUST be paired with a `PolicyMinimumAcceptedVersion`
+bump so old bodies under that change are rejected rather than silently
+mis-interpreted.
 
 ## Out of scope
 

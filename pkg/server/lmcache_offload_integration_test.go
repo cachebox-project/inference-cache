@@ -82,8 +82,12 @@ func be8(h uint64) []byte {
 func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	// One stored block then an immediate remove for the same hash — the
 	// shape vLLM+LMCache produces every time the engine evicts a GPU block.
+	// BlockSize=128 keeps the realized matched_tokens above the
+	// DefaultMinimumMatchedTokens floor so the assertion is about
+	// the offload-pinning behavior, not the floor; smaller block sizes would
+	// downgrade this hint to NO_HINT before the L2-tier guard mattered.
 	h := be8(0xD2CD1BA8E13D7DD6)
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}
+	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 128}
 	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
 
 	client, stop := runEngineReporterAgainstServer(t,
@@ -95,7 +99,7 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "vllm-model", TenantId: "ic-smoke", HashScheme: "vllm",
-		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{16},
+		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{128},
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
@@ -148,7 +152,12 @@ func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 func TestKnownEngineHashBytesMatchViaReporterAndLookupRoute(t *testing.T) {
 	const hashInt uint64 = 0xD2CD1BA8E13D7DD6
 	h := be8(hashInt)
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}
+	// BlockSize=128 keeps the realized matched_tokens above the
+	// DefaultMinimumMatchedTokens floor — the test pins
+	// hash-byte equality across the round-trip, not the floor; a 16-token
+	// single block would be downgraded to NO_HINT before the byte-equality
+	// assertion ran.
+	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 128}
 
 	client, stop := runEngineReporterAgainstServer(t,
 		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
@@ -158,7 +167,7 @@ func TestKnownEngineHashBytesMatchViaReporterAndLookupRoute(t *testing.T) {
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "vllm-model", TenantId: "ic-smoke", HashScheme: "vllm",
-		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{16},
+		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{128},
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)

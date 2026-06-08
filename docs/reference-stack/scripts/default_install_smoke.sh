@@ -17,11 +17,15 @@
 #      columns.
 #   4. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
-#      server's `/policy` endpoint, and `LookupRoute` observes the pushed
-#      minimumPrefixTokens gate without engine pods or inference traffic. The
-#      installed validating webhook also rejects a SECOND CachePolicy in the
-#      namespace (one-per-namespace), proving the bundle's webhook Service +
-#      cert-manager CA-injection path — not just envtest handler logic.
+#      server's `/policy` endpoint, and `LookupRoute` observes BOTH the pushed
+#      `minimumPrefixTokens` request-side gate AND the pushed
+#      `minimumMatchedTokens` result-side floor without engine pods or
+#      inference traffic — three orthogonal lookups (above both, below the
+#      request-side gate, sub-floor realized match) carry the three policy
+#      enforcement paths end-to-end. The installed validating webhook also
+#      rejects a SECOND CachePolicy in the namespace (one-per-namespace),
+#      proving the bundle's webhook Service + cert-manager CA-injection
+#      path — not just envtest handler logic.
 #   5. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller. The
@@ -868,26 +872,57 @@ fi
 
 # --- CachePolicy PUSH adoption assertion -----------------------------------
 # No read-back endpoint exists for /policy, by design. Prove the server adopted
-# the controller-pushed CachePolicy via an existing gRPC side effect instead:
-# seed one synthetic prefix metadata update, then require a lookup above the
-# policy's minimumPrefixTokens to hit while the same exact prefix below the
-# threshold returns NO_HINT. Without the pushed policy, the low-token lookup
-# would also be a PREFIX_MATCH. This avoids engine pods/images, model traffic,
-# and any new transport.
-log "seeding a prefix and asserting CachePolicy minimumPrefixTokens is enforced by LookupRoute"
+# the controller-pushed CachePolicy via existing gRPC side effects on three
+# orthogonal axes:
+#   1. minimumPrefixTokens (request-side gate, applied BEFORE the index lookup).
+#      Seed one prefix; the request below the policy threshold short-circuits
+#      to NO_HINT without touching the index; the request above hits.
+#   2. minimumMatchedTokens (result-side floor, applied AFTER the lookup, against
+#      the realized matched-token overlap). Seed a SECOND prefix whose stored
+#      tokenCount is above minimumPrefixTokens (so it clears the request-side
+#      gate) but BELOW minimumMatchedTokens (so the realized match downgrades
+#      to NO_HINT). Without this assertion the floor could be silently dropped
+#      and the smoke would still pass on the request-side gate alone. The
+#      sample carries minimumMatchedTokens explicitly (config/samples/
+#      cache_v1alpha1_cachepolicy.yaml).
+#
+# Note: with no CachePolicy at all the server-wide DefaultMinimumMatchedTokens
+# (= 64) ALSO downgrades the trivial 32-token match to NO_HINT — the no-policy
+# fallback fires the same floor as the sample CR sets. The point of the
+# trivial-match assertion is therefore "the pushed CR did not silently drop the
+# result-side floor" rather than "without the CR this would have been
+# PREFIX_MATCH". The low-prefix lookup is the standalone proof that policy
+# adoption happened (its NO_HINT outcome IS owned by the pushed
+# minimumPrefixTokens: 32 — no-policy would have ungated the request and
+# returned PREFIX_MATCH on the 64-token stored prefix). Together they cover
+# both policy enforcement axes end-to-end. Avoids engine pods/images, model
+# traffic, and any new transport.
+log "seeding two prefixes and asserting CachePolicy minimumPrefixTokens (request-side gate) AND minimumMatchedTokens (result-side floor) are both enforced by LookupRoute"
 policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"
-policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix")
+policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix") — stored at tokenCount=64, clears both gates
+trivial_hash_b64="dHJpdmlhbC1wcmVmaXg=" # base64("trivial-prefix") — stored at tokenCount=32, clears request gate (32 >= sample's 32) but below the 64 matched-tokens floor
+
+# Two stored prefixes in one ReportCacheState ingest: the regular 64-token
+# prefix (clears both gates) and the trivial 32-token prefix (clears the
+# request-side gate, fails the result-side floor — what proves the
+# minimumMatchedTokens floor actually fires end-to-end).
 policy_report_payload="$(cat <<EOF
-{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
+{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64},{"prefixHash":"$trivial_hash_b64","tokenCount":32}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
 EOF
 )"
 policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_DIR/grpcurl-policy-report.err")" || {
   cat "$LOG_DIR/grpcurl-policy-report.err" >&2 || true
-  fail "grpcurl ReportCacheState did not accept the CachePolicy smoke prefix"
+  fail "grpcurl ReportCacheState did not accept the CachePolicy smoke prefixes"
 }
 log "ReportCacheState response: $policy_report_resp"
 
+# Three lookups exercise the three orthogonal policy-enforcement paths:
+#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path works).
+#   - policy_low: below the request-side gate → NO_HINT (request-side gate fires).
+#   - policy_trivial: above the request-side gate but matched_tokens=32 < floor 64
+#     → NO_HINT (result-side floor fires — the assertion the request-side gate
+#     alone cannot make).
 policy_high_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":64}
 EOF
@@ -896,34 +931,46 @@ policy_low_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":1}
 EOF
 )"
+policy_trivial_payload="$(cat <<EOF
+{"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$trivial_hash_b64","prefixTokenCount":64}
+EOF
+)"
 
 deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
 policy_high_resp=""
 policy_low_resp=""
-until has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; do
+policy_trivial_resp=""
+until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
+  && has_reason_code "$policy_low_resp" "NO_HINT" \
+  && has_reason_code "$policy_trivial_resp" "NO_HINT"; do
   policy_high_resp="$(grpcurl_lookup_route "$policy_high_payload" "$LOG_DIR/grpcurl-policy-high.err")" || true
   policy_low_resp="$(grpcurl_lookup_route "$policy_low_payload" "$LOG_DIR/grpcurl-policy-low.err")" || true
+  policy_trivial_resp="$(grpcurl_lookup_route "$policy_trivial_payload" "$LOG_DIR/grpcurl-policy-trivial.err")" || true
 
-  if has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; then
+  if has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
+    && has_reason_code "$policy_low_resp" "NO_HINT" \
+    && has_reason_code "$policy_trivial_resp" "NO_HINT"; then
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
-    echo "above-threshold LookupRoute response:" >&2
+    echo "above-threshold LookupRoute response (want PREFIX_MATCH):" >&2
     echo "$policy_high_resp" >&2
-    echo "below-threshold LookupRoute response:" >&2
+    echo "below-request-gate LookupRoute response (want NO_HINT):" >&2
     echo "$policy_low_resp" >&2
-    for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err"; do
+    echo "trivial-match (below result floor) LookupRoute response (want NO_HINT):" >&2
+    echo "$policy_trivial_resp" >&2
+    for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err" "$LOG_DIR/grpcurl-policy-trivial.err"; do
       if [ -s "$err_file" ]; then
         echo "$(basename "$err_file"):" >&2
         cat "$err_file" >&2
       fi
     done
-    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want high-token PREFIX_MATCH and low-token NO_HINT)"
+    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request NO_HINT, trivial-match NO_HINT)"
   fi
   sleep 2
 done
-log "CachePolicy push adopted: above-threshold lookup hit, below-threshold lookup returned NO_HINT"
+log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned NO_HINT; trivial-match (matched_tokens<floor) lookup returned NO_HINT — both minimum-token policy knobs enforced end-to-end"
 kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --- paired-sample smoke ---------------------------------------------------
@@ -1904,8 +1951,8 @@ spec:
       sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
       # POST /policy — controller-audience must 204, default-audience must 401.
       # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
-      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
       # POST /probe — controller-audience must 200, default-audience must 401.
       # Body is a minimal valid ProbeRequest so any non-2xx is auth-side, not body-parse.
       pr_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")

@@ -13,5 +13,15 @@ spec:
   # count); set `eviction: LFU` to evict the least-frequently-used entries when
   # the index is over its cap.
   evictionTTL: 30m
+  # minimumPrefixTokens is a REQUEST-side gate: a request whose claimed prefix
+  # tokens fall below this short-circuits to NO_HINT without touching the index.
   minimumPrefixTokens: 32
+  # minimumMatchedTokens is a RESULT-side floor: replicas whose realized
+  # matched-tokens overlap is below this are filtered from the response, and
+  # if none survive the reason code downgrades to NO_HINT. Defaults to 64
+  # (4 KV blocks at the typical 16-token block size) — above the trivial
+  # chat-template framing every replica has identically, below useful
+  # real-prompt overlaps. Distinct from minimumPrefixTokens. Set to 0 to
+  # disable entirely (e.g. raw-recall benchmarking).
+  minimumMatchedTokens: 64
   lookupTimeoutMs: 20

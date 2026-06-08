@@ -91,9 +91,12 @@ func TestLookupRouteFailsOpen(t *testing.T) {
 func TestLookupRouteReasonCodes(t *testing.T) {
 	t.Run("PREFIX_MATCH on exact prefix hit", func(t *testing.T) {
 		svc := newTestService()
+		// TokenCount=128 keeps the realized match above the
+		// DefaultMinimumMatchedTokens floor so this test pins the
+		// PREFIX_MATCH wire code, not the floor.
 		svc.index.Ingest(index.Update{
 			ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
-			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 		})
 		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
@@ -167,9 +170,12 @@ func TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC(t *testing.T) {
 func TestLookupRouteSLOFlowsThroughHandler(t *testing.T) {
 	svc := newTestService()
 
+	// TokenCount=128 keeps the realized match above the
+	// DefaultMinimumMatchedTokens floor so this test pins SLO
+	// plumbing, not the floor.
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 50}},
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 	})
 
 	base := &icpb.LookupRouteRequest{
@@ -1402,9 +1408,13 @@ func TestLookupRouteUnaffectedByPolicyForUnknownTenant(t *testing.T) {
 	svc.policies.Replace([]ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200, LookupTimeoutMs: 1},
 	})
+	// TokenCount=128 keeps the realized match above the server-wide
+	// DefaultMinimumMatchedTokens floor, which fires for any
+	// tenant with no CachePolicy. The test pins "team-a's policy doesn't
+	// leak into team-b", not the floor.
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "team-b", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 	})
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
@@ -1430,7 +1440,10 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	defer cancel()
 
 	ingestHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
-	ingestCounts := []int32{16, 16, 16}
+	// Block tokens=64 each keeps the matched run (3 blocks × 64 = 192) above
+	// the DefaultMinimumMatchedTokens floor, so the test pins
+	// partial-run matched_tokens accounting, not the floor.
+	ingestCounts := []int32{64, 64, 64}
 
 	stream, err := client.ReportCacheState(ctx)
 	if err != nil {
@@ -1447,7 +1460,7 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	}
 
 	lookupHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3"), []byte("x4"), []byte("x5")}
-	lookupCounts := []int32{16, 16, 16, 16, 16}
+	lookupCounts := []int32{64, 64, 64, 64, 64}
 	resp, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
 		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
 		BlockHashes: lookupHashes, BlockTokenCounts: lookupCounts,
@@ -1461,8 +1474,8 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-a" {
 		t.Fatalf("expected single hit for replica-a, got %+v", resp.GetReplicaScores())
 	}
-	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 48 {
-		t.Fatalf("matched_tokens = %d, want 48 (3 blocks × 16 — the partial run, not the full request chain)", got)
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 192 {
+		t.Fatalf("matched_tokens = %d, want 192 (3 blocks × 64 — the partial run, not the full request chain)", got)
 	}
 }
 
@@ -1471,10 +1484,18 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 // request omits the legacy prefix_token_count (a chain-only caller). Without
 // this fallback the policy threshold would erroneously short-circuit every
 // chain request to NO_HINT regardless of its actual token budget.
+//
+// The policy explicitly sets MinimumMatchedTokens=0 so the §2.6 result-side
+// floor is disabled for this namespace. Otherwise the 48-token realized
+// match would clear the request-side gate (32) but fail the
+// DefaultMinimumMatchedTokens (64) the apiserver materializes on a bare CR,
+// and the test would assert PREFIX_MATCH for a configuration that production
+// would actually downgrade to NO_HINT. Making the opt-out explicit pins the
+// test scope to the request-side gate alone, matching its name.
 func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", MinimumPrefixTokens: 32},
+		{Namespace: "team-a", MinimumPrefixTokens: 32, MinimumMatchedTokens: 0},
 	})
 	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
 	counts := []int32{16, 16, 16}

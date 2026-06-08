@@ -483,9 +483,10 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 		WithObjects(&cachev1alpha1.CachePolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
 			Spec: cachev1alpha1.CachePolicySpec{
-				EvictionTTL:         ttlPtr(12 * time.Minute),
-				MinimumPrefixTokens: i32Ptr(64),
-				LookupTimeoutMs:     i32Ptr(10),
+				EvictionTTL:          ttlPtr(12 * time.Minute),
+				MinimumPrefixTokens:  i32Ptr(64),
+				MinimumMatchedTokens: i32Ptr(128),
+				LookupTimeoutMs:      i32Ptr(10),
 			},
 		}).
 		Build()
@@ -500,11 +501,17 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	if !ok {
 		t.Fatal("server store should hold team-a after a successful push")
 	}
-	if p.EvictionTTL != 12*time.Minute || p.MinimumPrefixTokens != 64 || p.LookupTimeoutMs != 10 {
+	if p.EvictionTTL != 12*time.Minute || p.MinimumPrefixTokens != 64 || p.MinimumMatchedTokens != 128 || p.LookupTimeoutMs != 10 {
 		t.Fatalf("round-trip mismatch: %+v", p)
 	}
 	if d := store.TTL("team-a"); d != 12*time.Minute {
 		t.Fatalf("store.TTL = %v", d)
+	}
+	// MinimumMatchedTokens flows through the resolver the server
+	// reads — guards against a future refactor that drops the field on the
+	// flatten path without anyone noticing.
+	if got := store.MinimumMatchedTokens("team-a"); got != 128 {
+		t.Fatalf("store.MinimumMatchedTokens = %d, want 128 (the policy value)", got)
 	}
 }
 

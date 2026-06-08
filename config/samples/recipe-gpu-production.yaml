@@ -96,8 +96,15 @@ spec:
   # from lastSeen and lookups do NOT refresh it — a hot-but-unreported prefix
   # still ages out. At most one CachePolicy is allowed per namespace.
   evictionTTL: 1h
-  # Skip lookups for very short prompts where a prefix hit saves little.
+  # Request-side gate: skip lookups for very short prompts where a prefix hit
+  # saves little. Matched against the request's claimed prefix token count.
   minimumPrefixTokens: 256
+  # Result-side floor on the REALIZED matched-tokens overlap. A production
+  # workload sees a fair amount of small chat-template-only overlaps —
+  # raising the floor above the 64 default to 256 keeps only substantial
+  # prefix matches counted as PREFIX_MATCH, so dashboards/SLOs read a clean
+  # signal. Set to 0 to disable.
+  minimumMatchedTokens: 256
   # Lookup deadline. A timed-out lookup fails open — it returns reason_code
   # TIMEOUT with empty scores and never fails the serving request. NOTE: 0 means
   # UNBOUNDED, not "instant"; keep a real budget here in production.

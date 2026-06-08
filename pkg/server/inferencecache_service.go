@@ -37,8 +37,11 @@ const (
 // / GetCacheState are backed by the in-memory CacheIndex (B6); the remaining
 // RPCs (RenderTemplate, LookupPDRoute, streams) stay fail-open stubs until their
 // modules land. All lookups remain side-effect-free apart from emitting metrics
-// and fail open — an empty result with NO_HINT (no match / below the configured
-// minimumPrefixTokens), with TIMEOUT (lookupTimeoutMs budget breach), or with
+// and fail open — an empty result with NO_HINT (no match; below the configured
+// minimumPrefixTokens request-side gate; or every replica's realized
+// matched_tokens fell below the per-namespace minimumMatchedTokens
+// result-side floor — see docs/design/lookuproute-ranking.md §2.6), with
+// TIMEOUT (lookupTimeoutMs budget breach), or with
 // one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
 // when the lookup misses AND the index can identify which contract key did not
 // match anything held (see docs/design/lookuproute-diagnostics.md). Every empty-
@@ -174,7 +177,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	if !hasDeadline {
 		start := time.Now()
 		result := s.lookupFn(lookupReq)
-		return s.buildLookupResponse(model, result, time.Since(start)), nil
+		return s.buildLookupResponse(model, tenant, result, time.Since(start)), nil
 	}
 
 	// Bounded path: a deadline is active, so bound the lookup at wall-clock
@@ -218,7 +221,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
-	return s.buildLookupResponse(model, result, elapsed), nil
+	return s.buildLookupResponse(model, tenant, result, elapsed), nil
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
@@ -227,7 +230,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
 // TENANT_HOT / NO_HINT / UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME)
 // via reasonForStrategy.
-func (s *inferenceCacheService) buildLookupResponse(model string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+	// Result-side floor on matched_tokens. The index returned
+	// PREFIX_MATCH because at least one replica held the requested prefix; that
+	// holds even when the realized overlap is the 1-block chat-template framing
+	// every replica has identically — which inflates operator-visible routing
+	// metrics by ~3× without changing routing quality (the proxy round-robins
+	// among equally-trivial holders). Filter replicas whose match falls below
+	// the policy floor; when none survive, downgrade to NO_HINT so the gateway
+	// rounds robin honestly. The downgrade happens BEFORE CreditHits so a
+	// non-delivered hint never bumps an LFU counter.
+	if result.Strategy == index.StrategyPrefixMatch {
+		result = s.applyMatchedTokensFloor(result, tenant)
+	}
 	// Credit the LFU access counters for the entries this response actually
 	// delivers. buildLookupResponse runs on every DELIVERED response (including
 	// NO_HINT and the UNKNOWN_* diagnostic responses) but never on the
@@ -279,6 +294,58 @@ func (s *inferenceCacheService) policyMinimumPrefixTokens(tenant string) int32 {
 		return 0
 	}
 	return s.policies.MinimumPrefixTokens(tenant)
+}
+
+// policyMinimumMatchedTokens returns the per-tenant matched-tokens floor
+// applied to PREFIX_MATCH responses. A nil store skips the floor entirely
+// (used by the test scaffolding that wires a service without a PolicyStore);
+// otherwise the resolver returns the tenant's configured value, or the
+// server-wide DefaultMinimumMatchedTokens when no CachePolicy is set.
+func (s *inferenceCacheService) policyMinimumMatchedTokens(tenant string) int32 {
+	if s.policies == nil {
+		return 0
+	}
+	return s.policies.MinimumMatchedTokens(tenant)
+}
+
+// applyMatchedTokensFloor filters scores below the per-tenant floor and, when
+// no replica survives, replaces the result with a fail-open NO_HINT. The
+// matching LFU hits are pruned in lockstep via LookupResult.RetainReplicas
+// (and dropped entirely on the all-empty downgrade), so a non-delivered
+// hint never bumps an LFU counter — preserving the no-credit-on-non-delivery
+// invariant even on the partial-keep path where one replica survives and a
+// sibling falls below the floor. The check is a no-op when the floor is zero
+// (policy opt-out) or when every score already clears the floor — the common
+// case for a real long-prefix match.
+func (s *inferenceCacheService) applyMatchedTokensFloor(result index.LookupResult, tenant string) index.LookupResult {
+	floor := s.policyMinimumMatchedTokens(tenant)
+	if floor <= 0 || len(result.Scores) == 0 {
+		return result
+	}
+	// Walk once: classify each score and count survivors. If every score
+	// clears the floor we return the original result untouched (zero
+	// allocation, common case for a real long-prefix match).
+	keep := make(map[string]bool, len(result.Scores))
+	survivors := 0
+	for _, sc := range result.Scores {
+		if sc.MatchedTokens >= floor {
+			keep[sc.ReplicaID] = true
+			survivors++
+		}
+	}
+	if survivors == len(result.Scores) {
+		return result
+	}
+	if survivors == 0 {
+		// No replica cleared the floor — downgrade to a fail-open NO_HINT.
+		// Constructing a fresh LookupResult drops the hits map entirely so a
+		// non-delivered hint cannot bump an LFU counter.
+		return index.LookupResult{Strategy: index.StrategyNone}
+	}
+	// Partial-keep: prune Scores AND hitsByReplica together so dropped
+	// replicas' LFU entries are not credited at CreditHits time.
+	result.RetainReplicas(keep)
+	return result
 }
 
 // reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's

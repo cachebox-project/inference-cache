@@ -565,6 +565,11 @@ func (in *CachePolicySpec) DeepCopyInto(out *CachePolicySpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.MinimumMatchedTokens != nil {
+		in, out := &in.MinimumMatchedTokens, &out.MinimumMatchedTokens
+		*out = new(int32)
+		**out = **in
+	}
 	if in.LookupTimeoutMs != nil {
 		in, out := &in.LookupTimeoutMs, &out.LookupTimeoutMs
 		*out = new(int32)

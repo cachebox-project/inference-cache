@@ -39,7 +39,13 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
 
    where `freshness = max(0, 1 − age / TTL)` — a linear decay from 1 (just
    reported) to 0 (older than the TTL).
-3. Return them ranked best-first, ties broken by replica ID. `reason_code: PREFIX_MATCH`. (The handler currently returns every qualifying candidate — there is no top-K limit today; the gateway typically uses the top entry.)
+3. Filter the scored replicas through the **matched-tokens floor** (§2.6)
+   so a 1-block chat-template-only overlap is not reported as a routing
+   hit. If at least one replica clears the floor, return them ranked
+   best-first (ties broken by replica ID) with `reason_code: PREFIX_MATCH`.
+   If none clear the floor, the response downgrades to `reason_code: NO_HINT`
+   with empty scores. (The handler returns every qualifying candidate — there is
+   no top-K limit today; the gateway typically uses the top entry.)
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the
@@ -150,11 +156,17 @@ A few details that matter for correctness:
   of some unrelated chain (because the bytes happen to collide) doesn't
   show up as a partial match against this request. The leading-run rule
   is enforced by where we initialize, not by separate position tracking.
-- **`reason_code` is unchanged on the match side.** Any non-empty match
-  — one block or the whole chain — is `PREFIX_MATCH`. On a miss, the
-  request goes through the same miss-classifier as the exact-match
-  path: a same-key first-block miss yields `NO_HINT`; a contract-key
-  mismatch yields the matching `UNKNOWN_*` code (see
+- **`reason_code` is unchanged on the match side, subject to the §2.6
+  floor.** Any non-empty match — one block or the whole chain — is
+  `PREFIX_MATCH` *provided* at least one replica's `matched_tokens`
+  clears the per-namespace `minimumMatchedTokens` floor. A chain match
+  that produces only sub-floor per-replica overlaps (e.g. a 1-block run
+  under the default 64-token floor) downgrades to `NO_HINT` exactly the
+  way an exact-match result does — the floor is a §2-and-§2.5 wrapping
+  filter, not a separate strategy. On a miss, the request goes through
+  the same miss-classifier as the exact-match path: a same-key
+  first-block miss yields `NO_HINT`; a contract-key mismatch yields the
+  matching `UNKNOWN_*` code (see
   [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)). The
   engine-opaque guards (empty `hash_scheme`, mismatched parallel-array
   lengths) and the cold-start carve-out continue to surface as
@@ -163,38 +175,50 @@ A few details that matter for correctness:
 ### Worked example — 5 blocks, 3 deep
 
 Request asks for the chain `[h1, h2, h3, h4, h5]` with per-block counts
-`[16, 16, 16, 16, 16]`. Index state for the requested
+`[64, 64, 64, 64, 64]`. Index state for the requested
 `(tenant, model, scheme)`:
+
+Block sizes are 64 tokens each so every per-replica run clears the
+default §2.6 matched-tokens floor; the §2.5 walk illustrates chain
+ranking in isolation from the floor. (A 16-token-per-block example
+under the default `minimumMatchedTokens: 64` would have *every* replica
+in this table filtered out and the response downgraded to `NO_HINT` —
+correct, but it would shadow the longest-prefix mechanics the section
+is teaching.)
 
 | Block hash | Holders → `{tokenCount, lastSeen age}`                                   |
 |------------|---------------------------------------------------------------------------|
-| `h1`       | `replica-A: {16, 1m}, replica-B: {16, 2m}, replica-C: {16, 4m}`           |
-| `h2`       | `replica-A: {32, 1m}, replica-B: {32, 2m}`                                |
-| `h3`       | `replica-A: {48, 1m}`                                                     |
+| `h1`       | `replica-A: {64, 1m}, replica-B: {64, 2m}, replica-C: {64, 4m}`           |
+| `h2`       | `replica-A: {128, 1m}, replica-B: {128, 2m}`                              |
+| `h3`       | `replica-A: {192, 1m}`                                                    |
 | `h4`       | *(nobody)*                                                                |
 | `h5`       | *(nobody)*                                                                |
 
 Walking the chain:
 
-| Step      | Running set after this block                       | Finalized                                  |
-|-----------|----------------------------------------------------|--------------------------------------------|
-| seed `h1` | `A: {tok=16, oldest=1m}, B: {tok=16, oldest=2m}, C: {tok=16, oldest=4m}` | —                                          |
-| at `h2`   | `A: {tok=32, oldest=1m}, B: {tok=32, oldest=2m}`   | `C: {tok=16, oldest=4m}` *(dropped at h2)* |
-| at `h3`   | `A: {tok=48, oldest=1m}`                           | `+ B: {tok=32, oldest=2m}` *(dropped at h3)*|
-| at `h4`   | *(empty — A doesn't hold h4)* → stop walking       | `+ A: {tok=48, oldest=1m}`                 |
+| Step      | Running set after this block                          | Finalized                                  |
+|-----------|-------------------------------------------------------|--------------------------------------------|
+| seed `h1` | `A: {tok=64, oldest=1m}, B: {tok=64, oldest=2m}, C: {tok=64, oldest=4m}` | —                                          |
+| at `h2`   | `A: {tok=128, oldest=1m}, B: {tok=128, oldest=2m}`    | `C: {tok=64, oldest=4m}` *(dropped at h2)* |
+| at `h3`   | `A: {tok=192, oldest=1m}`                             | `+ B: {tok=128, oldest=2m}` *(dropped at h3)*|
+| at `h4`   | *(empty — A doesn't hold h4)* → stop walking          | `+ A: {tok=192, oldest=1m}`                |
 
 Scoring each finalized replica (no pressure/SLO, TTL = 30 min, so
 `freshness = 1 − age/30m`):
 
-| Replica | matched_tokens | freshness | score | rank |
-|---------|----------------|-----------|-------|------|
-| `A`     | 48             | 0.97      | 46.4  | 1    |
-| `B`     | 32             | 0.93      | 29.8  | 2    |
-| `C`     | 16             | 0.87      | 13.9  | 3    |
+| Replica | matched_tokens | freshness | score  | rank |
+|---------|----------------|-----------|--------|------|
+| `A`     | 192            | 0.97      | 186.2  | 1    |
+| `B`     | 128            | 0.93      | 119.5  | 2    |
+| `C`     | 64             | 0.87      | 55.7   | 3    |
 
-Response: `reason_code: PREFIX_MATCH`, scores `[A (46), B (30), C (14)]`
-— the gateway routes to A for the deepest cache hit, with B as a hot
-backup if A is overloaded.
+Response: `reason_code: PREFIX_MATCH`, scores `[A (186), B (119),
+C (55)]` — the gateway routes to A for the deepest cache hit, with B as
+a hot backup if A is overloaded. Under the default §2.6 floor of 64 all
+three clear (A and B by a comfortable margin, C exactly at the
+boundary); raising `minimumMatchedTokens` to 128 would filter C out of
+the response and leave just `[A, B]`, illustrating the per-replica
+floor filter without changing the chain-walk numbers.
 
 ### Backward-compat — what an unmigrated producer or client sees
 
@@ -236,6 +260,79 @@ this. A future engine that emits position-blind block hashes (same
 bytes for a "middle" block as for a "leading" block) would violate the
 assumption and should not be ingested with the chain form. The contract
 doesn't enforce that — it's a producer-side discipline.
+
+## 2.6 The matched-tokens floor — a Phase-1 stopgap
+
+**Scope caveat.** This floor is a quick win for Llama-style chat-template
+workloads where the shared prefix is short (~16-32 tokens). It is **not**
+the production-grade ranking answer: workloads with long shared prefixes
+(RAG corpus headers, custom system prompts, few-shot examples) routinely
+match well above any reasonable fixed token floor on content every replica
+has — so the floor lets them through unchanged and the inflated-`PREFIX_MATCH`
+signal returns. The proper fix is a replica-*distinguishing-power* ranker —
+one that measures how rare an overlap is across replicas, not just how
+long — and is tracked as separate follow-up work. Ship the floor as a
+clean stopgap that fixes the visible Phase-2 benchmark inflation; revisit
+when the distinguishing-power algorithm lands.
+
+The baseline returned `PREFIX_MATCH` for *any* non-zero overlap, which gave
+operators an inflated routing signal: the cache-stress harness benchmarks
+showed ~70% of `PREFIX_MATCH` responses were 1-block (16-token) matches —
+the Llama-3 chat-template framing every replica had identically. Trivial
+matches deterministically route to whichever replica's chat-template hash
+arrived first; they are not useful routing decisions, but they were being
+counted as if they were.
+
+The matched-tokens floor adds a per-namespace **result-side** filter on top
+of the score from §2 (and §2.5 longest-prefix matching). Pseudocode:
+
+```
+effective_floor = CachePolicy.spec.minimumMatchedTokens   // per namespace
+                  ?? server_default                       // = 64 (4 blocks)
+
+scored = ranker(request)                                  // §2 / §2.5
+kept   = [s for s in scored if s.matched_tokens >= effective_floor]
+
+if len(kept) > 0:
+    reply(PREFIX_MATCH, kept)
+else:
+    reply(NO_HINT, [])
+```
+
+Key properties:
+
+- **Server-side default.** A namespace with no `CachePolicy` installed still
+  gets the safety floor (`DefaultMinimumMatchedTokens = 64`), so the
+  inflated-metric bug doesn't reappear for unconfigured tenants — which is
+  the common case.
+- **Per-namespace override.** A `CachePolicy.spec.minimumMatchedTokens` value
+  overrides the default for that namespace exactly as written.
+- **`= 0` is the explicit opt-out.** Useful for raw-recall benchmarking and
+  pre-regression tests; reverts a namespace to the
+  every-match-is-`PREFIX_MATCH` behavior.
+- **Per-replica filter, not response-level.** A long-prefix replica still
+  surfaces as `PREFIX_MATCH` even when a sibling replica only matched the
+  trivial chat-template head — the floor drops the sibling, keeps the long
+  match. Only when *no* replica clears the floor does the response
+  downgrade.
+- **Applied BEFORE `CreditHits` runs.** A sub-floor match that is downgraded
+  to `NO_HINT` does not bump the LFU access counter — the contract guarantee
+  that a non-delivered hint never credits remains intact. Filtered-out
+  replicas' entries are pruned from the hits map in lockstep with their
+  Scores, so the no-credit-on-non-delivery rule holds on the partial-keep
+  path too (one replica survives, a sibling falls below the floor).
+- **Distinct from `minimumPrefixTokens`.** That field is a request-side
+  pre-lookup gate against the *request's* claimed prefix length (skips the
+  index entirely on a too-short request); this is a result-side post-lookup
+  floor against the *realized* per-replica overlap (filters what the index
+  produced).
+
+The default is 64 = four KV blocks at the typical 16-token block size — well
+above the 16-token framing tokens every replica has identically, well below
+any useful real-prompt prefix overlap. Tune up (`minimumMatchedTokens: 256`)
+when a deployment runs especially long system prompts and you want only
+substantial overlaps to count as routing wins; tune down to `0` when
+debugging the ranker or measuring raw recall.
 
 ## 3. Pressure-aware scoring — locality vs. load
 
@@ -450,7 +547,10 @@ And the strategies compose into a single orchestrator:
 ```
 LookupRoute(req):
    if hash_scheme is empty            → NO_HINT             (engine domain unknown — fail open)
-   if there is an exact prefix match  → PREFIX_MATCH        (ranked by the full score)
+   if there is an exact or chain match:
+       drop replicas whose matched_tokens < §2.6 floor      (per-namespace minimumMatchedTokens; default 64)
+       if any survive                 → PREFIX_MATCH        (ranked by the full score over the survivors)
+       else                            → NO_HINT             (trivial overlap only — gateway round-robins honestly)
    else if any tenant-warm replicas   → TENANT_HOT          (ranked by the full score, soft hint)
    else (miss-classifier runs):
        if index is globally empty     → NO_HINT             (cold start — no data to compare against)
@@ -466,20 +566,27 @@ full design behind the `UNKNOWN_*` codes.
 Every factor and threshold is tunable through a `RankerConfig`. Defaults
 are set so that:
 
-- A deployment with **no stats reported** behaves identically to the
-  pre-PR baseline (pressure factor 1, no `TENANT_HOT` candidates qualify).
+- A deployment with **no stats reported** sees pressure factor 1 and no
+  `TENANT_HOT` candidates qualify — those two strategies collapse to the
+  pre-PR baseline. The §2.6 matched-tokens floor still applies on top
+  (default 64), so a sub-floor prefix match downgrades to `NO_HINT`
+  whether stats are reported or not; set `minimumMatchedTokens: 0` to
+  reproduce the strict pre-floor every-overlap-is-`PREFIX_MATCH` ranker
+  behavior end-to-end.
 - A request with **no SLO hint** sees no freshness boost (slo bias 1).
 - Setting `PressureWeight = 0`, `SLOTightBias = 0`, and
   `TenantHotMaxAge = 0` simultaneously is equivalent to the original B6
-  `matched_tokens × freshness` ranker.
+  `matched_tokens × freshness` ranker over the strategies in this doc.
+  Combine with `minimumMatchedTokens: 0` on the `CachePolicy` to also
+  disable the §2.6 floor for the namespace.
 
 ## 7. The reason-code summary
 
 | Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain                                                                                                                  | Strongest hint — route to top-ranked    |
+| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64). Sub-floor matches are filtered per-replica; if no replica clears, the response downgrades to `NO_HINT`.                                                                            | Strongest hint — route to top-ranked    |
 | `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
-| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), or any other unspecified outcome                  | Default routing; cache plane invisible  |
+| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), or any other unspecified outcome                  | Default routing; cache plane invisible  |
 | `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |
 | `UNKNOWN_MODEL`       | Prefix miss + `TENANT_HOT` miss + the tenant has entries but the requested `(tenant, model)` does not                                                                                                                                | Same — fail-open; configuration error   |
 | `UNKNOWN_HASH_SCHEME` | Prefix miss + `TENANT_HOT` miss + `(tenant, model)` has entries but the requested `hash_scheme` is absent for it                                                                                                                     | Same — fail-open; configuration error   |
