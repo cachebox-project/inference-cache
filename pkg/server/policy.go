@@ -334,12 +334,26 @@ func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
 //     EXPLICITLY opted out — raw-recall benchmarking, ranker debugging).
 //   - CachePolicy present, RoutingFloorScore == &x → x as-is.
 //
-// Negative values clamp to 0: a hand-crafted /policy POST that bypassed the
-// CRD pattern validator could carry a negative threshold, which the
-// "score < floor" comparison would treat as "no enforcement at all"
-// (no score is less than a negative number) — the opposite of intent. Clamp
-// to 0 instead so an out-of-bounds value falls back to opt-out rather than
-// silently disabling enforcement.
+// Negative values clamp to 0 — the same effective behavior as the operator
+// opt-out, NOT the safety default. The choice between "clamp negative to 0"
+// (current) and "clamp negative to DefaultRoutingFloorScore" (alternative)
+// is a judgment call on truly malformed wire input:
+//   - Clamp to 0: the buildLookupResponse check `floor > 0` short-circuits,
+//     no replicas are downgraded. Equivalent to the explicit opt-out.
+//   - Clamp to default: replicas below DefaultRoutingFloorScore would be
+//     downgraded as if the operator had said nothing.
+//
+// Both are defensible. We pick the clamp-to-0 path because the CRD pattern
+// validator already rejects negatives at admission, AND the controller-side
+// flatten path (resolveOnePolicy) ALSO falls back to default on parse
+// failure / negative. So the only path that lands a negative here is a
+// hand-crafted /policy POST that bypassed both gates — at which point
+// "treat as opt-out and don't enforce" is the same kind of fail-open
+// behavior the rest of the hot path uses for unknown / malformed input.
+// The defensive behavior of preventing a negative threshold from
+// silently disabling enforcement (which `score < negative` would, since
+// no score is less than a negative number) is still satisfied — the
+// clamp is what prevents that pathology.
 func (s *PolicyStore) RoutingFloorScore(tenant string) float32 {
 	p, ok := s.Lookup(tenant)
 	if !ok {

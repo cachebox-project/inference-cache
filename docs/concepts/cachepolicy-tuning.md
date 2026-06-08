@@ -4,8 +4,11 @@
 single namespace. The policy server ships with sane defaults (30m TTL, LRU eviction,
 no request-side prefix-length gate, a **result-side matched-tokens floor of 64
 (4 KV blocks) so trivial chat-template-only overlaps do not surface as
-`PREFIX_MATCH`** — see [the matched-tokens floor](#three-lookup-filter-knobs-one-role-each)
-below for the rationale and the explicit opt-out, no lookup deadline). So **most
+`PREFIX_MATCH`**, a **result-side routing-floor-score of `0.1` so
+every-replica-holds-it overlaps that the matched-tokens floor can't catch (long
+RAG headers, custom system prompts) also downgrade to `NO_HINT`** — see
+[the three lookup-filter knobs](#three-lookup-filter-knobs-one-role-each)
+below for the rationale and the explicit opt-outs, no lookup deadline). So **most
 namespaces need no CachePolicy at all** — you reach for one only when a specific
 namespace has a measured reason to deviate (a hot-prefix workload, a latency SLO,
 an unusually short or long prefix distribution, or a benchmark that wants to see

@@ -848,18 +848,29 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// Captured under the read lock so it's consistent with the prefixes
 	// view this lookup observes.
 	//
-	// Soft-state caveat: servingByScope is decremented at TTL-sweep time,
-	// not at every freshness check, so a replica that has gone stale (no
-	// recent report) can still be in the denominator for up to one
-	// DefaultSweepInterval before the eviction loop removes it. During
-	// that window the denominator is inflated by the stale entry while the
-	// numerator (the post-freshness-filter scored set below) is not, so a
-	// trivial overlap held by all-currently-fresh replicas can briefly
-	// surface a small but non-zero factor instead of the intended 0. The
-	// resulting hint is at worst "route to one of the replicas that all
-	// hold the same trivial overlap," which the gateway serves equivalently
-	// — soft-state semantics: a stale hint is acceptable; a wrong answer
-	// is not.
+	// Soft-state caveat — KNOWN bounded limitation. servingByScope is
+	// decremented at TTL-sweep time (removeReplicaLocked /
+	// scopeDecLocked), not at every freshness check. A replica that has
+	// gone stale (no recent report) stays in the denominator until the
+	// next sweep — bounded above by DefaultSweepInterval (1 min by
+	// default). During that window the denominator (servingByScope)
+	// counts the stale entry; the numerator (post-freshness `scores`
+	// below) does not. A trivial overlap held by every CURRENTLY-FRESH
+	// replica can briefly surface a small but non-zero distinguishing-
+	// power factor instead of the intended 0 — so a sub-trivial
+	// PREFIX_MATCH can ship from this lookup before the next sweep
+	// collapses the denominator. Net: at worst one DefaultSweepInterval
+	// of inflated PREFIX_MATCH rate on a workload that's already trivial,
+	// never a wrong routing answer. The resulting hint is "route to one
+	// of the replicas that all hold the same trivial overlap," which the
+	// gateway serves equivalently regardless of which it picks; the next
+	// sweep tick removes the stale denominator entry and the routing-
+	// floor catches the next-tick lookup. A correct-by-construction fix
+	// would maintain a separate per-scope fresh-replica counter updated
+	// lazily on the sweep; the bookkeeping is out of scope for this PR,
+	// the soft-state behavior matches the rest of the index, and the
+	// window is short enough that operators see the steady-state
+	// behavior.
 	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	scores := make([]ReplicaScore, 0, len(replicas))
 	var hitsByReplica map[string][]*replicaEntry
@@ -1049,13 +1060,20 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	// Captured BEFORE releasing the read lock so it stays consistent with
 	// the prefix view the chain walk just observed.
 	//
-	// Same soft-state caveat as lookupExact: servingByScope tracks the
-	// post-eviction view, so during the TTL-sweep window a recently-stale
-	// replica can briefly remain in the denominator. The cap, applied to a
-	// chain match, can leave a depth-aware factor slightly above 0 for an
-	// overlap that ALL currently-fresh replicas share. Eventually consistent;
-	// the gateway sees only a near-trivial PREFIX_MATCH that the floor will
-	// also catch once the score collapses on the next sweep tick.
+	// Same KNOWN BOUNDED soft-state caveat as lookupExact (see the long
+	// comment there): servingByScope is decremented at TTL-sweep time, not
+	// at every freshness check, so a recently-stale replica can briefly
+	// inflate the denominator for up to one DefaultSweepInterval. The
+	// depth-aware factor for an overlap held by every currently-fresh
+	// replica can stay slightly above 0 instead of collapsing cleanly to
+	// 0 during that window, so a sub-trivial PREFIX_MATCH can briefly
+	// ship. Net: at worst one DefaultSweepInterval of inflated PREFIX_MATCH
+	// rate on a workload that's already trivial; never a wrong routing
+	// answer. Eventually consistent: the next sweep tick removes the stale
+	// denominator entry and the routing-floor catches the next-tick
+	// lookup. A correct-by-construction fix would maintain a separate
+	// per-scope fresh-replica counter updated lazily on the sweep; out of
+	// scope for this PR.
 	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
 

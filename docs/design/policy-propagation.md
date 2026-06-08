@@ -219,11 +219,15 @@ intervention.
   Replicas whose match falls below the floor are filtered from the
   response; when none survive, the reason code downgrades to `NO_HINT`.
   See [`lookuproute-ranking.md`](./lookuproute-ranking.md).
-- `policies[].routingFloorScore` — float32. Optional. A nil/missing field
-  is normalized to `DefaultRoutingFloorScore` (`0.1`) for v3 and v4 bodies
-  (see Rollout asymmetry below); v5 bodies must send the field as
-  written, including an explicit `0` opt-out. A namespace that does NOT
-  have a `CachePolicy` at all falls back to `DefaultRoutingFloorScore`.
+- `policies[].routingFloorScore` — float32 pointer (omitempty). Optional.
+  A nil/missing field is normalized to `DefaultRoutingFloorScore` (`0.1`)
+  for v3 and v4 bodies (see Rollout asymmetry below). v5 bodies are NOT
+  normalized — a v5 controller that wants the safety floor leaves the
+  field nil and the server-side resolver `PolicyStore.RoutingFloorScore`
+  falls back to `DefaultRoutingFloorScore`; a v5 controller that wants
+  the explicit opt-out sends `&0` and the store records 0 byte-for-byte.
+  A namespace that does NOT have a `CachePolicy` at all falls back to
+  `DefaultRoutingFloorScore`.
   Distinct from `minimumMatchedTokens`: that's a result-side filter on
   realized *matched_tokens*; this is a result-side floor on the realized
   per-replica *score* (matched_tokens × freshness × pressure_factor ×
