@@ -1022,10 +1022,78 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			EstimatedCacheHitProb: fresh,
 		})
 	}
+	// Cardinality denominator for the distinguishing-power factor: every
+	// replica serving this engine domain (tenant, model, hash_scheme).
+	// Captured BEFORE releasing the read lock so it stays consistent with
+	// the prefix view the chain walk just observed.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
+
+	// Per-replica depth-aware distinguishing-power: a replica that reached
+	// deeper into the chain than its siblings holds something unique to it.
+	// For each scored replica R, num_matching_at_R's_depth = count of
+	// replicas whose matched_tokens >= R.matched_tokens (R plus every
+	// replica that went at least as deep). Sort-and-group walk is
+	// O(N log N) — pure arithmetic, no locking needed.
+	applyChainDistinguishingPower(scores, totalReplicas)
 
 	sortScoresDescByScoreThenID(scores)
 	return scores, hitsByReplica
+}
+
+// applyChainDistinguishingPower folds the depth-aware distinguishing-power
+// factor into a chain-lookup's per-replica scores in place. Unlike the
+// exact-match path — where every scored replica shares the same prefix
+// hash and the factor is uniform — a chain match can have replicas at
+// different depths (some reached more blocks than others). For each
+// replica R the factor is computed from
+//
+//	matching_at_R = count of replicas with matched_tokens >= R.matched_tokens
+//
+// so a uniquely-deepest replica sees the strongest factor (1 - 1/N) and a
+// shallow-only sibling sees a much smaller one (or 0 when every replica
+// reached the same depth). Without this, naïve shared-factor scoring would
+// zero a uniquely-deep replica's score whenever a sibling held the head
+// — the very routing decision the cache plane wants to surface.
+//
+// Sort-then-group walk is O(N log N) in the number of scored replicas;
+// pure arithmetic, no locking needed (caller releases the read lock first).
+// No-op when totalReplicas <= 1 (single-replica deployment) or len(scores)
+// == 0; the inner distinguishingPower call also degrades gracefully on
+// those branches but the guard saves an unnecessary sort.
+func applyChainDistinguishingPower(scores []ReplicaScore, totalReplicas int) {
+	if totalReplicas <= 1 || len(scores) == 0 {
+		return
+	}
+	// Sort by matched_tokens descending, ID ascending for deterministic
+	// grouping when several replicas reach the same depth. The caller's
+	// sortScoresDescByScoreThenID will re-sort by the final Score
+	// afterwards, so this intermediate order is internal.
+	sort.Slice(scores, func(a, b int) bool {
+		if scores[a].MatchedTokens != scores[b].MatchedTokens {
+			return scores[a].MatchedTokens > scores[b].MatchedTokens
+		}
+		return scores[a].ReplicaID < scores[b].ReplicaID
+	})
+	// Walk in groups of equal matched_tokens. Every replica in a group
+	// shares the same num_matching_at_depth = right (the count of
+	// replicas at this depth or deeper), so the factor is the same for
+	// the group. Tied replicas keep their relative score because they
+	// land in the same group.
+	for left := 0; left < len(scores); {
+		right := left
+		for right < len(scores) && scores[right].MatchedTokens == scores[left].MatchedTokens {
+			right++
+		}
+		dp := distinguishingPower(right, totalReplicas)
+		if dp != 1.0 {
+			f := float32(dp)
+			for k := left; k < right; k++ {
+				scores[k].Score *= f
+			}
+		}
+		left = right
+	}
 }
 
 // sortScoresDescByScoreThenID gives both lookup paths the same deterministic
