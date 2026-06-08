@@ -833,6 +833,13 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
+	// totalReplicas counts every replica known to be serving this engine
+	// domain (tenant, model, hash_scheme), not just the holders of THIS
+	// prefix. That's the denominator the distinguishing-power factor wants:
+	// "out of the replicas that could hold the content, how many do?"
+	// Captured under the read lock so it's consistent with the prefixes
+	// view this lookup observes.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	scores := make([]ReplicaScore, 0, len(replicas))
 	var hitsByReplica map[string][]*replicaEntry
 	for id, e := range replicas {
@@ -878,6 +885,20 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 		})
 	}
 	i.mu.RUnlock()
+
+	// Replica-distinguishing-power factor: every score in an exact-match
+	// response shares the same prefix-hash, so num_matching = len(scores)
+	// (after the staleness filter) and the factor is uniform. A factor of
+	// 0 (every replica holds the prefix — the trivial-overlap case) zeroes
+	// every Score so the service-layer post-score floor can downgrade the
+	// response to NO_HINT. totalReplicas <= 1 degrades to factor 1.0 so
+	// single-replica deployments preserve their baseline ranking.
+	if dp := distinguishingPower(len(scores), totalReplicas); dp != 1.0 {
+		f := float32(dp)
+		for k := range scores {
+			scores[k].Score *= f
+		}
+	}
 
 	sortScoresDescByScoreThenID(scores)
 	return scores, hitsByReplica
