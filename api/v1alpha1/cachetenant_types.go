@@ -50,6 +50,10 @@ type CacheTenantQuotaSpec struct {
 	// (tenant, model, hash_scheme, prefix_hash): a prefix held by several replicas
 	// counts once, not once per replica. Over budget, the tenant's oldest prefixes
 	// are evicted (Fairness). 0 is a valid cap (admit nothing).
+	//
+	// Sizing guidance — how this relates to pod memory, the global cap, and
+	// workload-shape multipliers (block-hash expansion in particular) — is in
+	// docs/operations/index-sizing.md.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxIndexEntries *int64 `json:"maxIndexEntries,omitempty"`

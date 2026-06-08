@@ -61,8 +61,11 @@ spec:
                 - LFU
                 type: string
               evictionTTL:
-                description: EvictionTTL is the maximum time a cache entry should
-                  remain usable.
+                description: |-
+                  EvictionTTL is the maximum time a cache entry should remain usable.
+                  Server default is 30m when unset. Tuning trade-offs (freshness vs. memory
+                  footprint) and the workflow for picking a value live in
+                  docs/operations/index-sizing.md.
                 type: string
               lookupTimeoutMs:
                 description: LookupTimeoutMs bounds cache lookup latency in milliseconds.
