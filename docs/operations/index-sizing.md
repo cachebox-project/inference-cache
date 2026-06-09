@@ -172,8 +172,10 @@ tolerate lower hit rate, tighter TTL, or a custom build.
 ## TTL trade-offs
 
 `CachePolicy.spec.evictionTTL` is a per-namespace knob with a server-side default
-of 30 minutes (`pkg/index.DefaultTTL`). Tenants without a CachePolicy use the global
-default; a namespace with one uses its own value.
+of 30 minutes (`pkg/index.DefaultTTL`). The fallback fires whenever the resolver
+returns ≤ 0 — i.e. **only a CachePolicy that explicitly sets `evictionTTL`
+overrides the default**. A namespace with no CachePolicy, or a CachePolicy that
+omits `evictionTTL`, both fall through to `DefaultTTL`.
 
 The TTL controls two things at once:
 
@@ -285,7 +287,7 @@ If you genuinely need more than 1M entries before the cap flag lands:
 
 | Default | Value | Rationale |
 |---|---|---|
-| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries; the cap is comfortably above realistic single-tenant load and gives multi-tenant clusters ~5× headroom before they need to think about it. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
+| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries, so this is roughly 5× the benchmark peak — **not a general sizing guarantee**: the worked examples in [Workload-shape sizing](#workload-shape-sizing) show a single-tenant chatbot can land at 2.5M and a multi-tenant chatbot at 10M. Treat 1M as a sensible default that small / moderate single-tenant workloads sit comfortably under; large or multi-tenant deployments need the workload-shape estimate, not the default. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
 | `DefaultTTL` | 30 minutes | Matches typical chat-style prefix reuse windows. Long enough that the same conversation's continuation lands on the same replica; short enough that a half-hour of cold prefixes don't bloat the index. CachePolicy lets per-namespace workloads override (raise for long-context, lower for tight memory). |
 | `DefaultSweepInterval` | 1 minute | The sweep is a full-walk over the prefix map looking for expired entries; CPU cost scales linearly with index size, but it runs on its own goroutine off the request path. One minute bounds memory lag without being noticeably hot on a 1M-entry index. Not yet directly benchmarked — file an issue if you observe sweep contention on the hot path. |
 
