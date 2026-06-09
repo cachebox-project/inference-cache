@@ -62,12 +62,14 @@ func newDoctorCommand(code *int) *cobra.Command {
 		Use:   "doctor",
 		Short: "Pre-flight diagnostic for an inference-cache installation",
 		Long: `doctor runs a read-only series of checks against an inference-cache
-installation and reports OK / WARN / FAIL findings with stable, greppable codes.
+installation and reports OK / INFO / WARN / FAIL findings with stable, greppable
+codes.
 
-It checks the cache-plane server's gRPC health and its /snapshot + /policy
-endpoints, then every CacheBackend's readiness, engine-pod matching, index
-participation and endpoint reachability, engine-pod injection, orphaned engine
-pods, CacheTenant quota status, and CachePolicy coverage.
+It checks the cache-plane server's gRPC health and its /snapshot, /policy, and
+/probe endpoints, then every CacheBackend's readiness, engine-pod matching, index
+participation, functional self-test, and endpoint reachability, engine-pod
+injection, orphaned engine pods, CacheTenant quota status, and CachePolicy
+coverage.
 
 Exit code: 0 when nothing is worse than INFO, 1 on any WARN, 2 on any FAIL —
 suitable for CI gating. Pass --config-only to validate cluster configuration

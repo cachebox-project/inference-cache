@@ -54,10 +54,32 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 	for ns := range byNamespace {
 		sort.Slice(byNamespace[ns], func(i, j int) bool { return byNamespace[ns][i].backend < byNamespace[ns][j].backend })
 	}
+	// No CacheBackend declares an engineSelector → nothing can be claimed, so
+	// there is nothing to audit (and no reason to list pods or events).
+	if len(byNamespace) == 0 {
+		return nil
+	}
 
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods, client.InNamespace(ns)); err != nil {
 		return []doctor.Finding{listError(checkEnginePodInjection, "Pod", err)}
+	}
+
+	// Fetch Events ONCE for the whole scope — across BOTH the legacy core/v1 and
+	// modern events.k8s.io/v1 APIs (the production controller emits via the
+	// modern recorder) — and index the pods carrying an InjectedByCacheBackend
+	// Event by their target UID. This keeps the audit at two Event List calls
+	// total rather than two per matched pod, so a cluster with many uninjected
+	// engine pods can't make doctor hammer the apiserver or hit its timeout.
+	allEvents, err := listAllEvents(ctx, c, ns)
+	if err != nil {
+		return []doctor.Finding{listError(checkEnginePodInjection, "Event", err)}
+	}
+	injectedPodUIDs := map[types.UID]struct{}{}
+	for i := range allEvents {
+		if e := allEvents[i]; e.Reason == eventInjectedByCacheBackend && e.Kind == "Pod" && e.UID != "" {
+			injectedPodUIDs[e.UID] = struct{}{}
+		}
 	}
 
 	var findings []doctor.Finding
@@ -95,16 +117,9 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 
 		// Fall back to the controller-emitted Event, matched to THIS pod's UID so
 		// an old Event left over from a same-named, recreated pod cannot mark a
-		// freshly-uninjected pod as healthy. listEventsFor reads BOTH the legacy
-		// core/v1 and the modern events.k8s.io/v1 APIs — the production
-		// controller emits via the modern recorder (events.k8s.io/v1 with
-		// Regarding), and reading only one API would silently miss real Events.
-		events, err := listEventsFor(ctx, c, pod.Namespace, "Pod", pod.Name)
-		if err != nil {
-			findings = append(findings, listError(checkEnginePodInjection, "Event", err))
-			continue
-		}
-		if hasInjectionEventForUID(events, pod.UID) {
+		// freshly-uninjected pod as healthy. The index was built from a single
+		// scope-wide Event scan above (both event APIs).
+		if _, injected := injectedPodUIDs[pod.UID]; injected {
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodeEnginePodInjected,
 				Status:   doctor.StatusOK,
@@ -123,19 +138,6 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		}
 	}
 	return findings
-}
-
-// hasInjectionEventForUID reports whether any event is an InjectedByCacheBackend
-// Event whose target UID matches the pod's current UID. Operates over the
-// normalized event shape so a match in either the legacy core/v1 or the modern
-// events.k8s.io/v1 API counts.
-func hasInjectionEventForUID(events []normalizedEvent, podUID types.UID) bool {
-	for i := range events {
-		if events[i].Reason == eventInjectedByCacheBackend && events[i].UID == podUID {
-			return true
-		}
-	}
-	return false
 }
 
 // OrphanPods surfaces pods that recorded a NoMatchingCacheBackend Event within

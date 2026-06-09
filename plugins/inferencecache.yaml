@@ -22,12 +22,12 @@ spec:
     inferencecache is the operator CLI for the inference-cache control plane.
 
     Its `doctor` subcommand runs a read-only pre-flight diagnostic — server
-    gRPC health, the /snapshot and /policy endpoints, per-CacheBackend health
-    (readiness, engine-pod matching, index participation, endpoint
-    reachability), engine-pod injection, orphaned pods, CacheTenant quota, and
-    CachePolicy coverage — and reports OK / WARN / FAIL findings with stable,
-    greppable codes. It exits 0 / 1 / 2 for CI gating and never mutates cluster
-    state.
+    gRPC health, the /snapshot, /policy, and /probe endpoints, per-CacheBackend
+    health (readiness, engine-pod matching, index participation, functional
+    self-test, endpoint reachability), engine-pod injection, orphaned pods,
+    CacheTenant quota, and CachePolicy coverage — and reports OK / INFO / WARN /
+    FAIL findings with stable, greppable codes. It exits 0 / 1 / 2 for CI gating
+    and never mutates cluster state.
 
     Usage:
       kubectl inferencecache doctor

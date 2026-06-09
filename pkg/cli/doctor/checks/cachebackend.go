@@ -227,7 +227,11 @@ func healthyMessage(cb *cachev1alpha1.CacheBackend, managed, dialed bool) string
 	if !managed {
 		return "External backend: Ready, " + endpoint
 	}
-	return fmt.Sprintf("Ready, engine pods matched, %d prefix(es) indexed, %s", prefixCount(cb.Status.IndexParticipation), endpoint)
+	matched := "engine pods matched"
+	if !hasEngineSelector(cb) {
+		matched = "no engineSelector (engine-pod matching not applicable)"
+	}
+	return fmt.Sprintf("Ready, %s, %d prefix(es) indexed, %s", matched, prefixCount(cb.Status.IndexParticipation), endpoint)
 }
 
 func prefixCount(ip *cachev1alpha1.CacheBackendIndexParticipation) int64 {

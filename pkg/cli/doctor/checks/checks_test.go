@@ -652,6 +652,14 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
+	t.Run("no selectored backends returns nil without listing pods/events", func(t *testing.T) {
+		// Only a selectorless backend exists → nothing to claim, early return.
+		c := fakeClient(t, &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "nosel", Namespace: "ns1"}})
+		if fs := EnginePodInjectionAudit(ctx, c, ""); fs != nil {
+			t.Fatalf("want nil for selectorless-only, got %v", codesOf(fs))
+		}
+	})
+
 	backend := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "be", Namespace: "ns1", UID: "be-uid"},
 		Spec: cachev1alpha1.CacheBackendSpec{

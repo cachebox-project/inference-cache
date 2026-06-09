@@ -184,19 +184,19 @@ func Run(ctx context.Context, d Deps) *doctor.Report {
 		add(ProbeReachability(ctx, d.HTTP, d.ProbeURL))
 	}
 
-	// 4: per-CacheBackend health.
+	// 5: per-CacheBackend health.
 	add(CacheBackendHealth(ctx, d.K8s, d.Namespace, now, d.staleWindow(), d.DialTCP))
 
-	// 5: engine-pod injection audit.
+	// 6: engine-pod injection audit.
 	add(EnginePodInjectionAudit(ctx, d.K8s, d.Namespace))
 
-	// 6: orphan-pod check.
+	// 7: orphan-pod check.
 	add(OrphanPods(ctx, d.K8s, d.Namespace, now, d.orphanWindow()))
 
-	// 7: CacheTenant health.
+	// 8: CacheTenant health.
 	add(CacheTenantHealth(ctx, d.K8s, d.Namespace))
 
-	// 8: CachePolicy coverage.
+	// 9: CachePolicy coverage.
 	add(CachePolicyCoverage(ctx, d.K8s, d.Namespace))
 
 	return report
@@ -256,61 +256,6 @@ type normalizedEvent struct {
 	When       time.Time
 	Message    string
 	APIVersion string // for diagnostics in messages: "core/v1" or "events.k8s.io/v1"
-}
-
-// listEventsFor returns the Events in ns (or all namespaces when ns is empty)
-// involving the named object of the given kind, normalized across both event
-// APIs. Doctor filters in code rather than via a field selector so the same
-// path works against the fake client used in tests (which does not implement
-// server-side field selection). An error from either API surfaces as the
-// returned error; a NotFound on a non-registered type would short-circuit
-// here, but both v1 APIs are part of the standard client-go scheme used by
-// callers, so this returns successfully even when one API has zero events.
-func listEventsFor(ctx context.Context, c client.Client, ns, kind, name string) ([]normalizedEvent, error) {
-	var out []normalizedEvent
-
-	var legacy corev1.EventList
-	if err := c.List(ctx, &legacy, client.InNamespace(ns)); err != nil {
-		return nil, err
-	}
-	for i := range legacy.Items {
-		e := legacy.Items[i]
-		if e.InvolvedObject.Kind != kind || e.InvolvedObject.Name != name {
-			continue
-		}
-		out = append(out, normalizedEvent{
-			Reason:     e.Reason,
-			Kind:       e.InvolvedObject.Kind,
-			Namespace:  e.InvolvedObject.Namespace,
-			Name:       e.InvolvedObject.Name,
-			UID:        e.InvolvedObject.UID,
-			When:       legacyEventTime(e),
-			Message:    e.Message,
-			APIVersion: "core/v1",
-		})
-	}
-
-	var modern eventsv1.EventList
-	if err := c.List(ctx, &modern, client.InNamespace(ns)); err != nil {
-		return nil, err
-	}
-	for i := range modern.Items {
-		e := modern.Items[i]
-		if e.Regarding.Kind != kind || e.Regarding.Name != name {
-			continue
-		}
-		out = append(out, normalizedEvent{
-			Reason:     e.Reason,
-			Kind:       e.Regarding.Kind,
-			Namespace:  e.Regarding.Namespace,
-			Name:       e.Regarding.Name,
-			UID:        e.Regarding.UID,
-			When:       modernEventTime(e),
-			Message:    e.Note,
-			APIVersion: "events.k8s.io/v1",
-		})
-	}
-	return out, nil
 }
 
 // listAllEvents returns every Event in ns (or cluster-wide when ns is empty)
