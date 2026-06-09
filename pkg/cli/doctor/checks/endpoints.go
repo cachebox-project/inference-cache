@@ -16,6 +16,7 @@ const (
 	checkServerReachability   = "ServerReachability"
 	checkSnapshotReachability = "SnapshotReachability"
 	checkPolicyReachability   = "PolicyReachability"
+	checkProbeReachability    = "ProbeReachability"
 )
 
 // snapshotBodyLimit caps how much of the /snapshot response doctor reads before
@@ -172,79 +173,85 @@ func SnapshotReachability(ctx context.Context, doer HTTPDoer, url, token string)
 	return findings
 }
 
-// PolicyReachability confirms the /policy route exists without mutating it. It
-// issues a non-mutating HTTP HEAD. A mounted route answers with its own status
-// (200, 401 from auth, or 405 from the GET/POST/PUT-only handler rejecting
-// HEAD) — all of which prove the route is wired. A 404, by contrast, is what the
-// server's ServeMux returns when /policy is NOT registered at all, so it is a
-// FAIL: the route doctor claims to verify is absent. A transport-level failure
-// (connection refused, DNS, timeout) is likewise a FAIL.
+// routeCodes bundles the three stable codes a route-existence probe can emit,
+// so PolicyReachability and ProbeReachability share one implementation.
+type routeCodes struct {
+	missing    string // not wired: nil deps / build error / transport error / 404
+	wired      string // mounted: 2xx / 401 / 403 / 405
+	unexpected string // mounted but answered an unexpected status (e.g. 5xx)
+}
+
+// PolicyReachability confirms the controller-write /policy route exists without
+// mutating it. See routeReachability for the shared semantics.
 func PolicyReachability(ctx context.Context, doer HTTPDoer, url string) []doctor.Finding {
-	if doer == nil || url == "" {
+	return routeReachability(ctx, doer, url, checkPolicyReachability, "/policy", routeCodes{
+		missing:    doctor.CodePolicyRouteMissing,
+		wired:      doctor.CodePolicyRouteWired,
+		unexpected: doctor.CodePolicyRouteUnexpected,
+	})
+}
+
+// ProbeReachability confirms the controller-driven /probe functional-self-test
+// route exists. /probe shares the snapshot listener and auth profile with
+// /snapshot + /policy; doctor only verifies the route is wired (a non-mutating
+// HEAD), never POSTs a probe. See routeReachability for the shared semantics.
+func ProbeReachability(ctx context.Context, doer HTTPDoer, url string) []doctor.Finding {
+	return routeReachability(ctx, doer, url, checkProbeReachability, "/probe", routeCodes{
+		missing:    doctor.CodeProbeRouteMissing,
+		wired:      doctor.CodeProbeRouteWired,
+		unexpected: doctor.CodeProbeRouteUnexpected,
+	})
+}
+
+// routeReachability issues a non-mutating HTTP HEAD and classifies the result.
+// A mounted route answers with its own status (200, 401 from auth, or 405 from
+// a handler that rejects HEAD) — all of which prove the route is wired. A 404
+// is what the server's ServeMux returns when the route is NOT registered, so it
+// is a FAIL: the route doctor claims to verify is absent. A transport-level
+// failure (connection refused, DNS, timeout) is likewise a FAIL. Any other
+// status (e.g. 5xx) is mounted-but-erroring — a WARN, not a missing route.
+func routeReachability(ctx context.Context, doer HTTPDoer, url, check, name string, codes routeCodes) []doctor.Finding {
+	missing := func(msg string) []doctor.Finding {
 		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteMissing,
-			Status:   doctor.StatusFail,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  "could not resolve the server /policy endpoint; pass --server-endpoint or check the inference-cache-server Service",
+			Code: codes.missing, Status: doctor.StatusFail,
+			Check: check, Resource: url, Message: msg,
 		}}
 	}
-
+	if doer == nil || url == "" {
+		return missing("could not resolve the server " + name + " endpoint; pass --server-endpoint or check the inference-cache-server Service")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
-		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteMissing,
-			Status:   doctor.StatusFail,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  fmt.Sprintf("could not build /policy request: %v", err),
-		}}
+		return missing(fmt.Sprintf("could not build %s request: %v", name, err))
 	}
-
 	resp, err := doer.Do(req)
 	if err != nil {
-		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteMissing,
-			Status:   doctor.StatusFail,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  fmt.Sprintf("HEAD /policy failed to connect: %v", err),
-		}}
+		return missing(fmt.Sprintf("HEAD %s failed to connect: %v", name, err))
 	}
 	defer resp.Body.Close()
 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
+		return missing(fmt.Sprintf("HEAD %s returned HTTP 404 — the %s route is not mounted on the server (a wired route answers 200/401/403/405, never 404)", name, name))
+	case routeStatusWired(resp.StatusCode):
 		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteMissing,
-			Status:   doctor.StatusFail,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  "HEAD /policy returned HTTP 404 — the /policy route is not mounted on the server (a wired route answers 200/401/403/405, never 404)",
-		}}
-	case policyStatusWired(resp.StatusCode):
-		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteWired,
-			Status:   doctor.StatusOK,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  fmt.Sprintf("/policy route is wired (HTTP %d to a non-mutating HEAD)", resp.StatusCode),
+			Code: codes.wired, Status: doctor.StatusOK,
+			Check: check, Resource: url,
+			Message: fmt.Sprintf("%s route is wired (HTTP %d to a non-mutating HEAD)", name, resp.StatusCode),
 		}}
 	default:
 		return []doctor.Finding{{
-			Code:     doctor.CodePolicyRouteUnexpected,
-			Status:   doctor.StatusWarn,
-			Check:    checkPolicyReachability,
-			Resource: url,
-			Message:  fmt.Sprintf("/policy is mounted but answered HTTP %d (expected 2xx/401/403/405) — the server or its middleware may be erroring", resp.StatusCode),
+			Code: codes.unexpected, Status: doctor.StatusWarn,
+			Check: check, Resource: url,
+			Message: fmt.Sprintf("%s is mounted but answered HTTP %d (expected 2xx/401/403/405) — the server or its middleware may be erroring", name, resp.StatusCode),
 		}}
 	}
 }
 
-// policyStatusWired reports whether a /policy HEAD status proves a healthy,
-// mounted route: any 2xx, or the auth/method-mismatch codes a wired handler
-// legitimately returns.
-func policyStatusWired(code int) bool {
+// routeStatusWired reports whether a HEAD status proves a healthy, mounted
+// route: any 2xx, or the auth/method-mismatch codes a wired handler legitimately
+// returns.
+func routeStatusWired(code int) bool {
 	if code >= 200 && code < 300 {
 		return true
 	}

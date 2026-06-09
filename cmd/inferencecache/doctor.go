@@ -119,7 +119,7 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 		// cache server, so wire the dialer regardless of server discovery.
 		deps.DialTCP = dialTCP
 
-		grpcTarget, snapshotURL, policyURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
+		grpcTarget, snapshotURL, policyURL, probeURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
 		if err != nil {
 			// Don't abort: the cluster-configuration checks still provide value,
 			// and leaving the endpoint deps nil makes checks 1-3 emit structured
@@ -138,6 +138,7 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 			deps.HTTP = &http.Client{Timeout: opts.timeout}
 			deps.SnapshotURL = snapshotURL
 			deps.PolicyURL = policyURL
+			deps.ProbeURL = probeURL
 			deps.Token = readToken(opts.tokenFile)
 		}
 	}
@@ -200,7 +201,7 @@ func restConfig(kubeconfig, kubeContext string) (*rest.Config, error) {
 // The server is found in the default system namespace, or by a cluster-wide
 // search, so `doctor -n app-ns` still probes the real server rather than
 // inference-cache-server.app-ns.svc.
-func resolveEndpoints(ctx context.Context, c client.Client, override string) (grpcTarget, snapshotURL, policyURL string, err error) {
+func resolveEndpoints(ctx context.Context, c client.Client, override string) (grpcTarget, snapshotURL, policyURL, probeURL string, err error) {
 	var host string
 	grpcPort := defaultGRPCPort
 	if override != "" {
@@ -212,13 +213,13 @@ func resolveEndpoints(ctx context.Context, c client.Client, override string) (gr
 	} else {
 		ns, findErr := findServerServiceNamespace(ctx, c)
 		if findErr != nil {
-			return "", "", "", findErr
+			return "", "", "", "", findErr
 		}
 		host = fmt.Sprintf("%s.%s.svc", defaultServerService, ns)
 	}
 	grpcTarget = net.JoinHostPort(host, grpcPort)
 	base := "http://" + net.JoinHostPort(host, defaultSnapshotPort)
-	return grpcTarget, base + "/snapshot", base + "/policy", nil
+	return grpcTarget, base + "/snapshot", base + "/policy", base + "/probe", nil
 }
 
 // findServerServiceNamespace locates the namespace hosting the

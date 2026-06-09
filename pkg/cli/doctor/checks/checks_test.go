@@ -336,6 +336,39 @@ func TestPolicyReachability(t *testing.T) {
 	})
 }
 
+func TestProbeReachability(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil doer", func(t *testing.T) {
+		if hasCode(ProbeReachability(ctx, nil, ""), doctor.CodeProbeRouteMissing) == nil {
+			t.Fatal("want PB001 for nil doer")
+		}
+	})
+	t.Run("405 wired (PB002)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusMethodNotAllowed) }))
+		defer srv.Close()
+		f := hasCode(ProbeReachability(ctx, srv.Client(), srv.URL+"/probe"), doctor.CodeProbeRouteWired)
+		if f == nil || f.Status != doctor.StatusOK {
+			t.Fatal("want PB002 OK on 405")
+		}
+	})
+	t.Run("404 not mounted (PB001)", func(t *testing.T) {
+		srv := httptest.NewServer(http.NewServeMux())
+		defer srv.Close()
+		if hasCode(ProbeReachability(ctx, srv.Client(), srv.URL+"/probe"), doctor.CodeProbeRouteMissing) == nil {
+			t.Fatal("want PB001 FAIL on 404")
+		}
+	})
+	t.Run("5xx unexpected (PB003)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }))
+		defer srv.Close()
+		f := hasCode(ProbeReachability(ctx, srv.Client(), srv.URL+"/probe"), doctor.CodeProbeRouteUnexpected)
+		if f == nil || f.Status != doctor.StatusWarn {
+			t.Fatal("want PB003 WARN on 502")
+		}
+	})
+}
+
 // --- CacheBackendHealth -----------------------------------------------------
 
 func okDial(context.Context, string) error  { return nil }
@@ -441,6 +474,52 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		f := hasCode(fs, doctor.CodeBackendNotReady)
 		if f == nil || !strings.Contains(f.Message, "NoKVEventsObserved") {
 			t.Fatalf("CB001 should surface reason, got %v", fs)
+		}
+	})
+
+	t.Run("FunctionalProbeOK false surfaces CB007", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Status.Conditions = append(cb.Status.Conditions, metav1.Condition{
+			Type: conditionFunctionalProbeOK, Status: metav1.ConditionFalse,
+			Reason: "ProbeFailed", Message: "lookup returned NO_HINT for a seeded prefix",
+		})
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		f := hasCode(fs, doctor.CodeBackendFunctionalProbeFailing)
+		if f == nil || !strings.Contains(f.Message, "ProbeFailed") {
+			t.Fatalf("want CB007 surfacing the probe reason, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("FunctionalProbeOK true does not flag", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Status.Conditions = append(cb.Status.Conditions, metav1.Condition{
+			Type: conditionFunctionalProbeOK, Status: metav1.ConditionTrue, Reason: "ProbeOK",
+		})
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if hasCode(fs, doctor.CodeBackendFunctionalProbeFailing) != nil {
+			t.Fatalf("FunctionalProbeOK=True must not flag CB007, got %v", codesOf(fs))
+		}
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("a fully-healthy backend with ProbeOK should be CB006, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("FunctionalProbeOK absent on External backend is ignored", func(t *testing.T) {
+		// External backends skip the managed axes entirely, including the probe.
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1"},
+			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal, Endpoint: "h:1"},
+			Status: cachev1alpha1.CacheBackendStatus{
+				Endpoint:   "h:1",
+				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ok")},
+			},
+		}
+		c := fakeClient(t, cb)
+		fs := CacheBackendHealth(ctx, c, "", now, DefaultStaleWindow, okDial)
+		if hasCode(fs, doctor.CodeBackendFunctionalProbeFailing) != nil {
+			t.Fatalf("External backend must not evaluate FunctionalProbeOK, got %v", codesOf(fs))
 		}
 	})
 
@@ -924,6 +1003,7 @@ func TestRun(t *testing.T) {
 		HTTP:         snap.Client(),
 		SnapshotURL:  snap.URL,
 		PolicyURL:    snap.URL,
+		ProbeURL:     snap.URL,
 		Token:        "tok",
 		DialTCP:      okDial,
 		Now:          func() time.Time { return now },
@@ -932,7 +1012,7 @@ func TestRun(t *testing.T) {
 	}
 	report := Run(ctx, deps)
 	// Endpoint checks present.
-	for _, want := range []string{doctor.CodeServerServing, doctor.CodeSnapshotOK, doctor.CodePolicyRouteWired, doctor.CodeBackendHealthy} {
+	for _, want := range []string{doctor.CodeServerServing, doctor.CodeSnapshotOK, doctor.CodePolicyRouteWired, doctor.CodeProbeRouteWired, doctor.CodeBackendHealthy} {
 		if hasCode(report.Findings, want) == nil {
 			t.Errorf("Run missing %s; got %v", want, codesOf(report.Findings))
 		}
@@ -945,7 +1025,7 @@ func TestRun(t *testing.T) {
 		// Zero Now/windows exercise the default fallbacks.
 		deps := Deps{K8s: fakeClient(t, healthyBackend(time.Now())), SkipEndpointChecks: true}
 		report := Run(ctx, deps)
-		for _, unwanted := range []string{doctor.CodeServerServing, doctor.CodeSnapshotOK, doctor.CodePolicyRouteWired} {
+		for _, unwanted := range []string{doctor.CodeServerServing, doctor.CodeSnapshotOK, doctor.CodePolicyRouteWired, doctor.CodeProbeRouteWired} {
 			if hasCode(report.Findings, unwanted) != nil {
 				t.Errorf("config-only must skip %s", unwanted)
 			}

@@ -72,6 +72,7 @@ func (s Status) MarshalJSON() ([]byte, error) {
 //	SV — server gRPC reachability/health
 //	SN — /snapshot endpoint
 //	PL — /policy endpoint
+//	PB — /probe endpoint (controller-driven functional self-test)
 //	CB — per-CacheBackend health
 //	EP — engine-pod injection audit
 //	OP — orphan-pod check
@@ -119,6 +120,17 @@ const (
 	// middleware is erroring. Worth a look, but not a missing route.
 	CodePolicyRouteUnexpected = "PL003"
 
+	// CodeProbeRouteMissing: the /probe route (controller-driven functional
+	// self-test endpoint, same auth profile as /snapshot + /policy) is not
+	// wired — connection refused / dial failure / HTTP 404 = route not mounted.
+	CodeProbeRouteMissing = "PB001"
+	// CodeProbeRouteWired: the /probe route answered with an expected status
+	// (2xx / 401 / 403 / 405), proving the route exists.
+	CodeProbeRouteWired = "PB002"
+	// CodeProbeRouteUnexpected: the /probe route answered with an unexpected
+	// status (e.g. 5xx) — mounted but erroring.
+	CodeProbeRouteUnexpected = "PB003"
+
 	// CodeBackendNotReady: the CacheBackend's Ready condition is not True.
 	CodeBackendNotReady = "CB001"
 	// CodeBackendSelectorMismatch: status.matchedEnginePods is 0 — the engine
@@ -140,6 +152,12 @@ const (
 	CodeBackendEndpointUnreachable = "CB005"
 	// CodeBackendHealthy: the CacheBackend passed every per-backend check.
 	CodeBackendHealthy = "CB006"
+	// CodeBackendFunctionalProbeFailing: the CacheBackend's FunctionalProbeOK
+	// condition is present but not True — the controller's end-to-end functional
+	// self-test (/probe) is failing or inconclusive for this backend, which is
+	// why Ready may be downgraded. Surfaces the underlying reason the bare Ready
+	// bit does not.
+	CodeBackendFunctionalProbeFailing = "CB007"
 
 	// CodeEnginePodNotInjected: a pod matching a CacheBackend's engineSelector
 	// has no InjectedByCacheBackend Event — it may be serving uncached.

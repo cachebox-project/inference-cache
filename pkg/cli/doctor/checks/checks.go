@@ -47,8 +47,9 @@ const DefaultOrphanWindow = 24 * time.Hour
 // client even if a check's target condition is not yet wired (it then simply
 // finds nothing). Keep these in lockstep with the producers.
 const (
-	conditionReady         = "Ready"
-	conditionQuotaExceeded = "QuotaExceeded"
+	conditionReady             = "Ready"
+	conditionQuotaExceeded     = "QuotaExceeded"
+	conditionFunctionalProbeOK = "FunctionalProbeOK"
 
 	// annotationInjectedBy is the durable wiring signal the pod webhook stamps on
 	// an injected engine pod; its value is the owning CacheBackend's
@@ -109,9 +110,11 @@ type Deps struct {
 	// HTTP issues the /snapshot and /policy probes. nil if the server HTTP
 	// endpoint could not be resolved.
 	HTTP HTTPDoer
-	// SnapshotURL and PolicyURL are the fully-qualified probe targets.
+	// SnapshotURL, PolicyURL, and ProbeURL are the fully-qualified probe
+	// targets on the server's controller-facing (:8081) listener.
 	SnapshotURL string
 	PolicyURL   string
+	ProbeURL    string
 	// Token is the ServiceAccount bearer token presented to /snapshot. Empty
 	// means doctor probes the unauthenticated path and flags the auth state.
 	Token string
@@ -171,11 +174,14 @@ func Run(ctx context.Context, d Deps) *doctor.Report {
 		}
 	}
 
-	// 1–3: control-plane endpoint reachability (skippable via --config-only).
+	// 1–4: control-plane endpoint reachability (skippable via --config-only).
+	// The three controller-facing endpoints (/snapshot, /policy, /probe) share
+	// the :8081 listener and one auth profile.
 	if !d.SkipEndpointChecks {
 		add(ServerReachability(ctx, d.Health, d.ServerTarget))
 		add(SnapshotReachability(ctx, d.HTTP, d.SnapshotURL, d.Token))
 		add(PolicyReachability(ctx, d.HTTP, d.PolicyURL))
+		add(ProbeReachability(ctx, d.HTTP, d.ProbeURL))
 	}
 
 	// 4: per-CacheBackend health.

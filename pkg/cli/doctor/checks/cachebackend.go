@@ -93,6 +93,19 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 			if f, ok := participationFinding(cb.Status.IndexParticipation, cb.Status.FirstKVEventObservedAt, ref, now, staleWindow); ok {
 				note(f)
 			}
+
+			// Functional self-test gate: the controller writes FunctionalProbeOK
+			// only once the backend is otherwise eligible, so its absence is not a
+			// problem (Ready/CB003 already cover the not-yet-ready state). A
+			// present-but-not-True condition is the silent-failure signal the bare
+			// Ready bit does not explain — surface its reason/message.
+			if fp := findCondition(cb.Status.Conditions, conditionFunctionalProbeOK); fp != nil && fp.Status != metav1.ConditionTrue {
+				note(doctor.Finding{
+					Code: doctor.CodeBackendFunctionalProbeFailing, Status: doctor.StatusWarn,
+					Check: checkCacheBackendHealth, Resource: ref,
+					Message: fmt.Sprintf("FunctionalProbeOK=%s (reason %s): the controller's end-to-end functional self-test is failing for this backend — %s", fp.Status, fp.Reason, fp.Message),
+				})
+			}
 		}
 
 		// Endpoint presence + reachability (all backends).

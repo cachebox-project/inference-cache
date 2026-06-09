@@ -32,11 +32,12 @@ CacheBackend / engine-pod data path, then tenant and policy configuration:
 | 1 | Server reachability | gRPC dial + `grpc.health.v1` `Health/Check` (service `""`) returns `SERVING` |
 | 2 | `/snapshot` reachability | HTTP GET returns 200 with a JSON-parseable body (bearer token if available; flags the unauthenticated path) |
 | 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 2xx/401/403/405 = wired, 404 = not mounted, 5xx = WARN) |
-| 4 | Per-CacheBackend health | `Ready=True`; managed backends have ever observed a KV event (durable `firstKVEventObservedAt` latch) and, if `lastEventAt` is present, it is fresh (drained backends with a cleared `lastEventAt` are not flagged); `status.endpoint` populated and reachable |
-| 5 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
-| 6 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
-| 7 | CacheTenant health | `QuotaExceeded` condition is not `True` |
-| 8 | CachePolicy coverage | each namespace with CacheBackends has at least one CachePolicy |
+| 4 | `/probe` reachability | the controller-driven functional self-test route (same `:8081` listener + auth profile) is wired (non-mutating HEAD; same status classification as `/policy`) |
+| 5 | Per-CacheBackend health | `Ready=True`; managed backends have ever observed a KV event (durable `firstKVEventObservedAt` latch) and, if `lastEventAt` is present, it is fresh (drained backends with a cleared `lastEventAt` are not flagged); `FunctionalProbeOK` is not failing (when the condition is present, a non-`True` value surfaces *why* Ready is downgraded); `status.endpoint` populated and reachable |
+| 6 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
+| 7 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
+| 8 | CacheTenant health | `QuotaExceeded` condition is not `True` |
+| 9 | CachePolicy coverage | each namespace with CacheBackends has at least one CachePolicy |
 
 ## Finding codes
 
@@ -57,12 +58,16 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `PL001` | FAIL | `/policy` route not wired (connection refused, or HTTP 404 = route not mounted) |
 | `PL002` | OK | `/policy` route is wired (2xx / 401 / 403 / 405) |
 | `PL003` | WARN | `/policy` mounted but answered an unexpected status (e.g. 5xx) |
+| `PB001` | FAIL | `/probe` route not wired (connection refused, or HTTP 404 = route not mounted) |
+| `PB002` | OK | `/probe` route is wired (2xx / 401 / 403 / 405) |
+| `PB003` | WARN | `/probe` mounted but answered an unexpected status (e.g. 5xx) |
 | `CB001` | WARN | CacheBackend `Ready` is not `True` |
 | `CB002` | WARN | managed backend with a selector matches 0 engine pods (LikelySelectorMismatch) |
 | `CB003` | WARN | no KV event ever observed for the backend (EngineNotReportingState) |
 | `CB004` | WARN | last KV event is stale (EngineStale) |
 | `CB005` | WARN | `status.endpoint` empty or unreachable |
 | `CB006` | OK | CacheBackend healthy on every applicable axis |
+| `CB007` | WARN | `FunctionalProbeOK` condition present but not `True` — the controller's functional self-test is failing for this backend (explains a Ready downgrade) |
 | `EP001` | WARN | matched engine pod missing an injection marker (no `inferencecache.io/injected-by` annotation and no Event) |
 | `EP002` | OK | matched engine pod is injected (annotation or Event) |
 | `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend; forward-looking — see note below) |
