@@ -1,0 +1,54 @@
+# PodMonitor for `inference-cache-controller-manager`. Without this, a
+# prometheus-operator install scrapes ONLY the server-binary metrics
+# (covered by servicemonitor.yaml) and silently misses every
+# controller-binary series — including
+# `inferencecache_backend_probe_result_total` (which `ServerProbeFail`
+# in this same overlay depends on) and
+# `inferencecache_backend_server_restart_cascades_total` (no alert
+# reads it today; reserved for a future cascade-loop alert).
+#
+# A PodMonitor (not a ServiceMonitor) is the right shape here because the
+# controller binary does not front its /metrics endpoint with a Service —
+# the manager pod listens on :8080 directly. Loaded by the same
+# `kubectl apply -k config/observability` as the PrometheusRule and the
+# server ServiceMonitor, so the alert bundle and BOTH scrape configs ship
+# together.
+#
+# Selector matches the controller Deployment in config/manager/manager.yaml.
+# The endpoint binds by port-NAME (`metrics`), not number, so this stays
+# correct if the manager flag default ever changes (the Deployment is the
+# source of truth for the named port).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: inference-cache-controller
+  namespace: inference-cache-system
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: observability
+    # NOTE: this label targets the UPSTREAM kube-prometheus stack's
+    # default `Prometheus` named `k8s`. Other common conventions:
+    #   * `prometheus-community/kube-prometheus-stack` Helm chart →
+    #     `release: <helm-release-name>` (no `prometheus:` label).
+    #   * Custom `Prometheus` CRs → whatever labels their
+    #     `podMonitorSelector.matchLabels` specifies.
+    # Prometheus Operator only loads PodMonitor CRs whose labels match
+    # the Prometheus CR's `podMonitorSelector`; `kubectl apply -k`
+    # succeeds either way but Prometheus silently ignores this scrape
+    # target until the labels match. Introspect your install with:
+    #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+    # and edit this label to match.
+    prometheus: k8s
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inference-cache
+      app.kubernetes.io/component: controller
+  namespaceSelector:
+    matchNames:
+      - inference-cache-system
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

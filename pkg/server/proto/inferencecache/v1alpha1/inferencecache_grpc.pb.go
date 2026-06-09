@@ -39,8 +39,10 @@ const (
 // Guarantees:
 //   - RenderTemplate / LookupRoute / LookupPDRoute / GetCacheState are
 //     side-effect-free apart from emitting metrics.
-//   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
-//     treat it as a no-op and route as they normally would.
+//   - Fail-open: an empty result is always valid regardless of the
+//     reason_code (NO_HINT, TIMEOUT, or one of the diagnostic codes
+//     UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME); clients treat
+//     it as a no-op and route as they normally would.
 //   - prefix_hash and block_hashes bytes are engine-defined and only matched
 //     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
@@ -180,8 +182,10 @@ type InferenceCache_StreamMetricsClient = grpc.ServerStreamingClient[Metric]
 // Guarantees:
 //   - RenderTemplate / LookupRoute / LookupPDRoute / GetCacheState are
 //     side-effect-free apart from emitting metrics.
-//   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
-//     treat it as a no-op and route as they normally would.
+//   - Fail-open: an empty result is always valid regardless of the
+//     reason_code (NO_HINT, TIMEOUT, or one of the diagnostic codes
+//     UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME); clients treat
+//     it as a no-op and route as they normally would.
 //   - prefix_hash and block_hashes bytes are engine-defined and only matched
 //     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed

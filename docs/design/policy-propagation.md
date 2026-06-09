@@ -3,9 +3,9 @@
 Status: implemented · Owners: controller (push) + server (apply)
 
 `CachePolicy` is a namespaced CRD reconciled by the controller, but its
-enforcement (eviction TTL, eviction algorithm, lookup threshold, lookup
-deadline) lives in the policy server. This document describes how the controller
-PROPAGATES the
+enforcement (eviction TTL, eviction algorithm, request-side prefix-length
+gate, result-side matched-tokens floor, result-side routing-floor score,
+lookup deadline) lives in the policy server. This document describes how the controller PROPAGATES the
 declarative CRs into the server's runtime so the configuration surface
 actually changes server behavior.
 
@@ -22,12 +22,85 @@ set of `CachePolicy` CRs), so it publishes and the server consumes.
 |---|---|---|---|
 | `/snapshot` | controller ← server | `GET` | controller tick |
 | `/policy`   | controller → server | `POST` (`PUT` also accepted) | watch event + tick |
+| `/probe`    | controller → server | `POST` | CacheBackend reconcile, rate-limited to ~once per backend per 30s |
 
-Both `/snapshot` and `/policy` sit on the server's internal `:8081`
-listener with **three independent gates**, each meant to catch a failure
-mode the others can't. `/healthz`, `/readyz`, and `/metrics` stay on
-the open `:8080` listener — kubelet probes and Prometheus scrapes can't
-present a SA bearer.
+All three of `/snapshot`, `/policy`, and `/probe` sit on the server's
+internal `:8081` listener with **three independent gates**, each meant to
+catch a failure mode the others can't. `/healthz`, `/readyz`, and
+`/metrics` stay on the open `:8080` listener — kubelet probes and
+Prometheus scrapes can't present a SA bearer.
+
+`/probe` is the functional self-test the CacheBackend reconciler
+drives per managed CacheBackend at reconcile time (composed on top of
+the KV-event readiness gate; rate-limited to ~once per backend per 30s,
+see [docs/design/cachebackend-api.md#functional-probe-gate](cachebackend-api.md#functional-probe-gate)).
+The server synthesizes a deterministic round-trip — in-process
+index-ingest → routing → tier-2 — under a reserved tenant id
+(`inferencecache.io/probe`) and replica id (`__probe-<backend>`),
+returning per-stage outcomes; the controller translates those into the
+`FunctionalProbeOK` condition (and downgrades `Ready` on a stage
+failure). Stage A's wire field name is `ingest` —
+matching the path the probe physically traverses: it writes through
+in-process `index.Ingest` rather than the gRPC `ReportCacheState`
+handler the real subscriber uses (the handler now drops messages with
+`tenant_id = inferencecache.io/probe` by design). A Stage A pass
+therefore proves the index ingest path is accepting writes; it does
+not, on its own, prove the full subscriber wire is healthy end-to-end.
+A Stage A fail still definitively means the index ingest path is broken.
+
+`/probe` shares the controller-auth profile with `/snapshot` and
+`/policy` because all three endpoints serve one caller identity (the
+controller SA). The probe entries auto-clean on each Run via an
+`ALL_CLEARED` event against the reserved replica, so the synthesized
+state never leaks into a real LookupRoute.
+
+#### `/probe` wire contract
+
+Request — JSON body, `POST /probe`. All fields are case-sensitive.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `backend` | string | yes | Stable, globally-unique CacheBackend identifier. Canonical form is `<namespace>/<name>` (the CacheBackend reconciler always sends this), but the handler accepts any non-empty string. Interpolated into the reserved replica id (`__probe-<backend>`) and the probe hash, so two CacheBackends with the same `backend` value share a replica id and contention slot. |
+| `model` | string | yes | Model identifier the probe synthesizes state under. Must match the model the controller is checking; the reserved tenant id is server-owned and cannot be passed in. |
+| `hashScheme` | string | yes | Engine domain (`vllm` / `sglang` / etc). Pins the engine the probe's synthetic block lives under so a probe for vllm cannot collide with a probe for sglang on the same backend. |
+| `backendType` | string | no | The CacheBackend's `spec.type`. `LMCache` (or empty, matching the CRD default) runs Stage C; `Memory` / `External` skip it. Unknown values fall through to skip. |
+
+Response — JSON body, HTTP `200 OK` on every well-formed request (per-stage failures are surfaced INSIDE the body, not via HTTP status — the call itself succeeded):
+
+```json
+{
+  "backend": "<backend echoed back>",
+  "ingest":  "ok|failed|skipped",
+  "routing": "ok|failed|skipped",
+  "t2":      "ok|failed|skipped",
+  "errors": [
+    { "stage": "ingest|routing|t2", "message": "..." }
+  ]
+}
+```
+
+Stage values:
+- `ok` — the stage passed.
+- `failed` — the stage failed; `errors` carries a stage-keyed diagnostic message.
+- `skipped` — the stage was not run. T2 is skipped on non-LMCache backends and when no T2Prober is wired. Downstream stages are skipped when an upstream stage failed (cascade prevention).
+
+Stage names:
+- `ingest` — Stage A. Verifies the in-process index ingest path accepts writes. NOTE: this stage writes via `index.Ingest` directly, NOT through the gRPC `ReportCacheState` handler the real subscriber uses (the handler drops messages with `tenant_id = inferencecache.io/probe` by design). A pass proves the index ingest path is healthy; a fail definitively means it's broken. Neither alone proves the wire subscriber path is healthy end-to-end.
+- `routing` — Stage B. Verifies the in-process `index.LookupRoute` (the orchestrated ranking entrypoint that the gRPC handler delegates to) returns `PREFIX_MATCH` for the probe-synthesized hash against the just-ingested entry. NOTE: this stage calls `index.LookupRoute` directly, NOT the gRPC `inferenceCacheService.LookupRoute` handler. The handler short-circuits `tenant_id = inferencecache.io/probe` to `NO_HINT` by design (defense against external lookups against the reserved scope), so the probe cannot route through it. Handler-level concerns — policy gating (`minimumPrefixTokens`), `lookupTimeoutMs` deadline, proto→domain translation — are not covered by this stage and have their own unit tests under `pkg/server`.
+- `t2` — Stage C. Verifies a tier-2 put/get round trip via the supplied `T2Prober` (LMCache backends; skipped otherwise).
+
+Status codes:
+- `200` — body carries the per-stage result; `errors` is empty when all stages passed.
+- `400` — body decode failure (invalid JSON, trailing content past the first value, missing required field, unknown field).
+- `401` / `403` — auth-middleware rejection (TokenReview failed or wrong SA / wrong audience).
+- `405` — wrong method; only `POST` is allowed (the handler echoes `Allow: POST`).
+
+Isolation + cleanup guarantees:
+- The synthesized state lives under tenant id `inferencecache.io/probe` and replica id `__probe-<backend>`. Both prefixes are reserved by the project's canonical namespace and the `__` Pod-name escape; a real workload cannot collide.
+- The reserved tenant is excluded from the index's global `maxEntries` cap accounting AND its cap-sweep victim candidate set, so a concurrent real-workload `Ingest` cannot evict a real entry to make room for a transient probe entry.
+- Each `Run` calls `ApplyEvent(EventAllCleared)` against the reserved replica via `defer`, leaving the index empty of probe entries on return (even on panic or early-return from a failed Stage A).
+- Reserved-tenant entries are still subject to the TTL sweep as defense-in-depth if the deferred cleanup somehow fails to run.
+- The `CacheTenant` admission webhook rejects CRs that newly claim `spec.tenantID = inferencecache.io/probe` — both `ValidateCreate` (unconditionally) and `ValidateUpdate` (only when the change newly introduces the id, via `filterIntroducedErrors`). Pre-existing CRs already holding the reserved id are not trapped on unrelated edits (the v1alpha1 tightening seam). The `ReportCacheState` / `PublishEvent` gRPC handlers silently drop messages carrying the same id — so an external client cannot fake state into the reserved scope through the public gRPC contract.
 
 1. **L3/L4** — a `NetworkPolicy` restricts ingress to pods matching the
    controller's selector.
@@ -45,24 +118,28 @@ present a SA bearer.
    cross-surface defense degrades; keep this audience distinct from
    any audience the apiserver accepts.
 
-The two internal endpoints share one auth profile because they share
+All three internal endpoints share one auth profile because they share
 one caller identity (the controller SA). `/snapshot` is the *read* side
-(CacheIndex poll, info leak if exposed) and `/policy` is the *write*
-side (CachePolicy push, active tampering if exposed) — write is more
-dangerous because replace-on-write semantics mean a rogue POST
-overrides every namespace's policy state cluster-wide with no audit
-trail. The read-side hardening landed first; the write side joined it
-on the same gate, with the audience layer hardening both endpoints
-uniformly.
+(CacheIndex poll, info leak if exposed), `/policy` is the *write* side
+(CachePolicy push, active tampering if exposed), and `/probe` is the
+controller-driven *functional-self-test* side (per-CacheBackend
+synthesis; silent Ready-gate degradation if a regression skipped it).
+Write is the most dangerous of the three because replace-on-write
+semantics mean a rogue POST to `/policy` overrides every namespace's
+policy state cluster-wide with no audit trail. The read-side hardening
+landed first; the write side joined it on the same gate; `/probe`
+joined the same shared gate (audience-bound + bearer-validated +
+NetworkPolicy-restricted) with the audience layer hardening all three
+endpoints uniformly.
 
-`inferencecache_snapshot_auth_total` and `inferencecache_policy_auth_total`
-are the per-endpoint observability surfaces for the two L7 layers
-(identity + audience); audience-mismatch denials surface in the
-`unauth` bucket of each counter, with the apiserver's diagnostic
-visible at WARN in the server log (e.g. `token audiences [...] is
-invalid for the target audiences [...]`). NetworkPolicy drops happen
-at the CNI before the listener and are observed via kube state metrics
-+ CNI flow logs, not these counters.
+`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+and `inferencecache_probe_auth_total` are the per-endpoint observability
+surfaces for the two L7 layers (identity + audience); audience-mismatch
+denials surface in the `unauth` bucket of each counter, with the
+apiserver's diagnostic visible at WARN in the server log (e.g.
+`token audiences [...] is invalid for the target audiences [...]`).
+NetworkPolicy drops happen at the CNI before the listener and are
+observed via kube state metrics + CNI flow logs, not these counters.
 
 ## Snapshot semantics
 
@@ -78,22 +155,26 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v3)
+## Wire schema (v5)
 
 ```json
 {
-  "version": 3,
+  "version": 5,
   "policies": [
     {
       "namespace": "team-a",
       "evictionTTL": 900000000000,
       "minimumPrefixTokens": 32,
+      "minimumMatchedTokens": 128,
+      "routingFloorScore": 5,
       "lookupTimeoutMs": 25,
       "eviction": "lfu"
     },
     {
       "namespace": "team-b",
-      "evictionTTL": 3600000000000
+      "evictionTTL": 3600000000000,
+      "minimumMatchedTokens": 64,
+      "routingFloorScore": 0.1
     }
   ],
   "tenants": [
@@ -106,10 +187,18 @@ intervention.
 }
 ```
 
-- `version` — schema version. Bumped on a breaking change. The server
-  rejects any value it does not recognize (HTTP 400). Currently `3`
-  (bumped from `1` to `2` when `tenants` was added, then to `3` when
-  `policies[].eviction` was added).
+- `version` — schema version. Bumped on every schema change so version
+  skew is observable; **whether the bump is rejected at decode is set
+  separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
+  Rollout asymmetry note in §Versioning and forward-compat below. v4 and
+  v5 are both additive and defaultable, so the v5 server still accepts
+  v3 and v4 bodies; a hypothetical breaking change would bump
+  `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
+  value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
+  (HTTP 400). Currently `5` (bumped from `1` to `2` when `tenants` was
+  added, to `3` when `policies[].eviction` was added, to `4` when
+  `policies[].minimumMatchedTokens` was added, and to `5` when
+  `policies[].routingFloorScore` was added).
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -123,7 +212,50 @@ intervention.
   defensive default for an unset field and for any legacy/raced data that
   predates the webhook.
 - `policies[].minimumPrefixTokens` — int32. Optional. `<=0` ⇒ "no
-  threshold".
+  threshold". A request-side gate against `LookupRouteRequest`'s claimed
+  prefix length BEFORE the index is touched.
+- `policies[].minimumMatchedTokens` — int32. Optional. `<=0` ⇒ "no floor for
+  this namespace" (the explicit opt-out). A namespace that does NOT have a
+  `CachePolicy` at all instead falls back to `DefaultMinimumMatchedTokens`
+  (= 64) — the server-wide safety floor. Distinct from
+  `minimumPrefixTokens`: this is a result-side filter applied AFTER the
+  index returns, against each replica's realized matched-token overlap.
+  Replicas whose match falls below the floor are filtered from the
+  response; when none survive, the reason code downgrades to `NO_HINT`.
+  See [`lookuproute-ranking.md`](./lookuproute-ranking.md).
+- `policies[].routingFloorScore` — float32 pointer (omitempty). Optional.
+  A nil/missing field is normalized to `DefaultRoutingFloorScore` (`0.1`)
+  for v3 and v4 bodies (see Rollout asymmetry below). v5 bodies are NOT
+  normalized; the v5 wire field can take three shapes:
+  - **Normal CRD-defaulted shape (the common case).** The CRD has a
+    `+kubebuilder:default="0.1"` marker, so an admitted CachePolicy
+    always carries a non-nil `spec.routingFloorScore`. The controller
+    flattens that to a non-nil `*float32` (e.g. `&0.1`) and sends it on
+    the wire. v5 bodies in production traffic look like this.
+  - **Explicit opt-out.** An operator setting
+    `spec.routingFloorScore: "0"` reaches the wire as `&0` (omitempty
+    on float32 *pointer* preserves `&0`; the zero-value case it
+    suppresses is the nil pointer). The store records `0` byte-for-byte
+    and the resolver returns `0`, disabling the floor.
+  - **Bare/manual body.** A hand-crafted /policy POST, a legacy CR that
+    predates the field, or any path that omits the field altogether
+    reaches the store as nil. The resolver `PolicyStore.RoutingFloorScore`
+    treats nil as the safety-default case and returns
+    `DefaultRoutingFloorScore`. This is the same effective behavior as
+    no CachePolicy at all, just routed through the
+    "CachePolicy-installed-but-field-absent" branch.
+
+  A namespace that does NOT have a `CachePolicy` at all falls back to
+  `DefaultRoutingFloorScore`.
+  Distinct from `minimumMatchedTokens`: that's a result-side filter on
+  realized *matched_tokens*; this is a result-side floor on the realized
+  per-replica *score* (matched_tokens × freshness × pressure_factor ×
+  slo_bias × distinguishing_power) AFTER the distinguishing-power-aware
+  ranker runs. When the top score falls below the floor, the whole
+  response downgrades to `NO_HINT`. The two floors compose: matched-tokens
+  filter runs first (per-replica), then the routing-floor-score check
+  runs on the top survivor's score. See
+  [`lookuproute-ranking.md`](./lookuproute-ranking.md).
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒
   "no deadline".
 - `policies[].eviction` — lower-cased cap-eviction algorithm (`"lru"` /
@@ -208,7 +340,9 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 |---|---|
 | `evictionTTL` | `pkg/index` `TTLResolver` — per-tenant `freshness()` decay + `evictExpired()` cutoff. |
 | `eviction` | `pkg/index` `EvictionResolver` — selects the per-namespace cap-based eviction algorithm. `lru` evicts oldest-by-`lastSeen`; `lfu` evicts the lowest per-entry access count, tie-broken on oldest `lastSeen`. The cap sweep (over `MaxEntries`) consults it to order victims. In `lfu` namespaces the lookup path also reads it to record which entries a *delivered* `LookupRoute` hint credits — the bump is lock-free and applied only when the response is actually returned (a `TIMEOUT`'d lookup credits nothing) and never changes a lookup result. The TTL sweep is algorithm-independent. Emitted as `inferencecache_index_evictions_total{algorithm,reason}`. |
-| `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest.prefix_token_count`. A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics. |
+| `minimumPrefixTokens` | Pre-lookup gate on `LookupRouteRequest`'s effective prefix token count: chain-bearing requests use `sum(block_token_counts)` and fall back to `prefix_token_count` only when the chain is empty (`effectivePrefixTokens` in the handler). A request shorter than the threshold short-circuits to `NO_HINT` without touching the index. Matches the CRD's "minimum prefix token count before lookup" semantics — gateway authors should size the gate against the chain budget they actually send. |
+| `minimumMatchedTokens` | Post-lookup floor on each replica's realized `matched_tokens`. The handler resolves the per-tenant floor via `PolicyStore.MinimumMatchedTokens`, which falls back to `DefaultMinimumMatchedTokens` (= 64) for tenants with no `CachePolicy`. Replicas whose `matched_tokens` falls below the floor are filtered from the scored result; if none survive, the response downgrades to `reason_code: NO_HINT` with empty scores. The downgrade runs **before** the LFU `CreditHits` step so a non-delivered hint never bumps the per-entry access counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
+| `routingFloorScore` | Post-score floor on the per-replica score from the distinguishing-power-aware ranker. The handler resolves the per-tenant floor via `PolicyStore.RoutingFloorScore`, which falls back to `DefaultRoutingFloorScore` (`0.1`) for tenants with no `CachePolicy`. When the top surviving replica's score falls below the floor, the response downgrades to `reason_code: NO_HINT` with empty scores. Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica filter), then this score floor checks the top survivor. Both downgrades run **before** the LFU `CreditHits` step so a non-delivered hint never bumps an LFU counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 
@@ -244,13 +378,47 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
-`version` is `3`: it was bumped from `1` to `2` when the `tenants` slice
-was added, then to `3` when `policies[].eviction` (the per-namespace
-cap-eviction algorithm) was added. The server decodes with
-`DisallowUnknownFields`, so a stale controller's push is rejected with a
-clear "unsupported version" error rather than silently dropping fields;
-controller and server roll out together and the periodic re-push
-reconciles any transient skew.
+`version` is `5`: it was bumped from `1` to `2` when the `tenants` slice
+was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
+algorithm) was added, to `4` when `policies[].minimumMatchedTokens`
+(the result-side matched-tokens floor) was added, and to `5` when
+`policies[].routingFloorScore` (the per-namespace post-score floor for
+the distinguishing-power-aware ranker) was added. The server decodes with
+`DisallowUnknownFields`, so an older server receiving a newer body still
+fails loud on the unknown field even before its version check fires.
+
+**Rollout asymmetry (additive-defaultable carve-out).** The version check is
+deliberately asymmetric so a server-first rollout (newer server, older
+controller still pushing the prior schema) does NOT drop existing policy
+state mid-upgrade:
+
+- A v5 server accepts any body whose `version` is in
+  `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
+  `[3, 5]`. Bodies outside the band are rejected with
+  `unsupported policy snapshot version`.
+- For accepted older bodies, each new field is *normalized* before reaching
+  the store. v3 has neither `minimumMatchedTokens` nor `routingFloorScore`;
+  v4 has the former but not the latter. JSON decodes the missing fields as
+  their zero values, which would be indistinguishable from the v4/v5
+  explicit opt-outs (`0` / nil-pointer) and silently disable both floors
+  for every namespace with a CR during the rollout. The server fills in
+  `DefaultMinimumMatchedTokens` (`64`) for v3 bodies and
+  `DefaultRoutingFloorScore` (`0.1`) for v3 and v4 bodies, so the
+  effective floors match the no-CachePolicy fallbacks
+  `PolicyStore.MinimumMatchedTokens` / `PolicyStore.RoutingFloorScore`
+  apply to tenants without a CR. Every other knob (TTL, prefix gate,
+  timeout, eviction, tenant quota) reaches the store byte-for-byte.
+- v5 bodies are NOT normalized — an operator's explicit
+  `routingFloorScore: 0` opt-out (or `minimumMatchedTokens: 0`) reaches
+  the store as written. Each normalization fires only when the version
+  says the corresponding new field could not have been present.
+
+The carve-out only applies to **additive, defaultable** schema changes: a
+new field whose absence has a safe well-defined synthesized value. A
+schema change that is load-bearing (removes a field, changes meaning, makes
+an existing field required) MUST be paired with a `PolicyMinimumAcceptedVersion`
+bump so old bodies under that change are rejected rather than silently
+mis-interpreted.
 
 ## Out of scope
 
@@ -265,7 +433,9 @@ reconciles any transient skew.
 - `LookupRoute` ranking v2 (pressure / SLO scoring, `TENANT_HOT`
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
-- mTLS for `/policy` and `/snapshot` — the current shape ships
-  TokenReview-backed bearer auth + audience binding + a NetworkPolicy
+- mTLS for `/snapshot`, `/policy`, and `/probe` — the current shape
+  ships TokenReview-backed bearer auth + audience binding + a NetworkPolicy
   gate; mTLS is a separate hardening step tracked under the gRPC TLS
-  posture decision.
+  posture decision, and applies uniformly across the controller-facing
+  bridge (all three endpoints share one auth profile, so mTLS will gate
+  all three at once).

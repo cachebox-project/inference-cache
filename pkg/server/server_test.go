@@ -26,10 +26,16 @@ import (
 // newTestService builds a service backed by a fresh, empty index + policy
 // store for handler-level unit tests. The index uses the policy store as its
 // TTL resolver so per-tenant TTL changes during a test are reflected exactly
-// as they would be in the running binary.
+// as they would be in the running binary, and reserves the probe tenant so
+// the cap/snapshot/aggregate behavior matches the production binary's
+// Service.New wiring (otherwise tests would see different read-side
+// filtering than the running server).
 func newTestService() *inferenceCacheService {
 	policies := NewPolicyStore()
-	idx := index.New(index.WithTTLResolver(policies))
+	idx := index.New(
+		index.WithTTLResolver(policies),
+		index.WithReservedTenants(ProbeTenantID),
+	)
 	return newInferenceCacheService(idx, newServerMetrics(), policies)
 }
 
@@ -85,9 +91,12 @@ func TestLookupRouteFailsOpen(t *testing.T) {
 func TestLookupRouteReasonCodes(t *testing.T) {
 	t.Run("PREFIX_MATCH on exact prefix hit", func(t *testing.T) {
 		svc := newTestService()
+		// TokenCount=128 keeps the realized match above the
+		// DefaultMinimumMatchedTokens floor so this test pins the
+		// PREFIX_MATCH wire code, not the floor.
 		svc.index.Ingest(index.Update{
 			ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
-			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 		})
 		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
@@ -161,9 +170,12 @@ func TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC(t *testing.T) {
 func TestLookupRouteSLOFlowsThroughHandler(t *testing.T) {
 	svc := newTestService()
 
+	// TokenCount=128 keeps the realized match above the
+	// DefaultMinimumMatchedTokens floor so this test pins SLO
+	// plumbing, not the floor.
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 50}},
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 	})
 
 	base := &icpb.LookupRouteRequest{
@@ -344,6 +356,76 @@ func TestSnapshotEndpointReflectsIngest(t *testing.T) {
 	}
 	if len(snap.Tenants) != 1 || snap.Tenants[0].TenantID != "tenant-a" {
 		t.Fatalf("tenants = %+v, want tenant-a", snap.Tenants)
+	}
+}
+
+// TestReportCacheState_AcceptsClientVersionOnReplicaStats is a wire-level smoke
+// for the ReplicaStats.client_version (field 5) addition: a producer that sets
+// client_version on its CacheStateUpdate.Stats must be accepted by the real
+// server stream end-to-end (Ack returned, no error, the replica still lands in
+// the snapshot), so older producers that don't fill the field AND newer ones
+// that do both keep working today. The server doesn't yet surface
+// client_version on /snapshot — that wiring lands in a follow-up PR; this test
+// is the guard that the new field has reached the server's regenerated proto
+// descriptor and is silently preserved on the ingest path.
+func TestReportCacheState_AcceptsClientVersionOnReplicaStats(t *testing.T) {
+	conn, _, snapshotURL, stop := startInProcessServerConnFull(t)
+	grpcClient := icpb.NewInferenceCacheClient(conn)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := grpcClient.ReportCacheState(ctx)
+	if err != nil {
+		t.Fatalf("open ReportCacheState: %v", err)
+	}
+	if err := stream.Send(&icpb.CacheStateUpdate{
+		ReplicaId:  "replica-cv",
+		ModelId:    "llama-3-8b",
+		TenantId:   "tenant-cv",
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 64}},
+		Stats: &icpb.ReplicaStats{
+			ReplicaId:        "replica-cv",
+			CacheMemoryBytes: 9999,
+			HitRate:          0.5,
+			ClientVersion:    "lmcache==0.4.2",
+		},
+	}); err != nil {
+		t.Fatalf("send update with client_version: %v", err)
+	}
+	ack, err := stream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("Ack.accepted = false, reason=%q — server rejected an update carrying client_version", ack.GetReasonCode())
+	}
+
+	code, body := getString(t, snapshotURL+"/snapshot")
+	if code != http.StatusOK {
+		t.Fatalf("/snapshot status = %d, want 200", code)
+	}
+	var snap index.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode snapshot JSON: %v (body=%s)", err, body)
+	}
+	if snap.TotalPrefixes != 1 {
+		t.Fatalf("totalPrefixes = %d, want 1 — ingestion path dropped the update", snap.TotalPrefixes)
+	}
+	var got *index.ReplicaSnapshot
+	for i := range snap.Replicas {
+		if snap.Replicas[i].ReplicaID == "replica-cv" {
+			got = &snap.Replicas[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("replica-cv not present in /snapshot.replicas; client_version on the wire broke ingest: %+v", snap.Replicas)
+	}
+	if got.CacheMemoryBytes != 9999 {
+		t.Errorf("replica-cv.cacheMemoryBytes = %d, want 9999 — other ReplicaStats fields stopped flowing alongside client_version", got.CacheMemoryBytes)
 	}
 }
 
@@ -803,15 +885,23 @@ func TestReportThenLookupReturnsPrefixMatch(t *testing.T) {
 		t.Fatalf("matched_tokens = %d, want 128", got)
 	}
 
-	// A different hash_scheme must not match the same bytes (engine isolation).
+	// A different hash_scheme must not match the same bytes (engine
+	// isolation). Post-diagnostics the classifier surfaces the more specific
+	// code — (tenant, model) is populated under vllm; the lookup asks under
+	// sglang — so the reason narrows from NO_HINT to UNKNOWN_HASH_SCHEME.
+	// The cross-scheme no-leak property is unchanged: no replica score
+	// appears.
 	other, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
 		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "sglang", PrefixHash: prefix,
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute (other scheme): %v", err)
 	}
-	if other.GetReasonCode() != "NO_HINT" {
-		t.Fatalf("cross-scheme reason = %q, want NO_HINT", other.GetReasonCode())
+	if other.GetReasonCode() != "UNKNOWN_HASH_SCHEME" {
+		t.Fatalf("cross-scheme reason = %q, want UNKNOWN_HASH_SCHEME (scheme-mismatch diagnostic)", other.GetReasonCode())
+	}
+	if len(other.GetReplicaScores()) != 0 {
+		t.Fatalf("cross-scheme lookup must yield no scores; got %+v", other.GetReplicaScores())
 	}
 }
 
@@ -847,6 +937,231 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 		t.Fatalf("cache_memory_bytes = %d, want 2048", resp.GetReplicas()[0].GetCacheMemoryBytes())
 	}
 }
+
+// TestLookupRouteFailsOpenForReservedProbeTenant pins the symmetric read-side
+// guard: an external gRPC caller that knows (or guesses) a backend name and
+// re-derives the deterministic probe hash MUST NOT observe the synthetic
+// __probe-<backend> replica when querying with tenant_id == ProbeTenantID.
+// Fail-open with NO_HINT — the contract says "never error on the hot path",
+// and the legitimate probe path uses index.LookupRoute directly (not the
+// gRPC handler), so the in-process Run is unaffected.
+func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed something in the probe scope so a leak would actually surface.
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT — external lookup against reserved tenant must fail-open", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("external lookup against reserved tenant returned scores: %+v", resp.GetReplicaScores())
+	}
+}
+
+// TestLookupRouteEmitsMetricForReservedProbeTenantNoHint pins the metric
+// contract on the reserved-tenant short-circuit: even though the call is
+// fail-open without touching the index, observeLookup still fires with
+// reason_code=NO_HINT + hint_used=false, so the "one increment per
+// LookupRoute call" contract on inferencecache_lookup_route_calls_total
+// holds. A future dashboard slicing the metric on tenant_id can surface
+// external traffic against the reserved tenant as an attempted scope probe.
+func TestLookupRouteEmitsMetricForReservedProbeTenantNoHint(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+	}); err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	got := lookupCallsValueFromService(t, svc, "m", "NO_HINT", "false")
+	if got != 1 {
+		t.Errorf("lookup_route_calls_total{model=m,reason=NO_HINT,hint_used=false} = %v, want 1 — reserved-tenant short-circuit must still emit the metric", got)
+	}
+}
+
+// lookupCallsValueFromService reads the in-memory counter value for one
+// label set off the service's per-Service Prometheus registry. Avoids
+// pulling in github.com/prometheus/client_golang/prometheus/testutil
+// (and its transitive kylelemons/godebug dep) for one assertion.
+func lookupCallsValueFromService(t *testing.T, svc *inferenceCacheService, model, reason, hintUsed string) float64 {
+	t.Helper()
+	mfs, err := svc.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("registry.Gather: %v", err)
+	}
+	const name = "inferencecache_lookup_route_calls_total"
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			matched := 0
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "model":
+					if l.GetValue() == model {
+						matched++
+					}
+				case "reason_code":
+					if l.GetValue() == reason {
+						matched++
+					}
+				case "hint_used":
+					if l.GetValue() == hintUsed {
+						matched++
+					}
+				}
+			}
+			if matched == 3 {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// TestGetCacheStateReturnsEmptyForReservedProbeTenant is the same guard on
+// the per-(tenant, model) aggregate RPC: an external caller MUST NOT see
+// the probe's synthetic replica stats or prefix count via GetCacheState.
+func TestGetCacheStateReturnsEmptyForReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("GetCacheState: %v", err)
+	}
+	if resp.GetSummary().GetTotalPrefixes() != 0 {
+		t.Fatalf("GetCacheState exposed %d probe prefixes; want 0", resp.GetSummary().GetTotalPrefixes())
+	}
+	if len(resp.GetReplicas()) != 0 {
+		t.Fatalf("GetCacheState exposed probe replicas: %+v", resp.GetReplicas())
+	}
+}
+
+// TestSnapshotFiltersReservedProbeTenant pins the cluster-aggregate
+// (/snapshot) read-side guard. The CacheIndex poller polls /snapshot every
+// ~25s; a probe in flight during that poll must not be temporarily reflected
+// into operator-visible CacheIndex CR status.
+func TestSnapshotFiltersReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	// Seed both a real tenant (visible) and the probe tenant (hidden).
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real-r", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("rp"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{ReplicaID: "real-r", CacheMemoryBytes: 5000, HitRate: 0.5},
+	})
+	svc.index.Ingest(index.Update{
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("pp"), TokenCount: 16}},
+		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	snap := svc.index.Snapshot()
+
+	if snap.TotalPrefixes != 1 {
+		t.Errorf("TotalPrefixes = %d, want 1 — reserved tenant must not contribute to the cluster total", snap.TotalPrefixes)
+	}
+	for _, r := range snap.Replicas {
+		if r.Tenant == ProbeTenantID || strings.HasPrefix(r.ReplicaID, ProbeReplicaPrefix) {
+			t.Errorf("Snapshot exposed reserved replica row: %+v", r)
+		}
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == ProbeTenantID {
+			t.Errorf("Snapshot exposed reserved tenant row: %+v", tn)
+		}
+	}
+}
+
+// TestReportCacheStateDropsReservedProbeTenant pins the gRPC defense against
+// an external client writing to the server-reserved probe scope: an ingest
+// carrying tenant_id == ProbeTenantID is silently dropped. The complementary
+// CacheTenant admission rule rejects a CR claiming the same id at the CRD
+// layer; together they keep the probe scope server-internal across all
+// reservation paths.
+func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	stream := &fakeReportStream{updates: []*icpb.CacheStateUpdate{{
+		ReplicaId:  "spoofed",
+		ModelId:    "m",
+		TenantId:   ProbeTenantID,
+		HashScheme: "vllm",
+		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 32}},
+	}}}
+	if err := svc.ReportCacheState(stream); err != nil {
+		t.Fatalf("ReportCacheState: %v", err)
+	}
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 0 {
+		t.Fatalf("external ingest under reserved probe tenant landed in the index: %+v", scores)
+	}
+}
+
+// TestPublishEventDropsReservedProbeTenant pins the symmetric guard for
+// CacheEvent: an external PREFIX_EVICTED / ALL_CLEARED targeting the probe
+// tenant must not reach the index. The probe re-synthesizes on every Run so
+// the impact would be limited, but the contract is "external clients can't
+// touch server-internal state" — silent drop, no error on the hot path.
+func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
+	svc := newTestService()
+	svc.index.Ingest(index.Update{
+		ReplicaID: "real", Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
+	})
+	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
+		Type: icpb.CacheEvent_ALL_CLEARED, ReplicaId: "real",
+		ModelId: "m", TenantId: ProbeTenantID,
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Fatalf("Ack should be true even on a silent drop")
+	}
+	// The seeded entry must survive — the ALL_CLEARED was dropped before the index saw it.
+	scores := svc.index.Lookup(index.LookupRequest{
+		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if len(scores) != 1 || scores[0].ReplicaID != "real" {
+		t.Fatalf("external CacheEvent against probe tenant disturbed reserved state: %+v", scores)
+	}
+}
+
+// fakeReportStream replays a fixed slice of updates and signals EOF.
+type fakeReportStream struct {
+	icpb.InferenceCache_ReportCacheStateServer
+	updates []*icpb.CacheStateUpdate
+	idx     int
+	acked   bool
+}
+
+func (f *fakeReportStream) Recv() (*icpb.CacheStateUpdate, error) {
+	if f.idx >= len(f.updates) {
+		return nil, io.EOF
+	}
+	u := f.updates[f.idx]
+	f.idx++
+	return u, nil
+}
+
+func (f *fakeReportStream) SendAndClose(*icpb.Ack) error { f.acked = true; return nil }
 
 func TestPublishEventAppliesToIndex(t *testing.T) {
 	svc := newTestService()
@@ -1093,9 +1408,13 @@ func TestLookupRouteUnaffectedByPolicyForUnknownTenant(t *testing.T) {
 	svc.policies.Replace([]ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200, LookupTimeoutMs: 1},
 	})
+	// TokenCount=128 keeps the realized match above the server-wide
+	// DefaultMinimumMatchedTokens floor, which fires for any
+	// tenant with no CachePolicy. The test pins "team-a's policy doesn't
+	// leak into team-b", not the floor.
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "team-b", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}},
 	})
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
@@ -1121,7 +1440,10 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	defer cancel()
 
 	ingestHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
-	ingestCounts := []int32{16, 16, 16}
+	// Block tokens=64 each keeps the matched run (3 blocks × 64 = 192) above
+	// the DefaultMinimumMatchedTokens floor, so the test pins
+	// partial-run matched_tokens accounting, not the floor.
+	ingestCounts := []int32{64, 64, 64}
 
 	stream, err := client.ReportCacheState(ctx)
 	if err != nil {
@@ -1138,7 +1460,7 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	}
 
 	lookupHashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3"), []byte("x4"), []byte("x5")}
-	lookupCounts := []int32{16, 16, 16, 16, 16}
+	lookupCounts := []int32{64, 64, 64, 64, 64}
 	resp, err := client.LookupRoute(ctx, &icpb.LookupRouteRequest{
 		ModelId: "llama-3-8b", TenantId: "tenant-a", HashScheme: "vllm",
 		BlockHashes: lookupHashes, BlockTokenCounts: lookupCounts,
@@ -1152,8 +1474,8 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 	if len(resp.GetReplicaScores()) != 1 || resp.GetReplicaScores()[0].GetReplicaId() != "replica-a" {
 		t.Fatalf("expected single hit for replica-a, got %+v", resp.GetReplicaScores())
 	}
-	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 48 {
-		t.Fatalf("matched_tokens = %d, want 48 (3 blocks × 16 — the partial run, not the full request chain)", got)
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != 192 {
+		t.Fatalf("matched_tokens = %d, want 192 (3 blocks × 64 — the partial run, not the full request chain)", got)
 	}
 }
 
@@ -1162,10 +1484,18 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 // request omits the legacy prefix_token_count (a chain-only caller). Without
 // this fallback the policy threshold would erroneously short-circuit every
 // chain request to NO_HINT regardless of its actual token budget.
+//
+// The policy explicitly sets MinimumMatchedTokens=0 so the §2.6 result-side
+// floor is disabled for this namespace. Otherwise the 48-token realized
+// match would clear the request-side gate (32) but fail the
+// DefaultMinimumMatchedTokens (64) the apiserver materializes on a bare CR,
+// and the test would assert PREFIX_MATCH for a configuration that production
+// would actually downgrade to NO_HINT. Making the opt-out explicit pins the
+// test scope to the request-side gate alone, matching its name.
 func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", MinimumPrefixTokens: 32},
+		{Namespace: "team-a", MinimumPrefixTokens: 32, MinimumMatchedTokens: 0},
 	})
 	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
 	counts := []int32{16, 16, 16}
@@ -1285,11 +1615,14 @@ func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
 
 // TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot is the symmetric
 // guard to TestLookupRouteMalformedChainNeverFallsThroughToTenantHot: a
-// chain-bearing request with no first-block match must hard-stop at NO_HINT,
-// not surface a TENANT_HOT hint against an unrelated warm replica. The
-// chain caller asked specifically for longest-prefix matching; a soft
-// locality nudge is not what they requested and "no overlap → NO_HINT" is
-// the documented contract.
+// chain-bearing request with no first-block match (under matching contract
+// keys — same (tenant, model, hash_scheme) as the warm replica) must
+// hard-stop at NO_HINT, not surface a TENANT_HOT hint against an unrelated
+// warm replica. The chain caller asked specifically for longest-prefix
+// matching; a soft locality nudge is not what they requested. (Chain
+// misses with a MISMATCHED contract key surface as the matching UNKNOWN_*
+// code instead — that path is covered by the diagnostics tests; this test
+// is about the same-key novel-chain case.)
 func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
 	svc := newTestService()
 	svc.index.Ingest(index.Update{

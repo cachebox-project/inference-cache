@@ -204,21 +204,42 @@ type ReplicaScore struct {
 	EstimatedCacheHitProb float32
 }
 
-// Strategy names which ranking path produced a LookupResult, so the gRPC
-// handler can map it to the contract's reason_code vocabulary
-// (PREFIX_MATCH | TENANT_HOT | NO_HINT) without re-running the index logic.
+// Strategy names which ranking-or-classification path produced a LookupResult,
+// so the gRPC handler can map it to the contract's reason_code vocabulary
+// (PREFIX_MATCH | TENANT_HOT | NO_HINT | UNKNOWN_TENANT | UNKNOWN_MODEL |
+// UNKNOWN_HASH_SCHEME) without re-running the index logic.
 type Strategy int
 
 const (
 	// StrategyNone — no candidates from any strategy. Handler emits NO_HINT.
 	StrategyNone Strategy = iota
 	// StrategyPrefixMatch — at least one replica holds the requested prefix
-	// in this hash_scheme. Handler emits PREFIX_MATCH.
+	// in this hash_scheme. Handler emits PREFIX_MATCH, BUT the service-layer
+	// matched-tokens floor (CachePolicy.spec.minimumMatchedTokens, default 64
+	// — see docs/design/lookuproute-ranking.md §2.6) can still downgrade the
+	// response to NO_HINT before it ships to the wire: replicas whose
+	// matched_tokens falls below the floor are filtered, and if none survive
+	// the strategy is replaced with StrategyNone in buildLookupResponse. The
+	// index itself stays policy-unaware — this Strategy is the *pre-policy*
+	// prefix-match outcome.
 	StrategyPrefixMatch
 	// StrategyTenantHot — no exact prefix match, but the tenant has recently
 	// warm replicas (hit_rate-based). A coarser locality signal than prefix
 	// match. Handler emits TENANT_HOT.
 	StrategyTenantHot
+	// StrategyUnknownTenant — the request supplied a non-empty tenant_id and
+	// the index holds zero prefix entries for that tenant across every model
+	// and hash_scheme. Handler emits UNKNOWN_TENANT. See
+	// docs/design/lookuproute-diagnostics.md.
+	StrategyUnknownTenant
+	// StrategyUnknownModel — the tenant is known but the (tenant, model_id)
+	// pair has zero entries. Handler emits UNKNOWN_MODEL.
+	StrategyUnknownModel
+	// StrategyUnknownHashScheme — the (tenant, model_id) pair has entries,
+	// but none under the request's hash_scheme. Handler emits
+	// UNKNOWN_HASH_SCHEME — the scheme-mismatch case (e.g. ingest under
+	// "vllm", lookup under "vllm-v1").
+	StrategyUnknownHashScheme
 )
 
 // LookupResult is the orchestrated outcome of LookupRoute — the ranked
@@ -226,12 +247,17 @@ const (
 type LookupResult struct {
 	Scores   []ReplicaScore
 	Strategy Strategy
-	// hits are the entries that contributed matched tokens to Scores, captured
-	// (LFU namespaces only) during the lookup but NOT yet counted. The caller
-	// credits them via CreditHits ONLY when it actually delivers this result —
-	// so a lookup the gRPC handler discards as TIMEOUT never bumps an LFU
-	// counter. Unexported: *replicaEntry is an index-internal type.
-	hits []*replicaEntry
+	// hitsByReplica are the entries that contributed matched tokens to Scores,
+	// captured (LFU namespaces only) during the lookup but NOT yet counted.
+	// Keyed by replica ID so callers that prune Scores (e.g. the service-layer
+	// matched-tokens floor that drops sub-floor replicas) can drop the
+	// corresponding entries in lockstep via RetainReplicas — preserving the
+	// no-credit-on-non-delivery invariant even when the response is partially
+	// filtered. The caller credits the surviving entries via CreditHits ONLY
+	// when it actually delivers this result — so a lookup the gRPC handler
+	// discards as TIMEOUT never bumps an LFU counter. Unexported:
+	// *replicaEntry is an index-internal type.
+	hitsByReplica map[string][]*replicaEntry
 }
 
 // CreditHits records one LFU access for each entry that contributed matched
@@ -241,28 +267,67 @@ type LookupResult struct {
 // caller actually received. Lock-free (each accessCount is an atomic), so it is
 // safe to call after the index read lock has been released; a concurrently
 // evicted entry's bump is harmless (soft state). A no-op for LRU namespaces and
-// for NO_HINT/TENANT_HOT results (hits is empty).
+// for NO_HINT/TENANT_HOT results (hitsByReplica is empty).
 func (r LookupResult) CreditHits() {
-	for _, e := range r.hits {
-		e.accessCount.Add(1)
+	for _, entries := range r.hitsByReplica {
+		for _, e := range entries {
+			e.accessCount.Add(1)
+		}
+	}
+}
+
+// RetainReplicas prunes Scores AND hitsByReplica down to the replica IDs whose
+// boolean is true in keep. Callers that filter the scored result post-lookup
+// (the service-layer matched-tokens floor, which drops sub-floor replicas)
+// must call this rather than mutating Scores directly, so the hits map stays
+// in lockstep — otherwise the dropped replica's entries would still be
+// credited at CreditHits time, violating the no-credit-on-non-delivery
+// invariant and skewing LFU cap eviction toward replicas whose hints never
+// reached the gateway. The Scores slice is rebuilt without the original
+// backing array so the dropped scores are eligible for GC. A no-op when
+// every score is already kept; an all-empty keep map collapses Scores to
+// nothing (the caller should normally swap in StrategyNone in that case).
+func (r *LookupResult) RetainReplicas(keep map[string]bool) {
+	if len(r.Scores) == 0 {
+		return
+	}
+	kept := make([]ReplicaScore, 0, len(r.Scores))
+	for _, sc := range r.Scores {
+		if keep[sc.ReplicaID] {
+			kept = append(kept, sc)
+		}
+	}
+	r.Scores = kept
+	for id := range r.hitsByReplica {
+		if !keep[id] {
+			delete(r.hitsByReplica, id)
+		}
 	}
 }
 
 // RankerConfig tunes the pressure / SLO / tenant-hot strategies layered on
 // the baseline matchedTokens × freshness score. Zero-valued knobs collapse
-// the formula back to the baseline — so the new ranker is safe to leave
-// enabled even when stats are absent or SLO is unspecified.
+// those layers back to the baseline — so they're safe to leave enabled
+// even when stats are absent or SLO is unspecified. The cardinality-aware
+// distinguishingPower factor (PREFIX_MATCH path only) is always on for
+// multi-replica deployments and degrades to 1.0 for single-replica
+// deployments; no per-knob disable. See lookuproute-ranking.md §2.7.
 //
-// Concretely:
+// Concretely (PREFIX_MATCH path):
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
-//	pressureFactor = max(0, 1 - PressureWeight × pressure)         // 1 when no stats
-//	sloBias        = 1 + freshness × SLOTightBias                  // when TTFT tight
-//	               = 1                                              // otherwise
+//	score              = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
+//	pressureFactor     = max(0, 1 - PressureWeight × pressure)             // 1 when no stats
+//	sloBias            = 1 + freshness × SLOTightBias                      // when TTFT tight
+//	                   = 1                                                  // otherwise
+//	distinguishingPower = 1 - num_matching_at_depth / total_replicas        // when total_replicas ≥ 2
+//	                   = 1                                                  // single-replica deployment
 //
 // PressureWeight = 0 disables the penalty (pressureFactor=1). SLOTightBias
-// = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables the
-// TENANT_HOT fallback entirely (LookupRoute returns NO_HINT on prefix-miss).
+// = 0 disables the SLO bias (sloBias=1). TenantHotMaxAge ≤ 0 disables only
+// the TENANT_HOT fallback (a prefix miss whose keys all populate the index
+// goes straight to NO_HINT instead of trying for a tenant-warm hint); the
+// miss-classifier still runs, so a prefix miss with a mismatched contract
+// key still surfaces as the matching UNKNOWN_* code.
 type RankerConfig struct {
 	PressureWeight      float32
 	SLOTightTTFTMs      int32
@@ -353,6 +418,16 @@ type Index struct {
 	ttlResolver      TTLResolver
 	quotaResolver    TenantQuotaResolver
 	evictionResolver EvictionResolver
+	// reservedTenants identifies tenant ids whose prefix entries are EXCLUDED
+	// from the global maxEntries cap accounting AND the cap-sweep victim
+	// candidate set. The index doesn't know what these tenants are for —
+	// callers (the server) declare them via WithReservedTenants. The intent
+	// is to host ephemeral synthetic state (e.g. the server's functional
+	// self-test probe) that a concurrent real-workload Ingest must never see
+	// as either a cap pressure source OR a candidate to evict. TTL sweep and
+	// per-tenant quota enforcement still apply unchanged. Nil/empty means no
+	// exemptions and the cap behaves identically to its historical shape.
+	reservedTenants map[string]struct{}
 
 	ready atomic.Bool
 
@@ -365,6 +440,12 @@ type Index struct {
 	prefixes     map[prefixKey]map[string]*replicaEntry // prefix → replicaID → entry
 	stats        map[statsKey]statEntry
 	totalEntries int // sum of replicaEntries across all prefixes (memory bound)
+	// reservedEntries counts the subset of totalEntries whose tenant is in
+	// reservedTenants. The cap math is `totalEntries - reservedEntries` so
+	// reserved-tenant entries contribute to memory accounting but neither
+	// fill the cap nor get picked as victims. Maintained in lockstep with
+	// totalEntries by upsert/removeReplicaLocked.
+	reservedEntries int
 
 	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
 	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
@@ -375,6 +456,17 @@ type Index struct {
 	// tenants[].indexEntries — equal, per tenant, to that tenant's slice of
 	// prefixes.summary.total.
 	prefixesByTenant map[string]int
+
+	// prefixesByTenantModel mirrors prefixesByTenant at (tenant, model)
+	// granularity, so HasAnyForTenantModel (the LookupRoute miss-classifier
+	// UNKNOWN_MODEL check) is O(1) instead of iterating servingByScope. Same
+	// counted unit (distinct prefix key) and same maintenance invariants:
+	// bumped on first-sight of a new prefix key for the (tenant, model);
+	// dropped when the key's last replica leaves. Without this secondary
+	// index a sustained misconfigured client (e.g. a gateway pinned to the
+	// wrong model_id) would put a global servingByScope scan on the miss
+	// path, scaling with the cluster's scope count instead of staying O(1).
+	prefixesByTenantModel map[modelKey]int
 
 	// servingByScope counts, for each (tenant, model, hash_scheme), how many
 	// distinct prefix entries each replica currently holds. It exists purely
@@ -444,23 +536,51 @@ func WithEvictionResolver(r EvictionResolver) Option {
 	return func(i *Index) { i.evictionResolver = r }
 }
 
+// WithReservedTenants declares a set of tenant ids whose prefix entries are
+// EXCLUDED from the global maxEntries cap accounting AND the cap-sweep victim
+// candidate set. Intended for ephemeral server-internal state (e.g. the
+// functional self-test probe) so that a concurrent real-workload Ingest
+// neither sees probe entries as cap pressure nor picks one of its own
+// real-workload entries as a victim to make room for a transient probe entry.
+// TTL sweep and per-tenant quota enforcement still apply to reserved tenants
+// unchanged; only the global cap is bypassed. The set is read-only after
+// construction; callers thread the set through this Option once. Empty/nil
+// means no exemptions (historical behavior).
+func WithReservedTenants(tenants ...string) Option {
+	return func(i *Index) {
+		if len(tenants) == 0 {
+			return
+		}
+		if i.reservedTenants == nil {
+			i.reservedTenants = make(map[string]struct{}, len(tenants))
+		}
+		for _, t := range tenants {
+			if t == "" {
+				continue
+			}
+			i.reservedTenants[t] = struct{}{}
+		}
+	}
+}
+
 // withClock overrides the time source (tests only).
 func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
 
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
 	i := &Index{
-		ttl:              DefaultTTL,
-		sweepInterval:    DefaultSweepInterval,
-		maxEntries:       DefaultMaxEntries,
-		now:              time.Now,
-		ranker:           DefaultRankerConfig(),
-		prefixes:         make(map[prefixKey]map[string]*replicaEntry),
-		stats:            make(map[statsKey]statEntry),
-		prefixesByTenant: make(map[string]int),
-		servingByScope:   make(map[scopeKey]map[string]int),
-		replicasByModel:  make(map[modelKey]map[string]struct{}),
-		reportedModels:   make(map[string]struct{}),
+		ttl:                   DefaultTTL,
+		sweepInterval:         DefaultSweepInterval,
+		maxEntries:            DefaultMaxEntries,
+		now:                   time.Now,
+		ranker:                DefaultRankerConfig(),
+		prefixes:              make(map[prefixKey]map[string]*replicaEntry),
+		stats:                 make(map[statsKey]statEntry),
+		prefixesByTenant:      make(map[string]int),
+		prefixesByTenantModel: make(map[modelKey]int),
+		servingByScope:        make(map[scopeKey]map[string]int),
+		replicasByModel:       make(map[modelKey]map[string]struct{}),
+		reportedModels:        make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -582,6 +702,11 @@ func (i *Index) Ingest(u Update) {
 	if hasQuota {
 		evictedPrefixes = i.evictOldestForTenantLocked(u.Tenant, maxEntries)
 	}
+	// enforceCapLocked is a no-op for reserved-tenant writes that don't push
+	// the effective total (totalEntries - reservedEntries) over maxEntries —
+	// reserved tenants do not fill the cap, so a probe ingest never triggers
+	// eviction here, and a concurrent real-workload ingest sees the probe
+	// entry as cap-invisible too. See WithReservedTenants.
 	capEvicted := i.enforceCapLocked()
 	i.mu.Unlock()
 
@@ -650,8 +775,11 @@ func (i *Index) ApplyEvent(ev Event) {
 // Lookup returns replicas holding the requested prefix, ranked by the
 // ranking-v2 score:
 //
-//	score = matchedTokens × freshness × pressureFactor × sloBias
+//	score = matchedTokens × freshness × pressureFactor × sloBias × distinguishingPower
 //
+// distinguishingPower is `1 - num_matching_at_depth / total_replicas` for
+// multi-replica deployments (per-replica depth-aware for chain matches —
+// see lookuproute-ranking.md §2.7), `1.0` for single-replica.
 // pressureFactor folds in ReplicaStats.Pressure when the replica has stats
 // reported in this (tenant, model) (otherwise 1 — a replica with no stats
 // is treated as unloaded). sloBias kicks in when the request's TTFT budget
@@ -674,12 +802,16 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 }
 
 // lookupWithHits runs the lookup and ALSO returns the entries that contributed
-// matched tokens to the result (LFU namespaces only; nil otherwise). The lookup
-// itself is side-effect-free — it never bumps the LFU counter. The public Lookup
-// discards the hits; LookupRoute carries them on its LookupResult so the gRPC
-// handler can credit them via LookupResult.CreditHits once — and only if — it
-// actually delivers the response (not on a TIMEOUT/early-deadline path).
-func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+// matched tokens to the result, keyed by replica ID (LFU namespaces only; nil
+// otherwise). The lookup itself is side-effect-free — it never bumps the LFU
+// counter. The public Lookup discards the hits; LookupRoute carries them on
+// its LookupResult so the gRPC handler can credit them via
+// LookupResult.CreditHits once — and only if — it actually delivers the
+// response (not on a TIMEOUT/early-deadline path). The per-replica keying
+// lets a post-lookup filter (the service-layer matched-tokens floor) drop
+// sub-floor replicas' entries from the credit list in lockstep with
+// dropping their Scores.
+func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	// Without a known hash_scheme, opaque hash bytes cannot be matched
 	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
@@ -694,9 +826,17 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, []*replicaEnt
 	return i.lookupExact(req)
 }
 
-// lookupExact is the legacy single-blob exact-match path. Preserved
-// unchanged so existing callers (no block-hash chain) keep their behavior.
-func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+// lookupExact is the legacy single-blob exact-match path. The wire shape
+// is unchanged for existing callers (no block-hash chain), but the
+// per-replica score now folds in the replica-distinguishing-power factor on
+// top of the matched_tokens × freshness × pressure × slo_bias baseline. The
+// service layer can also downgrade an exact-match response to NO_HINT when
+// the top score falls below the per-namespace routingFloorScore OR when
+// every replica's matched_tokens falls below the per-namespace
+// minimumMatchedTokens floor — see pkg/server/inferencecache_service.go
+// buildLookupResponse. Old gateway clients that only inspect reason_code
+// continue to fail open on a downgrade.
+func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
 	now := i.now()
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
@@ -709,21 +849,84 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 
 	i.mu.RLock()
 	replicas := i.prefixes[key]
+	// totalReplicas counts every replica known to be serving this engine
+	// domain (tenant, model, hash_scheme), not just the holders of THIS
+	// prefix. That's the denominator the distinguishing-power factor wants:
+	// "out of the replicas that could hold the content, how many do?"
+	// Captured under the read lock so it's consistent with the prefixes
+	// view this lookup observes.
+	//
+	// Definition caveat — "total replicas" means "replicas with at least
+	// one prefix entry in the requested scope," not "replicas serving the
+	// scope." servingByScope is incremented by upsertReplicaLocked when a
+	// replica's first prefix entry lands in the scope; it tracks the set
+	// of replicas the index has observed reporting state in the scope.
+	// A replica that's part of the cluster but has not reported a prefix
+	// in this (tenant, model, hash_scheme) — e.g. just started, just
+	// cleared its cache, or is serving a different scope — is invisible
+	// to the index and so absent from the denominator. Two consequences:
+	//   - 2-of-3 partial-diffusion case (replicas r0, r1 hold the prefix;
+	//     r2 has reported no prefix in scope) is scored 2-of-2 → factor
+	//     0 → downgrade. This is the right answer from the cache plane's
+	//     limited view: r2 is invisible, so the cache plane has no
+	//     evidence r2 is a peer. Treating r2 as a peer (factor 0.33)
+	//     would require speculating about replicas the cache plane has
+	//     not observed.
+	//   - "Total replicas in scope" semantics are eventually consistent
+	//     with the engine reporting state. The C1 kvevent subscriber
+	//     reports prefix and stats together on ReportCacheState, so a
+	//     production engine that's been running for one TTL cycle will
+	//     appear in servingByScope reliably. The visible-only edge case
+	//     is benign for the steady-state regime and explicitly tested
+	//     by TestLookupExactNonZeroDistinguishingWhenOneOfThreeHoldsPrefix
+	//     (the "decoy replica holds OTHER prefix in scope" shape).
+	//
+	// Soft-state caveat — KNOWN bounded limitation. servingByScope is
+	// decremented at TTL-sweep time (removeReplicaLocked /
+	// scopeDecLocked), not at every freshness check. A replica that has
+	// gone stale (no recent report) stays in the denominator until the
+	// next sweep — bounded above by DefaultSweepInterval (1 min by
+	// default). During that window the denominator (servingByScope)
+	// counts the stale entry; the numerator (post-freshness `scores`
+	// below) does not. A trivial overlap held by every CURRENTLY-FRESH
+	// replica can briefly surface a small but non-zero distinguishing-
+	// power factor instead of the intended 0 — so a sub-trivial
+	// PREFIX_MATCH can ship from this lookup before the next sweep
+	// collapses the denominator. Net: at worst one DefaultSweepInterval
+	// of inflated PREFIX_MATCH rate on a workload that's already trivial,
+	// never a wrong routing answer. The resulting hint is "route to one
+	// of the replicas that all hold the same trivial overlap," which the
+	// gateway serves equivalently regardless of which it picks; the next
+	// sweep tick removes the stale denominator entry and the routing-
+	// floor catches the next-tick lookup. A correct-by-construction fix
+	// would maintain a separate per-scope fresh-replica counter updated
+	// lazily on the sweep; the bookkeeping is out of scope for this PR,
+	// the soft-state behavior matches the rest of the index, and the
+	// window is short enough that operators see the steady-state
+	// behavior.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	scores := make([]ReplicaScore, 0, len(replicas))
-	var hits []*replicaEntry
+	var hitsByReplica map[string][]*replicaEntry
 	for id, e := range replicas {
 		fresh := freshnessAt(now, e.lastSeen, ttl)
 		if fresh <= 0 {
 			continue // stale; will be swept
 		}
 		// LFU hit capture: this entry is about to contribute matched tokens to
-		// the result, so record it as a candidate "use". Only entries that
-		// contribute a non-zero MatchedTokens are captured — counting
-		// merely-considered entries would inflate the counter with cold data.
-		// The counter is bumped later (LookupResult.CreditHits) and only if the
-		// handler actually delivers this result, never under the read lock.
+		// the result, so record it as a candidate "use" under THIS replica's
+		// key. Only entries that contribute a non-zero MatchedTokens are
+		// captured — counting merely-considered entries would inflate the
+		// counter with cold data. The counter is bumped later
+		// (LookupResult.CreditHits) and only if the handler actually delivers
+		// this result, never under the read lock. Keying by replica ID is what
+		// lets a post-lookup filter (the matched-tokens floor) drop a
+		// sub-floor replica's entries from the credit list in lockstep with
+		// dropping its Score.
 		if lfu && e.tokenCount > 0 {
-			hits = append(hits, e)
+			if hitsByReplica == nil {
+				hitsByReplica = make(map[string][]*replicaEntry, len(replicas))
+			}
+			hitsByReplica[id] = append(hitsByReplica[id], e)
 		}
 		// Only fold in pressure when the replica's stats *payload* is still
 		// fresh under the global TTL. statsReported reflects when the stat
@@ -748,8 +951,23 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	}
 	i.mu.RUnlock()
 
+	// Replica-distinguishing-power factor: every score in an exact-match
+	// response shares the same prefix-hash, so num_matching = len(scores)
+	// (after the staleness filter) and the factor is uniform. A factor of
+	// 0 (every replica holds the prefix — the trivial-overlap case) zeroes
+	// every Score so the service-layer post-score floor can downgrade the
+	// response to NO_HINT. totalReplicas <= 1 degrades to factor 1.0 so
+	// single-replica deployments preserve their baseline ranking.
+	//
+	if dp := distinguishingPower(len(scores), totalReplicas); dp != 1.0 {
+		f := float32(dp)
+		for k := range scores {
+			scores[k].Score *= f
+		}
+	}
+
 	sortScoresDescByScoreThenID(scores)
-	return scores, hits
+	return scores, hitsByReplica
 }
 
 // lookupChain implements longest-common-prefix matching against the
@@ -763,7 +981,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 // The pressure and SLO factors from lookupExact compose unchanged: the chain
 // walk only changes how matched_tokens is derived; the score formula
 // (matched_tokens × freshness × pressureFactor × sloBias) is the same.
-func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry) {
+func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
@@ -830,7 +1048,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 	}
 
 	scores := make([]ReplicaScore, 0, len(finalized))
-	var hits []*replicaEntry
+	var hitsByReplica map[string][]*replicaEntry
 	for id, st := range finalized {
 		if st.matchedTokens <= 0 {
 			continue
@@ -841,10 +1059,15 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 		}
 		// LFU hit capture: this run contributes a non-zero MatchedTokens to the
 		// result, so every block entry in the matched run is a candidate "use".
-		// Captured here, credited later (only on a delivered response).
-		// (st.entries is non-nil only under LFU.)
-		if lfu {
-			hits = append(hits, st.entries...)
+		// Captured here under THIS replica's ID so a post-lookup filter (the
+		// matched-tokens floor) can drop sub-floor replicas' entries from the
+		// credit list in lockstep with dropping their Scores. Credited later
+		// only on a delivered response. (st.entries is non-nil only under LFU.)
+		if lfu && len(st.entries) > 0 {
+			if hitsByReplica == nil {
+				hitsByReplica = make(map[string][]*replicaEntry, len(finalized))
+			}
+			hitsByReplica[id] = st.entries
 		}
 		// Pressure / SLO compose exactly as in lookupExact: same source of
 		// truth (statsReported within TTL), same factor formulas. The chain
@@ -865,10 +1088,94 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, []*replicaEntry)
 			EstimatedCacheHitProb: fresh,
 		})
 	}
+	// Cardinality denominator for the distinguishing-power factor: every
+	// replica with at least one prefix entry in this engine domain
+	// (tenant, model, hash_scheme) — see the definition + soft-state
+	// caveats on lookupExact's totalReplicas declaration above for the
+	// full discussion of (a) replicas that are in the cluster but have
+	// not reported any prefix in scope being invisible to this counter,
+	// and (b) the TTL-sweep-window soft-state behavior.
+	// Captured BEFORE releasing the read lock so it stays consistent with
+	// the prefix view the chain walk just observed.
+	totalReplicas := len(i.servingByScope[scopeKey{req.Tenant, req.Model, req.HashScheme}])
 	i.mu.RUnlock()
 
+	// Per-replica depth-aware distinguishing-power: a replica that reached
+	// deeper into the chain than its siblings holds something unique to it.
+	// For each scored replica R, num_matching_at_R's_depth = count of
+	// replicas whose matched_tokens >= R.matched_tokens (R plus every
+	// replica that went at least as deep). Sort-and-group walk is
+	// O(N log N) — pure arithmetic, no locking needed.
+	applyChainDistinguishingPower(scores, totalReplicas)
+
 	sortScoresDescByScoreThenID(scores)
-	return scores, hits
+	return scores, hitsByReplica
+}
+
+// applyChainDistinguishingPower folds the depth-aware distinguishing-power
+// factor into a chain-lookup's per-replica scores in place. Unlike the
+// exact-match path — where every scored replica shares the same prefix
+// hash and the factor is uniform — a chain match can have replicas at
+// different depths (some reached more blocks than others). For each
+// replica R the factor is computed from
+//
+//	matching_at_R = count of replicas with matched_tokens >= R.matched_tokens
+//
+// so a uniquely-deepest replica sees the strongest factor (1 - 1/N) and a
+// shallow-only sibling sees a much smaller one (or 0 when every replica
+// reached the same depth). Without this, naïve shared-factor scoring would
+// zero a uniquely-deep replica's score whenever a sibling held the head
+// — the very routing decision the cache plane wants to surface.
+//
+// Sort-then-group walk is O(N log N) in the number of scored replicas;
+// pure arithmetic, no locking needed (caller releases the read lock first).
+// No-op when totalReplicas <= 1 (single-replica deployment) or len(scores)
+// == 0; the inner distinguishingPower call also degrades gracefully on
+// those branches but the guard saves an unnecessary sort.
+//
+// Grouping is by `MatchedTokens`, not by raw block depth: two replicas at
+// different block-counts that happen to sum to the same matched-tokens
+// total are treated as the same "depth" for cardinality. This is
+// intentional and consistent with the ranking score (which is also based
+// on matched_tokens, not block count): a 0-token block contributes 0 to
+// the score AND 0 to the depth tie-break, so two replicas separated only
+// by 0-token blocks get the same factor. If two replicas have the same
+// matched_tokens but different per-block compositions, they are
+// indistinguishable from the gateway's perspective anyway — the score is
+// the only routing input.
+func applyChainDistinguishingPower(scores []ReplicaScore, totalReplicas int) {
+	if totalReplicas <= 1 || len(scores) == 0 {
+		return
+	}
+	// Sort by matched_tokens descending, ID ascending for deterministic
+	// grouping when several replicas reach the same depth. The caller's
+	// sortScoresDescByScoreThenID will re-sort by the final Score
+	// afterwards, so this intermediate order is internal.
+	sort.Slice(scores, func(a, b int) bool {
+		if scores[a].MatchedTokens != scores[b].MatchedTokens {
+			return scores[a].MatchedTokens > scores[b].MatchedTokens
+		}
+		return scores[a].ReplicaID < scores[b].ReplicaID
+	})
+	// Walk in groups of equal matched_tokens. Every replica in a group
+	// shares the same num_matching_at_depth = right (the count of
+	// replicas at this depth or deeper), so the factor is the same for
+	// the group. Tied replicas keep their relative score because they
+	// land in the same group.
+	for left := 0; left < len(scores); {
+		right := left
+		for right < len(scores) && scores[right].MatchedTokens == scores[left].MatchedTokens {
+			right++
+		}
+		dp := distinguishingPower(right, totalReplicas)
+		if dp != 1.0 {
+			f := float32(dp)
+			for k := left; k < right; k++ {
+				scores[k].Score *= f
+			}
+		}
+		left = right
+	}
 }
 
 // sortScoresDescByScoreThenID gives both lookup paths the same deterministic
@@ -884,20 +1191,35 @@ func sortScoresDescByScoreThenID(scores []ReplicaScore) {
 
 // LookupRoute is the orchestrated ranking entrypoint used by the gRPC
 // LookupRoute handler. It runs the prefix-match path first; on a miss it
-// falls back to TENANT_HOT (replicas warm for this tenant+model). The
-// returned Strategy tells the handler which contract reason_code to emit
-// (PREFIX_MATCH | TENANT_HOT | NO_HINT) — keeping that decision in the
-// index keeps the ranker pluggable and the handler stateless.
+// falls back to TENANT_HOT (replicas warm for this tenant+model); on a
+// miss of that too it runs the diagnostic miss classifier to surface a
+// specific contract-key mismatch (UNKNOWN_TENANT / UNKNOWN_MODEL /
+// UNKNOWN_HASH_SCHEME) when one of (tenant, model, hash_scheme) does not
+// match any data held. The returned Strategy tells the handler which
+// contract reason_code to emit (PREFIX_MATCH | TENANT_HOT | NO_HINT |
+// UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME) — keeping that
+// decision in the index keeps the ranker pluggable and the handler
+// stateless. See docs/design/lookuproute-diagnostics.md.
 //
 // TENANT_HOT is intentionally a SOFTER hint than PREFIX_MATCH: there is no
 // prefix overlap, so MatchedTokens is 0 and the gateway is free to ignore.
+// The UNKNOWN_* strategies return empty Scores — fail-open semantics are
+// unchanged from NO_HINT; the diagnostic only narrows the reason code.
 func (i *Index) LookupRoute(req LookupRequest) LookupResult {
-	// Empty/unspecified hash_scheme fails open across BOTH strategies. The
-	// prefix-match path already guards this in Lookup, but the TENANT_HOT
-	// fallback keys only on (tenant, model) and would otherwise still emit
-	// a hint — that violates the contract: a request the engine domain of
-	// can't be identified must produce NO_HINT, not a soft locality nudge.
-	if req.HashScheme == "" {
+	// Empty/unspecified contract keys fail open before any prefix-match,
+	// TENANT_HOT, or diagnostic logic runs. The contract requires
+	// tenant_id, model_id, and hash_scheme to be supplied; a request that
+	// omits any of them is a contract violation, not a key mismatch. The
+	// hash_scheme short-circuit also protected against the TENANT_HOT
+	// fallback emitting a hint for an unidentified engine domain; the
+	// tenant/model short-circuits additionally protect against
+	// equally-broken producer state — entries indexed under Tenant: ""
+	// or Model: "" (e.g. the DefaultTenantSentinel bucket the cluster
+	// aggregate counts) would otherwise produce a real PREFIX_MATCH or
+	// TENANT_HOT hint for an empty-key caller. The classifyMiss empty-key
+	// guard alone is not enough: it only runs on a miss path, so a
+	// matching empty-key prefix lookup would bypass it entirely.
+	if req.Tenant == "" || req.Model == "" || req.HashScheme == "" {
 		return LookupResult{Strategy: StrategyNone}
 	}
 	// Chain-bearing requests short-circuit on ANY chain failure (malformed
@@ -905,27 +1227,34 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	// fall through to TENANT_HOT. The chain caller is asking specifically
 	// for longest-prefix matching; surfacing an unrelated tenant-warm
 	// replica as a soft locality nudge would be a wrong hint against what
-	// they explicitly requested. The contract doc spells this out:
-	// "NO_HINT when no replica matches the first block."
+	// they explicitly requested. Same-key chain misses surface as NO_HINT
+	// (the genuine novel-prefix case); chain misses with a mismatched
+	// contract key surface as the matching UNKNOWN_* code via the
+	// miss-classifier below — same diagnostic surface as the exact path.
 	chainBearing := len(req.BlockHashes) > 0 || len(req.BlockTokenCounts) > 0
 	if chainBearing {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return LookupResult{Strategy: StrategyNone}
 		}
 		if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
-			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
+			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 		}
-		return LookupResult{Strategy: StrategyNone}
+		// Chain misses never fall through to TENANT_HOT (by design — see
+		// contract doc), so run the miss classifier directly.
+		return LookupResult{Strategy: i.classifyMiss(req)}
 	}
 	if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
-		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hits: hits}
+		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 	}
 	if hot := i.tenantHotCandidates(req); len(hot) > 0 {
 		// TENANT_HOT carries MatchedTokens=0, so no hits to credit — it is a
 		// softer locality nudge, not a prefix HIT.
 		return LookupResult{Scores: hot, Strategy: StrategyTenantHot}
 	}
-	return LookupResult{Strategy: StrategyNone}
+	// Prefix miss + TENANT_HOT miss → diagnose which contract key (if any) is
+	// the mismatched one. A request whose keys are all populated but whose
+	// prefix is novel still lands at StrategyNone (the fail-open NO_HINT).
+	return LookupResult{Strategy: i.classifyMiss(req)}
 }
 
 // tenantHotCandidates returns replicas warm for (tenant, model) within the
@@ -946,9 +1275,11 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 //     Below that, it's "not warm enough" to be a useful hint.
 //
 // The fallback is gated on TenantHotMaxAge > 0 so RankerConfig{} disables
-// it entirely (back to NO_HINT on prefix-miss). The score uses hit_rate as
-// the locality proxy (in place of matched_tokens, which is zero by
-// definition here) and reuses the same pressure/SLO factors as the
+// only the soft locality nudge. The miss-classifier still runs after, so
+// a same-key novel-prefix miss lands at NO_HINT while a mismatched contract
+// key still surfaces as the matching UNKNOWN_* code. The score uses
+// hit_rate as the locality proxy (in place of matched_tokens, which is zero
+// by definition here) and reuses the same pressure/SLO factors as the
 // prefix-match path so a tight-SLO caller still gets a freshness-biased
 // ranking.
 func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
@@ -1148,11 +1479,25 @@ func (i *Index) Aggregate() Aggregate {
 // aggregateLocked walks the prefix map exactly once, attributing every distinct
 // prefix key to its tenant bucket and the running total in the same step. Caller
 // holds at least the read lock. Because both numbers come from the one
-// iteration, Total == Σ PerTenant == len(i.prefixes) always holds — no second
-// pass, no separate counter that could drift.
+// iteration, Total == Σ PerTenant always holds — no second pass, no separate
+// counter that could drift. Reserved-tenant entries (see WithReservedTenants)
+// are excluded from BOTH PerTenant and Total so the cluster aggregate the
+// operator sees never temporarily surfaces synthetic probe state.
+//
+// Unit note: Aggregate counts DISTINCT PREFIX KEYS — one (tenant, model,
+// hash_scheme, prefix_hash) tuple, regardless of how many replicas hold it.
+// The cap accounting (totalEntries / reservedEntries / effectiveTotal)
+// counts REPLICA×PREFIX entries — a prefix held by N replicas contributes N
+// to totalEntries. The two are different units; they aren't expected to
+// match numerically, only to track the same RESERVED-TENANT EXCLUSION
+// principle (the operator-visible aggregate and the cap-enforcement view
+// both treat reserved tenants as if they weren't there).
 func (i *Index) aggregateLocked() Aggregate {
 	agg := Aggregate{PerTenant: make(map[string]int64)}
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		// Untenanted prefixes (key.tenant == "") bucket under "" — collision-free,
 		// since no real CacheTenant tenantID is empty.
 		agg.PerTenant[key.tenant]++
@@ -1216,6 +1561,13 @@ type TenantSnapshot struct {
 // stats reported for each replica id; tenant memory/hit-rate dedup replicas
 // within a tenant (it is an approximation — a replica serving multiple models
 // for a tenant is counted once). Results are sorted for deterministic output.
+//
+// Reserved tenants (see WithReservedTenants) are excluded from the snapshot
+// entirely — replicas, tenants, and totals — so a probe in flight cannot
+// temporarily publish its synthetic `__probe-<backend>` replica or the
+// reserved tenant id into the CacheIndex CR status the controller polls.
+// Same rationale as their exclusion from the cap-sweep victim set:
+// server-internal state must not leak to operator-visible surfaces.
 func (i *Index) Snapshot() Snapshot {
 	i.mu.RLock()
 
@@ -1228,6 +1580,9 @@ func (i *Index) Snapshot() Snapshot {
 	latestByReplica := make(map[tenantReplica]statEntry)
 	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
+		if i.isReservedTenant(sk.tenant) {
+			continue
+		}
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[tr] = s
@@ -1249,6 +1604,9 @@ func (i *Index) Snapshot() Snapshot {
 	}
 	prefixByReplica := make(map[tenantReplica]*replicaPrefixAgg)
 	for key, replicas := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		for id, e := range replicas {
 			tr := tenantReplica{key.tenant, id}
 			a := prefixByReplica[tr]
@@ -1265,7 +1623,9 @@ func (i *Index) Snapshot() Snapshot {
 
 	// Per-tenant distinct-prefix counts + the grand total come from ONE
 	// authoritative walk (aggregateLocked) so the reported numbers can't drift:
-	// TotalPrefixes == Σ tenants[].indexEntries by construction.
+	// TotalPrefixes == Σ tenants[].indexEntries by construction. The walk
+	// already excludes reserved tenants, so the snapshot total matches what
+	// operator dashboards expect to see.
 	agg := i.aggregateLocked()
 	snap := Snapshot{TotalPrefixes: int(agg.Total)}
 
@@ -1362,14 +1722,119 @@ func (i *Index) Snapshot() Snapshot {
 }
 
 // EntryCountsByModel returns the number of distinct prefixes per model.
+// Reserved-tenant entries (see WithReservedTenants) are excluded so the
+// inferencecache_index_entries gauge reportEntries publishes never
+// transiently surfaces synthetic probe state during a Run. Mirrors the
+// snapshot/aggregate exclusion of the reserved scope.
 func (i *Index) EntryCountsByModel() map[string]int {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	counts := make(map[string]int)
 	for key := range i.prefixes {
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		counts[key.model]++
 	}
 	return counts
+}
+
+// HasAnyForTenant reports whether the index holds any prefix entries for the
+// tenant across every model and hash_scheme. O(1): backed by prefixesByTenant.
+// Used by LookupRoute's miss-path classifier (and exposed publicly so other
+// debugging / status surfaces can reuse it) to distinguish a wrong tenant_id
+// from a genuinely novel prefix — see docs/design/lookuproute-diagnostics.md.
+func (i *Index) HasAnyForTenant(tenant string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantLocked(tenant)
+}
+
+// HasAnyForTenantModel reports whether (tenant, model) has any prefix entries
+// across every hash_scheme. O(1): backed by prefixesByTenantModel. Used by
+// the miss classifier to surface UNKNOWN_MODEL — must stay O(1) so a
+// sustained misconfigured client (a gateway pinned to the wrong model_id)
+// can't put a global scan on the LookupRoute miss path.
+func (i *Index) HasAnyForTenantModel(tenant, model string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantModelLocked(tenant, model)
+}
+
+// HasAnyForTenantModelScheme reports whether (tenant, model, hash_scheme) has
+// any prefix entries. O(1): backed by servingByScope. Used by the miss
+// classifier to surface UNKNOWN_HASH_SCHEME — the scheme-mismatch case
+// (ingest under "vllm", lookup under "vllm-v1").
+func (i *Index) HasAnyForTenantModelScheme(tenant, model, hashScheme string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme)
+}
+
+// hasAnyForTenantLocked is the lock-free variant. Caller holds at least the
+// read lock. The Locked split mirrors aggregateLocked/Aggregate so the miss
+// classifier can run all three checks under a single read-lock acquisition.
+func (i *Index) hasAnyForTenantLocked(tenant string) bool {
+	return i.prefixesByTenant[tenant] > 0
+}
+
+// hasAnyForTenantModelLocked is the O(1) (tenant, model) presence check.
+// Caller holds at least the read lock. Backed by prefixesByTenantModel,
+// which upsert/removeReplicaLocked maintain in lockstep with the prefix map
+// at distinct-prefix-key granularity (same unit as prefixesByTenant).
+func (i *Index) hasAnyForTenantModelLocked(tenant, model string) bool {
+	return i.prefixesByTenantModel[modelKey{tenant, model}] > 0
+}
+
+// hasAnyForTenantModelSchemeLocked is the per-scope check. Caller holds at
+// least the read lock.
+func (i *Index) hasAnyForTenantModelSchemeLocked(tenant, model, hashScheme string) bool {
+	return len(i.servingByScope[scopeKey{tenant, model, hashScheme}]) > 0
+}
+
+// classifyMiss returns the diagnostic Strategy for a LookupRoute call whose
+// prefix lookup found nothing AND whose TENANT_HOT fallback (when applicable)
+// also did. It walks the contract keys outer-to-inner (widest scope first)
+// — tenant, then (tenant, model), then (tenant, model, hash_scheme) — and
+// returns the first level at which the index has no data. If every level
+// is populated the miss is a genuinely novel prefix → StrategyNone (the
+// existing fail-open NO_HINT).
+//
+// The whole walk runs under one RLock acquisition so concurrent ingests can't
+// produce a contradictory classification (e.g. tenant unknown → tenant known
+// in a single call). The caller (LookupRoute) takes no other locks across
+// this call, so there is no lock-ordering concern.
+//
+// Preconditions enforced by LookupRoute (the only caller): req.Tenant,
+// req.Model, and req.HashScheme are all non-empty. Missing-key requests are
+// short-circuited at the top of LookupRoute and never reach this function,
+// so no empty-key guard is needed here.
+//
+// Cold-start carve-out: a globally-empty index stays on NO_HINT (every
+// tenant query would otherwise classify as UNKNOWN_TENANT before any
+// ReportCacheState lands). The UNKNOWN_* codes are meant to signal "you
+// queried with a key that does not match what I hold" — but during cold
+// start the server holds NOTHING, so the honest answer is "no hint",
+// not "your tenant_id is wrong." The diagnostic resumes the moment any
+// replica has reported state, which is the asymmetric case the SDK
+// guidance is targeted at (one tenant populated, the gateway pointing at
+// another).
+func (i *Index) classifyMiss(req LookupRequest) Strategy {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if len(i.prefixes) == 0 {
+		return StrategyNone
+	}
+	if !i.hasAnyForTenantLocked(req.Tenant) {
+		return StrategyUnknownTenant
+	}
+	if !i.hasAnyForTenantModelLocked(req.Tenant, req.Model) {
+		return StrategyUnknownModel
+	}
+	if !i.hasAnyForTenantModelSchemeLocked(req.Tenant, req.Model, req.HashScheme) {
+		return StrategyUnknownHashScheme
+	}
+	return StrategyNone
 }
 
 // ttlFor returns the effective TTL for a tenant. A nil resolver, or one that
@@ -1396,6 +1861,44 @@ func (i *Index) evictionFor(tenant string) string {
 		}
 	}
 	return EvictionLRU
+}
+
+// distinguishingPower returns the multiplier the LookupRoute ranker uses to
+// discount prefix matches that don't distinguish between replicas. Defined as
+//
+//	distinguishingPower = 1 - matching/total   (for total >= 2)
+//
+// so every-replica-holds-it overlaps (chat-template framing, RAG corpus
+// headers, custom system prompts shared across the deployment) collapse to
+// zero — the per-namespace post-score floor (CachePolicy.spec.routingFloorScore)
+// then downgrades the response to NO_HINT and the gateway round-robins
+// honestly instead of being credited with a trivial routing decision. A
+// uniquely-held match (matching=1, total=N) sees the strongest factor
+// (1 - 1/N), proportional to how diluted the prefix is in the cluster.
+//
+// total <= 1 degrades to 1.0: a single-replica deployment has nothing to
+// distinguish among, so a naïve factor of 0 would zero EVERY score and
+// downgrade every hint. Returning 1 preserves the baseline ranking on that
+// shape (matched_tokens × freshness × pressure × slo_bias), which is the
+// only useful answer.
+//
+// Negative `matching` (only possible from a buggy caller — production paths
+// derive it from len(...)) clamps to 1.0 — same shape as total <= 1 — so a
+// bug never amplifies a score above its baseline. matching > total clamps
+// to 0 — same conservative interpretation as "every replica has it" — so a
+// transient over-count (e.g. a stale total from a concurrent ingest) fails
+// safe rather than inverting ranking with a negative factor.
+//
+// Pure function: no allocation, no locking. Cheap enough that the lookup
+// path multiplies it in per replica without flinching.
+func distinguishingPower(matching, total int) float64 {
+	if total <= 1 || matching < 0 {
+		return 1.0
+	}
+	if matching >= total {
+		return 0.0
+	}
+	return 1.0 - float64(matching)/float64(total)
 }
 
 // freshnessAt decays linearly from 1 (just seen) to 0 (>= ttl old). Pure
@@ -1426,8 +1929,11 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 		replicas = make(map[string]*replicaEntry)
 		i.prefixes[key] = replicas
 		// First replica of a brand-new prefix key → one more distinct prefix
-		// for this tenant (the maxIndexEntries unit).
+		// for this tenant (the maxIndexEntries unit), and one more for the
+		// (tenant, model) bucket the miss-classifier's UNKNOWN_MODEL check
+		// reads.
 		i.prefixesByTenant[key.tenant]++
+		i.prefixesByTenantModel[modelKey{key.tenant, key.model}]++
 	}
 	e, existed := replicas[replicaID]
 	if !existed {
@@ -1438,6 +1944,9 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 		e = &replicaEntry{}
 		replicas[replicaID] = e
 		i.totalEntries++
+		if i.isReservedTenant(key.tenant) {
+			i.reservedEntries++
+		}
 		i.scopeIncLocked(scopeKey{key.tenant, key.model, key.hashScheme}, replicaID)
 	}
 	e.tokenCount = tokenCount
@@ -1452,14 +1961,23 @@ func (i *Index) removeReplicaLocked(key prefixKey, replicas map[string]*replicaE
 	}
 	delete(replicas, replicaID)
 	i.totalEntries--
+	if i.isReservedTenant(key.tenant) {
+		i.reservedEntries--
+	}
 	if len(replicas) == 0 {
 		delete(i.prefixes, key)
 		// Last replica gone → the prefix key is removed → one fewer distinct
-		// prefix for this tenant.
+		// prefix for this tenant AND for the (tenant, model) bucket.
 		if n := i.prefixesByTenant[key.tenant] - 1; n <= 0 {
 			delete(i.prefixesByTenant, key.tenant)
 		} else {
 			i.prefixesByTenant[key.tenant] = n
+		}
+		mk := modelKey{key.tenant, key.model}
+		if n := i.prefixesByTenantModel[mk] - 1; n <= 0 {
+			delete(i.prefixesByTenantModel, mk)
+		} else {
+			i.prefixesByTenantModel[mk] = n
 		}
 	}
 	// Drop the replica from the (tenant, model, hash_scheme) serving count
@@ -1605,7 +2123,13 @@ func (i *Index) evictExpired() {
 // over cap). Caller holds the write lock. maxEntries == 0 means unbounded. The
 // sort is O(n log n); it only runs while over the cap.
 func (i *Index) enforceCapLocked() map[string]int {
-	if i.maxEntries <= 0 || i.totalEntries <= i.maxEntries {
+	// Reserved-tenant entries (the probe's synthetic state, etc.) are excluded
+	// from the cap accounting AND the victim candidate set — so a concurrent
+	// real-workload Ingest that fires while a probe is in flight cannot evict
+	// a real-workload entry to make room for a transient probe entry that
+	// cleanup is about to remove. effectiveTotal is the over-cap measurement.
+	effectiveTotal := i.totalEntries - i.reservedEntries
+	if i.maxEntries <= 0 || effectiveTotal <= i.maxEntries {
 		return nil
 	}
 	// Resolve each tenant's algorithm once per sweep (the resolver takes the
@@ -1626,8 +2150,12 @@ func (i *Index) enforceCapLocked() map[string]int {
 		effectiveCount int64
 		lastSeen       time.Time
 	}
-	all := make([]ref, 0, i.totalEntries)
+	all := make([]ref, 0, effectiveTotal)
 	for key, replicas := range i.prefixes {
+		// Skip reserved-tenant entries from the victim candidate set entirely.
+		if i.isReservedTenant(key.tenant) {
+			continue
+		}
 		algo := algoOf(key.tenant)
 		for id, e := range replicas {
 			var eff int64
@@ -1663,7 +2191,7 @@ func (i *Index) enforceCapLocked() map[string]int {
 	})
 	var evicted map[string]int
 	for _, r := range all {
-		if i.totalEntries <= i.maxEntries {
+		if i.totalEntries-i.reservedEntries <= i.maxEntries {
 			break
 		}
 		i.removeReplicaLocked(r.key, i.prefixes[r.key], r.replica)
@@ -1673,6 +2201,19 @@ func (i *Index) enforceCapLocked() map[string]int {
 		evicted[r.algo]++
 	}
 	return evicted
+}
+
+// isReservedTenant reports whether the given tenant id was declared as
+// reserved via WithReservedTenants. Tight inlining matters because this is
+// checked on every prefix-entry insert/remove. Returns false on nil sets so
+// the default index (no reservations) pays exactly one extra map-nil check
+// per call.
+func (i *Index) isReservedTenant(tenant string) bool {
+	if len(i.reservedTenants) == 0 {
+		return false
+	}
+	_, ok := i.reservedTenants[tenant]
+	return ok
 }
 
 // tenantQuotaFor returns the tenant's index-entry budget and whether one is

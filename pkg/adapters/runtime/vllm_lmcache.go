@@ -37,6 +37,26 @@ const (
 	// the system can address by name without hard-coding the integer.
 	defaultLMCacheServerPortName = "lmcache"
 
+	// defaultLMCacheDataVolumeName / defaultLMCacheDataMountPath name the
+	// persistent data volume the adapter DECLARES (via
+	// [ResolvedCacheServer.DataVolume]) when the CacheBackend sets
+	// spec.storage.pvc. The reconciler provisions a PVC owner-referenced to the
+	// CacheBackend and mounts it at this path on the lmcache-server container.
+	//
+	// NOTE: declaring the data volume provisions + attaches the PVC, but it does
+	// NOT by itself make KV survive a pod restart. The lmcache-server still runs
+	// with the in-memory storage device (defaultLMCacheServerStorage = "cpu"),
+	// so the mounted volume is not yet written to. Switching the server to a
+	// disk-backed device that spills to this exact directory is a deliberately
+	// separate follow-up (the supported on-server disk mechanism depends on the
+	// pinned LMCache server version and is not a simple positional-arg flip — see
+	// the storage section of docs/design/cachebackend-api.md). Splitting the
+	// version-agnostic provisioning half (here) from the server-side device
+	// switch lets PVC provisioning, owner-ref GC, the multi-replica gate, and
+	// status.capacity land independently.
+	defaultLMCacheDataVolumeName = "cache-data"
+	defaultLMCacheDataMountPath  = "/var/lib/lmcache"
+
 	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
 	// since they round-trip through CacheBackend.Spec.BackendConfig (a
 	// map[string]string).
@@ -230,9 +250,9 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 // Service.Spec.Ports / Service.Spec.Type keeps the seam clean: an adapter
 // rendering identical containers for two CacheBackends in different
 // namespaces never has to learn about names.
-func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*ResolvedCacheServer, error) {
 	if cache == nil {
-		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
+		return nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
 	cfg := cache.Spec.BackendConfig
 	image := enginewire.ConfigOr(cfg, cfgKeyServerImage, defaultLMCacheServerImage)
@@ -259,12 +279,12 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// CPU + memory requests are added ONLY when autoscaling is configured
-		// — a CPU-utilization HPA needs the CPU request as the utilization
-		// denominator, so the scaler can't move without one. Non-autoscaled
-		// backends keep main's pre-existing "no requests" rendering so this
-		// change doesn't alter scheduling for users not opting into HPA. A
-		// future first-class spec field can promote these from defaults.
+		// Container resources come from spec.resources (CRD-defaulted to a
+		// 4Gi request / 8Gi memory limit so every CacheBackend is bounded
+		// by the cgroup rather than OOM-killed under T2 write load). When
+		// autoscaling is set, the helper additionally fills in a CPU
+		// request fallback so a CPU-utilization HPA has a denominator —
+		// never overwriting an operator-supplied CPU request.
 		Resources: defaultServerResources(cache),
 	}
 
@@ -285,26 +305,70 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			},
 		},
 	}
-	return pod, svc, nil
+
+	// Declare the persistent data volume when the operator asked for one. The
+	// adapter is the only layer that knows where its data lives, so it names the
+	// volume + mount path; the reconciler provisions the PVC and mounts it. When
+	// spec.storage.pvc is unset, DataVolume stays nil and the server runs
+	// ephemeral exactly as before — status quo preserved.
+	//
+	// The adapter does NOT add the corev1.Volume / VolumeMount itself: it has no
+	// PVC name (the reconciler owns CacheBackend identity), and declaring intent
+	// keeps the controller generic across future backends. See the constant doc
+	// for why the server's storage device is not switched to disk here.
+	var dataVolume *AdapterDataVolume
+	if cache.Spec.Storage != nil && cache.Spec.Storage.PVC != nil {
+		dataVolume = &AdapterDataVolume{
+			VolumeName: defaultLMCacheDataVolumeName,
+			MountPath:  defaultLMCacheDataMountPath,
+		}
+	}
+
+	return &ResolvedCacheServer{PodSpec: pod, Service: svc, DataVolume: dataVolume}, nil
 }
 
-// defaultServerResources returns the requests baked into the lmcache-server
-// container. The defaults are a conservative floor sized for a small KV
-// working set + an HPA-usable CPU baseline (a CPU-utilization HPA can't
-// compute a denominator without a CPU request). They are applied ONLY when
-// the CacheBackend opts into autoscaling, so backends that don't use an HPA
-// keep the previous "no requests" rendering and don't see scheduling
-// behaviour change on upgrade. A future first-class spec field can override.
+// defaultServerResources resolves the Container.Resources block for the
+// lmcache-server. spec.resources (CRD-defaulted to a 4Gi memory request /
+// 8Gi memory limit) is the operator-owned baseline and is passed through
+// verbatim. When spec.autoscaling is set, the helper additionally fills in
+// a CPU request fallback (250m) so a CPU-utilization HPA has a denominator
+// — the fallback never overwrites an operator-supplied CPU request. The
+// returned ResourceRequirements is a fresh value so callers never alias
+// into the CR's spec; mutating the result MUST NOT propagate back into the
+// informer-cached object.
 func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRequirements {
+	var out corev1.ResourceRequirements
+	if cache != nil && cache.Spec.Resources != nil {
+		out = *cache.Spec.Resources.DeepCopy()
+	}
 	if cache == nil || cache.Spec.Autoscaling == nil {
-		return corev1.ResourceRequirements{}
+		return out
 	}
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("250m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi"),
-		},
+	// nil-safe init: spec.resources may have been omitted (or carried
+	// only Limits), so Requests can be nil here even though we are
+	// about to write into it for the HPA fallback below.
+	if out.Requests == nil {
+		out.Requests = corev1.ResourceList{}
 	}
+	// CPU-only fallback: the autoscaling spec drives a
+	// targetCPUUtilizationPercent HPA, which needs a *positive* CPU
+	// request as the denominator. The admission validator admits
+	// requests.cpu: "0" (zero is a valid kubelet shape — "no
+	// guaranteed minimum"), but with autoscaling it gives the HPA a
+	// zero denominator and breaks utilization math; so we treat
+	// present-but-non-positive identically to absent and replace it
+	// with the fallback. A positive operator-supplied value survives
+	// untouched.
+	//
+	// Memory is NOT auto-filled — spec.resources (carrying the
+	// CRD-stamped memory default) is the canonical source for memory,
+	// and synthesising a memory request here would override an
+	// operator-supplied limits-only shape.
+	cpu, hasCPU := out.Requests[corev1.ResourceCPU]
+	if !hasCPU || cpu.Sign() <= 0 {
+		out.Requests[corev1.ResourceCPU] = resource.MustParse("250m")
+	}
+	return out
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
@@ -418,6 +482,16 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 			"--tenant-id=$(POD_NAMESPACE)",
 			"--model-id=" + modelID,
 			"--hash-scheme=" + subscriberHashScheme,
+			// This adapter pairs vLLM with LMCache, a separate L2 cache tier
+			// that retains blocks after the engine evicts them from GPU. vLLM
+			// emits BlockRemoved on every GPU eviction even when the block is
+			// still resident at LMCache; forwarding that as PREFIX_EVICTED
+			// would drop a routing hint the replica can still cheaply serve
+			// from L2 — the gateway then routes elsewhere and wastes the L2
+			// hit. Keep the entry until its freshness TTL expires; soft state
+			// means a stale hint is a cache miss at worst, while a missing one
+			// routes the request away from its warm replica.
+			"--ignore-block-removed=true",
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{

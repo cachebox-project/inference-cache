@@ -32,6 +32,19 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 20
         name: manager
+        # Container ports are advertised for the optional observability
+        # PodMonitor (config/observability/podmonitor.yaml) — the
+        # controller-runtime manager already binds these regardless of
+        # whether they're declared here, but the PodMonitor selects by
+        # port-NAME (not number) so the declaration must exist. Declaring
+        # ports does not open them in any way; they're purely metadata.
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: probe
+          containerPort: 8081
+          protocol: TCP
         readinessProbe:
           httpGet:
             path: /readyz
@@ -50,10 +63,11 @@ spec:
           capabilities:
             drop:
             - ALL
-        # Audience-bound projected SA token used by BOTH the CacheIndex
-        # poller (GET /snapshot) and the CachePolicy push (POST /policy)
-        # — the two endpoints share one auth middleware identity, so one
-        # projected token serves both.
+        # Audience-bound projected SA token used by ALL THREE controller-
+        # to-server endpoints: the CacheIndex poller (GET /snapshot), the
+        # CachePolicy push (POST /policy), and the CacheBackend functional
+        # probe (POST /probe). All three share one auth middleware
+        # identity on the server, so one projected token serves all three.
         # Kubelet projects the token (calling TokenRequest on behalf of
         # the pod) with audience "inferencecache.io/controller" baked into
         # the JWT, and rewrites the file on rotation; the audience is

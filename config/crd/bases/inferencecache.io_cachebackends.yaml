@@ -65,11 +65,30 @@ spec:
               CacheBackendSpec defines the desired state of a cache backend.
 
               Persistent storage (spec.storage.pvc) and the autoscaling spec
-              (spec.autoscaling) are both surfaced here for v1alpha1 forward-compat. The
-              autoscaling spec is reconciled into a HorizontalPodAutoscaler today;
-              spec.storage.pvc is accepted but inert until a follow-up wires it through
-              to the runtime adapter's rendered pod (there is no PVC provisioning, no
-              volume injection, and no status.capacity reporting until then).
+              (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
+              HorizontalPodAutoscaler. On a managed Deployment backend
+              (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
+              PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
+              when the CacheBackend is deleted), mounts it into the cache-server pod at the
+              runtime adapter's declared data path, and reports the bound PVC's actual size
+              in status.capacity.
+
+              Two scoping rules apply:
+
+                - Only a managed Deployment backend provisions storage. A StatefulSet
+                  backend is routed to the unmanaged path today (see DeploymentKind), so it
+                  provisions nothing, storage included; per-replica volumeClaimTemplates are
+                  a follow-up. An External backend provisions no workload at all, so
+                  spec.storage.pvc is a no-op there.
+                - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
+                  multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
+                  Ready=False/InvalidStorageConfiguration rather than provisioned;
+                  per-replica persistent storage via StatefulSet is a separate follow-up.
+
+              NOTE: provisioning + mounting the PVC does not by itself make the cache server
+              spill KV to it — switching the LMCache server to a disk-backed storage device
+              is a separate follow-up; until then the volume is attached but the server
+              keeps KV in memory.
             properties:
               allowCrossNamespace:
                 description: |-
@@ -525,6 +544,124 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              resources:
+                default:
+                  limits:
+                    memory: 8Gi
+                  requests:
+                    memory: 4Gi
+                description: |-
+                  Resources are the compute resources requested + limited on the cache
+                  server container of a managed backend workload (the lmcache-server
+                  container for a Type=LMCache backend). The runtime adapter passes
+                  the admitted Requests/Limits maps through to Container.Resources;
+                  the kubebuilder default below stamps a conservative 4Gi request /
+                  8Gi memory limit on the minimal-YAML path (when the field is
+                  OMITTED) so the cache server is bounded by the cgroup rather than
+                  node-pressure OOM-killed by the kubelet under heavy T2 write load —
+                  a cache-stress benchmark against an unlimited lmcache-server
+                  repeatedly OOM-killed the pod within minutes of T2 traffic, which
+                  the default limit eliminates. Operators tune per-deployment by
+                  overriding the field; an explicit empty `spec.resources: {}` is
+                  honored as suppression of the schema-stamped memory request/limit
+                  (no memory request, no memory limit rendered). When spec.autoscaling
+                  is set the runtime adapter still fills in a CPU request fallback
+                  (the HPA-utilization denominator) on top of the empty struct —
+                  that fallback is orthogonal to the memory default this field
+                  controls.
+
+                  Admission narrows the surface relative to the upstream
+                  ResourceRequirements shape: a non-empty `resources.claims` slice
+                  is rejected (the runtime adapter does not yet plumb pod-level
+                  `spec.resourceClaims`); strictly-negative `requests` / `limits`
+                  quantities are rejected (the CRD schema admits a leading "-" but
+                  the kubelet would later reject the pod); `requests` / `limits`
+                  keys that are not valid container resource names are rejected
+                  (standard names cpu/memory/ephemeral-storage admit; a
+                  `hugepages-<size>` name admits only when the size suffix parses
+                  as a strictly-positive quantity, e.g. "hugepages-2Mi"; any other
+                  name must be third-party vendor-prefixed like "nvidia.com/gpu" —
+                  the K8s-reserved `kubernetes.io/` and `requests.kubernetes.io/`
+                  prefixes are rejected); and the request/limit relationship is
+                  resource-aware — overcommittable resources (cpu, memory,
+                  ephemeral-storage) admit `limits[X] >= requests[X]`, while
+                  non-overcommittable resources (hugepages-*, vendor-prefixed
+                  extended resources) require `limits[X] == requests[X]` when both
+                  are set. Vendor-prefixed extended-resource quantities (e.g.
+                  nvidia.com/gpu) must be integer values — K8s allocates extended
+                  resources by whole units. See
+                  docs/design/cachebackend-api.md#resources for the full validator
+                  table.
+
+                  When spec.autoscaling is set, the adapter additionally fills in a
+                  CPU request fallback (250m) if this field omits one — a
+                  CPU-utilization HPA needs a *positive* CPU request as its
+                  denominator. The fallback never overwrites a positive
+                  operator-supplied value; a non-positive value (e.g.
+                  `requests.cpu: "0"`, which the admission validator admits as a
+                  valid kubelet shape for non-autoscaled pods) is treated as
+                  absent and replaced, because the HPA cannot use 0 as a
+                  denominator.
+
+                  External backends provision no workload of their own, so the field
+                  is inert for spec.type=External.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
               storage:
                 description: Storage describes persistent storage requested by the
                   backend.
@@ -537,12 +674,21 @@ spec:
                         anyOf:
                         - type: integer
                         - type: string
-                        description: Size is the requested persistent storage size.
+                        description: |-
+                          Size is the requested persistent storage size. It can be increased later
+                          (the controller patches the PVC request up, and the StorageClass expands
+                          the volume if it allows expansion); it cannot be decreased — Kubernetes
+                          does not support shrinking a PVC, so a smaller value is ignored.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                       storageClassName:
-                        description: StorageClassName is the optional StorageClass
-                          for the PVC.
+                        description: |-
+                          StorageClassName is the optional StorageClass for the PVC. Omit (leave
+                          null) to use the cluster default StorageClass; set it to the empty string
+                          ("") to explicitly opt out of the default (static / no-provisioner
+                          binding) — the controller preserves the distinction. It is immutable after
+                          the PVC is created — Kubernetes rejects StorageClass changes — so a later
+                          edit is ignored (the controller logs and keeps the existing class).
                         type: string
                     required:
                     - size
@@ -1987,12 +2133,12 @@ spec:
               capacity:
                 description: |-
                   Capacity is a human-readable summary of the backend's provisioned
-                  capacity (e.g. the requested PVC size when persistent storage is
-                  actually wired through to the cache server). It is informational;
-                  clients must not parse it. The field is intentionally left empty
-                  until the storage wire-up follow-up lands — the rendered cache-server
-                  pod has no data volume to attach a PVC to today, so reporting a
-                  requested size as "provisioned" would mislead operators.
+                  capacity: the bound PersistentVolumeClaim's actual capacity when
+                  spec.storage.pvc is set and the PVC has bound (the real provisioned size,
+                  which may exceed the request), or empty for an ephemeral backend or while
+                  the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
+                  binds only once the pod schedules). It is informational; clients must not
+                  parse it.
                 type: string
               conditions:
                 description: Conditions describe the latest observations of the backend.
@@ -2166,6 +2312,34 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              observedServerInstance:
+                description: |-
+                  ObservedServerInstance is the controller's cascade-decision
+                  baseline — a stable identifier for the Ready cache-server pod
+                  set the controller last anchored against. NOT a live current-
+                  pod-set view: the controller intentionally pins this through
+                  transient rolling-update midpoints and through no-Ready
+                  windows so the cascade does not fire on rollbacks or transient
+                  outages. For the live pod inventory, operators should consult
+                  status.matchedEnginePods (engine side) and `kubectl get pod`
+                  (cache-server side).
+
+                  Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
+                  and lex-sorted by pod name. restart-sum is the per-pod
+                  containerStatuses[].RestartCount summed across cache-server
+                  containers (the names from the owned Deployment's pod
+                  template; foreign sidecars are excluded). Inert and cleared
+                  for External backends, unsupported-runtime backends, and on
+                  the InvalidStorageConfiguration gate (a persistent
+                  multi-replica spec the controller refuses to provision until
+                  the operator scales to 1 or removes spec.storage.pvc).
+
+                  Operator-side recovery for the upstream LMCache
+                  LMServerConnector EPIPE-on-restart bug. See
+                  docs/design/cachebackend-api.md for the cascade contract,
+                  transition rules (which changes do / do not cascade), and
+                  rate-limit / no-Ready / rollback / scale-up rationale.
+                type: string
             type: object
         type: object
     served: true

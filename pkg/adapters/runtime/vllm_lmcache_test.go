@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -44,16 +45,38 @@ func TestVLLMLMCacheSupports(t *testing.T) {
 	}
 }
 
+// resolvePod unwraps ResolveCacheServer for tests that only assert on the
+// rendered pod, failing on error or a nil result. Tests that need the Service
+// or DataVolume call ResolveCacheServer directly.
+func resolvePod(t *testing.T, a KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) *corev1.PodSpec {
+	t.Helper()
+	resolved, err := a.ResolveCacheServer(cb)
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if resolved == nil || resolved.PodSpec == nil {
+		t.Fatalf("ResolveCacheServer returned nil resolved/pod")
+	}
+	return resolved.PodSpec
+}
+
 func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	resolved, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if pod == nil || svc == nil {
-		t.Fatalf("ResolveCacheServer returned nil pod or svc")
+	if resolved == nil || resolved.PodSpec == nil || resolved.Service == nil {
+		t.Fatalf("ResolveCacheServer returned nil resolved/pod/svc")
+	}
+	pod, svc := resolved.PodSpec, resolved.Service
+
+	// An ephemeral backend (no spec.storage.pvc) declares no data volume and
+	// keeps the in-memory "cpu" storage device — status quo preserved.
+	if resolved.DataVolume != nil {
+		t.Fatalf("DataVolume = %+v, want nil for an ephemeral backend", resolved.DataVolume)
 	}
 
 	if len(pod.Containers) != 1 {
@@ -105,10 +128,7 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	// adapter must render a TCP probe targeting the named lmcache port so
 	// Ready waits on the real accept loop.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, newLMCacheBackend(nil))
 	probe := pod.Containers[0].ReadinessProbe
 	if probe == nil {
 		t.Fatalf("ReadinessProbe is nil; want a TCP probe so Ready waits on the actual accept loop")
@@ -121,39 +141,223 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerNoRequestsWithoutAutoscaling(t *testing.T) {
-	// Non-autoscaled backends keep the previous "no requests" rendering so
-	// upgrades don't change scheduling for users who don't opt into an HPA.
+func TestVLLMLMCacheResolveCacheServerNoRequestsForRawNilResourcesNoAutoscaling(t *testing.T) {
+	// Renderer baseline for the RAW-STRUCT path (no apiserver in the
+	// loop): spec.resources is nil and spec.autoscaling is nil, so the
+	// adapter renders zero Requests on the container. On a live cluster
+	// the same minimal CacheBackend arrives at the reconciler with the
+	// CRD-stamped memory default already applied to spec.resources — the
+	// reconciler-against-real-apiserver behavior is asserted end-to-end
+	// in TestIntegrationCacheBackendResources/DefaultStampsMemoryLimits…
+	// This test pins the no-default-stamp invariant the unit-test path
+	// relies on so future contributors don't accidentally inject defaults
+	// in the renderer itself.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, newLMCacheBackend(nil))
 	if len(pod.Containers[0].Resources.Requests) != 0 {
-		t.Fatalf("container Requests = %v, want empty when autoscaling is unset", pod.Containers[0].Resources.Requests)
+		t.Fatalf("container Requests = %v, want empty when spec.resources is nil and autoscaling is unset (raw-struct path)", pod.Containers[0].Resources.Requests)
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerHasResourceRequestsWhenAutoscaled(t *testing.T) {
-	// A CPU-utilization HPA needs the pod's CPU request as the denominator
-	// to compute utilization, so without one the autoscaler never gets a
-	// usable metric. The adapter must therefore declare CPU + memory
-	// requests on the lmcache-server container when spec.autoscaling is set.
+func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) {
+	// A targetCPUUtilizationPercent HPA needs the pod's CPU request
+	// as the utilization denominator, so without one the autoscaler
+	// never gets a usable metric. The adapter must therefore declare
+	// a CPU request on the lmcache-server container when spec.autoscaling
+	// is set. Memory is NOT auto-filled — spec.resources is the
+	// canonical source (and on the apiserver path the CRD-stamped
+	// default carries it); synthesising a second memory request here
+	// would silently override an operator-supplied limits-only shape.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	reqs := pod.Containers[0].Resources.Requests
 	cpu, hasCPU := reqs[corev1.ResourceCPU]
 	if !hasCPU || cpu.IsZero() {
 		t.Fatalf("container Resources.Requests missing a CPU request under autoscaling: %v", reqs)
 	}
-	mem, hasMem := reqs[corev1.ResourceMemory]
-	if !hasMem || mem.IsZero() {
-		t.Fatalf("container Resources.Requests missing a memory request under autoscaling: %v", reqs)
+	if _, hasMem := reqs[corev1.ResourceMemory]; hasMem {
+		t.Fatalf("container Resources.Requests[memory] = %v, want unset (memory is not auto-filled — spec.resources is the canonical source)", reqs[corev1.ResourceMemory])
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerAutoscalingPreservesLimitsOnlyResources(t *testing.T) {
+	// Operator-supplied limits-only spec.resources combined with
+	// autoscaling MUST surface as: limits intact, requests carry only
+	// the HPA CPU fallback (no synthesised memory request). The
+	// previous behavior synthesised a 1Gi memory request whenever
+	// memory was absent under autoscaling, which silently overrode
+	// the operator's "limit-only" intent — that is the gap this
+	// test pins shut.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+	}
+	pod := resolvePod(t, a, cb)
+	got := pod.Containers[0].Resources
+
+	wantLim := resource.MustParse("8Gi")
+	if mem := got.Limits[corev1.ResourceMemory]; mem.Cmp(wantLim) != 0 {
+		t.Fatalf("Limits[memory] = %v, want operator-supplied %v", mem.String(), wantLim.String())
+	}
+	if _, hasMem := got.Requests[corev1.ResourceMemory]; hasMem {
+		t.Fatalf("Requests[memory] = %v, want unset (operator declared limits-only)", got.Requests[corev1.ResourceMemory])
+	}
+	if cpu, hasCPU := got.Requests[corev1.ResourceCPU]; !hasCPU || cpu.IsZero() {
+		t.Fatalf("Requests[cpu] = %v, want HPA fallback", cpu)
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerHonorsSpecResources(t *testing.T) {
+	// spec.resources is the operator-owned knob for the lmcache-server
+	// container's Resources. When set the adapter MUST pass it through
+	// verbatim (modulo the autoscaling CPU fallback covered in a separate
+	// test) — the CRD-schema default supplies memory limits to every
+	// CacheBackend so the cache-server pod is bounded by the cgroup limit
+	// rather than OOM-killed by the kubelet under T2 load.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+	}
+	pod := resolvePod(t, a, cb)
+	got := pod.Containers[0].Resources
+
+	wantReqMem := resource.MustParse("4Gi")
+	if mem := got.Requests[corev1.ResourceMemory]; mem.Cmp(wantReqMem) != 0 {
+		t.Fatalf("Requests[memory] = %v, want %v", mem.String(), wantReqMem.String())
+	}
+	wantLimMem := resource.MustParse("8Gi")
+	if mem := got.Limits[corev1.ResourceMemory]; mem.Cmp(wantLimMem) != 0 {
+		t.Fatalf("Limits[memory] = %v, want %v", mem.String(), wantLimMem.String())
+	}
+	if _, ok := got.Requests[corev1.ResourceCPU]; ok {
+		t.Fatalf("Requests[cpu] = %v, want unset (no autoscaling, operator did not opt in)", got.Requests[corev1.ResourceCPU])
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerSpecResourcesNotMutated(t *testing.T) {
+	// The adapter must not mutate the CacheBackend's spec.resources in
+	// place — controllers reconcile against an informer-cached object,
+	// and a write through the pointer would propagate back to every
+	// subsequent reader on the same shared cache.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+	}
+	_ = resolvePod(t, a, cb)
+
+	if cb.Spec.Resources.Requests != nil {
+		t.Fatalf("spec.resources.requests = %v, want nil (adapter mutated the spec)", cb.Spec.Resources.Requests)
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerEmptySpecResourcesIsRespected(t *testing.T) {
+	// An operator who explicitly supplies `spec.resources: {}` is
+	// suppressing the CRD-default memory budget. The adapter MUST honor
+	// the empty struct as "no Resources" rather than synthesising a
+	// fallback — otherwise the documented suppress-the-default workflow
+	// silently re-introduces limits the operator deliberately omitted.
+	// (No autoscaling here either: the autoscaling-fallback test pins
+	// the orthogonal HPA-CPU behavior.)
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Resources = &corev1.ResourceRequirements{}
+	pod := resolvePod(t, a, cb)
+	got := pod.Containers[0].Resources
+	if len(got.Requests) != 0 {
+		t.Fatalf("Requests = %v, want empty when spec.resources is {} (operator suppressed default)", got.Requests)
+	}
+	if len(got.Limits) != 0 {
+		t.Fatalf("Limits = %v, want empty when spec.resources is {} (operator suppressed default)", got.Limits)
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerAutoscalingFillsMissingCPU(t *testing.T) {
+	// When spec.resources is set but omits a CPU request, autoscaling
+	// must still get a CPU-request denominator filled in by the adapter
+	// — otherwise the operator's memory-only spec.resources silently
+	// breaks the HPA metric path. The adapter MUST NOT overwrite a
+	// CPU request the operator did supply.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		},
+	}
+	pod := resolvePod(t, a, cb)
+	reqs := pod.Containers[0].Resources.Requests
+	cpu, hasCPU := reqs[corev1.ResourceCPU]
+	if !hasCPU || cpu.IsZero() {
+		t.Fatalf("Requests[cpu] = %v, want a non-zero CPU fallback for HPA", cpu)
+	}
+	// Operator-supplied memory must survive the autoscaling merge.
+	wantMem := resource.MustParse("4Gi")
+	if mem := reqs[corev1.ResourceMemory]; mem.Cmp(wantMem) != 0 {
+		t.Fatalf("Requests[memory] = %v, want operator-supplied %v", mem.String(), wantMem.String())
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerAutoscalingReplacesZeroCPU(t *testing.T) {
+	// The admission webhook admits `requests.cpu: "0"` (zero is a
+	// valid kubelet shape — explicit "no guaranteed minimum"), but
+	// paired with autoscaling it gives the HPA a zero denominator
+	// and breaks utilization math. The renderer's fallback contract
+	// is "the HPA always has a usable CPU denominator under
+	// autoscaling", so a zero (or otherwise non-positive)
+	// operator-supplied CPU request MUST be replaced with the 250m
+	// fallback at render time. A POSITIVE operator-supplied value
+	// still survives — that case is pinned by
+	// TestVLLMLMCacheResolveCacheServerAutoscalingRespectsOperatorCPU.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+	}
+	pod := resolvePod(t, a, cb)
+	cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]
+	if cpu.Sign() <= 0 {
+		t.Fatalf("Requests[cpu] = %v, want non-zero HPA fallback (operator wrote 0)", cpu)
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerAutoscalingRespectsOperatorCPU(t *testing.T) {
+	// If the operator already supplied a CPU request, the autoscaling
+	// fallback MUST NOT overwrite it — the operator's value is
+	// authoritative for HPA-utilization math, and a silent overwrite
+	// would surprise users tuning the denominator.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+	cb.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("750m"),
+		},
+	}
+	pod := resolvePod(t, a, cb)
+	wantCPU := resource.MustParse("750m")
+	if cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]; cpu.Cmp(wantCPU) != 0 {
+		t.Fatalf("Requests[cpu] = %v, want operator-supplied %v", cpu.String(), wantCPU.String())
 	}
 }
 
@@ -161,10 +365,7 @@ func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
 
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	if got := pod.Containers[0].Image; got != "registry.example.com/lmcache:pinned" {
 		t.Fatalf("container image = %q, want overridden", got)
 	}
@@ -176,10 +377,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 		"serverCommand": "python3 -m lmcache.v1.multiprocess.server --cpu-buffer-size 60",
 	})
 
-	pod, _, err := a.ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
+	pod := resolvePod(t, a, cb)
 	c := pod.Containers[0]
 	if len(c.Command) != 1 || c.Command[0] != "python3" {
 		t.Fatalf("command = %v, want [python3]", c.Command)
@@ -197,8 +395,52 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 
 func TestVLLMLMCacheResolveCacheServerNilCache(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	if _, _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, err := a.ResolveCacheServer(nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
+	}
+}
+
+func TestVLLMLMCacheResolveCacheServerPersistentDeclaresDataVolume(t *testing.T) {
+	// When spec.storage.pvc is set, the adapter declares a DataVolume so the
+	// reconciler can provision + mount a PVC. The adapter declares (name +
+	// mount path) but does NOT add the volume/mount itself — the reconciler
+	// owns the PVC name and the merge.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{PVC: &cachev1alpha1.CacheBackendPVCSpec{}}
+
+	resolved, err := a.ResolveCacheServer(cb)
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if resolved.DataVolume == nil {
+		t.Fatalf("DataVolume = nil, want non-nil when spec.storage.pvc is set")
+	}
+	if resolved.DataVolume.VolumeName == "" {
+		t.Fatalf("DataVolume.VolumeName is empty; want a stable volume name")
+	}
+	if !strings.HasPrefix(resolved.DataVolume.MountPath, "/") {
+		t.Fatalf("DataVolume.MountPath = %q, want an absolute in-container path", resolved.DataVolume.MountPath)
+	}
+	if len(resolved.PodSpec.Volumes) != 0 {
+		t.Fatalf("adapter rendered pod volumes %v; the reconciler owns volume mounting", resolved.PodSpec.Volumes)
+	}
+
+	// Deferred device-switch invariant: the lmcache-server command is unchanged
+	// when persistence is requested — the storage device stays "cpu" (positional
+	// arg 3 of the legacy command). Switching it to a disk-backed device that
+	// spills to the mount path is a separate follow-up. Assert the FULL arg set
+	// (not just arg[2] when len==3) so a reshape or drop of the args fails this
+	// canary instead of silently passing.
+	c := resolved.PodSpec.Containers[0]
+	wantArgs := []string{"0.0.0.0", "65432", "cpu"}
+	if len(c.Args) != len(wantArgs) {
+		t.Fatalf("server args = %v, want %v (storage device must stay cpu; disk-backed device is a separate follow-up)", c.Args, wantArgs)
+	}
+	for i, w := range wantArgs {
+		if c.Args[i] != w {
+			t.Fatalf("server args[%d] = %q, want %q (disk-backed device is a separate follow-up)", i, c.Args[i], w)
+		}
 	}
 }
 
@@ -651,6 +893,14 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 		"--tenant-id=$(POD_NAMESPACE)",
 		"--model-id=Qwen/Qwen2.5-0.5B-Instruct",
 		"--hash-scheme=vllm",
+		// Required for vLLM+LMCache: LMCache is an L2 tier that retains
+		// blocks after the engine evicts them from GPU. Forwarding vLLM's
+		// per-block BlockRemoved as PREFIX_EVICTED would drop a routing
+		// hint the replica can still cheaply serve from L2 — the
+		// cache-stress 0-PREFIX_MATCH regression. Pinning the arg here
+		// keeps a future adapter edit from silently re-enabling the
+		// eviction forward and re-introducing the bug.
+		"--ignore-block-removed=true",
 	}
 	for _, want := range wantArgFragments {
 		if !containsArg(c.Args, want) {
@@ -754,6 +1004,7 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 	fs.String("tenant-id", "", "")
 	fs.String("hash-scheme", "", "")
 	fs.Duration("window", 0, "")
+	fs.Bool("ignore-block-removed", false, "")
 
 	if err := fs.Parse(c.Args); err != nil {
 		t.Fatalf("rendered sidecar args rejected by subscriber FlagSet: %v\nargs = %v", err, c.Args)

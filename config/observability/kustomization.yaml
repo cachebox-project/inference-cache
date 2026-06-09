@@ -1,0 +1,52 @@
+# Optional observability overlay — applies BOTH scrape configs (a
+# `ServiceMonitor` for the inference-cache-server and a `PodMonitor`
+# for the inference-cache-controller) AND the alerting rules (a
+# `PrometheusRule`) for the inference-cache alert bundle. Shipping
+# them together means a single `kubectl apply -k` wires the cache
+# plane into a prometheus-operator install end-to-end — Prometheus
+# starts scraping every `inferencecache_*` series (server- and
+# controller-side) AND has the rules loaded to fire on degenerate
+# patterns. The controller PodMonitor is required for the
+# ServerProbeFail and other controller-owned alerts to have a series
+# to evaluate.
+#
+# Requires prometheus-operator / kube-prometheus CRDs to be present in
+# the cluster (`monitoring.coreos.com/v1`).
+#
+# Apply with:
+#   kubectl apply -k config/observability
+#
+# For non-operator installs, see config/observability/alerting-rules.yaml
+# (flat Prometheus rules file) plus your own scrape config covering BOTH
+# pods: `inference-cache-server.inference-cache-system.svc.cluster.local:8080`
+# (server-side series — index, lookup, auth) AND the
+# `inference-cache-controller-manager` pod's `:8080` (controller-side
+# series — per-stage probe-result counter, cache-server restart-cascade
+# counter). The controller-side alerts (ServerProbeFail today) read
+# controller-emitted series, so a server-only scrape leaves them inert.
+#
+# Deliberately not aggregated into `config/default` so the default install
+# stays usable on clusters without prometheus-operator CRDs installed.
+#
+# All three CRs are pinned to `inference-cache-system` (the operator
+# namespace) so they land somewhere a typical prometheus-operator
+# install's `ruleNamespaceSelector` / `serviceMonitorNamespaceSelector`
+# / `podMonitorNamespaceSelector` already scans. If your Prometheus CR
+# watches a different namespace (e.g. `monitoring`), override here:
+#
+#   namespace: monitoring
+#
+# Note on the LMCacheT2NoHits alert: this overlay scrapes
+# inference-cache-server (via servicemonitor.yaml) and the controller
+# pod (via podmonitor.yaml). The LMCacheT2NoHits alert ALSO reads vLLM's
+# `vllm:external_prefix_cache_*` series, which live on engine pods.
+# Operators must wire a separate ServiceMonitor / PodMonitor for vLLM
+# pods, or rely on Prometheus's `kubernetes_sd_configs: pod`, for that
+# alert to be effective.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inference-cache-system
+resources:
+  - servicemonitor.yaml
+  - podmonitor.yaml
+  - prometheus-rules.yaml

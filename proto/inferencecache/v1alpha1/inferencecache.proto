@@ -10,8 +10,10 @@ option go_package = "github.com/cachebox-project/inference-cache/pkg/server/prot
 // Guarantees:
 //   - RenderTemplate / LookupRoute / LookupPDRoute / GetCacheState are
 //     side-effect-free apart from emitting metrics.
-//   - Fail-open: an empty result with reason_code NO_HINT is valid; clients
-//     treat it as a no-op and route as they normally would.
+//   - Fail-open: an empty result is always valid regardless of the
+//     reason_code (NO_HINT, TIMEOUT, or one of the diagnostic codes
+//     UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME); clients treat
+//     it as a no-op and route as they normally would.
 //   - prefix_hash and block_hashes bytes are engine-defined and only matched
 //     within a matching hash_scheme; the server never interprets them.
 //   - RenderTemplate is deterministic for a fixed
@@ -83,7 +85,7 @@ message ReplicaScore {
 
 message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
-  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT
+  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
   int64 lookup_latency_us = 3;
 }
 
@@ -121,6 +123,19 @@ message ReplicaStats {
   int64 cache_memory_bytes = 2;
   float hit_rate = 3;
   float pressure = 4;
+  // Opaque version string identifying the client-side cache library the
+  // reporting replica is linked against (e.g. an LMCache client release).
+  // The string is engine-opaque on the wire: no semver parsing or ordering
+  // is implied at this layer. Empty / unset is allowed and means "unknown";
+  // older producers that don't fill the field MUST keep being accepted
+  // (additive, v1alpha1-compatible).
+  //
+  // Reserves field 5 for the producer half of an end-to-end client/server
+  // version-skew detection surface. The consumer half — server-side storage
+  // and per-CacheBackend exposure — lands in a follow-up change and is not
+  // part of this contract update; producers can populate the field today,
+  // and the server will silently keep accepting it either way.
+  string client_version = 5;
 }
 
 message CacheStateUpdate {

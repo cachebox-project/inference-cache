@@ -17,11 +17,18 @@
 #      columns.
 #   4. The CachePolicy PUSH path works: an applied `CachePolicy` renders its
 #      operator-facing printer columns, the controller pushes it to the
-#      server's `/policy` endpoint, and `LookupRoute` observes the pushed
-#      minimumPrefixTokens gate without engine pods or inference traffic. The
-#      installed validating webhook also rejects a SECOND CachePolicy in the
-#      namespace (one-per-namespace), proving the bundle's webhook Service +
-#      cert-manager CA-injection path — not just envtest handler logic.
+#      server's `/policy` endpoint, and `LookupRoute` observes ALL THREE
+#      policy enforcement paths without engine pods or inference traffic:
+#      the pushed `minimumPrefixTokens` request-side gate, the pushed
+#      `minimumMatchedTokens` per-replica result-side floor, and the
+#      pushed `routingFloorScore` whole-response score floor. Three
+#      orthogonal lookups exercise the first two (above both, below the
+#      request-side gate, sub-floor realized match); a follow-up patch +
+#      re-lookup pair exercises the routingFloorScore propagation and
+#      replace-on-write semantics. The installed validating webhook also
+#      rejects a SECOND CachePolicy in the namespace (one-per-namespace),
+#      proving the bundle's webhook Service + cert-manager CA-injection
+#      path — not just envtest handler logic.
 #   5. The per-CacheTenant status projection works: an applied `CacheTenant`
 #      gets `.status.indexEntries=0` (observed-zero — no engine traffic in the
 #      smoke) and a `Ready=True` condition written by the same poller. The
@@ -42,10 +49,32 @@
 #      injected-by annotation on the engine pod, and surfaces the
 #      InjectedByCacheBackend Event (with the persisted pod UID — the
 #      regression that hides events from `kubectl describe pod`). Then
-#      scaling the engine to 0 drives status.matchedEnginePods=0 via the
+#      the cache-server restart cascade: force-deleting the
+#      cache-server pod flips status.observedServerInstance to the
+#      replacement's server-instance identifier and patches the cascade-restart-trigger
+#      annotation onto the engine Deployment's pod template (the
+#      mechanism that drives the rolling restart). Finally scaling the
+#      engine to 0 drives status.matchedEnginePods=0 via the
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
+#   8b. PVC-backed storage wire-up (spec.storage.pvc): a single-replica LMCache
+#      CacheBackend with spec.storage.pvc.size set provisions a PVC
+#      owner-referenced to the CacheBackend, mounts it into the cache-server
+#      pod, binds (waiting for the WaitForFirstConsumer pod schedule first),
+#      and populates status.capacity from the bound size. (Server-side
+#      disk-backed KV is a separate follow-up; not asserted here.)
+#   8c. CacheBackend.spec.resources defaults + threading: the CRD-schema
+#      default stamps spec.resources.limits.memory on every admitted
+#      CacheBackend (so the cache-server pod is bounded by the cgroup
+#      rather than node-pressure OOM-killed by the kubelet under T2
+#      write load — the failure mode that surfaced in the Phase-2
+#      benchmark), and the controller threads the value into the
+#      rendered Deployment container. The smoke asserts BOTH ends of
+#      the contract against the real kubectl-installed bundle — the
+#      CR's spec carries the default AND the rendered pod template's
+#      container shows the same limit — because either half-failing
+#      reintroduces the regression.
 #   9. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
@@ -67,14 +96,24 @@
 #      The probe POSTs a valid snapshot body so the rejection cannot be
 #      misattributed to a 400; the only valid outcome is 401 (auth
 #      middleware) or a curl timeout (NetworkPolicy drop).
-#  12. The audience binding holds on BOTH /snapshot and /policy: a probe
+#  11b. The /probe endpoint rejects unauthenticated callers: same side-pod
+#      shape against the functional-self-test endpoint. /probe shares the
+#      controller-auth profile with /snapshot and /policy, so a regression
+#      that wired /probe outside that profile would let any pod that can
+#      reach :8081 drive a synthetic round-trip AND, since the CacheBackend
+#      reconciler now consumes the result to publish FunctionalProbeOK and
+#      downgrade Ready, observe or trigger forged Ready transitions on
+#      every managed backend. Sends a valid ProbeRequest body so the
+#      rejection cannot be misattributed to a 400; valid outcomes are
+#      401 / NetworkPolicy drop.
+#  12. The audience binding holds on /snapshot, /policy, AND /probe: a probe
 #      pod with the controller's SA + labels reads two mounted tokens
 #      (audience-bound projected + default-audience apiserver automount)
-#      and asserts the audience-bound token admits on both endpoints
+#      and asserts the audience-bound token admits on all three endpoints
 #      while the default-audience token of the SAME SA is rejected on
-#      both. The two endpoints share one middleware identity (one
-#      controller SA, one audience), so any drift would surface on both
-#      simultaneously. Catches a regression in the SERVER's audience-
+#      all three. The three endpoints share one middleware identity (one
+#      controller SA, one audience), so any drift would surface on all
+#      three simultaneously. Catches a regression in the SERVER's audience-
 #      enforcement half of the contract — `--controller-audience` flag
 #      drift, the middleware forgetting to populate
 #      `TokenReviewSpec.Audiences`, or the apiserver mis-enforcing
@@ -84,6 +123,19 @@
 #      that drift is caught by item 2 above — observedServer populates
 #      only when the REAL controller's poller successfully scrapes
 #      /snapshot.
+#  12b. The authenticated /probe handler returns the expected default
+#       posture on a clean install: a controller-SA-authenticated POST
+#       gets HTTP 200 AND the parsed JSON body asserts ingest=ok,
+#       routing=ok, t2=skipped (no T2Prober is wired into the server
+#       today, so Stage C always reports skipped). A regression where
+#       the handler returns 200 with a per-stage "failed" would
+#       otherwise slip past the audience-binding phase above (which only
+#       checks HTTP status).
+#  12c. The CacheTenant admission webhook rejects a CR claiming the
+#       server-reserved probe tenantID (inferencecache.io/probe). Pairs
+#       with the existing duplicate-tenantID assertion to pin BOTH
+#       CacheTenant validation rules end-to-end against the real
+#       installed webhook.
 #  13. The opt-in gRPC TLS path works: applying config/overlays/server-tls
 #      (config/default + the config/server/tls component) rolls the server with
 #      --tls-cert-file/--tls-key-file + the cert-manager Secret. After rollout,
@@ -137,9 +189,10 @@
 #           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
 #           GRPC_LOCAL_PORT, LOG_DIR, POLICY_SMOKE_NS, SAMPLE_NS,
 #           PROMPT_TOPOLOGY_SMOKE_NS, SAMPLE_ENDPOINT_TIMEOUT,
-#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT, SAMPLE_ENGINE_IMAGE,
+#           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
+#           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
+#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS, STORAGE_SMOKE_NS.
 
 set -euo pipefail
 
@@ -182,6 +235,14 @@ SAMPLE_MATCH_TIMEOUT="${SAMPLE_MATCH_TIMEOUT:-60}"
 # engine pod is gone. 75s = one full cadence + buffer for the patch + pod-
 # terminate round-trip.
 SAMPLE_DRIFT_TIMEOUT="${SAMPLE_DRIFT_TIMEOUT:-75}"
+# Cache-server restart cascade. Each wait covers a different leg of
+# the loop: the controller observing the replacement cache-server pod
+# and computing its server-instance identifier
+# (`<pod-uid>:<restart-sum>`), then patching the engine Deployment's
+# pod template annotations. 60s absorbs the cache-server pod's
+# recreate-and-Ready cycle (the busybox stand-in starts in a few
+# seconds; the wait dominates on a cold node).
+SAMPLE_CASCADE_TIMEOUT="${SAMPLE_CASCADE_TIMEOUT:-60}"
 # KV-event gate: time budget for the managed cache-server Deployment to pull
 # its image and reach Available, then for the gate to publish
 # AwaitingFirstKVEvent. The image pull dominates on a cold node, hence the
@@ -606,6 +667,34 @@ if ! grep -q "already claimed by CacheTenant" <<<"$ct_reject_out"; then
 fi
 log "duplicate-tenantID CacheTenant rejected at admission by the installed validating webhook"
 
+# --- CacheTenant admission: reserved probe tenantID ------------------------
+# The functional self-test uses tenant_id "inferencecache.io/probe" as
+# server-internal state. The CacheTenant admission webhook MUST reject any
+# CR claiming that id so an operator-created tenant cannot collide with the
+# probe scope (which would bypass quota enforcement at the PolicyStore
+# layer and share the probe's reserved replica). The rule fires on CREATE,
+# and on an UPDATE that newly introduces the id — pinned end-to-end by
+# this assertion against the real installed webhook (not just envtest).
+log "asserting a CacheTenant claiming the reserved probe tenantID is rejected at admission"
+reserved_ct_yaml="$(cat <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheTenant
+metadata:
+  name: cachetenant-reserved-probe
+spec:
+  tenantID: inferencecache.io/probe
+EOF
+)"
+if reserved_ct_out="$(printf '%s\n' "$reserved_ct_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$reserved_ct_out"
+  fail "CacheTenant claiming the reserved probe tenantID was admitted; the reservation rule did not fire on the real install"
+fi
+if ! grep -q "reserved" <<<"$reserved_ct_out"; then
+  echo "$reserved_ct_out"
+  fail "reserved-probe-tenantID CacheTenant was rejected, but not by the expected rule (missing 'reserved' in the diagnostic)"
+fi
+log "CacheTenant claiming the reserved probe tenantID rejected by the installed validating webhook"
+
 # --- PromptTemplate + PDTopology schema-only assertion ----------------------
 # config/default installs the PromptTemplate/PDTopology CRDs and RBAC, and the
 # controller manager adds their Go types to the scheme, but no PromptTemplate
@@ -706,6 +795,26 @@ if ! grep -Eq '^inferencecache_server_up[[:space:]]+1([[:space:]]|$)' "$LOG_DIR/
 fi
 log "server HTTP surface OK: /readyz returned 200 and /metrics exposes inferencecache_server_up 1"
 
+# --- functional-probe gate: positive-case coverage scoped to a later phase --
+# The controller-side caller publishes the FunctionalProbeOK condition on
+# managed CacheBackends. This smoke asserts the NEGATIVE case directly
+# (FunctionalProbeOK absent while the upstream KV-event gate holds
+# Ready=False) inline in the paired-sample phase below, alongside the
+# KV-event gate assertion it cascades off of — see the
+# "functional-probe gate (downstream of KV-event gate)" block after the
+# AwaitingFirstKVEvent assertion. The positive case (FunctionalProbeOK
+# appearing once the upstream gate clears) requires an engine workload
+# that actually publishes KV events, which this smoke does not stand up;
+# that assertion lands with a follow-up that ships an engine-pod fixture.
+# The metric inferencecache_backend_probe_result_total is similarly not
+# /metrics-visible on this install because Prometheus client_golang's
+# CounterVec exposes no HELP/TYPE/data lines until a WithLabelValues
+# child is instantiated, and that requires a real probe call to fire —
+# which only happens after the upstream gate clears. Stage 2's
+# controller-side wiring is otherwise covered by 20+ unit tests and an
+# envtest integration sub-test driving a real CacheBackend reconciler
+# against an httptest /probe server.
+
 # --- gRPC default posture assertion (plaintext) ----------------------------
 # config/default serves :9090 plaintext. Assert a plaintext client can list the
 # services. (We deliberately do NOT probe with a TLS client here: a TLS
@@ -789,26 +898,57 @@ fi
 
 # --- CachePolicy PUSH adoption assertion -----------------------------------
 # No read-back endpoint exists for /policy, by design. Prove the server adopted
-# the controller-pushed CachePolicy via an existing gRPC side effect instead:
-# seed one synthetic prefix metadata update, then require a lookup above the
-# policy's minimumPrefixTokens to hit while the same exact prefix below the
-# threshold returns NO_HINT. Without the pushed policy, the low-token lookup
-# would also be a PREFIX_MATCH. This avoids engine pods/images, model traffic,
-# and any new transport.
-log "seeding a prefix and asserting CachePolicy minimumPrefixTokens is enforced by LookupRoute"
+# the controller-pushed CachePolicy via existing gRPC side effects on three
+# orthogonal axes:
+#   1. minimumPrefixTokens (request-side gate, applied BEFORE the index lookup).
+#      Seed one prefix; the request below the policy threshold short-circuits
+#      to NO_HINT without touching the index; the request above hits.
+#   2. minimumMatchedTokens (result-side floor, applied AFTER the lookup, against
+#      the realized matched-token overlap). Seed a SECOND prefix whose stored
+#      tokenCount is above minimumPrefixTokens (so it clears the request-side
+#      gate) but BELOW minimumMatchedTokens (so the realized match downgrades
+#      to NO_HINT). Without this assertion the floor could be silently dropped
+#      and the smoke would still pass on the request-side gate alone. The
+#      sample carries minimumMatchedTokens explicitly (config/samples/
+#      cache_v1alpha1_cachepolicy.yaml).
+#
+# Note: with no CachePolicy at all the server-wide DefaultMinimumMatchedTokens
+# (= 64) ALSO downgrades the trivial 32-token match to NO_HINT — the no-policy
+# fallback fires the same floor as the sample CR sets. The point of the
+# trivial-match assertion is therefore "the pushed CR did not silently drop the
+# result-side floor" rather than "without the CR this would have been
+# PREFIX_MATCH". The low-prefix lookup is the standalone proof that policy
+# adoption happened (its NO_HINT outcome IS owned by the pushed
+# minimumPrefixTokens: 32 — no-policy would have ungated the request and
+# returned PREFIX_MATCH on the 64-token stored prefix). Together they cover
+# both policy enforcement axes end-to-end. Avoids engine pods/images, model
+# traffic, and any new transport.
+log "seeding two prefixes and asserting CachePolicy minimumPrefixTokens (request-side gate) AND minimumMatchedTokens (result-side floor) are both enforced by LookupRoute"
 policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"
-policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix")
+policy_hash_b64="cG9saWN5LXByZWZpeA==" # base64("policy-prefix") — stored at tokenCount=64, clears both gates
+trivial_hash_b64="dHJpdmlhbC1wcmVmaXg=" # base64("trivial-prefix") — stored at tokenCount=32, clears request gate (32 >= sample's 32) but below the 64 matched-tokens floor
+
+# Two stored prefixes in one ReportCacheState ingest: the regular 64-token
+# prefix (clears both gates) and the trivial 32-token prefix (clears the
+# request-side gate, fails the result-side floor — what proves the
+# minimumMatchedTokens floor actually fires end-to-end).
 policy_report_payload="$(cat <<EOF
-{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
+{"replicaId":"$policy_replica","modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$policy_hash_b64","tokenCount":64},{"prefixHash":"$trivial_hash_b64","tokenCount":32}],"stats":{"replicaId":"$policy_replica","hitRate":1}}
 EOF
 )"
 policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_DIR/grpcurl-policy-report.err")" || {
   cat "$LOG_DIR/grpcurl-policy-report.err" >&2 || true
-  fail "grpcurl ReportCacheState did not accept the CachePolicy smoke prefix"
+  fail "grpcurl ReportCacheState did not accept the CachePolicy smoke prefixes"
 }
 log "ReportCacheState response: $policy_report_resp"
 
+# Three lookups exercise the three orthogonal policy-enforcement paths:
+#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path works).
+#   - policy_low: below the request-side gate → NO_HINT (request-side gate fires).
+#   - policy_trivial: above the request-side gate but matched_tokens=32 < floor 64
+#     → NO_HINT (result-side floor fires — the assertion the request-side gate
+#     alone cannot make).
 policy_high_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":64}
 EOF
@@ -817,34 +957,98 @@ policy_low_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":1}
 EOF
 )"
+policy_trivial_payload="$(cat <<EOF
+{"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$trivial_hash_b64","prefixTokenCount":64}
+EOF
+)"
 
 deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
 policy_high_resp=""
 policy_low_resp=""
-until has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; do
+policy_trivial_resp=""
+until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
+  && has_reason_code "$policy_low_resp" "NO_HINT" \
+  && has_reason_code "$policy_trivial_resp" "NO_HINT"; do
   policy_high_resp="$(grpcurl_lookup_route "$policy_high_payload" "$LOG_DIR/grpcurl-policy-high.err")" || true
   policy_low_resp="$(grpcurl_lookup_route "$policy_low_payload" "$LOG_DIR/grpcurl-policy-low.err")" || true
+  policy_trivial_resp="$(grpcurl_lookup_route "$policy_trivial_payload" "$LOG_DIR/grpcurl-policy-trivial.err")" || true
 
-  if has_reason_code "$policy_high_resp" "PREFIX_MATCH" && has_reason_code "$policy_low_resp" "NO_HINT"; then
+  if has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
+    && has_reason_code "$policy_low_resp" "NO_HINT" \
+    && has_reason_code "$policy_trivial_resp" "NO_HINT"; then
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
-    echo "above-threshold LookupRoute response:" >&2
+    echo "above-threshold LookupRoute response (want PREFIX_MATCH):" >&2
     echo "$policy_high_resp" >&2
-    echo "below-threshold LookupRoute response:" >&2
+    echo "below-request-gate LookupRoute response (want NO_HINT):" >&2
     echo "$policy_low_resp" >&2
-    for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err"; do
+    echo "trivial-match (below result floor) LookupRoute response (want NO_HINT):" >&2
+    echo "$policy_trivial_resp" >&2
+    for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err" "$LOG_DIR/grpcurl-policy-trivial.err"; do
       if [ -s "$err_file" ]; then
         echo "$(basename "$err_file"):" >&2
         cat "$err_file" >&2
       fi
     done
-    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want high-token PREFIX_MATCH and low-token NO_HINT)"
+    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request NO_HINT, trivial-match NO_HINT)"
   fi
   sleep 2
 done
-log "CachePolicy push adopted: above-threshold lookup hit, below-threshold lookup returned NO_HINT"
+log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned NO_HINT; trivial-match (matched_tokens<floor) lookup returned NO_HINT — both minimum-token policy knobs enforced end-to-end"
+
+# --- routingFloorScore end-to-end probe ------------------------------------
+# Proves the new field flows CR → controller flatten → /policy push → server
+# resolver → buildLookupResponse downgrade. The same 64-token prefix that
+# returned PREFIX_MATCH above goes to NO_HINT after we patch the live
+# CachePolicy to routingFloorScore="1000" (well above any plausible score:
+# matched_tokens (64) × freshness (~1) × distinguishing_power (1.0 — only
+# one replica was seeded, so the factor degenerates) = ~64, which is below
+# the strict 1000 floor). Restoring "0.1" must flip the response back to
+# PREFIX_MATCH — proving replace-on-write semantics carry the new field too.
+# Without engine pods or model traffic, this is the minimum end-to-end
+# exercise of the new operator-facing knob.
+log "asserting CachePolicy.spec.routingFloorScore is propagated and gates LookupRoute"
+
+apply_floor() {
+  local floor="$1"
+  kubectl -n "$POLICY_SMOKE_NS" patch cachepolicy cachepolicy-sample \
+    --type=merge -p "{\"spec\":{\"routingFloorScore\":\"$floor\"}}" >/dev/null \
+    || fail "kubectl patch cachepolicy routingFloorScore=$floor failed"
+}
+
+wait_floor_reason() {
+  local payload="$1" want="$2" err_file="$3" label="$4"
+  local deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+  local resp=""
+  until has_reason_code "$resp" "$want"; do
+    resp="$(grpcurl_lookup_route "$payload" "$err_file")" || true
+    if has_reason_code "$resp" "$want"; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
+      echo "$label response (want $want):" >&2
+      echo "$resp" >&2
+      if [ -s "$err_file" ]; then
+        echo "$(basename "$err_file"):" >&2
+        cat "$err_file" >&2
+      fi
+      fail "server did not adopt routingFloorScore patch within ${POLICY_PUSH_TIMEOUT}s ($label, want $want)"
+    fi
+    sleep 2
+  done
+}
+
+apply_floor "1000"
+wait_floor_reason "$policy_high_payload" "NO_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
+log "routingFloorScore=1000 enforced: same 64-token match now NO_HINT (score below floor)"
+
+apply_floor "0.1"
+wait_floor_reason "$policy_high_payload" "PREFIX_MATCH" "$LOG_DIR/grpcurl-policy-floor-restored.err" "routingFloorScore=0.1 high-token lookup"
+log "routingFloorScore=0.1 restored: same 64-token match flipped back to PREFIX_MATCH (replace-on-write OK)"
+
 kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --- paired-sample smoke ---------------------------------------------------
@@ -947,6 +1151,42 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
+# --- spec.resources defaults + thread-through ------------------------------
+# The minimal paired-sample CacheBackend declares no spec.resources, so the
+# CRD-schema default must stamp limits.memory=8Gi (and the matching
+# requests.memory=4Gi) on the persisted CR; the controller must then thread
+# that limit onto the rendered Deployment's lmcache-server container. Both
+# halves must hold — half-failing reintroduces the OOM-kill cliff that
+# motivated bounding the cache-server pod by the cgroup.
+log "asserting spec.resources defaults stamp on the CR and thread to the rendered Deployment"
+cb_lim_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.resources.limits.memory}' 2>/dev/null || true)"
+if [ "$cb_lim_mem" != "8Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "cb.spec.resources.limits.memory=$cb_lim_mem, want 8Gi (CRD schema default not applied)"
+fi
+cb_req_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.resources.requests.memory}' 2>/dev/null || true)"
+if [ "$cb_req_mem" != "4Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "cb.spec.resources.requests.memory=$cb_req_mem, want 4Gi (CRD schema default not applied)"
+fi
+dep_lim_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.limits.memory}' \
+  2>/dev/null || true)"
+if [ "$dep_lim_mem" != "8Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
+  fail "deploy.lmcache-server.resources.limits.memory=$dep_lim_mem, want 8Gi (controller did not thread spec.resources)"
+fi
+dep_req_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.requests.memory}' \
+  2>/dev/null || true)"
+if [ "$dep_req_mem" != "4Gi" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
+  fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (controller did not thread spec.resources)"
+fi
+log "spec.resources defaults stamped + threaded: requests.memory=4Gi limits.memory=8Gi"
+
 # --- KV-event readiness gate assertion (operator-facing) --------------------
 # The managed backend has an engine pod attached (matchedEnginePods=1), but the
 # smoke's stub engine (busybox) emits no KV events and the controller runs with
@@ -1007,6 +1247,34 @@ if [ -n "$gate_latch" ]; then
 fi
 log "KV-event gate engaged: firstEventTimeout=$fet, Ready=False/AwaitingFirstKVEvent, firstKVEventObservedAt unset"
 
+# --- functional-probe gate (downstream of KV-event gate) -------------------
+# The functional-probe gate is cascade-prevented from running while any
+# upstream gate keeps Ready=False — there is no point in driving a
+# synthetic round-trip against a backend the operator has not yet
+# declared "is supposed to be working." This asserts that
+# operator-visible behavior on the live install:
+#   - The FunctionalProbeOK condition MUST be ABSENT on a backend the
+#     upstream KV-event gate is holding at Ready=False/AwaitingFirstKVEvent.
+#     Its presence here would be a regression: the controller is firing
+#     the probe loop on a backend that's still warming up, paging
+#     operators on a known-not-ready state.
+#   - The Ready condition's status+reason still reflect the upstream gate
+#     (False/AwaitingFirstKVEvent), not a downstream probe verdict —
+#     proving cascade-prevention is on, not just "no probe call yet."
+# A positive-case assertion (FunctionalProbeOK appearing once the
+# upstream gate clears) requires an engine workload that actually
+# publishes KV events; not feasible from this smoke without a real GPU
+# or the CPU vLLM image. That's deferred to a Stage 4 follow-up that
+# lands an engine-pod fixture; this negative case still locks the
+# operator-facing cascade behavior in place.
+fp_status="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.conditions[?(@.type=="FunctionalProbeOK")].status}' 2>/dev/null || true)"
+if [ -n "$fp_status" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "FunctionalProbeOK condition present (status=$fp_status) while Ready=$gate_status/$gate_reason; cascade-prevention regressed — downstream probe gate must not fire while upstream KV-event gate is False"
+fi
+log "functional-probe cascade-prevention holds: FunctionalProbeOK absent while Ready=False/AwaitingFirstKVEvent"
+
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the
 # Event with this UID, not the empty one a webhook-recorded Event
@@ -1050,6 +1318,108 @@ if [ -z "$seen" ]; then
 fi
 log "InjectedByCacheBackend Event present on the engine pod (UID matches the persisted pod)"
 
+# --- cache-server restart cascade ------------------------------------------
+# When the cache-server pod is replaced (OOM-kill, eviction, image roll,
+# operator-initiated restart, …), every injected engine pod holds a stale
+# LMCache client socket — the upstream LMServerConnector opens its TCP
+# socket in __init__ only and silently fails every subsequent PUT with
+# EPIPE until the engine pod itself rolls. The controller's
+# observedServerInstance latch detects the cache-server UID transition
+# and cascade-restarts every engine Deployment that owns pods carrying
+# this backend's inferencecache.io/injected-by annotation AND the
+# matching inferencecache.io/injected-by-uid (the UID half rejects
+# forgeries and stale name-reuse), by patching
+# AnnotationCacheServerRestartTrigger onto the Deployment's pod template
+# (the same mechanism kubectl rollout restart uses).
+#
+# This phase asserts the end-to-end loop on the real install:
+#   - status.observedServerInstance picks up the current cache-server
+#     server-instance identifier (`<pod-uid>:<restart-sum>`) after the
+#     initial rollout (no cascade — first observation never cascades).
+#   - Forcing a cache-server pod restart flips observedServerInstance
+#     to the replacement's server-instance identifier.
+#   - The engine Deployment's spec.template.metadata.annotations gets
+#     the cascade trigger set to that new identifier — proving the
+#     loop closed against the installed RBAC + actual apiserver Patch,
+#     not just envtest.
+#
+# Must run BEFORE the drift case below, which scales the engine to 0:
+# with no engine pod present, no injected-by annotations remain in the
+# namespace, so the cascade would find no Deployments to annotate.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the initial cache-server pod to publish status.observedServerInstance"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+baseline_server_instance=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  baseline_server_instance=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
+  if [ -n "$baseline_server_instance" ]; then break; fi
+  sleep 2
+done
+if [ -z "$baseline_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "status.observedServerInstance not populated within ${SAMPLE_CASCADE_TIMEOUT}s; cannot exercise the cache-server restart cascade"
+fi
+log "baseline status.observedServerInstance=$baseline_server_instance"
+
+# Force-delete the cache-server pod to simulate the OOM / restart trigger.
+# The Deployment controller recreates it with a fresh UID.
+cache_pod=$(kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [ -z "$cache_pod" ]; then
+  fail "no cache-server pod labeled app.kubernetes.io/instance=qwen-demo-cache found in $SAMPLE_NS"
+fi
+log "deleting cache-server pod $cache_pod to simulate restart"
+# Don't mask the delete with `|| true` — a failed trigger here would
+# silently look like the cascade isn't firing, which would be
+# diagnosed as a controller bug instead of a smoke-script failure.
+if ! kubectl -n "$SAMPLE_NS" delete pod "$cache_pod" \
+     --force --grace-period=0 >/dev/null 2>&1; then
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "failed to delete cache-server pod $cache_pod to simulate restart"
+fi
+
+# Wait for the controller to observe the new pod and update the latch.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for status.observedServerInstance to flip to the replacement's server-instance identifier"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+new_server_instance=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  cur=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.observedServerInstance}' 2>/dev/null || true)
+  if [ -n "$cur" ] && [ "$cur" != "$baseline_server_instance" ]; then
+    new_server_instance="$cur"
+    break
+  fi
+  sleep 2
+done
+if [ -z "$new_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  kubectl -n "$SAMPLE_NS" get pod -l app.kubernetes.io/instance=qwen-demo-cache -o wide || true
+  fail "status.observedServerInstance did not advance past $baseline_server_instance within ${SAMPLE_CASCADE_TIMEOUT}s"
+fi
+log "status.observedServerInstance flipped: $baseline_server_instance → $new_server_instance"
+
+# Assert the engine Deployment's pod template carries the cascade trigger
+# annotation set to the new server-instance identifier (the same value the
+# controller wrote to status.observedServerInstance). The annotation is
+# the mechanism that drives the rolling restart, so its absence here is
+# a missed cascade.
+log "waiting up to ${SAMPLE_CASCADE_TIMEOUT}s for the engine Deployment to receive the cascade trigger annotation"
+deadline=$(($(date +%s) + SAMPLE_CASCADE_TIMEOUT))
+trigger=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  trigger=$(kubectl -n "$SAMPLE_NS" get deploy qwen-engine \
+    -o jsonpath='{.spec.template.metadata.annotations.inferencecache\.io/cache-server-restart-trigger}' \
+    2>/dev/null || true)
+  if [ "$trigger" = "$new_server_instance" ]; then break; fi
+  sleep 2
+done
+if [ "$trigger" != "$new_server_instance" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-engine -o yaml || true
+  fail "engine Deployment cascade trigger=$trigger, want $new_server_instance (the cache-server restart did not cascade)"
+fi
+log "engine Deployment qwen-engine carries inferencecache.io/cache-server-restart-trigger=$trigger"
+
 # --- drift case: cadence-driven Matched → 0 --------------------------------
 # Scale engine to 0; force-delete to avoid the (terminating) pod still
 # being label-visible to the reconciler's pod List for an extended
@@ -1081,6 +1451,103 @@ log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter caden
 # the namespace at the start of this phase, so this leaves the cluster
 # in the state the rest of the smoke produced.
 kubectl delete namespace "$SAMPLE_NS" \
+  --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
+
+# --- PVC-backed storage (spec.storage.pvc) wire-up --------------------------
+# spec.storage.pvc provisions a PVC owner-referenced to the CacheBackend and
+# mounts it into the cache-server pod. This phase asserts the operator-facing
+# surfaces this change delivers — PVC created + owner ref, the data-volume
+# mount on the pod, PVC binds, and status.capacity populates — on a real
+# install. (Switching the lmcache-server to actually spill KV to the volume is
+# a separate follow-up; this phase does NOT assert KV-survives-restart.)
+#
+# kind's default StorageClass (local-path) is WaitForFirstConsumer, so the PVC
+# binds only once a consuming pod schedules — we wait for the cache-server
+# Deployment to reach Available BEFORE asserting bind + capacity.
+STORAGE_SMOKE_NS="${STORAGE_SMOKE_NS:-cb-storage-smoke}"
+log "asserting spec.storage.pvc provisions + mounts a PVC (namespace $STORAGE_SMOKE_NS)"
+kubectl create namespace "$STORAGE_SMOKE_NS" >/dev/null 2>&1 || true
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: persistent-cache
+  namespace: $STORAGE_SMOKE_NS
+spec:
+  type: LMCache
+  replicas: 1
+  integration:
+    engine: vllm
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  backendConfig:
+    model: meta-llama/Meta-Llama-3-8B-Instruct
+    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  storage:
+    pvc:
+      size: 1Gi
+EOF
+
+# 1. The PVC is provisioned with a controller owner reference (drives GC on
+#    CacheBackend delete).
+pvc_deadline=$(($(date +%s) + 60))
+pvc_owner=""
+while [ "$(date +%s)" -lt "$pvc_deadline" ]; do
+  pvc_owner="$(kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data \
+    -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].name}' 2>/dev/null || true)"
+  [ -n "$pvc_owner" ] && break
+  sleep 2
+done
+if [ "$pvc_owner" != "persistent-cache" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get pvc -o yaml || true
+  fail "PVC persistent-cache-data not created with a controller owner ref to CacheBackend/persistent-cache (owner=$pvc_owner)"
+fi
+log "PVC persistent-cache-data created, owner=CacheBackend/persistent-cache"
+
+# 2. The cache-server pod template mounts the PVC by claim name.
+claim="$(kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.persistentVolumeClaim)].persistentVolumeClaim.claimName}' 2>/dev/null || true)"
+if [ "$claim" != "persistent-cache-data" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache -o yaml || true
+  fail "cache-server pod does not mount PVC persistent-cache-data (claim=$claim)"
+fi
+log "cache-server pod mounts PVC claim=$claim"
+
+# 3. Wait for the cache-server Deployment to go Available — this schedules the
+#    pod, which triggers the WaitForFirstConsumer bind.
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the persistent cache-server Deployment to reach Available (triggers PVC bind)"
+if ! kubectl -n "$STORAGE_SMOKE_NS" wait --for=condition=Available --timeout="${SAMPLE_GATE_TIMEOUT}s" \
+     deployment/persistent-cache >/dev/null 2>&1; then
+  kubectl -n "$STORAGE_SMOKE_NS" get deployment/persistent-cache -o yaml || true
+  kubectl -n "$STORAGE_SMOKE_NS" describe pvc persistent-cache-data || true
+  fail "persistent cache-server Deployment did not reach Available within ${SAMPLE_GATE_TIMEOUT}s; the PVC may not have bound"
+fi
+
+# 4. The PVC binds, and status.capacity reflects the bound size.
+pvc_phase="$(kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data \
+  -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+if [ "$pvc_phase" != "Bound" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" describe pvc persistent-cache-data || true
+  fail "PVC persistent-cache-data phase=$pvc_phase, want Bound (kind's default StorageClass should bind once the pod schedules)"
+fi
+cap_deadline=$(($(date +%s) + 60))
+capacity=""
+while [ "$(date +%s)" -lt "$cap_deadline" ]; do
+  capacity="$(kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache \
+    -o jsonpath='{.status.capacity}' 2>/dev/null || true)"
+  [ -n "$capacity" ] && break
+  sleep 2
+done
+if [ -z "$capacity" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache -o yaml || true
+  kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data -o yaml || true
+  fail "status.capacity not populated after the PVC bound"
+fi
+log "persistent storage wired: PVC Bound, status.capacity=$capacity"
+
+# Sample cleanup: drop the dedicated namespace (best-effort).
+kubectl delete namespace "$STORAGE_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
 # --- External CacheBackend end-to-end ---------------------------------------
@@ -1459,26 +1926,85 @@ case "$policy_probe_out" in
     ;;
 esac
 
-# --- Audience-binding assertion (BOTH /snapshot and /policy) --------------
+# --- /probe auth assertion ------------------------------------------------
+# /probe is the controller-driven functional self-test endpoint; same
+# controller-auth profile as /snapshot and /policy. The complementary
+# UNAUTHENTICATED-rejection half is what this section checks — a regression
+# that wired /probe outside the shared auth profile would let any pod that
+# can reach :8081 drive a synthetic round-trip AND, since the CacheBackend
+# reconciler now consumes the result to publish FunctionalProbeOK and
+# downgrade Ready, observe (or trigger forged) Ready transitions on every
+# managed backend. Sends a valid ProbeRequest body so the rejection cannot
+# be misattributed to a 400; the only valid outcomes are 401 (auth) or
+# curl_failed:28 (NetworkPolicy drop under an enforcing CNI). Mirror of the
+# /policy probe above.
+log "asserting unauthenticated /probe POST from a side pod is rejected"
+SIDE_POD_PROBE="ic-probe-probe"
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_PROBE" --image=curlimages/curl:8.10.1 --restart=Never \
+  --command -- /bin/sh -c '
+    # POST a minimal valid ProbeRequest so any non-2xx response must be an
+    # auth rejection, not a body-parse rejection.
+    curl -sS -m 5 -o /dev/null -w "%{http_code}" \
+      -H "Content-Type: application/json" \
+      -d "{\"backend\":\"smoke\",\"model\":\"smoke-model\",\"hashScheme\":\"vllm\"}" \
+      http://inference-cache-server:8081/probe || echo "curl_failed:$?"
+  ' >/tmp/probe-probe-create.log 2>&1; then
+  cat /tmp/probe-probe-create.log >&2 || true
+  fail "kubectl run $SIDE_POD_PROBE failed; cannot run /probe auth assertion"
+fi
+
+# 90s budget + describe-pod fallback matches the /snapshot and /policy probes
+# above — the surrounding phases (External-backend, audience-binding) can
+# leave the kubelet busy reaping Terminating pods.
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$SIDE_POD_PROBE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_probe_out="$(kubectl -n "$NAMESPACE" logs "$SIDE_POD_PROBE" 2>/dev/null || true)"
+if [ -z "$probe_probe_out" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$SIDE_POD_PROBE" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --grace-period=0 --force >/dev/null 2>&1 || true
+
+# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
+# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
+# CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass). 200 (synthesis ran unauthenticated) is the regression this whole
+# section exists to prevent.
+case "$probe_probe_out" in
+  "401"|*"curl_failed:28"*)
+    log "unauthenticated /probe POST rejected (probe output: $probe_probe_out)"
+    ;;
+  *)
+    fail "unauthenticated /probe POST was not rejected (or curl failed for an unexpected reason); got: $probe_probe_out"
+    ;;
+esac
+
+# --- Audience-binding assertion (/snapshot, /policy, AND /probe) ----------
 # Audience-binding follow-up to the bearer-token gate. The controller pod
 # in production mounts TWO ServiceAccount tokens:
 #   1. The default automount at /var/run/secrets/kubernetes.io/serviceaccount/token
 #      — audience = the apiserver. Used by the controller-runtime client.
 #   2. A projected volume at /var/run/secrets/inferencecache.io/controller-token/token
 #      — audience = "inferencecache.io/controller". Used by the CacheIndex
-#      poller AND the CachePolicy push side — they share the projected
-#      token because /snapshot and /policy share one auth middleware.
+#      poller, the CachePolicy push side, AND the functional-probe driver —
+#      they share the projected token because /snapshot, /policy, and /probe
+#      share one auth middleware.
 # The server passes TokenReviewSpec.Audiences=["inferencecache.io/controller"]
-# on every review for BOTH endpoints, so a default-audience token MUST
-# come back 401 on BOTH even though the SA identity (controller-manager)
+# on every review for ALL THREE endpoints, so a default-audience token MUST
+# come back 401 on all three even though the SA identity (controller-manager)
 # would otherwise be admitted.
 #
-# Why a single probe pod with FOUR scrapes (audience-bound × {snapshot,
-# policy} ∪ default-audience × {snapshot, policy}): the two endpoints share
-# one middleware identity, so audience drift would surface on both
-# simultaneously — but a regression in JUST ONE direction (e.g. the policy
-# handler skipping the auth wrapper) would show up here too. Four small
-# checks, one pod, one assertion: "all four outcomes match the contract."
+# Why a single probe pod with SIX scrapes (audience-bound × {snapshot,
+# policy, probe} ∪ default-audience × {snapshot, policy, probe}): the three
+# endpoints share one middleware identity, so audience drift would surface
+# on all three simultaneously — but a regression in JUST ONE direction (e.g.
+# the probe handler skipping the auth wrapper) would show up here too. Six
+# small checks, one pod, one assertion: "all six outcomes match the contract."
 #
 # Scoping — what each smoke gate actually catches (the assertions are
 # complementary, not redundant):
@@ -1492,11 +2018,11 @@ esac
 #     that earlier gate.
 #   - THIS probe asserts only server-side behavior: that an audience-bound
 #     token admits and a default-audience token of the same SA is rejected,
-#     on BOTH endpoints. It uses an inline duplicate volume spec so it can
-#     run even if the controller's manifest is broken (which would
+#     on all three endpoints. It uses an inline duplicate volume spec so it
+#     can run even if the controller's manifest is broken (which would
 #     otherwise mask the server-side check). It does NOT catch drift in
 #     config/manager/manager.yaml; that's the earlier gate's job.
-log "asserting audience binding on both /snapshot and /policy"
+log "asserting audience binding on /snapshot, /policy, and /probe"
 PROBE_POD="ic-audience-probe"
 kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
@@ -1522,7 +2048,7 @@ spec:
       # label), so we expect no L3/L4 drop — but a short -m timeout + explicit
       # curl-exit capture keeps a regression (DNS, Service rename, allowlist
       # drift) from looking like a silent bad outcome. If curl fails on any
-      # of the four scrapes, we emit "K=curl_failed:N" so the case statement
+      # of the six scrapes, we emit "K=curl_failed:N" so the case statement
       # below surfaces the exit code, not the empty-status default.
       controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
       default_token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
@@ -1533,9 +2059,13 @@ spec:
       sa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" "http://inference-cache-server:8081/snapshot" || echo "curl_failed:\$?")
       # POST /policy — controller-audience must 204, default-audience must 401.
       # Body is a minimal valid PolicySnapshot so any non-2xx is auth-side, not body-parse.
-      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":3,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
-      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def"
+      pa_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      pa_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"version":4,"policies":[]}' "http://inference-cache-server:8081/policy" || echo "curl_failed:\$?")
+      # POST /probe — controller-audience must 200, default-audience must 401.
+      # Body is a minimal valid ProbeRequest so any non-2xx is auth-side, not body-parse.
+      pr_ctrl=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$controller_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")
+      pr_def=\$(curl -sS -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer \$default_token" -H "Content-Type: application/json" -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' "http://inference-cache-server:8081/probe" || echo "curl_failed:\$?")
+      echo "snapshot_ctrl=\$sa_ctrl snapshot_def=\$sa_def policy_ctrl=\$pa_ctrl policy_def=\$pa_def probe_ctrl=\$pr_ctrl probe_def=\$pr_def"
     volumeMounts:
     - name: controller-token
       mountPath: /var/run/secrets/inferencecache.io/controller-token
@@ -1572,13 +2102,13 @@ kubectl -n "$NAMESPACE" delete pod "$PROBE_POD" --grace-period=0 --force >/dev/n
 
 log "audience probe output: $audience_probe"
 # Expected outcome line, in order:
-#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401
+#   snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401
 # Anything else is a regression. curl_failed:28 splits out so an operator
 # triaging a red smoke knows whether to look at NetworkPolicy (timeout) vs
 # Service/listener (other curl exit).
 case "$audience_probe" in
-  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401")
-    log "audience binding verified on both endpoints — controller-audience token admitted, default-audience token rejected on /snapshot and /policy"
+  "snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401")
+    log "audience binding verified on all three endpoints — controller-audience token admitted, default-audience token rejected on /snapshot, /policy, and /probe"
     ;;
   *controller_token_missing*)
     fail "probe pod is missing /var/run/secrets/inferencecache.io/controller-token/token — the projected volume did not mount; check the probe-pod manifest above (and config/manager/manager.yaml for the production analog)"
@@ -1593,7 +2123,99 @@ case "$audience_probe" in
     fail "audience-binding probe could not connect to the controller-facing listener (curl exited non-zero). Check Service name 'inference-cache-server', port 8081, and that the listener is up. Probe output: $audience_probe"
     ;;
   *)
-    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401')"
+    fail "audience-binding probe got unexpected outcome: $audience_probe (want 'snapshot_ctrl=200 snapshot_def=401 policy_ctrl=204 policy_def=401 probe_ctrl=200 probe_def=401')"
+    ;;
+esac
+
+# --- /probe functional-self-test result assertion -------------------------
+# The audience-binding section above asserts /probe returned HTTP 200 with the
+# controller-audience token, but a deployed handler can also return 200 with a
+# per-stage `failed`. This section drives one authenticated /probe call,
+# captures the JSON body, and asserts ingest=ok, routing=ok, t2=skipped.
+# No T2Prober is wired into the server today, so Stage C always reports
+# skipped on a clean install — when one is plumbed in, this assertion
+# tightens to t2=ok. A regression that flips ingest or routing to failed
+# on a clean install would be a clear signal that the cache-plane
+# internal round-trip itself is broken — exactly the class of bug the
+# probe exists to catch.
+log "asserting authenticated /probe returns ingest=ok, routing=ok, t2=skipped"
+PROBE_RESULT_POD="ic-probe-result"
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+probe_result_yaml=$(cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PROBE_RESULT_POD
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: controller
+spec:
+  serviceAccountName: inference-cache-controller-manager
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: curlimages/curl:8.10.1
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      controller_token=\$(cat /var/run/secrets/inferencecache.io/controller-token/token 2>/dev/null || echo "")
+      if [ -z "\$controller_token" ]; then echo "controller_token_missing"; exit 0; fi
+      # Capture body to stdout — the smoke parses ingest/routing/t2 from it.
+      curl -sS -m 5 -H "Authorization: Bearer \$controller_token" \\
+        -H "Content-Type: application/json" \\
+        -d '{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}' \\
+        http://inference-cache-server:8081/probe || echo "curl_failed:\$?"
+    volumeMounts:
+    - name: controller-token
+      mountPath: /var/run/secrets/inferencecache.io/controller-token
+      readOnly: true
+  volumes:
+  - name: controller-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: inferencecache.io/controller
+          expirationSeconds: 3600
+EOF
+)
+if ! echo "$probe_result_yaml" | kubectl apply -f - >/tmp/probe-result-create.log 2>&1; then
+  cat /tmp/probe-result-create.log >&2 || true
+  fail "kubectl apply for $PROBE_RESULT_POD failed; cannot run /probe result assertion"
+fi
+for _ in $(seq 1 90); do
+  phase="$(kubectl -n "$NAMESPACE" get pod "$PROBE_RESULT_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+    break
+  fi
+  sleep 1
+done
+probe_result_body="$(kubectl -n "$NAMESPACE" logs "$PROBE_RESULT_POD" 2>/dev/null || true)"
+if [ -z "$probe_result_body" ]; then
+  kubectl -n "$NAMESPACE" describe pod "$PROBE_RESULT_POD" >&2 || true
+fi
+kubectl -n "$NAMESPACE" delete pod "$PROBE_RESULT_POD" --grace-period=0 --force >/dev/null 2>&1 || true
+log "probe result body: $probe_result_body"
+case "$probe_result_body" in
+  *controller_token_missing*)
+    fail "probe-result pod is missing /var/run/secrets/inferencecache.io/controller-token/token"
+    ;;
+  *"curl_failed:"*)
+    fail "probe-result curl failed: $probe_result_body"
+    ;;
+esac
+# Parse the three stage values; reject anything that isn't the expected
+# default posture (ingest=ok, routing=ok, t2=skipped). The default-install
+# CacheBackend has no engine pods reporting state, but the probe synthesizes
+# its own — so Stage A + B must always pass on a clean install regardless of
+# workload. Stage C is "skipped" because no T2Prober is wired in this revision.
+case "$probe_result_body" in
+  *'"ingest":"ok"'*'"routing":"ok"'*'"t2":"skipped"'*)
+    log "probe result matches expected default posture (ingest=ok, routing=ok, t2=skipped)"
+    ;;
+  *)
+    fail "probe result does not match expected default posture; want ingest=ok routing=ok t2=skipped, got: $probe_result_body"
     ;;
 esac
 
@@ -1850,4 +2472,4 @@ if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
 fi
 log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, External backend end-to-end, /snapshot + /policy unauth rejection, audience binding on both endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"

@@ -50,6 +50,28 @@ spec:
     minReplicas: 2
     maxReplicas: 6
     targetCPUUtilizationPercent: 70
+  # Per-replica resource budget for the lmcache-server container. Omit
+  # spec.resources entirely and the CRD-schema default supplies
+  # `requests.memory=4Gi`, `limits.memory=8Gi` — adequate for a small
+  # workload, conservative enough that the kubelet does not OOM-kill the
+  # cache pod from node-level memory pressure. The cgroup memory limit
+  # is still a hard ceiling: a working set larger than the configured
+  # limit will trigger an in-cgroup OOM-kill, so size the limit to your
+  # KV footprint. Production workloads should override the request/limit
+  # explicitly so the cache pod's cgroup matches what it will actually
+  # hold (and so the cluster-autoscaler reasons about correct headroom).
+  # 16Gi/24Gi below sizes for a Qwen2.5-7B prod shape — tune to yours.
+  #
+  # NOTE: this override is memory-only. The autoscaling block above
+  # requests a CPU-utilization HPA, so the controller fills in a 250m
+  # CPU request fallback automatically (an HPA needs a CPU request as
+  # its utilization denominator). Add `cpu: …` under requests below to
+  # pin the denominator explicitly if you want a different baseline.
+  resources:
+    requests:
+      memory: "16Gi"
+    limits:
+      memory: "24Gi"
   integration:
     engine: vllm
     role: ReadWrite
@@ -74,8 +96,25 @@ spec:
   # from lastSeen and lookups do NOT refresh it — a hot-but-unreported prefix
   # still ages out. At most one CachePolicy is allowed per namespace.
   evictionTTL: 1h
-  # Skip lookups for very short prompts where a prefix hit saves little.
+  # Request-side gate: skip lookups for very short prompts where a prefix hit
+  # saves little. Matched against the request's claimed prefix token count.
   minimumPrefixTokens: 256
+  # Result-side floor on REALIZED matched-tokens overlap. A production
+  # workload sees a fair amount of small chat-template-only overlaps —
+  # raising the floor above the 64 default to 256 keeps only substantial
+  # prefix matches counted as PREFIX_MATCH, so dashboards/SLOs read a clean
+  # signal. Set to 0 to disable.
+  minimumMatchedTokens: 256
+  # Result-side floor on the per-replica SCORE from the distinguishing-power-
+  # aware ranker. Composes with minimumMatchedTokens above: the matched-tokens
+  # floor filters per-replica, then this score floor gates the response's top
+  # surviving score. A production workload with long shared prefixes (custom
+  # system prompts, RAG corpus headers, few-shot examples) sees marginal
+  # partial-diffusion matches even after the distinguishing-power factor
+  # zeroes the all-replicas-hold-it case; "5" keeps only substantial routing-
+  # useful matches counted as PREFIX_MATCH. Set to "0" to disable (raw-recall
+  # benchmarking).
+  routingFloorScore: "5"
   # Lookup deadline. A timed-out lookup fails open — it returns reason_code
   # TIMEOUT with empty scores and never fails the serving request. NOTE: 0 means
   # UNBOUNDED, not "instant"; keep a real budget here in production.

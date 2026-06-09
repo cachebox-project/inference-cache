@@ -80,6 +80,7 @@ func newPolicyTestScheme(t *testing.T) *runtime.Scheme {
 func ttlPtr(d time.Duration) *metav1.Duration { x := metav1.Duration{Duration: d}; return &x }
 func i32Ptr(v int32) *int32                   { return &v }
 func i64Ptr(v int64) *int64                   { return &v }
+func strPtr(s string) *string                 { return &s }
 
 // TestPushSnapshotFlattensPoliciesAndTenants proves the single reconciler emits
 // one combined snapshot from BOTH CR types: policies keyed by namespace, tenant
@@ -483,9 +484,11 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 		WithObjects(&cachev1alpha1.CachePolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
 			Spec: cachev1alpha1.CachePolicySpec{
-				EvictionTTL:         ttlPtr(12 * time.Minute),
-				MinimumPrefixTokens: i32Ptr(64),
-				LookupTimeoutMs:     i32Ptr(10),
+				EvictionTTL:          ttlPtr(12 * time.Minute),
+				MinimumPrefixTokens:  i32Ptr(64),
+				MinimumMatchedTokens: i32Ptr(128),
+				RoutingFloorScore:    strPtr("2.5"),
+				LookupTimeoutMs:      i32Ptr(10),
 			},
 		}).
 		Build()
@@ -500,11 +503,30 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	if !ok {
 		t.Fatal("server store should hold team-a after a successful push")
 	}
-	if p.EvictionTTL != 12*time.Minute || p.MinimumPrefixTokens != 64 || p.LookupTimeoutMs != 10 {
+	if p.EvictionTTL != 12*time.Minute || p.MinimumPrefixTokens != 64 || p.MinimumMatchedTokens != 128 || p.LookupTimeoutMs != 10 {
 		t.Fatalf("round-trip mismatch: %+v", p)
+	}
+	// RoutingFloorScore flows through the resolver the server reads — guards
+	// against a future refactor that drops the field on the flatten path
+	// without anyone noticing. Pointer because the wire schema distinguishes
+	// "absent" (nil — apply default) from "explicit 0" (&0 — opt-out).
+	if p.RoutingFloorScore == nil {
+		t.Fatalf("RoutingFloorScore is nil after round-trip, want &2.5")
+	}
+	if got, want := *p.RoutingFloorScore, float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
+		t.Fatalf("RoutingFloorScore on round-trip = %v, want 2.5", got)
+	}
+	if got, want := store.RoutingFloorScore("team-a"), float32(2.5); got-want > 1e-3 || want-got > 1e-3 {
+		t.Fatalf("store.RoutingFloorScore = %v, want 2.5 (resolver returns the configured value)", got)
 	}
 	if d := store.TTL("team-a"); d != 12*time.Minute {
 		t.Fatalf("store.TTL = %v", d)
+	}
+	// MinimumMatchedTokens flows through the resolver the server
+	// reads — guards against a future refactor that drops the field on the
+	// flatten path without anyone noticing.
+	if got := store.MinimumMatchedTokens("team-a"); got != 128 {
+		t.Fatalf("store.MinimumMatchedTokens = %d, want 128 (the policy value)", got)
 	}
 }
 
@@ -549,4 +571,77 @@ func TestReconcilerFlattensEvictionAlgorithm(t *testing.T) {
 // Kept as a one-line helper so the call site reads naturally in the test.
 func policyHandlerForTest(s *cacheserver.PolicyStore) http.HandlerFunc {
 	return cacheserver.NewPolicyHTTPHandler(s)
+}
+
+// TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput pins the
+// defensive behavior of the controller-side parser: a value the CRD validator
+// would have rejected (overflowing literal, +Inf, NaN, negative leak) must
+// fall back to the server-wide DefaultRoutingFloorScore rather than zero. A
+// zero would silently disable the floor for that namespace — the OPPOSITE
+// of the safe interpretation — and the CRD validator is normally the gate
+// against this class of bug, so the test exercises hand-crafted CRs that
+// bypass admission (the same shape a corrupted store or future schema drift
+// could produce).
+func TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput(t *testing.T) {
+	type tc struct {
+		name string
+		spec string
+		want float32
+	}
+	// A literal that overflows float32 max (~3.4e38). The CRD pattern caps
+	// the integer part at 8 digits today, so the apiserver would normally
+	// reject a string this long at admission — this case exercises the
+	// defense-in-depth path where the CR reaches resolveOnePolicy with a
+	// corrupted spec (CR predating the tightened pattern, hand-crafted
+	// /policy POST that bypasses admission, schema drift, etc.). The
+	// controller must still fall back to the safety default rather than 0.
+	overflowing := "999999999999999999999999999999999999999999999999"
+	cases := []tc{
+		{name: "overflowing literal", spec: overflowing, want: cacheserver.DefaultRoutingFloorScore},
+		{name: "malformed", spec: "not-a-number", want: cacheserver.DefaultRoutingFloorScore},
+		// A negative leak — bypasses the CRD pattern but flows through to
+		// the parser. Must fall back, not be honored.
+		{name: "negative", spec: "-1.5", want: cacheserver.DefaultRoutingFloorScore},
+		// Sanity: a well-formed value parses cleanly.
+		{name: "valid", spec: "2.5", want: 2.5},
+		{name: "explicit zero opt-out", spec: "0", want: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cp := &cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+				Spec:       cachev1alpha1.CachePolicySpec{RoutingFloorScore: strPtr(c.spec)},
+			}
+			rp := resolveOnePolicy(cp)
+			// resolveOnePolicy must always produce a non-nil pointer when
+			// the CR carried a value — the pointer-on-the-wire scheme
+			// reserves nil for "field omitted on the wire body" only.
+			if rp.RoutingFloorScore == nil {
+				t.Fatalf("RoutingFloorScore is nil for %q; resolveOnePolicy must produce a non-nil pointer when the CR carries a value", c.spec)
+			}
+			if d := *rp.RoutingFloorScore - c.want; d > 1e-3 || d < -1e-3 {
+				t.Fatalf("RoutingFloorScore for %q = %v, want %v", c.spec, *rp.RoutingFloorScore, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveOnePolicyRoutingFloorScoreNilWhenAbsent pins the other side of
+// the pointer-disambiguation contract: a CR that does NOT carry the
+// RoutingFloorScore field at all (Spec.RoutingFloorScore == nil) must
+// produce a nil ResolvedPolicy.RoutingFloorScore so the server-side
+// resolver can apply DefaultRoutingFloorScore. The kubebuilder default
+// normally materializes "0.1" on every admitted CR, so this path fires
+// only for legacy CRs predating the field — but those CRs MUST get the
+// safety floor, not silent opt-out.
+func TestResolveOnePolicyRoutingFloorScoreNilWhenAbsent(t *testing.T) {
+	cp := &cachev1alpha1.CachePolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "team-a"},
+		Spec:       cachev1alpha1.CachePolicySpec{}, // RoutingFloorScore deliberately absent
+	}
+	rp := resolveOnePolicy(cp)
+	if rp.RoutingFloorScore != nil {
+		t.Fatalf("RoutingFloorScore = %v, want nil when Spec.RoutingFloorScore is absent — silent default-substitution would defeat the absent-vs-zero disambiguation",
+			*rp.RoutingFloorScore)
+	}
 }

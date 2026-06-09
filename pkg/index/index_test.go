@@ -18,6 +18,75 @@ func (c *fakeClock) add(d time.Duration) { c.t = c.t.Add(d) }
 
 func hash(s string) []byte { return []byte(s) }
 
+// TestReservedTenantHiddenFromCapAndAggregate pins the WithReservedTenants
+// contract: reserved-tenant entries are present in the index (so the probe's
+// Stage A lookup still finds them) but invisible to the cap accounting,
+// aggregate, snapshot, and per-model entry-count gauge — so a probe in flight
+// cannot displace real workload state via the cap sweep AND cannot leak
+// into observability surfaces. Mirrors TestProberRun* in pkg/server, but
+// from the index's perspective.
+func TestReservedTenantHiddenFromCapAndAggregate(t *testing.T) {
+	const reserved = "inferencecache.io/probe"
+	idx := New(WithMaxEntries(1), WithReservedTenants(reserved))
+
+	idx.Ingest(Update{
+		ReplicaID: "real", Model: "m", Tenant: "real-tenant", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("rp"), TokenCount: 64}},
+	})
+	idx.Ingest(Update{
+		ReplicaID: "__probe-cb", Model: "m", Tenant: reserved, HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("pp"), TokenCount: 16}},
+		Stats:    &ReplicaStats{ReplicaID: "__probe-cb", CacheMemoryBytes: 1234, HitRate: 1.0},
+	})
+
+	// Cap math sees only the real entry; the probe entry didn't trigger
+	// eviction (which would have removed the real entry under cap=1).
+	if scores := idx.Lookup(LookupRequest{
+		Tenant: "real-tenant", Model: "m", HashScheme: "vllm", PrefixHash: hash("rp"),
+	}); len(scores) != 1 || scores[0].ReplicaID != "real" {
+		t.Fatalf("real workload entry evicted under cap=1; got scores = %+v", scores)
+	}
+
+	// Aggregate excludes the reserved tenant — Total == real-tenant entry count.
+	agg := idx.Aggregate()
+	if agg.Total != 1 {
+		t.Errorf("Aggregate.Total = %d, want 1 — reserved tenant must not contribute", agg.Total)
+	}
+	if _, present := agg.PerTenant[reserved]; present {
+		t.Errorf("Aggregate.PerTenant includes reserved tenant: %+v", agg.PerTenant)
+	}
+
+	// EntryCountsByModel feeds inferencecache_index_entries — must not surface
+	// the synthetic model count from a reserved-tenant entry.
+	if got := idx.EntryCountsByModel()["m"]; got != 1 {
+		t.Errorf("EntryCountsByModel[m] = %d, want 1 — reserved tenant must not bump the per-model gauge", got)
+	}
+
+	// Snapshot: no reserved tenant, no reserved replica.
+	snap := idx.Snapshot()
+	if snap.TotalPrefixes != 1 {
+		t.Errorf("Snapshot.TotalPrefixes = %d, want 1", snap.TotalPrefixes)
+	}
+	for _, r := range snap.Replicas {
+		if r.Tenant == reserved || r.ReplicaID == "__probe-cb" {
+			t.Errorf("Snapshot exposed reserved replica: %+v", r)
+		}
+	}
+	for _, tn := range snap.Tenants {
+		if tn.TenantID == reserved {
+			t.Errorf("Snapshot exposed reserved tenant: %+v", tn)
+		}
+	}
+
+	// But the probe's own Stage A lookup STILL finds its entry — the
+	// exemption applies only to external surfaces, not to internal callers.
+	if scores := idx.Lookup(LookupRequest{
+		Tenant: reserved, Model: "m", HashScheme: "vllm", PrefixHash: hash("pp"),
+	}); len(scores) != 1 || scores[0].ReplicaID != "__probe-cb" {
+		t.Fatalf("reserved-tenant lookup must still work for the probe's own Stage A check; got scores = %+v", scores)
+	}
+}
+
 func TestIngestAndLookupRanksByTokensAndFreshness(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))
@@ -27,6 +96,15 @@ func TestIngestAndLookupRanksByTokensAndFreshness(t *testing.T) {
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 100}}})
 	idx.Ingest(Update{ReplicaID: "replica-b", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 50}}})
+	// Decoy: a third replica serves the same engine domain (tenant, model,
+	// hash_scheme) but holds a DIFFERENT prefix. It populates the
+	// distinguishing-power denominator (total_replicas=3) without showing
+	// up in the scored result for hash("p1"). Without it both holders of
+	// the queried prefix would have factor (1 - 2/2)=0, zeroing every
+	// score and replacing the freshness-vs-tokens story this test
+	// asserts with a lexicographic-ID tiebreak.
+	idx.Ingest(Update{ReplicaID: "replica-c-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p1")})
 	if len(got) != 2 {
@@ -520,13 +598,15 @@ func TestIngestSanitizesNegativeInfinity(t *testing.T) {
 // Ranking v2 — pressure / SLO / TENANT_HOT fallback
 // ---------------------------------------------------------------------------
 
-// TestLookupBaselinePreservedWhenSignalsAbsent locks in the contract that the
-// new ranker reduces to the matched_tokens × freshness baseline (B6)
-// when (a) no replica stats are reported (pressure=0) and (b) the request
-// carries no SLO hint (TTFT=0). The whole reason the new score factors compose
-// multiplicatively: this property has to hold so existing ranking tests stay
-// authoritative for the baseline.
-func TestLookupBaselinePreservedWhenSignalsAbsent(t *testing.T) {
+// TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent locks in the
+// contract that the pressure and SLO score factors collapse to 1 when (a) no
+// replica stats are reported (pressure=0) and (b) the request carries no SLO
+// hint (TTFT=0). The distinguishing-power factor still applies (it depends on
+// cluster cardinality, not on these signals), so the expected scores below
+// fold it in (1 - 2/3 = 1/3 with the decoy replica below) — the test is about
+// the pressure/SLO contribution being 1, not about the score being equal to
+// matched_tokens × freshness alone.
+func TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(6_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))
 
@@ -534,18 +614,23 @@ func TestLookupBaselinePreservedWhenSignalsAbsent(t *testing.T) {
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 80}}})
 	idx.Ingest(Update{ReplicaID: "r2", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 40}}})
+	// Decoy replica holds a different prefix in the same engine domain so
+	// the distinguishing-power factor is not zero (matching=2 < total=3).
+	// Factor = 1 - 2/3 = 1/3, so expected scores are 80/3 and 40/3.
+	idx.Ingest(Update{ReplicaID: "r3-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 scores, got %d", len(got))
 	}
-	// At ingest time freshness == 1 for both, no pressure, no SLO → score
-	// must equal tokenCount exactly. Floats are exact here (whole ints × 1).
-	if got[0].ReplicaID != "r1" || got[0].Score != 80 {
-		t.Fatalf("r1 baseline score = %v (id %q), want 80", got[0].Score, got[0].ReplicaID)
+	// freshness == 1, no pressure, no SLO, distinguishing_power = 1/3.
+	approxEq := func(got, want float32) bool { return got-want > -1e-3 && got-want < 1e-3 }
+	if got[0].ReplicaID != "r1" || !approxEq(got[0].Score, 80.0/3.0) {
+		t.Fatalf("r1 baseline score = %v (id %q), want 80/3 (~26.67) — matched_tokens × freshness × distinguishing_power(2,3)", got[0].Score, got[0].ReplicaID)
 	}
-	if got[1].ReplicaID != "r2" || got[1].Score != 40 {
-		t.Fatalf("r2 baseline score = %v (id %q), want 40", got[1].Score, got[1].ReplicaID)
+	if got[1].ReplicaID != "r2" || !approxEq(got[1].Score, 40.0/3.0) {
+		t.Fatalf("r2 baseline score = %v (id %q), want 40/3 (~13.33)", got[1].Score, got[1].ReplicaID)
 	}
 }
 
@@ -627,6 +712,14 @@ func TestLookupPressureAwareRanking(t *testing.T) {
 					Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: r.tokenCount}},
 					Stats:    &ReplicaStats{Pressure: r.pressure}})
 			}
+			// Decoy replica with a different prefix in the same engine
+			// domain keeps the distinguishing-power factor strictly
+			// positive (matching < total). Without it, when EVERY
+			// replica in the test holds hash("p"), the factor zeroes
+			// every score and the ordering this test asserts collapses
+			// to a meaningless lexicographic tiebreak.
+			idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+				Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 			got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p")})
 			if len(got) != len(tc.wantOrder) {
@@ -665,6 +758,12 @@ func TestLookupSLOAwareRankingBiasesFreshness(t *testing.T) {
 	clk.add(20 * time.Minute)
 	idx.Ingest(Update{ReplicaID: "small-fresh", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}, Timestamp: clk.t})
+	// Decoy: holds a different prefix in the same engine domain so the
+	// distinguishing-power factor stays > 0 (matching=2 < total=3). The
+	// factor multiplies both replicas' scores by the same constant, so
+	// the SLO-bias ordering this test asserts is preserved.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}, Timestamp: clk.t})
 
 	tests := []struct {
 		name      string
@@ -707,6 +806,11 @@ func TestLookupSLOBiasDisabledWhenKnobsZero(t *testing.T) {
 	clk.add(20 * time.Minute)
 	idx.Ingest(Update{ReplicaID: "small-fresh", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 50}}, Timestamp: clk.t})
+	// Decoy in the same engine domain (different prefix) keeps the
+	// distinguishing-power factor > 0 so the disabled-SLO ordering this
+	// test asserts isn't masked by a lexicographic tiebreak.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}, Timestamp: clk.t})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("p"), TTFTBudgetMs: 50})
@@ -765,7 +869,11 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 			wantScores: 1, // cold replica filtered by hit_rate threshold
 		},
 		{
-			name: "no prefix match AND no warm replicas → StrategyNone",
+			// Stats-only ingest registers no prefix entries → the prefix map is
+			// globally empty → the cold-start carve-out keeps this on the
+			// fail-open NO_HINT path. The no-replica-leak intent is preserved
+			// by the wantScores==0 assertion.
+			name: "stats-only ingest, novel prefix → StrategyNone (globally empty prefix map)",
 			ingest: []Update{
 				{ReplicaID: "cold", Model: model, Tenant: tenant, HashScheme: scheme,
 					Stats: &ReplicaStats{HitRate: 0.0}},
@@ -775,7 +883,11 @@ func TestLookupRouteOrchestratorStrategies(t *testing.T) {
 			wantScores: 0,
 		},
 		{
-			name:       "empty index, no signals → StrategyNone (fail open)",
+			// Empty index = cold start. The cold-start carve-out short-circuits
+			// classifyMiss to NO_HINT so a freshly-started server does not flood
+			// every gateway with UNKNOWN_TENANT until the first ReportCacheState
+			// lands. The diagnostic resumes the moment any prefix is reported.
+			name:       "empty index → StrategyNone (cold-start carve-out)",
 			ingest:     nil,
 			req:        LookupRequest{Model: model, Tenant: tenant, HashScheme: scheme, PrefixHash: hashFor("novel")},
 			wantStrat:  StrategyNone,
@@ -907,9 +1019,12 @@ func TestTenantHotHonorsHitRateThreshold(t *testing.T) {
 }
 
 // TestTenantHotDisabledByZeroMaxAge proves the kill-switch: a RankerConfig
-// with TenantHotMaxAge=0 disables the fallback entirely, so a prefix miss
-// always lands at StrategyNone (NO_HINT). Useful when an operator wants
-// strict baseline behavior back.
+// with TenantHotMaxAge=0 disables the soft locality fallback, so a
+// same-key prefix miss (the case set up below — (t, m, vllm) populated,
+// only this prefix novel) lands at StrategyNone (NO_HINT) instead of
+// TENANT_HOT. The miss-classifier still runs for mismatched contract keys
+// — see the dedicated diagnostics tests; this test pins only the
+// kill-switch behavior on the same-key path.
 func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 	cfg := DefaultRankerConfig()
 	cfg.TenantHotMaxAge = 0 // explicit disable
@@ -933,6 +1048,11 @@ func TestTenantHotDisabledByZeroMaxAge(t *testing.T) {
 // updates under a different scheme) could leak into hints for the wrong
 // domain. The replica below holds a prefix only under "sglang"; a lookup
 // under "vllm" must NOT promote it via TENANT_HOT.
+//
+// Post-diagnostics: this is also the canonical UNKNOWN_HASH_SCHEME diagnostic
+// shape — (t, m) populated under sglang, the lookup asks under vllm — so
+// the classifier now surfaces the more specific code. The leak guarantee is
+// unchanged: no replica from another scheme ever appears in Scores.
 func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "wrong-engine", Model: "m", Tenant: "t", HashScheme: "sglang",
@@ -941,9 +1061,12 @@ func TestTenantHotRequiresReplicaServingRequestedScheme(t *testing.T) {
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
-	if res.Strategy != StrategyNone {
-		t.Fatalf("replica serving sglang must NOT surface for a vllm lookup; got %v (%+v)",
+	if res.Strategy != StrategyUnknownHashScheme {
+		t.Fatalf("(t, m) populated under sglang but the lookup asks under vllm: must surface UNKNOWN_HASH_SCHEME; got %v (%+v)",
 			res.Strategy, res.Scores)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("UNKNOWN_HASH_SCHEME must carry no scores (no cross-scheme leak); got %+v", res.Scores)
 	}
 }
 
@@ -987,9 +1110,17 @@ func TestTenantHotDropsReplicaAfterPrefixSweep(t *testing.T) {
 
 	res := idx.LookupRoute(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		PrefixHash: hash("novel")})
+	// Sweep drops the only prefix → the index is now globally empty for the
+	// prefix map → cold-start carve-out short-circuits classifyMiss to NO_HINT.
+	// The original "TENANT_HOT must NOT fire" intent is preserved (Scores
+	// empty); reverting to NO_HINT instead of a diagnostic is correct here
+	// because there is no other-tenant data to compare against.
 	if res.Strategy != StrategyNone {
 		t.Fatalf("after sweep, replica with no live serving prefix must NOT enable TENANT_HOT; got %v (%+v)",
 			res.Strategy, res.Scores)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("post-sweep response must carry no scores; got %+v", res.Scores)
 	}
 }
 
@@ -1032,6 +1163,10 @@ func TestLookupIgnoresStaleStatsPressurePenalty(t *testing.T) {
 // for a more subtle case: an update that carries stats but NO prefix entry
 // (regardless of HashScheme) cannot become a TENANT_HOT candidate, because
 // the index has no evidence the replica serves any prefix at all.
+//
+// Stats-only ingest registers no prefix entries → prefix map globally empty
+// → cold-start carve-out keeps the response on NO_HINT. The original
+// guarantee (stats-only replica never appears in Scores) is preserved.
 func TestTenantHotIgnoresStatsOnlyReplicas(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "stats-only", Model: "m", Tenant: "t", HashScheme: "vllm",
@@ -1043,11 +1178,22 @@ func TestTenantHotIgnoresStatsOnlyReplicas(t *testing.T) {
 		t.Fatalf("stats-only update must NOT surface in TENANT_HOT; got %v (%+v)",
 			res.Strategy, res.Scores)
 	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("stats-only response must carry no scores; got %+v", res.Scores)
+	}
 }
 
 // TestTenantHotIsolatedByTenant guards that a warm replica in tenant-a's
 // index can never leak into tenant-b's TENANT_HOT fallback — per-tenant
 // isolation is a hard constraint of the index regardless of strategy.
+//
+// Setup is stats-only ingest, so the prefix map is globally empty → the
+// cold-start carve-out keeps the response on NO_HINT. The no-leak property
+// the test guards (no tenant-a replica appears in tenant-b's Scores) is
+// preserved by the wantScores==0 assertion. The asymmetric UNKNOWN_TENANT
+// case (tenant-a populated with REAL prefixes, lookup for tenant-b) is
+// covered by TestLookupRouteUnknownTenantOnlyWhenIndexHasData in
+// diagnostics_test.go.
 func TestTenantHotIsolatedByTenant(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "warm-a", Model: "m", Tenant: "tenant-a", HashScheme: "vllm",
@@ -1057,6 +1203,9 @@ func TestTenantHotIsolatedByTenant(t *testing.T) {
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
 		t.Fatalf("tenant-b lookup leaked tenant-a's warm replica: %+v", res)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("response must carry no scores (no cross-tenant leak); got %+v", res.Scores)
 	}
 }
 
@@ -1083,6 +1232,12 @@ func TestLookupRouteEmptyHashSchemeFailsOpenAcrossStrategies(t *testing.T) {
 // TestTenantHotIsolatedByModel guards the analogous model isolation: a warm
 // replica for model A in tenant t doesn't surface for model B in tenant t.
 // Different models have disjoint cache state; mixing them would mis-hint.
+//
+// Stats-only ingest registers no prefix entries → prefix map globally empty
+// → cold-start carve-out keeps the response on NO_HINT. The no-leak
+// property is preserved by wantScores==0. The asymmetric UNKNOWN_MODEL case
+// (model-a populated with REAL prefixes, lookup for model-b) is covered by
+// TestLookupRouteClassifiesUnknownModel in diagnostics_test.go.
 func TestTenantHotIsolatedByModel(t *testing.T) {
 	idx := New(WithRanker(DefaultRankerConfig()))
 	idx.Ingest(Update{ReplicaID: "warm", Model: "model-a", Tenant: "t", HashScheme: "vllm",
@@ -1092,6 +1247,9 @@ func TestTenantHotIsolatedByModel(t *testing.T) {
 		PrefixHash: hash("novel")})
 	if res.Strategy != StrategyNone {
 		t.Fatalf("model-b lookup leaked model-a's warm replica: %+v", res)
+	}
+	if len(res.Scores) != 0 {
+		t.Fatalf("response must carry no scores (no cross-model leak); got %+v", res.Scores)
 	}
 }
 
@@ -1544,15 +1702,26 @@ func TestChainLookupSharesPressureAndSLOFactorsWithExact(t *testing.T) {
 	idx.Ingest(Update{ReplicaID: "small-cool", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{BlockHashes: hashes[:2], BlockTokenCounts: counts[:2]}},
 		Stats:    &ReplicaStats{Pressure: 0.0}})
+	// Decoy replica in the same engine domain (different prefix) keeps the
+	// distinguishing-power denominator above the per-depth matching count,
+	// so the chain factor for small-cool is 1 - 2/3 = 1/3 (not 0). Without
+	// it small-cool's score would collapse to 0 (matching at its depth ==
+	// total) and big-but-hot's pressure-discounted score would dominate by
+	// default, masking the pressure-flips-ranking property this test
+	// asserts.
+	idx.Ingest(Update{ReplicaID: "zzz-decoy", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("decoy"), TokenCount: 1}}})
 
 	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
 		BlockHashes: hashes, BlockTokenCounts: counts})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 chain scores, got %+v", got)
 	}
-	// big-but-hot: matched=48, fresh=1, pressureFactor=(1-1*0.9)=0.1, sloBias=1 → 4.8
-	// small-cool:  matched=32, fresh=1, pressureFactor=(1-1*0.0)=1.0, sloBias=1 → 32
-	// Without pressure folding, big-but-hot's 48 would beat small-cool's 32.
+	// With totalReplicas = 3 (big-but-hot + small-cool + decoy):
+	// big-but-hot: matched=48, pressureFactor=0.1, dp=1-1/3=2/3 → 48 × 0.1 × 2/3 = 3.2
+	// small-cool:  matched=32, pressureFactor=1.0, dp=1-2/3=1/3 → 32 × 1.0 × 1/3 ≈ 10.67
+	// Without pressure folding (pressureFactor=1.0 for both),
+	// big-but-hot's 48×2/3=32 would tie or beat small-cool's 32×1/3≈10.67.
 	if got[0].ReplicaID != "small-cool" {
 		t.Fatalf("pressure factor missing from chain score: ranked %+v first (want small-cool)", got[0])
 	}

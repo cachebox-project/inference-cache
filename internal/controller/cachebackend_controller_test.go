@@ -5,12 +5,14 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -40,10 +42,19 @@ func newScheme(t *testing.T) *runtime.Scheme {
 func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendReconciler {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).
 		WithObjects(objs...).
 		Build()
-	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	return &CacheBackendReconciler{
+		Client: c,
+		Scheme: scheme,
+		Log:    logr.Discard(),
+		// Seed a real serverInstanceCascade so lifecycle tests that
+		// assert on the in-process shadow / lastAt / counted maps
+		// actually exercise the clear path rather than skipping
+		// the check on a nil pointer.
+		serverInstanceCascade: newServerInstanceCascade(),
+	}
 }
 
 func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) {
@@ -450,6 +461,232 @@ func TestReconcileTypeSwitchToExternalCleansUpChildren(t *testing.T) {
 	}
 	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "external.ns1.svc:8080" {
 		t.Fatalf("status.endpoint = %q, want mirrored external endpoint", got)
+	}
+}
+
+// TestReconcileTypeSwitchToExternalClearsObservedServerInstance asserts
+// that status.observedServerInstance is cleared when a managed
+// CacheBackend transitions to External — leaving a stale latch on an
+// External backend would surface a UID that no longer maps to any
+// controller-managed pod, and a subsequent flip back to managed
+// would inherit the stale baseline and either false-cascade
+// immediately or false-pin a non-existent pod set. This is the
+// lifecycle contract reconcileExternal encodes; a status-field flip
+// is exactly the kind of seam tests must hold, alongside the
+// preserved-fields contract (firstKVEventObservedAt must survive).
+func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// Plant BOTH a baseline ObservedServerInstance AND an in-memory
+	// shadow value, simulating a managed period that had observed a
+	// Ready cache-server pod. The test then verifies that the
+	// External transition clears BOTH — without the planted shadow,
+	// the shadow assertion would vacuously pass on an empty map.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q (test would be vacuous without a planted value)", got, "cache-pod-uid:0")
+	}
+
+	// Confirm preserved fields we expect NOT to be clobbered alongside
+	// the latch (firstKVEventObservedAt + indexParticipation must
+	// survive the External transition per reconcileExternal's godoc).
+	preserved := getBackend(t, r, "cache", "ns1")
+	preserved.Status.FirstKVEventObservedAt = &metav1.Time{Time: time.Unix(1_000_000_000, 0).UTC()}
+	if err := r.Status().Update(context.Background(), preserved); err != nil {
+		t.Fatalf("plant firstKVEventObservedAt: %v", err)
+	}
+
+	// Switch to External.
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	switching.Spec.Endpoint = "external.ns1.svc:8080"
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to external: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→External transition", got.Status.ObservedServerInstance)
+	}
+	if got.Status.FirstKVEventObservedAt == nil {
+		t.Fatalf("status.firstKVEventObservedAt was clobbered on External transition; it must survive as a monotonic latch")
+	}
+	// The in-memory cascade shadow MUST also be cleared. A retained
+	// shadow would let a later External→managed transition resolve
+	// effectivePrior to the prior-period currentID and false-cascade
+	// the engine fleet on the first new Ready pod.
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after managed→External transition; want cleared (a lingering shadow would false-cascade on the return path)", shadow)
+	}
+}
+
+// TestReconcileSwitchToStatefulSetClearsObservedServerInstance asserts
+// the same clearing for the managed→unsupported-runtime transition
+// (reconcileUnmanaged path). The StatefulSet deployment-kind is
+// currently the canonical unmanaged trigger.
+func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q", got, "cache-pod-uid:0")
+	}
+
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on managed→unmanaged transition", got.Status.ObservedServerInstance)
+	}
+	// In-memory shadow must also be cleared on the unmanaged path.
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
+	}
+}
+
+// TestReconcileSwitchToInvalidStorageClearsObservedServerInstance
+// asserts that the InvalidStorage gate (reconcileInvalidStorage)
+// clears status.observedServerInstance AND wipes the in-process
+// cascade shadow. Without the clearing, a backend whose
+// configuration is later corrected would inherit the prior-period
+// baseline and false-cascade on the first new Ready pod even
+// though the engine fleet has been waiting on a fail-open backend
+// the whole time.
+func TestReconcileSwitchToInvalidStorageClearsObservedServerInstance(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+
+	reconcile(t, r, "cache", "ns1")
+	// Plant a baseline AND a shadow value as if a prior managed
+	// period had observed a Ready cache-server pod. Without planting
+	// the shadow, the post-transition shadow assertion would pass
+	// vacuously on an empty map.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant baseline observedServerInstance: %v", err)
+	}
+	plantedKey := cascadeKey{namespace: live.Namespace, name: live.Name, uid: string(live.UID)}
+	r.serverInstanceCascade.recordAttempt(plantedKey, "cache-pod-uid:0")
+	if got := r.serverInstanceCascade.lastAttempt(plantedKey); got != "cache-pod-uid:0" {
+		t.Fatalf("planted shadow precondition failed: lastAttempt = %q, want %q", got, "cache-pod-uid:0")
+	}
+
+	// Flip into the InvalidStorage gate: replicas > 1 with a single
+	// ReadWriteOnce PVC is the canonical trigger.
+	switching := getBackend(t, r, "cache", "ns1")
+	two := int32(2)
+	switching.Spec.Replicas = &two
+	switching.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{
+			Size: resource.MustParse("10Gi"),
+		},
+	}
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to invalid storage: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.ObservedServerInstance != "" {
+		t.Fatalf("status.observedServerInstance = %q, want cleared on InvalidStorage gate", got.Status.ObservedServerInstance)
+	}
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
+		t.Fatalf("cascade shadow = %q after InvalidStorage gate; want cleared (lingering shadow would false-cascade when the operator fixes the config)", shadow)
+	}
+}
+
+// TestReconcileLifecycleExitsClearProbeRateLimiter pins the cleanup hook
+// every lifecycle-exit path must call — without it, a CR that returns to
+// the managed path within the prior 30s window keeps a stale lastCalled
+// timestamp on r.probeLimiter, the very first reconcile on re-entry skips
+// the /probe call entirely (rate-limited), and Ready=True is published
+// with no fresh FunctionalProbeOK verdict to back it. One table-driven
+// test for the three places that must call probeLimiter.forget:
+// reconcileExternal, reconcileUnmanaged, reconcileInvalidStorage.
+func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+	}{
+		{
+			name: "managed → External",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+				cb.Spec.Endpoint = "external.ns1.svc:8080"
+			},
+		},
+		{
+			name: "managed → Unmanaged (StatefulSet kind)",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+			},
+		},
+		{
+			name: "managed → InvalidStorage gate",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				two := int32(2)
+				cb.Spec.Replicas = &two
+				cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+					PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+			reconcile(t, r, "cache", "ns1")
+
+			// Plant a rate-limit entry so the clearing assertion is not
+			// vacuous on an empty map. The key matches what
+			// evaluateFunctionalProbe + the lifecycle exits use:
+			// "namespace/name".
+			key := "ns1/cache"
+			now := time.Unix(2_000_000, 0)
+			r.probeLimiter.markCalled(key, now)
+			if got := r.probeLimiter.lastCalled(key); got != now {
+				t.Fatalf("planted rate-limit precondition failed: lastCalled = %v, want %v (test would be vacuous without a planted value)", got, now)
+			}
+
+			// Trigger the lifecycle exit.
+			switching := getBackend(t, r, "cache", "ns1")
+			tc.mutate(switching)
+			if err := r.Update(context.Background(), switching); err != nil {
+				t.Fatalf("apply lifecycle-exit spec change: %v", err)
+			}
+			reconcile(t, r, "cache", "ns1")
+
+			// The rate-limit entry MUST be cleared. A retained entry would
+			// suppress the first /probe call on the managed → exit → managed
+			// return path inside the 30s window.
+			if got := r.probeLimiter.lastCalled(key); !got.IsZero() {
+				t.Fatalf("probeLimiter.lastCalled(%q) = %v after lifecycle exit; want zero (forget) — re-entry inside the 30s window would skip the first probe call", key, got)
+			}
+		})
 	}
 }
 
@@ -991,7 +1228,12 @@ func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Func
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	return &CacheBackendReconciler{
+		Client:                c,
+		Scheme:                scheme,
+		Log:                   logr.Discard(),
+		serverInstanceCascade: newServerInstanceCascade(),
+	}
 }
 
 // TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded
