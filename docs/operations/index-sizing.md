@@ -159,9 +159,10 @@ working set down to ~1M, and the rest of the prefixes won't have hints. Three ch
    re-used at the 15-minute mark go to miss instead of hit. Cheapest tuning option and
    usually the right one.
 3. **Rebuild with a higher cap.** Bump `DefaultMaxEntries` in `pkg/index/index.go` to,
-   say, 3M and size the pod for ~1.5 GiB (~700 MiB peak RSS at 1.5M plus 20 % headroom).
-   Most heavyweight option; reach for it when the workload can't tolerate the hit-rate
-   loss from option 1 or the TTL trim from option 2.
+   say, 3M. At ~500 B/entry that's ~1.4 GiB peak RSS — size the pod for at least 2 GiB
+   to leave the 20 % headroom on top of the linear scaling. Most heavyweight option;
+   reach for it when the workload can't tolerate the hit-rate loss from option 1 or
+   the TTL trim from option 2.
 
 Same shape applies to any "over the cap" case: pick A, B, or C based on whether you can
 tolerate lower hit rate, tighter TTL, or a custom build.

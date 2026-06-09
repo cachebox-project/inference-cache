@@ -48,27 +48,37 @@ func main() {
 		os.Exit(2)
 	}
 
-	// keysPerBucket rounds DOWN, so the requested -keys may not all be ingested
-	// when (tenants × models) doesn't divide. Compute the actually-ingested
-	// total here and use that as the denominator for every bytes-per-entry
-	// number below — otherwise the report would inflate the denominator and
-	// under-state per-entry cost. If the rounding leaves a zero per-bucket
-	// count, the run would ingest nothing — fail rather than divide by zero
-	// in the report.
-	keysPerBucket := *keys / ((*tenants) * (*models))
-	if keysPerBucket == 0 {
-		fmt.Fprintf(os.Stderr, "keys=%d < tenants×models=%d; need at least one key per bucket. raise -keys or lower -tenants/-models.\n",
-			*keys, (*tenants)*(*models))
+	// Bound-check EVERY downstream multiply step-by-step in int64 against
+	// int's actual range on this platform. Without this guard a bad flag
+	// combo (extreme -tenants × -models, or extreme totals) wraps the int
+	// result, which the harness then uses as both the cap input and the
+	// bytes-per-entry denominator — emitting plausible-looking nonsense.
+	// We check BEFORE the int divide for keysPerBucket too, because
+	// (*tenants)*(*models) is otherwise computed unguarded in int.
+	//
+	// We also reject prod == intMax so the later `WithMaxEntries(totalEntries+1)`
+	// never overflows int into a non-positive (unbounded) cap.
+	const intMax = int64(^uint(0) >> 1) // MaxInt on this build (64-bit ⇒ 2^63-1; 32-bit ⇒ 2^31-1)
+	tm := int64(*tenants)
+	if tm > intMax/int64(*models) {
+		fmt.Fprintf(os.Stderr, "tenants×models=%d × %d would overflow int on this platform; lower a flag\n", *tenants, *models)
 		os.Exit(2)
 	}
-	// Bound-check the planned product BEFORE it hits Go's int (signed,
-	// 64-bit on supported targets, 32-bit on 32-bit builds). Without this
-	// guard a bad flag combo wraps the result, which the harness then uses
-	// as both the cap input and the bytes-per-entry denominator — emitting
-	// plausible-looking nonsense. Multiply step-by-step in int64 and check
-	// against int's actual range on this platform; reject before any wrap.
-	const intMax = int64(^uint(0) >> 1) // MaxInt on this build (64-bit ⇒ 2^63-1; 32-bit ⇒ 2^31-1)
-	prod := int64(keysPerBucket)
+	tm *= int64(*models)
+	// keysPerBucket rounds DOWN, so the requested -keys may not all be
+	// ingested when (tenants × models) doesn't divide. Compute the
+	// actually-ingested total here and use it as the denominator for every
+	// bytes-per-entry number below — otherwise the report would inflate
+	// the denominator and under-state per-entry cost. If the rounding
+	// leaves a zero per-bucket count, the run would ingest nothing — fail
+	// rather than divide by zero in the report.
+	keysPerBucket := int64(*keys) / tm
+	if keysPerBucket == 0 {
+		fmt.Fprintf(os.Stderr, "keys=%d < tenants×models=%d; need at least one key per bucket. raise -keys or lower -tenants/-models.\n",
+			*keys, tm)
+		os.Exit(2)
+	}
+	prod := keysPerBucket
 	for _, m := range []int{*tenants, *models, *replicas} {
 		if m <= 0 || prod > intMax/int64(m) {
 			fmt.Fprintf(os.Stderr, "totalEntries would overflow int on this platform; lower a flag (keysPerBucket=%d tenants=%d models=%d replicas=%d)\n",
@@ -77,11 +87,21 @@ func main() {
 		}
 		prod *= int64(m)
 	}
-	ingestedKeys := keysPerBucket * (*tenants) * (*models)
+	// Reserve room for the cap-input `totalEntries+1`; prod == intMax would
+	// wrap that to MinInt and produce an unbounded cap (which the harness
+	// then claims to have measured under a bound that doesn't exist).
+	if prod >= intMax {
+		fmt.Fprintf(os.Stderr, "totalEntries=%d hits MaxInt; lower a flag so the cap input (totalEntries+1) stays representable\n", prod)
+		os.Exit(2)
+	}
+	// Convert back to int now that overflow is ruled out — the inner loops
+	// use these as slice/range indices.
+	keysPerBucketInt := int(keysPerBucket)
+	ingestedKeys := keysPerBucketInt * (*tenants) * (*models)
 	totalEntries := int(prod)
 	if ingestedKeys != *keys {
 		fmt.Fprintf(os.Stderr, "warning: keys=%d not divisible by tenants×models=%d; ingesting %d keys (per-bucket=%d)\n",
-			*keys, (*tenants)*(*models), ingestedKeys, keysPerBucket)
+			*keys, tm, ingestedKeys, keysPerBucketInt)
 	}
 
 	// No eviction during the run: we want steady-state population, not a
@@ -109,8 +129,8 @@ func main() {
 			tenant := fmt.Sprintf("tenant-%d", tenantIdx)
 			for modelIdx := 0; modelIdx < *models; modelIdx++ {
 				model := fmt.Sprintf("meta-llama/Llama-3-70B-Instruct-m%d", modelIdx)
-				bucketStart := (tenantIdx*(*models) + modelIdx) * keysPerBucket
-				bucketEnd := bucketStart + keysPerBucket
+				bucketStart := (tenantIdx*(*models) + modelIdx) * keysPerBucketInt
+				bucketEnd := bucketStart + keysPerBucketInt
 
 				batch := make([]index.PrefixRef, 0, *batchSize)
 				for prefixIdx := bucketStart; prefixIdx < bucketEnd; prefixIdx++ {
