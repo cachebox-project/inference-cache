@@ -134,8 +134,8 @@ The index stores **one entry per block hash**, not per prompt. The vLLM KV-event
 subscriber maps each `BlockStored` event into one `PrefixEntry` per block hash (see
 [`pkg/adapters/engine/mapper.go`](../../pkg/adapters/engine/mapper.go) — `StoredPrefixes`),
 each with a cumulative `token_count`. A 1000-token prompt at vLLM's 16-token block size
-produces ~62 block hashes, which becomes ~62 entries per replica. Plan for this expansion,
-not the single-blob shape, when sizing.
+produces ~63 block hashes (`ceil(1000/16)`), which becomes ~63 entries per replica. Plan
+for this expansion, not the single-blob shape, when sizing.
 
 ### Worked example — a chatbot that overshoots the cap
 
@@ -211,13 +211,13 @@ prefix warm, the engine recomputes. So the cost of "TTL too long" is wasted inde
 | `CachePolicy.spec.evictionTTL` | per-namespace duration | server default 30m | Bounds freshness window + steady-state memory for the namespace. |
 | `CachePolicy.spec.eviction` | per-namespace enum (`LRU`/`LFU`) | `LRU` | Picks the victim under cap pressure. LFU keeps frequently-hit prefixes warm. |
 | `CacheTenant.spec.quota.maxIndexEntries` | per-tenant int64 | unset = unbounded | Bounds the per-tenant slice of the index; over-budget evicts the tenant's own oldest entries (Fairness). |
-| Global entry cap | server compile-time constant | `DefaultMaxEntries = 1,000,000` | Backstop. Not currently a flag (see follow-up below). |
+| Global entry cap | server compile-time constant | `DefaultMaxEntries = 1,000,000` | Backstop. Compile-time today; see the "State today" callout under [Knobs the operator actually has](#knobs-the-operator-actually-has). |
 | Global TTL fallback | server compile-time constant | `DefaultTTL = 30m` | Applies to tenants in namespaces without a CachePolicy. |
 | Sweep interval | server compile-time constant | `DefaultSweepInterval = 1m` | How often the TTL pass runs. Higher = more lag, less CPU. |
 
-**Follow-up.** The global cap, global TTL, and sweep interval are hardcoded; flipping any
-of them today requires a rebuild. Filing the flag work as a follow-up to this guide; track
-under your own ticket if you need it before that lands.
+**State today.** The global cap, global TTL, and sweep interval are compile-time
+constants in `pkg/index/index.go`; flipping any of them requires a server rebuild. The
+per-namespace and per-tenant CRs above are the runtime-tunable surface.
 
 ---
 
@@ -272,7 +272,7 @@ After a representative workload window (typically one peak hour + one trough):
   prefix keys per model, but the cap is on total replica×prefix entries, so on a
   multi-replica deployment the gauge can sit well below 1M while the cap is firing.)
   Choices: shorten `evictionTTL` (cheap), tighten per-tenant quotas (operator-controlled),
-  or raise the cap (requires the follow-up flag).
+  or raise the cap (requires a server rebuild today — see [Knobs the operator actually has](#knobs-the-operator-actually-has)).
 - `index_evictions_total{reason="ttl"}` ≈ 0 *and* the gateway's prefix-cache hit rate is
   low → TTL is set so high that nothing ever ages out, but routing isn't paying off.
   Either the workload doesn't reuse prefixes (no fix needed at the cache plane) or the
@@ -293,9 +293,9 @@ After a representative workload window (typically one peak hour + one trough):
   index after that check; otherwise look at metrics registry, snapshot cache, or recent
   code changes.
 
-### 4. The escape hatch (today, until the cap is a flag)
+### 4. The escape hatch (without rebuilding)
 
-If you genuinely need more than 1M entries before the cap flag lands:
+If you genuinely need more than 1M entries and don't want to rebuild the server:
 
 - **Shorter TTL** trims steady-state. A namespace seeing 100K new prefixes/min at
   TTL=30m steady-states at 3M; the same workload at TTL=10m steady-states at 1M.
