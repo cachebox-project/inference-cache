@@ -127,7 +127,7 @@ Replicas multiply E by R but only at ~50 B/extra-replica per shared entry.
 | Single-tenant chatbot, ~100K distinct prompt prefixes seen in the TTL window after dedup (much smaller than raw arrivals — chats share system prompts, few-shots, and recent turns), ~5 blocks / prompt | 100K | × 5 | ~500K | Comfortable. |
 | Multi-tenant chatbot, 20 tenants × 100K prompts | 2M (Σ across tenants) | × 5 | ~10M | **Cap-bound.** Choices: shorten `evictionTTL` per namespace (linear win), tighten per-tenant `maxIndexEntries`, or raise the cap + pod memory. |
 | RAG, 50K documents, ~10-block chunks, TTL=2h | 50K | × 10 | ~500K | Comfortable single-tenant; cap-bound at scale. |
-| Long-context coding assistant, 1K active sessions, ~500-block prompts | 1K | × 500 | ~500K | Comfortable, but watch `index_evictions_total{reason="cap"}` — if chain length grows, this is the workload most likely to outgrow the cap silently. |
+| Long-context coding assistant, 1K active sessions, ~500-block prompts | 1K | × 500 | ~500K | Comfortable, but watch `inferencecache_index_evictions_total{reason="cap"}` — if chain length grows, this is the workload most likely to outgrow the cap silently. |
 
 ### Block-hash expansion is the most-overlooked multiplier
 
@@ -246,9 +246,9 @@ one to compare against the [Per-entry footprint](#per-entry-memory-footprint) ta
 | Signal | Series | Source | What it tells you |
 |---|---|---|---|
 | Steady-state size | `inferencecache_index_entries{model}` | server `/metrics` | **Distinct prefix keys per model** — not total replica×prefix entries. A prefix held by R replicas counts once here. Use this for trend / hit-rate work; it is **not** a direct cap-closeness signal in multi-replica setups (see next row). |
-| Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | server `/metrics` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
+| Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | server `/metrics` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `inferencecache_index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
 | Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | server `/metrics` | A tenant is exceeding `spec.quota.maxIndexEntries`. **A bounded, non-zero rate is normal Fairness behavior** (ingest pushes over → eviction trims back). Concern only if the rate climbs without bound — see [Watch and adjust](#3-watch-and-adjust) for the full nuance. |
-| TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | server `/metrics` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `index_entries` falling = the workload is shrinking. |
+| TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | server `/metrics` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `inferencecache_index_entries` falling = the workload is shrinking. |
 | Pod working set (≈ what counts against the memory limit) | `container_memory_working_set_bytes{pod="inference-cache-server-..."}` | **kubelet/cAdvisor** (not the server) | This is what kubelet uses to OOM-kill the pod, so it is the right signal to compare against the pod memory limit. It is NOT strictly RSS (working set ≈ RSS + active anonymous pages, minus tmpfs). For literal RSS, scrape `container_memory_rss` or the Go-runtime `process_resident_memory_bytes` instead — both run a bit lower than working set. Compare either against the [Per-entry footprint](#per-entry-memory-footprint) table (which reports the harness's `Maxrss` high-water mark — a peak-RSS figure, not steady-state). |
 
 ### 2. Pick a starting point
@@ -277,27 +277,27 @@ one to compare against the [Per-entry footprint](#per-entry-memory-footprint) ta
 
 After a representative workload window (typically one peak hour + one trough):
 
-- `index_evictions_total{reason="cap"}` non-zero → the workload exceeds the global cap.
-  (Do not rely on `index_entries` alone to detect this — that gauge counts distinct
+- `inferencecache_index_evictions_total{reason="cap"}` non-zero → the workload exceeds the global cap.
+  (Do not rely on `inferencecache_index_entries` alone to detect this — that gauge counts distinct
   prefix keys per model, but the cap is on total replica×prefix entries, so on a
   multi-replica deployment the gauge can sit well below 1M while the cap is firing.)
   Choices: shorten `evictionTTL` (cheap), tighten per-tenant quotas (operator-controlled),
   or raise the cap (requires a server rebuild today — see [Knobs the operator actually has](#knobs-the-operator-actually-has)).
-- `index_evictions_total{reason="ttl"}` ≈ 0 *and* the gateway's prefix-cache hit rate is
+- `inferencecache_index_evictions_total{reason="ttl"}` ≈ 0 *and* the gateway's prefix-cache hit rate is
   low → TTL is set so high that nothing ever ages out, but routing isn't paying off.
   Either the workload doesn't reuse prefixes (no fix needed at the cache plane) or the
   KV-event subscriber isn't reporting (a separate diagnostic — check `replica_id`
   population in `/snapshot`).
-- `tenant_evictions_total` non-zero on a tenant whose `status.indexEntries` is at or
+- `inferencecache_tenant_evictions_total` non-zero on a tenant whose `status.indexEntries` is at or
   just below their quota → **this is the expected steady-state.** Ingest pushes the
   tenant over budget, the per-ingest eviction trims it back to ≤ quota, the counter
   bumps. As long as the *rate* is bounded (you're not seeing it climb without bound),
   Fairness is doing exactly what it should. Look closer only if the rate keeps rising
   alongside a stable `status.indexEntries` — that would mean the quota is too tight
   for arrivals and you're burning eviction work on every batch.
-- RSS climbing with `index_entries` flat → could still be the index, in two ways:
+- RSS climbing with `inferencecache_index_entries` flat → could still be the index, in two ways:
   (1) a new replica started reporting an existing prefix set (each replica adds ~50 B
-  per shared prefix, undetected by the per-distinct-prefix gauge), or (2) `index_entries`
+  per shared prefix, undetected by the per-distinct-prefix gauge), or (2) `inferencecache_index_entries`
   is unchanged but per-tenant distribution shifted. Confirm by reading `/snapshot` and
   summing `replicas[].prefixCount` — if the sum grew, it's the index. Only rule out the
   index after that check; otherwise look at metrics registry, snapshot cache, or recent

@@ -1,16 +1,16 @@
-// Targeted tests for the pure helpers that produce the harness's reported
-// numbers. The harness is operator tooling and excluded from coverage (see
-// COVER_EXCLUDE in the Makefile), but the encodeHash + humanBytes + sizing
-// math drive the bytes-per-entry denominators the sizing guide cites — so
-// a silent regression there would publish misleading sizing numbers. These
-// tests pin the cases that matter without trying to test main()'s flag-
-// validation flow (that requires process-level exit assertions and is
+// Targeted tests for the helpers that produce the harness's reported numbers.
+// The harness is operator tooling and excluded from coverage (see COVER_EXCLUDE
+// in the Makefile), but encodeHash, humanBytes, and planRun drive the
+// bytes-per-entry denominators and the cap input the sizing guide cites — a
+// silent regression here would publish misleading sizing numbers. Tests pin
+// the cases that matter; the main()-level glue (flag.Parse + exit codes) is
 // covered manually via the in-tree "go run ./hack/index-sizing -flag=…"
-// sweeps the maintainer runs to refresh the guide).
+// sweeps the maintainer runs to refresh the guide.
 package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -60,6 +60,81 @@ func TestEncodeHash(t *testing.T) {
 	zero := make([]byte, 24)
 	if !bytes.Equal(tail, zero) {
 		t.Fatalf("encodeHash(_, 32) tail not zero-padded: %x", tail)
+	}
+}
+
+func TestPlanRunHappyPaths(t *testing.T) {
+	// Each case exercises a different combinator: pure single-tenant single-
+	// replica, multi-tenant split, multi-replica fan-out, and the warning-
+	// without-error truncated-divisor case. Verifies that the derived
+	// numbers (ingestedKeys + totalEntries) match what the harness loop
+	// would actually produce — these are the per-entry denominators the
+	// guide publishes.
+	cases := []struct {
+		name                            string
+		keys, replicas, tenants, models int
+		wantKeysPerBucket, wantIngested int
+		wantTotalEntries                int
+		wantTruncated                   bool
+	}{
+		{"single-tenant", 1_000_000, 1, 1, 1, 1_000_000, 1_000_000, 1_000_000, false},
+		{"multi-tenant-clean", 1_000_000, 1, 4, 1, 250_000, 1_000_000, 1_000_000, false},
+		{"multi-replica", 500_000, 3, 1, 1, 500_000, 500_000, 1_500_000, false},
+		{"truncated", 1_000_000, 1, 3, 1, 333_333, 999_999, 999_999, true},
+		{"tenants-models-cross-product", 600, 1, 5, 3, 40, 600, 600, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := planRun(tc.keys, tc.replicas, 32, tc.tenants, tc.models, 1_000)
+			if err != nil {
+				t.Fatalf("planRun(...) returned error: %v", err)
+			}
+			if plan.KeysPerBucket != tc.wantKeysPerBucket {
+				t.Errorf("KeysPerBucket = %d, want %d", plan.KeysPerBucket, tc.wantKeysPerBucket)
+			}
+			if plan.IngestedKeys != tc.wantIngested {
+				t.Errorf("IngestedKeys = %d, want %d", plan.IngestedKeys, tc.wantIngested)
+			}
+			if plan.TotalEntries != tc.wantTotalEntries {
+				t.Errorf("TotalEntries = %d, want %d", plan.TotalEntries, tc.wantTotalEntries)
+			}
+			if plan.Truncated != tc.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", plan.Truncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+func TestPlanRunRejections(t *testing.T) {
+	// Each case targets a distinct guard inside planRun. The asserted
+	// substring lets the test catch a regression where the right branch
+	// is taken but the wrong error is reported.
+	cases := []struct {
+		name                              string
+		keys, replicas, hashSize, tenants int
+		models, batchSize                 int
+		wantSubstr                        string
+	}{
+		{"zero-keys", 0, 1, 32, 1, 1, 1_000, "strictly positive"},
+		{"zero-replicas", 100, 0, 32, 1, 1, 1_000, "strictly positive"},
+		{"zero-tenants", 100, 1, 32, 0, 1, 1_000, "strictly positive"},
+		{"zero-models", 100, 1, 32, 1, 0, 1_000, "strictly positive"},
+		{"zero-batch", 100, 1, 32, 1, 1, 0, "strictly positive"},
+		{"negative-keys", -1, 1, 32, 1, 1, 1_000, "strictly positive"},
+		{"narrow-hash", 100, 1, 4, 1, 1, 1_000, "hash-bytes must be >= 8"},
+		{"keys-less-than-buckets", 5, 1, 32, 10, 2, 1_000, "need at least one key per bucket"},
+		{"overflow-replicas", 1_000_000, 1 << 62, 32, 1, 1, 1_000, "would overflow int"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := planRun(tc.keys, tc.replicas, tc.hashSize, tc.tenants, tc.models, tc.batchSize)
+			if err == nil {
+				t.Fatalf("planRun(...) succeeded, want error containing %q", tc.wantSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("planRun error = %q, want substring %q", err.Error(), tc.wantSubstr)
+			}
+		})
 	}
 }
 

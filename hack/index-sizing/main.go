@@ -24,6 +24,71 @@ import (
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
+// runPlan is the derived per-run shape: per-bucket key count, the actually-
+// ingested total (which may be less than the requested -keys if the divisor
+// rounds down), and the total storage entries. Centralized in one struct so
+// the helper can return it under test instead of hand-threading naked ints.
+type runPlan struct {
+	KeysPerBucket int
+	IngestedKeys  int
+	TotalEntries  int
+	Truncated     bool // ingestedKeys < requested
+}
+
+// planRun translates the flag values into a runPlan, applying every rule the
+// harness depends on: strict-positive flags, hash-bytes >= 8 (so encodeHash
+// can't collide), no divide-by-zero from a tenants×models that exceeds keys,
+// and platform-aware overflow guards. Extracted from main() so the rules are
+// reachable from tests — when the rules drift, the bytes-per-entry numbers in
+// the operator guide silently drift with them.
+//
+// Returns an error string suitable for stderr; main() prefixes it and exits.
+func planRun(keys, replicas, hashSize, tenants, models, batchSize int) (runPlan, error) {
+	if keys <= 0 || replicas <= 0 || tenants <= 0 || models <= 0 || batchSize <= 0 {
+		return runPlan{}, fmt.Errorf("keys, replicas, tenants, models, batch must be strictly positive: keys=%d replicas=%d tenants=%d models=%d batch=%d",
+			keys, replicas, tenants, models, batchSize)
+	}
+	if hashSize < 8 {
+		return runPlan{}, fmt.Errorf("hash-bytes must be >= 8 (encodeHash packs the key index into the first 8 bytes; narrower widths collide). got %d", hashSize)
+	}
+
+	// Bound-check EVERY downstream multiply step-by-step in int64 against
+	// int's actual range on this platform; a bad flag combo would otherwise
+	// wrap and the harness would use the wrap as both the cap input and
+	// the bytes-per-entry denominator. We also reject prod == intMax so
+	// the later `WithMaxEntries(totalEntries+1)` cannot wrap to a
+	// non-positive (unbounded) cap.
+	const intMax = int64(^uint(0) >> 1)
+	tm := int64(tenants)
+	if tm > intMax/int64(models) {
+		return runPlan{}, fmt.Errorf("tenants×models=%d × %d would overflow int on this platform; lower a flag", tenants, models)
+	}
+	tm *= int64(models)
+	keysPerBucket64 := int64(keys) / tm
+	if keysPerBucket64 == 0 {
+		return runPlan{}, fmt.Errorf("keys=%d < tenants×models=%d; need at least one key per bucket. raise -keys or lower -tenants/-models", keys, tm)
+	}
+	prod := keysPerBucket64
+	for _, m := range []int{tenants, models, replicas} {
+		if prod > intMax/int64(m) {
+			return runPlan{}, fmt.Errorf("totalEntries would overflow int on this platform; lower a flag (keysPerBucket=%d tenants=%d models=%d replicas=%d)",
+				keysPerBucket64, tenants, models, replicas)
+		}
+		prod *= int64(m)
+	}
+	if prod >= intMax {
+		return runPlan{}, fmt.Errorf("totalEntries=%d hits MaxInt; lower a flag so the cap input (totalEntries+1) stays representable", prod)
+	}
+	keysPerBucket := int(keysPerBucket64)
+	ingestedKeys := keysPerBucket * tenants * models
+	return runPlan{
+		KeysPerBucket: keysPerBucket,
+		IngestedKeys:  ingestedKeys,
+		TotalEntries:  int(prod),
+		Truncated:     ingestedKeys != keys,
+	}, nil
+}
+
 func main() {
 	keys := flag.Int("keys", 1_000_000, "distinct prefix keys to ingest")
 	replicas := flag.Int("replicas", 1, "replicas reporting each prefix (entries = keys × replicas)")
@@ -33,76 +98,18 @@ func main() {
 	batchSize := flag.Int("batch", 1_000, "prefixes per Ingest call")
 	flag.Parse()
 
-	// Reject inputs that would divide-by-zero (`tenants=0`/`models=0`), corrupt
-	// the per-entry denominator (`keys`/`replicas` ≤ 0), or panic deep in the
-	// loop (`batch` ≤ 0). hash-bytes < 8 would let encodeHash silently produce
-	// duplicate hashes (it packs the key index into the first 8 bytes), so the
-	// floor is 8 — enough to encode any practical -keys value uniquely.
-	if *keys <= 0 || *replicas <= 0 || *tenants <= 0 || *models <= 0 || *batchSize <= 0 {
-		fmt.Fprintf(os.Stderr, "keys, replicas, tenants, models, batch must be strictly positive: keys=%d replicas=%d tenants=%d models=%d batch=%d\n",
-			*keys, *replicas, *tenants, *models, *batchSize)
+	plan, err := planRun(*keys, *replicas, *hashSize, *tenants, *models, *batchSize)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if *hashSize < 8 {
-		fmt.Fprintf(os.Stderr, "hash-bytes must be >= 8 (encodeHash packs the key index into the first 8 bytes; narrower widths collide). got %d\n", *hashSize)
-		os.Exit(2)
-	}
-
-	// Bound-check EVERY downstream multiply step-by-step in int64 against
-	// int's actual range on this platform. Without this guard a bad flag
-	// combo (extreme -tenants × -models, or extreme totals) wraps the int
-	// result, which the harness then uses as both the cap input and the
-	// bytes-per-entry denominator — emitting plausible-looking nonsense.
-	// We check BEFORE the int divide for keysPerBucket too, because
-	// (*tenants)*(*models) is otherwise computed unguarded in int.
-	//
-	// We also reject prod == intMax so the later `WithMaxEntries(totalEntries+1)`
-	// never overflows int into a non-positive (unbounded) cap.
-	const intMax = int64(^uint(0) >> 1) // MaxInt on this build (64-bit ⇒ 2^63-1; 32-bit ⇒ 2^31-1)
-	tm := int64(*tenants)
-	if tm > intMax/int64(*models) {
-		fmt.Fprintf(os.Stderr, "tenants×models=%d × %d would overflow int on this platform; lower a flag\n", *tenants, *models)
-		os.Exit(2)
-	}
-	tm *= int64(*models)
-	// keysPerBucket rounds DOWN, so the requested -keys may not all be
-	// ingested when (tenants × models) doesn't divide. Compute the
-	// actually-ingested total here and use it as the denominator for every
-	// bytes-per-entry number below — otherwise the report would inflate
-	// the denominator and under-state per-entry cost. If the rounding
-	// leaves a zero per-bucket count, the run would ingest nothing — fail
-	// rather than divide by zero in the report.
-	keysPerBucket := int64(*keys) / tm
-	if keysPerBucket == 0 {
-		fmt.Fprintf(os.Stderr, "keys=%d < tenants×models=%d; need at least one key per bucket. raise -keys or lower -tenants/-models.\n",
-			*keys, tm)
-		os.Exit(2)
-	}
-	prod := keysPerBucket
-	for _, m := range []int{*tenants, *models, *replicas} {
-		if m <= 0 || prod > intMax/int64(m) {
-			fmt.Fprintf(os.Stderr, "totalEntries would overflow int on this platform; lower a flag (keysPerBucket=%d tenants=%d models=%d replicas=%d)\n",
-				keysPerBucket, *tenants, *models, *replicas)
-			os.Exit(2)
-		}
-		prod *= int64(m)
-	}
-	// Reserve room for the cap-input `totalEntries+1`; prod == intMax would
-	// wrap that to MinInt and produce an unbounded cap (which the harness
-	// then claims to have measured under a bound that doesn't exist).
-	if prod >= intMax {
-		fmt.Fprintf(os.Stderr, "totalEntries=%d hits MaxInt; lower a flag so the cap input (totalEntries+1) stays representable\n", prod)
-		os.Exit(2)
-	}
-	// Convert back to int now that overflow is ruled out — the inner loops
-	// use these as slice/range indices.
-	keysPerBucketInt := int(keysPerBucket)
-	ingestedKeys := keysPerBucketInt * (*tenants) * (*models)
-	totalEntries := int(prod)
-	if ingestedKeys != *keys {
+	if plan.Truncated {
 		fmt.Fprintf(os.Stderr, "warning: keys=%d not divisible by tenants×models=%d; ingesting %d keys (per-bucket=%d)\n",
-			*keys, tm, ingestedKeys, keysPerBucketInt)
+			*keys, (*tenants)*(*models), plan.IngestedKeys, plan.KeysPerBucket)
 	}
+	keysPerBucketInt := plan.KeysPerBucket
+	ingestedKeys := plan.IngestedKeys
+	totalEntries := plan.TotalEntries
 
 	// No eviction during the run: we want steady-state population, not a
 	// post-sweep slice of it. TTL + sweep are pushed past any reasonable
