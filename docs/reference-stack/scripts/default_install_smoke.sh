@@ -457,10 +457,35 @@ kubectl -n "$NAMESPACE" wait --for=condition=Available --timeout="$READY_TIMEOUT
 server_mem_limit=$(kubectl -n "$NAMESPACE" get deployment/inference-cache-server \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].resources.limits.memory}' \
   2>/dev/null || true)
-if [ "$server_mem_limit" != "1Gi" ]; then
-  fail "inference-cache-server memory limit = '$server_mem_limit' (want 1Gi to fit DefaultMaxEntries=1M per docs/operations/index-sizing.md)"
+# Normalize to bytes so the assertion catches semantic drift, not literal-string
+# drift: K8s quantities like "1Gi" and "1024Mi" are equivalent and either is a
+# valid way to express the documented 1 GiB. The minimum sized to fit the
+# DefaultMaxEntries=1M cap at ~540 MiB peak RSS plus a 1.5x headroom margin is
+# 1 GiB = 1073741824 bytes; we accept anything >= that.
+mem_to_bytes() {
+  # Strips a K8s memory quantity suffix (Ki/Mi/Gi/Ti or k/M/G/T) and emits bytes.
+  # Returns 0 on unparseable input — caller treats 0 as "below threshold" and
+  # fails noisily.
+  local v="$1"
+  case "$v" in
+    *Ki) echo $(( ${v%Ki} * 1024 )) ;;
+    *Mi) echo $(( ${v%Mi} * 1024 * 1024 )) ;;
+    *Gi) echo $(( ${v%Gi} * 1024 * 1024 * 1024 )) ;;
+    *Ti) echo $(( ${v%Ti} * 1024 * 1024 * 1024 * 1024 )) ;;
+    *k)  echo $(( ${v%k} * 1000 )) ;;
+    *M)  echo $(( ${v%M} * 1000 * 1000 )) ;;
+    *G)  echo $(( ${v%G} * 1000 * 1000 * 1000 )) ;;
+    *T)  echo $(( ${v%T} * 1000 * 1000 * 1000 * 1000 )) ;;
+    *[0-9]) echo "$v" ;;
+    *) echo 0 ;;
+  esac
+}
+server_mem_bytes=$(mem_to_bytes "$server_mem_limit")
+min_bytes=$(( 1024 * 1024 * 1024 ))   # 1 GiB
+if [ "$server_mem_bytes" -lt "$min_bytes" ]; then
+  fail "inference-cache-server memory limit = '$server_mem_limit' ($server_mem_bytes bytes); want >= 1Gi ($min_bytes bytes) to fit DefaultMaxEntries=1M per docs/operations/index-sizing.md"
 fi
-log "inference-cache-server memory limit = $server_mem_limit (sized for DefaultMaxEntries=1M)"
+log "inference-cache-server memory limit = $server_mem_limit ($server_mem_bytes bytes; >= 1Gi → sized for DefaultMaxEntries=1M)"
 
 # --- CacheBackend CRD schema-trim assertion --------------------------------
 # The installed CRD must reflect the inert-field trim: the three removed fields

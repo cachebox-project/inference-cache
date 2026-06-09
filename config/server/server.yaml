@@ -170,10 +170,14 @@ spec:
               memory: 1Gi
             requests:
               cpu: 50m
-              # Low floor on scheduling — the request only matters for binpacking,
-              # not the OOM threshold; limit above is what counts against pod-level
-              # memory pressure.
-              memory: 128Mi
+              # Request is the binpacking + node-pressure-eviction floor. Sized
+              # toward a "moderate" working set (~250K-500K entries, ~150-300 MiB
+              # peak RSS per the sizing guide) so the scheduler can place the pod
+              # somewhere it has room to grow into the 1Gi limit without becoming
+              # the first eviction target under node memory pressure. Operators
+              # running closer to the cap should bump both the request and the
+              # limit in lockstep.
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

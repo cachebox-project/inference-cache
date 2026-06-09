@@ -228,16 +228,16 @@ Start from observation, not guess.
 ### 1. Watch the metrics that already exist
 
 All `inferencecache_*` signals below are exported on the server's `/metrics` (port 8080).
-The pod-RSS row is a cluster-level metric from kubelet/cAdvisor, scraped separately
-(usually by kube-prometheus's `kubelet` `ServiceMonitor`) — included here because it is
-the right RSS signal to compare against the [Per-entry footprint](#per-entry-memory-footprint)
-table.
+The pod working-set row is a cluster-level metric from kubelet/cAdvisor, scraped
+separately (usually by kube-prometheus's `kubelet` `ServiceMonitor`) — included here
+because it is the signal that maps to the pod memory limit (and therefore the right
+one to compare against the [Per-entry footprint](#per-entry-memory-footprint) table).
 
 | Signal | Series | Source | What it tells you |
 |---|---|---|---|
 | Steady-state size | `inferencecache_index_entries{model}` | server `/metrics` | **Distinct prefix keys per model** — not total replica×prefix entries. A prefix held by R replicas counts once here. Use this for trend / hit-rate work; it is **not** a direct cap-closeness signal in multi-replica setups (see next row). |
 | Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | server `/metrics` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
-| Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | server `/metrics` | A tenant is exceeding `spec.quota.maxIndexEntries`. Usually fine (Fairness), but a sustained signal means the quota is too tight for the workload. |
+| Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | server `/metrics` | A tenant is exceeding `spec.quota.maxIndexEntries`. **A bounded, non-zero rate is normal Fairness behavior** (ingest pushes over → eviction trims back). Concern only if the rate climbs without bound — see [Watch and adjust](#3-watch-and-adjust) for the full nuance. |
 | TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | server `/metrics` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `index_entries` falling = the workload is shrinking. |
 | Pod working set (≈ what counts against the memory limit) | `container_memory_working_set_bytes{pod="inference-cache-server-..."}` | **kubelet/cAdvisor** (not the server) | This is what kubelet uses to OOM-kill the pod, so it is the right signal to compare against the pod memory limit. It is NOT strictly RSS (working set ≈ RSS + active anonymous pages, minus tmpfs). For literal RSS, scrape `container_memory_rss` or the Go-runtime `process_resident_memory_bytes` instead — both run a bit lower than working set. Compare either against the [Per-entry footprint](#per-entry-memory-footprint) table (which reports the harness's `Maxrss` high-water mark — a peak-RSS figure, not steady-state). |
 
@@ -293,9 +293,11 @@ After a representative workload window (typically one peak hour + one trough):
   index after that check; otherwise look at metrics registry, snapshot cache, or recent
   code changes.
 
-### 4. The escape hatch (without rebuilding)
+### 4. Reduce the admitted working set (without rebuilding)
 
-If you genuinely need more than 1M entries and don't want to rebuild the server:
+The two levers below **don't let you exceed the 1M global cap** — only a rebuild does
+that. What they do is trim the workload down so it fits under the cap, removing the
+cap-eviction pressure that would otherwise be the binding constraint:
 
 - **Shorter TTL** trims steady-state. A namespace seeing 100K new prefixes/min at
   TTL=30m steady-states at 3M; the same workload at TTL=10m steady-states at 1M.
