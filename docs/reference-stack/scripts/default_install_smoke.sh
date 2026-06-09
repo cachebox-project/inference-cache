@@ -465,20 +465,26 @@ server_mem_limit=$(kubectl -n "$NAMESPACE" get deployment/inference-cache-server
 mem_to_bytes() {
   # Strips a K8s memory quantity suffix (Ki/Mi/Gi/Ti or k/M/G/T) and emits bytes.
   # Returns 0 on unparseable input — caller treats 0 as "below threshold" and
-  # fails noisily.
-  local v="$1"
+  # fails noisily. Uses awk for the multiply so fractional quantities like
+  # 1.5Gi don't trip bash integer arithmetic (which would crash the gate
+  # instead of failing it cleanly).
+  local v="$1" n factor
   case "$v" in
-    *Ki) echo $(( ${v%Ki} * 1024 )) ;;
-    *Mi) echo $(( ${v%Mi} * 1024 * 1024 )) ;;
-    *Gi) echo $(( ${v%Gi} * 1024 * 1024 * 1024 )) ;;
-    *Ti) echo $(( ${v%Ti} * 1024 * 1024 * 1024 * 1024 )) ;;
-    *k)  echo $(( ${v%k} * 1000 )) ;;
-    *M)  echo $(( ${v%M} * 1000 * 1000 )) ;;
-    *G)  echo $(( ${v%G} * 1000 * 1000 * 1000 )) ;;
-    *T)  echo $(( ${v%T} * 1000 * 1000 * 1000 * 1000 )) ;;
-    *[0-9]) echo "$v" ;;
-    *) echo 0 ;;
+    *Ki) n=${v%Ki}; factor=1024 ;;
+    *Mi) n=${v%Mi}; factor=$((1024 * 1024)) ;;
+    *Gi) n=${v%Gi}; factor=$((1024 * 1024 * 1024)) ;;
+    *Ti) n=${v%Ti}; factor=$((1024 * 1024 * 1024 * 1024)) ;;
+    *k)  n=${v%k};  factor=1000 ;;
+    *M)  n=${v%M};  factor=$((1000 * 1000)) ;;
+    *G)  n=${v%G};  factor=$((1000 * 1000 * 1000)) ;;
+    *T)  n=${v%T};  factor=$((1000 * 1000 * 1000 * 1000)) ;;
+    *) n=$v; factor=1 ;;
   esac
+  awk -v n="$n" -v f="$factor" 'BEGIN {
+    # awk parses leading numerics; "garbage" becomes 0, "1.5" stays 1.5.
+    # printf "%.0f" rounds the product back to an integer byte count.
+    printf "%.0f\n", n * f
+  }'
 }
 server_mem_bytes=$(mem_to_bytes "$server_mem_limit")
 min_bytes=$(( 1024 * 1024 * 1024 ))   # 1 GiB

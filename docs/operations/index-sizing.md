@@ -52,7 +52,8 @@ so reaching for a larger footprint needs a recompile today.
 ## Per-entry memory footprint
 
 **Two units that get conflated.** The CRD field name `maxIndexEntries`, the snapshot
-field `tenants[].indexEntries`, and the metric `inferencecache_index_entries{model}` all
+field `tenants[].indexEntries`, and the metric `inferencecache_index_entries` (with a
+`model` label, e.g. `inferencecache_index_entries{model="meta-llama/Llama-3"}`) all
 count **distinct prefix keys** — one per `(tenant, model, hash_scheme, prefix_hash)`,
 regardless of how many replicas hold it. The internal `pkg/index.DefaultMaxEntries` cap,
 by contrast, counts **total storage entries** — one per `(prefix_key, replica)` tuple.
@@ -136,6 +137,15 @@ subscriber maps each `BlockStored` event into one `PrefixEntry` per block hash (
 each with a cumulative `token_count`. A 1000-token prompt at vLLM's 16-token block size
 produces ~63 block hashes (`ceil(1000/16)`), which becomes ~63 entries per replica. Plan
 for this expansion, not the single-blob shape, when sizing.
+
+**Edge case: chain entries that also co-set `prefix_hash`.** A producer is allowed to
+report both representations on the same `PrefixEntry` — the chain (`BlockHashes` +
+`BlockTokenCounts`) for the longest-prefix matcher AND the legacy single-blob
+`PrefixHash` for unmigrated callers. When that happens, the index keeps both: N
+per-block entries plus 1 legacy single-blob entry, so the per-replica cost is **N+1**,
+not N. The vLLM mapper above does NOT co-set today (it emits per-block PrefixEntries
+without a chain field on each), so most operators won't see this. But if a future
+adapter mixes the two, plan for the +1.
 
 ### Worked example — a chatbot that overshoots the cap
 
