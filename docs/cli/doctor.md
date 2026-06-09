@@ -158,20 +158,21 @@ Table — one row per finding (`STATUS  CODE  CHECK  RESOURCE  MESSAGE`).
 | `--snapshot-token-file` | in-cluster SA token path | bearer token presented to `/snapshot` |
 | `-o, --output` | `human` | `human`, `json`, or `table` |
 | `--no-color` | off | disable ANSI color |
-| `--config-only` | off | skip the live endpoint probes (checks 1–3); run only the cluster-config checks |
+| `--config-only` | off | skip the live endpoint probes (server gRPC health, `/snapshot`, `/policy`, `/probe`); run only the cluster-config checks |
 | `--timeout` | `30s` | overall run timeout |
 
 ## Running in-cluster vs. from a workstation
 
-The declarative Kubernetes-config checks (4–8, minus check 4's TCP dial) work
-from anywhere your kubeconfig can reach the apiserver. The live endpoint probes
-(1–3) and check 4's `status.endpoint` TCP dial need network reachability to the
-cache-plane server's
-gRPC `:9090` / snapshot-policy `:8081` ports and to each backend's endpoint —
-which from a workstation are usually in-cluster Service DNS / ClusterIPs that do
-not resolve. `--config-only` skips the endpoint probes (1–3) and check 4's TCP
-dial (it still validates `status.endpoint` is published), so it is the right
-mode from a workstation without a port-forward:
+The declarative Kubernetes-config checks (per-CacheBackend health, injection
+audit, orphan-pod, CacheTenant, CachePolicy — minus the per-CacheBackend TCP
+dial) work from anywhere your kubeconfig can reach the apiserver. The live
+endpoint probes (server gRPC health, `/snapshot`, `/policy`, `/probe`) and the
+per-CacheBackend `status.endpoint` TCP dial need network reachability to the
+cache-plane server's gRPC `:9090` / snapshot-policy-probe `:8081` ports and to
+each backend's endpoint — which from a workstation are usually in-cluster
+Service DNS / ClusterIPs that do not resolve. `--config-only` skips the endpoint
+probes and the per-CacheBackend TCP dial (it still validates `status.endpoint`
+is published), so it is the right mode from a workstation without a port-forward:
 
 - **In-cluster** (e.g. a debug pod): the server is discovered by Service DNS and
   reached directly.

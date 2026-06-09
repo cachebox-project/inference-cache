@@ -85,7 +85,7 @@ without probing the live server endpoints.`,
 	f.StringVar(&opts.tokenFile, "snapshot-token-file", opts.tokenFile, "Path to a ServiceAccount bearer token presented to /snapshot. Missing file => unauthenticated probe (flagged in output).")
 	f.StringVarP(&opts.outputFormat, "output", "o", opts.outputFormat, "Output format: human, json, or table.")
 	f.BoolVar(&opts.noColor, "no-color", false, "Disable ANSI color in human output (color is auto-disabled when stdout is not a TTY).")
-	f.BoolVar(&opts.configOnly, "config-only", false, "Skip the live server endpoint probes (checks 1-3); run only the cluster-configuration checks.")
+	f.BoolVar(&opts.configOnly, "config-only", false, "Skip the live server endpoint probes (gRPC health, /snapshot, /policy, /probe); run only the cluster-configuration checks.")
 	f.DurationVar(&opts.timeout, "timeout", opts.timeout, "Overall timeout for the diagnostic run.")
 	return cmd
 }
@@ -122,9 +122,9 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 		grpcTarget, snapshotURL, policyURL, probeURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
 		if err != nil {
 			// Don't abort: the cluster-configuration checks still provide value,
-			// and leaving the endpoint deps nil makes checks 1-3 emit structured
-			// FAIL findings (exit 2) — consistent with a server that is down,
-			// rather than a bare error on a separate channel.
+			// and leaving the endpoint deps nil makes the live endpoint checks
+			// emit structured FAIL findings (exit 2) — consistent with a server
+			// that is down, rather than a bare error on a separate channel.
 			fmt.Fprintf(os.Stderr, "warning: %v; skipping live server endpoint probes\n", err)
 		} else {
 			conn, err := grpccreds.NewClient(grpcTarget, grpccreds.WithTransportCredentials(insecure.NewCredentials()))
