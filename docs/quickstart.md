@@ -69,6 +69,18 @@ at the top of the recipe.)
 > are exempt from this gate — they go Ready as soon as admission accepts the
 > endpoint.)
 
+> **A second readiness gate composes on top.** Once the KV-event gate above
+> clears, the controller runs a synthetic functional self-test (publish a
+> known prefix → look it up → optional tier-2 round-trip) and publishes a
+> `FunctionalProbeOK` condition on the CR. Stages `ok` → `Ready=True` stays;
+> a per-stage failure downgrades `Ready=False` with a stage-specific reason
+> (`ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`). The gate
+> is cascade-prevented — `FunctionalProbeOK` does **not** appear while the
+> upstream KV-event gate is still pending. Disabled by passing
+> `--server-probe-url=""` to the controller (the condition then never
+> appears); External backends are exempt from this gate too. See
+> [Troubleshooting](#troubleshooting) for the per-reason runbook.
+
 ## What you get
 
 Once the backend is Ready and engine pods are bound, three things are live:
@@ -110,3 +122,86 @@ Once the backend is Ready and engine pods are bound, three things are live:
   the `recipe-gpu-production.yaml` recipe shows a production CachePolicy.
 - **Full field reference** — `kubectl explain cachebackend.spec` (and
   `cachepolicy.spec`, `cachetenant.spec`) for every field and its defaults.
+
+## Troubleshooting
+
+A managed backend's `Ready` status is the composition of three gates
+(managed-readiness → KV-event gate → functional-probe gate), so the first
+two columns of `kubectl get cachebackend` only tell half the story.
+`kubectl get cachebackend <name> -o yaml` and scan
+`.status.conditions[]` for which gate is unhappy. The condition `.reason`
+is the actionable string.
+
+### `Ready=False` / `AwaitingFirstKVEvent`
+
+The KV-event gate is still waiting for the first KV event. Common causes:
+
+- The controller is running with `--kvevent-subscriber-image` unset (the
+  default). No subscriber sidecar is injected, so no events ever flow.
+  Set the flag on the controller Deployment.
+- The subscriber sidecar is present but cannot reach the engine's
+  KV-event publisher. Check the subscriber pod's logs for ZMQ connect
+  errors; verify the engine container has `--kv-events-config` set
+  (see the `recipe-*` samples for the canonical shape).
+- The engine container is running but has not received any prompts yet
+  (the first BlockStored is published on the first request). Send a
+  single chat completion through the engine and re-check.
+
+If `firstEventTimeout` elapses (default `5m`) without an event, the
+condition flips to `Ready=False / NoKVEventsObserved` and `Degraded=True`;
+diagnostic steps are the same.
+
+### `Ready=False` / `Probe*Failed` (with `FunctionalProbeOK=False`)
+
+The KV-event gate cleared (real engine pods reported state) but the
+controller's synthetic functional round-trip failed. Read the
+condition's `.message` first — the controller embeds the server's
+stage-specific diagnostic. By `.reason`:
+
+| `.reason` | Stage | What it means | First-response |
+|---|---|---|---|
+| `ProbeIngestFailed` | publish | The server's in-process index `Ingest` path is dropping writes. Does **not** indicate a subscriber problem — that path isn't exercised by the probe. | Check the server's `inferencecache_index_entries` gauge; look at server logs for `pkg/index` errors. Confirm `inferencecache_server_up == 1`. |
+| `ProbeRoutingFailed` | lookup | The index recorded the probe entry but `LookupRoute` returned `NO_HINT`. Likely an index-key-scheme mismatch (the probe's `hashScheme` derives from `spec.integration.engine`; default `vllm`) or a lookup-filter regression. | Check `inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}` for the affected backend. Confirm `spec.integration.engine` is a known runtime ID (`vllm` or `sglang`); a typo silently fails open and produces NO_HINT. |
+| `ProbeT2Failed` | tier-2 | The tier-2 put/get cycle failed (LMCache, today). Only reachable when a `T2Prober` is wired into the server — none is registered in the current revision, so this condition does **not** appear on a clean install. | Will be applicable once a `T2Prober` ships; not actionable today. |
+
+### `FunctionalProbeOK=Unknown` / `ProbeError`
+
+The controller could not reach the server's `/probe` endpoint at all
+(transport error, 5xx, audience-bound TokenReview rejected the call). A
+brief server outage produces this state without flapping `Ready` —
+**unless** `FunctionalProbeOK` is *already* `False/Probe*Failed`, in
+which case the prior stage failure is sticky and `Ready` stays
+downgraded (a transient server outage must not mask a real regression
+by fading the condition back to `Unknown` and then to `Ready=True`).
+
+First-response:
+
+- Check that `--server-probe-url` is reachable from the controller pod
+  (intra-cluster `inference-cache-server:8081` by default).
+- Verify the projected SA token is mounted at
+  `/var/run/secrets/inferencecache.io/controller-token/token`.
+- Confirm the audience-bound TokenReview accepts the controller SA —
+  the server's `--controller-audience` flag must equal
+  `inferencecache.io/controller`. A mismatch surfaces as repeated
+  `ProbeError` on every reconcile.
+
+### `FunctionalProbeOK=True` / `ProbeBypassed`
+
+An operator has annotated the CR with
+`inferencecache.io/skip-functional-probe: "true"`. The probe is
+skipped entirely and the gate does not downgrade `Ready`. Remove the
+annotation when you no longer need the bypass — a bypassed backend
+with a real regression still ships broken cache state.
+
+### `FunctionalProbeOK` is missing from `.status.conditions[]`
+
+Three possible causes:
+
+- The upstream KV-event gate hasn't cleared yet (the more common case).
+  The probe gate is cascade-prevented from running until the upstream
+  reports `Ready=True`; resolve the KV-event gate first.
+- The controller is wired with `--server-probe-url=""` (functional
+  probing is disabled). Any stale `FunctionalProbeOK` is also cleared
+  on the next reconcile in this mode.
+- The CR is `spec.type: External` or running an unsupported runtime —
+  the probe gate is exempt from External + Unmanaged paths.

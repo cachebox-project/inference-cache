@@ -25,6 +25,9 @@
 # reaches Ready=True and reports index entries only when the kvevent-subscriber
 # sidecar is auto-attached — that requires the controller to run with
 # --kvevent-subscriber-image set (empty by default). See docs/quickstart.md.
+# Once the KV-event gate clears, the FunctionalProbeOK gate composes on top —
+# a per-stage probe failure surfaces Ready=False / Probe*Failed. See the
+# Troubleshooting section of docs/quickstart.md.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
