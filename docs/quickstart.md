@@ -102,12 +102,17 @@ Once the backend is Ready and engine pods are bound, three things are live:
   ```
 
   `READY` flips to `True` only after the managed-readiness baseline
-  (pods Up, Service endpoints) **plus** both post-rollout gates pass:
-  a real KV event has been observed (not merely the pod being
-  reachable) AND the controller's synthetic functional self-test
-  round-trips cleanly. Any of these gates can hold the backend at
-  `Ready=False` with a stage-specific reason on
-  `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
+  (pods Up, Service endpoints) **and** the KV-event gate (a real
+  event observed, not merely the pod being reachable) **and** —
+  *when functional probing is enabled and not bypassed* — the
+  controller's synthetic functional self-test round-trips cleanly.
+  The functional-probe gate can be disabled cluster-wide
+  (`--server-probe-url=""`) or skipped per-CR via the
+  `inferencecache.io/skip-functional-probe: "true"` annotation; in
+  either of those states the gate cannot hold `Ready=False`. Any
+  active gate can hold the backend at `Ready=False` with a
+  stage-specific reason on `.status.conditions[]` — see
+  [Troubleshooting](#troubleshooting).
   `MATCHED` is the engine-pod count the selector binds, and
   `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 
