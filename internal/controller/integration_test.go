@@ -118,6 +118,21 @@ func getRV(t *testing.T, r *CacheBackendReconciler, name, namespace string, obj 
 
 func ptrBool(v bool) *bool { return &v }
 
+type getObservingClient struct {
+	client.Client
+	onGet func(types.NamespacedName, client.Object)
+}
+
+func (c *getObservingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	if c.onGet != nil {
+		// Record attempts, including NotFound, so the watch drain sees stale
+		// queued reconciles that would recreate a deleted child.
+		c.onGet(types.NamespacedName(key), obj)
+	}
+	return err
+}
+
 // pollDeployment waits for a Deployment to exist at key, returning its UID.
 func pollDeployment(t *testing.T, k8s client.Client, key types.NamespacedName, what string) string {
 	t.Helper()
@@ -478,6 +493,22 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 		if len(hpaList.Items) != 0 {
 			t.Fatalf("HPAs after clearing autoscaling = %d, want 0", len(hpaList.Items))
+		}
+	})
+
+	t.Run("HPANoChurnAgainstRealDefaulting", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(ctx, autoscalingBackend("cache", ns, 2, 5, ptrInt32(60))); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		// Two reconciles to converge any first-write differences before the RV snapshot.
+		reconcile(t, r, "cache", ns)
+		hpaRV := getRV(t, r, "cache", ns, &autoscalingv2.HorizontalPodAutoscaler{})
+
+		reconcile(t, r, "cache", ns)
+		if got := getRV(t, r, "cache", ns, &autoscalingv2.HorizontalPodAutoscaler{}); got != hpaRV {
+			t.Fatalf("HPA churned: RV %s -> %s", hpaRV, got)
 		}
 	})
 
@@ -1016,8 +1047,8 @@ func TestIntegrationCacheBackendMatchedEnginePods(t *testing.T) {
 }
 
 // TestIntegrationCacheBackendWatch runs a real manager so the Owns(...) watches
-// are exercised end to end: deleting the managed Deployment re-triggers
-// reconcile and the controller recreates it.
+// are exercised end to end: deleting managed Deployment/HPA children re-triggers
+// reconcile and the controller recreates them.
 func TestIntegrationCacheBackendWatch(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, cfg := startEnv(t)
@@ -1032,8 +1063,21 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if err := (&CacheBackendReconciler{
+	hpaGets := make(chan types.NamespacedName, 100)
+	observedClient := &getObservingClient{
 		Client: mgr.GetClient(),
+		onGet: func(key types.NamespacedName, obj client.Object) {
+			if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); !ok {
+				return
+			}
+			select {
+			case hpaGets <- key:
+			default:
+			}
+		},
+	}
+	if err := (&CacheBackendReconciler{
+		Client: observedClient,
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
 	}).SetupWithManager(mgr); err != nil {
@@ -1051,43 +1095,158 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 		t.Fatalf("cache did not sync")
 	}
 
-	ns := freshNS(t, k8s)
-	if err := k8s.Create(context.Background(), lmcacheBackend("cache", ns)); err != nil {
-		t.Fatalf("create CacheBackend: %v", err)
-	}
-
-	key := types.NamespacedName{Name: "cache", Namespace: ns}
-	waitForDeployment := func(what string) string {
+	waitForHPA := func(t *testing.T, key types.NamespacedName, what string) string {
 		t.Helper()
 		deadline := time.Now().Add(20 * time.Second)
 		for time.Now().Before(deadline) {
-			var dep appsv1.Deployment
-			if err := k8s.Get(context.Background(), key, &dep); err == nil {
-				return string(dep.UID)
+			var hpa autoscalingv2.HorizontalPodAutoscaler
+			if err := k8s.Get(context.Background(), key, &hpa); err == nil {
+				return string(hpa.UID)
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		t.Fatalf("timed out waiting for deployment to %s", what)
+		t.Fatalf("timed out waiting for HPA to %s", what)
 		return ""
 	}
-
-	originalUID := waitForDeployment("be created by the manager")
-
-	// Delete the child; the Owns() watch must re-trigger reconcile and recreate it.
-	if err := k8s.Delete(context.Background(), &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: ns},
-	}); err != nil {
-		t.Fatalf("delete deployment: %v", err)
-	}
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		var dep appsv1.Deployment
-		if err := k8s.Get(context.Background(), key, &dep); err == nil && string(dep.UID) != originalUID {
-			return // recreated with a new UID — Owns(Deployment) watch re-trigger confirmed
+	waitForObservedGeneration := func(t *testing.T, key types.NamespacedName, want int64) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			var live cachev1alpha1.CacheBackend
+			if err := k8s.Get(context.Background(), key, &live); err == nil && live.Status.ObservedGeneration >= want {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		time.Sleep(200 * time.Millisecond)
+		t.Fatalf("timed out waiting for CacheBackend %s/%s observedGeneration to reach %d", key.Namespace, key.Name, want)
 	}
-	t.Fatalf("deployment was not recreated after deletion (Owns watch did not re-trigger)")
+	drainHPAGetEvents := func() {
+		for {
+			select {
+			case <-hpaGets:
+			default:
+				return
+			}
+		}
+	}
+	waitForHPAGet := func(t *testing.T, key types.NamespacedName, what string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case got := <-hpaGets:
+				if got == key {
+					return
+				}
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		t.Fatalf("timed out waiting for reconciler to get HPA %s/%s (%s)", key.Namespace, key.Name, what)
+	}
+	waitForQuietHPAGets := func(t *testing.T, key types.NamespacedName, quietFor time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		quietUntil := time.Now().Add(quietFor)
+		for {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for reconciler HPA gets on %s/%s to go quiet", key.Namespace, key.Name)
+			}
+			remainingQuiet := time.Until(quietUntil)
+			if remainingQuiet <= 0 {
+				return
+			}
+			select {
+			case got := <-hpaGets:
+				if got == key {
+					quietUntil = time.Now().Add(quietFor)
+				}
+			case <-time.After(remainingQuiet):
+				return
+			}
+		}
+	}
+
+	t.Run("OwnsDeploymentWatchRecreatesDeletedChild", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(context.Background(), lmcacheBackend("cache", ns)); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+
+		key := types.NamespacedName{Name: "cache", Namespace: ns}
+		originalUID := pollDeployment(t, k8s, key, "be created by the manager")
+
+		// Delete the child; the Owns() watch must re-trigger reconcile and recreate it.
+		if err := k8s.Delete(context.Background(), &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: ns},
+		}); err != nil {
+			t.Fatalf("delete deployment: %v", err)
+		}
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			var dep appsv1.Deployment
+			if err := k8s.Get(context.Background(), key, &dep); err == nil && string(dep.UID) != originalUID {
+				return // recreated with a new UID — Owns(Deployment) watch re-trigger confirmed
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Fatalf("deployment was not recreated after deletion (Owns watch did not re-trigger)")
+	})
+
+	t.Run("OwnsHPAWatchRecreatesDeletedChild", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(context.Background(), autoscalingBackend("cache", ns, 2, 5, ptrInt32(60))); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+
+		key := types.NamespacedName{Name: "cache", Namespace: ns}
+		waitForHPA(t, key, "be created by the manager")
+
+		// Drain the initial create/status/owned-child event burst before deleting
+		// the HPA. Otherwise an already-queued parent/Deployment reconcile could
+		// recreate the HPA and make this test pass even if Owns(HPA) were absent.
+		//
+		// The drain waits for a known spec-driven reconcile to reach the HPA, then
+		// waits for HPA reads to go quiet. It deliberately does not require a
+		// status-only parent reconcile; that keeps the test valid if the parent
+		// watch is ever narrowed to generation-changing updates.
+		drainHPAGetEvents()
+		var live cachev1alpha1.CacheBackend
+		if err := k8s.Get(context.Background(), key, &live); err != nil {
+			t.Fatalf("get CacheBackend before drain update: %v", err)
+		}
+		beforeGeneration := live.Generation
+		if live.Spec.BackendConfig == nil {
+			live.Spec.BackendConfig = map[string]string{}
+		}
+		live.Spec.BackendConfig["testDrain"] = time.Now().Format(time.RFC3339Nano)
+		if err := k8s.Update(context.Background(), &live); err != nil {
+			t.Fatalf("update CacheBackend to drain initial queue: %v", err)
+		}
+		if live.Generation <= beforeGeneration {
+			t.Fatalf("drain update did not advance generation: %d -> %d", beforeGeneration, live.Generation)
+		}
+		waitForObservedGeneration(t, key, live.Generation)
+		waitForHPAGet(t, key, "drain spec update reconcile")
+		waitForQuietHPAGets(t, key, 500*time.Millisecond)
+
+		originalUID := waitForHPA(t, key, "remain after the drain reconcile")
+
+		// Delete the child; the Owns() watch must re-trigger reconcile and recreate it.
+		if err := k8s.Delete(context.Background(), &autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: ns},
+		}); err != nil {
+			t.Fatalf("delete HPA: %v", err)
+		}
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			var hpa autoscalingv2.HorizontalPodAutoscaler
+			if err := k8s.Get(context.Background(), key, &hpa); err == nil && string(hpa.UID) != originalUID {
+				return // recreated with a new UID — Owns(HPA) watch re-trigger confirmed
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Fatalf("HPA was not recreated after deletion (Owns watch did not re-trigger)")
+	})
 }
 
 // TestIntegrationCacheIndexPollerProjectsParticipation exercises the poller
