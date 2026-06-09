@@ -110,14 +110,23 @@ Once the backend is Ready and engine pods are bound, three things are live:
   (pods Up, Service endpoints) **and** the KV-event gate (a real
   event observed, not merely the pod being reachable). When functional
   probing is enabled and not bypassed, a per-stage *failed* probe
-  outcome additionally downgrades `Ready=False` — but the gate is
-  fail-soft on transport/HTTP errors: a `/probe` call that never
-  completes publishes `FunctionalProbeOK=Unknown/ProbeError` and
-  leaves `Ready` alone (so a transient server outage cannot mask a
-  pre-existing `Probe*Failed` — see Troubleshooting's sticky-False
-  semantics, and a transient outage with no prior failure does NOT
-  hold a backend out of `Ready=True`). The functional-probe gate can
-  also be disabled cluster-wide (`--server-probe-url=""`) or skipped
+  outcome additionally downgrades `Ready=False`. On a `/probe`
+  transport/HTTP error the gate is fail-soft AND sticky in two
+  distinct ways depending on prior state:
+  - If no `FunctionalProbeOK` is present, or it's currently `True`,
+    a transport error publishes
+    `FunctionalProbeOK=Unknown/ProbeError` and leaves `Ready`
+    alone — a transient server outage does NOT hold an otherwise-Ready
+    backend out of `Ready=True`.
+  - If `FunctionalProbeOK=False/Probe*Failed` is already published,
+    a transport error preserves the False condition AND keeps
+    `Ready=False` with the prior stage reason. The False is sticky
+    until a successful probe explicitly resolves it — a transient
+    server outage must NOT mask a known per-stage regression by
+    fading the condition to `Unknown` and then to `Ready=True`.
+
+  The functional-probe gate can also be disabled cluster-wide
+  (`--server-probe-url=""`) or skipped
   per-CR via the `inferencecache.io/skip-functional-probe: "true"`
   annotation. Any active gate that reports a per-stage failure can
   hold the backend at `Ready=False` with a stage-specific reason on
@@ -146,8 +155,8 @@ Once the backend is Ready and engine pods are bound, three things are live:
 ## Troubleshooting
 
 A managed backend's `Ready` status is the composition of three gates
-(managed-readiness → KV-event gate → functional-probe gate), so the first
-two columns of `kubectl get cachebackend` only tell half the story.
+(managed-readiness → KV-event gate → functional-probe gate), so the
+`READY` column of `kubectl get cachebackend` only tells half the story.
 `kubectl get cachebackend <name> -o yaml` and scan
 `.status.conditions[]` for which gate is unhappy. The condition `.reason`
 is the actionable string.
