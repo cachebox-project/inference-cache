@@ -162,10 +162,18 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 256Mi
+              # Sized to fit the default DefaultMaxEntries=1,000,000 cap at
+              # ~540 MiB peak RSS plus headroom (see
+              # docs/operations/index-sizing.md). Operators on small workloads
+              # can dial this down; operators on large workloads should bump
+              # both this and DefaultMaxEntries.
+              memory: 1Gi
             requests:
               cpu: 50m
-              memory: 64Mi
+              # Low floor on scheduling — the request only matters for binpacking,
+              # not the OOM threshold; limit above is what counts against pod-level
+              # memory pressure.
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
