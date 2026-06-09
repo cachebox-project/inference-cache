@@ -72,7 +72,10 @@ at the top of the recipe.)
 > **A second readiness gate composes on top.** Once the KV-event gate above
 > clears, the controller runs a synthetic functional self-test (publish a
 > known prefix → look it up → optional tier-2 round-trip) and publishes a
-> `FunctionalProbeOK` condition on the CR. Stages `ok` → `Ready=True` stays;
+> `FunctionalProbeOK` condition on the CR. Every stage `ok` or
+> `skipped` (the passing states `ProbeResult.AllPassed` accepts; today's
+> clean installs report `t2=skipped` because no `T2Prober` is wired) →
+> `Ready=True` stays;
 > a per-stage failure downgrades `Ready=False` with a stage-specific reason
 > (`ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`). The gate
 > is cascade-prevented — `FunctionalProbeOK` does **not** appear while the
@@ -103,16 +106,20 @@ Once the backend is Ready and engine pods are bound, three things are live:
 
   `READY` flips to `True` only after the managed-readiness baseline
   (pods Up, Service endpoints) **and** the KV-event gate (a real
-  event observed, not merely the pod being reachable) **and** —
-  *when functional probing is enabled and not bypassed* — the
-  controller's synthetic functional self-test round-trips cleanly.
-  The functional-probe gate can be disabled cluster-wide
-  (`--server-probe-url=""`) or skipped per-CR via the
-  `inferencecache.io/skip-functional-probe: "true"` annotation; in
-  either of those states the gate cannot hold `Ready=False`. Any
-  active gate can hold the backend at `Ready=False` with a
-  stage-specific reason on `.status.conditions[]` — see
-  [Troubleshooting](#troubleshooting).
+  event observed, not merely the pod being reachable). When functional
+  probing is enabled and not bypassed, a per-stage *failed* probe
+  outcome additionally downgrades `Ready=False` — but the gate is
+  fail-soft on transport/HTTP errors: a `/probe` call that never
+  completes publishes `FunctionalProbeOK=Unknown/ProbeError` and
+  leaves `Ready` alone (so a transient server outage cannot mask a
+  pre-existing `Probe*Failed` — see Troubleshooting's sticky-False
+  semantics, and a transient outage with no prior failure does NOT
+  hold a backend out of `Ready=True`). The functional-probe gate can
+  also be disabled cluster-wide (`--server-probe-url=""`) or skipped
+  per-CR via the `inferencecache.io/skip-functional-probe: "true"`
+  annotation. Any active gate that reports a per-stage failure can
+  hold the backend at `Ready=False` with a stage-specific reason on
+  `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
   `MATCHED` is the engine-pod count the selector binds, and
   `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 
