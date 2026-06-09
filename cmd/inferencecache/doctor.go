@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -230,9 +231,17 @@ func resolveEndpoints(ctx context.Context, c client.Client, override string) (gr
 // there, else a cluster-wide search.
 func findServerServiceNamespace(ctx context.Context, c client.Client) (string, error) {
 	var svc corev1.Service
-	if err := c.Get(ctx, client.ObjectKey{Namespace: defaultSystemNamespace, Name: defaultServerService}, &svc); err == nil {
+	err := c.Get(ctx, client.ObjectKey{Namespace: defaultSystemNamespace, Name: defaultServerService}, &svc)
+	switch {
+	case err == nil:
 		return defaultSystemNamespace, nil
+	case !apierrors.IsNotFound(err):
+		// A real read failure (Forbidden, timeout, apiserver error) must not be
+		// masked as "not in the system namespace" — surface it so the operator
+		// fixes the actual problem instead of chasing a misleading discovery error.
+		return "", fmt.Errorf("get Service %s/%s: %w", defaultSystemNamespace, defaultServerService, err)
 	}
+	// NotFound in the system namespace → fall back to a cluster-wide search.
 	var svcs corev1.ServiceList
 	if err := c.List(ctx, &svcs); err != nil {
 		return "", fmt.Errorf("list Services to discover %q: %w", defaultServerService, err)

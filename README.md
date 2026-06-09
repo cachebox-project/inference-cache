@@ -4,7 +4,8 @@ A Kubernetes-native cache plane for LLM inference.
 
 ## Repository layout
 
-One operator, split across two binaries plus the CRDs.
+One operator, split across two control-plane binaries (controller + server) plus
+the operator CLI and the CRDs.
 
 **CRDs — the API**
 - `api/v1alpha1/` — Go types (`CacheBackend`; `CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex` as they land) + generated deepcopy

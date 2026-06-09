@@ -118,14 +118,20 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		// Fall back to the controller-emitted Event, matched to THIS pod's UID so
 		// an old Event left over from a same-named, recreated pod cannot mark a
 		// freshly-uninjected pod as healthy. The index was built from a single
-		// scope-wide Event scan above (both event APIs).
+		// scope-wide Event scan above (both event APIs). Unlike the annotation,
+		// the Event does NOT record which backend injected the pod — it only
+		// proves the cache plane injected it. So the message deliberately does
+		// not claim the currently-matched backend did the injecting (injection is
+		// sticky to pod CREATE, but a pod's labels can later drift to match a
+		// different backend); the inferencecache.io/injected-by annotation is the
+		// authoritative per-backend signal.
 		if _, injected := injectedPodUIDs[pod.UID]; injected {
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodeEnginePodInjected,
 				Status:   doctor.StatusOK,
 				Check:    checkEnginePodInjection,
 				Resource: ref,
-				Message:  fmt.Sprintf("engine pod matched CacheBackend %q and carries an InjectedByCacheBackend Event for its current UID", matched.backend),
+				Message:  fmt.Sprintf("engine pod matches CacheBackend %q (engineSelector) and carries an InjectedByCacheBackend Event for its current UID — it was injected by the cache plane (the Event does not record which backend; the inferencecache.io/injected-by annotation is the authoritative per-backend signal and is absent or unvalidated here)", matched.backend),
 			})
 		} else {
 			findings = append(findings, doctor.Finding{
