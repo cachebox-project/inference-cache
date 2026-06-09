@@ -159,6 +159,11 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
+#  15. The operator `inferencecache doctor` CLI runs end-to-end against the live
+#      install: build the binary, apply a CacheBackend, run the config-only
+#      checks, and assert it emits the documented JSON envelope, surfaces a
+#      CacheBackend (CB0xx) finding, and exits with a code matching the reported
+#      summary.exitCode (the CI-gating contract).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
