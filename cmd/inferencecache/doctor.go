@@ -11,7 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
-	grpccreds "google.golang.org/grpc"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	corev1 "k8s.io/api/core/v1"
@@ -131,7 +131,7 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 			// that is down, rather than a bare error on a separate channel.
 			fmt.Fprintf(os.Stderr, "warning: %v; skipping live server endpoint probes\n", err)
 		} else {
-			conn, err := grpccreds.NewClient(grpcTarget, grpccreds.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.NewClient(grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				return fmt.Errorf("dial server gRPC %q: %w", grpcTarget, err)
 			}

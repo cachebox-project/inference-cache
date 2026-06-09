@@ -902,6 +902,21 @@ func TestCachePolicyCoverage(t *testing.T) {
 		}
 	})
 
+	t.Run("duplicate policies are a WARN", func(t *testing.T) {
+		be := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "dup"}}
+		p1 := &cachev1alpha1.CachePolicy{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "dup"}}
+		p2 := &cachev1alpha1.CachePolicy{ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: "dup"}}
+		c := fakeClient(t, be, p1, p2)
+		fs := CachePolicyCoverage(ctx, c, "")
+		f := hasCode(fs, doctor.CodePolicyCoverageDuplicate)
+		if f == nil || f.Status != doctor.StatusWarn {
+			t.Fatalf("want CP003 WARN for 2 policies, got %v", codesOf(fs))
+		}
+		if hasCode(fs, doctor.CodePolicyCoveragePresent) != nil {
+			t.Fatalf("duplicate namespace must not also report CP002, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("backend list error", func(t *testing.T) {
 		c := listErrClient{Client: fakeClient(t), failOn: func(l client.ObjectList) bool {
 			_, ok := l.(*cachev1alpha1.CacheBackendList)

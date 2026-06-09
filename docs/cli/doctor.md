@@ -74,7 +74,8 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `CT001` | WARN | CacheTenant over quota (`QuotaExceeded=True`) |
 | `CT002` | OK | CacheTenant within quota |
 | `CP001` | INFO | namespace with CacheBackends has no CachePolicy (server defaults apply) |
-| `CP002` | OK | namespace has CachePolicy coverage |
+| `CP002` | OK | namespace has exactly one CachePolicy |
+| `CP003` | WARN | namespace has more than one CachePolicy (only the lexicographically-first is effective; the rest are inert) |
 
 Notes:
 

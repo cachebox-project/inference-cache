@@ -177,9 +177,14 @@ const (
 	// CodePolicyCoverageMissing: a namespace containing CacheBackends has no
 	// CachePolicy (server defaults apply — advisory, not an error).
 	CodePolicyCoverageMissing = "CP001"
-	// CodePolicyCoveragePresent: a namespace with CacheBackends has at least one
+	// CodePolicyCoveragePresent: a namespace with CacheBackends has exactly one
 	// CachePolicy.
 	CodePolicyCoveragePresent = "CP002"
+	// CodePolicyCoverageDuplicate: a namespace has more than one CachePolicy.
+	// Admission allows at most one per namespace but is best-effort (it can race
+	// concurrent CREATEs), and the controller deterministically keeps only the
+	// lexicographically-first — so the extras are inert and worth surfacing.
+	CodePolicyCoverageDuplicate = "CP003"
 )
 
 // Finding is a single diagnostic result. The struct doubles as the stable JSON

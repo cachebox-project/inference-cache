@@ -107,7 +107,8 @@ func CachePolicyCoverage(ctx context.Context, c client.Client, ns string) []doct
 
 	var findings []doctor.Finding
 	for _, n := range ordered {
-		if count := policyNamespaces[n]; count == 0 {
+		switch count := policyNamespaces[n]; {
+		case count == 0:
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodePolicyCoverageMissing,
 				Status:   doctor.StatusInfo,
@@ -115,13 +116,21 @@ func CachePolicyCoverage(ctx context.Context, c client.Client, ns string) []doct
 				Resource: "namespace/" + n,
 				Message:  fmt.Sprintf("namespace %q has CacheBackends but no CachePolicy — the server's default eviction/lookup policy applies", n),
 			})
-		} else {
+		case count > 1:
+			findings = append(findings, doctor.Finding{
+				Code:     doctor.CodePolicyCoverageDuplicate,
+				Status:   doctor.StatusWarn,
+				Check:    checkCachePolicyCoverage,
+				Resource: "namespace/" + n,
+				Message:  fmt.Sprintf("namespace %q has %d CachePolicies — at most one is allowed; the controller keeps only the lexicographically-first and the rest are inert. Delete the extras to avoid confusion about which policy is in effect", n, count),
+			})
+		default:
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodePolicyCoveragePresent,
 				Status:   doctor.StatusOK,
 				Check:    checkCachePolicyCoverage,
 				Resource: "namespace/" + n,
-				Message:  fmt.Sprintf("namespace %q has %d CachePolicy(ies)", n, count),
+				Message:  fmt.Sprintf("namespace %q has 1 CachePolicy", n),
 			})
 		}
 	}
