@@ -70,8 +70,10 @@ at the top of the recipe.)
 > endpoint.)
 
 > **A second readiness gate composes on top.** Once the KV-event gate above
-> clears, the controller runs a synthetic functional self-test (publish a
-> known prefix → look it up → optional tier-2 round-trip) and publishes a
+> clears, the controller runs a synthetic functional self-test (ingest a
+> synthetic prefix through the server's in-process `index.Ingest` → look
+> it up → optional tier-2 round-trip; the gRPC `PublishEvent` /
+> `ReportCacheState` subscriber path is NOT exercised) and publishes a
 > `FunctionalProbeOK` condition on the CR. Every stage `ok` or
 > `skipped` (the passing states `ProbeResult.AllPassed` accepts; today's
 > clean installs report `t2=skipped` because no `T2Prober` is wired) →
