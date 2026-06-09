@@ -176,7 +176,9 @@ spec:
               # somewhere it has room to grow into the 1Gi limit without becoming
               # the first eviction target under node memory pressure. Operators
               # running closer to the cap should bump both the request and the
-              # limit in lockstep.
+              # limit in lockstep — and, if they need MORE than the cap,
+              # DefaultMaxEntries is a compile-time constant in pkg/index, so
+              # exceeding it currently requires building a custom server image.
               memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false

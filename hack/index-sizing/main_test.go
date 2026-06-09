@@ -39,9 +39,10 @@ func TestEncodeHash(t *testing.T) {
 		})
 	}
 
-	// Distinctness sweep: the first 2^24 indices must produce 2^24 distinct
-	// 8-byte hashes — small enough to run fast, large enough that a wrong
-	// pack (e.g. truncating before bytes ran out) would collide.
+	// Distinctness sweep: the first 2^14 (16384) indices must produce 2^14
+	// distinct 8-byte hashes — small enough to run fast, large enough that
+	// a wrong pack (e.g. truncating before bytes ran out, or zeroing the
+	// wrong byte position) would collide within the sweep.
 	seen := make(map[string]struct{}, 1<<14)
 	for i := 0; i < 1<<14; i++ {
 		h := encodeHash(i, 8)
