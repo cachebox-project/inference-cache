@@ -60,6 +60,7 @@ func newDoctorCommand(code *int) *cobra.Command {
 	}
 	cmd := &cobra.Command{
 		Use:   "doctor",
+		Args:  cobra.NoArgs, // reject stray positional args (e.g. a namespace typo'd without -n)
 		Short: "Pre-flight diagnostic for an inference-cache installation",
 		Long: `doctor runs a read-only series of checks against an inference-cache
 installation and reports OK / INFO / WARN / FAIL findings with stable, greppable

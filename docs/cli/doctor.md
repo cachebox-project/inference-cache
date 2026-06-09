@@ -128,7 +128,8 @@ Summary: 1 OK, 0 INFO, 1 WARN, 0 FAIL  (exit 1)
 ```
 
 JSON (stable schema — `summary` + `findings[]`, each finding
-`{code,status,check,resource,message}`):
+`{code,status,check,resource?,message}`; `resource` is omitted for cluster-wide
+findings, so consumers must treat it as optional):
 
 ```json
 {

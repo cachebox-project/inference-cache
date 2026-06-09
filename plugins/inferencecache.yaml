@@ -46,9 +46,9 @@ spec:
           arch: amd64
       uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_linux_amd64.tar.gz
       sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      bin: inferencecache
+      bin: kubectl-inferencecache
       files:
-        - from: inferencecache
+        - from: kubectl-inferencecache
           to: .
         - from: LICENSE
           to: .
@@ -58,9 +58,9 @@ spec:
           arch: arm64
       uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_linux_arm64.tar.gz
       sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      bin: inferencecache
+      bin: kubectl-inferencecache
       files:
-        - from: inferencecache
+        - from: kubectl-inferencecache
           to: .
         - from: LICENSE
           to: .
@@ -70,9 +70,9 @@ spec:
           arch: amd64
       uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_darwin_amd64.tar.gz
       sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      bin: inferencecache
+      bin: kubectl-inferencecache
       files:
-        - from: inferencecache
+        - from: kubectl-inferencecache
           to: .
         - from: LICENSE
           to: .
@@ -82,9 +82,9 @@ spec:
           arch: arm64
       uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_darwin_arm64.tar.gz
       sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      bin: inferencecache
+      bin: kubectl-inferencecache
       files:
-        - from: inferencecache
+        - from: kubectl-inferencecache
           to: .
         - from: LICENSE
           to: .
@@ -94,9 +94,9 @@ spec:
           arch: amd64
       uri: https://github.com/cachebox-project/inference-cache/releases/download/v0.0.0/inferencecache_v0.0.0_windows_amd64.tar.gz
       sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      bin: inferencecache.exe
+      bin: kubectl-inferencecache.exe
       files:
-        - from: inferencecache.exe
+        - from: kubectl-inferencecache.exe
           to: .
         - from: LICENSE
           to: .
