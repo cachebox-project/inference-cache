@@ -599,9 +599,12 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 			ID:           t.TenantID,
 			IndexEntries: t.IndexEntries,
 			HitRate:      formatRate(t.HitRate),
-			// Deprecated, always 0 (see TenantCacheStatus.MemoryUsed); copied
-			// through to keep the builder total over the snapshot fields.
-			MemoryUsed: t.MemoryUsed,
+			// Deprecated field, hard-zeroed here (NOT copied from the snapshot):
+			// the controller is authoritative for keeping it 0 even when talking
+			// to an older/skewed server that still reports a non-zero (double-
+			// counted) per-tenant memory in its /snapshot. See
+			// TenantCacheStatus.MemoryUsed.
+			MemoryUsed: 0,
 		})
 	}
 	return st

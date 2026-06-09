@@ -1586,7 +1586,6 @@ func (i *Index) Snapshot() Snapshot {
 	// across tenancy. We then aggregate ONLY across models / hash_schemes
 	// within the same (tenant, replicaID).
 	latestByReplica := make(map[tenantReplica]statEntry)
-	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
 		if i.isReservedTenant(sk.tenant) {
 			continue
@@ -1594,9 +1593,6 @@ func (i *Index) Snapshot() Snapshot {
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[tr] = s
-		}
-		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
-			latestByTenantReplica[tr] = s
 		}
 	}
 
@@ -1668,7 +1664,7 @@ func (i *Index) Snapshot() Snapshot {
 		n      int
 	}
 	byTenant := make(map[string]*tenantAgg)
-	for tr, s := range latestByTenantReplica {
+	for tr, s := range latestByReplica {
 		// Untenanted stats bucket under "" — the same key the entry walk uses, so a
 		// tenant's stats and its indexEntries land together.
 		bucket := tr.tenant
