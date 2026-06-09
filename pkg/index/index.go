@@ -1547,17 +1547,22 @@ type ReplicaSnapshot struct {
 //
 // IndexEntries is the tenant's live distinct-prefix count, the quantity
 // CacheTenant.spec.quota.maxIndexEntries bounds; across all tenants these sum
-// to Snapshot.TotalPrefixes by construction (see Aggregate). Per-tenant memory
-// is deliberately absent: cache_memory_bytes is the engine total across all
-// tenants on a replica, so summing it per tenant double-counts on shared
-// engines. For memory, read the per-replica ReplicaSnapshot.CacheMemoryBytes
-// (engine total per replica). See docs/design/crd-contract.md and
-// docs/concepts/cachetenant-identity-and-quota.md for the enforcement
-// boundary rationale.
+// to Snapshot.TotalPrefixes by construction (see Aggregate).
+//
+// MemoryUsed is deprecated and never populated (always 0): cache_memory_bytes
+// is the engine total across all tenants on a replica, so summing it per tenant
+// double-counts on shared engines. The field is retained in the wire shape for
+// controller/server skew-compatibility (an older controller still finds the
+// key) and scheduled for removal at v1beta1. For memory, read the per-replica
+// ReplicaSnapshot.CacheMemoryBytes (engine total per replica). See
+// docs/design/crd-contract.md and docs/concepts/cachetenant-identity-and-quota.md
+// for the enforcement-boundary rationale.
 type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
 	IndexEntries int64   `json:"indexEntries"`
 	HitRate      float32 `json:"hitRate"`
+	// Deprecated: always 0; read ReplicaSnapshot.CacheMemoryBytes instead.
+	MemoryUsed int64 `json:"memoryUsed"`
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest

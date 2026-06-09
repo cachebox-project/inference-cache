@@ -534,23 +534,25 @@ if [ -z "$ci_changed" ] || [ "$ci_changed" = "<none>" ] || [ "$ci_changed" = "<u
 fi
 log "CacheIndex printer columns render Prefixes=$ci_prefixes Changed=$ci_changed"
 
-# --- CacheIndex CRD schema-trim assertion ----------------------------------
-# Per-tenant memory was removed from status.tenants[] (engine KV cache is a
-# shared, tenant-unaware pool — on any engine serving multiple tenants the
-# value double-counts). The honest per-replica field stays. Probing the live
-# CRD proves the trim made it into the installed bundle, not just the repo.
+# --- CacheIndex CRD per-tenant-memory deprecation assertion ----------------
+# Per-tenant memory cannot be honestly attributed on a shared, tenant-unaware
+# engine (status.tenants[].memoryUsed double-counts the same bytes once per
+# tenant), so the field is DEPRECATED and always 0 — but retained in the
+# v1alpha1 schema for wire/shape compatibility (removal deferred to v1beta1).
+# The honest per-replica engine total stays. Probing the live CRD proves both
+# fields are in the installed bundle, not just the repo.
 ci_field_type() {
   kubectl get crd cacheindices.inferencecache.io \
     -o "jsonpath={.spec.versions[?(@.name=='v1alpha1')].schema.openAPIV3Schema.properties.$1.type}" \
     2>/dev/null || true
 }
-if [ -n "$(ci_field_type 'status.properties.tenants.items.properties.memoryUsed')" ]; then
-  fail "CRD still serves removed status.tenants[].memoryUsed (schema trim not installed)"
+if [ -z "$(ci_field_type 'status.properties.tenants.items.properties.memoryUsed')" ]; then
+  fail "CRD is missing status.tenants[].memoryUsed (deprecated+zeroed but retained in the v1alpha1 schema for compat — must remain until v1beta1)"
 fi
 if [ -z "$(ci_field_type 'status.properties.replicas.items.properties.cacheMemoryBytes')" ]; then
-  fail "CRD is missing status.replicas[].cacheMemoryBytes (the honest per-replica engine total — must remain after the per-tenant trim)"
+  fail "CRD is missing status.replicas[].cacheMemoryBytes (the honest per-replica engine total)"
 fi
-log "CacheIndex CRD reflects the schema trim (status.tenants[].memoryUsed absent; status.replicas[].cacheMemoryBytes present)"
+log "CacheIndex CRD serves deprecated status.tenants[].memoryUsed (retained, always 0) and the honest status.replicas[].cacheMemoryBytes"
 
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing

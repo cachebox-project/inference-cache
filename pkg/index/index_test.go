@@ -360,6 +360,12 @@ func TestSnapshotAggregates(t *testing.T) {
 	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].IndexEntries != 1 || snap.Tenants[1].HitRate != 0.6 {
 		t.Fatalf("tenant-b = %+v, want indexEntries 1 hitRate 0.6", snap.Tenants[1])
 	}
+	// MemoryUsed is deprecated and never accumulated: it stays 0 even though
+	// both tenants' replicas reported non-zero CacheMemoryBytes.
+	if snap.Tenants[0].MemoryUsed != 0 || snap.Tenants[1].MemoryUsed != 0 {
+		t.Fatalf("tenant MemoryUsed must be 0 (deprecated, not accumulated): a=%d b=%d",
+			snap.Tenants[0].MemoryUsed, snap.Tenants[1].MemoryUsed)
+	}
 }
 
 // TestSnapshotJSONRoundtripPreservesTenantAndPrefixFields guards the wire

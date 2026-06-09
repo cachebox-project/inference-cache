@@ -54,6 +54,10 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 			TenantID:     "team-a",
 			IndexEntries: 3,
 			HitRate:      0.5,
+			// Deprecated, always 0 in production; pinned here because the JSON
+			// tag carries no omitempty, so the key stays on the wire (skew-safe
+			// for an older controller still decoding it).
+			MemoryUsed: 0,
 		}},
 		TotalPrefixes: 3,
 		HotPrefixes:   0,
@@ -93,7 +97,7 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	if len(tenants) != 1 {
 		t.Fatalf("expected one tenant row; got %d", len(tenants))
 	}
-	wantTenant := []string{"tenantId", "indexEntries", "hitRate"}
+	wantTenant := []string{"tenantId", "indexEntries", "hitRate", "memoryUsed"}
 	assertExactKeys(t, "TenantSnapshot", tenants[0], wantTenant)
 }
 

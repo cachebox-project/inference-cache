@@ -599,6 +599,9 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 			ID:           t.TenantID,
 			IndexEntries: t.IndexEntries,
 			HitRate:      formatRate(t.HitRate),
+			// Deprecated, always 0 (see TenantCacheStatus.MemoryUsed); copied
+			// through to keep the builder total over the snapshot fields.
+			MemoryUsed: t.MemoryUsed,
 		})
 	}
 	return st
