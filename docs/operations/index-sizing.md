@@ -16,6 +16,19 @@ need same-arch numbers — the harness is documented at the top of `main.go`.
 
 ---
 
+## What you can and can't directly set
+
+There is **no `globalMaxEntries` CRD field**. The levers you actually have are:
+
+1. **Pod memory limit** — `Deployment.spec.containers[].resources.limits.memory`. This is the only hard ceiling Kubernetes enforces; everything else is soft state inside the process.
+2. **`CachePolicy.spec.evictionTTL`** — per-namespace, default 30m. Shorter TTL ⇒ smaller steady-state index.
+3. **`CachePolicy.spec.eviction`** — per-namespace `LRU` (default) or `LFU`. Picks which entries get evicted under cap pressure; doesn't change *how much* memory you use.
+4. **`CacheTenant.spec.quota.maxIndexEntries`** — per-tenant. Bounds one tenant's slice of the index.
+
+The global cap (`DefaultMaxEntries = 1,000,000`), the global TTL fallback, and the sweep interval are **compile-time constants** in the server binary today. Raising them requires a rebuild. See [Knobs the operator actually has](#knobs-the-operator-actually-has) for the full table; the rest of this doc is mostly about how to use the levers above intelligently.
+
+---
+
 ## TL;DR
 
 | Workload shape | Peak RSS (process high-water mark) | Pod memory budget |
@@ -36,8 +49,15 @@ so reaching for a larger footprint needs a recompile today.
 
 ## Per-entry memory footprint
 
-One index entry is one `(tenant, model, hash_scheme, prefix_hash) → replica_id` tuple.
-A prefix held by two replicas is two entries; a prefix held by one replica is one.
+**Two units that get conflated.** The CRD field name `maxIndexEntries`, the snapshot
+field `tenants[].indexEntries`, and the metric `inferencecache_index_entries{model}` all
+count **distinct prefix keys** — one per `(tenant, model, hash_scheme, prefix_hash)`,
+regardless of how many replicas hold it. The internal `pkg/index.DefaultMaxEntries` cap,
+by contrast, counts **total storage entries** — one per `(prefix_key, replica)` tuple.
+A single prefix held by R replicas is 1 "indexEntries" but R "storage entries". When
+the doc says "entries" below, the column header makes which unit explicit.
+
+A prefix held by two replicas is two storage entries; a prefix held by one replica is one.
 
 Measured footprint after GC + `debug.FreeOSMemory()` (peak RSS via `getrusage.Maxrss`):
 
@@ -47,27 +67,16 @@ Measured footprint after GC + `debug.FreeOSMemory()` (peak RSS via `getrusage.Ma
 | 1,000,000 | 481 MiB | 544 MiB | 504 | 570 |
 | 1,500,000 | 641 MiB | 701 MiB | 448 | 490 |
 
-Scaling is linear in the number of entries above ~100K (the per-entry RSS share drops as
-the fixed Go-runtime overhead — ~30–50 MiB — amortizes). Per-entry heap cost trends
-slightly *down* as the index grows (504 B at 500K-1M, 448 B at 1.5M) — likely Go map
-bucket-fill effects. A rule-of-thumb pod sizing model good to ~10 % conservative on the
-peak RSS, with peak RSS adding ~10–15 % over heap:
+Scaling is linear in the number of entries above ~100K (the per-entry share drops as
+the ~30–50 MiB Go-runtime baseline amortizes). Per-entry heap cost trends slightly
+*down* as the index grows (504 B/entry at 500K-1M → 448 B/entry at 1.5M), likely Go
+map bucket-fill effects.
 
-```
-heap_bytes      ≈  30 MiB  +  450 × distinct_prefix_keys  +  50 × additional_replica_holdings
-peak_RSS_bytes  ≈  heap_bytes × 1.15
-```
-
-Where:
-
-- *distinct prefix keys* — unique `(tenant, model, hash_scheme, prefix_hash)` tuples.
-  This is the unit `tenants[].indexEntries` reports and `CacheTenant.spec.quota.maxIndexEntries`
-  bounds.
-- *additional replica holdings* — every replica beyond the first that reports the same
-  key. Holding the same prefix on R replicas costs ~450 + (R-1) × 50 bytes, not R × 450.
-
-Verify against the measured table when sizing critically; the formula is a planning
-heuristic, not a tight predictor.
+**Planning rule of thumb.** Plan **~500 bytes per distinct prefix key** plus
+**~50 bytes per additional-replica holding** plus a **~50 MiB Go-runtime baseline**.
+Apply a **~20 % pod-memory headroom over the table values above** to absorb heap
+fragmentation, transient ingest peaks, and growth. For any sizing commitment, read the
+table — the rule of thumb is for back-of-envelope work, not a tight predictor.
 
 ### Where the bytes go
 
@@ -112,7 +121,7 @@ Replicas multiply E by R but only at ~50 B/extra-replica per shared entry.
 
 | Shape | Distinct prompts in TTL window | × block-chain length | = E (per replica) | Sits at default 1M cap |
 |---|---:|---:|---:|---|
-| Single-tenant chatbot, ~5K QPS, ~5 blocks / prompt | 100K | × 5 | ~500K | Comfortable. |
+| Single-tenant chatbot, ~100K distinct prompt prefixes seen in the TTL window after dedup (much smaller than raw arrivals — chats share system prompts, few-shots, and recent turns), ~5 blocks / prompt | 100K | × 5 | ~500K | Comfortable. |
 | Multi-tenant chatbot, 20 tenants × 100K prompts | 2M (Σ across tenants) | × 5 | ~10M | **Cap-bound.** Choices: shorten `evictionTTL` per namespace (linear win), tighten per-tenant `maxIndexEntries`, or raise the cap + pod memory. |
 | RAG, 50K documents, ~10-block chunks, TTL=2h | 50K | × 10 | ~500K | Comfortable single-tenant; cap-bound at scale. |
 | Long-context coding assistant, 1K active sessions, ~500-block prompts | 1K | × 500 | ~500K | Comfortable, but watch `index_evictions_total{reason="cap"}` — if chain length grows, this is the workload most likely to outgrow the cap silently. |
@@ -125,6 +134,37 @@ subscriber maps each `BlockStored` event into one `PrefixEntry` per block hash (
 each with a cumulative `token_count`. A 1000-token prompt at vLLM's 16-token block size
 produces ~62 block hashes, which becomes ~62 entries per replica. Plan for this expansion,
 not the single-blob shape, when sizing.
+
+### Worked example — a chatbot that overshoots the cap
+
+Suppose you run a single-tenant chatbot with ~50K distinct conversation prefixes alive
+within a 30-minute window (after dedup — most chats share system prompts + few-shots),
+each averaging ~800 tokens (≈ 50 block hashes), reported by a single cache replica.
+
+```
+E = distinct_prompts × block_chain × replicas
+  = 50,000 × 50 × 1
+  = 2,500,000 storage entries
+```
+
+That's **2.5× the default 1M global cap**. The cap will fire, evictions will trim the
+working set down to ~1M, and the rest of the prefixes won't have hints. Three choices:
+
+1. **Accept the cap.** Pod stays at 1 GiB; the cache plane still routes ~1M worth of hot
+   prefixes, the rest miss. Hit rate is lower than it could be, but routing stays
+   correct (soft-state guarantee). This is the right answer when the workload is at the
+   margin and the cost of tuning isn't worth the lift.
+2. **Shorten `evictionTTL`.** TTL=10m instead of 30m → steady-state population drops
+   roughly 3×, to ~830K, comfortably under the cap. Pod stays at 1 GiB. Cost: prefixes
+   re-used at the 15-minute mark go to miss instead of hit. Cheapest tuning option and
+   usually the right one.
+3. **Rebuild with a higher cap.** Bump `DefaultMaxEntries` in `pkg/index/index.go` to,
+   say, 3M and size the pod for ~1.5 GiB (~700 MiB peak RSS at 1.5M plus 20 % headroom).
+   Most heavyweight option; reach for it when the workload can't tolerate the hit-rate
+   loss from option 1 or the TTL trim from option 2.
+
+Same shape applies to any "over the cap" case: pick A, B, or C based on whether you can
+tolerate lower hit rate, tighter TTL, or a custom build.
 
 ---
 
@@ -244,7 +284,7 @@ If you genuinely need more than 1M entries before the cap flag lands:
 
 | Default | Value | Rationale |
 |---|---|---|
-| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries; the cap is comfortably above realistic single-tenant load and gives multi-tenant clusters a 10× headroom before they need to think about it. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
+| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries; the cap is comfortably above realistic single-tenant load and gives multi-tenant clusters ~5× headroom before they need to think about it. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
 | `DefaultTTL` | 30 minutes | Matches typical chat-style prefix reuse windows. Long enough that the same conversation's continuation lands on the same replica; short enough that a half-hour of cold prefixes don't bloat the index. CachePolicy lets per-namespace workloads override (raise for long-context, lower for tight memory). |
 | `DefaultSweepInterval` | 1 minute | The sweep is a full-walk over the prefix map looking for expired entries; CPU cost scales linearly with index size, but it runs on its own goroutine off the request path. One minute bounds memory lag without being noticeably hot on a 1M-entry index. Not yet directly benchmarked — file an issue if you observe sweep contention on the hot path. |
 

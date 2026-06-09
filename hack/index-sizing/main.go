@@ -61,8 +61,24 @@ func main() {
 			*keys, (*tenants)*(*models))
 		os.Exit(2)
 	}
+	// Bound-check the planned product BEFORE it hits Go's int (signed,
+	// 64-bit on supported targets, 32-bit on 32-bit builds). Without this
+	// guard a bad flag combo wraps the result, which the harness then uses
+	// as both the cap input and the bytes-per-entry denominator — emitting
+	// plausible-looking nonsense. Multiply step-by-step in int64 and check
+	// against int's actual range on this platform; reject before any wrap.
+	const intMax = int64(^uint(0) >> 1) // MaxInt on this build (64-bit ⇒ 2^63-1; 32-bit ⇒ 2^31-1)
+	prod := int64(keysPerBucket)
+	for _, m := range []int{*tenants, *models, *replicas} {
+		if m <= 0 || prod > intMax/int64(m) {
+			fmt.Fprintf(os.Stderr, "totalEntries would overflow int on this platform; lower a flag (keysPerBucket=%d tenants=%d models=%d replicas=%d)\n",
+				keysPerBucket, *tenants, *models, *replicas)
+			os.Exit(2)
+		}
+		prod *= int64(m)
+	}
 	ingestedKeys := keysPerBucket * (*tenants) * (*models)
-	totalEntries := ingestedKeys * (*replicas)
+	totalEntries := int(prod)
 	if ingestedKeys != *keys {
 		fmt.Fprintf(os.Stderr, "warning: keys=%d not divisible by tenants×models=%d; ingesting %d keys (per-bucket=%d)\n",
 			*keys, (*tenants)*(*models), ingestedKeys, keysPerBucket)
