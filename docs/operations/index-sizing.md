@@ -31,12 +31,14 @@ The global cap (`DefaultMaxEntries = 1,000,000`), the global TTL fallback, and t
 
 ## TL;DR
 
-| Workload shape | Peak RSS (process high-water mark) | Pod memory budget |
+| Storage entries (distinct prefix keys × replicas reporting each) | Peak RSS (process high-water mark) | Pod memory budget |
 |---|---|---|
-| 100K distinct prefix entries | ~110 MiB | 256 MiB |
-| 500K entries | ~300 MiB | 512 MiB |
-| 1M entries (`DefaultMaxEntries`) | ~540 MiB | **1 GiB (recommended floor)** |
-| 1.5M entries | ~700 MiB | 1.5 GiB |
+| 100K storage entries | ~110 MiB | 256 MiB |
+| 500K storage entries | ~300 MiB | 512 MiB |
+| 1M storage entries (`DefaultMaxEntries`) | ~540 MiB | **1 GiB (recommended floor)** |
+| 1.5M storage entries | ~700 MiB | 1.5 GiB |
+
+(With one cache replica per prefix, "storage entries" equals "distinct prefix keys" — multi-replica deployments amplify the storage count but only at ~50 B per extra-replica per shared key, not a full per-entry cost. See [Per-entry memory footprint](#per-entry-memory-footprint).)
 
 The "peak RSS" column is `Maxrss` from the harness run — the high-water mark the process ever reached, not current RSS. For a one-shot bulk ingest the peak ≈ steady-state + transient ingest allocations; in production the steady-state is somewhat lower. Treat the column as a **conservative pod-budget figure**: if you provision for the peak, the steady-state has headroom built in.
 
@@ -225,25 +227,32 @@ Start from observation, not guess.
 
 ### 1. Watch the metrics that already exist
 
-Every signal below is exported on `/metrics` (port 8080) — no code change needed.
+All `inferencecache_*` signals below are exported on the server's `/metrics` (port 8080).
+The pod-RSS row is a cluster-level metric from kubelet/cAdvisor, scraped separately
+(usually by kube-prometheus's `kubelet` `ServiceMonitor`) — included here because it is
+the right RSS signal to compare against the [Per-entry footprint](#per-entry-memory-footprint)
+table.
 
-| Signal | Series | What it tells you |
-|---|---|---|
-| Steady-state size | `inferencecache_index_entries{model}` | **Distinct prefix keys per model** — not total replica×prefix entries. A prefix held by R replicas counts once here. Use this for trend / hit-rate work; it is **not** a direct cap-closeness signal in multi-replica setups (see next row). |
-| Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
-| Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | A tenant is exceeding `spec.quota.maxIndexEntries`. Usually fine (Fairness), but a sustained signal means the quota is too tight for the workload. |
-| TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `index_entries` falling = the workload is shrinking. |
-| Pod RSS | `container_memory_working_set_bytes{pod="inference-cache-server-..."}` | What you'd compare against the model in [Per-entry footprint](#per-entry-memory-footprint). |
+| Signal | Series | Source | What it tells you |
+|---|---|---|---|
+| Steady-state size | `inferencecache_index_entries{model}` | server `/metrics` | **Distinct prefix keys per model** — not total replica×prefix entries. A prefix held by R replicas counts once here. Use this for trend / hit-rate work; it is **not** a direct cap-closeness signal in multi-replica setups (see next row). |
+| Cap pressure (authoritative) | `rate(inferencecache_index_evictions_total{reason="cap"}[10m])` | server `/metrics` | The global cap is on total replica×prefix entries; this counter is what fires when it's exceeded. Anything sustained > 0 means the cap is the binding constraint — use this signal, not `index_entries`, to detect cap pressure. An info-severity alert ships in [`config/observability/alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) (`IndexEvictionsSpike` — fires at sustained > 10 cap-evictions/sec for 10m). |
+| Quota pressure | `rate(inferencecache_tenant_evictions_total[10m])` | server `/metrics` | A tenant is exceeding `spec.quota.maxIndexEntries`. Usually fine (Fairness), but a sustained signal means the quota is too tight for the workload. |
+| TTL churn | `rate(inferencecache_index_evictions_total{reason="ttl"}[10m])` | server `/metrics` | The TTL sweep is doing work. High and steady = entries arriving and aging out at a healthy rate. High and *increasing* together with `index_entries` falling = the workload is shrinking. |
+| Pod RSS | `container_memory_working_set_bytes{pod="inference-cache-server-..."}` | **kubelet/cAdvisor** (not the server) | What you'd compare against the model in [Per-entry footprint](#per-entry-memory-footprint). |
 
 ### 2. Pick a starting point
 
 1. Estimate **distinct prefix keys** for the workload using the multipliers above.
    Then derive **total storage entries** = distinct keys × R, where R is the number
    of cache replicas reporting each key. The global cap is enforced on the storage
-   total, the per-tenant quota is enforced on the distinct-key total, and the pod
-   memory budget tracks the storage total (plus the ~50 B/extra-replica term from
-   [Per-entry footprint](#per-entry-memory-footprint)).
-2. Map the storage-entry estimate to a **pod memory budget** via the table in [TL;DR](#tldr).
+   total, the per-tenant quota is enforced on the distinct-key total.
+2. Map to a **pod memory budget**. For **single-replica** clusters, use the storage-entry
+   row in the [TL;DR](#tldr) table directly. For **multi-replica** clusters, the
+   storage-entry row in TL;DR is a *conservative upper bound* — extra replicas only
+   cost ~50 B per shared key, not the full ~500 B/entry the table assumes. For a
+   tighter number use the formula `heap ≈ 50 MiB + (500 + 50 × (R-1)) × distinct_keys`
+   from [Per-entry footprint](#per-entry-memory-footprint), then add ~20 % headroom.
 3. Set `evictionTTL` (per CachePolicy) to the smallest value that keeps the typical
    re-use window inside the TTL — see the [TTL choice table](#ttl-trade-offs).
 4. If the workload is multi-tenant, set `CacheTenant.spec.quota.maxIndexEntries` per
@@ -299,7 +308,7 @@ If you genuinely need more than 1M entries before the cap flag lands:
 
 | Default | Value | Rationale |
 |---|---|---|
-| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry. Internal cache-stress benchmarks peaked at ~200K entries, so this is roughly 5× the benchmark peak — **not a general sizing guarantee**: the worked examples in [Workload-shape sizing](#workload-shape-sizing) show a single-tenant chatbot can land at 2.5M and a multi-tenant chatbot at 10M. Treat 1M as a sensible default that small / moderate single-tenant workloads sit comfortably under; large or multi-tenant deployments need the workload-shape estimate, not the default. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
+| `DefaultMaxEntries` | 1,000,000 | One-pod fit for a 1 GiB server budget at ~500 B/entry (see [Per-entry footprint](#per-entry-memory-footprint) — measurements in this guide go up to 1.5M). **Not a general sizing guarantee**: the worked examples in [Workload-shape sizing](#workload-shape-sizing) show a single-tenant chatbot can land at 2.5M and a multi-tenant chatbot at 10M. Treat 1M as a sensible default for small / moderate single-tenant workloads; large or multi-tenant deployments need the workload-shape estimate, not the default. Re-evaluated against the measurements above — the value stayed; what changed is that we now document the relationship to pod memory explicitly. |
 | `DefaultTTL` | 30 minutes | Matches typical chat-style prefix reuse windows. Long enough that the same conversation's continuation lands on the same replica; short enough that a half-hour of cold prefixes don't bloat the index. CachePolicy lets per-namespace workloads override (raise for long-context, lower for tight memory). |
 | `DefaultSweepInterval` | 1 minute | The sweep is a full-walk over the prefix map looking for expired entries; CPU cost scales linearly with index size, but it runs on its own goroutine off the request path. One minute bounds memory lag without being noticeably hot on a 1M-entry index. Not yet directly benchmarked — file an issue if you observe sweep contention on the hot path. |
 
