@@ -176,8 +176,15 @@ Service DNS / ClusterIPs that do not resolve. `--config-only` skips the endpoint
 probes and the per-CacheBackend TCP dial (it still validates `status.endpoint`
 is published), so it is the right mode from a workstation without a port-forward:
 
-- **In-cluster** (e.g. a debug pod): the server is discovered by Service DNS and
-  reached directly.
+- **In-cluster**: the server is discovered by Service DNS. Note the two
+  listeners have different ingress posture: the gRPC `:9090` port is open to all
+  in-cluster clients, but the controller-facing `:8081` listener (`/snapshot`,
+  `/policy`, `/probe`) is restricted by a `NetworkPolicy` to the controller's pod
+  selector. So the gRPC health check works from any pod, but the three HTTP
+  endpoint probes only succeed when doctor runs as the controller (or from a pod
+  whose labels match that NetworkPolicy ingress) — from an ordinary debug pod
+  they fail even with Service DNS. Run `--config-only`, port-forward, or use a
+  controller-shaped pod if you only need the cluster-config checks there.
 - **From a workstation**: the in-cluster Service DNS does not resolve. Either
   port-forward and point doctor at it —
 
