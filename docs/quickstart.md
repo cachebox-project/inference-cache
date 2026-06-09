@@ -101,11 +101,13 @@ Once the backend is Ready and engine pods are bound, three things are live:
   my-cache        LMCache   True    1         my-cache.default...   128        12s         3m
   ```
 
-  `READY` flips to `True` only after **both** readiness gates pass: a real
-  KV event has been observed (not merely the pod being reachable) AND the
-  controller's synthetic functional self-test round-trips cleanly. Either
-  gate can hold the backend at `Ready=False` with a stage-specific reason
-  on `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
+  `READY` flips to `True` only after the managed-readiness baseline
+  (pods Up, Service endpoints) **plus** both post-rollout gates pass:
+  a real KV event has been observed (not merely the pod being
+  reachable) AND the controller's synthetic functional self-test
+  round-trips cleanly. Any of these gates can hold the backend at
+  `Ready=False` with a stage-specific reason on
+  `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
   `MATCHED` is the engine-pod count the selector binds, and
   `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 
@@ -165,7 +167,7 @@ stage-specific diagnostic. By `.reason`:
 | `.reason` | Stage | What it means | First-response |
 |---|---|---|---|
 | `ProbeIngestFailed` | publish | The server's in-process index `Ingest` path is dropping writes. Does **not** indicate a subscriber problem — that path isn't exercised by the probe. | Check the server's `inferencecache_index_entries` gauge; look at server logs for `pkg/index` errors. Confirm `inferencecache_server_up == 1`. |
-| `ProbeRoutingFailed` | lookup | The index recorded the probe entry but `LookupRoute` returned `NO_HINT`. Likely an index-key-scheme mismatch (the probe's `hashScheme` derives from `spec.integration.engine`; default `vllm`) or a lookup-filter regression. | Check `inferencecache_lookup_route_calls_total{reason_code="NO_HINT"}` for the affected backend. Confirm `spec.integration.engine` is a known runtime ID (`vllm` or `sglang`); a typo silently fails open and produces NO_HINT. |
+| `ProbeRoutingFailed` | lookup | The index recorded the probe entry but `LookupRoute` returned `NO_HINT`. Likely an index-key-scheme mismatch (the probe's `hashScheme` derives from `spec.integration.engine`; default `vllm`) or a lookup-filter regression. | Read the `FunctionalProbeOK` condition's `.message` for the server's stage diagnostic and check `inferencecache_backend_probe_result_total{backend, stage="routing", result="failed"}` for the trend. (The server-side `inferencecache_lookup_route_calls_total` is NOT the right surface here — the probe calls `index.LookupRoute` directly through an in-process seam, bypassing the gRPC handler that emits that metric.) Confirm `spec.integration.engine` is a known runtime ID (`vllm` or `sglang`); a typo silently fails open and produces NO_HINT. |
 | `ProbeT2Failed` | tier-2 | The tier-2 put/get cycle failed (LMCache, today). Only reachable when a `T2Prober` is wired into the server — none is registered in the current revision, so this condition does **not** appear on a clean install. | Will be applicable once a `T2Prober` ships; not actionable today. |
 
 ### `FunctionalProbeOK=Unknown` / `ProbeError`
