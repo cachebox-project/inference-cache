@@ -180,7 +180,7 @@ stage-specific diagnostic. By `.reason`:
 
 | `.reason` | Stage | What it means | First-response |
 |---|---|---|---|
-| `ProbeIngestFailed` | publish | The server's in-process index `Ingest` path is dropping writes. Does **not** indicate a subscriber problem — that path isn't exercised by the probe. | Check the server's `inferencecache_index_entries` gauge; look at server logs for `pkg/index` errors. Confirm `inferencecache_server_up == 1`. |
+| `ProbeIngestFailed` | publish | The server's in-process index `Ingest` path is dropping writes. Does **not** indicate a subscriber problem — that path isn't exercised by the probe. | Read the `FunctionalProbeOK` condition's `.message` for the server's stage diagnostic; check `inferencecache_backend_probe_result_total{backend="<namespace>/<name>", stage="ingest", result="failed"}` for the trend. The server-side `inferencecache_index_entries` gauge is fine as background index-health context but cannot confirm whether the synthetic probe entry landed — probe entries live under the reserved `inferencecache.io/probe` tenant, which is excluded from the cap-accounting gauge by design. Inspect server logs for `pkg/index` errors. Confirm `inferencecache_server_up == 1`. |
 | `ProbeRoutingFailed` | lookup | `LookupRoute` did not return a clean `PREFIX_MATCH` for the probe's reserved replica. Two failure modes share this reason and are disambiguated by the condition `.message`: (a) the lookup returned a non-`PREFIX_MATCH` strategy (`NO_HINT`, `TENANT_HOT`, `TIMEOUT`, etc.) — likely an internal `hash_scheme` regression that dropped the probe's scheme on ingest (an empty scheme fails open and produces `NO_HINT`) or a lookup-filter regression in `pkg/index`/`pkg/server`; (b) the lookup did return `PREFIX_MATCH` but the probe's reserved replica isn't among the scored replicas — a probe-id-derivation or reserved-replica-collision regression. The probe's `hashScheme` derives from `spec.integration.engine` (admission rejects unknown runtime IDs, so a typo never reaches this stage). | Read the `FunctionalProbeOK` condition's `.message` first — the server names which failure mode hit. Check `inferencecache_backend_probe_result_total{backend="<namespace>/<name>", stage="routing", result="failed"}` for the trend. (The server-side `inferencecache_lookup_route_calls_total` is NOT the right surface here — the probe calls `index.LookupRoute` directly through an in-process seam, bypassing the gRPC handler that emits that metric.) Inspect server logs for `pkg/index` lookup-path errors. |
 | `ProbeT2Failed` | tier-2 | The tier-2 put/get cycle failed (LMCache, today). Only reachable when a `T2Prober` is wired into the server — none is registered in the current revision, so this condition does **not** appear on a clean install. | Will be applicable once a `T2Prober` ships; not actionable today. |
 
@@ -218,10 +218,14 @@ with a real regression still ships broken cache state.
 Four possible causes, in order of how common they are on a healthy
 install:
 
-- **Upstream KV-event gate hasn't cleared yet.** The probe gate is
-  cascade-prevented from running until the upstream reports
-  `Ready=True`. Resolve the KV-event gate first; the probe condition
-  appears on the next reconcile after the upstream clears.
+- **Any upstream gate is holding `Ready != True`.** The probe gate is
+  cascade-prevented from running whenever the composed upstream
+  verdict (managed-readiness baseline + KV-event gate) is not
+  `Ready=True`. That includes rollout-in-progress, replicas
+  unavailable, scaled-to-zero, and `AwaitingFirstKVEvent` /
+  `NoKVEventsObserved` — not only KV-event-pending. Resolve the
+  upstream condition first; the probe condition appears on the next
+  reconcile after the upstream clears.
 - **Functional probing is disabled on the controller.** The
   `--server-probe-url=""` flag turns the gate off entirely. Any
   stale `FunctionalProbeOK` left over from a previous wiring is also
