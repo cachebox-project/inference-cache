@@ -101,9 +101,13 @@ Once the backend is Ready and engine pods are bound, three things are live:
   my-cache        LMCache   True    1         my-cache.default...   128        12s         3m
   ```
 
-  `READY` flips to `True` only after a real KV event is observed (not merely
-  when the pod is reachable), `MATCHED` is the engine-pod count the selector
-  binds, and `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
+  `READY` flips to `True` only after **both** readiness gates pass: a real
+  KV event has been observed (not merely the pod being reachable) AND the
+  controller's synthetic functional self-test round-trips cleanly. Either
+  gate can hold the backend at `Ready=False` with a stage-specific reason
+  on `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
+  `MATCHED` is the engine-pod count the selector binds, and
+  `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 
 ## Next steps
 
@@ -195,13 +199,21 @@ with a real regression still ships broken cache state.
 
 ### `FunctionalProbeOK` is missing from `.status.conditions[]`
 
-Three possible causes:
+Four possible causes, in order of how common they are on a healthy
+install:
 
-- The upstream KV-event gate hasn't cleared yet (the more common case).
-  The probe gate is cascade-prevented from running until the upstream
-  reports `Ready=True`; resolve the KV-event gate first.
-- The controller is wired with `--server-probe-url=""` (functional
-  probing is disabled). Any stale `FunctionalProbeOK` is also cleared
-  on the next reconcile in this mode.
-- The CR is `spec.type: External` or running an unsupported runtime —
-  the probe gate is exempt from External + Unmanaged paths.
+- **Upstream KV-event gate hasn't cleared yet.** The probe gate is
+  cascade-prevented from running until the upstream reports
+  `Ready=True`. Resolve the KV-event gate first; the probe condition
+  appears on the next reconcile after the upstream clears.
+- **Functional probing is disabled on the controller.** The
+  `--server-probe-url=""` flag turns the gate off entirely. Any
+  stale `FunctionalProbeOK` left over from a previous wiring is also
+  cleared on the next reconcile in this mode.
+- **The CR is `spec.type: External`.** External backends are wholly
+  exempt from the probe gate — the controller never drives a
+  round-trip against a cache it does not manage.
+- **The CR is on an Unmanaged path** (unsupported runtime, deferred
+  `deploymentKind: StatefulSet`, or other reconcile branch that sheds
+  the managed workload). The probe gate is exempt from these paths
+  and any prior `FunctionalProbeOK` condition is removed on transition.
