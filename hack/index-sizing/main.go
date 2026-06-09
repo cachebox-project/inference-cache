@@ -188,7 +188,7 @@ func main() {
 	runtime.ReadMemStats(&ms)
 
 	var ru syscall.Rusage
-	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	rusageErr := syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
 	// Maxrss is a high-water mark, NOT current RSS — it records the largest
 	// resident-set size the process ever reached, even if pages have since
 	// been returned to the OS by debug.FreeOSMemory. For a one-shot bulk
@@ -197,11 +197,19 @@ func main() {
 	// over-states the post-GC working set. We report it as peak_rss and
 	// the doc treats it as a conservative pod-budget number, not a
 	// steady-state RSS reading.
-	peakRSS := uint64(ru.Maxrss)
-	// macOS Maxrss is bytes; Linux is KiB. The harness is documented to run
-	// on either, so normalize before reporting.
-	if runtime.GOOS == "linux" {
-		peakRSS *= 1024
+	//
+	// rusageErr unavailable → don't print a synthetic 0 (which a reader
+	// would mistake for "peak RSS measured as zero", an impossible result
+	// that would fold straight into bytes/entry as zero). Report the gap
+	// explicitly so the operator knows that field is missing.
+	var peakRSS uint64
+	if rusageErr == nil {
+		peakRSS = uint64(ru.Maxrss)
+		// macOS Maxrss is bytes; Linux is KiB. The harness is documented to
+		// run on either, so normalize before reporting.
+		if runtime.GOOS == "linux" {
+			peakRSS *= 1024
+		}
 	}
 
 	snap := idx.Snapshot()
@@ -218,7 +226,11 @@ func main() {
 	fmt.Printf("heap_inuse              %s\n", humanBytes(ms.HeapInuse))
 	fmt.Printf("heap_sys                %s\n", humanBytes(ms.HeapSys))
 	fmt.Printf("sys (Go total)          %s\n", humanBytes(ms.Sys))
-	fmt.Printf("peak_rss                %s  (%.0f bytes/entry; high-water mark, not current)\n", humanBytes(peakRSS), float64(peakRSS)/float64(totalEntries))
+	if rusageErr != nil {
+		fmt.Printf("peak_rss                unavailable (getrusage: %v)\n", rusageErr)
+	} else {
+		fmt.Printf("peak_rss                %s  (%.0f bytes/entry; high-water mark, not current)\n", humanBytes(peakRSS), float64(peakRSS)/float64(totalEntries))
+	}
 	fmt.Printf("num_gc                  %d\n", ms.NumGC)
 }
 

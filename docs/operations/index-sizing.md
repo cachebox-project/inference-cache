@@ -150,10 +150,12 @@ E = distinct_prompts × block_chain × replicas
 That's **2.5× the default 1M global cap**. The cap will fire, evictions will trim the
 working set down to ~1M, and the rest of the prefixes won't have hints. Three choices:
 
-1. **Accept the cap.** Pod stays at 1 GiB; the cache plane still routes ~1M worth of hot
-   prefixes, the rest miss. Hit rate is lower than it could be, but routing stays
-   correct (soft-state guarantee). This is the right answer when the workload is at the
-   margin and the cost of tuning isn't worth the lift.
+1. **Accept the cap.** Pod stays at 1 GiB; the cache plane still routes ~1M worth of
+   prefixes (the most recently-seen ones under LRU, or the most-accessed under LFU —
+   see [`CachePolicy.spec.eviction`](#knobs-the-operator-actually-has)), the rest miss.
+   Hit rate is lower than it could be, but routing stays correct (soft-state
+   guarantee). This is the right answer when the workload is at the margin and the
+   cost of tuning isn't worth the lift.
 2. **Shorten `evictionTTL`.** TTL=10m instead of 30m → steady-state population drops
    roughly 3×, to ~830K, comfortably under the cap. Pod stays at 1 GiB. Cost: prefixes
    re-used at the 15-minute mark go to miss instead of hit. Cheapest tuning option and
@@ -235,8 +237,13 @@ Every signal below is exported on `/metrics` (port 8080) — no code change need
 
 ### 2. Pick a starting point
 
-1. Estimate **distinct prefix entries** for the workload using the multipliers above.
-2. Map to a **pod memory budget** via the table in [TL;DR](#tldr).
+1. Estimate **distinct prefix keys** for the workload using the multipliers above.
+   Then derive **total storage entries** = distinct keys × R, where R is the number
+   of cache replicas reporting each key. The global cap is enforced on the storage
+   total, the per-tenant quota is enforced on the distinct-key total, and the pod
+   memory budget tracks the storage total (plus the ~50 B/extra-replica term from
+   [Per-entry footprint](#per-entry-memory-footprint)).
+2. Map the storage-entry estimate to a **pod memory budget** via the table in [TL;DR](#tldr).
 3. Set `evictionTTL` (per CachePolicy) to the smallest value that keeps the typical
    re-use window inside the TTL — see the [TTL choice table](#ttl-trade-offs).
 4. If the workload is multi-tenant, set `CacheTenant.spec.quota.maxIndexEntries` per
@@ -262,8 +269,13 @@ After a representative workload window (typically one peak hour + one trough):
   Either the workload doesn't reuse prefixes (no fix needed at the cache plane) or the
   KV-event subscriber isn't reporting (a separate diagnostic — check `replica_id`
   population in `/snapshot`).
-- `tenant_evictions_total` non-zero on a tenant whose `status.indexEntries` is well
-  below their quota → racing/stale CR. Reconcile.
+- `tenant_evictions_total` non-zero on a tenant whose `status.indexEntries` is at or
+  just below their quota → **this is the expected steady-state.** Ingest pushes the
+  tenant over budget, the per-ingest eviction trims it back to ≤ quota, the counter
+  bumps. As long as the *rate* is bounded (you're not seeing it climb without bound),
+  Fairness is doing exactly what it should. Look closer only if the rate keeps rising
+  alongside a stable `status.indexEntries` — that would mean the quota is too tight
+  for arrivals and you're burning eviction work on every batch.
 - RSS climbing with `index_entries` flat → could still be the index, in two ways:
   (1) a new replica started reporting an existing prefix set (each replica adds ~50 B
   per shared prefix, undetected by the per-distinct-prefix gauge), or (2) `index_entries`
