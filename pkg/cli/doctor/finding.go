@@ -109,8 +109,9 @@ const (
 	// this degrades gracefully to a WARN rather than a connectivity FAIL.
 	CodeSnapshotAuthGated = "SN005"
 
-	// CodePolicyRouteMissing: the /policy route is not wired (connection
-	// refused / dial failure).
+	// CodePolicyRouteMissing: the /policy route is not wired — a connection
+	// refused / dial failure, or an HTTP 404 (the server's ServeMux returns 404
+	// only when the route is not mounted; a wired route answers 2xx/401/403/405).
 	CodePolicyRouteMissing = "PL001"
 	// CodePolicyRouteWired: the /policy route answered with an expected status
 	// (2xx / 401 / 403 / 405), proving the route exists.
@@ -160,9 +161,13 @@ const (
 	CodeBackendFunctionalProbeFailing = "CB007"
 
 	// CodeEnginePodNotInjected: a pod matching a CacheBackend's engineSelector
-	// has no InjectedByCacheBackend Event — it may be serving uncached.
+	// carries no injection marker — neither a validated
+	// inferencecache.io/injected-by annotation nor an InjectedByCacheBackend
+	// Event for its current UID — so it may be serving uncached.
 	CodeEnginePodNotInjected = "EP001"
-	// CodeEnginePodInjected: a matched engine pod carries the injection Event.
+	// CodeEnginePodInjected: a matched engine pod is injected, proven by either
+	// the validated inferencecache.io/injected-by annotation (authoritative,
+	// names the backend) or an InjectedByCacheBackend Event for its UID.
 	CodeEnginePodInjected = "EP002"
 
 	// CodeOrphanPod: a pod has a NoMatchingCacheBackend Event — it expected

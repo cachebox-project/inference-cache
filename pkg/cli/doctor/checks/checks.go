@@ -16,6 +16,7 @@ package checks
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -131,12 +132,21 @@ type Deps struct {
 	// OrphanWindow overrides DefaultOrphanWindow when non-zero.
 	OrphanWindow time.Duration
 
-	// SkipEndpointChecks omits the three live control-plane endpoint probes
-	// (server gRPC health, /snapshot, /policy) and runs only the declarative
+	// SkipEndpointChecks omits the four live control-plane endpoint probes
+	// (server gRPC health, /snapshot, /policy, /probe) and runs only the declarative
 	// cluster-configuration checks. Set by `doctor --config-only` for operators
 	// validating CacheBackend/CacheTenant/CachePolicy configuration without a
 	// reachable cache server (e.g. in CI, or before exposing the Service).
 	SkipEndpointChecks bool
+
+	// EndpointDiscoveryErr, when non-nil, records that the caller could not
+	// resolve the server endpoint (Service discovery / RBAC failure). Run then
+	// surfaces it as a single structured ServerReachability FAIL — so the
+	// actionable, wrapped error lands in the report (and the --output=json
+	// contract), not just on stderr — and skips the individual endpoint probes
+	// (which would otherwise be four redundant "could not resolve" FAILs).
+	// Ignored when SkipEndpointChecks is true.
+	EndpointDiscoveryErr error
 }
 
 func (d Deps) now() time.Time {
@@ -176,8 +186,21 @@ func Run(ctx context.Context, d Deps) *doctor.Report {
 
 	// 1–4: control-plane endpoint reachability (skippable via --config-only).
 	// The three controller-facing endpoints (/snapshot, /policy, /probe) share
-	// the :8081 listener and one auth profile.
-	if !d.SkipEndpointChecks {
+	// the :8081 listener and one auth profile. When endpoint discovery itself
+	// failed, emit one FAIL carrying the actionable error instead of four
+	// generic "could not resolve" findings.
+	switch {
+	case d.SkipEndpointChecks:
+		// nothing
+	case d.EndpointDiscoveryErr != nil:
+		report.Add(doctor.Finding{
+			Code:     doctor.CodeServerUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkServerReachability,
+			Resource: d.ServerTarget,
+			Message:  fmt.Sprintf("could not resolve the cache-plane server endpoint: %v — pass --server-endpoint, or check the inference-cache-server Service and the caller's RBAC to read/list Services", d.EndpointDiscoveryErr),
+		})
+	default:
 		add(ServerReachability(ctx, d.Health, d.ServerTarget))
 		add(SnapshotReachability(ctx, d.HTTP, d.SnapshotURL, d.Token))
 		add(PolicyReachability(ctx, d.HTTP, d.PolicyURL))

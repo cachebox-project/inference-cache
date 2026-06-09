@@ -1044,6 +1044,29 @@ func TestRun(t *testing.T) {
 		t.Errorf("healthy run should exit 0, got %d", report.ExitCode())
 	}
 
+	t.Run("discovery error becomes one structured FAIL, not four generic ones", func(t *testing.T) {
+		deps := Deps{
+			K8s:                  fakeClient(t, healthyBackend(now)),
+			ServerTarget:         "inference-cache-server.inference-cache-system.svc:9090",
+			EndpointDiscoveryErr: errors.New("services is forbidden: cannot list resource \"services\""),
+			Now:                  func() time.Time { return now },
+		}
+		report := Run(ctx, deps)
+		f := hasCode(report.Findings, doctor.CodeServerUnreachable)
+		if f == nil || f.Status != doctor.StatusFail {
+			t.Fatalf("want a single SV001 FAIL carrying the discovery error, got %v", codesOf(report.Findings))
+		}
+		if !strings.Contains(f.Message, "forbidden") {
+			t.Errorf("discovery FAIL should carry the actionable error, got %q", f.Message)
+		}
+		// The individual endpoint probes must NOT also run.
+		for _, unwanted := range []string{doctor.CodeSnapshotUnreachable, doctor.CodePolicyRouteMissing, doctor.CodeProbeRouteMissing} {
+			if hasCode(report.Findings, unwanted) != nil {
+				t.Errorf("discovery-failed run must not also emit %s", unwanted)
+			}
+		}
+	})
+
 	t.Run("config-only skips endpoint checks and uses defaults", func(t *testing.T) {
 		// Zero Now/windows exercise the default fallbacks.
 		deps := Deps{K8s: fakeClient(t, healthyBackend(time.Now())), SkipEndpointChecks: true}

@@ -125,11 +125,12 @@ func runDoctor(ctx context.Context, opts *doctorOptions, code *int) error {
 
 		grpcTarget, snapshotURL, policyURL, probeURL, err := resolveEndpoints(ctx, k8s, opts.serverEndpoint)
 		if err != nil {
-			// Don't abort: the cluster-configuration checks still provide value,
-			// and leaving the endpoint deps nil makes the live endpoint checks
-			// emit structured FAIL findings (exit 2) — consistent with a server
-			// that is down, rather than a bare error on a separate channel.
+			// Don't abort: the cluster-configuration checks still provide value.
+			// Record the discovery error on Deps so Run surfaces it as a single
+			// structured FAIL (carrying the actionable error in the report and
+			// --output=json), and also echo it to stderr for interactive runs.
 			fmt.Fprintf(os.Stderr, "warning: %v; skipping live server endpoint probes\n", err)
+			deps.EndpointDiscoveryErr = err
 		} else {
 			conn, err := grpc.NewClient(grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
