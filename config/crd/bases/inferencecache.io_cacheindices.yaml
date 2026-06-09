@@ -195,6 +195,11 @@ spec:
                         status.replicas[].cacheMemoryBytes.
 
                         Deprecated: always 0; read status.replicas[].cacheMemoryBytes instead.
+
+                        Intentionally NOT omitempty: the field must always serialize as
+                        `memoryUsed: 0` so a consumer of the published v1alpha1 status sees the
+                        key stay put (omitempty would drop the key on the zero value and break
+                        the deprecate-in-place shape contract).
                       format: int64
                       type: integer
                   required:

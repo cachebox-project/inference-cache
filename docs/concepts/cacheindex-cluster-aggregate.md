@@ -65,9 +65,11 @@ status:
     - id: team-search             # indexEntries across tenants sums to prefixes.summary.total
       indexEntries: 902
       hitRate: "0.81"
+      memoryUsed: 0               # deprecated, always 0 (read replicas[].cacheMemoryBytes)
     - id: team-rag
       indexEntries: 526
       hitRate: "0.64"
+      memoryUsed: 0
   replicas:
     - id: qwen-engine-7d9c5-abcde
       tenant: team-search

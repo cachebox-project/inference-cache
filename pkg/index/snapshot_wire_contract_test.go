@@ -34,8 +34,11 @@ import (
 //     updated in the same commit. Coordinate with anything else that
 //     decodes /snapshot.
 func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
-	// Construct a Snapshot whose every leaf field is non-zero so the
-	// json encoder emits all keys (including ones marked omitempty).
+	// Construct a Snapshot whose leaf fields are set so the json encoder
+	// emits all keys (including ones marked omitempty). One exception:
+	// TenantSnapshot.MemoryUsed is deprecated and deliberately left 0 — its
+	// JSON tag carries NO omitempty, so the key stays on the wire even at 0
+	// (the skew-compat guarantee). Do NOT "fix" it to a non-zero value.
 	// Tags marked omitempty whose values would be zero are excluded from
 	// the frozen list below ON PURPOSE — they're documented optional and
 	// their absence on the wire is part of the contract.
