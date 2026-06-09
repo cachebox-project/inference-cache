@@ -211,8 +211,8 @@ prefix warm, the engine recomputes. So the cost of "TTL too long" is wasted inde
 | `CachePolicy.spec.evictionTTL` | per-namespace duration | server default 30m | Bounds freshness window + steady-state memory for the namespace. |
 | `CachePolicy.spec.eviction` | per-namespace enum (`LRU`/`LFU`) | `LRU` | Picks the victim under cap pressure. LFU keeps frequently-hit prefixes warm. |
 | `CacheTenant.spec.quota.maxIndexEntries` | per-tenant int64 | unset = unbounded | Bounds the per-tenant slice of the index; over-budget evicts the tenant's own oldest entries (Fairness). |
-| Global entry cap | server compile-time constant | `DefaultMaxEntries = 1,000,000` | Backstop. Compile-time today; see the "State today" callout under [Knobs the operator actually has](#knobs-the-operator-actually-has). |
-| Global TTL fallback | server compile-time constant | `DefaultTTL = 30m` | Applies to tenants in namespaces without a CachePolicy. |
+| Global entry cap | server compile-time constant | `DefaultMaxEntries = 1,000,000` | Backstop. Compile-time today; see the "State today" callout below. |
+| Global TTL fallback | server compile-time constant | `DefaultTTL = 30m` | Applies whenever the per-tenant TTL resolver returns ≤ 0 — i.e. tenants in namespaces without a CachePolicy AND CachePolicies that exist but omit `spec.evictionTTL`. |
 | Sweep interval | server compile-time constant | `DefaultSweepInterval = 1m` | How often the TTL pass runs. Higher = more lag, less CPU. |
 
 **State today.** The global cap, global TTL, and sweep interval are compile-time

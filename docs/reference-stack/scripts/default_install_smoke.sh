@@ -444,6 +444,24 @@ kubectl -n "$NAMESPACE" wait --for=condition=Available --timeout="$READY_TIMEOUT
   deployment/inference-cache-server \
   || fail "controller and/or server did not reach Available within $READY_TIMEOUT"
 
+# --- server resources sized for DefaultMaxEntries ---------------------------
+# The default install MUST budget enough memory to actually hold the
+# DefaultMaxEntries=1,000,000 cap; without that, the default cap is a
+# meaningless number — operators would OOM well before reaching it. The
+# sizing-guide measurements (docs/operations/index-sizing.md) put 1M
+# entries at ~540 MiB peak RSS, so the limit lives at 1Gi. Asserting on
+# the live Deployment proves the bundle still ships that resource shape —
+# the smoke would catch a future refactor that "simplified" the limit
+# back to its old 256Mi value, which would silently re-introduce the
+# OOM-below-cap discrepancy.
+server_mem_limit=$(kubectl -n "$NAMESPACE" get deployment/inference-cache-server \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].resources.limits.memory}' \
+  2>/dev/null || true)
+if [ "$server_mem_limit" != "1Gi" ]; then
+  fail "inference-cache-server memory limit = '$server_mem_limit' (want 1Gi to fit DefaultMaxEntries=1M per docs/operations/index-sizing.md)"
+fi
+log "inference-cache-server memory limit = $server_mem_limit (sized for DefaultMaxEntries=1M)"
+
 # --- CacheBackend CRD schema-trim assertion --------------------------------
 # The installed CRD must reflect the inert-field trim: the three removed fields
 # are absent from the served v1alpha1 schema, and the field that replaced the
