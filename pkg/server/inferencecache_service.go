@@ -360,7 +360,7 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		toks, err := s.tokenizer.Encode(ctx, req.GetModelId(),
 			[]tokenize.Message{{Role: "user", Content: text}},
 			tokenize.EncodeOptions{AddGenerationPrompt: true})
-		if err != nil || len(toks) == 0 {
+		if err != nil || len(toks) == 0 || len(toks) > MaxLookupTokens {
 			return lookupInputs{failOpen: true}
 		}
 		bh, btc := fingerprint.Chain(toks, s.blockSize)

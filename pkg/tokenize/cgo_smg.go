@@ -72,26 +72,60 @@ type smgTokenizer struct {
 // (fail-soft startup; that model is simply unavailable).
 func newSMGTokenizer(modelsDir string) *smgTokenizer {
 	t := &smgTokenizer{handles: make(map[string]*C.Handle)}
-	entries, err := os.ReadDir(modelsDir)
-	if err != nil {
+	if _, err := os.Stat(modelsDir); err != nil {
 		slog.Warn("tokenize: cannot read tokenizer models dir; server-side tokenization disabled",
 			"dir", modelsDir, "err", err)
 		return t
 	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		model := e.Name()
-		h, err := loadHandle(filepath.Join(modelsDir, model))
+	for _, m := range discoverModels(modelsDir) {
+		h, err := loadHandle(m.path)
 		if err != nil {
-			slog.Warn("tokenize: failed to load tokenizer; model unavailable", "model", model, "err", err)
+			slog.Warn("tokenize: failed to load tokenizer; model unavailable", "model", m.id, "err", err)
 			continue
 		}
-		t.handles[model] = h
+		t.handles[m.id] = h
 	}
 	slog.Info("tokenize: loaded tokenizers", "dir", modelsDir, "count", len(t.handles))
 	return t
+}
+
+type discoveredModel struct {
+	id   string // engine-facing model id (slash-separated relative path)
+	path string // absolute/relative filesystem path to load from
+}
+
+// discoverModels walks modelsDir and returns each model directory keyed by its
+// path RELATIVE to modelsDir (slash-separated), so a model id with a namespace
+// separator (e.g. "Qwen/Qwen2.5-0.5B-Instruct") resolves. The request model_id is
+// only ever matched against these pre-loaded keys, never joined onto a path —
+// confinement holds.
+func discoverModels(modelsDir string) []discoveredModel {
+	var out []discoveredModel
+	_ = filepath.WalkDir(modelsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries, keep walking siblings
+		}
+		if !d.IsDir() || path == modelsDir || !isModelDir(path) {
+			return nil
+		}
+		rel, relErr := filepath.Rel(modelsDir, path)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
+		out = append(out, discoveredModel{id: filepath.ToSlash(rel), path: path})
+		return filepath.SkipDir // a model directory is a leaf; don't descend into it
+	})
+	return out
+}
+
+// isModelDir reports whether dir holds tokenizer artifacts the loader can use —
+// an HF tokenizer.json or a *.tiktoken file.
+func isModelDir(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "tokenizer.json")); err == nil {
+		return true
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.tiktoken"))
+	return len(matches) > 0
 }
 
 // loadHandle creates one tokenizer handle from a local path (a tokenizer dir) or

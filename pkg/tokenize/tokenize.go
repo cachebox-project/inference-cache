@@ -52,10 +52,12 @@ var ErrUnavailable = errors.New("tokenize: tokenizer unavailable")
 
 // Config configures the tokenizer constructed by New.
 type Config struct {
-	// ModelsDir, when set, resolves a model id to "<ModelsDir>/<model>" (a
-	// directory holding the model's tokenizer.json). When empty, the model id
-	// is passed through to the loader as a path or an HF model id. Only the
-	// cgo (smgcgo) build consults this; the default build ignores it.
+	// ModelsDir is the directory of vetted per-model tokenizer artifacts
+	// (<ModelsDir>/<model_id>/tokenizer.json; model_id may contain a namespace
+	// separator). The cgo (smgcgo) build eagerly loads every tokenizer under it
+	// at startup and serves them from memory, confined to this directory. Empty
+	// disables server-side tokenization (New returns Unavailable). The default
+	// (non-cgo) build ignores this field.
 	ModelsDir string
 }
 

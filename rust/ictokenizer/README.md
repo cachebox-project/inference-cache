@@ -42,9 +42,14 @@ CGO_LDFLAGS="-L$(pwd)/rust/ictokenizer/target/release" \
 ```
 
 The archive is statically linked into the Go binary (no shared library to ship).
-`tokenizer.json` artifacts are resolved per model — either via the server's
-`--tokenizer-models-dir` (`<dir>/<model>/tokenizer.json`) or, if unset, by treating
-the model id as a path or a HuggingFace id (downloaded; gated models need `HF_TOKEN`).
+Server-side tokenization is fail-closed: the server loads tokenizers **eagerly at
+startup** from a vetted `--tokenizer-models-dir` (`<dir>/<model_id>/tokenizer.json`,
+where `<model_id>` may include a namespace, e.g. `Qwen/Qwen2.5-0.5B-Instruct`) and
+serves them from memory, confined to that directory. With no directory configured,
+server-side tokenization is disabled (the prompt_text path fails open to `NO_HINT`).
+This crate's `ic_tokenizer_create` can still load by an arbitrary path or HF id
+(downloaded; gated models need `HF_TOKEN`) — that capability is used for tests, not
+the request hot path.
 
 ## C ABI
 
