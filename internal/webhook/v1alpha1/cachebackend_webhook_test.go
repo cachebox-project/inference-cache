@@ -388,68 +388,6 @@ func TestValidator_EndpointOnManagedTypeBlankAdmitted(t *testing.T) {
 	}
 }
 
-func TestValidator_PersistentStorageOnMemoryOnlyBackendRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
-	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeNIXL
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
-	}
-	requireInvalidWithCause(t, v, cb, "spec.storage.pvc",
-		"memory-only and cannot declare spec.storage.pvc")
-}
-
-func TestValidator_PersistentStorageOnHierarchicalBackendAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
-	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("100Gi")},
-	}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("LMCache with PVC rejected: %v", err)
-	}
-}
-
-func TestValidator_NonPositivePVCSizeRejected(t *testing.T) {
-	// size drives a real PVC request, so a non-positive value must be a
-	// field-scoped rejection at admission, not a late child-PVC failure.
-	for _, sz := range []string{"0", "0Gi"} {
-		v := &CacheBackendValidator{}
-		cb := newBackend()
-		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-		cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-			PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse(sz)},
-		}
-		requireInvalidWithCause(t, v, cb, "spec.storage.pvc.size",
-			"must be a positive storage quantity")
-	}
-}
-
-func TestValidator_StorageWithOverlongNameRejected(t *testing.T) {
-	// The derived PVC name (<name>-data) must fit the 253-char k8s name limit;
-	// a near-max CacheBackend name + the suffix would otherwise make the backend
-	// silently unreconcilable. 250 + len("-data")=5 = 255 > 253.
-	v := &CacheBackendValidator{}
-	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-	cb.Name = strings.Repeat("a", 250)
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
-	}
-	requireInvalidWithCause(t, v, cb, "metadata.name", "would exceed the 253-character limit")
-
-	// A normal-length name with the same storage spec is accepted.
-	ok := newBackend()
-	ok.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-	ok.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
-	}
-	if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
-		t.Fatalf("normal-length persistent backend rejected: %v", err)
-	}
-}
-
 func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
 	// limits.memory < requests.memory makes the operator's intent
 	// impossible to satisfy at scheduling time and is the canonical
@@ -1306,15 +1244,15 @@ func TestValidator_ExternalEndpoint_LMSchemeWithPathRejected(t *testing.T) {
 func TestValidator_AggregatesMultipleViolations(t *testing.T) {
 	// Two independent violations on a single CR must both appear in the
 	// rejection's status.details.causes, so kubectl prints them together.
-	// Here: PVC on a memory-only backend (NIXL) plus a cross-namespace
-	// endpoint without opt-in. Both rules should fire on the same spec.
+	// Here: an endpoint on a non-External backend plus scale-to-zero with
+	// autoscaling and no explicit minReplicas. Both rules should fire on
+	// the same spec.
 	v := &CacheBackendValidator{}
 	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeNIXL
-	cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
-		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("1Gi")},
-	}
-	cb.Spec.Endpoint = "x.other-ns.svc"
+	cb.Spec.Endpoint = "cache.example.com:8200"
+	zero := int32(0)
+	cb.Spec.Replicas = &zero
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
 
 	_, err := v.ValidateCreate(context.Background(), cb)
 	statusErr, ok := err.(*apierrors.StatusError)
@@ -1377,8 +1315,8 @@ func (stubVLLMLMCacheAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1a
 	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
 }
 
-func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*adapterruntime.ResolvedCacheServer, error) {
-	return nil, nil
+func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
 }
 func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
 	return nil
@@ -1417,8 +1355,8 @@ func (stubExternalAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1alph
 	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal
 }
 
-func (stubExternalAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*adapterruntime.ResolvedCacheServer, error) {
-	return nil, nil
+func (stubExternalAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
 }
 func (stubExternalAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
 	return nil

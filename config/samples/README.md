@@ -30,17 +30,12 @@ before applying. All but `recipe-gpu-production` run without a GPU.
 | [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | `type: External` — point the operator at a cache server you manage yourself; the controller provisions nothing. |
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
-| [`recipe-persistent-cache.yaml`](recipe-persistent-cache.yaml) | `spec.storage.pvc` — provisions a PVC owner-referenced to the CacheBackend and mounts it into the cache-server pod (single replica; ReadWriteOnce). Adopt-and-keep on removal. (Server-side disk-backed KV is a separate follow-up; the volume is mounted but the server still keeps KV in memory.) |
 
 **Prerequisites per recipe.** Most recipes are self-contained. One has an
 external dependency: `recipe-external-cache.yaml` needs a cache server already
 running at the endpoint you supply (replace the placeholder).
 `recipe-multi-tenant.yaml` has no external dependency but creates and deploys
-into two namespaces of its own. `recipe-persistent-cache.yaml` needs a usable
-default StorageClass for its PVC to bind (kind ships one) — on a cluster without
-one, set `spec.storage.pvc.storageClassName` to an existing class (or
-pre-provision a matching PV), otherwise the PVC stays `Pending` and
-`status.capacity` never populates.
+into two namespaces of its own.
 
 **Apply + observability.** Each recipe's `kubectl apply` wires matching engine
 pods to the cache. For *managed* backends the wiring becomes available once the

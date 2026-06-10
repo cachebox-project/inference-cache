@@ -68,21 +68,21 @@ func TestSupports_NilCache(t *testing.T) {
 	}
 }
 
-func TestResolveCacheServer_ReturnsNil(t *testing.T) {
+func TestResolveCacheServer_ReturnsNilTriple(t *testing.T) {
 	a := external.NewAdapter()
 	cb := externalBackend("lm://x:1")
-	resolved, err := a.ResolveCacheServer(cb)
+	pod, svc, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer must not error for a valid External CR: %v", err)
 	}
-	if resolved != nil {
-		t.Fatalf("ResolveCacheServer must return nil for External (no controller-managed cache-server); got %+v", resolved)
+	if pod != nil || svc != nil {
+		t.Fatalf("ResolveCacheServer must return nil pod + nil service for External; got pod=%v svc=%v", pod, svc)
 	}
 }
 
 func TestResolveCacheServer_NilCacheErrors(t *testing.T) {
 	a := external.NewAdapter()
-	if _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, _, err := a.ResolveCacheServer(nil); err == nil {
 		t.Fatalf("ResolveCacheServer must error on nil cache")
 	}
 }

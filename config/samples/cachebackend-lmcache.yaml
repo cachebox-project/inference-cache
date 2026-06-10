@@ -12,13 +12,10 @@
 #
 # Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
 # canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler
-# from spec.autoscaling. spec.storage.pvc provisions a PersistentVolumeClaim
-# owner-referenced to the CacheBackend and mounts it into the cache-server
-# pod (see recipe-persistent-cache.yaml for a worked example). Switching the
-# lmcache-server to actually spill KV to that volume — a disk-backed storage
-# device — is a separate follow-up; until then the volume is mounted but the
-# server still keeps KV in memory. A persistent backend must be single-replica
-# (a ReadWriteOnce PVC can't be multi-attached).
+# from spec.autoscaling. The lmcache-server keeps KV in memory; for a
+# durable / shared cache pick a backend designed for it (the planned
+# Mooncake backend) rather than a volume knob on this one — see
+# docs/design/lmcache-server-persistence.md.
 #
 # Override the lmcache-server image (defaults to a pinned lmcache/standalone
 # version; keep it wire-compatible with the engine's lmcache client) or the

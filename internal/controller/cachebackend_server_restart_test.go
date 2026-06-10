@@ -199,7 +199,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
 		WithObjects(f.backend, f.serverDep, f.serverRS, f.serverPod, f.engineDep, f.engineRS, f.enginePod).
 		Build()
 	f.r = &CacheBackendReconciler{

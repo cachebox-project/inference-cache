@@ -207,9 +207,9 @@ type serverInstanceCascade struct {
 	counted map[cascadeKey]string
 	// cleared records that the latch for this key was explicitly
 	// cleared (a lifecycle exit from the managed path —
-	// reconcileExternal, reconcileUnmanaged, or
-	// reconcileInvalidStorage — wiped the shadow and asked the
-	// reconciler to publish status.observedServerInstance="").
+	// reconcileExternal or reconcileUnmanaged — wiped the shadow
+	// and asked the reconciler to publish
+	// status.observedServerInstance="").
 	// The sentinel survives a transient status-patch failure on
 	// that clear: the in-memory cleared bit overrides any stale
 	// non-empty status field on the NEXT reconcile, so a
@@ -341,9 +341,9 @@ func (s *serverInstanceCascade) canCascade(key cascadeKey, now time.Time, window
 // clearServerInstanceLatchShadow wipes the in-memory shadow + rate-
 // limit timestamp for this backend. Called from lifecycle paths that
 // intentionally clear the on-cluster status.observedServerInstance
-// field (reconcileExternal, reconcileUnmanaged, reconcileInvalidStorage).
+// field (reconcileExternal, reconcileUnmanaged).
 // The shadow must follow the cluster-visible field; otherwise a
-// later managed→External→managed (or invalid→fixed) transition in
+// later managed→External→managed transition in
 // the same controller process would consult the lingering shadow,
 // resolve effectivePrior to the stale prior-period value, and
 // misclassify the first new Ready pod as a replacement —
@@ -467,7 +467,7 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// shadow → statusField.
 	//
 	// 1) The "cleared" sentinel is checked first. A lifecycle exit
-	//    from the managed path (External / Unmanaged / InvalidStorage)
+	//    from the managed path (External / Unmanaged)
 	//    sets it via clear(); it survives a transient status-patch
 	//    failure on the same clear. If the operator flips back to
 	//    managed before the External-side patchStatus retry has

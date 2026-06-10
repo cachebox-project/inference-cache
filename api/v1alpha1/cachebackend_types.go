@@ -2,7 +2,6 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -42,31 +41,8 @@ const (
 
 // CacheBackendSpec defines the desired state of a cache backend.
 //
-// Persistent storage (spec.storage.pvc) and the autoscaling spec
-// (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
-// HorizontalPodAutoscaler. On a managed Deployment backend
-// (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
-// PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
-// when the CacheBackend is deleted), mounts it into the cache-server pod at the
-// runtime adapter's declared data path, and reports the bound PVC's actual size
-// in status.capacity.
-//
-// Two scoping rules apply:
-//
-//   - Only a managed Deployment backend provisions storage. A StatefulSet
-//     backend is routed to the unmanaged path today (see DeploymentKind), so it
-//     provisions nothing, storage included; per-replica volumeClaimTemplates are
-//     a follow-up. An External backend provisions no workload at all, so
-//     spec.storage.pvc is a no-op there.
-//   - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
-//     multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
-//     Ready=False/InvalidStorageConfiguration rather than provisioned;
-//     per-replica persistent storage via StatefulSet is a separate follow-up.
-//
-// NOTE: provisioning + mounting the PVC does not by itself make the cache server
-// spill KV to it — switching the LMCache server to a disk-backed storage device
-// is a separate follow-up; until then the volume is attached but the server
-// keeps KV in memory.
+// The autoscaling spec (spec.autoscaling) is reconciled into a
+// HorizontalPodAutoscaler for managed backends.
 type CacheBackendSpec struct {
 	// Type identifies the backing cache implementation. Defaults to LMCache —
 	// the standalone lmcache-server workload Phase-1 ships; operators pick
@@ -103,10 +79,6 @@ type CacheBackendSpec struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
-
-	// Storage describes persistent storage requested by the backend.
-	// +optional
-	Storage *CacheBackendStorageSpec `json:"storage,omitempty"`
 
 	// Autoscaling configures horizontal autoscaling for the managed backend
 	// workload. When set, the controller reconciles a HorizontalPodAutoscaler
@@ -248,32 +220,6 @@ type CacheBackendSpec struct {
 	// not in-cluster Service DNS (external hostnames, IPs) are unaffected.
 	// +optional
 	AllowCrossNamespace bool `json:"allowCrossNamespace,omitempty"`
-}
-
-// CacheBackendStorageSpec defines storage settings for a cache backend.
-type CacheBackendStorageSpec struct {
-	// PVC describes a persistent volume claim used by the backend.
-	// +optional
-	PVC *CacheBackendPVCSpec `json:"pvc,omitempty"`
-}
-
-// CacheBackendPVCSpec defines PVC-backed storage settings.
-type CacheBackendPVCSpec struct {
-	// Size is the requested persistent storage size. It can be increased later
-	// (the controller patches the PVC request up, and the StorageClass expands
-	// the volume if it allows expansion); it cannot be decreased — Kubernetes
-	// does not support shrinking a PVC, so a smaller value is ignored.
-	// +kubebuilder:validation:Required
-	Size resource.Quantity `json:"size"`
-
-	// StorageClassName is the optional StorageClass for the PVC. Omit (leave
-	// null) to use the cluster default StorageClass; set it to the empty string
-	// ("") to explicitly opt out of the default (static / no-provisioner
-	// binding) — the controller preserves the distinction. It is immutable after
-	// the PVC is created — Kubernetes rejects StorageClass changes — so a later
-	// edit is ignored (the controller logs and keeps the existing class).
-	// +optional
-	StorageClassName *string `json:"storageClassName,omitempty"`
 }
 
 // CacheBackendAutoscalingSpec configures horizontal autoscaling of the managed
@@ -562,16 +508,6 @@ type CacheBackendStatus struct {
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
-	// Capacity is a human-readable summary of the backend's provisioned
-	// capacity: the bound PersistentVolumeClaim's actual capacity when
-	// spec.storage.pvc is set and the PVC has bound (the real provisioned size,
-	// which may exceed the request), or empty for an ephemeral backend or while
-	// the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
-	// binds only once the pod schedules). It is informational; clients must not
-	// parse it.
-	// +optional
-	Capacity string `json:"capacity,omitempty"`
-
 	// MatchedEnginePods is the number of pods in this CacheBackend's namespace
 	// whose labels match spec.engineSelector at the last reconcile. The field
 	// is a pointer so nil ("not yet computed") is distinguishable from 0
@@ -665,10 +601,7 @@ type CacheBackendStatus struct {
 	// containerStatuses[].RestartCount summed across cache-server
 	// containers (the names from the owned Deployment's pod
 	// template; foreign sidecars are excluded). Inert and cleared
-	// for External backends, unsupported-runtime backends, and on
-	// the InvalidStorageConfiguration gate (a persistent
-	// multi-replica spec the controller refuses to provision until
-	// the operator scales to 1 or removes spec.storage.pvc).
+	// for External backends and unsupported-runtime backends.
 	//
 	// Operator-side recovery for the upstream LMCache
 	// LMServerConnector EPIPE-on-restart bug. See
