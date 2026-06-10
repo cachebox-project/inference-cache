@@ -141,6 +141,36 @@ func TestLookupRouteTokenIDsEqualsExplicitChain(t *testing.T) {
 	}
 }
 
+// A token_ids input shorter than one full KV block must fail open with NO_HINT,
+// not fall through to a TENANT_HOT locality hint — there is no block the engine
+// could have prefix-cached. We make the tenant warm (a real prefix + recent,
+// high-hit-rate stats) so a miss WOULD otherwise surface TENANT_HOT.
+func TestLookupRouteShortTokenIDsFailsOpenNotTenantHot(t *testing.T) {
+	const blockSz = 16
+	svc := newTestService()
+	warm := tokenSeq(7_000, 64)
+	ingestFingerprintPrefix(svc.index, "r1", "m", "tenant-x", "vllm", warm, blockSz)
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r1", Model: "m", Tenant: "tenant-x", HashScheme: "vllm",
+		Stats:     &index.ReplicaStats{ReplicaID: "r1", HitRate: 0.9},
+		Timestamp: time.Now(),
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm",
+		TokenIds: tokenSeq(9_000_000, 8), // 8 tokens < blockSize → no full block
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (sub-block token_ids must not surface a hint)", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Errorf("sub-block token_ids returned %d scores, want 0", len(resp.GetReplicaScores()))
+	}
+}
+
 // A novel pre-tokenized prefix the server has never seen must fail open.
 func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
 	stored := tokenSeq(1_000, 64)

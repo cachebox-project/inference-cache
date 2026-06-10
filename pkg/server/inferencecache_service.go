@@ -296,16 +296,23 @@ type lookupInputs struct {
 //     tokenized, then fingerprinted; the canonical tokens are echoed so the
 //     caller forwards exactly those to the engine (match by construction).
 //
-// failOpen is set only for the prompt_text path when the tokenizer is
-// unavailable or errors. A token_ids / prompt_text input too short to fill one
-// block yields an empty chain (failOpen=false), which the downstream exact-match
-// path turns into a fail-open NO_HINT.
+// failOpen is set for the prompt_text path when the tokenizer is unavailable or
+// errors, AND for a token_ids / prompt_text input too short to fill one full KV
+// block (fingerprint.Chain yields an empty chain): a dual-input caller is asking
+// for a specific-prefix lookup, so a sub-block prompt must fail open with
+// NO_HINT rather than fall through to the legacy empty-prefix path (which could
+// otherwise surface a TENANT_HOT locality hint for a prompt that has no
+// cacheable block — symmetric with the "chain misses never fall to TENANT_HOT"
+// rule in grpc-contract.md).
 func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) lookupInputs {
 	if len(req.GetBlockHashes()) > 0 || len(req.GetPrefixHash()) > 0 {
 		return lookupInputs{blockHashes: req.GetBlockHashes(), blockTokenCounts: req.GetBlockTokenCounts()}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
 		bh, btc := fingerprint.Chain(toks, s.blockSize)
+		if len(bh) == 0 {
+			return lookupInputs{failOpen: true} // shorter than one block — nothing the engine can prefix-cache
+		}
 		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
 	}
 	if text := req.GetPromptText(); text != "" {
@@ -316,6 +323,9 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 			return lookupInputs{failOpen: true}
 		}
 		bh, btc := fingerprint.Chain(toks, s.blockSize)
+		if len(bh) == 0 {
+			return lookupInputs{failOpen: true}
+		}
 		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
 	}
 	return lookupInputs{}

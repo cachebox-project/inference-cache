@@ -7,6 +7,12 @@
 // It is a library, not a request proxy: the inference-cache server never calls
 // it on the hot path. A gateway, benchmark, or canary drives the flow
 // (tokenize → fingerprint → LookupRoute → pick replica → Complete).
+//
+// Placement: it lives under pkg/adapters/ because it adapts to an inference
+// engine's request API (the OpenAI /v1/completions and, later, vLLM gRPC
+// surfaces). Unlike the engine subscriber under pkg/adapters/engine (which a
+// binary owns for KV-event ingest), this egress client belongs to no binary —
+// it is harness/demonstrator code used by the canary and future gateway clients.
 package engineclient
 
 import (

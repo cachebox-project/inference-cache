@@ -113,17 +113,28 @@ func scrapeCounter(ctx context.Context, client *http.Client, url, metric string)
 		if line == "" || line[0] == '#' || !strings.HasPrefix(line, metric) {
 			continue
 		}
-		// Match "<metric>" or "<metric>{labels}" — the char after the name must
-		// be a space or '{', not another identifier char (avoid prefix collisions).
+		// The char after the name must be whitespace or '{', not another
+		// identifier char — avoids prefix collisions (e.g. <metric>_bucket).
 		rest := line[len(metric):]
-		if rest == "" || (rest[0] != ' ' && rest[0] != '{') {
+		if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != '{') {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
+		// Skip an optional {labels} block (label values may contain spaces, so a
+		// naive field split is wrong), then take the value token. In Prometheus
+		// exposition the value is the FIRST token after the labels; an optional
+		// timestamp follows it, so don't read the last token.
+		if rest[0] == '{' {
+			end := strings.IndexByte(rest, '}')
+			if end < 0 {
+				continue // malformed label set
+			}
+			rest = rest[end+1:]
 		}
-		if v, err := strconv.ParseFloat(fields[len(fields)-1], 64); err == nil {
+		rest = strings.TrimSpace(rest)
+		if sp := strings.IndexAny(rest, " \t"); sp >= 0 {
+			rest = rest[:sp] // drop a trailing timestamp
+		}
+		if v, err := strconv.ParseFloat(rest, 64); err == nil {
 			sum += v
 		}
 	}

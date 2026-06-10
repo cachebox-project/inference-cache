@@ -103,6 +103,25 @@ func TestScrapeCounterIgnoresPrefixCollisions(t *testing.T) {
 	}
 }
 
+// scrapeCounter must read the sample value, not a trailing timestamp, and must
+// tolerate label values that contain spaces.
+func TestScrapeCounterReadsValueNotTimestamp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// First series carries a label value with a space AND a trailing timestamp.
+		_, _ = w.Write([]byte("vllm:prefix_cache_hits_total{model=\"a b\"} 7 1700000000000\n" +
+			"vllm:prefix_cache_hits_total{model=\"c\"} 3\n"))
+	}))
+	defer srv.Close()
+
+	got, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	if err != nil {
+		t.Fatalf("scrapeCounter: %v", err)
+	}
+	if got != 10 {
+		t.Errorf("scrapeCounter = %d, want 10 (values 7+3, not the timestamp)", got)
+	}
+}
+
 // TestPrefixCacheCanaryLive runs the real by-construction canary against a live
 // OpenAI-compatible engine. Operator-run, not CI: set IC_ENGINE_URL (e.g.
 // http://localhost:8000) and IC_ENGINE_MODEL (the served model). A long

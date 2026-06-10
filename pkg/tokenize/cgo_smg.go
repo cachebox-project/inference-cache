@@ -44,7 +44,14 @@ import (
 
 // smgTokenizer is the cgo-backed Tokenizer. It lazily loads and caches one
 // llm-tokenizer handle per model (loads are expensive — an HF download or a
-// disk read). Safe for concurrent use.
+// disk read).
+//
+// Concurrency: the RWMutex guards only the handle-cache map (creation). Encoding
+// itself needs no lock: a handle wraps an Arc<dyn Tokenizer>, and upstream's
+// Encoder/Decoder traits are `Send + Sync` with `&self` encode / chat-template
+// methods, so simultaneous Encode/EncodeText calls on the same handle are safe
+// by Rust's Sync guarantee. Serializing them would needlessly bottleneck the
+// LookupRoute hot path.
 type smgTokenizer struct {
 	// resolve maps a model id to the path/HF-id the tokenizer loads from.
 	resolve func(model string) string

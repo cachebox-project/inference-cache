@@ -7,7 +7,7 @@
 # This isolates the ENGINE half of the guarantee. The other halves are covered
 # by their own tests: the tokenizer (pkg/tokenize, verified against a real HF
 # tokenizer) and the content fingerprint (pkg/fingerprint, golden tests). The
-# Go test TestPrefixCacheCanaryLive drives pkg/engineclient: it sends a long
+# Go test TestPrefixCacheCanaryLive drives pkg/adapters/engineclient: it sends a long
 # token-ID prompt to /v1/completions twice and asserts vLLM's
 # prefix_cache_hits_total rises on the warm (identical) request.
 #
@@ -75,7 +75,7 @@ export IC_ENGINE_MODEL
 export IC_ENGINE_PROMPT_TOKENS="$PROMPT_TOKENS"
 
 log "running the by-construction canary (token-ID prompt prefix-cache hit)"
-go test ./pkg/engineclient/ -run TestPrefixCacheCanaryLive -count=1 -v \
+go test ./pkg/adapters/engineclient/ -run TestPrefixCacheCanaryLive -count=1 -v \
   || fail "canary failed: the engine did not prefix-cache the token-ID prompt"
 
 log "PASS: engine prefix-cached the token-ID prompt — routing fingerprint matches by construction"
