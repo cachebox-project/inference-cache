@@ -30,7 +30,13 @@ type goldenVector struct {
 	PrefixHashes  []goldenHash `json:"prefix_hashes"`
 }
 
+type goldenScheme struct {
+	Algorithm string `json:"algorithm"`
+	Seed      uint64 `json:"seed"`
+}
+
 type goldenFile struct {
+	Scheme  goldenScheme   `json:"scheme"`
 	Vectors []goldenVector `json:"vectors"`
 }
 
@@ -43,6 +49,14 @@ func loadGoldenVectors(t *testing.T) []goldenVector {
 	var f goldenFile
 	if err := json.Unmarshal(raw, &f); err != nil {
 		t.Fatalf("parse golden fixture: %v", err)
+	}
+	// The scheme block is the fixture's human-readable contract; pin its
+	// machine-checkable fields so an accidental edit can't slip through.
+	if f.Scheme.Algorithm != "XXH3-64" {
+		t.Fatalf("fixture scheme.algorithm = %q, want XXH3-64", f.Scheme.Algorithm)
+	}
+	if f.Scheme.Seed != Seed {
+		t.Fatalf("fixture scheme.seed = %d, want %d (fingerprint.Seed)", f.Scheme.Seed, Seed)
 	}
 	if len(f.Vectors) == 0 {
 		t.Fatal("golden fixture has no vectors")
