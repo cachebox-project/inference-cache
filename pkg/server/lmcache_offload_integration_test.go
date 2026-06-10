@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
@@ -75,6 +76,16 @@ func be8(h uint64) []byte {
 	return out
 }
 
+// tokenSeq returns [start, start+1, ..., start+n-1] as token IDs — a stable block
+// of content for the Reporter to fingerprint.
+func tokenSeq(start, n int) []uint32 {
+	out := make([]uint32, n)
+	for i := range out {
+		out[i] = uint32(start + i)
+	}
+	return out
+}
+
 // L2-tier mode: with WithIgnoreBlockRemoved set, BlockRemoved is dropped at
 // the reporter, so the index retains the routing hint and LookupRoute returns
 // PREFIX_MATCH for a block the engine has since evicted from GPU. This is the
@@ -86,8 +97,11 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	// DefaultMinimumMatchedTokens floor so the assertion is about
 	// the offload-pinning behavior, not the floor; smaller block sizes would
 	// downgrade this hint to NO_HINT before the L2-tier guard mattered.
-	h := be8(0xD2CD1BA8E13D7DD6)
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 128}
+	h := be8(0xD2CD1BA8E13D7DD6) // engine block hash — reverse-map identity only
+	toks := tokenSeq(1000, 128)  // one 128-token block
+	// The index keys on our content fingerprint; the gateway queries with the same.
+	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
+	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
 	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
 
 	client, stop := runEngineReporterAgainstServer(t,
@@ -99,7 +113,7 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "vllm-model", TenantId: "ic-smoke", HashScheme: "vllm",
-		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{128},
+		BlockHashes: [][]byte{our}, BlockTokenCounts: []int32{128},
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
@@ -118,7 +132,9 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 // (one store + one remove of the same hash) must yield NO_HINT here.
 func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 	h := be8(0xC0FFEE0011223344)
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}
+	toks := tokenSeq(2000, 128)
+	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
+	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
 	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
 
 	client, stop := runEngineReporterAgainstServer(t, nil, // default reporter
@@ -129,7 +145,7 @@ func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "vllm-model", TenantId: "ic-smoke", HashScheme: "vllm",
-		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{16},
+		BlockHashes: [][]byte{our}, BlockTokenCounts: []int32{128},
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
@@ -139,25 +155,20 @@ func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 	}
 }
 
-// The 8-byte-BE byte pattern the subscriber's hashToBytes produces from a
-// vLLM integer hash (covered byte-for-byte by TestDecodeLargeUint64Hash in
-// pkg/adapters/engine) MUST be byte-identical to what the gateway proxy
-// sends in LookupRoute, or the server's prefixKey map lookup misses. This
-// test pins the second half of that round-trip — for a hash whose live wire
-// bytes were captured during the L2 offload diagnosis (0xD2CD1BA8E13D7DD6),
-// feeding those bytes through the Reporter's ingest path and then querying
-// LookupRoute with the same bytes returns PREFIX_MATCH. A regression that
-// silently changed the prefixKey shape, the proto wire bytes, or the
-// reporter's StoredPrefixes hash field would fail here.
-func TestKnownEngineHashBytesMatchViaReporterAndLookupRoute(t *testing.T) {
-	const hashInt uint64 = 0xD2CD1BA8E13D7DD6
-	h := be8(hashInt)
-	// BlockSize=128 keeps the realized matched_tokens above the
-	// DefaultMinimumMatchedTokens floor — the test pins
-	// hash-byte equality across the round-trip, not the floor; a 16-token
-	// single block would be downgraded to NO_HINT before the byte-equality
-	// assertion ran.
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, BlockSize: 128}
+// The content fingerprint the Reporter forwards on ingest (derived in-pod from
+// the event's token_ids) MUST be byte-identical to what a gateway computes from
+// the same tokens and sends in LookupRoute, or the server's prefixKey map lookup
+// misses. This pins that round-trip end-to-end: feed a block's tokens through the
+// Reporter's ingest path, then query LookupRoute with the content hash computed
+// from the same tokens — expect PREFIX_MATCH. A regression in the fingerprint
+// construction, the prefixKey shape, or the proto wire bytes would fail here.
+func TestContentHashRoundTripViaReporterAndLookupRoute(t *testing.T) {
+	h := be8(0xD2CD1BA8E13D7DD6) // engine block hash — reverse-map identity only
+	// BlockSize=128 keeps matched_tokens above the DefaultMinimumMatchedTokens
+	// floor, so the assertion is about the hash round-trip, not the floor.
+	toks := tokenSeq(3000, 128)
+	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
+	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
 
 	client, stop := runEngineReporterAgainstServer(t,
 		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
@@ -167,12 +178,12 @@ func TestKnownEngineHashBytesMatchViaReporterAndLookupRoute(t *testing.T) {
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
 		ModelId: "vllm-model", TenantId: "ic-smoke", HashScheme: "vllm",
-		BlockHashes: [][]byte{h}, BlockTokenCounts: []int32{128},
+		BlockHashes: [][]byte{our}, BlockTokenCounts: []int32{128},
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
-		t.Fatalf("reason = %q, want PREFIX_MATCH — server prefixKey did not match the bytes the Reporter forwarded for the canonical 0xD2CD1BA8E13D7DD6 hash. scores=%+v", resp.GetReasonCode(), resp.GetReplicaScores())
+		t.Fatalf("reason = %q, want PREFIX_MATCH — the content fingerprint the Reporter forwarded did not match the gateway-side fingerprint for the same tokens. scores=%+v", resp.GetReasonCode(), resp.GetReplicaScores())
 	}
 }

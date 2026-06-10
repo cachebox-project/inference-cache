@@ -28,6 +28,9 @@ type Reporter struct {
 	maxPend            int
 	logger             *slog.Logger
 	ignoreBlockRemoved bool
+	// pos derives our positional content fingerprint from each event's tokens and
+	// chains it across events. Owned by Run (single goroutine), so unsynchronized.
+	pos *positionalIndex
 }
 
 // ReporterOption configures a Reporter.
@@ -64,6 +67,7 @@ func NewReporter(client icpb.InferenceCacheClient, cfg Config, opts ...ReporterO
 		rpcTimeout: 5 * time.Second,
 		maxPend:    4096,
 		logger:     slog.Default(),
+		pos:        newPositionalIndex(),
 	}
 	for _, o := range opts {
 		o(r)
@@ -110,7 +114,18 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 			for _, ev := range b.Events {
 				switch e := ev.(type) {
 				case BlockStored:
-					pending = append(pending, StoredPrefixes(e)...)
+					entries := r.pos.Stored(e)
+					if len(entries) == 0 && len(e.BlockHashes) > 0 {
+						// A BlockStored carrying block hashes produced no index
+						// entries — either token_ids are absent (engine not emitting
+						// them → the fingerprint path silently regresses to all
+						// NO_HINT) or the block_hashes / token-block counts disagree.
+						// Either is a producer problem on the routing-hit ingest path,
+						// so surface it rather than dropping silently.
+						r.logger.Warn("BlockStored produced no index entries (missing or mismatched token_ids)",
+							"block_hashes", len(e.BlockHashes), "token_ids", len(e.TokenIDs), "block_size", e.BlockSize)
+					}
+					pending = append(pending, entries...)
 					if tsUs > 0 {
 						pendTs = tsUs
 					}
@@ -126,7 +141,14 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// the entry stays in the index until the freshness TTL expires;
 					// rely on TTL for actual staleness and leave the L2-served hint
 					// intact. See WithIgnoreBlockRemoved.
+					//
+					// Either way the local reverse map MUST drop the evicted blocks:
+					// the engine never references a GPU-evicted block as a future
+					// parent, so retaining it only grows pos unbounded — and in
+					// L2 mode there is no other prune point until AllBlocksCleared.
+					// So prune locally even when we suppress the server-side eviction.
 					if r.ignoreBlockRemoved {
+						r.pos.Removed(e) // prune the reverse map; don't forward (L2 keeps the hint)
 						continue
 					}
 					// Removals are the pruning path and adds are additive, so the
@@ -134,12 +156,13 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// same block (store-then-evict within one window). Flush pending
 					// adds first to preserve store→evict order.
 					flush()
-					for _, cev := range r.cfg.RemovedEvents(e, b.TimestampSeconds) {
-						r.publish(cev)
+					for _, ourHash := range r.pos.Removed(e) {
+						r.publish(r.cfg.EvictedEvent(ourHash, b.TimestampSeconds))
 					}
 				case AllBlocksCleared:
 					pending = pending[:0] // a clear supersedes buffered adds
 					pendTs = 0
+					r.pos.Cleared()
 					r.publish(r.cfg.ClearedEvent(b.TimestampSeconds))
 				}
 			}

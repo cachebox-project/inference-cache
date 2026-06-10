@@ -140,3 +140,16 @@ The contract supports expressing a prefix as an **ordered, engine-aligned chain 
 **Block-hash position assumption.** The index matches block hashes by exact byte equality without tracking the position in which a block was originally reported. The longest-leading-run rank therefore only describes a *leading* prefix when the engine's block hashes are parent-chained (vLLM, SGLang both are) — i.e. a block hash uniquely identifies the prefix that ends in that block. Engines that ever emit position-blind block hashes (same bytes for a "middle" block as for a "leading" block) would violate this assumption and should not be ingested with the chain form.
 
 **Engine-opaque + metadata-only guarantees still hold.** Block hashes are engine-defined opaque bytes; matching is byte-equality within a `hash_scheme`, and an empty `hash_scheme` still fails open (drop on ingest / `NO_HINT` on lookup) — the rule extends to chain-bearing ingests and lookups. Block hashes + per-block token counts are metadata only — never KV tensors or prompt text. Cross-tenant isolation is unchanged (the chain is scoped by tenant + model just like the legacy key).
+
+## Content-fingerprint routing key
+
+**Update — content-fingerprint routing key.** The engine's *own* KV-block hash is seeded by a per-process-random value (vLLM's `NONE_HASH = os.urandom(32)` when `PYTHONHASHSEED` is unset), so it is **not reproducible** across replicas or by an external consumer — a gateway can never recompute it, and every `LookupRoute` would miss. The `vllm` `hash_scheme` therefore keys the index on a **deterministic content fingerprint** derived from token content, not the engine hash. The server still treats `prefix_hash` / `block_hashes` as opaque bytes (matching is byte-equality within a `hash_scheme`); this section only specifies how a producer/consumer computes them so that ingest and lookup agree.
+
+Construction (XXH3-64, matching SMG `event_tree.rs` so the two interoperate on one index):
+
+- `SEED = 1337`.
+- Per-block `content_hash = XXH3_64(seed=SEED)` over the little-endian `uint32` encoding of each token id in the block.
+- Rolling positional prefix hash: `prefix_hash[0] = content_hash[0]`; `prefix_hash[i] = XXH3_64(seed=SEED)` over `prefix_hash[i-1].to_le_bytes(8) ++ content_hash[i].to_le_bytes(8)`.
+- Wire encoding: each `prefix_hash` is the **8-byte big-endian** form of that `uint64`.
+
+The fingerprint is positional (block `i`'s key identifies the whole prefix `0..i`), satisfying the parent-chained block-hash assumption above. Both ends must agree: the `kvevent-subscriber` computes it in-pod from the engine event's `token_ids` (the tokens never leave the pod — only the hash does); a gateway recomputes it from the prompt's tokens. Reference implementation: `pkg/fingerprint`. **Caveat:** the fingerprint is token-content-only, so prefixes that differ only by LoRA adapter (identical tokens) share a key unless partitioned by `model_id` — tracked as a follow-up.

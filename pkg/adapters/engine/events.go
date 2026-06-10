@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"reflect"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -18,9 +19,11 @@ import (
 //	  BlockRemoved     = ["BlockRemoved", block_hashes]
 //	  AllBlocksCleared = ["AllBlocksCleared"]
 //
-// We decode ONLY the metadata we forward (hashes, block size). token_ids,
-// parent_block_hash, and lora_id are intentionally never materialized into our
-// types — the contract is metadata-only, never prompt-derived token content.
+// We decode the metadata we forward (hashes, block size) plus token_ids and
+// parent_block_hash. The subscriber uses those two LOCALLY, in-pod, to derive its
+// own deterministic content fingerprint for the index key (see positional.go) —
+// the token IDs are hashed and never leave the pod, so only hashes ever reach the
+// server and the control plane stays metadata-only. lora_id is still ignored.
 
 // Event is one decoded KV-cache event. The concrete types are BlockStored,
 // BlockRemoved, and AllBlocksCleared.
@@ -29,12 +32,23 @@ type Event interface{ isEvent() }
 // BlockStored reports KV blocks that became resident. BlockSize is the number of
 // tokens per block; a block covers BlockSize tokens of the prefix.
 //
-// BlockHashes are opaque prefix-hash bytes. vLLM's ExternalBlockHash is a union
-// of bytes and int — integer hashes are normalized to 8-byte big-endian here, so
-// downstream only ever sees opaque bytes (matching the contract's prefix_hash).
+// BlockHashes are the engine's opaque per-block hashes (int variants normalized
+// to 8-byte big-endian). They serve only as a stable per-block identity for the
+// reverse map; the index key itself is our own content fingerprint derived from
+// TokenIDs (see positional.go).
+//
+// ParentBlockHash is the engine hash of the block preceding this event's first
+// block — nil for a sequence root or when absent — normalized like BlockHashes.
+// It lets the subscriber chain its rolling prefix hash across events.
+//
+// TokenIDs are the flat token IDs of this event's blocks (BlockSize tokens per
+// block, in block order). They are hashed in-pod to derive the fingerprint and
+// never leave the pod.
 type BlockStored struct {
-	BlockHashes [][]byte
-	BlockSize   int32
+	BlockHashes     [][]byte
+	ParentBlockHash []byte
+	TokenIDs        []uint32
+	BlockSize       int32
 }
 
 // BlockRemoved reports KV blocks that were evicted. BlockHashes are opaque bytes
@@ -119,6 +133,14 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 		if err != nil {
 			return nil, fmt.Errorf("BlockStored.block_hashes: %w", err)
 		}
+		parent, err := decodeParent(fields[2])
+		if err != nil {
+			return nil, fmt.Errorf("BlockStored.parent_block_hash: %w", err)
+		}
+		tokenIDs, err := decodeTokenIDs(fields[3])
+		if err != nil {
+			return nil, fmt.Errorf("BlockStored.token_ids: %w", err)
+		}
 		var bs int32
 		if err := msgpack.Unmarshal(fields[4], &bs); err != nil {
 			return nil, fmt.Errorf("BlockStored.block_size: %w", err)
@@ -126,7 +148,12 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 		if bs <= 0 {
 			return nil, fmt.Errorf("BlockStored.block_size must be positive, got %d", bs)
 		}
-		return BlockStored{BlockHashes: hashes, BlockSize: bs}, nil
+		return BlockStored{
+			BlockHashes:     hashes,
+			ParentBlockHash: parent,
+			TokenIDs:        tokenIDs,
+			BlockSize:       bs,
+		}, nil
 	case "BlockRemoved":
 		// [tag, block_hashes]
 		if len(fields) < 2 {
@@ -194,4 +221,41 @@ func uint64BE(u uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, u)
 	return b
+}
+
+// decodeParent decodes the optional parent_block_hash. A msgpack nil yields a nil
+// parent (sequence root); an int or bytes hash is normalized like a block hash so
+// it can be matched against BlockHashes in the reverse map.
+func decodeParent(raw msgpack.RawMessage) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil // a msgpack nil decodes to an empty RawMessage — no parent
+	}
+	var v interface{}
+	if err := msgpack.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	return hashToBytes(v)
+}
+
+// decodeTokenIDs decodes the flat token_ids array to uint32 (vLLM token IDs fit in
+// 32 bits). Hashed in-pod for the content fingerprint; never forwarded.
+func decodeTokenIDs(raw msgpack.RawMessage) ([]uint32, error) {
+	if len(raw) == 0 {
+		return nil, nil // a msgpack nil decodes to an empty RawMessage — no tokens
+	}
+	var ids []int64
+	if err := msgpack.Unmarshal(raw, &ids); err != nil {
+		return nil, err
+	}
+	out := make([]uint32, len(ids))
+	for i, t := range ids {
+		if t < 0 || t > math.MaxUint32 {
+			return nil, fmt.Errorf("token id %d out of uint32 range", t)
+		}
+		out[i] = uint32(t)
+	}
+	return out, nil
 }
