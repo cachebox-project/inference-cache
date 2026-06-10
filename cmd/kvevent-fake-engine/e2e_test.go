@@ -25,6 +25,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"time"
 
 	"github.com/go-zeromq/zmq4"
+	"github.com/vmihailenco/msgpack/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -163,10 +165,14 @@ func startSubscriberPipeline(t *testing.T, grpcAddr, endpoint, tenant string, lo
 	out := make(chan *engine.EventBatch, 256)
 	subCtx, cancelSub := context.WithCancel(context.Background())
 
+	// Run only exits via context cancellation (it reconnects forever, fail-soft)
+	// — capture the error so an unexpected exit reason surfaces as a test
+	// failure instead of a silent timeout.
+	var subErr error
 	subDone := make(chan struct{})
 	go func() {
 		defer close(subDone)
-		_ = sub.Run(subCtx, out)
+		subErr = sub.Run(subCtx, out)
 	}()
 	repDone := make(chan struct{})
 	go func() {
@@ -177,6 +183,9 @@ func startSubscriberPipeline(t *testing.T, grpcAddr, endpoint, tenant string, lo
 	stop = func() {
 		cancelSub()
 		<-subDone
+		if !errors.Is(subErr, context.Canceled) {
+			t.Errorf("subscriber exited with %v, want context.Canceled", subErr)
+		}
 		close(out)
 		<-repDone
 		_ = conn.Close()
@@ -288,7 +297,9 @@ func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
 		t.Errorf("one-block prefix: reason = %q, want PREFIX_MATCH; scores=%+v",
 			resp.GetReasonCode(), resp.GetReplicaScores())
-	} else if s := resp.GetReplicaScores()[0]; s.GetReplicaId() != e2eReplica || s.GetMatchedTokens() != e2eBlockTok {
+	} else if scores := resp.GetReplicaScores(); len(scores) == 0 {
+		t.Error("one-block prefix: PREFIX_MATCH with zero replica scores violates the contract")
+	} else if s := scores[0]; s.GetReplicaId() != e2eReplica || s.GetMatchedTokens() != e2eBlockTok {
 		t.Errorf("one-block prefix: got replica %q matched_tokens %d, want %q with %d",
 			s.GetReplicaId(), s.GetMatchedTokens(), e2eReplica, e2eBlockTok)
 	}
@@ -319,12 +330,34 @@ func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	}
 }
 
-// TestE2EMissingTokenIDsIndexesNothing locks the producer contract: when
-// BlockStored events arrive WITHOUT token_ids (an engine version that stops
-// emitting them — the silent all-NO_HINT regression), the subscriber must
-// log "BlockStored produced no index entries" and index nothing. The warn is
-// the breadcrumb an operator greps for; the empty index is the safety
-// property (no wrong keys, no phantom hints).
+// truncatedBlockStoredPayload encodes a BlockStored whose tuple stops before
+// token_ids/block_size — the shape a vLLM version would produce if the
+// token_ids field were REMOVED from the msgspec struct (later fields shift
+// position, the tuple shrinks). The subscriber's decoder must reject the whole
+// batch ("dropping undecodable event batch") rather than misread block_size
+// as token_ids; either way nothing may be indexed.
+func truncatedBlockStoredPayload(t *testing.T) []byte {
+	t.Helper()
+	event := []interface{}{"BlockStored", []interface{}{fakeBlockHash(0)}, nil}
+	payload, err := msgpack.Marshal([]interface{}{float64(0), []interface{}{event}})
+	if err != nil {
+		t.Fatalf("marshal truncated payload: %v", err)
+	}
+	return payload
+}
+
+// TestE2EMissingTokenIDsIndexesNothing locks the producer contract from both
+// failure shapes of "the engine stops emitting token_ids" (the silent
+// all-NO_HINT regression):
+//
+//   - field present but empty/nil (engine keeps the msgspec field, stops
+//     filling it) → the Reporter logs "BlockStored produced no index entries";
+//   - field removed from the struct (tuple shrinks / positions shift) → the
+//     decoder rejects the batch and the Subscriber logs "dropping undecodable
+//     event batch".
+//
+// The warn lines are the breadcrumbs an operator greps for; the empty index is
+// the safety property (no wrong keys, no phantom hints) asserted for both.
 func TestE2EMissingTokenIDsIndexesNothing(t *testing.T) {
 	const tenant = "e2e-no-tokens"
 	tokens := tokenSeq(9_000, e2eBlockTok)
@@ -332,6 +365,7 @@ func TestE2EMissingTokenIDsIndexesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatchPayloads: %v", err)
 	}
+	payloads = append(payloads, truncatedBlockStoredPayload(t))
 
 	grpcAddr, stopServer := startServerTCP(t)
 	defer stopServer()
@@ -343,11 +377,15 @@ func TestE2EMissingTokenIDsIndexesNothing(t *testing.T) {
 
 	client := dialQueryClient(t, grpcAddr)
 
-	// The warn is the sync point: once it fires, the event has been fully
-	// processed (Stored() ran and produced nothing), so the assertions below
-	// observe the post-ingest state, not a not-yet-delivered one.
+	// The warns are the sync points: once both fire, both events have been
+	// fully processed (Stored() ran and produced nothing; the truncated batch
+	// was rejected at decode), so the assertions below observe the post-ingest
+	// state, not a not-yet-delivered one.
 	waitFor(t, `the "BlockStored produced no index entries" warning`, func() bool {
 		return strings.Contains(logs.String(), "BlockStored produced no index entries")
+	})
+	waitFor(t, `the "dropping undecodable event batch" warning (truncated tuple)`, func() bool {
+		return strings.Contains(logs.String(), "dropping undecodable event batch")
 	})
 
 	// Nothing indexed: the aggregate for this tenant/model must be empty.
