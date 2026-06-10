@@ -236,6 +236,10 @@ tokenize-cgo-test: tokenize-cgo-build ## Compile/link + test the WHOLE tree unde
 	CGO_LDFLAGS="-L$(CURDIR)/rust/ictokenizer/target/release" $(GO_CMD) build -tags smgcgo ./...
 	CGO_LDFLAGS="-L$(CURDIR)/rust/ictokenizer/target/release" IC_TEST_TOKENIZER="$${IC_TEST_TOKENIZER:-$(TOKENIZE_CGO_TEST_MODEL)}" $(GO_CMD) test -tags smgcgo -count=1 ./pkg/tokenize/...
 
+.PHONY: test-fingerprint-e2e
+test-fingerprint-e2e: ## Run the GPU-free content-fingerprint routing e2e (fake engine over ZMQ → subscriber → server → LookupRoute).
+	$(GO_CMD) test -race -count=1 -v -run 'TestE2E' ./cmd/kvevent-fake-engine/
+
 .PHONY: vulncheck
 vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulnerabilities. Needs network.
 	@test -s $(GOVULNCHECK) || GOBIN=$(LOCALBIN) $(GO_CMD) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)

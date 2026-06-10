@@ -151,6 +151,33 @@ jobs:
     - name: Verify samples
       run: make verify-samples
 
+  # GPU-free end-to-end gate for the content-fingerprint routing path: a fake
+  # engine publishes vLLM-shaped BlockStored events over a real ZMQ socket, the
+  # real kvevent-subscriber pipeline derives content fingerprints, the real
+  # server indexes them, and LookupRoute must return PREFIX_MATCH (with the
+  # publishing replica as the hint) for the published prefix and NO_HINT for a
+  # novel one — plus the producer-contract guard (no token_ids → warn + index
+  # nothing). Unlike the scheduled kind canaries (which pull real engine
+  # images), this needs no GPU, no image, no cluster — it runs on every PR in
+  # seconds and locks the routing path against the all-NO_HINT regression.
+  fingerprint-e2e:
+    name: Fingerprint Routing E2E
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Fingerprint routing e2e
+      run: make test-fingerprint-e2e
+
   vulnerability-scan:
     name: Vulnerability Scan
     runs-on: ubuntu-latest
@@ -195,6 +222,7 @@ jobs:
     needs:
     - lint-generated-proto
     - test
+    - fingerprint-e2e
     - vulnerability-scan
     - build
     if: always()
@@ -205,6 +233,7 @@ jobs:
       env:
         LINT_GENERATED_PROTO_RESULT: ${{ needs.lint-generated-proto.result }}
         TEST_RESULT: ${{ needs.test.result }}
+        FINGERPRINT_E2E_RESULT: ${{ needs.fingerprint-e2e.result }}
         VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
         BUILD_RESULT: ${{ needs.build.result }}
       run: |
@@ -212,6 +241,7 @@ jobs:
         for item in \
           "lint-generated-proto:$LINT_GENERATED_PROTO_RESULT" \
           "test:$TEST_RESULT" \
+          "fingerprint-e2e:$FINGERPRINT_E2E_RESULT" \
           "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
           "build:$BUILD_RESULT"; do
           name="${item%%:*}"
@@ -231,6 +261,7 @@ jobs:
     needs:
     - lint-generated-proto
     - test
+    - fingerprint-e2e
     - vulnerability-scan
     - build
     permissions:
