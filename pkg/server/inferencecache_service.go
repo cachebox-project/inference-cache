@@ -153,45 +153,59 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return resp, nil
 	}
 
-	// Dual-input resolution: turn token_ids / prompt_text into the block-hash
-	// chain the rest of the handler already understands, so the gate, deadline,
-	// and index path are unchanged. A gateway that already fingerprinted (an
-	// explicit prefix_hash / block_hashes chain) is left untouched. The
-	// canonical tokens are echoed back only on the prompt_text path. ok=false
-	// means fail open (tokenizer unavailable or errored on the prompt_text
-	// path) — return NO_HINT, never an error on the hot path.
-	echoTokens, ok := s.resolveLookupChain(ctx, req)
-	if !ok {
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
-		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
-		return resp, nil
-	}
-
-	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
-	// request that can't clear it — no index lock, no goroutine. A chain
-	// request reports its token budget via block_token_counts (the legacy
-	// prefix_token_count may be 0); fall back to that sum so chain callers
-	// aren't gated out by a zero legacy field.
-	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 && effectivePrefixTokens(req) < minTokens {
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
-		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
-		return resp, nil
-	}
-
-	// Apply the per-tenant lookup budget as a derived context deadline so we
-	// honor whichever is tighter — the caller's deadline or the policy budget.
+	// Apply the per-tenant lookup budget as a derived context deadline FIRST so
+	// it bounds the WHOLE hot path — including tokenization — not just the index
+	// lookup. We honor whichever is tighter: the caller's deadline or the policy
+	// budget. (A prior version resolved the prompt_text tokenizer before the
+	// budget existed, so a slow first-time tokenizer load could block past the
+	// budget instead of failing open.)
 	budget := s.policyTimeout(tenant)
 	if budget > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
-
 	// Fast-path the timeout check: an upstream deadline already breached means
-	// running the lookup will produce a stale answer for a caller that has
-	// given up. Still fail open (no error).
+	// any further work serves a caller that has given up. Still fail open.
 	if err := ctx.Err(); err != nil {
 		return s.timeoutResponse(model, 0), nil
+	}
+	_, hasDeadline := ctx.Deadline()
+
+	// Dual-input resolution: turn token_ids / prompt_text into the block-hash
+	// chain the rest of the handler understands (an explicit prefix_hash /
+	// block_hashes chain is passed through). The prompt_text path runs the
+	// tokenizer, which can load/download a model on its first use, so when a
+	// deadline is active we run resolution in a goroutine and fail open with
+	// TIMEOUT rather than block the hot path past the budget. resolveLookupChain
+	// does NOT mutate req, so a goroutine that outlives this call shares nothing
+	// mutable and is race-free.
+	var in lookupInputs
+	if hasDeadline {
+		ch := make(chan lookupInputs, 1)
+		go func() { ch <- s.resolveLookupChain(ctx, req) }()
+		select {
+		case in = <-ch:
+		case <-ctx.Done():
+			return s.timeoutResponse(model, 0), nil
+		}
+	} else {
+		in = s.resolveLookupChain(ctx, req)
+	}
+	if in.failOpen {
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
+	}
+
+	// Pre-lookup gate on the effective prefix token count (from the resolved
+	// chain, falling back to the legacy prefix_token_count). Short-circuit a
+	// request that can't clear the threshold — no index lock.
+	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 &&
+		effectivePrefixTokens(in.blockTokenCounts, req.GetPrefixTokenCount()) < minTokens {
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
 	}
 
 	slo := req.GetSlo()
@@ -201,22 +215,19 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		HashScheme:       req.GetHashScheme(),
 		PrefixHash:       req.GetPrefixHash(),
 		TokenCount:       req.GetPrefixTokenCount(),
-		BlockHashes:      req.GetBlockHashes(),
-		BlockTokenCounts: req.GetBlockTokenCounts(),
+		BlockHashes:      in.blockHashes,
+		BlockTokenCounts: in.blockTokenCounts,
 		TTFTBudgetMs:     slo.GetTtftMs(),
 		TBTBudgetMs:      slo.GetTbtMs(),
 	}
 
-	// Default (and dominant) path: no policy budget AND no caller deadline.
-	// The in-memory lookup is normally sub-millisecond, so wrapping it in a
-	// goroutine + channel every call would just churn allocations and pile
-	// up runtime work behind the index lock during a sweep — measurably the
-	// hot path for tenants with no CachePolicy. Run synchronously.
-	_, hasDeadline := ctx.Deadline()
+	// Default (and dominant) path: no deadline → run the in-memory lookup
+	// synchronously (it is normally sub-millisecond; a goroutine + channel every
+	// call would just churn allocations behind the index lock during a sweep).
 	if !hasDeadline {
 		start := time.Now()
 		result := s.lookupFn(lookupReq)
-		return s.buildLookupResponse(model, tenant, result, time.Since(start), echoTokens), nil
+		return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 	}
 
 	// Bounded path: a deadline is active, so bound the lookup at wall-clock
@@ -260,45 +271,54 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
-	return s.buildLookupResponse(model, tenant, result, elapsed, echoTokens), nil
+	return s.buildLookupResponse(model, tenant, result, elapsed, in.echoTokens), nil
+}
+
+// lookupInputs is the resolved dual-input chain the handler looks up. It does
+// NOT alias the request, so it is safe to produce from a goroutine that may
+// outlive the call (the deadline-bounded resolution path).
+type lookupInputs struct {
+	blockHashes      [][]byte // effective chain (empty → fall back to req.prefix_hash exact match)
+	blockTokenCounts []int32  // parallel per-block token counts
+	echoTokens       []uint32 // canonical tokens to echo (prompt_text path only)
+	failOpen         bool     // true → return NO_HINT (tokenizer unavailable/errored)
 }
 
 // resolveLookupChain implements the dual-input precedence for LookupRoute and
-// normalizes the request into the block-hash-chain form the gate and index
-// already understand. Precedence:
+// returns the block-hash chain to look up — WITHOUT mutating req (so it is
+// race-free when run in a deadline-bounded goroutine). Precedence:
 //
 //  1. An explicit prefix_hash or block_hashes chain (a gateway that already
-//     fingerprinted) wins — left untouched.
+//     fingerprinted) wins — req's chain is passed through.
 //  2. token_ids (pre-tokenized): fingerprinted directly via pkg/fingerprint, no
 //     tokenizer needed. Not echoed (the caller already has the tokens).
 //  3. prompt_text (raw text): the model's chat template is applied and the text
-//     tokenized, then fingerprinted; the canonical tokens are returned to echo
-//     so the caller forwards exactly those to the engine (match by construction).
+//     tokenized, then fingerprinted; the canonical tokens are echoed so the
+//     caller forwards exactly those to the engine (match by construction).
 //
-// It writes the derived chain onto the request in place. Returns ok=false only
-// for the prompt_text path when the tokenizer is unavailable or errors — the
-// caller fails open to NO_HINT. A token_ids / prompt_text input too short to
-// fill one block yields an empty chain (ok=true), which the downstream exact-
-// match path turns into a fail-open NO_HINT.
-func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) (echoTokens []uint32, ok bool) {
+// failOpen is set only for the prompt_text path when the tokenizer is
+// unavailable or errors. A token_ids / prompt_text input too short to fill one
+// block yields an empty chain (failOpen=false), which the downstream exact-match
+// path turns into a fail-open NO_HINT.
+func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) lookupInputs {
 	if len(req.GetBlockHashes()) > 0 || len(req.GetPrefixHash()) > 0 {
-		return nil, true
+		return lookupInputs{blockHashes: req.GetBlockHashes(), blockTokenCounts: req.GetBlockTokenCounts()}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
-		req.BlockHashes, req.BlockTokenCounts = fingerprint.Chain(toks, s.blockSize)
-		return nil, true
+		bh, btc := fingerprint.Chain(toks, s.blockSize)
+		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
 	}
 	if text := req.GetPromptText(); text != "" {
 		toks, err := s.tokenizer.Encode(ctx, req.GetModelId(),
 			[]tokenize.Message{{Role: "user", Content: text}},
 			tokenize.EncodeOptions{AddGenerationPrompt: true})
 		if err != nil || len(toks) == 0 {
-			return nil, false
+			return lookupInputs{failOpen: true}
 		}
-		req.BlockHashes, req.BlockTokenCounts = fingerprint.Chain(toks, s.blockSize)
-		return toks, true
+		bh, btc := fingerprint.Chain(toks, s.blockSize)
+		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
 	}
-	return nil, true
+	return lookupInputs{}
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
@@ -640,20 +660,19 @@ func microsToTime(us int64) time.Time {
 	return time.UnixMicro(us)
 }
 
-// effectivePrefixTokens returns the token count the request asserts its
-// prefix covers, picking the right field based on whether the request is in
-// chain or legacy form. Chain takes precedence over the legacy
-// prefix_token_count to match the documented precedence rule: a chain-bearing
-// request is a positive assertion of the new form, so a co-set legacy field
-// must not override what the chain reports. The handler uses the result to
-// gate against CachePolicy.minimumPrefixTokens before touching the index.
-func effectivePrefixTokens(req *icpb.LookupRouteRequest) int32 {
-	if counts := req.GetBlockTokenCounts(); len(counts) > 0 {
+// effectivePrefixTokens returns the token count the request asserts its prefix
+// covers, given the resolved per-block token counts (from the dual-input chain)
+// and the legacy prefix_token_count. The chain takes precedence: a chain-bearing
+// request is a positive assertion of the new form, so a co-set legacy field must
+// not override what the chain reports. The handler uses the result to gate
+// against CachePolicy.minimumPrefixTokens before touching the index.
+func effectivePrefixTokens(blockTokenCounts []int32, legacyCount int32) int32 {
+	if len(blockTokenCounts) > 0 {
 		var sum int32
-		for _, v := range counts {
+		for _, v := range blockTokenCounts {
 			sum += v
 		}
 		return sum
 	}
-	return req.GetPrefixTokenCount()
+	return legacyCount
 }

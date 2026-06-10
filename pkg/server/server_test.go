@@ -1606,7 +1606,7 @@ func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := effectivePrefixTokens(tc.req); got != tc.want {
+			if got := effectivePrefixTokens(tc.req.GetBlockTokenCounts(), tc.req.GetPrefixTokenCount()); got != tc.want {
 				t.Fatalf("effectivePrefixTokens = %d, want %d", got, tc.want)
 			}
 		})

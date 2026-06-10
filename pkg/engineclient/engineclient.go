@@ -20,7 +20,6 @@ import (
 type CompletionParams struct {
 	MaxTokens   int
 	Temperature float32
-	Stream      bool
 }
 
 // Completion is the engine's response, trimmed to what callers need to confirm

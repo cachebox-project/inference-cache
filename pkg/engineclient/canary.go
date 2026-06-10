@@ -3,6 +3,7 @@ package engineclient
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +40,9 @@ type ProbeResult struct {
 // so HitsDelta reflects only the warm request. A HitsDelta > 0 is the success
 // signal.
 func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params CompletionParams) (ProbeResult, error) {
+	if p.Client == nil {
+		return ProbeResult{}, errors.New("canary: PrefixCacheProbe.Client is nil")
+	}
 	metricsURL := p.MetricsURL
 	if metricsURL == "" {
 		metricsURL = strings.TrimRight(p.EngineURL, "/") + "/metrics"
@@ -55,9 +59,12 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 
 	hitsPre, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
 	if err != nil {
-		return ProbeResult{}, fmt.Errorf("canary: scrape (pre): %w", err)
+		return ProbeResult{}, fmt.Errorf("canary: scrape hits (pre): %w", err)
 	}
-	queriesPre, _ := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPre, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: scrape queries (pre): %w", err)
+	}
 
 	warm, err := p.Client.Complete(ctx, p.EngineURL, p.Model, tokens, params)
 	if err != nil {
@@ -66,9 +73,12 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 
 	hitsPost, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
 	if err != nil {
-		return ProbeResult{}, fmt.Errorf("canary: scrape (post): %w", err)
+		return ProbeResult{}, fmt.Errorf("canary: scrape hits (post): %w", err)
 	}
-	queriesPost, _ := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPost, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: scrape queries (post): %w", err)
+	}
 
 	return ProbeResult{
 		HitsDelta:    hitsPost - hitsPre,

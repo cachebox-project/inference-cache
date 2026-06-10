@@ -29,6 +29,42 @@ func (f fakeTokenizer) EncodeText(context.Context, string, string, tokenize.Enco
 	return f.tokens, f.err
 }
 
+// blockingTokenizer blocks Encode until released, simulating a slow first-time
+// tokenizer load that a non-cancellable cgo call can't interrupt mid-flight.
+type blockingTokenizer struct{ release chan struct{} }
+
+func (b blockingTokenizer) Encode(context.Context, string, []tokenize.Message, tokenize.EncodeOptions) ([]uint32, error) {
+	<-b.release
+	return nil, nil
+}
+
+func (b blockingTokenizer) EncodeText(context.Context, string, string, tokenize.EncodeOptions) ([]uint32, error) {
+	<-b.release
+	return nil, nil
+}
+
+// A slow tokenizer on the prompt_text path must be bounded by the tenant's
+// lookupTimeoutMs and fail open with TIMEOUT — never block the hot path past the
+// budget. Guards the deadline-ordering fix (tokenization happens under the
+// budget context, not before it).
+func TestLookupRoutePromptTextSlowTokenizerTimesOut(t *testing.T) {
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "tenant-x", LookupTimeoutMs: 20}})
+	release := make(chan struct{})
+	defer close(release) // unblock the tokenizer goroutine at test end
+	svc.tokenizer = blockingTokenizer{release: release}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hello world",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute must not error on the hot path: %v", err)
+	}
+	if resp.GetReasonCode() != "TIMEOUT" {
+		t.Errorf("reason = %q, want TIMEOUT (slow tokenizer must be bounded by lookupTimeoutMs)", resp.GetReasonCode())
+	}
+}
+
 // ingestFingerprintPrefix stores tokens as per-block positional prefix entries
 // for replica on (model, tenant, scheme) — mirroring what the kvevent-subscriber
 // ingests for a cached prefix, so a content-fingerprint lookup matches.
@@ -185,6 +221,41 @@ func TestLookupRoutePromptTextTokenizesAndEchoes(t *testing.T) {
 	}
 	if !equalU32(resp.GetTokenIds(), tokens) {
 		t.Errorf("echoed token_ids = %v, want %v", resp.GetTokenIds(), tokens)
+	}
+}
+
+// The server's configured block size (not a hardcoded 16) drives token_ids
+// fingerprinting: a prefix ingested at block size 32 matches a token_ids lookup
+// only when the service fingerprints at the same 32.
+func TestLookupRouteTokenIDsHonorsConfiguredBlockSize(t *testing.T) {
+	const blockSz = 32
+	tokens := tokenSeq(3_000, 64) // 2 blocks of 32, matched_tokens=64 clears the floor
+
+	svc := newTestService()
+	svc.blockSize = blockSz
+	ingestFingerprintPrefix(svc.index, "r1", "m", "tenant-x", "vllm", tokens, blockSz)
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", TokenIds: tokens,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "PREFIX_MATCH" {
+		t.Fatalf("reason = %q, want PREFIX_MATCH at block size %d", resp.GetReasonCode(), blockSz)
+	}
+
+	// The default-16 service must NOT match the block-32 ingest (different chunking).
+	svc16 := newTestService()
+	ingestFingerprintPrefix(svc16.index, "r1", "m", "tenant-x", "vllm", tokens, blockSz)
+	resp16, err := svc16.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", TokenIds: tokens,
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute (bs16): %v", err)
+	}
+	if resp16.GetReasonCode() == "PREFIX_MATCH" {
+		t.Errorf("block-16 service matched a block-32 ingest — block size must affect chunking")
 	}
 }
 

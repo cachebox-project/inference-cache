@@ -71,7 +71,11 @@ func (c *OpenAIClient) Complete(ctx context.Context, endpoint, model string, tok
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	httpClient := c.http
+	if httpClient == nil { // tolerate a zero-value OpenAIClient (bypassing NewOpenAI)
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Completion{}, fmt.Errorf("engineclient: POST %s: %w", url, err)
 	}
