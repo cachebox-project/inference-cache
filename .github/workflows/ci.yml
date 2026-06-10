@@ -270,7 +270,7 @@ jobs:
     # outside contributors. The scan + aggregation gate still runs.
     - name: Upload Trivy SARIF (controller)
       if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-      uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+      uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e  # v3
       with:
         sarif_file: trivy-controller.sarif
         category: trivy-controller
@@ -288,7 +288,7 @@ jobs:
 
     - name: Upload Trivy SARIF (server)
       if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-      uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+      uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e  # v3
       with:
         sarif_file: trivy-server.sarif
         category: trivy-server
