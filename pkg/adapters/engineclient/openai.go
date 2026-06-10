@@ -32,11 +32,14 @@ func NewOpenAI(httpClient *http.Client) *OpenAIClient {
 }
 
 type completionRequest struct {
-	Model       string   `json:"model"`
-	Prompt      []uint32 `json:"prompt"`
-	MaxTokens   int      `json:"max_tokens,omitempty"`
-	Temperature float32  `json:"temperature,omitempty"`
-	Stream      bool     `json:"stream"`
+	Model     string   `json:"model"`
+	Prompt    []uint32 `json:"prompt"`
+	MaxTokens int      `json:"max_tokens,omitempty"`
+	// No omitempty: temperature 0 is a meaningful value (greedy/deterministic),
+	// which a cache canary wants — omitempty would silently drop it and the
+	// engine would apply its non-zero default.
+	Temperature float32 `json:"temperature"`
+	Stream      bool    `json:"stream"`
 }
 
 type completionResponse struct {

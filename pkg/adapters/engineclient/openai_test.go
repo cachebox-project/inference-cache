@@ -18,17 +18,19 @@ func TestOpenAISendsTokenIDPromptAndParsesCompletion(t *testing.T) {
 	var gotPath, gotModel string
 	var gotPrompt []uint32
 	var gotMaxTokens int
+	var gotTemp *float32 // pointer so we can tell "sent 0" from "omitted"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		var body struct {
-			Model     string   `json:"model"`
-			Prompt    []uint32 `json:"prompt"`
-			MaxTokens int      `json:"max_tokens"`
+			Model       string   `json:"model"`
+			Prompt      []uint32 `json:"prompt"`
+			MaxTokens   int      `json:"max_tokens"`
+			Temperature *float32 `json:"temperature"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		gotModel, gotPrompt, gotMaxTokens = body.Model, body.Prompt, body.MaxTokens
+		gotModel, gotPrompt, gotMaxTokens, gotTemp = body.Model, body.Prompt, body.MaxTokens, body.Temperature
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"text":" world","finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`))
 	}))
@@ -51,6 +53,10 @@ func TestOpenAISendsTokenIDPromptAndParsesCompletion(t *testing.T) {
 	}
 	if gotMaxTokens != 2 {
 		t.Errorf("max_tokens = %d, want 2", gotMaxTokens)
+	}
+	// An explicit temperature: 0 must reach the wire (not be dropped by omitempty).
+	if gotTemp == nil || *gotTemp != 0 {
+		t.Errorf("temperature = %v, want explicit 0 on the wire", gotTemp)
 	}
 	if got.Text != " world" {
 		t.Errorf("text = %q, want %q", got.Text, " world")
