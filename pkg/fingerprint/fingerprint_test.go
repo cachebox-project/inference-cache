@@ -108,13 +108,21 @@ func TestGoldenVectors(t *testing.T) {
 	}
 }
 
-// The scheme is frozen: this single hardcoded anchor exists so that
-// regenerating the fixture under a silently-changed construction (which would
-// keep TestGoldenVectors green by construction) still fails here. Do not
-// update it without coordinating every producer and consumer of these hashes.
+// The scheme is frozen: these hardcoded anchors exist so that regenerating the
+// fixture under a silently-changed construction (which would keep
+// TestGoldenVectors green by construction) still fails here. They pin every
+// layer of the scheme — per-block content hashing, the LE-u64 rolling chain,
+// and the explicit-parent chain. Do not update them without coordinating every
+// producer and consumer of these hashes.
 func TestSchemeFrozenAnchor(t *testing.T) {
 	if got := ContentHash(seq(1, 16)); got != 16863443419780771464 {
 		t.Fatalf("ContentHash(seq(1,16)) = %d, want 16863443419780771464 — the frozen scheme changed", got)
+	}
+	if got := PrefixHashes(seq(0, 64), 16)[3]; got != 3888788807566526800 {
+		t.Fatalf("PrefixHashes(seq(0,64),16)[3] = %d, want 3888788807566526800 — the rolling chain changed", got)
+	}
+	if got := PrefixHashesFrom(seq(50, 32), 16, 0xDEADBEEF, true)[1]; got != 2998384554010166533 {
+		t.Fatalf("PrefixHashesFrom(seq(50,32),16,0xDEADBEEF,true)[1] = %d, want 2998384554010166533 — parent chaining changed", got)
 	}
 }
 
