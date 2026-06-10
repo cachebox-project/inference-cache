@@ -30,6 +30,55 @@ func (f fakeTokenizer) EncodeText(context.Context, string, string, tokenize.Enco
 	return f.tokens, f.err
 }
 
+// recordingTokenizer captures the arguments the handler passes to Encode so a
+// test can pin the load-bearing "single user message + generation prompt"
+// contract (a regression there would still pass the other prompt_text tests,
+// since the fake ignores its inputs).
+type recordingTokenizer struct {
+	tokens   []uint32
+	gotModel string
+	gotMsgs  []tokenize.Message
+	gotOpts  tokenize.EncodeOptions
+	called   bool
+}
+
+func (r *recordingTokenizer) Encode(_ context.Context, model string, msgs []tokenize.Message, opts tokenize.EncodeOptions) ([]uint32, error) {
+	r.called, r.gotModel, r.gotMsgs, r.gotOpts = true, model, msgs, opts
+	return r.tokens, nil
+}
+
+func (r *recordingTokenizer) EncodeText(context.Context, string, string, tokenize.EncodeOptions) ([]uint32, error) {
+	return r.tokens, nil
+}
+
+// The prompt_text path must call Encode with the request's model, the prompt
+// wrapped as a SINGLE user message, and AddGenerationPrompt set — that exact
+// shape is what makes the fingerprint match a chat engine's cached tokens.
+func TestLookupRoutePromptTextPassesSingleUserMessageToTokenizer(t *testing.T) {
+	rt := &recordingTokenizer{tokens: tokenSeq(0, 64)}
+	svc := newTestService()
+	svc.tokenizer = rt
+
+	if _, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "llama-3", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hello world",
+	}); err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+
+	if !rt.called {
+		t.Fatal("tokenizer.Encode was not called")
+	}
+	if rt.gotModel != "llama-3" {
+		t.Errorf("Encode model = %q, want llama-3", rt.gotModel)
+	}
+	if len(rt.gotMsgs) != 1 || rt.gotMsgs[0].Role != "user" || rt.gotMsgs[0].Content != "hello world" {
+		t.Errorf("Encode msgs = %+v, want a single {user, \"hello world\"} message", rt.gotMsgs)
+	}
+	if !rt.gotOpts.AddGenerationPrompt {
+		t.Error("Encode opts.AddGenerationPrompt = false, want true")
+	}
+}
+
 // blockingTokenizer blocks Encode until released, simulating a slow first-time
 // tokenizer load that a non-cancellable cgo call can't interrupt mid-flight.
 type blockingTokenizer struct{ release chan struct{} }

@@ -72,7 +72,7 @@ func TestCgoNewEmptyDirIsUnavailable(t *testing.T) {
 	tk := New(Config{}) // no ModelsDir
 	_, err := tk.Encode(context.Background(), "anything", []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})
 	if !errors.Is(err, ErrUnavailable) {
-		t.Errorf("Encode err = %v, want ErrUnavailable (no models dir → fail closed)", err)
+		t.Errorf("Encode err = %v, want ErrUnavailable (no models dir → no tokenizer loaded; lookup fails open downstream)", err)
 	}
 }
 

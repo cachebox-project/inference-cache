@@ -177,11 +177,13 @@ pub unsafe extern "C" fn ic_tokenizer_encode_chat(
                 return IC_ERR_INVALID_ARG;
             }
         };
-        let empty: [Value; 0] = [];
+        // Leave tools/documents UNDEFINED (None) rather than Some(empty): many
+        // HF/Jinja chat templates branch on `tools is defined`, so passing an
+        // empty list would render differently than the engine does for an
+        // ordinary no-tools chat request — which would desync our fingerprint
+        // tokens from the engine's. A no-tools request must look like no tools.
         let params = ChatTemplateParams {
             add_generation_prompt: add_generation_prompt != 0,
-            tools: Some(&empty),
-            documents: Some(&empty),
             ..Default::default()
         };
         let tokenizer = &(*handle).tokenizer;
