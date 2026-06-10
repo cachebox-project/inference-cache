@@ -161,10 +161,11 @@ See the README's "Repository layout" for the full map. In short:
 | gRPC handlers, server wiring | `pkg/server/` |
 | Cache-state index logic | `pkg/index/` |
 | Mutable-slot rendering (the wedge) | `pkg/render/` |
-| Engine / runtime adapters | `pkg/adapters/{engine,runtime}/` |
+| Engine / runtime adapters (KV-event ingest, config injection) | `pkg/adapters/{engine,runtime}/` |
+| Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/adapters/engineclient/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
-Each package's `doc.go` states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to.
+Each package's `doc.go` (or package comment) states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to — or, for harness / egress libraries such as `pkg/adapters/engineclient`, that it belongs to no binary.
 
 **Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
 

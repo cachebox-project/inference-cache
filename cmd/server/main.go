@@ -16,6 +16,7 @@ import (
 
 	"github.com/cachebox-project/inference-cache/pkg/server"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -45,6 +46,8 @@ func main() {
 	// implemented here. See docs/design/grpc-tls.md.
 	tlsCertFile := flag.String("tls-cert-file", "", "Path to the PEM server certificate for the gRPC port (:9090). Set together with --tls-key-file to enable TLS; leave both empty for plaintext (dev/CI).")
 	tlsKeyFile := flag.String("tls-key-file", "", "Path to the PEM private key for the gRPC port (:9090). Set together with --tls-cert-file to enable TLS; leave both empty for plaintext (dev/CI).")
+	tokenizerModelsDir := flag.String("tokenizer-models-dir", "", "Directory of vetted per-model tokenizer artifacts (<dir>/<model_id>/tokenizer.json, where <model_id> may contain a namespace, e.g. Qwen/Qwen2.5-0.5B-Instruct) used to tokenize LookupRoute prompt_text server-side. Tokenizers are loaded eagerly at startup and confined to this directory; a request model_id is matched only against the pre-loaded set (never joined onto a path). Empty (the default) disables server-side tokenization — the prompt_text lookup path fails open to NO_HINT. Only effective in the tokenizer-enabled build (-tags smgcgo).")
+	engineBlockSize := flag.Int("engine-block-size", server.DefaultEngineBlockSize, "KV block size (tokens per block) used to fingerprint token_ids / tokenized prompt_text on LookupRoute. MUST match the engine's KV block size and the kvevent-subscriber's. vLLM's default is 16.")
 	flag.Parse()
 
 	format, err := server.ParseLogFormat(*logFormat)
@@ -76,7 +79,22 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Wire the server-owned tokenizer for the (model, prompt_text) LookupRoute
+	// path. tokenize.New returns the real cgo tokenizer only under the smgcgo
+	// build; otherwise it is Unavailable (the prompt_text path fails open to
+	// NO_HINT), so this is safe to wire unconditionally. Warn loudly if a
+	// tokenizer directory was configured on a build that cannot use it — a wrong
+	// image/build-tag deployment would otherwise look configured while every
+	// prompt_text lookup silently fails open.
+	if *tokenizerModelsDir != "" && !tokenize.Enabled() {
+		slog.WarnContext(ctx, "tokenizer_models_dir_ignored",
+			"reason", "server-side tokenization is not compiled in (build without -tags smgcgo)",
+			"tokenizer_models_dir", *tokenizerModelsDir,
+			"effect", "every LookupRoute prompt_text request fails open to NO_HINT")
+	}
 	var opts []server.Option
+	opts = append(opts, server.WithTokenizer(tokenize.New(tokenize.Config{ModelsDir: *tokenizerModelsDir})))
+	opts = append(opts, server.WithEngineBlockSize(*engineBlockSize))
 	if *expectedSA != "" {
 		restCfg, err := rest.InClusterConfig()
 		if err != nil {

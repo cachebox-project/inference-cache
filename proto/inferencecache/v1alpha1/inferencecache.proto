@@ -74,6 +74,28 @@ message LookupRouteRequest {
   // entry — a wrong hint is worse than a stale one).
   repeated bytes block_hashes = 7;
   repeated int32 block_token_counts = 8;
+  // Dual-input tokenization (server-owned). A gateway that carries no tokenizer
+  // sends the prompt and lets the server tokenize + fingerprint:
+  //   - token_ids: pre-tokenized input. The server derives the content-
+  //     fingerprint chain directly (pkg/fingerprint) — no tokenizer needed, so
+  //     this path works in every build.
+  //   - prompt_text: raw prompt text. The server wraps it as a SINGLE `user`
+  //     chat message, applies model_id's chat template WITH the assistant
+  //     generation prompt appended, then tokenizes (requires the cgo tokenizer
+  //     build; otherwise the request fails open to NO_HINT). This single-turn
+  //     wrapping is the only shape supported today — multi-turn message arrays
+  //     and already-rendered / completion-style prompts are not (they would
+  //     fingerprint a different token sequence than the engine caches); a
+  //     structured-messages field is a future addition. token_ids is the escape
+  //     hatch for any caller that needs exact control over the tokenized input.
+  // Precedence: an explicit prefix_hash / block_hashes chain (a gateway that
+  // already fingerprinted) wins; else token_ids; else prompt_text. Every path
+  // funnels into the same content-fingerprint block-chain match, so a
+  // (model, text) lookup matches the engine's cached prefix by construction.
+  // hash_scheme / model_id / tenant_id are still supplied by the caller (engine
+  // routing config, not tokenizer knowledge).
+  repeated uint32 token_ids = 9;
+  string prompt_text = 10;
 }
 
 message ReplicaScore {
@@ -87,6 +109,13 @@ message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
   string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
   int64 lookup_latency_us = 3;
+  // Canonical token IDs the server tokenized for this request, echoed back ONLY
+  // when the server itself tokenized prompt_text. A gateway that sent token_ids
+  // already has them, so this stays empty on that path (avoids echoing a large
+  // token array on every lookup). Forward these exact tokens to the engine
+  // (e.g. /v1/completions with a token-ID prompt) so the engine caches the same
+  // tokens the fingerprint was computed over — match by construction.
+  repeated uint32 token_ids = 4;
 }
 
 message LookupPDRouteRequest {

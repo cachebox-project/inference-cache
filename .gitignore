@@ -46,3 +46,6 @@ __pycache__/
 
 # Serena per-project cache (semantic code navigation)
 .serena/
+
+# Rust cgo-tokenizer build artifacts (opt-in smgcgo build; Cargo.lock IS tracked)
+rust/*/target/
