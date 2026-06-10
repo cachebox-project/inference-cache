@@ -1,6 +1,6 @@
 # Design: LMCache server-side disk persistence — entry-point decision
 
-Status: **Proposed** · Recommendation: **Retire `spec.storage.pvc`; express durability via backend choice (remote store / Mooncake)** · Pairs with: `docs/design/cachebackend-api.md` (Persistent storage)
+Status: **Accepted** · Decision: **Retire `spec.storage.pvc`; express durability via backend choice (remote store / Mooncake)** · Pairs with: `docs/design/cachebackend-api.md`
 
 > This is a decision record produced by a research pass. It captures *which*
 > LMCache server entry point (if any) can make the cache-server we provision
