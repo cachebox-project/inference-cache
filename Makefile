@@ -378,7 +378,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
