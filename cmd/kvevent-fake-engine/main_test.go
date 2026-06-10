@@ -8,24 +8,21 @@ import (
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
-// decodeStored decodes each payload through the REAL subscriber decoder and
-// returns its single BlockStored. If the synthetic encoding drifts from what
+// decodeStored decodes one payload through the REAL subscriber decoder and
+// returns its BlockStored events. If the synthetic encoding drifts from what
 // the subscriber decodes, a smoke would assert against a key the subscriber
 // never produced (false green) — so every shape change must round-trip here.
-func decodeStored(t *testing.T, payloads [][]byte) []engine.BlockStored {
+func decodeStored(t *testing.T, payload []byte) []engine.BlockStored {
 	t.Helper()
-	out := make([]engine.BlockStored, 0, len(payloads))
-	for i, p := range payloads {
-		batch, err := engine.DecodeEventBatch(p)
-		if err != nil {
-			t.Fatalf("DecodeEventBatch(payload %d): %v", i, err)
-		}
-		if len(batch.Events) != 1 {
-			t.Fatalf("payload %d: got %d events, want 1", i, len(batch.Events))
-		}
-		bs, ok := batch.Events[0].(engine.BlockStored)
+	batch, err := engine.DecodeEventBatch(payload)
+	if err != nil {
+		t.Fatalf("DecodeEventBatch: %v", err)
+	}
+	out := make([]engine.BlockStored, 0, len(batch.Events))
+	for i, ev := range batch.Events {
+		bs, ok := ev.(engine.BlockStored)
 		if !ok {
-			t.Fatalf("payload %d: event = %T, want BlockStored", i, batch.Events[0])
+			t.Fatalf("event %d = %T, want BlockStored", i, ev)
 		}
 		out = append(out, bs)
 	}
@@ -34,18 +31,19 @@ func decodeStored(t *testing.T, payloads [][]byte) []engine.BlockStored {
 
 // Single-event form: the decoded token_ids and the fingerprints derived from
 // them must equal what the publisher logs/queries for.
-func TestBuildBatchPayloadsRoundTrips(t *testing.T) {
+func TestBuildBatchPayloadRoundTrips(t *testing.T) {
 	const blockSize = 128
 	tokens := tokenSeq(0, blockSize*2) // 2 blocks, one event
 
-	payloads, err := buildBatchPayloads(tokens, blockSize, 1, false)
+	payload, err := buildBatchPayload(tokens, blockSize, 1, false)
 	if err != nil {
-		t.Fatalf("buildBatchPayloads: %v", err)
+		t.Fatalf("buildBatchPayload: %v", err)
 	}
-	if len(payloads) != 1 {
-		t.Fatalf("got %d payloads, want 1", len(payloads))
+	evs := decodeStored(t, payload)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
 	}
-	bs := decodeStored(t, payloads)[0]
+	bs := evs[0]
 
 	if bs.BlockSize != blockSize {
 		t.Errorf("BlockSize = %d, want %d", bs.BlockSize, blockSize)
@@ -78,18 +76,19 @@ func TestBuildBatchPayloadsRoundTrips(t *testing.T) {
 	}
 }
 
-// Multi-event form: blocks split across events must chain — event N+1's
-// parent_block_hash decodes to event N's last block hash, so the subscriber's
-// reverse map can resume the rolling prefix hash across events.
-func TestBuildBatchPayloadsChainAcrossEvents(t *testing.T) {
+// Multi-event form: blocks split across events inside ONE batch must chain —
+// event N+1's parent_block_hash decodes to event N's last block hash, so the
+// subscriber's reverse map can resume the rolling prefix hash across events,
+// and a replayed message carries the whole chain atomically (parent-first).
+func TestBuildBatchPayloadChainsAcrossEvents(t *testing.T) {
 	const blockSize = 16
 	tokens := tokenSeq(100, blockSize*3) // 3 blocks over 2 events: [b0,b1] then [b2]
 
-	payloads, err := buildBatchPayloads(tokens, blockSize, 2, false)
+	payload, err := buildBatchPayload(tokens, blockSize, 2, false)
 	if err != nil {
-		t.Fatalf("buildBatchPayloads: %v", err)
+		t.Fatalf("buildBatchPayload: %v", err)
 	}
-	evs := decodeStored(t, payloads)
+	evs := decodeStored(t, payload)
 	if len(evs) != 2 {
 		t.Fatalf("got %d events, want 2", len(evs))
 	}
@@ -121,19 +120,22 @@ func TestBuildBatchPayloadsChainAcrossEvents(t *testing.T) {
 // Omit-tokens form: the payload still carries block hashes and block size but
 // no token_ids — the engine-regression shape the subscriber must refuse to
 // index (the e2e asserts the warn + nothing-indexed contract on top of this).
-func TestBuildBatchPayloadsOmitTokenIDs(t *testing.T) {
+func TestBuildBatchPayloadOmitTokenIDs(t *testing.T) {
 	const blockSize = 128
 	tokens := tokenSeq(0, blockSize)
 
-	payloads, err := buildBatchPayloads(tokens, blockSize, 1, true)
+	payload, err := buildBatchPayload(tokens, blockSize, 1, true)
 	if err != nil {
-		t.Fatalf("buildBatchPayloads: %v", err)
+		t.Fatalf("buildBatchPayload: %v", err)
 	}
-	bs := decodeStored(t, payloads)[0]
-	if len(bs.BlockHashes) != 1 {
-		t.Fatalf("got %d block hashes, want 1", len(bs.BlockHashes))
+	evs := decodeStored(t, payload)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
 	}
-	if len(bs.TokenIDs) != 0 {
-		t.Fatalf("decoded %d token_ids, want 0 when omitted", len(bs.TokenIDs))
+	if len(evs[0].BlockHashes) != 1 {
+		t.Fatalf("got %d block hashes, want 1", len(evs[0].BlockHashes))
+	}
+	if len(evs[0].TokenIDs) != 0 {
+		t.Fatalf("decoded %d token_ids, want 0 when omitted", len(evs[0].TokenIDs))
 	}
 }

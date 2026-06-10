@@ -1,15 +1,19 @@
 // Command kvevent-fake-engine is a TEST-ONLY stand-in for a vLLM engine's KV-event
-// ZMQ publisher, used by the fingerprint-routing e2e and smokes. It binds a ZMQ PUB
-// socket and repeatedly publishes a deterministic sequence of synthetic BlockStored
-// events (a fixed token sequence chunked into blocks) so a kvevent-subscriber
-// ingests them into the inference-cache index. It also logs the content fingerprint
-// the subscriber is expected to derive (EXPECT prefix_hash[...]), so a smoke can
-// assert that LookupRoute returns PREFIX_MATCH for that exact key.
+// ZMQ publisher, used by the fingerprint-routing e2e in this package (and runnable
+// standalone against a live install). It binds a ZMQ PUB socket and repeatedly
+// publishes a deterministic sequence of synthetic BlockStored events (a fixed token
+// sequence chunked into blocks) so a kvevent-subscriber ingests them into the
+// inference-cache index. It also logs the content fingerprint the subscriber is
+// expected to derive (EXPECT prefix_hash[...]), so a smoke can assert that
+// LookupRoute returns PREFIX_MATCH for that exact key. It is never shipped in a
+// production bundle.
 //
-// It is built only for tests and smoke images and is never shipped in a production
-// bundle. PUB/SUB has a slow-joiner race (a subscriber that connects after a
-// message is sent misses it), so the sequence is republished on an interval —
-// ingest is idempotent server-side, so replaying is safe.
+// PUB/SUB has a slow-joiner race (a subscriber that connects after a message is
+// sent misses it), so the sequence is republished on an interval. To keep the
+// replay genuinely idempotent, the WHOLE parent-chained event sequence travels in
+// one EventBatch per ZMQ message: a late joiner decodes either the complete batch
+// (events in parent-first order) or nothing, so a suffix event can never arrive
+// without its parent and be mis-indexed as a fresh sequence root.
 package main
 
 import (
@@ -45,8 +49,8 @@ func main() {
 
 	// Validate before allocating: a negative block-size/num-blocks would panic
 	// in tokenSeq below, an oversized product would overflow it, a negative
-	// start token would wrap to a huge uint32 ID, and a non-positive interval
-	// would spin the publish loop hot instead of pacing it.
+	// or too-large start token would wrap the uint32 token IDs, and a
+	// non-positive interval would spin the publish loop hot instead of pacing it.
 	const maxTotalTokens = 1 << 24 // sanity bound for a test publisher
 	if *blockSize <= 0 || *numBlocks <= 0 {
 		log.Fatalf("-block-size and -num-blocks must be positive, got %d and %d", *blockSize, *numBlocks)
@@ -54,20 +58,21 @@ func main() {
 	if *numBlocks > maxTotalTokens / *blockSize {
 		log.Fatalf("-block-size × -num-blocks must not exceed %d tokens, got %d × %d", maxTotalTokens, *blockSize, *numBlocks)
 	}
+	totalTokens := (*blockSize) * (*numBlocks)
 	if *startTok < 0 {
 		log.Fatalf("-start-token must be non-negative, got %d", *startTok)
 	}
-	if int64(*startTok)+int64(*blockSize)*int64(*numBlocks)-1 > math.MaxUint32 {
-		log.Fatalf("-start-token %d + %d tokens exceeds uint32 token-ID range", *startTok, *blockSize**numBlocks)
+	if int64(*startTok)+int64(totalTokens)-1 > math.MaxUint32 {
+		log.Fatalf("-start-token %d + %d tokens exceeds uint32 token-ID range", *startTok, totalTokens)
 	}
 	if *interval <= 0 {
 		log.Fatalf("-interval must be positive, got %s", *interval)
 	}
 
-	tokens := tokenSeq(*startTok, *blockSize**numBlocks)
-	payloads, err := buildBatchPayloads(tokens, *blockSize, *numEvents, *omitTokens)
+	tokens := tokenSeq(*startTok, totalTokens)
+	payload, err := buildBatchPayload(tokens, *blockSize, *numEvents, *omitTokens)
 	if err != nil {
-		log.Fatalf("build payloads: %v", err)
+		log.Fatalf("build payload: %v", err)
 	}
 
 	// Log what the subscriber should derive — smokes grep these EXPECT lines.
@@ -88,16 +93,16 @@ func main() {
 		log.Fatalf("zmq listen %s: %v", *bind, err)
 	}
 	defer func() { _ = pub.Close() }()
-	log.Printf("publishing %d BlockStored event(s) on %s topic=%q (%d block(s), %d tokens) every %s",
-		len(payloads), *bind, *topic, *numBlocks, len(tokens), *interval)
+	log.Printf("publishing %d BlockStored event(s) per batch on %s topic=%q (%d block(s), %d tokens) every %s",
+		*numEvents, *bind, *topic, *numBlocks, len(tokens), *interval)
 
-	publishLoop(ctx, pub, *topic, payloads, *interval)
+	publishLoop(ctx, pub, *topic, [][]byte{payload}, *interval)
 }
 
 // publishLoop re-sends the payload sequence in order until ctx is cancelled.
 // Each ZMQ message is [topic, seq(u64 BE), payload] — the frame shape vLLM's
-// EventPublisher emits. The whole sequence is replayed every interval so a
-// late-joining subscriber still sees every event.
+// EventPublisher emits. The sequence is replayed every interval so a
+// late-joining subscriber still sees every message.
 func publishLoop(ctx context.Context, pub zmq4.Socket, topic string, payloads [][]byte, interval time.Duration) {
 	var seq uint64
 	for {
@@ -133,21 +138,24 @@ func tokenSeq(start, n int) []uint32 {
 // earlier block as its parent.
 func fakeBlockHash(i int) int64 { return 0xE000 + int64(i) }
 
-// buildBatchPayloads encodes the token sequence as a deterministic sequence of
-// vLLM-shaped EventBatch payloads (one BlockStored per batch), in the msgpack
-// array-tagged form the kvevent-subscriber decodes:
+// buildBatchPayload encodes the token sequence as ONE vLLM-shaped EventBatch
+// payload carrying a deterministic sequence of BlockStored events, in the
+// msgpack array-tagged form the kvevent-subscriber decodes:
 //
-//	[ts, [["BlockStored", block_hashes, parent_block_hash, token_ids, block_size, lora_id]]]
+//	[ts, [["BlockStored", block_hashes, parent_block_hash, token_ids, block_size, lora_id], ...]]
 //
-// The full blocks are split across nEvents batches; every batch after the first
-// carries parent_block_hash = the previous batch's last block hash — the shape
+// The full blocks are split across nEvents events; every event after the first
+// carries parent_block_hash = the previous event's last block hash — the shape
 // vLLM uses when an already-cached prefix is extended, which is what exercises
-// the subscriber's cross-event prefix-hash chaining. ts is 0 (the subscriber
+// the subscriber's cross-event prefix-hash chaining. All events ride in a
+// single batch so a republished message is decoded atomically, parent-first —
+// a late-joining subscriber can never see a suffix event without its parent
+// (which would mis-index it as a fresh sequence root). ts is 0 (the subscriber
 // maps 0 to "now" server-side, so the entry is always fresh); lora_id is nil.
 // With omitTokens the token_ids field is nil — the shape of an engine that
 // stops emitting token_ids, which the subscriber must reject (warn + index
 // nothing) rather than ingest.
-func buildBatchPayloads(tokens []uint32, blockSize, nEvents int, omitTokens bool) ([][]byte, error) {
+func buildBatchPayload(tokens []uint32, blockSize, nEvents int, omitTokens bool) ([]byte, error) {
 	if blockSize <= 0 {
 		return nil, fmt.Errorf("block size must be positive, got %d", blockSize)
 	}
@@ -159,7 +167,7 @@ func buildBatchPayloads(tokens []uint32, blockSize, nEvents int, omitTokens bool
 		return nil, fmt.Errorf("events must be in [1, %d] (the full-block count), got %d", nBlocks, nEvents)
 	}
 
-	payloads := make([][]byte, 0, nEvents)
+	events := make([]interface{}, 0, nEvents)
 	base, rem := nBlocks/nEvents, nBlocks%nEvents
 	lo := 0
 	for e := 0; e < nEvents; e++ {
@@ -186,13 +194,13 @@ func buildBatchPayloads(tokens []uint32, blockSize, nEvents int, omitTokens bool
 			tokenIDs = ids
 		}
 
-		event := []interface{}{"BlockStored", hashes, parent, tokenIDs, int32(blockSize), nil}
-		payload, err := msgpack.Marshal([]interface{}{float64(0), []interface{}{event}})
-		if err != nil {
-			return nil, fmt.Errorf("marshal event %d (blocks %d-%d): %w", e, lo, hi-1, err)
-		}
-		payloads = append(payloads, payload)
+		events = append(events, []interface{}{"BlockStored", hashes, parent, tokenIDs, int32(blockSize), nil})
 		lo = hi
 	}
-	return payloads, nil
+
+	payload, err := msgpack.Marshal([]interface{}{float64(0), events})
+	if err != nil {
+		return nil, fmt.Errorf("marshal batch of %d event(s): %w", nEvents, err)
+	}
+	return payload, nil
 }

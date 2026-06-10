@@ -252,12 +252,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	const tenant = "e2e-route"
 	tokens := tokenSeq(5_000, 2*e2eBlockTok) // two blocks
-	// Two blocks split across two parent-chained events — exercises the
-	// subscriber's cross-event chaining, not just single-event decode.
-	payloads, err := buildBatchPayloads(tokens, e2eBlockTok, 2, false)
+	// Two blocks split across two parent-chained events (in one atomic batch
+	// message) — exercises the subscriber's cross-event chaining, not just
+	// single-event decode.
+	payload, err := buildBatchPayload(tokens, e2eBlockTok, 2, false)
 	if err != nil {
-		t.Fatalf("buildBatchPayloads: %v", err)
+		t.Fatalf("buildBatchPayload: %v", err)
 	}
+	payloads := [][]byte{payload}
 
 	grpcAddr, stopServer := startServerTCP(t)
 	defer stopServer()
@@ -361,11 +363,14 @@ func truncatedBlockStoredPayload(t *testing.T) []byte {
 func TestE2EMissingTokenIDsIndexesNothing(t *testing.T) {
 	const tenant = "e2e-no-tokens"
 	tokens := tokenSeq(9_000, e2eBlockTok)
-	payloads, err := buildBatchPayloads(tokens, e2eBlockTok, 1, true /* omit token_ids */)
+	payload, err := buildBatchPayload(tokens, e2eBlockTok, 1, true /* omit token_ids */)
 	if err != nil {
-		t.Fatalf("buildBatchPayloads: %v", err)
+		t.Fatalf("buildBatchPayload: %v", err)
 	}
-	payloads = append(payloads, truncatedBlockStoredPayload(t))
+	// The truncated shape must be its own message: a decode error drops the
+	// whole batch, so bundling it with the omit-tokens event would mask the
+	// forwarder-warning path.
+	payloads := [][]byte{payload, truncatedBlockStoredPayload(t)}
 
 	grpcAddr, stopServer := startServerTCP(t)
 	defer stopServer()
