@@ -105,6 +105,16 @@ jobs:
           exit 1
         fi
 
+    # Cross-language golden fixture: prove the checked-in
+    # pkg/fingerprint/testdata/golden_vectors.json matches its generator, so a
+    # generator-only edit (or a hand-edited fixture) can't merge silently. The
+    # make target skips without python3+xxhash; installing the pinned dep here
+    # makes the check real in CI.
+    - name: Verify golden vectors match generator
+      run: |
+        python3 -m pip install --quiet -r pkg/fingerprint/testdata/requirements.txt
+        make verify-golden-vectors
+
   test:
     name: Test
     runs-on: ubuntu-latest

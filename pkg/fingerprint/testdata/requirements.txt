@@ -1,1 +1,1 @@
-xxhash>=3.0
+xxhash==3.7.0
