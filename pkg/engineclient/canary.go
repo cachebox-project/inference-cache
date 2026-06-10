@@ -1,0 +1,124 @@
+package engineclient
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+// PrefixCacheProbe is the by-construction canary: it sends the SAME token-ID
+// prompt to an OpenAI-compatible engine twice and reports the change in vLLM's
+// prefix-cache counters. A positive hit delta on the second (warm) request shows
+// the engine cached exactly the token-ID prompt it was given — so a routing
+// fingerprint computed over those same tokens is guaranteed to match the engine's
+// cached prefix. It needs no router: it isolates the engine half of the
+// guarantee (the tokenizer half is proven by pkg/tokenize, the fingerprint half
+// by pkg/fingerprint).
+type PrefixCacheProbe struct {
+	Client     EngineClient // sends the token-ID prompt (typically NewOpenAI)
+	HTTP       *http.Client // scrapes /metrics; defaults to http.DefaultClient
+	EngineURL  string       // base URL, e.g. http://host:8000
+	MetricsURL string       // optional; defaults to EngineURL + "/metrics"
+	Model      string
+}
+
+// ProbeResult reports the warm-request prefix-cache deltas plus both completions.
+type ProbeResult struct {
+	HitsDelta    int // vllm:prefix_cache_hits_total change across the warm request
+	QueriesDelta int // vllm:prefix_cache_queries_total change across the warm request
+	Cold         Completion
+	Warm         Completion
+}
+
+// Run fires the cold request (populating the cache), then measures the
+// prefix-cache counters immediately before and after an identical warm request,
+// so HitsDelta reflects only the warm request. A HitsDelta > 0 is the success
+// signal.
+func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params CompletionParams) (ProbeResult, error) {
+	metricsURL := p.MetricsURL
+	if metricsURL == "" {
+		metricsURL = strings.TrimRight(p.EngineURL, "/") + "/metrics"
+	}
+	httpClient := p.HTTP
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	cold, err := p.Client.Complete(ctx, p.EngineURL, p.Model, tokens, params)
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: cold request: %w", err)
+	}
+
+	hitsPre, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: scrape (pre): %w", err)
+	}
+	queriesPre, _ := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+
+	warm, err := p.Client.Complete(ctx, p.EngineURL, p.Model, tokens, params)
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: warm request: %w", err)
+	}
+
+	hitsPost, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("canary: scrape (post): %w", err)
+	}
+	queriesPost, _ := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+
+	return ProbeResult{
+		HitsDelta:    hitsPost - hitsPre,
+		QueriesDelta: queriesPost - queriesPre,
+		Cold:         cold,
+		Warm:         warm,
+	}, nil
+}
+
+// scrapeCounter sums every series of a Prometheus counter (ignoring labels) from
+// a /metrics endpoint. vLLM reports prefix-cache counters as floats; we truncate
+// to int since they are monotonic integer counts.
+func scrapeCounter(ctx context.Context, client *http.Client, url, metric string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("metrics endpoint returned %s", resp.Status)
+	}
+
+	var sum float64
+	sc := bufio.NewScanner(io.LimitReader(resp.Body, 8<<20))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" || line[0] == '#' || !strings.HasPrefix(line, metric) {
+			continue
+		}
+		// Match "<metric>" or "<metric>{labels}" — the char after the name must
+		// be a space or '{', not another identifier char (avoid prefix collisions).
+		rest := line[len(metric):]
+		if rest == "" || (rest[0] != ' ' && rest[0] != '{') {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if v, err := strconv.ParseFloat(fields[len(fields)-1], 64); err == nil {
+			sum += v
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, err
+	}
+	return int(sum), nil
+}
