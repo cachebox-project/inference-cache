@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os/signal"
 	"syscall"
 	"time"
@@ -55,6 +56,9 @@ func main() {
 	}
 	if *startTok < 0 {
 		log.Fatalf("-start-token must be non-negative, got %d", *startTok)
+	}
+	if int64(*startTok)+int64(*blockSize)*int64(*numBlocks)-1 > math.MaxUint32 {
+		log.Fatalf("-start-token %d + %d tokens exceeds uint32 token-ID range", *startTok, *blockSize**numBlocks)
 	}
 	if *interval <= 0 {
 		log.Fatalf("-interval must be positive, got %s", *interval)
