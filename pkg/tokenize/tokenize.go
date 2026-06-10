@@ -50,6 +50,19 @@ type Tokenizer interface {
 // The lookup hot path treats it as fail-open (NO_HINT), never an RPC error.
 var ErrUnavailable = errors.New("tokenize: tokenizer unavailable")
 
+// Config configures the tokenizer constructed by New.
+type Config struct {
+	// ModelsDir, when set, resolves a model id to "<ModelsDir>/<model>" (a
+	// directory holding the model's tokenizer.json). When empty, the model id
+	// is passed through to the loader as a path or an HF model id. Only the
+	// cgo (smgcgo) build consults this; the default build ignores it.
+	ModelsDir string
+}
+
+// New returns the tokenizer for the current build: the cgo SMG-backed tokenizer
+// under the `smgcgo` build tag, or Unavailable otherwise. The server wires the
+// result onto the (model, prompt_text) LookupRoute path.
+
 // Unavailable is the default Tokenizer: every call fails open with
 // ErrUnavailable. It lets the server build and run without the cgo tokenizer.
 type Unavailable struct{}

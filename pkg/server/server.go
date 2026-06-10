@@ -20,6 +20,7 @@ import (
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
 // Config controls the cache server listeners.
@@ -79,6 +80,15 @@ func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string
 	}
 }
 
+// WithTokenizer wires the server-owned tokenizer onto the (model, prompt_text)
+// LookupRoute path. When unset (the default), the handler keeps tokenize.Unavailable
+// and that path fails open to NO_HINT; the token_ids path is unaffected. The
+// production binary passes tokenize.New(...) — the real tokenizer under the
+// smgcgo build, Unavailable otherwise.
+func WithTokenizer(tk tokenize.Tokenizer) Option {
+	return func(s *Service) { s.tokenizer = tk }
+}
+
 // Service hosts the gRPC API and the HTTP health/metrics endpoints.
 type Service struct {
 	grpcServer        *grpc.Server
@@ -91,6 +101,7 @@ type Service struct {
 	metrics           *serverMetrics
 	index             *index.Index
 	policies          *PolicyStore
+	tokenizer         tokenize.Tokenizer
 }
 
 // New constructs a cache service.
@@ -210,7 +221,11 @@ func New(opts ...Option) *Service {
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(s.grpcServer, healthServer)
-	icpb.RegisterInferenceCacheServer(s.grpcServer, newInferenceCacheService(idx, metrics, policies))
+	svc := newInferenceCacheService(idx, metrics, policies)
+	if s.tokenizer != nil {
+		svc.tokenizer = s.tokenizer
+	}
+	icpb.RegisterInferenceCacheServer(s.grpcServer, svc)
 	// Register gRPC server reflection so operators can use grpcurl
 	// (list / describe / generic call) and similar schema-aware debug tooling
 	// without shipping the .proto. Reflection exposes only the service schema,

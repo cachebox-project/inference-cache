@@ -16,6 +16,7 @@ import (
 
 	"github.com/cachebox-project/inference-cache/pkg/server"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -45,6 +46,7 @@ func main() {
 	// implemented here. See docs/design/grpc-tls.md.
 	tlsCertFile := flag.String("tls-cert-file", "", "Path to the PEM server certificate for the gRPC port (:9090). Set together with --tls-key-file to enable TLS; leave both empty for plaintext (dev/CI).")
 	tlsKeyFile := flag.String("tls-key-file", "", "Path to the PEM private key for the gRPC port (:9090). Set together with --tls-cert-file to enable TLS; leave both empty for plaintext (dev/CI).")
+	tokenizerModelsDir := flag.String("tokenizer-models-dir", "", "Directory holding per-model tokenizer artifacts (<dir>/<model>/tokenizer.json) used to tokenize LookupRoute prompt_text server-side. Empty: a model id is treated as a path or an HF model id. Only effective in the tokenizer-enabled build (-tags smgcgo); otherwise the prompt_text lookup path fails open to NO_HINT.")
 	flag.Parse()
 
 	format, err := server.ParseLogFormat(*logFormat)
@@ -76,7 +78,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Wire the server-owned tokenizer for the (model, prompt_text) LookupRoute
+	// path. tokenize.New returns the real cgo tokenizer only under the smgcgo
+	// build; otherwise it is Unavailable (the prompt_text path fails open to
+	// NO_HINT), so this is safe to wire unconditionally.
 	var opts []server.Option
+	opts = append(opts, server.WithTokenizer(tokenize.New(tokenize.Config{ModelsDir: *tokenizerModelsDir})))
 	if *expectedSA != "" {
 		restCfg, err := rest.InClusterConfig()
 		if err != nil {

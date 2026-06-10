@@ -226,6 +226,14 @@ test: ## Run unit tests.
 test-race: ## Run unit tests with the race detector (fresh, no cache).
 	$(GO_CMD) test -race -count=1 ./...
 
+.PHONY: tokenize-cgo-build
+tokenize-cgo-build: ## Build the rust/ictokenizer static archive (C-ABI shim over SMG's llm-tokenizer) for the cgo tokenizer. Needs a Rust toolchain + network (git dep, first build only).
+	cargo build --release --manifest-path rust/ictokenizer/Cargo.toml
+
+.PHONY: tokenize-cgo-test
+tokenize-cgo-test: tokenize-cgo-build ## Build + test the cgo SMG-backed tokenizer (-tags smgcgo). Opt-in: needs Rust + network, NOT part of `make ci`. Set IC_TEST_TOKENIZER to a tokenizer path or HF model id to run the real-tokenizer tests (they skip when unset).
+	CGO_LDFLAGS="-L$(CURDIR)/rust/ictokenizer/target/release" $(GO_CMD) test -tags smgcgo -count=1 ./pkg/tokenize/...
+
 .PHONY: vulncheck
 vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulnerabilities. Needs network.
 	@test -s $(GOVULNCHECK) || GOBIN=$(LOCALBIN) $(GO_CMD) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)

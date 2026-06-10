@@ -1,0 +1,29 @@
+[package]
+name = "ictokenizer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Thin C-ABI shim over llm-tokenizer for the inference-cache Go server (cgo)."
+
+[lib]
+name = "ictokenizer"
+# staticlib so the Rust + llm-tokenizer code links directly into the Go binary
+# (no .so to ship, no LD_LIBRARY_PATH). Consumed via cgo behind the `smgcgo`
+# build tag — never part of the default (pure-Go) build.
+crate-type = ["staticlib"]
+
+[dependencies]
+serde_json = "1.0"
+libc = "0.2"
+
+# Reuse SMG's tokenizer crate (HF + tiktoken loaders, chat templates, custom
+# encoders). Pinned to a specific commit for reproducibility; bump deliberately.
+# Depends ONLY on llm-tokenizer — NOT on SMG's model_gateway crate — so this
+# shim does not drag in the gateway or a Python toolchain.
+[dependencies.llm-tokenizer]
+git = "https://github.com/lightseekorg/smg.git"
+rev = "f6db034f34135e7df18c98927d88bcb23b9cbfcc"
+
+[profile.release]
+# Smaller, faster-to-link static archive.
+opt-level = 2
