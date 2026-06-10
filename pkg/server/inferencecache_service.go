@@ -19,6 +19,13 @@ import (
 // chain won't line up with the ingested keys. 16 is vLLM's default.
 const DefaultEngineBlockSize = 16
 
+// DefaultTokenizeTimeout bounds server-side prompt_text tokenization when no
+// tighter deadline applies (no caller deadline AND no CachePolicy.lookupTimeoutMs).
+// The cgo tokenizer can load/download a model on first use, so without a bound a
+// no-deadline LookupRoute could block the hot path; instead it fails open. Set a
+// CachePolicy.lookupTimeoutMs for tighter, per-tenant control.
+const DefaultTokenizeTimeout = 5 * time.Second
+
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
@@ -83,16 +90,22 @@ type inferenceCacheService struct {
 	// blockSize is the KV block size used to fingerprint token_ids / tokenized
 	// prompt_text into the block-hash chain. Defaults to DefaultEngineBlockSize.
 	blockSize int
+
+	// tokenizeTimeout bounds prompt_text tokenization when no caller deadline or
+	// CachePolicy.lookupTimeoutMs applies. Defaults to DefaultTokenizeTimeout;
+	// tests override it.
+	tokenizeTimeout time.Duration
 }
 
 func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
 	return &inferenceCacheService{
-		index:     idx,
-		metrics:   metrics,
-		policies:  policies,
-		lookupFn:  idx.LookupRoute,
-		tokenizer: tokenize.Unavailable{},
-		blockSize: DefaultEngineBlockSize,
+		index:           idx,
+		metrics:         metrics,
+		policies:        policies,
+		lookupFn:        idx.LookupRoute,
+		tokenizer:       tokenize.Unavailable{},
+		blockSize:       DefaultEngineBlockSize,
+		tokenizeTimeout: DefaultTokenizeTimeout,
 	}
 }
 
@@ -130,6 +143,7 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.LookupRouteRequest) (*icpb.LookupRouteResponse, error) {
 	tenant := req.GetTenantId()
 	model := req.GetModelId()
+	start := time.Now() // hot-path clock — includes tokenization, reported on every path
 
 	// Reserved probe scope: never serve external LookupRoute queries against
 	// the server-internal probe tenant. Without this guard, a caller that
@@ -165,10 +179,18 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		ctx, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
+	// When the request will tokenize (prompt_text) and nothing else bounds it,
+	// apply a default safety timeout so a slow first-time tokenizer load can't
+	// block the hot path indefinitely — it fails open instead.
+	if _, has := ctx.Deadline(); !has && req.GetPromptText() != "" && s.tokenizeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.tokenizeTimeout)
+		defer cancel()
+	}
 	// Fast-path the timeout check: an upstream deadline already breached means
 	// any further work serves a caller that has given up. Still fail open.
 	if err := ctx.Err(); err != nil {
-		return s.timeoutResponse(model, 0, nil), nil
+		return s.timeoutResponse(model, time.Since(start), nil), nil
 	}
 	_, hasDeadline := ctx.Deadline()
 
@@ -187,7 +209,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		select {
 		case in = <-ch:
 		case <-ctx.Done():
-			return s.timeoutResponse(model, 0, nil), nil
+			return s.timeoutResponse(model, time.Since(start), nil), nil
 		}
 	} else {
 		in = s.resolveLookupChain(ctx, req)
@@ -195,16 +217,15 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// A deadline-aware tokenizer may have returned a context error that surfaced
 	// as failOpen; if the budget actually expired that is a TIMEOUT, not NO_HINT.
 	if ctx.Err() != nil {
-		return s.timeoutResponse(model, 0, in.echoTokens), nil
+		return s.timeoutResponse(model, time.Since(start), in.echoTokens), nil
 	}
 	if in.failOpen {
 		// in.echoTokens is set when a sub-block prompt_text still tokenized
 		// successfully (the gateway needs those tokens); nil when the tokenizer
 		// was unavailable or errored. Either way any response after the server
-		// tokenized carries whatever tokens it produced.
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint, TokenIds: in.echoTokens}
-		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
-		return resp, nil
+		// tokenized carries whatever tokens it produced, and reports the elapsed
+		// hot-path time so an expensive tokenizer failure is visible.
+		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
 	// Pre-lookup gate on the effective prefix token count (from the resolved
@@ -214,9 +235,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// when there is no routing hint.
 	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 &&
 		effectivePrefixTokens(in.blockTokenCounts, req.GetPrefixTokenCount()) < minTokens {
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint, TokenIds: in.echoTokens}
-		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
-		return resp, nil
+		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
 	slo := req.GetSlo()
@@ -236,7 +255,6 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// synchronously (it is normally sub-millisecond; a goroutine + channel every
 	// call would just churn allocations behind the index lock during a sweep).
 	if !hasDeadline {
-		start := time.Now()
 		result := s.lookupFn(lookupReq)
 		return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 	}
@@ -246,7 +264,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// or large writer can hold — without the goroutine+select the RPC could
 	// block past the policy budget and surface a client-side deadline
 	// instead of a clean fail-open TIMEOUT.
-	start := time.Now()
+	lookupStart := time.Now()
 	type boundedResult struct {
 		result  index.LookupResult
 		elapsed time.Duration
@@ -254,7 +272,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	resCh := make(chan boundedResult, 1)
 	go func() {
 		r := s.lookupFn(lookupReq)
-		resCh <- boundedResult{result: r, elapsed: time.Since(start)}
+		resCh <- boundedResult{result: r, elapsed: time.Since(lookupStart)}
 	}()
 
 	var (
@@ -273,7 +291,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		result = b.result
 		elapsed = b.elapsed
 		if budget > 0 && elapsed > budget {
-			return s.timeoutResponse(model, elapsed, in.echoTokens), nil
+			return s.timeoutResponse(model, time.Since(start), in.echoTokens), nil
 		}
 	case <-ctx.Done():
 		// Deadline (or upstream cancellation) hit while waiting for the
@@ -436,6 +454,22 @@ func (s *inferenceCacheService) timeoutResponse(model string, elapsed time.Durat
 		TokenIds: echoTokens,
 	}
 	s.metrics.observeLookup(model, reasonTimeout, false, elapsed)
+	return resp
+}
+
+// noHintResponse builds a fail-open NO_HINT envelope that reports the real
+// elapsed hot-path time (so an expensive tokenizer load/failure is visible on
+// inferencecache_lookup_route_latency_seconds) and echoes the canonical tokens
+// when the server tokenized prompt_text. Used by the post-tokenization fail-open
+// and min-prefix-gate paths; the pre-tokenization early returns (probe, empty
+// input) keep their zero-latency NO_HINT.
+func (s *inferenceCacheService) noHintResponse(model string, elapsed time.Duration, echoTokens []uint32) *icpb.LookupRouteResponse {
+	resp := &icpb.LookupRouteResponse{
+		ReasonCode:      reasonNoHint,
+		LookupLatencyUs: elapsed.Microseconds(),
+		TokenIds:        echoTokens,
+	}
+	s.metrics.observeLookup(model, reasonNoHint, false, elapsed)
 	return resp
 }
 

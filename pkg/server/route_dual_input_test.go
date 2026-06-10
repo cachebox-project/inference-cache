@@ -171,6 +171,27 @@ func TestLookupRouteShortTokenIDsFailsOpenNotTenantHot(t *testing.T) {
 	}
 }
 
+// Even with NO CachePolicy timeout and no caller deadline, a slow prompt_text
+// tokenizer is bounded by the default tokenize timeout and fails open with
+// TIMEOUT rather than blocking the hot path.
+func TestLookupRoutePromptTextDefaultTokenizeTimeout(t *testing.T) {
+	svc := newTestService()
+	svc.tokenizeTimeout = 20 * time.Millisecond // shrink the default for the test
+	release := make(chan struct{})
+	defer close(release)
+	svc.tokenizer = blockingTokenizer{release: release}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hello world",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute must not error: %v", err)
+	}
+	if resp.GetReasonCode() != "TIMEOUT" {
+		t.Errorf("reason = %q, want TIMEOUT (default tokenize bound must fire with no policy)", resp.GetReasonCode())
+	}
+}
+
 // A novel pre-tokenized prefix the server has never seen must fail open.
 func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
 	stored := tokenSeq(1_000, 64)

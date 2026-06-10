@@ -46,7 +46,7 @@ func main() {
 	// implemented here. See docs/design/grpc-tls.md.
 	tlsCertFile := flag.String("tls-cert-file", "", "Path to the PEM server certificate for the gRPC port (:9090). Set together with --tls-key-file to enable TLS; leave both empty for plaintext (dev/CI).")
 	tlsKeyFile := flag.String("tls-key-file", "", "Path to the PEM private key for the gRPC port (:9090). Set together with --tls-cert-file to enable TLS; leave both empty for plaintext (dev/CI).")
-	tokenizerModelsDir := flag.String("tokenizer-models-dir", "", "Directory holding per-model tokenizer artifacts (<dir>/<model>/tokenizer.json) used to tokenize LookupRoute prompt_text server-side. Empty: a model id is treated as a path or an HF model id. Only effective in the tokenizer-enabled build (-tags smgcgo); otherwise the prompt_text lookup path fails open to NO_HINT.")
+	tokenizerModelsDir := flag.String("tokenizer-models-dir", "", "Directory holding per-model tokenizer artifacts (<dir>/<model>/tokenizer.json) used to tokenize LookupRoute prompt_text server-side. Empty: a request's model_id is resolved as a local path or a HuggingFace id, which can trigger an on-demand download — in production set this to a directory of vetted tokenizers so an untrusted prompt_text caller cannot drive arbitrary tokenizer loads. Only effective in the tokenizer-enabled build (-tags smgcgo); otherwise the prompt_text lookup path fails open to NO_HINT.")
 	engineBlockSize := flag.Int("engine-block-size", server.DefaultEngineBlockSize, "KV block size (tokens per block) used to fingerprint token_ids / tokenized prompt_text on LookupRoute. MUST match the engine's KV block size and the kvevent-subscriber's. vLLM's default is 16.")
 	flag.Parse()
 
