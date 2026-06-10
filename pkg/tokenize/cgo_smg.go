@@ -64,10 +64,11 @@ type smgTokenizer struct {
 	handles map[string]*C.Handle
 }
 
-// newSMGTokenizer eagerly loads every tokenizer under modelsDir. Each immediate
-// subdirectory is one model: its name is the model id and it must hold the
-// tokenizer artifacts (tokenizer.json, plus tokenizer_config.json for the chat
-// template). Loads are confined to modelsDir — a request model_id is never joined
+// newSMGTokenizer eagerly loads every tokenizer under modelsDir. A model is any
+// directory (at any depth) holding the tokenizer artifacts (tokenizer.json, plus
+// tokenizer_config.json for the chat template); its model id is its path relative
+// to modelsDir, so namespaced ids like "Qwen/Qwen2.5-0.5B-Instruct" arrange as
+// nested directories. Loads are confined to modelsDir — a request model_id is never joined
 // onto a path — and happen at startup, never on the hot path, so they trigger no
 // HF download mid-request. A model that fails to load is logged and skipped
 // (fail-soft startup; that model is simply unavailable).

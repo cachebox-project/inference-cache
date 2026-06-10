@@ -3,6 +3,7 @@ package engineclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -96,8 +97,8 @@ func TestOpenAIErrorsOnNoChoices(t *testing.T) {
 // clearly rather than silently doing nothing.
 func TestGRPCClientNotImplemented(t *testing.T) {
 	var c EngineClient = GRPCTokenizedClient{}
-	if _, err := c.Complete(context.Background(), "engine:8000", "m", []uint32{1}, CompletionParams{}); err == nil {
-		t.Fatal("expected ErrNotImplemented, got nil")
+	if _, err := c.Complete(context.Background(), "engine:8000", "m", []uint32{1}, CompletionParams{}); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("err = %v, want ErrNotImplemented", err)
 	}
 }
 
