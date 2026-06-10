@@ -168,7 +168,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// Fast-path the timeout check: an upstream deadline already breached means
 	// any further work serves a caller that has given up. Still fail open.
 	if err := ctx.Err(); err != nil {
-		return s.timeoutResponse(model, 0), nil
+		return s.timeoutResponse(model, 0, nil), nil
 	}
 	_, hasDeadline := ctx.Deadline()
 
@@ -187,23 +187,33 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		select {
 		case in = <-ch:
 		case <-ctx.Done():
-			return s.timeoutResponse(model, 0), nil
+			return s.timeoutResponse(model, 0, nil), nil
 		}
 	} else {
 		in = s.resolveLookupChain(ctx, req)
 	}
+	// A deadline-aware tokenizer may have returned a context error that surfaced
+	// as failOpen; if the budget actually expired that is a TIMEOUT, not NO_HINT.
+	if ctx.Err() != nil {
+		return s.timeoutResponse(model, 0, in.echoTokens), nil
+	}
 	if in.failOpen {
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		// in.echoTokens is nil on every failOpen path (tokenizer unavailable or
+		// errored, or a sub-block prompt), so this echoes nothing — but keep it
+		// uniform: any response after the server tokenized carries the tokens.
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint, TokenIds: in.echoTokens}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
 	}
 
 	// Pre-lookup gate on the effective prefix token count (from the resolved
 	// chain, falling back to the legacy prefix_token_count). Short-circuit a
-	// request that can't clear the threshold — no index lock.
+	// request that can't clear the threshold — no index lock. Still echo the
+	// canonical tokens: a prompt_text caller needs them to call the engine even
+	// when there is no routing hint.
 	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 &&
 		effectivePrefixTokens(in.blockTokenCounts, req.GetPrefixTokenCount()) < minTokens {
-		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint, TokenIds: in.echoTokens}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
 	}
@@ -257,18 +267,18 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		// still win and we'd surface stale scores as PREFIX_MATCH.
 		// Re-check the deadline before honoring the result.
 		if ctx.Err() != nil {
-			return s.timeoutResponse(model, time.Since(start)), nil
+			return s.timeoutResponse(model, time.Since(start), in.echoTokens), nil
 		}
 		result = b.result
 		elapsed = b.elapsed
 		if budget > 0 && elapsed > budget {
-			return s.timeoutResponse(model, elapsed), nil
+			return s.timeoutResponse(model, elapsed, in.echoTokens), nil
 		}
 	case <-ctx.Done():
 		// Deadline (or upstream cancellation) hit while waiting for the
 		// lookup. The goroutine will land eventually with its result
 		// discarded; the RPC returns immediately.
-		return s.timeoutResponse(model, time.Since(start)), nil
+		return s.timeoutResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
 	return s.buildLookupResponse(model, tenant, result, elapsed, in.echoTokens), nil
@@ -412,10 +422,14 @@ func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result
 // timeoutResponse builds the fail-open TIMEOUT envelope plus its metric
 // observation. Kept as a helper because both the pre-lookup deadline-breach
 // branch and the post-lookup budget-breach branch share the same shape.
-func (s *inferenceCacheService) timeoutResponse(model string, elapsed time.Duration) *icpb.LookupRouteResponse {
+func (s *inferenceCacheService) timeoutResponse(model string, elapsed time.Duration, echoTokens []uint32) *icpb.LookupRouteResponse {
 	resp := &icpb.LookupRouteResponse{
 		ReasonCode:      reasonTimeout,
 		LookupLatencyUs: elapsed.Microseconds(),
+		// Echo the canonical tokens when the server already tokenized prompt_text
+		// (nil otherwise) so the caller can still forward them to the engine even
+		// though the routing hint timed out.
+		TokenIds: echoTokens,
 	}
 	s.metrics.observeLookup(model, reasonTimeout, false, elapsed)
 	return resp

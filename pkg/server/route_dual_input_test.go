@@ -289,6 +289,29 @@ func TestLookupRouteTokenIDsHonorsConfiguredBlockSize(t *testing.T) {
 	}
 }
 
+// Even when the min-prefix gate downgrades a prompt_text lookup to NO_HINT, the
+// server still echoes the canonical tokens so the caller can forward them to the
+// engine (it tokenized; the gateway has no tokenizer).
+func TestLookupRoutePromptTextEchoesTokensOnMinPrefixGate(t *testing.T) {
+	tokens := tokenSeq(2_500_000, 64) // 64 effective tokens, below the 1000 gate
+	svc := newTestService()
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "tenant-x", MinimumPrefixTokens: 1000}})
+	svc.tokenizer = fakeTokenizer{tokens: tokens}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hi",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT (below minimumPrefixTokens)", resp.GetReasonCode())
+	}
+	if !equalU32(resp.GetTokenIds(), tokens) {
+		t.Errorf("min-prefix NO_HINT dropped the token echo: got %d tokens, want %d", len(resp.GetTokenIds()), len(tokens))
+	}
+}
+
 // No cgo tokenizer (the default build): the (model, prompt_text) path fails open
 // to NO_HINT rather than erroring on the hot path.
 func TestLookupRoutePromptTextUnavailableTokenizerFailsOpen(t *testing.T) {
