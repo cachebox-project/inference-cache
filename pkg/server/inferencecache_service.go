@@ -26,6 +26,12 @@ const DefaultEngineBlockSize = 16
 // CachePolicy.lookupTimeoutMs for tighter, per-tenant control.
 const DefaultTokenizeTimeout = 5 * time.Second
 
+// MaxLookupTokens caps the caller-supplied token_ids a single LookupRoute will
+// fingerprint, so an oversized request can't burn CPU/memory on the hot path —
+// it fails open to NO_HINT instead. Far above any real model context window
+// (~1M tokens); legitimate prompts never approach it.
+const MaxLookupTokens = 1 << 20
+
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
@@ -300,7 +306,10 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
-	return s.buildLookupResponse(model, tenant, result, elapsed, in.echoTokens), nil
+	// Report total hot-path time (tokenization + lookup), not just the index
+	// lookup, so the new prompt_text path isn't under-reported on the latency
+	// metric. The budget check above still uses the lookup-only `elapsed`.
+	return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 }
 
 // lookupInputs is the resolved dual-input chain the handler looks up. It does
@@ -338,6 +347,9 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		return lookupInputs{blockHashes: req.GetBlockHashes(), blockTokenCounts: req.GetBlockTokenCounts()}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
+		if len(toks) > MaxLookupTokens {
+			return lookupInputs{failOpen: true} // oversized — don't fingerprint on the hot path
+		}
 		bh, btc := fingerprint.Chain(toks, s.blockSize)
 		if len(bh) == 0 {
 			return lookupInputs{failOpen: true} // shorter than one block — nothing the engine can prefix-cache

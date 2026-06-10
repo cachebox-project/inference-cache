@@ -214,6 +214,22 @@ func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
 	}
 }
 
+// An oversized token_ids request fails open rather than burning CPU/memory
+// fingerprinting it on the hot path.
+func TestLookupRouteOversizedTokenIDsFailsOpen(t *testing.T) {
+	svc := newTestService()
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm",
+		TokenIds: make([]uint32, MaxLookupTokens+1),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (oversized token_ids must fail open)", resp.GetReasonCode())
+	}
+}
+
 // An explicit block-hash chain (a gateway that already fingerprinted) takes
 // precedence over token_ids. We supply a matching chain AND a novel token_ids;
 // if precedence holds the chain wins and we PREFIX_MATCH. If token_ids wrongly

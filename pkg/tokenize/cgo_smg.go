@@ -37,64 +37,87 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"unsafe"
 )
 
-// smgTokenizer is the cgo-backed Tokenizer. It lazily loads and caches one
-// llm-tokenizer handle per model (loads are expensive — an HF download or a
-// disk read).
+// smgTokenizer is the cgo-backed Tokenizer. Tokenizers are loaded EAGERLY at
+// construction from a vetted models directory (one subdir per model, holding the
+// tokenizer artifacts) and served from an in-memory map — so the LookupRoute hot
+// path never loads, downloads, or touches a request-controlled filesystem path.
+// A request model_id that is not in the pre-loaded set fails open (ErrUnavailable).
+// This is what makes server-side tokenization safe to expose: an untrusted
+// prompt_text caller cannot drive arbitrary tokenizer loads/downloads or escape
+// the vetted directory via the model_id.
 //
-// Concurrency: the RWMutex guards only the handle-cache map (creation). Encoding
-// itself needs no lock: a handle wraps an Arc<dyn Tokenizer>, and upstream's
-// Encoder/Decoder traits are `Send + Sync` with `&self` encode / chat-template
-// methods, so simultaneous Encode/EncodeText calls on the same handle are safe
-// by Rust's Sync guarantee. Serializing them would needlessly bottleneck the
-// LookupRoute hot path.
+// Concurrency: the map is populated once at construction, then only read. Encode
+// holds the RLock across the cgo call so Close cannot free a handle mid-use;
+// concurrent Encode calls share the RLock — upstream's Encoder/Decoder traits are
+// `Send + Sync` with `&self` methods, so simultaneous encodes on one handle are
+// safe by Rust's Sync guarantee.
 type smgTokenizer struct {
-	// resolve maps a model id to the path/HF-id the tokenizer loads from.
-	resolve func(model string) string
-
 	mu      sync.RWMutex
 	handles map[string]*C.Handle
 }
 
-// newSMGTokenizer builds the cgo tokenizer. modelsDir, when non-empty, resolves
-// a model id to "<modelsDir>/<model>" (a directory holding tokenizer.json);
-// otherwise the model id is passed through (a local path, or an HF model id that
-// llm-tokenizer downloads — gated models need HF_TOKEN).
+// newSMGTokenizer eagerly loads every tokenizer under modelsDir. Each immediate
+// subdirectory is one model: its name is the model id and it must hold the
+// tokenizer artifacts (tokenizer.json, plus tokenizer_config.json for the chat
+// template). Loads are confined to modelsDir — a request model_id is never joined
+// onto a path — and happen at startup, never on the hot path, so they trigger no
+// HF download mid-request. A model that fails to load is logged and skipped
+// (fail-soft startup; that model is simply unavailable).
 func newSMGTokenizer(modelsDir string) *smgTokenizer {
-	resolve := func(model string) string { return model }
-	if modelsDir != "" {
-		resolve = func(model string) string { return filepath.Join(modelsDir, model) }
+	t := &smgTokenizer{handles: make(map[string]*C.Handle)}
+	entries, err := os.ReadDir(modelsDir)
+	if err != nil {
+		slog.Warn("tokenize: cannot read tokenizer models dir; server-side tokenization disabled",
+			"dir", modelsDir, "err", err)
+		return t
 	}
-	return &smgTokenizer{resolve: resolve, handles: make(map[string]*C.Handle)}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		model := e.Name()
+		h, err := loadHandle(filepath.Join(modelsDir, model))
+		if err != nil {
+			slog.Warn("tokenize: failed to load tokenizer; model unavailable", "model", model, "err", err)
+			continue
+		}
+		t.handles[model] = h
+	}
+	slog.Info("tokenize: loaded tokenizers", "dir", modelsDir, "count", len(t.handles))
+	return t
 }
 
-func (t *smgTokenizer) handleFor(model string) (*C.Handle, error) {
-	t.mu.RLock()
-	h, ok := t.handles[model]
-	t.mu.RUnlock()
-	if ok {
-		return h, nil
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if h, ok := t.handles[model]; ok { // double-check after taking the write lock
-		return h, nil
-	}
-
-	cPath := C.CString(t.resolve(model))
-	defer C.free(unsafe.Pointer(cPath))
+// loadHandle creates one tokenizer handle from a local path (a tokenizer dir) or
+// — for tests only — an HF model id. Production construction (newSMGTokenizer)
+// only ever passes confined local paths, so the hot path never downloads.
+func loadHandle(ref string) (*C.Handle, error) {
+	cRef := C.CString(ref)
+	defer C.free(unsafe.Pointer(cRef))
 	var cErr *C.char
-	handle := C.ic_tokenizer_create(cPath, &cErr)
-	if handle == nil {
-		return nil, fmt.Errorf("%w: load tokenizer for model %q: %s", ErrUnavailable, model, takeCErr(cErr))
+	h := C.ic_tokenizer_create(cRef, &cErr)
+	if h == nil {
+		return nil, fmt.Errorf("%w: load tokenizer %q: %s", ErrUnavailable, ref, takeCErr(cErr))
 	}
-	t.handles[model] = handle
-	return handle, nil
+	return h, nil
+}
+
+// loadSingleModel builds a tokenizer with exactly one model loaded directly from
+// ref (a local tokenizer dir or an HF model id). It keeps the cgo `C` type out
+// of test files, which can't carry the cgo preamble; tests use it to exercise
+// the real tokenizer without a structured models directory.
+func loadSingleModel(model, ref string) (*smgTokenizer, error) {
+	h, err := loadHandle(ref)
+	if err != nil {
+		return nil, err
+	}
+	return &smgTokenizer{handles: map[string]*C.Handle{model: h}}, nil
 }
 
 type wireMessage struct {
@@ -105,10 +128,6 @@ type wireMessage struct {
 // Encode applies the model's chat template to msgs then tokenizes.
 func (t *smgTokenizer) Encode(ctx context.Context, model string, msgs []Message, opts EncodeOptions) ([]uint32, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	h, err := t.handleFor(model)
-	if err != nil {
 		return nil, err
 	}
 	wire := make([]wireMessage, len(msgs))
@@ -122,6 +141,12 @@ func (t *smgTokenizer) Encode(ctx context.Context, model string, msgs []Message,
 	cMsgs := C.CString(string(payload))
 	defer C.free(unsafe.Pointer(cMsgs))
 
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	h, ok := t.handles[model]
+	if !ok {
+		return nil, fmt.Errorf("%w: model %q not loaded", ErrUnavailable, model)
+	}
 	var (
 		ids  *C.uint32_t
 		n    C.size_t
@@ -139,13 +164,15 @@ func (t *smgTokenizer) EncodeText(ctx context.Context, model, text string, opts 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	h, err := t.handleFor(model)
-	if err != nil {
-		return nil, err
-	}
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
 
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	h, ok := t.handles[model]
+	if !ok {
+		return nil, fmt.Errorf("%w: model %q not loaded", ErrUnavailable, model)
+	}
 	var (
 		ids  *C.uint32_t
 		n    C.size_t
@@ -160,7 +187,7 @@ func (t *smgTokenizer) EncodeText(ctx context.Context, model, text string, opts 
 	return takeIDs(ids, n), nil
 }
 
-// Close frees every cached tokenizer handle.
+// Close frees every loaded tokenizer handle.
 func (t *smgTokenizer) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
