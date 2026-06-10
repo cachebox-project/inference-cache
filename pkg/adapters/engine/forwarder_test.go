@@ -357,9 +357,11 @@ func TestReporterDefaultStillForwardsBlockRemoved(t *testing.T) {
 // as added.
 func TestReporterClearSupersedesBufferedAdds(t *testing.T) {
 	rec := runReporter(t, &EventBatch{
-		TimestampSeconds: 1,
+		TimestampSeconds: 0,
 		Events: []Event{
-			BlockStored{BlockHashes: [][]byte{{1}, {2}}, BlockSize: 16},
+			// Real tokens so the store actually buffers prefix entries; the in-batch
+			// clear must then discard them — otherwise this test is vacuous.
+			BlockStored{BlockHashes: [][]byte{{1}, {2}}, TokenIDs: tokSeq(0, 2*16), BlockSize: 16},
 			AllBlocksCleared{},
 		},
 	})

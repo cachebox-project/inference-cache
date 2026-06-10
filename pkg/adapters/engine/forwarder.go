@@ -115,12 +115,14 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 				switch e := ev.(type) {
 				case BlockStored:
 					entries := r.pos.Stored(e)
-					if len(entries) == 0 && len(e.BlockHashes) > 0 && len(e.TokenIDs) > 0 {
-						// A well-formed-looking event that produced no index entries
-						// was dropped (block_hashes / token-block count mismatch).
-						// This is now the routing-hit ingest path, so surface the
-						// discard for operators rather than dropping it silently.
-						r.logger.Warn("dropping malformed BlockStored (block_hashes / token-block count mismatch)",
+					if len(entries) == 0 && len(e.BlockHashes) > 0 {
+						// A BlockStored carrying block hashes produced no index
+						// entries — either token_ids are absent (engine not emitting
+						// them → the fingerprint path silently regresses to all
+						// NO_HINT) or the block_hashes / token-block counts disagree.
+						// Either is a producer problem on the routing-hit ingest path,
+						// so surface it rather than dropping silently.
+						r.logger.Warn("BlockStored produced no index entries (missing or mismatched token_ids)",
 							"block_hashes", len(e.BlockHashes), "token_ids", len(e.TokenIDs), "block_size", e.BlockSize)
 					}
 					pending = append(pending, entries...)
