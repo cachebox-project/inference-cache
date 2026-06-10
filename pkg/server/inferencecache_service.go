@@ -33,6 +33,14 @@ const DefaultTokenizeTimeout = 5 * time.Second
 // (~1M tokens); legitimate prompts never approach it.
 const MaxLookupTokens = 1 << 20
 
+// MaxPromptTextBytes caps the raw prompt_text a single LookupRoute will tokenize.
+// The cgo tokenizer call is not cancellable once it enters Rust, so a timed-out
+// LookupRoute returns TIMEOUT while the encode keeps running; bounding the input
+// bounds that worst-case in-flight work — an oversized prompt fails open WITHOUT
+// entering the tokenizer. ~1 MiB is far above any real prompt and within the gRPC
+// receive limit.
+const MaxPromptTextBytes = 1 << 20
+
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
@@ -317,9 +325,12 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 }
 
-// lookupInputs is the resolved dual-input chain the handler looks up. It does
-// NOT alias the request, so it is safe to produce from a goroutine that may
-// outlive the call (the deadline-bounded resolution path).
+// lookupInputs is the resolved dual-input chain the handler looks up. On the
+// explicit-chain path it may alias req's block_hashes / block_token_counts
+// slices; that is safe for the deadline-bounded resolution goroutine because
+// resolveLookupChain only READS req (never mutates it), and a result produced
+// after the handler has already timed out is discarded (never read), so there is
+// no concurrent access to the aliased slices.
 type lookupInputs struct {
 	blockHashes      [][]byte // effective chain (empty → fall back to req.prefix_hash exact match)
 	blockTokenCounts []int32  // parallel per-block token counts
@@ -372,6 +383,9 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
 	}
 	if text := req.GetPromptText(); text != "" {
+		if len(text) > MaxPromptTextBytes {
+			return lookupInputs{failOpen: true} // oversized raw prompt — don't enter the (uncancellable) tokenizer
+		}
 		toks, err := s.tokenizer.Encode(ctx, req.GetModelId(),
 			[]tokenize.Message{{Role: "user", Content: text}},
 			tokenize.EncodeOptions{AddGenerationPrompt: true})

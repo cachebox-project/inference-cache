@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -239,6 +240,23 @@ func TestLookupRouteCountsOnlyChainFailsOpen(t *testing.T) {
 	}
 	if len(resp.GetReplicaScores()) != 0 {
 		t.Errorf("one-sided chain returned %d scores, want 0", len(resp.GetReplicaScores()))
+	}
+}
+
+// An oversized raw prompt_text fails open WITHOUT entering the (uncancellable)
+// tokenizer — bounding worst-case in-flight cgo encode work.
+func TestLookupRouteOversizedPromptTextFailsOpen(t *testing.T) {
+	svc := newTestService()
+	svc.tokenizer = fakeTokenizer{tokens: tokenSeq(0, 64)} // would succeed if reached
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm",
+		PromptText: strings.Repeat("a", MaxPromptTextBytes+1),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (oversized prompt_text must fail open before tokenizing)", resp.GetReasonCode())
 	}
 }
 
