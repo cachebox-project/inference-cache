@@ -42,8 +42,9 @@ CGO_LDFLAGS="-L$(pwd)/rust/ictokenizer/target/release" \
 ```
 
 The archive is statically linked into the Go binary (no shared library to ship).
-Server-side tokenization is fail-closed: the server loads tokenizers **eagerly at
-startup** from a vetted `--tokenizer-models-dir` (`<dir>/<model_id>/tokenizer.json`,
+Server-side tokenization is **closed to request-controlled loading** (it requires
+an explicit vetted directory): the server loads tokenizers **eagerly at startup**
+from a vetted `--tokenizer-models-dir` (`<dir>/<model_id>/tokenizer.json`,
 where `<model_id>` may include a namespace, e.g. `Qwen/Qwen2.5-0.5B-Instruct`) and
 serves them from memory, confined to that directory. With no directory configured,
 server-side tokenization is disabled (the prompt_text path fails open to `NO_HINT`).

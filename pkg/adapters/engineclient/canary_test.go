@@ -198,7 +198,14 @@ func TestPrefixCacheCanaryLive(t *testing.T) {
 		tokens[i] = uint32(1 + i%(vocab-1)) // [1, vocab) — valid for any vocab >= the window
 	}
 
-	probe := &PrefixCacheProbe{Client: NewOpenAI(nil), EngineURL: engineURL, Model: model}
+	probe := &PrefixCacheProbe{
+		Client:    NewOpenAI(nil),
+		EngineURL: engineURL,
+		Model:     model,
+		// Allow metric-name overrides for vLLM builds that rename the counters.
+		HitsMetric:    os.Getenv("IC_ENGINE_HITS_METRIC"),
+		QueriesMetric: os.Getenv("IC_ENGINE_QUERIES_METRIC"),
+	}
 	res, err := probe.Run(context.Background(), tokens, CompletionParams{MaxTokens: 1, Temperature: 0})
 	if err != nil {
 		t.Fatalf("live canary: %v", err)

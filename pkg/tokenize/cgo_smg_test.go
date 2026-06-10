@@ -66,8 +66,8 @@ func TestCgoTokenizerEncodeTextWorks(t *testing.T) {
 	}
 }
 
-// Hermetic (no network): server-side tokenization is fail-closed without a vetted
-// models directory.
+// Hermetic (no network): without a vetted models directory the cgo build loads
+// no tokenizer (the prompt_text path then fails open to NO_HINT downstream).
 func TestCgoNewEmptyDirIsUnavailable(t *testing.T) {
 	tk := New(Config{}) // no ModelsDir
 	_, err := tk.Encode(context.Background(), "anything", []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})

@@ -417,6 +417,25 @@ func TestLookupRoutePromptTextSubBlockStillEchoes(t *testing.T) {
 	}
 }
 
+// When concurrent tokenizations are saturated, the prompt_text path sheds load
+// and fails open (NO_HINT) rather than queuing more uncancellable cgo work.
+func TestLookupRoutePromptTextShedsLoadWhenSaturated(t *testing.T) {
+	svc := newTestService()
+	svc.tokenizer = fakeTokenizer{tokens: tokenSeq(0, 64)} // would succeed if reached
+	svc.tokenizeSem = make(chan struct{}, 1)
+	svc.tokenizeSem <- struct{}{} // fill the only slot
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hello",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (saturated tokenizer must shed load)", resp.GetReasonCode())
+	}
+}
+
 // No cgo tokenizer (the default build): the (model, prompt_text) path fails open
 // to NO_HINT rather than erroring on the hot path.
 func TestLookupRoutePromptTextUnavailableTokenizerFailsOpen(t *testing.T) {

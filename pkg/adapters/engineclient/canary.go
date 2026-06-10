@@ -25,7 +25,17 @@ type PrefixCacheProbe struct {
 	EngineURL  string       // base URL, e.g. http://host:8000
 	MetricsURL string       // optional; defaults to EngineURL + "/metrics"
 	Model      string
+	// HitsMetric / QueriesMetric name the vLLM prefix-cache counters to read.
+	// Empty defaults to the standard names below; override when a vLLM build
+	// exposes different metric names so the canary doesn't fail on metric drift.
+	HitsMetric    string
+	QueriesMetric string
 }
+
+const (
+	defaultHitsMetric    = "vllm:prefix_cache_hits_total"
+	defaultQueriesMetric = "vllm:prefix_cache_queries_total"
+)
 
 // ProbeResult reports the warm-request prefix-cache deltas plus both completions.
 type ProbeResult struct {
@@ -51,17 +61,25 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	hitsMetric := p.HitsMetric
+	if hitsMetric == "" {
+		hitsMetric = defaultHitsMetric
+	}
+	queriesMetric := p.QueriesMetric
+	if queriesMetric == "" {
+		queriesMetric = defaultQueriesMetric
+	}
 
 	cold, err := p.Client.Complete(ctx, p.EngineURL, p.Model, tokens, params)
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: cold request: %w", err)
 	}
 
-	hitsPre, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	hitsPre, err := requireCounter(ctx, httpClient, metricsURL, hitsMetric)
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape hits (pre): %w", err)
 	}
-	queriesPre, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPre, err := requireCounter(ctx, httpClient, metricsURL, queriesMetric)
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape queries (pre): %w", err)
 	}
@@ -71,11 +89,11 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 		return ProbeResult{}, fmt.Errorf("canary: warm request: %w", err)
 	}
 
-	hitsPost, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	hitsPost, err := requireCounter(ctx, httpClient, metricsURL, hitsMetric)
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape hits (post): %w", err)
 	}
-	queriesPost, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPost, err := requireCounter(ctx, httpClient, metricsURL, queriesMetric)
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape queries (post): %w", err)
 	}

@@ -82,7 +82,16 @@ func main() {
 	// Wire the server-owned tokenizer for the (model, prompt_text) LookupRoute
 	// path. tokenize.New returns the real cgo tokenizer only under the smgcgo
 	// build; otherwise it is Unavailable (the prompt_text path fails open to
-	// NO_HINT), so this is safe to wire unconditionally.
+	// NO_HINT), so this is safe to wire unconditionally. Warn loudly if a
+	// tokenizer directory was configured on a build that cannot use it — a wrong
+	// image/build-tag deployment would otherwise look configured while every
+	// prompt_text lookup silently fails open.
+	if *tokenizerModelsDir != "" && !tokenize.Enabled() {
+		slog.WarnContext(ctx, "tokenizer_models_dir_ignored",
+			"reason", "server-side tokenization is not compiled in (build without -tags smgcgo)",
+			"tokenizer_models_dir", *tokenizerModelsDir,
+			"effect", "every LookupRoute prompt_text request fails open to NO_HINT")
+	}
 	var opts []server.Option
 	opts = append(opts, server.WithTokenizer(tokenize.New(tokenize.Config{ModelsDir: *tokenizerModelsDir})))
 	opts = append(opts, server.WithEngineBlockSize(*engineBlockSize))

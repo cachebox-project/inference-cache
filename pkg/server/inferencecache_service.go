@@ -41,6 +41,12 @@ const MaxLookupTokens = 1 << 20
 // receive limit.
 const MaxPromptTextBytes = 1 << 20
 
+// MaxConcurrentTokenize caps concurrent prompt_text tokenizations across all
+// LookupRoute calls, bounding in-flight (uncancellable) cgo encode work. Beyond
+// it the prompt_text path sheds load and fails open to NO_HINT rather than
+// accumulating goroutines behind a slow/wedged tokenizer.
+const MaxConcurrentTokenize = 64
+
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
@@ -110,6 +116,14 @@ type inferenceCacheService struct {
 	// CachePolicy.lookupTimeoutMs applies. Defaults to DefaultTokenizeTimeout;
 	// tests override it.
 	tokenizeTimeout time.Duration
+
+	// tokenizeSem caps concurrent prompt_text tokenizations. The cgo encode runs
+	// in the deadline-bounded resolution goroutine and can't be cancelled, so a
+	// slow/wedged tokenizer would otherwise accumulate unbounded in-flight work
+	// under load. A non-blocking acquire sheds load: when saturated, the
+	// prompt_text path fails open (NO_HINT) instead of piling up goroutines.
+	// Buffered to MaxConcurrentTokenize; tests may replace it.
+	tokenizeSem chan struct{}
 }
 
 func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
@@ -118,6 +132,7 @@ func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies
 		metrics:         metrics,
 		policies:        policies,
 		lookupFn:        idx.LookupRoute,
+		tokenizeSem:     make(chan struct{}, MaxConcurrentTokenize),
 		tokenizer:       tokenize.Unavailable{},
 		blockSize:       DefaultEngineBlockSize,
 		tokenizeTimeout: DefaultTokenizeTimeout,
@@ -386,6 +401,17 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 	if text := req.GetPromptText(); text != "" {
 		if len(text) > MaxPromptTextBytes {
 			return lookupInputs{failOpen: true} // oversized raw prompt — don't enter the (uncancellable) tokenizer
+		}
+		// Shed load: cap concurrent (uncancellable) tokenizations. A non-blocking
+		// acquire means a saturated tokenizer fails open immediately rather than
+		// queuing more in-flight cgo work.
+		if s.tokenizeSem != nil {
+			select {
+			case s.tokenizeSem <- struct{}{}:
+				defer func() { <-s.tokenizeSem }()
+			default:
+				return lookupInputs{failOpen: true}
+			}
 		}
 		toks, err := s.tokenizer.Encode(ctx, req.GetModelId(),
 			[]tokenize.Message{{Role: "user", Content: text}},
