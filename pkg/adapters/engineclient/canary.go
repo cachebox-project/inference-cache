@@ -57,11 +57,11 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 		return ProbeResult{}, fmt.Errorf("canary: cold request: %w", err)
 	}
 
-	hitsPre, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	hitsPre, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape hits (pre): %w", err)
 	}
-	queriesPre, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPre, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape queries (pre): %w", err)
 	}
@@ -71,11 +71,11 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 		return ProbeResult{}, fmt.Errorf("canary: warm request: %w", err)
 	}
 
-	hitsPost, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
+	hitsPost, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_hits_total")
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape hits (post): %w", err)
 	}
-	queriesPost, err := scrapeCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
+	queriesPost, err := requireCounter(ctx, httpClient, metricsURL, "vllm:prefix_cache_queries_total")
 	if err != nil {
 		return ProbeResult{}, fmt.Errorf("canary: scrape queries (post): %w", err)
 	}
@@ -88,24 +88,39 @@ func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params Comp
 	}, nil
 }
 
-// scrapeCounter sums every series of a Prometheus counter (ignoring labels) from
-// a /metrics endpoint. vLLM reports prefix-cache counters as floats; we truncate
-// to int since they are monotonic integer counts.
-func scrapeCounter(ctx context.Context, client *http.Client, url, metric string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// requireCounter is scrapeCounter but treats an ABSENT metric as an error — a
+// renamed/disabled vLLM counter must not read as a real zero (which would let
+// the canary misdiagnose metrics wiring as prefix-cache behavior).
+func requireCounter(ctx context.Context, client *http.Client, url, metric string) (int, error) {
+	v, found, err := scrapeCounter(ctx, client, url, metric)
 	if err != nil {
 		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("metric %q not found at %s (renamed/disabled?)", metric, url)
+	}
+	return v, nil
+}
+
+// scrapeCounter sums every series of a Prometheus counter (ignoring labels) from
+// a /metrics endpoint and reports whether the metric was present at all. vLLM
+// reports prefix-cache counters as floats; we truncate to int since they are
+// monotonic integer counts.
+func scrapeCounter(ctx context.Context, client *http.Client, url, metric string) (sum int, found bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, false, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("metrics endpoint returned %s", resp.Status)
+		return 0, false, fmt.Errorf("metrics endpoint returned %s", resp.Status)
 	}
 
-	var sum float64
+	var acc float64
 	sc := bufio.NewScanner(io.LimitReader(resp.Body, 8<<20))
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -134,14 +149,15 @@ func scrapeCounter(ctx context.Context, client *http.Client, url, metric string)
 		if sp := strings.IndexAny(rest, " \t"); sp >= 0 {
 			rest = rest[:sp] // drop a trailing timestamp
 		}
-		if v, err := strconv.ParseFloat(rest, 64); err == nil {
-			sum += v
+		if v, perr := strconv.ParseFloat(rest, 64); perr == nil {
+			acc += v
+			found = true
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return int(sum), nil
+	return int(acc), found, nil
 }
 
 // closingBrace returns the index of the '}' that closes the label set starting

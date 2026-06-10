@@ -96,13 +96,15 @@ func (c *OpenAIClient) Complete(ctx context.Context, endpoint, model string, tok
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return Completion{}, fmt.Errorf("engineclient: decode response: %w", err)
 	}
-	out := Completion{
+	if len(parsed.Choices) == 0 {
+		// A 2xx with no choices is a malformed/protocol response, not a valid
+		// empty generation — surface it rather than returning an empty Completion.
+		return Completion{}, fmt.Errorf("engineclient: engine returned no choices: %s", strings.TrimSpace(string(body)))
+	}
+	return Completion{
+		Text:             parsed.Choices[0].Text,
+		FinishReason:     parsed.Choices[0].FinishReason,
 		PromptTokens:     parsed.Usage.PromptTokens,
 		CompletionTokens: parsed.Usage.CompletionTokens,
-	}
-	if len(parsed.Choices) > 0 {
-		out.Text = parsed.Choices[0].Text
-		out.FinishReason = parsed.Choices[0].FinishReason
-	}
-	return out, nil
+	}, nil
 }

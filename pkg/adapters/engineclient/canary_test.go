@@ -94,12 +94,35 @@ func TestScrapeCounterIgnoresPrefixCollisions(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	got, found, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
 	if err != nil {
 		t.Fatalf("scrapeCounter: %v", err)
 	}
+	if !found {
+		t.Error("found = false, want true (metric is present)")
+	}
 	if got != 5 {
 		t.Errorf("scrapeCounter = %d, want 5 (must ignore the _bogus prefix collision)", got)
+	}
+}
+
+// An absent metric reports found=false (so requireCounter can distinguish it from
+// a real zero), and requireCounter turns that into an error.
+func TestScrapeCounterAbsentMetric(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("some_other_metric 3\n"))
+	}))
+	defer srv.Close()
+
+	got, found, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	if err != nil {
+		t.Fatalf("scrapeCounter: %v", err)
+	}
+	if found || got != 0 {
+		t.Errorf("absent metric: got (%d, found=%v), want (0, false)", got, found)
+	}
+	if _, err := requireCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total"); err == nil {
+		t.Error("requireCounter returned nil error for an absent metric")
 	}
 }
 
@@ -113,9 +136,12 @@ func TestScrapeCounterReadsValueNotTimestamp(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	got, found, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
 	if err != nil {
 		t.Fatalf("scrapeCounter: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true")
 	}
 	if got != 10 {
 		t.Errorf("scrapeCounter = %d, want 10 (values 7+3, not the timestamp)", got)
@@ -130,9 +156,12 @@ func TestScrapeCounterQuoteAwareLabels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	got, found, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
 	if err != nil {
 		t.Fatalf("scrapeCounter: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true")
 	}
 	if got != 7 {
 		t.Errorf("scrapeCounter = %d, want 7 (a '}' inside a quoted label must not end the label set)", got)
@@ -141,9 +170,11 @@ func TestScrapeCounterQuoteAwareLabels(t *testing.T) {
 
 // TestPrefixCacheCanaryLive runs the real by-construction canary against a live
 // OpenAI-compatible engine. Operator-run, not CI: set IC_ENGINE_URL (e.g.
-// http://localhost:8000) and IC_ENGINE_MODEL (the served model). A long
-// ascending token sequence exceeds the prefix-cache block threshold; the warm
-// identical request must register a prefix-cache hit.
+// http://localhost:8000) and IC_ENGINE_MODEL (the served model). A long token
+// sequence exceeds the prefix-cache block threshold; the warm identical request
+// must register a prefix-cache hit. Token IDs cycle within a conservative vocab
+// window (override with IC_ENGINE_VOCAB) so small-vocab model overrides stay
+// valid.
 func TestPrefixCacheCanaryLive(t *testing.T) {
 	engineURL := os.Getenv("IC_ENGINE_URL")
 	model := os.Getenv("IC_ENGINE_MODEL")
@@ -156,9 +187,19 @@ func TestPrefixCacheCanaryLive(t *testing.T) {
 			n = parsed
 		}
 	}
+	vocab := 256 // conservative; below any real tokenizer's vocab
+	if v := os.Getenv("IC_ENGINE_VOCAB"); v != "" {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed > 1 {
+			vocab = parsed
+		}
+	}
+	tokens := make([]uint32, n)
+	for i := range tokens {
+		tokens[i] = uint32(1 + i%(vocab-1)) // [1, vocab) — valid for any vocab >= the window
+	}
 
 	probe := &PrefixCacheProbe{Client: NewOpenAI(nil), EngineURL: engineURL, Model: model}
-	res, err := probe.Run(context.Background(), tokenRange(1, n), CompletionParams{MaxTokens: 1, Temperature: 0})
+	res, err := probe.Run(context.Background(), tokens, CompletionParams{MaxTokens: 1, Temperature: 0})
 	if err != nil {
 		t.Fatalf("live canary: %v", err)
 	}

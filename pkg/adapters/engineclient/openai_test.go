@@ -79,6 +79,19 @@ func TestOpenAIErrorsOnNon2xx(t *testing.T) {
 	}
 }
 
+// A 2xx response with zero choices is a malformed engine reply, not a valid
+// empty generation — Complete must surface it as an error.
+func TestOpenAIErrorsOnNoChoices(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	if _, err := NewOpenAI(nil).Complete(context.Background(), srv.URL, "m", []uint32{1}, CompletionParams{}); err == nil {
+		t.Fatal("expected an error for a response with no choices, got nil")
+	}
+}
+
 // The gRPC TokenizedInput client is a stub for now — it must report that
 // clearly rather than silently doing nothing.
 func TestGRPCClientNotImplemented(t *testing.T) {

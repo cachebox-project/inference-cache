@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -197,6 +198,13 @@ func (t *smgTokenizer) Encode(ctx context.Context, model string, msgs []Message,
 func (t *smgTokenizer) EncodeText(ctx context.Context, model, text string, opts EncodeOptions) ([]uint32, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	// C.CString builds a NUL-terminated string, so an embedded NUL would silently
+	// truncate the text on the Rust side — reject it rather than tokenize a
+	// truncated prompt. (Encode goes through JSON, which escapes NUL, so it's
+	// unaffected.)
+	if strings.IndexByte(text, 0) >= 0 {
+		return nil, fmt.Errorf("tokenize: text contains a NUL byte")
 	}
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
