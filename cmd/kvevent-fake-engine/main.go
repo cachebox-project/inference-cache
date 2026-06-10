@@ -43,10 +43,18 @@ func main() {
 	flag.Parse()
 
 	// Validate before allocating: a negative block-size/num-blocks would panic
-	// in tokenSeq below, and a non-positive interval would spin the publish
-	// loop hot instead of pacing it.
+	// in tokenSeq below, an oversized product would overflow it, a negative
+	// start token would wrap to a huge uint32 ID, and a non-positive interval
+	// would spin the publish loop hot instead of pacing it.
+	const maxTotalTokens = 1 << 24 // sanity bound for a test publisher
 	if *blockSize <= 0 || *numBlocks <= 0 {
 		log.Fatalf("-block-size and -num-blocks must be positive, got %d and %d", *blockSize, *numBlocks)
+	}
+	if *numBlocks > maxTotalTokens / *blockSize {
+		log.Fatalf("-block-size × -num-blocks must not exceed %d tokens, got %d × %d", maxTotalTokens, *blockSize, *numBlocks)
+	}
+	if *startTok < 0 {
+		log.Fatalf("-start-token must be non-negative, got %d", *startTok)
 	}
 	if *interval <= 0 {
 		log.Fatalf("-interval must be positive, got %s", *interval)
