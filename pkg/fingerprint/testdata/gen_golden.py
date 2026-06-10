@@ -26,13 +26,17 @@ only full blocks.
 The scheme is FROZEN. Regenerating this file must be a no-op; if it is not,
 every consumer above breaks and the change needs cross-repo coordination.
 
-Run:  python3 gen_golden.py   (requires `pip install xxhash`; writes
+Run:  python3 gen_golden.py            (requires `pip install xxhash`; writes
       golden_vectors.json next to this script)
+      python3 gen_golden.py --check    (no write; exit 1 if the checked-in
+      fixture differs from what this generator produces — drift detector)
 """
+import argparse
 import base64
 import json
 import os
 import struct
+import sys
 
 import xxhash
 
@@ -89,6 +93,13 @@ def vector(name, description, tokens, block_size, parent=None):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--check", action="store_true",
+        help="verify golden_vectors.json matches this generator (no write); exit 1 on drift",
+    )
+    args = ap.parse_args()
+
     for toks in ([1, 2, 3], list(range(16)), list(range(40))):
         assert content_hash(toks) == content_streaming(toks)
 
@@ -148,9 +159,27 @@ def main():
     }
 
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_vectors.json")
+    rendered = json.dumps(fixture, indent=2) + "\n"
+
+    if args.check:
+        try:
+            with open(out) as f:
+                on_disk = f.read()
+        except FileNotFoundError:
+            print(f"DRIFT: {out} does not exist", file=sys.stderr)
+            sys.exit(1)
+        if on_disk != rendered:
+            print(
+                f"DRIFT: {out} differs from what gen_golden.py produces — the "
+                "frozen scheme or the fixture was changed unilaterally",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("golden_vectors.json is current (regeneration is a no-op)")
+        return
+
     with open(out, "w") as f:
-        json.dump(fixture, f, indent=2)
-        f.write("\n")
+        f.write(rendered)
     print(f"wrote {out}")
 
 

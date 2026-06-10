@@ -1,6 +1,7 @@
 package fingerprint
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -79,7 +80,7 @@ func (g goldenHash) value(t *testing.T, ctx string) uint64 {
 	if len(wire) != 8 {
 		t.Fatalf("%s: b64be decodes to %d bytes, want 8", ctx, len(wire))
 	}
-	if got := string(Bytes(h)); got != string(wire) {
+	if !bytes.Equal(Bytes(h), wire) {
 		t.Fatalf("%s: b64be bytes %x disagree with dec %s (Bytes() = %x)", ctx, wire, g.Dec, Bytes(h))
 	}
 	return h
@@ -132,11 +133,19 @@ func TestSchemeFrozenAnchor(t *testing.T) {
 	if got := ContentHash(seq(1, 16)); got != 16863443419780771464 {
 		t.Fatalf("ContentHash(seq(1,16)) = %d, want 16863443419780771464 — the frozen scheme changed", got)
 	}
-	if got := PrefixHashes(seq(0, 64), 16)[3]; got != 3888788807566526800 {
-		t.Fatalf("PrefixHashes(seq(0,64),16)[3] = %d, want 3888788807566526800 — the rolling chain changed", got)
+	chained := PrefixHashes(seq(0, 64), 16)
+	if len(chained) != 4 {
+		t.Fatalf("PrefixHashes(seq(0,64),16) returned %d hashes, want 4", len(chained))
 	}
-	if got := PrefixHashesFrom(seq(50, 32), 16, 0xDEADBEEF, true)[1]; got != 2998384554010166533 {
-		t.Fatalf("PrefixHashesFrom(seq(50,32),16,0xDEADBEEF,true)[1] = %d, want 2998384554010166533 — parent chaining changed", got)
+	if chained[3] != 3888788807566526800 {
+		t.Fatalf("PrefixHashes(seq(0,64),16)[3] = %d, want 3888788807566526800 — the rolling chain changed", chained[3])
+	}
+	parented := PrefixHashesFrom(seq(50, 32), 16, 0xDEADBEEF, true)
+	if len(parented) != 2 {
+		t.Fatalf("PrefixHashesFrom(seq(50,32),16,0xDEADBEEF,true) returned %d hashes, want 2", len(parented))
+	}
+	if parented[1] != 2998384554010166533 {
+		t.Fatalf("PrefixHashesFrom(seq(50,32),16,0xDEADBEEF,true)[1] = %d, want 2998384554010166533 — parent chaining changed", parented[1])
 	}
 }
 
