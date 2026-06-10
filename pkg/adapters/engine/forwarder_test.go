@@ -22,10 +22,11 @@ import (
 // assert cross-RPC ordering.
 type recordingServer struct {
 	icpb.UnimplementedInferenceCacheServer
-	mu      sync.Mutex
-	updates []*icpb.CacheStateUpdate
-	events  []*icpb.CacheEvent
-	ops     []string
+	mu       sync.Mutex
+	updates  []*icpb.CacheStateUpdate
+	events   []*icpb.CacheEvent
+	ops      []string
+	reporter *Reporter // set by runReporterWithOpts so tests can inspect internal state
 }
 
 func (s *recordingServer) ReportCacheState(stream icpb.InferenceCache_ReportCacheStateServer) error {
@@ -89,6 +90,7 @@ func runReporterWithOpts(t *testing.T, opts []ReporterOption, batches ...*EventB
 	t.Cleanup(func() { _ = conn.Close() })
 
 	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), opts...)
+	rec.reporter = r
 	in := make(chan *EventBatch, len(batches))
 	for _, b := range batches {
 		in <- b
@@ -281,6 +283,25 @@ func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
 		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED {
 			t.Errorf("ignore_block_removed=true must drop PREFIX_EVICTED, got eviction for hash=%x", e.GetPrefixHash())
 		}
+	}
+}
+
+// In L2 mode (ignore_block_removed), a BlockRemoved must still prune the
+// subscriber's reverse map even though the eviction is NOT forwarded — otherwise
+// the map grows unbounded until AllBlocksCleared (the L2 memory-leak path: the
+// engine evicts from GPU on every store, but the block stays at L2 so we keep the
+// server hint, yet we must still forget the engine-hash → our-hash mapping).
+func TestReporterIgnoreBlockRemovedStillPrunesReverseMap(t *testing.T) {
+	const bs = 16
+	toks := tokSeq(70, bs)
+	rec := runReporterWithOpts(t,
+		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 0, Events: []Event{BlockStored{BlockHashes: [][]byte{{0x70}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 0, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0x70}}}}},
+	)
+	// Run has returned (input drained), so the single-goroutine index is quiescent.
+	if n := len(rec.reporter.pos.blocks); n != 0 {
+		t.Errorf("reverse map has %d entries after store+remove in L2 mode, want 0 (unbounded-growth leak)", n)
 	}
 }
 

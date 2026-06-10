@@ -58,12 +58,39 @@ func TestDecodeEventBatch(t *testing.T) {
 	if stored.BlockSize != 128 {
 		t.Errorf("BlockSize = %d, want 128", stored.BlockSize)
 	}
+	// token_ids and parent_block_hash are now load-bearing (content fingerprint +
+	// cross-event chaining), so assert they survive decoding.
+	if len(stored.TokenIDs) != 4 || stored.TokenIDs[0] != 0 || stored.TokenIDs[3] != 3 {
+		t.Errorf("TokenIDs = %v, want [0 1 2 3] preserved", stored.TokenIDs)
+	}
+	if stored.ParentBlockHash != nil {
+		t.Errorf("ParentBlockHash = %x, want nil (fixture parent is nil)", stored.ParentBlockHash)
+	}
 
 	if _, ok := batch.Events[1].(BlockRemoved); !ok {
 		t.Errorf("event[1] = %T, want BlockRemoved", batch.Events[1])
 	}
 	if _, ok := batch.Events[2].(AllBlocksCleared); !ok {
 		t.Errorf("event[2] = %T, want AllBlocksCleared", batch.Events[2])
+	}
+}
+
+// A non-nil integer parent_block_hash normalizes to 8-byte big-endian (matching
+// block hashes, so the reverse-map lookup matches), and token_ids are preserved —
+// both load-bearing for the content fingerprint and cross-event chaining.
+func TestDecodeBlockStoredParentAndTokens(t *testing.T) {
+	payload := encodeVLLMBatch(t, 1,
+		[]interface{}{"BlockStored", []uint64{42}, uint64(7), []int64{5, 6, 7}, int32(16), nil})
+	batch, err := DecodeEventBatch(payload)
+	if err != nil {
+		t.Fatalf("DecodeEventBatch: %v", err)
+	}
+	stored := batch.Events[0].(BlockStored)
+	if len(stored.ParentBlockHash) != 8 || binary.BigEndian.Uint64(stored.ParentBlockHash) != 7 {
+		t.Errorf("ParentBlockHash = %x, want 8-byte big-endian of 7", stored.ParentBlockHash)
+	}
+	if len(stored.TokenIDs) != 3 || stored.TokenIDs[0] != 5 || stored.TokenIDs[2] != 7 {
+		t.Errorf("TokenIDs = %v, want [5 6 7]", stored.TokenIDs)
 	}
 }
 

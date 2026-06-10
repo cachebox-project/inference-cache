@@ -114,7 +114,16 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 			for _, ev := range b.Events {
 				switch e := ev.(type) {
 				case BlockStored:
-					pending = append(pending, r.pos.Stored(e)...)
+					entries := r.pos.Stored(e)
+					if len(entries) == 0 && len(e.BlockHashes) > 0 && len(e.TokenIDs) > 0 {
+						// A well-formed-looking event that produced no index entries
+						// was dropped (block_hashes / token-block count mismatch).
+						// This is now the routing-hit ingest path, so surface the
+						// discard for operators rather than dropping it silently.
+						r.logger.Warn("dropping malformed BlockStored (block_hashes / token-block count mismatch)",
+							"block_hashes", len(e.BlockHashes), "token_ids", len(e.TokenIDs), "block_size", e.BlockSize)
+					}
+					pending = append(pending, entries...)
 					if tsUs > 0 {
 						pendTs = tsUs
 					}
@@ -130,7 +139,14 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// the entry stays in the index until the freshness TTL expires;
 					// rely on TTL for actual staleness and leave the L2-served hint
 					// intact. See WithIgnoreBlockRemoved.
+					//
+					// Either way the local reverse map MUST drop the evicted blocks:
+					// the engine never references a GPU-evicted block as a future
+					// parent, so retaining it only grows pos unbounded — and in
+					// L2 mode there is no other prune point until AllBlocksCleared.
+					// So prune locally even when we suppress the server-side eviction.
 					if r.ignoreBlockRemoved {
+						r.pos.Removed(e) // prune the reverse map; don't forward (L2 keeps the hint)
 						continue
 					}
 					// Removals are the pruning path and adds are additive, so the

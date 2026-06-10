@@ -3,7 +3,7 @@ package fingerprint
 import "testing"
 
 // Golden values generated from the SMG construction via Python `xxhash`
-// (xxh3_64, seed 1337) — see /tmp/gen_golden.py. Go's zeebo/xxh3 reproducing
+// (xxh3_64, seed 1337) — see testdata/gen_golden.py. Go's zeebo/xxh3 reproducing
 // these proves cross-language (subscriber ↔ proxy) and cross-impl (↔ SMG)
 // parity on the canonical XXH3-64.
 
