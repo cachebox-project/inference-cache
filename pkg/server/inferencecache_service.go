@@ -6,9 +6,18 @@ import (
 	"io"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
+
+// DefaultEngineBlockSize is the KV block size (tokens per block) the server
+// assumes when it fingerprints token_ids / tokenized prompt_text on the
+// dual-input LookupRoute path. It MUST match the engine's KV block size (and the
+// kvevent-subscriber's, which reads it per-event) or the derived block-hash
+// chain won't line up with the ingested keys. 16 is vLLM's default.
+const DefaultEngineBlockSize = 16
 
 // Reason codes returned on the lookup path (tech spec §4.2 / grpc-contract.md).
 // String, not enum — forward-compat per the gRPC contract decision (a new
@@ -63,14 +72,27 @@ type inferenceCacheService struct {
 	// override it to inject slow lookups that prove the deadline path actually
 	// fires.
 	lookupFn func(index.LookupRequest) index.LookupResult
+
+	// tokenizer serves the (model, prompt_text) dual-input LookupRoute path:
+	// apply the model's chat template, tokenize, then fingerprint. The default
+	// build wires tokenize.Unavailable (no cgo), so that path fails open to
+	// NO_HINT; a cgo build (tag smgcgo) injects the SMG-backed tokenizer. The
+	// pre-tokenized token_ids path needs no tokenizer.
+	tokenizer tokenize.Tokenizer
+
+	// blockSize is the KV block size used to fingerprint token_ids / tokenized
+	// prompt_text into the block-hash chain. Defaults to DefaultEngineBlockSize.
+	blockSize int
 }
 
 func newInferenceCacheService(idx *index.Index, metrics *serverMetrics, policies *PolicyStore) *inferenceCacheService {
 	return &inferenceCacheService{
-		index:    idx,
-		metrics:  metrics,
-		policies: policies,
-		lookupFn: idx.LookupRoute,
+		index:     idx,
+		metrics:   metrics,
+		policies:  policies,
+		lookupFn:  idx.LookupRoute,
+		tokenizer: tokenize.Unavailable{},
+		blockSize: DefaultEngineBlockSize,
 	}
 }
 
@@ -131,6 +153,20 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return resp, nil
 	}
 
+	// Dual-input resolution: turn token_ids / prompt_text into the block-hash
+	// chain the rest of the handler already understands, so the gate, deadline,
+	// and index path are unchanged. A gateway that already fingerprinted (an
+	// explicit prefix_hash / block_hashes chain) is left untouched. The
+	// canonical tokens are echoed back only on the prompt_text path. ok=false
+	// means fail open (tokenizer unavailable or errored on the prompt_text
+	// path) — return NO_HINT, never an error on the hot path.
+	echoTokens, ok := s.resolveLookupChain(ctx, req)
+	if !ok {
+		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
+		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
+		return resp, nil
+	}
+
 	// Pre-lookup gate. Resolve the threshold once and short-circuit on a
 	// request that can't clear it — no index lock, no goroutine. A chain
 	// request reports its token budget via block_token_counts (the legacy
@@ -180,7 +216,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	if !hasDeadline {
 		start := time.Now()
 		result := s.lookupFn(lookupReq)
-		return s.buildLookupResponse(model, tenant, result, time.Since(start)), nil
+		return s.buildLookupResponse(model, tenant, result, time.Since(start), echoTokens), nil
 	}
 
 	// Bounded path: a deadline is active, so bound the lookup at wall-clock
@@ -224,7 +260,45 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, time.Since(start)), nil
 	}
 
-	return s.buildLookupResponse(model, tenant, result, elapsed), nil
+	return s.buildLookupResponse(model, tenant, result, elapsed, echoTokens), nil
+}
+
+// resolveLookupChain implements the dual-input precedence for LookupRoute and
+// normalizes the request into the block-hash-chain form the gate and index
+// already understand. Precedence:
+//
+//  1. An explicit prefix_hash or block_hashes chain (a gateway that already
+//     fingerprinted) wins — left untouched.
+//  2. token_ids (pre-tokenized): fingerprinted directly via pkg/fingerprint, no
+//     tokenizer needed. Not echoed (the caller already has the tokens).
+//  3. prompt_text (raw text): the model's chat template is applied and the text
+//     tokenized, then fingerprinted; the canonical tokens are returned to echo
+//     so the caller forwards exactly those to the engine (match by construction).
+//
+// It writes the derived chain onto the request in place. Returns ok=false only
+// for the prompt_text path when the tokenizer is unavailable or errors — the
+// caller fails open to NO_HINT. A token_ids / prompt_text input too short to
+// fill one block yields an empty chain (ok=true), which the downstream exact-
+// match path turns into a fail-open NO_HINT.
+func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) (echoTokens []uint32, ok bool) {
+	if len(req.GetBlockHashes()) > 0 || len(req.GetPrefixHash()) > 0 {
+		return nil, true
+	}
+	if toks := req.GetTokenIds(); len(toks) > 0 {
+		req.BlockHashes, req.BlockTokenCounts = fingerprint.Chain(toks, s.blockSize)
+		return nil, true
+	}
+	if text := req.GetPromptText(); text != "" {
+		toks, err := s.tokenizer.Encode(ctx, req.GetModelId(),
+			[]tokenize.Message{{Role: "user", Content: text}},
+			tokenize.EncodeOptions{AddGenerationPrompt: true})
+		if err != nil || len(toks) == 0 {
+			return nil, false
+		}
+		req.BlockHashes, req.BlockTokenCounts = fingerprint.Chain(toks, s.blockSize)
+		return toks, true
+	}
+	return nil, true
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
@@ -233,7 +307,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 // reason_code comes from the index's chosen Strategy (PREFIX_MATCH /
 // TENANT_HOT / NO_HINT / UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME)
 // via reasonForStrategy.
-func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result index.LookupResult, elapsed time.Duration) *icpb.LookupRouteResponse {
+func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result index.LookupResult, elapsed time.Duration, echoTokens []uint32) *icpb.LookupRouteResponse {
 	// Two-stage result-side floor on PREFIX_MATCH responses. Both happen
 	// BEFORE CreditHits below so a non-delivered hint never bumps an LFU
 	// counter — the no-credit-on-non-delivery invariant.
@@ -295,6 +369,11 @@ func (s *inferenceCacheService) buildLookupResponse(model, tenant string, result
 			})
 		}
 	}
+	// Echo the canonical tokens the server tokenized (prompt_text path only) so
+	// the caller forwards exactly those to the engine — the engine then caches
+	// the same tokens this lookup was fingerprinted over. Empty on the
+	// token_ids / pre-fingerprinted paths (the caller already has the tokens).
+	resp.TokenIds = echoTokens
 	resp.LookupLatencyUs = elapsed.Microseconds()
 	s.metrics.observeLookup(model, resp.ReasonCode, len(result.Scores) > 0, elapsed)
 	return resp

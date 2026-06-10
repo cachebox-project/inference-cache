@@ -44,8 +44,8 @@ service InferenceCache {
 - **RenderTemplateRequest** `{ string template_ref; map<string,string> variables; string tenant_id; }`
 - **RenderTemplateResponse** `{ bytes rendered_prompt; bytes stable_prefix_hash; bytes tenant_namespace; string reason_code; string template_revision; }`
   reason ∈ `OK | TEMPLATE_NOT_FOUND | RENDER_ERROR`
-- **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; }`
-- **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; }`
+- **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; repeated uint32 token_ids = 9; string prompt_text = 10; }`
+- **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; repeated uint32 token_ids = 4; }`
   reason ∈ `PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME`
 - **LookupPDRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string pd_topology_ref; }`
 - **LookupPDRouteResponse** `{ string prefill_replica_id; string decode_replica_id; string transport_hint; string reason_code; }`
@@ -153,3 +153,11 @@ Construction (XXH3-64, matching SMG `event_tree.rs` so the two interoperate on o
 - Wire encoding: each `prefix_hash` is the **8-byte big-endian** form of that `uint64`.
 
 The fingerprint is positional (block `i`'s key identifies the whole prefix `0..i`), satisfying the parent-chained block-hash assumption above. Both ends must agree: the `kvevent-subscriber` computes it in-pod from the engine event's `token_ids` (the tokens never leave the pod — only the hash does); a gateway recomputes it from the prompt's tokens. Reference implementation: `pkg/fingerprint`. **Caveat:** the fingerprint is token-content-only, so prefixes that differ only by LoRA adapter (identical tokens) share a key unless partitioned by `model_id` — tracked as a follow-up.
+
+**Update — dual-input `LookupRoute` (server-side tokenization).** `LookupRouteRequest` adds `token_ids` (9) and `prompt_text` (10) so a gateway that carries **no tokenizer** can let the server compute the fingerprint. The server resolves exactly one input by precedence:
+
+1. An explicit `prefix_hash` / `block_hashes` chain (a gateway that already fingerprinted) — used as-is, unchanged from the existing path.
+2. `token_ids` — the server derives the block-hash chain directly via `pkg/fingerprint` (`Chain(token_ids, block_size)` → the same per-block positional hashes the subscriber ingests). No tokenizer needed, so this works in every server build.
+3. `prompt_text` — the server applies `model_id`'s chat template and tokenizes (the server-owned tokenizer), then fingerprints as in (2). This path requires a server built with the tokenizer (build tag `smgcgo`); a server without it **fails open to `NO_HINT`** rather than erroring. The canonical `token_ids` the server produced are echoed in `LookupRouteResponse.token_ids` (4) **only on this path**, so the caller forwards exactly those tokens to the engine (e.g. OpenAI `/v1/completions` with a token-id `prompt`) — the engine then caches the same tokens the lookup was fingerprinted over, so routing key and engine cache key match **by construction**, with no tokenizer-parity dependence between gateway and engine.
+
+`model_id` / `tenant_id` / `hash_scheme` are still supplied by the caller on every path — they are engine/routing config, not tokenizer knowledge. `block_size` matches the engine's KV block size (16 for vLLM); the server's default is configurable and must equal the subscriber's. All input paths funnel into the identical block-chain matching semantics (the longest-leading-run rule above), so `reason_code`, the matched-tokens / routing-floor gates, and fail-open behavior are unchanged. A `token_ids` / `prompt_text` input too short to fill one block yields an empty chain → fail-open `NO_HINT`. `LookupRoute` stays side-effect-free apart from metrics (tokenization is transient: the server sees prompt text only to hash it, never stores it).
