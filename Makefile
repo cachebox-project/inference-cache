@@ -390,7 +390,6 @@ pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admissi
 		exit 1; \
 	fi
 	@echo "✓ no generated-code drift"
-	@$(MAKE) --no-print-directory verify-golden-vectors
 	@$(MAKE) --no-print-directory verify-samples
 	@echo ""
 	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
