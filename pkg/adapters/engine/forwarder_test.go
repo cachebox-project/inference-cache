@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
@@ -105,10 +106,16 @@ func runReporterWithOpts(t *testing.T, opts []ReporterOption, batches ...*EventB
 }
 
 func TestReporterForwardsBlockStored(t *testing.T) {
-	h0, h1 := []byte{0x0a}, []byte{0x0b}
+	const bs = 16
+	toks := tokSeq(100, 2*bs) // 2 full blocks
+	want := fingerprint.PrefixHashes(toks, bs)
 	rec := runReporter(t, &EventBatch{
 		TimestampSeconds: 2.0,
-		Events:           []Event{BlockStored{BlockHashes: [][]byte{h0, h1}, BlockSize: 128}},
+		Events: []Event{BlockStored{
+			BlockHashes: [][]byte{{0x0a}, {0x0b}},
+			TokenIDs:    toks,
+			BlockSize:   bs,
+		}},
 	})
 
 	rec.mu.Lock()
@@ -125,25 +132,31 @@ func TestReporterForwardsBlockStored(t *testing.T) {
 			hashes = append(hashes, p.GetPrefixHash())
 		}
 	}
-	if len(hashes) != 2 || !bytes.Equal(hashes[0], h0) || !bytes.Equal(hashes[1], h1) {
-		t.Errorf("forwarded hashes = %x, want [%x %x]", hashes, h0, h1)
+	// The forwarded keys are our content fingerprints, not the engine block hashes.
+	if len(hashes) != 2 ||
+		!bytes.Equal(hashes[0], fingerprint.Bytes(want[0])) ||
+		!bytes.Equal(hashes[1], fingerprint.Bytes(want[1])) {
+		t.Errorf("forwarded hashes = %x, want content hashes [%x %x]",
+			hashes, fingerprint.Bytes(want[0]), fingerprint.Bytes(want[1]))
 	}
 }
 
 // With a window long enough that the ticker never fires, the only path that can
 // deliver buffered adds is the shutdown flush — which must reopen the stream.
 func TestReporterFlushesPendingOnShutdown(t *testing.T) {
-	h := []byte{0x42}
+	const bs = 16
+	toks := tokSeq(42, bs)
+	want := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
 	rec := runReporterWindow(t, time.Hour, &EventBatch{
 		TimestampSeconds: 1,
-		Events:           []Event{BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}},
+		Events:           []Event{BlockStored{BlockHashes: [][]byte{{0x42}}, TokenIDs: toks, BlockSize: bs}},
 	})
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	var found bool
 	for _, u := range rec.updates {
 		for _, p := range u.GetPrefixes() {
-			if bytes.Equal(p.GetPrefixHash(), h) {
+			if bytes.Equal(p.GetPrefixHash(), want) {
 				found = true
 			}
 		}
@@ -156,21 +169,25 @@ func TestReporterFlushesPendingOnShutdown(t *testing.T) {
 // Store-then-evict within one debounce window must reach the server in order
 // (add before evict), or the additive add would re-create the evicted prefix.
 func TestReporterFlushesAddsBeforeRemoval(t *testing.T) {
-	h := []byte{0x55}
+	const bs = 16
+	toks := tokSeq(55, bs)
+	// The evict key is our content hash for the stored block (the engine hash 0x55
+	// is mapped to it via the reverse map on removal).
+	our := string(fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0]))
 	// Large window so only the BlockRemoved-triggered flush (not the ticker) can
 	// deliver the buffered add — exercising the ordering guarantee.
 	rec := runReporterWindow(t, time.Hour,
-		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{h}, BlockSize: 16}}},
-		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{h}}}},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0x55}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0x55}}}}},
 	)
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	var addAt, evictAt = -1, -1
 	for i, op := range rec.ops {
 		switch op {
-		case "add:" + string(h):
+		case "add:" + our:
 			addAt = i
-		case "evict:" + string(h):
+		case "evict:" + our:
 			evictAt = i
 		}
 	}
@@ -191,9 +208,14 @@ func TestNewReporterClampsWindow(t *testing.T) {
 }
 
 func TestReporterForwardsRemovalsAndClear(t *testing.T) {
+	const bs = 16
+	// Store the two blocks first so removal can map their engine hashes (7, 8) to
+	// our prefix hashes via the reverse map.
+	toks := tokSeq(700, 2*bs)
 	rec := runReporter(t,
-		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{7}, {8}}}}},
-		&EventBatch{TimestampSeconds: 2, Events: []Event{AllBlocksCleared{}}},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{7}, {8}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{7}, {8}}}}},
+		&EventBatch{TimestampSeconds: 3, Events: []Event{AllBlocksCleared{}}},
 	)
 
 	rec.mu.Lock()
@@ -225,16 +247,17 @@ func TestReporterForwardsRemovalsAndClear(t *testing.T) {
 // reaches the server (via the shutdown flush) — silently dropping adds
 // alongside evictions would defeat the whole reporter.
 func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
-	addHash := []byte{0x01}
-	evictHash := []byte{0x02}
+	const bs = 16
+	toks := tokSeq(1, bs)
+	wantAdd := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
 	rec := runReporterWithOpts(t,
 		// time.Hour so the only path that can deliver the add is the shutdown
 		// flush — exactly as in TestReporterFlushesPendingOnShutdown. That
 		// also confirms BlockRemoved doesn't accidentally trigger the
 		// pre-removal flush when ignore is set.
 		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
-		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{addHash}, BlockSize: 16}}},
-		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{evictHash}}}},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0x01}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0x02}}}}},
 	)
 
 	rec.mu.Lock()
@@ -244,7 +267,7 @@ func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
 	var addFound bool
 	for _, u := range rec.updates {
 		for _, p := range u.GetPrefixes() {
-			if bytes.Equal(p.GetPrefixHash(), addHash) {
+			if bytes.Equal(p.GetPrefixHash(), wantAdd) {
 				addFound = true
 			}
 		}
@@ -288,15 +311,19 @@ func TestReporterIgnoreBlockRemovedStillForwardsAllCleared(t *testing.T) {
 // contract — single-tier deployments rely on PREFIX_EVICTED to drop stale
 // hints promptly. Guards against accidental flag-default flips.
 func TestReporterDefaultStillForwardsBlockRemoved(t *testing.T) {
-	h := []byte{0x33}
+	const bs = 16
+	toks := tokSeq(33, bs)
+	want := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
+	// Store the block first so its engine hash (0x33) maps to our prefix hash.
 	rec := runReporter(t,
-		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockRemoved{BlockHashes: [][]byte{h}}}},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0x33}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0x33}}}}},
 	)
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	var found bool
 	for _, e := range rec.events {
-		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED && bytes.Equal(e.GetPrefixHash(), h) {
+		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED && bytes.Equal(e.GetPrefixHash(), want) {
 			found = true
 		}
 	}

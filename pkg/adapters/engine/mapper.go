@@ -122,3 +122,17 @@ func (c Config) ClearedEvent(tsSeconds float64) *icpb.CacheEvent {
 		TimestampUs: microsFromSeconds(tsSeconds),
 	}
 }
+
+// EvictedEvent builds one PREFIX_EVICTED CacheEvent for an already-derived prefix
+// hash (our content fingerprint, the index key to drop). The subscriber maps an
+// evicted engine block hash to this key via positionalIndex.Removed.
+func (c Config) EvictedEvent(prefixHash []byte, tsSeconds float64) *icpb.CacheEvent {
+	return &icpb.CacheEvent{
+		Type:        icpb.CacheEvent_PREFIX_EVICTED,
+		ReplicaId:   c.ReplicaID,
+		ModelId:     c.ModelID,
+		TenantId:    c.TenantID,
+		PrefixHash:  prefixHash,
+		TimestampUs: microsFromSeconds(tsSeconds),
+	}
+}

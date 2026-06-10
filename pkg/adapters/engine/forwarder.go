@@ -28,6 +28,9 @@ type Reporter struct {
 	maxPend            int
 	logger             *slog.Logger
 	ignoreBlockRemoved bool
+	// pos derives our positional content fingerprint from each event's tokens and
+	// chains it across events. Owned by Run (single goroutine), so unsynchronized.
+	pos *positionalIndex
 }
 
 // ReporterOption configures a Reporter.
@@ -64,6 +67,7 @@ func NewReporter(client icpb.InferenceCacheClient, cfg Config, opts ...ReporterO
 		rpcTimeout: 5 * time.Second,
 		maxPend:    4096,
 		logger:     slog.Default(),
+		pos:        newPositionalIndex(),
 	}
 	for _, o := range opts {
 		o(r)
@@ -110,7 +114,7 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 			for _, ev := range b.Events {
 				switch e := ev.(type) {
 				case BlockStored:
-					pending = append(pending, StoredPrefixes(e)...)
+					pending = append(pending, r.pos.Stored(e)...)
 					if tsUs > 0 {
 						pendTs = tsUs
 					}
@@ -134,12 +138,13 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// same block (store-then-evict within one window). Flush pending
 					// adds first to preserve store→evict order.
 					flush()
-					for _, cev := range r.cfg.RemovedEvents(e, b.TimestampSeconds) {
-						r.publish(cev)
+					for _, ourHash := range r.pos.Removed(e) {
+						r.publish(r.cfg.EvictedEvent(ourHash, b.TimestampSeconds))
 					}
 				case AllBlocksCleared:
 					pending = pending[:0] // a clear supersedes buffered adds
 					pendTs = 0
+					r.pos.Cleared()
 					r.publish(r.cfg.ClearedEvent(b.TimestampSeconds))
 				}
 			}
