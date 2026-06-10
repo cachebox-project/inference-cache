@@ -282,11 +282,15 @@ func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	}
 
 	// The one-block prefix of the same prompt must also hit (a shorter prompt
-	// sharing the leading block).
+	// sharing the leading block), with the same replica and exactly one
+	// block's worth of matched tokens.
 	resp := lookupChain(t, client, tenant, want[:1])
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
 		t.Errorf("one-block prefix: reason = %q, want PREFIX_MATCH; scores=%+v",
 			resp.GetReasonCode(), resp.GetReplicaScores())
+	} else if s := resp.GetReplicaScores()[0]; s.GetReplicaId() != e2eReplica || s.GetMatchedTokens() != e2eBlockTok {
+		t.Errorf("one-block prefix: got replica %q matched_tokens %d, want %q with %d",
+			s.GetReplicaId(), s.GetMatchedTokens(), e2eReplica, e2eBlockTok)
 	}
 
 	// Miss: a novel prompt — same scheme, same fingerprint construction,

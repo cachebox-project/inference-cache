@@ -42,6 +42,16 @@ func main() {
 	)
 	flag.Parse()
 
+	// Validate before allocating: a negative block-size/num-blocks would panic
+	// in tokenSeq below, and a non-positive interval would spin the publish
+	// loop hot instead of pacing it.
+	if *blockSize <= 0 || *numBlocks <= 0 {
+		log.Fatalf("-block-size and -num-blocks must be positive, got %d and %d", *blockSize, *numBlocks)
+	}
+	if *interval <= 0 {
+		log.Fatalf("-interval must be positive, got %s", *interval)
+	}
+
 	tokens := tokenSeq(*startTok, *blockSize**numBlocks)
 	payloads, err := buildBatchPayloads(tokens, *blockSize, *numEvents, *omitTokens)
 	if err != nil {
@@ -167,7 +177,7 @@ func buildBatchPayloads(tokens []uint32, blockSize, nEvents int, omitTokens bool
 		event := []interface{}{"BlockStored", hashes, parent, tokenIDs, int32(blockSize), nil}
 		payload, err := msgpack.Marshal([]interface{}{float64(0), []interface{}{event}})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("marshal event %d (blocks %d-%d): %w", e, lo, hi-1, err)
 		}
 		payloads = append(payloads, payload)
 		lo = hi
