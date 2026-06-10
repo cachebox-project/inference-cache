@@ -4,13 +4,14 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
-// This file translates decoded vLLM events into the gRPC contract. The mapping
-// follows the index's state model:
-//   - BlockStored  -> CacheStateUpdate (additive ingest via ReportCacheState)
-//   - BlockRemoved -> PREFIX_EVICTED CacheEvent(s) (removal via PublishEvent)
-//   - AllBlocksCleared -> ALL_CLEARED CacheEvent
-// Only hashes + counts cross the wire — never tokens or prompt text. Block hashes
-// are already opaque bytes by the time they reach here (see events.go).
+// This file stamps the replica/model/tenant/hash_scheme identity onto the gRPC
+// contract messages the subscriber forwards:
+//   - CacheStateUpdate (additive ingest via ReportCacheState) wraps the
+//     PrefixEntry list produced by positionalIndex.Stored
+//   - EvictedEvent / ClearedEvent carry the PREFIX_EVICTED / ALL_CLEARED removals
+//     (via PublishEvent)
+// Only hashes + counts cross the wire — never tokens or prompt text. The prefix
+// keys are our deterministic content fingerprints, derived in positional.go.
 
 // microsFromSeconds converts vLLM's float-seconds timestamp to the contract's
 // timestamp_us. A non-positive input yields 0 (server treats 0 as "now").
@@ -64,52 +65,6 @@ func (c Config) StatsUpdate(tsUs int64, stats *icpb.ReplicaStats) *icpb.CacheSta
 			Pressure:         stats.GetPressure(),
 		},
 	}
-}
-
-// StoredPrefixes renders a BlockStored event as PrefixEntry values: one per block
-// hash. token_count is cumulative: vLLM block hashes chain their parent, so block
-// i's hash identifies the prefix up to and including block i and therefore covers
-// (i+1) blocks of this event. This keeps the ranking signal (longer prefixes rank
-// higher) instead of a flat per-block count. It counts only within-event tokens —
-// the parent prefix's length isn't in the event — so it's a lower bound, and it
-// never uses token contents.
-func StoredPrefixes(ev BlockStored) []*icpb.PrefixEntry {
-	prefixes := make([]*icpb.PrefixEntry, 0, len(ev.BlockHashes))
-	for i, h := range ev.BlockHashes {
-		prefixes = append(prefixes, &icpb.PrefixEntry{
-			PrefixHash: h,
-			TokenCount: int32(i+1) * ev.BlockSize,
-		})
-	}
-	return prefixes
-}
-
-// StoredUpdate builds the CacheStateUpdate for a single BlockStored event.
-// Returns nil if the event carries no hashes (nothing to report).
-func (c Config) StoredUpdate(ev BlockStored, tsSeconds float64) *icpb.CacheStateUpdate {
-	return c.Update(microsFromSeconds(tsSeconds), StoredPrefixes(ev))
-}
-
-// RemovedEvents builds one PREFIX_EVICTED CacheEvent per removed block hash.
-// CacheEvent carries a single prefix_hash, so a BlockRemoved with N hashes maps
-// to N events.
-func (c Config) RemovedEvents(ev BlockRemoved, tsSeconds float64) []*icpb.CacheEvent {
-	if len(ev.BlockHashes) == 0 {
-		return nil
-	}
-	us := microsFromSeconds(tsSeconds)
-	out := make([]*icpb.CacheEvent, 0, len(ev.BlockHashes))
-	for _, h := range ev.BlockHashes {
-		out = append(out, &icpb.CacheEvent{
-			Type:        icpb.CacheEvent_PREFIX_EVICTED,
-			ReplicaId:   c.ReplicaID,
-			ModelId:     c.ModelID,
-			TenantId:    c.TenantID,
-			PrefixHash:  h,
-			TimestampUs: us,
-		})
-	}
-	return out
 }
 
 // ClearedEvent builds the ALL_CLEARED CacheEvent for an AllBlocksCleared event.

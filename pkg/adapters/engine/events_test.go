@@ -25,8 +25,8 @@ func encodeVLLMBatch(t *testing.T, ts float64, events ...[]interface{}) []byte {
 }
 
 func TestDecodeEventBatch(t *testing.T) {
-	// A BlockStored carrying token_ids (which must be dropped), a BlockRemoved,
-	// an AllBlocksCleared, and an unknown event type (must be skipped).
+	// A BlockStored carrying token_ids (now preserved for content hashing), a
+	// BlockRemoved, an AllBlocksCleared, and an unknown event type (skipped).
 	payload := encodeVLLMBatch(t, 1779901681.5,
 		[]interface{}{"BlockStored", []uint64{10, 11}, nil, []int64{0, 1, 2, 3}, int32(128), nil},
 		[]interface{}{"BlockRemoved", []uint64{4}},

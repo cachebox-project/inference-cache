@@ -35,12 +35,17 @@ func newPositionalIndex() *positionalIndex {
 
 // Stored derives the positional PrefixEntry list for a BlockStored event and
 // records each block in the reverse map. It chains from the parent when that
-// parent is known; otherwise it starts a fresh sequence at position 0. A fresh
-// sequence is the common case (the parent is the engine's random root, which we
-// never store); it can also happen, rarely, if a parent's event was dropped — in
-// which case starting fresh is the safe choice, since a wrong-positioned hash
-// simply never matches a query rather than mis-routing. Returns nil when there is
-// nothing to index.
+// parent is known; otherwise it starts a fresh sequence at position 0.
+//
+// Starting fresh on an unknown parent is correct for the common case — the parent
+// is the engine's random root (NONE_HASH), which we never store, so every genuine
+// fresh prefix lands here. It is also reached, rarely, when a parent's event was
+// dropped or the subscriber restarted mid-stream: that suffix block is then keyed
+// as if it were a root, so if its tokens happen to equal some real root prefix's
+// leading tokens it can yield a false PREFIX_MATCH. That is a bounded, soft-state
+// cost (a wrong hint degrades to a cache miss, never a wrong answer) and does not
+// occur on a clean cold start (no gaps). Hardening — learn NONE_HASH and drop
+// true gaps — is tracked as a follow-up. Returns nil when nothing is indexable.
 func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 	bs := int(ev.BlockSize)
 	if bs <= 0 || len(ev.BlockHashes) == 0 {
@@ -56,15 +61,15 @@ func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 		}
 	}
 
-	// One rolling prefix hash per full block of token_ids; align with block_hashes.
+	// One rolling prefix hash per full block of token_ids. token_ids must cover
+	// exactly the event's blocks; a length mismatch is a malformed event — drop it
+	// rather than partially index, which would desync our keys from the engine's
+	// block identities and corrupt a later removal.
 	phs := fingerprint.PrefixHashesFrom(ev.TokenIDs, bs, parentPrefix, hasParent)
-	n := len(phs)
-	if len(ev.BlockHashes) < n {
-		n = len(ev.BlockHashes)
-	}
-	if n == 0 {
+	if len(phs) != len(ev.BlockHashes) {
 		return nil
 	}
+	n := len(phs)
 
 	out := make([]*icpb.PrefixEntry, 0, n)
 	tokens := parentTokens

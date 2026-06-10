@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"reflect"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -251,6 +252,9 @@ func decodeTokenIDs(raw msgpack.RawMessage) ([]uint32, error) {
 	}
 	out := make([]uint32, len(ids))
 	for i, t := range ids {
+		if t < 0 || t > math.MaxUint32 {
+			return nil, fmt.Errorf("token id %d out of uint32 range", t)
+		}
 		out[i] = uint32(t)
 	}
 	return out, nil
