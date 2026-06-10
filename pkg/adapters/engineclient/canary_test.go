@@ -122,6 +122,23 @@ func TestScrapeCounterReadsValueNotTimestamp(t *testing.T) {
 	}
 }
 
+// scrapeCounter must skip a '}' that appears inside a quoted label value when
+// finding the end of the label set.
+func TestScrapeCounterQuoteAwareLabels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("vllm:prefix_cache_hits_total{path=\"a}b\"} 7\n"))
+	}))
+	defer srv.Close()
+
+	got, err := scrapeCounter(context.Background(), http.DefaultClient, srv.URL, "vllm:prefix_cache_hits_total")
+	if err != nil {
+		t.Fatalf("scrapeCounter: %v", err)
+	}
+	if got != 7 {
+		t.Errorf("scrapeCounter = %d, want 7 (a '}' inside a quoted label must not end the label set)", got)
+	}
+}
+
 // TestPrefixCacheCanaryLive runs the real by-construction canary against a live
 // OpenAI-compatible engine. Operator-run, not CI: set IC_ENGINE_URL (e.g.
 // http://localhost:8000) and IC_ENGINE_MODEL (the served model). A long

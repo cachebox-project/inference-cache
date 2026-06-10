@@ -21,9 +21,10 @@ const DefaultEngineBlockSize = 16
 
 // DefaultTokenizeTimeout bounds server-side prompt_text tokenization when no
 // tighter deadline applies (no caller deadline AND no CachePolicy.lookupTimeoutMs).
-// The cgo tokenizer can load/download a model on first use, so without a bound a
-// no-deadline LookupRoute could block the hot path; instead it fails open. Set a
-// CachePolicy.lookupTimeoutMs for tighter, per-tenant control.
+// Tokenizers are loaded eagerly at startup (not on the request path), so this is
+// defense-in-depth: it caps the in-memory chat-template render + encode so a
+// pathological prompt can't block a no-deadline LookupRoute — it fails open
+// instead. Set a CachePolicy.lookupTimeoutMs for tighter, per-tenant control.
 const DefaultTokenizeTimeout = 5 * time.Second
 
 // MaxLookupTokens caps the caller-supplied token_ids a single LookupRoute will
@@ -185,10 +186,14 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		ctx, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
-	// When the request will tokenize (prompt_text) and nothing else bounds it,
-	// apply a default safety timeout so a slow first-time tokenizer load can't
-	// block the hot path indefinitely — it fails open instead.
-	if _, has := ctx.Deadline(); !has && req.GetPromptText() != "" && s.tokenizeTimeout > 0 {
+	// When prompt_text is the EFFECTIVE input (no higher-precedence chain /
+	// prefix_hash / token_ids that would make us ignore it) and nothing else
+	// bounds the call, apply a default safety timeout so tokenization can't block
+	// the hot path indefinitely — it fails open instead.
+	willTokenize := req.GetPromptText() != "" &&
+		len(req.GetBlockHashes()) == 0 && len(req.GetBlockTokenCounts()) == 0 &&
+		len(req.GetPrefixHash()) == 0 && len(req.GetTokenIds()) == 0
+	if _, has := ctx.Deadline(); !has && willTokenize && s.tokenizeTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.tokenizeTimeout)
 		defer cancel()
@@ -343,8 +348,18 @@ type lookupInputs struct {
 // cacheable block — symmetric with the "chain misses never fall to TENANT_HOT"
 // rule in grpc-contract.md).
 func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) lookupInputs {
-	if len(req.GetBlockHashes()) > 0 || len(req.GetPrefixHash()) > 0 {
-		return lookupInputs{blockHashes: req.GetBlockHashes(), blockTokenCounts: req.GetBlockTokenCounts()}
+	// An explicit fingerprint attempt: the caller set a prefix_hash and/or a
+	// block-hash chain. Pass req's values through to the index (which exact-
+	// matches prefix_hash and walks the chain). A one-sided / malformed chain —
+	// block_hashes and block_token_counts present with mismatched lengths, or one
+	// set without the other — must fail open with NO_HINT rather than fall through
+	// to a lower-precedence input (token_ids / prompt_text) or a TENANT_HOT hint.
+	bh, btc := req.GetBlockHashes(), req.GetBlockTokenCounts()
+	if len(bh) > 0 || len(btc) > 0 || len(req.GetPrefixHash()) > 0 {
+		if len(bh) != len(btc) {
+			return lookupInputs{failOpen: true}
+		}
+		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
 		if len(toks) > MaxLookupTokens {

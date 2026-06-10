@@ -124,9 +124,9 @@ func scrapeCounter(ctx context.Context, client *http.Client, url, metric string)
 		// exposition the value is the FIRST token after the labels; an optional
 		// timestamp follows it, so don't read the last token.
 		if rest[0] == '{' {
-			end := strings.IndexByte(rest, '}')
+			end := closingBrace(rest)
 			if end < 0 {
-				continue // malformed label set
+				continue // unterminated label set
 			}
 			rest = rest[end+1:]
 		}
@@ -142,4 +142,24 @@ func scrapeCounter(ctx context.Context, client *http.Client, url, metric string)
 		return 0, err
 	}
 	return int(sum), nil
+}
+
+// closingBrace returns the index of the '}' that closes the label set starting
+// at s[0] == '{', skipping any '}' inside a double-quoted label value (honoring
+// \" and \\ escapes). Returns -1 if the label set is unterminated.
+func closingBrace(s string) int {
+	inQuote, escaped := false, false
+	for i := 1; i < len(s); i++ {
+		switch c := s[i]; {
+		case escaped:
+			escaped = false
+		case inQuote && c == '\\':
+			escaped = true
+		case c == '"':
+			inQuote = !inQuote
+		case c == '}' && !inQuote:
+			return i
+		}
+	}
+	return -1
 }

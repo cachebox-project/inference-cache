@@ -214,6 +214,34 @@ func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
 	}
 }
 
+// A one-sided / malformed chain — block_token_counts set without block_hashes —
+// must fail open with NO_HINT and never fall through to token_ids/prompt_text or
+// surface a TENANT_HOT hint, even with a warm tenant.
+func TestLookupRouteCountsOnlyChainFailsOpen(t *testing.T) {
+	svc := newTestService()
+	warm := tokenSeq(7_500, 64)
+	ingestFingerprintPrefix(svc.index, "r1", "m", "tenant-x", "vllm", warm, 16)
+	svc.index.Ingest(index.Update{
+		ReplicaID: "r1", Model: "m", Tenant: "tenant-x", HashScheme: "vllm",
+		Stats:     &index.ReplicaStats{ReplicaID: "r1", HitRate: 0.9},
+		Timestamp: time.Now(),
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm",
+		BlockTokenCounts: []int32{16, 16}, // counts without hashes — malformed
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (one-sided chain must fail open)", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Errorf("one-sided chain returned %d scores, want 0", len(resp.GetReplicaScores()))
+	}
+}
+
 // An oversized token_ids request fails open rather than burning CPU/memory
 // fingerprinting it on the hot path.
 func TestLookupRouteOversizedTokenIDsFailsOpen(t *testing.T) {
