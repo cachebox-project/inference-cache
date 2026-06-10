@@ -278,7 +278,7 @@ func (s *serverInstanceCascade) shouldIncrementCascade(key cascadeKey, currentID
 // explicit "cleared" sentinel that overrides any stale non-empty
 // status.observedServerInstance on the next reconcile. Called when
 // the backend transitions out of the managed path (External,
-// unsupported runtime, invalid storage) and its
+// unsupported runtime) and its
 // status.observedServerInstance is also cleared on the cluster.
 //
 // The sentinel exists because the in-memory clear runs BEFORE the
@@ -294,7 +294,7 @@ func (s *serverInstanceCascade) shouldIncrementCascade(key cascadeKey, currentID
 // "treat prior as empty regardless of what statusField says".
 // recordAttempt deletes the sentinel (a new baseline is now being
 // persisted; we are no longer in the cleared state). Controller
-// restart loses the sentinel; the External/Unmanaged/Invalid
+// restart loses the sentinel; the External/Unmanaged
 // path's patchStatus retry on subsequent reconciles is the durable
 // backstop for that case.
 func (s *serverInstanceCascade) clear(key cascadeKey) {
