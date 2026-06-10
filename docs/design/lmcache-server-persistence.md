@@ -8,6 +8,23 @@ Status: **Proposed** · Recommendation: **Retire `spec.storage.pvc`; express dur
 > and the recommendation. The implementation follow-up that would wire the chosen
 > mechanism is re-scoped off this doc.
 
+> **Accuracy note (after primary-source verification).** An earlier draft framed
+> local-PVC persistence as *architecturally impossible* on our topology — that
+> over-claims. LMCache's L2 `fs` adapter is **topology-neutral** (works on any
+> POSIX filesystem; a PVC mount satisfies it), so persistence itself is
+> achievable. The real constraint is the **transfer mechanism**: MP mode's
+> preferred path is CUDA IPC (needs `hostIPC` + same-node → DaemonSet), and
+> whether its `--supported-transfer-mode non_gpu` path works **end-to-end over a
+> plain Service without `hostIPC`** is **unverified** — that single fact is what
+> would make a Deployment+Service MP-mode server with an `fs` adapter on a PVC
+> viable. This decision **retires `spec.storage.pvc` as a deliberate product
+> choice — not because it is impossible**, but because the value proposition
+> (survive-restart on a single RWO replica, under a fail-open posture where a
+> cold cache is a few misses, not an outage) does not justify resolving that open
+> question, and durable/shared cache is better delivered by the planned Mooncake
+> backend. Where the options below say "rejected/incompatible" for MP mode, read
+> "**not pursued, pending an unverified transfer-mode fact**."
+
 ## Context
 
 The persistent-storage wire-up shipped the **Kubernetes-side plumbing** for
