@@ -216,8 +216,9 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// Dual-input resolution: turn token_ids / prompt_text into the block-hash
 	// chain the rest of the handler understands (an explicit prefix_hash /
 	// block_hashes chain is passed through). The prompt_text path runs the
-	// tokenizer, which can load/download a model on its first use, so when a
-	// deadline is active we run resolution in a goroutine and fail open with
+	// tokenizer encode (tokenizers are pre-loaded at startup, so no per-request
+	// I/O), which is still a cgo call that can't be cancelled mid-flight, so when
+	// a deadline is active we run resolution in a goroutine and fail open with
 	// TIMEOUT rather than block the hot path past the budget. resolveLookupChain
 	// does NOT mutate req, so a goroutine that outlives this call shares nothing
 	// mutable and is race-free.

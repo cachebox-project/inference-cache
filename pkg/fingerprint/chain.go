@@ -2,9 +2,10 @@ package fingerprint
 
 // Chain turns a flat token-ID slice into the block-hash chain a
 // LookupRouteRequest carries for longest-prefix matching: blockHashes[i] is the
-// 8-byte big-endian positional prefix hash covering tokens 0..i*blockSize, and
-// blockTokenCounts[i] is the per-block token count (always blockSize for a full
-// block). It is the query-side mirror of the subscriber's per-block PrefixEntry
+// 8-byte big-endian positional prefix hash covering tokens 0..(i+1)*blockSize
+// (block i is the i-th full block, so block 0 covers the first blockSize tokens),
+// and blockTokenCounts[i] is the per-block token count (always blockSize for a
+// full block). It is the query-side mirror of the subscriber's per-block PrefixEntry
 // ingest (pkg/adapters/engine/positional.go) — so a lookup built from the same
 // tokens the engine cached matches the ingested keys by construction.
 //

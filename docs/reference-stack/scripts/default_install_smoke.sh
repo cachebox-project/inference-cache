@@ -945,6 +945,32 @@ if ! has_reason_code "$resp" "NO_HINT"; then
   fail "expected reason_code=NO_HINT for an unknown model, got: $resp"
 fi
 
+# --- Dual-input LookupRoute assertions (server-side tokenization surface) ---
+# CONTRIBUTING requires gRPC behavior changes to extend this gate. The default
+# install ships the pure-Go server (no cgo tokenizer), so prove BOTH dual-input
+# paths are wired at the deployment level and fail open:
+#   - token_ids: the server fingerprints the supplied tokens itself (no tokenizer
+#     needed); for an unknown model it fails open to NO_HINT.
+#   - prompt_text: the default build has no tokenizer, so this path fails open to
+#     NO_HINT (never an error on the hot path).
+ti_resp="$(grpcurl_lookup_route '{"modelId":"install-smoke-unknown","hashScheme":"vllm","tokenIds":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]}' "$LOG_DIR/grpcurl-tokenids.err")" || {
+  cat "$LOG_DIR/grpcurl-tokenids.err" >&2 || true
+  fail "grpcurl LookupRoute(token_ids) did not return a response"
+}
+log "LookupRoute(token_ids) response: $ti_resp"
+if ! has_reason_code "$ti_resp" "NO_HINT"; then
+  fail "expected reason_code=NO_HINT for token_ids on an unknown model, got: $ti_resp"
+fi
+
+pt_resp="$(grpcurl_lookup_route '{"modelId":"install-smoke-unknown","hashScheme":"vllm","promptText":"hello world"}' "$LOG_DIR/grpcurl-prompttext.err")" || {
+  cat "$LOG_DIR/grpcurl-prompttext.err" >&2 || true
+  fail "grpcurl LookupRoute(prompt_text) did not return a response"
+}
+log "LookupRoute(prompt_text) response: $pt_resp"
+if ! has_reason_code "$pt_resp" "NO_HINT"; then
+  fail "expected reason_code=NO_HINT for prompt_text on the default (tokenizer-less) build, got: $pt_resp"
+fi
+
 # --- CachePolicy PUSH adoption assertion -----------------------------------
 # No read-back endpoint exists for /policy, by design. Prove the server adopted
 # the controller-pushed CachePolicy via existing gRPC side effects on three
