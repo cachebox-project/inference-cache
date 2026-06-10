@@ -246,7 +246,7 @@ func TestReconcileDeploymentRespectsHPAReplicas(t *testing.T) {
 	}
 }
 
-// ---- Status (Progressing, Capacity, observedGeneration) ---------------------
+// ---- Status (Progressing, observedGeneration) -------------------------------
 
 func TestStatusProgressingTrueWhilePending(t *testing.T) {
 	scheme := newScheme(t)
