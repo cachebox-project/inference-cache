@@ -162,10 +162,24 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 256Mi
+              # Sized to fit the default DefaultMaxEntries=1,000,000 cap at
+              # ~540 MiB peak RSS plus headroom (see
+              # docs/operations/index-sizing.md). Operators on small workloads
+              # can dial this down; operators on large workloads should bump
+              # both this and DefaultMaxEntries.
+              memory: 1Gi
             requests:
               cpu: 50m
-              memory: 64Mi
+              # Request is the binpacking + node-pressure-eviction floor. Sized
+              # toward a "moderate" working set (~250K-500K entries, ~150-300 MiB
+              # peak RSS per the sizing guide) so the scheduler can place the pod
+              # somewhere it has room to grow into the 1Gi limit without becoming
+              # the first eviction target under node memory pressure. Operators
+              # running closer to the cap should bump both the request and the
+              # limit in lockstep — and, if they need MORE than the cap,
+              # DefaultMaxEntries is a compile-time constant in pkg/index, so
+              # exceeding it currently requires building a custom server image.
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

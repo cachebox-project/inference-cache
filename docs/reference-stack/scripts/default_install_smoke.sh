@@ -454,6 +454,55 @@ kubectl -n "$NAMESPACE" wait --for=condition=Available --timeout="$READY_TIMEOUT
   deployment/inference-cache-server \
   || fail "controller and/or server did not reach Available within $READY_TIMEOUT"
 
+# --- server resources sized for DefaultMaxEntries ---------------------------
+# The default install MUST budget enough memory to actually hold the
+# DefaultMaxEntries=1,000,000 cap; without that, the default cap is a
+# meaningless number — operators would OOM well before reaching it. The
+# sizing-guide measurements (docs/operations/index-sizing.md) put 1M
+# entries at ~540 MiB peak RSS, so the limit lives at 1Gi. Asserting on
+# the live Deployment proves the bundle still ships that resource shape —
+# the smoke would catch a future refactor that "simplified" the limit
+# back to its old 256Mi value, which would silently re-introduce the
+# OOM-below-cap discrepancy.
+server_mem_limit=$(kubectl -n "$NAMESPACE" get deployment/inference-cache-server \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].resources.limits.memory}' \
+  2>/dev/null || true)
+# Normalize to bytes so the assertion catches semantic drift, not literal-string
+# drift: K8s quantities like "1Gi" and "1024Mi" are equivalent and either is a
+# valid way to express the documented 1 GiB. The minimum sized to fit the
+# DefaultMaxEntries=1M cap at ~540 MiB peak RSS plus a 1.5x headroom margin is
+# 1 GiB = 1073741824 bytes; we accept anything >= that.
+mem_to_bytes() {
+  # Strips a K8s memory quantity suffix (Ki/Mi/Gi/Ti or k/M/G/T) and emits bytes.
+  # Returns 0 on unparseable input — caller treats 0 as "below threshold" and
+  # fails noisily. Uses awk for the multiply so fractional quantities like
+  # 1.5Gi don't trip bash integer arithmetic (which would crash the gate
+  # instead of failing it cleanly).
+  local v="$1" n factor
+  case "$v" in
+    *Ki) n=${v%Ki}; factor=1024 ;;
+    *Mi) n=${v%Mi}; factor=$((1024 * 1024)) ;;
+    *Gi) n=${v%Gi}; factor=$((1024 * 1024 * 1024)) ;;
+    *Ti) n=${v%Ti}; factor=$((1024 * 1024 * 1024 * 1024)) ;;
+    *k)  n=${v%k};  factor=1000 ;;
+    *M)  n=${v%M};  factor=$((1000 * 1000)) ;;
+    *G)  n=${v%G};  factor=$((1000 * 1000 * 1000)) ;;
+    *T)  n=${v%T};  factor=$((1000 * 1000 * 1000 * 1000)) ;;
+    *) n=$v; factor=1 ;;
+  esac
+  awk -v n="$n" -v f="$factor" 'BEGIN {
+    # awk parses leading numerics; "garbage" becomes 0, "1.5" stays 1.5.
+    # printf "%.0f" rounds the product back to an integer byte count.
+    printf "%.0f\n", n * f
+  }'
+}
+server_mem_bytes=$(mem_to_bytes "$server_mem_limit")
+min_bytes=$(( 1024 * 1024 * 1024 ))   # 1 GiB
+if [ "$server_mem_bytes" -lt "$min_bytes" ]; then
+  fail "inference-cache-server memory limit = '$server_mem_limit' ($server_mem_bytes bytes); want >= 1Gi ($min_bytes bytes) to fit DefaultMaxEntries=1M per docs/operations/index-sizing.md"
+fi
+log "inference-cache-server memory limit = $server_mem_limit ($server_mem_bytes bytes; >= 1Gi → sized for DefaultMaxEntries=1M)"
+
 # --- CacheBackend CRD schema-trim assertion --------------------------------
 # The installed CRD must reflect the inert-field trim: the three removed fields
 # are absent from the served v1alpha1 schema, and the field that replaced the

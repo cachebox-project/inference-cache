@@ -39,6 +39,9 @@ type CachePolicySpec struct {
 	Eviction CachePolicyEvictionAlgorithm `json:"eviction,omitempty"`
 
 	// EvictionTTL is the maximum time a cache entry should remain usable.
+	// Server default is 30m when unset. Tuning trade-offs (freshness vs. memory
+	// footprint) and the workflow for picking a value live in
+	// docs/operations/index-sizing.md.
 	// +optional
 	EvictionTTL *metav1.Duration `json:"evictionTTL,omitempty"`
 
