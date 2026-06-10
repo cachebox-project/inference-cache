@@ -198,9 +198,10 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.timeoutResponse(model, 0, in.echoTokens), nil
 	}
 	if in.failOpen {
-		// in.echoTokens is nil on every failOpen path (tokenizer unavailable or
-		// errored, or a sub-block prompt), so this echoes nothing — but keep it
-		// uniform: any response after the server tokenized carries the tokens.
+		// in.echoTokens is set when a sub-block prompt_text still tokenized
+		// successfully (the gateway needs those tokens); nil when the tokenizer
+		// was unavailable or errored. Either way any response after the server
+		// tokenized carries whatever tokens it produced.
 		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint, TokenIds: in.echoTokens}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
@@ -334,7 +335,10 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		}
 		bh, btc := fingerprint.Chain(toks, s.blockSize)
 		if len(bh) == 0 {
-			return lookupInputs{failOpen: true}
+			// Sub-block prompt: no cacheable chain, so fail open — but still echo
+			// the tokens we produced; a tokenizer-less gateway needs them to call
+			// the engine even though there is no routing hint.
+			return lookupInputs{failOpen: true, echoTokens: toks}
 		}
 		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
 	}

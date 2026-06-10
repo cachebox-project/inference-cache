@@ -59,10 +59,6 @@ type Config struct {
 	ModelsDir string
 }
 
-// New returns the tokenizer for the current build: the cgo SMG-backed tokenizer
-// under the `smgcgo` build tag, or Unavailable otherwise. The server wires the
-// result onto the (model, prompt_text) LookupRoute path.
-
 // Unavailable is the default Tokenizer: every call fails open with
 // ErrUnavailable. It lets the server build and run without the cgo tokenizer.
 type Unavailable struct{}

@@ -312,6 +312,28 @@ func TestLookupRoutePromptTextEchoesTokensOnMinPrefixGate(t *testing.T) {
 	}
 }
 
+// A sub-block prompt_text (tokenizes, but to fewer than one full KV block) fails
+// open with NO_HINT yet still echoes the tokens — the gateway tokenized nothing
+// itself and needs them to call the engine.
+func TestLookupRoutePromptTextSubBlockStillEchoes(t *testing.T) {
+	short := tokenSeq(2_600_000, 8) // 8 tokens < blockSize 16 → no full block
+	svc := newTestService()
+	svc.tokenizer = fakeTokenizer{tokens: short}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hi",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Fatalf("reason = %q, want NO_HINT (sub-block prompt)", resp.GetReasonCode())
+	}
+	if !equalU32(resp.GetTokenIds(), short) {
+		t.Errorf("sub-block prompt_text dropped the echo: got %d tokens, want %d", len(resp.GetTokenIds()), len(short))
+	}
+}
+
 // No cgo tokenizer (the default build): the (model, prompt_text) path fails open
 // to NO_HINT rather than erroring on the hot path.
 func TestLookupRoutePromptTextUnavailableTokenizerFailsOpen(t *testing.T) {
