@@ -26,10 +26,11 @@ only full blocks.
 The scheme is FROZEN. Regenerating this file must be a no-op; if it is not,
 every consumer above breaks and the change needs cross-repo coordination.
 
-Run:  python3 gen_golden.py            (requires `pip install xxhash`; writes
-      golden_vectors.json next to this script)
+Run:  python3 gen_golden.py            (writes golden_vectors.json next to
+      this script; deps: pip install -r requirements.txt)
       python3 gen_golden.py --check    (no write; exit 1 if the checked-in
-      fixture differs from what this generator produces — drift detector)
+      fixture differs from what this generator produces — drift detector;
+      wired into `make pre-pr` via the verify-golden-vectors target)
 """
 import argparse
 import base64

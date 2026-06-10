@@ -277,6 +277,19 @@ verify-samples: envtest ## Run every YAML under config/samples/ through admissio
 	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		$(GO_CMD) run ./hack/verify-samples
 
+# Best-effort gate (like the KUBEBUILDER_ASSETS-gated envtests): skips with a
+# notice when python3/xxhash are unavailable rather than failing the build —
+# the Go golden-vector tests still validate the committed fixture either way;
+# this additionally proves the GENERATOR agrees with it.
+.PHONY: verify-golden-vectors
+verify-golden-vectors: ## Verify pkg/fingerprint/testdata/golden_vectors.json matches its generator (skips if python3/xxhash missing; pip install -r pkg/fingerprint/testdata/requirements.txt to enable).
+	@if command -v python3 >/dev/null 2>&1 && python3 -c 'import xxhash' >/dev/null 2>&1; then \
+		python3 pkg/fingerprint/testdata/gen_golden.py --check; \
+	else \
+		echo "SKIP verify-golden-vectors: python3 with xxhash not available" \
+		     "(pip install -r pkg/fingerprint/testdata/requirements.txt to enable)"; \
+	fi
+
 .PHONY: image-build
 image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
 
@@ -377,6 +390,7 @@ pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admissi
 		exit 1; \
 	fi
 	@echo "✓ no generated-code drift"
+	@$(MAKE) --no-print-directory verify-golden-vectors
 	@$(MAKE) --no-print-directory verify-samples
 	@echo ""
 	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
