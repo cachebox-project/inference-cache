@@ -135,10 +135,12 @@ func startFakeEngine(t *testing.T, payloads [][]byte) (endpoint string, stop fun
 	return endpoint, stop
 }
 
-// startSubscriberPipeline wires the real Subscriber → Reporter pair exactly
-// as cmd/kvevent-subscriber/main.go does (same components, same shutdown
-// ordering: cancel the subscriber, then close the channel so the reporter
-// drains its final flush).
+// startSubscriberPipeline wires the real Subscriber → Reporter pair the same
+// way cmd/kvevent-subscriber/main.go wires its EVENT path (same components,
+// same shutdown ordering: cancel the subscriber, then close the channel so
+// the reporter drains its final flush). The binary's stats-scraper path and
+// runtime options like WithIgnoreBlockRemoved are not part of this test —
+// it exercises fingerprint routing, not stats reporting.
 func startSubscriberPipeline(t *testing.T, grpcAddr, endpoint, tenant string, logs *syncWriter) (stop func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(logs, nil))
