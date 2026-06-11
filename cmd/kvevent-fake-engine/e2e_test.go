@@ -324,11 +324,17 @@ func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	// fingerprint change, normalized to 8-byte big-endian like the decoder
 	// does) must NOT be index keys anymore. If this ever matches, the index
 	// has regressed to engine-hash keying — the exact shape of the original
-	// bug, just with the miss showing up on the gateway side instead.
+	// bug, just with the miss showing up on the gateway side instead. Like
+	// the novel-prefix case, the miss must be exactly the fail-open NO_HINT
+	// with zero scores (tenant/model/scheme all exist in the index, so any
+	// other code means the miss path regressed too).
 	resp = lookupChain(t, client, tenant, []uint64{uint64(fakeBlockHash(0)), uint64(fakeBlockHash(1))})
-	if resp.GetReasonCode() == "PREFIX_MATCH" {
-		t.Errorf("engine block hashes matched the index — routing must key on the content fingerprint, not the engine's hashes; scores=%+v",
-			resp.GetReplicaScores())
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("engine block hashes: reason = %q, want NO_HINT — routing must key on the content fingerprint, not the engine's hashes; scores=%+v",
+			resp.GetReasonCode(), resp.GetReplicaScores())
+	}
+	if n := len(resp.GetReplicaScores()); n != 0 {
+		t.Errorf("engine block hashes: %d replica scores, want 0", n)
 	}
 }
 
