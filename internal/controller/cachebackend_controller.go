@@ -870,6 +870,10 @@ func (r *CacheBackendReconciler) buildStatefulSet(backend *cachev1alpha1.CacheBa
 			Replicas:    &replicas,
 			ServiceName: serviceName,
 			Selector:    &metav1.LabelSelector{MatchLabels: selector},
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec:       *pod,
@@ -1085,11 +1089,20 @@ func statefulSetVolumeClaimTemplatesEqual(live, desired []corev1.PersistentVolum
 		if live[i].Name != desired[i].Name {
 			return false
 		}
-		if !equality.Semantic.DeepEqual(live[i].Spec, desired[i].Spec) {
+		liveSpec := normalizeVolumeClaimTemplateSpec(live[i].Spec)
+		desiredSpec := normalizeVolumeClaimTemplateSpec(desired[i].Spec)
+		if !equality.Semantic.DeepEqual(liveSpec, desiredSpec) {
 			return false
 		}
 	}
 	return true
+}
+
+func normalizeVolumeClaimTemplateSpec(spec corev1.PersistentVolumeClaimSpec) corev1.PersistentVolumeClaimSpec {
+	if spec.VolumeMode != nil && *spec.VolumeMode == corev1.PersistentVolumeFilesystem {
+		spec.VolumeMode = nil
+	}
+	return spec
 }
 
 // autoscalingFloor is the effective minReplicas value for the HPA — the

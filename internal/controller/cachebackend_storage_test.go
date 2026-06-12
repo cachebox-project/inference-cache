@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -363,6 +364,12 @@ func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testin
 	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 3 {
 		t.Fatalf("statefulset replicas = %v, want 3", sts.Spec.Replicas)
 	}
+	retention := sts.Spec.PersistentVolumeClaimRetentionPolicy
+	if retention == nil ||
+		retention.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType ||
+		retention.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatalf("StatefulSet persistentVolumeClaimRetentionPolicy = %+v, want Retain/Retain", retention)
+	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("volumeClaimTemplates = %d, want 1: %#v", len(sts.Spec.VolumeClaimTemplates), sts.Spec.VolumeClaimTemplates)
 	}
@@ -390,6 +397,32 @@ func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testin
 	cond := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady)
 	if cond != nil && cond.Reason == conditionReasonInvalidStorageConfiguration {
 		t.Fatalf("StatefulSet per-replica PVC backend must not be gated as InvalidStorageConfiguration")
+	}
+}
+
+func TestStatefulSetVolumeClaimTemplateComparisonIgnoresAPIServerDefaults(t *testing.T) {
+	volumeMode := corev1.PersistentVolumeFilesystem
+	live := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-data"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+			VolumeMode: &volumeMode,
+		},
+	}
+	desired := live.DeepCopy()
+	desired.Spec.VolumeMode = nil
+
+	if !statefulSetVolumeClaimTemplatesEqual([]corev1.PersistentVolumeClaim{live}, []corev1.PersistentVolumeClaim{*desired}) {
+		t.Fatalf("defaulted volumeMode=Filesystem must not count as immutable StatefulSet storage drift")
+	}
+
+	changed := desired.DeepCopy()
+	changed.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("20Gi")
+	if statefulSetVolumeClaimTemplatesEqual([]corev1.PersistentVolumeClaim{live}, []corev1.PersistentVolumeClaim{*changed}) {
+		t.Fatalf("changed storage request must still count as immutable StatefulSet storage drift")
 	}
 }
 

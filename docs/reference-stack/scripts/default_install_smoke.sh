@@ -1632,6 +1632,8 @@ kind: CacheBackend
 metadata:
   name: persistent-cache-sts
   namespace: $STORAGE_SMOKE_NS
+  annotations:
+    inferencecache.io/require-kv-events: "false"
 spec:
   type: LMCache
   deploymentKind: StatefulSet
@@ -1689,6 +1691,42 @@ if [ "$sts_pvc_count" != "2" ]; then
   fail "StatefulSet persistent-cache-sts PVC count=$sts_pvc_count, want 2 per-replica PVCs"
 fi
 log "StatefulSet persistent storage wired: per-replica PVC count=$sts_pvc_count"
+
+# Force a follow-up reconcile after the StatefulSet exists so the controller
+# re-compares the live apiserver-defaulted volumeClaimTemplates. A false
+# immutable-drift detection here would clear status.endpoint and Ready.
+sts_reconcile_marker="$(date +%s)"
+kubectl -n "$STORAGE_SMOKE_NS" annotate cb persistent-cache-sts \
+  inferencecache.io/smoke-reconcile-ts="$sts_reconcile_marker" --overwrite >/dev/null
+sleep 8
+sts_expected_endpoint="persistent-cache-sts.${STORAGE_SMOKE_NS}.svc.cluster.local:65432"
+sts_status_deadline=$(($(date +%s) + 60))
+sts_status_endpoint=""
+sts_ready_status=""
+sts_ready_reason=""
+while [ "$(date +%s)" -lt "$sts_status_deadline" ]; do
+  sts_status_endpoint="$(kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache-sts \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+  sts_ready_status="$(kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache-sts \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  sts_ready_reason="$(kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache-sts \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  if [ "$sts_status_endpoint" = "$sts_expected_endpoint" ] &&
+     [ "$sts_ready_status" = "True" ] &&
+     [ "$sts_ready_reason" = "BackendReady" ]; then
+    break
+  fi
+  sleep 2
+done
+if [ "$sts_status_endpoint" != "$sts_expected_endpoint" ] ||
+   [ "$sts_ready_status" != "True" ] ||
+   [ "$sts_ready_reason" != "BackendReady" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache-sts -o yaml || true
+  kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts -o yaml || true
+  kubectl -n "$STORAGE_SMOKE_NS" get pvc -o wide || true
+  fail "StatefulSet CacheBackend status after follow-up reconcile endpoint=$sts_status_endpoint Ready=$sts_ready_status/$sts_ready_reason, want $sts_expected_endpoint True/BackendReady"
+fi
+log "StatefulSet CacheBackend status held after follow-up reconcile: endpoint=$sts_status_endpoint Ready=$sts_ready_status/$sts_ready_reason"
 
 # Sample cleanup: drop the dedicated namespace (best-effort).
 kubectl delete namespace "$STORAGE_SMOKE_NS" \
