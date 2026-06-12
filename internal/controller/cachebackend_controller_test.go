@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -393,6 +394,57 @@ func TestManagedReadinessZeroReplicasNotReady(t *testing.T) {
 	}
 }
 
+func TestManagedReadinessForStatefulSetUsesReadyReplicas(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(2)
+	replicas := int32(2)
+
+	cases := []struct {
+		name       string
+		status     appsv1.StatefulSetStatus
+		wantStatus metav1.ConditionStatus
+		wantReason string
+	}{
+		{
+			name: "rolled out and ready",
+			status: appsv1.StatefulSetStatus{
+				ObservedGeneration: 1,
+				UpdatedReplicas:    2,
+				ReadyReplicas:      2,
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: conditionReasonBackendReady,
+		},
+		{
+			name: "rolled out but not ready",
+			status: appsv1.StatefulSetStatus{
+				ObservedGeneration: 1,
+				UpdatedReplicas:    2,
+				ReadyReplicas:      1,
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonReplicasUnavailable,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+				Status:     tc.status,
+			}
+			status, reason, message := managedReadinessForWorkload(cb, observationFromStatefulSet(sts))
+			if status != tc.wantStatus || reason != tc.wantReason {
+				t.Fatalf("managedReadinessForWorkload = %v/%q (%q), want %v/%q", status, reason, message, tc.wantStatus, tc.wantReason)
+			}
+			if !strings.Contains(message, "replicas ready") {
+				t.Fatalf("message = %q, want StatefulSet readiness wording", message)
+			}
+		})
+	}
+}
+
 func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	scheme := newScheme(t)
 	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
@@ -730,6 +782,23 @@ func TestReconcileStatefulSetKindCreatesStatefulSet(t *testing.T) {
 	}
 	if ep := getBackend(t, r, "cache", "ns1").Status.Endpoint; ep != "cache.ns1.svc.cluster.local:65432" {
 		t.Fatalf("status.endpoint = %q, want service endpoint", ep)
+	}
+}
+
+func TestReconcileStatefulSetDoesNotScheduleDeploymentCascadePoll(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(scheme, cb)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile StatefulSet backend: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("StatefulSet reconcile RequeueAfter = %s, want 0; Deployment restart-cascade polling does not apply", result.RequeueAfter)
 	}
 }
 

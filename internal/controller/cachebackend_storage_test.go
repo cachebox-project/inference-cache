@@ -392,6 +392,47 @@ func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testin
 	}
 }
 
+func TestReconcileStatefulSetStorageEditSurfacesImmutableDrift(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	if len(sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("initial volumeClaimTemplates = %d, want none", len(sts.Spec.VolumeClaimTemplates))
+	}
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Generation = 2
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend storage: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	sts = getStatefulSet(t, r, "cache", "ns1")
+	if len(sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("StatefulSet volumeClaimTemplates were mutated after creation: %#v", sts.Spec.VolumeClaimTemplates)
+	}
+	for _, mount := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "cache-data" {
+			t.Fatalf("pod template mounted new immutable storage claim after creation: mounts=%v", sts.Spec.Template.Spec.Containers[0].VolumeMounts)
+		}
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
+	wantReason := conditionReasonImmutableStatefulSetStorage
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != wantReason {
+		t.Fatalf("Ready condition = %+v, want False/%s", cond, wantReason)
+	}
+	if updated.Status.ObservedGeneration != 2 {
+		t.Fatalf("status.observedGeneration = %d, want 2 so the immutable-storage condition is tied to the edited spec", updated.Status.ObservedGeneration)
+	}
+}
+
 func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)

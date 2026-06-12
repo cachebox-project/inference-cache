@@ -621,6 +621,13 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 			return ctrl.Result{}, err
 		}
 		sts := r.buildStatefulSet(backend, podSpec, svc.Name, volumeClaimTemplates)
+		storageDrift, err := r.statefulSetVolumeClaimTemplatesDrift(ctx, backend, sts)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if storageDrift {
+			return r.reconcileImmutableStatefulSetStorage(ctx, backend)
+		}
 		applyErr = r.applyStatefulSet(ctx, backend, sts)
 		if applyErr == nil {
 			if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
@@ -749,24 +756,23 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
 			requeueAfter = cascadeWait
 		}
-	}
-	// Schedule an unconditional periodic re-poll of the cache-server
-	// pod set on managed backends. Reason: an in-place container
-	// restart (kubelet respawning a crashed cache-server container
-	// without bumping pod.UID) does NOT change owned-Deployment status
-	// counts, and the controller deliberately does not watch Pods
-	// cluster-wide (see refreshMatchedEnginePods godoc). The
-	// matched-engine-pods cadence above does not cover this case
-	// either: when an operator removes spec.engineSelector after
-	// engines were injected, len(matchedEnginePods)→0 and that
-	// cadence stops firing, leaving in-place restarts unobservable
-	// until something unrelated triggers a reconcile. Pinning a
-	// floor at the rate-limit interval bounds the observation
-	// latency for in-place restarts at one cadence (cheap: one
-	// Pod List + one Deployment Get per backend per cadence).
-	pollCadence := r.minServerRestartCascadeInterval()
-	if requeueAfter == 0 || pollCadence < requeueAfter {
-		requeueAfter = pollCadence
+		// Schedule an unconditional periodic re-poll of the cache-server
+		// pod set for Deployment-managed backends. Reason: an in-place
+		// container restart (kubelet respawning a crashed cache-server
+		// container without bumping pod.UID) does NOT change owned-Deployment
+		// status counts, and the controller deliberately does not watch Pods
+		// cluster-wide (see refreshMatchedEnginePods godoc). The
+		// matched-engine-pods cadence above does not cover this case either:
+		// when an operator removes spec.engineSelector after engines were
+		// injected, len(matchedEnginePods)→0 and that cadence stops firing,
+		// leaving in-place restarts unobservable until something unrelated
+		// triggers a reconcile. Pinning a floor at the rate-limit interval
+		// bounds the observation latency for in-place restarts at one cadence
+		// (cheap: one Pod List + one Deployment Get per backend per cadence).
+		pollCadence := r.minServerRestartCascadeInterval()
+		if requeueAfter == 0 || pollCadence < requeueAfter {
+			requeueAfter = pollCadence
+		}
 	}
 
 	if applyErr != nil {
@@ -1043,6 +1049,40 @@ func (r *CacheBackendReconciler) applyStatefulSet(ctx context.Context, backend *
 		return fmt.Errorf("apply statefulset %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
 	return nil
+}
+
+// statefulSetVolumeClaimTemplatesDrift reports whether an owned StatefulSet
+// already exists with immutable volumeClaimTemplates that differ from the
+// desired storage shape. It intentionally ignores metadata-only differences:
+// labels can drift without changing the per-replica PVC contract, while name
+// and spec differences require an operator-led replacement or migration.
+func (r *CacheBackendReconciler) statefulSetVolumeClaimTemplatesDrift(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.StatefulSet) (bool, error) {
+	live := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get statefulset %s/%s for storage drift check: %w", desired.Namespace, desired.Name, err)
+	}
+	if !metav1.IsControlledBy(live, backend) {
+		return false, nil
+	}
+	return !statefulSetVolumeClaimTemplatesEqual(live.Spec.VolumeClaimTemplates, desired.Spec.VolumeClaimTemplates), nil
+}
+
+func statefulSetVolumeClaimTemplatesEqual(live, desired []corev1.PersistentVolumeClaim) bool {
+	if len(live) != len(desired) {
+		return false
+	}
+	for i := range live {
+		if live[i].Name != desired[i].Name {
+			return false
+		}
+		if !equality.Semantic.DeepEqual(live[i].Spec, desired[i].Spec) {
+			return false
+		}
+	}
+	return true
 }
 
 // autoscalingFloor is the effective minReplicas value for the HPA — the
@@ -1366,6 +1406,39 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 		// Not a transient/recoverable workload fault; the Degraded condition
 		// (rollout/replica health) does not apply to an unprovisioned workload.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+	})
+	return ctrl.Result{}, err
+}
+
+// reconcileImmutableStatefulSetStorage publishes a terminal drift condition
+// when a StatefulSet backend asks to add, remove, or reshape
+// volumeClaimTemplates after the StatefulSet already exists. Kubernetes does
+// not let the controller mutate those templates in place, so the safest
+// reconciliation is to leave the live workload untouched and tell the operator
+// to replace or migrate it explicitly.
+func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	r.clearServerInstanceLatchShadow(backend)
+	err := r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = ""
+		backend.Status.Capacity = ""
+		backend.Status.ObservedServerInstance = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             conditionReasonImmutableStatefulSetStorage,
+			Message:            immutableStatefulSetStorageMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             conditionReasonImmutableStatefulSetStorage,
+			Message:            "controller will not mutate StatefulSet volumeClaimTemplates after creation",
+			ObservedGeneration: backend.Generation,
+		})
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 	})
 	return ctrl.Result{}, err
 }
@@ -1912,12 +1985,20 @@ const (
 	// spec.storage.pvc. StatefulSet uses per-replica PVCs via
 	// volumeClaimTemplates instead.
 	conditionReasonInvalidStorageConfiguration = "InvalidStorageConfiguration"
+	// conditionReasonImmutableStatefulSetStorage is set Ready=False when a
+	// StatefulSet backend's desired volumeClaimTemplates no longer match the
+	// templates established at StatefulSet creation. Kubernetes treats those
+	// templates as immutable, so the controller surfaces the drift instead of
+	// applying a pod template that references uncreated or stale claims.
+	conditionReasonImmutableStatefulSetStorage = "ImmutableStatefulSetStorage"
 )
 
 // invalidStorageMessage is the Ready=False/InvalidStorageConfiguration message,
 // shared by the status condition and the Warning event so kubectl describe and
 // the event stream say the same thing.
 const invalidStorageMessage = "spec.storage.pvc on deploymentKind=Deployment requires a single replica: a ReadWriteOnce PVC cannot be multi-attached across replicas. Scale to spec.replicas=1 and spec.autoscaling.maxReplicas<=1, remove spec.storage.pvc, or use deploymentKind=StatefulSet for per-replica PVCs."
+
+const immutableStatefulSetStorageMessage = "StatefulSet volumeClaimTemplates are immutable after creation; create a replacement CacheBackend or migrate data deliberately to change spec.storage.pvc"
 
 // annotationStorageRetainedWarned marks a retained (adopt-and-keep) PVC for
 // which the OrphanedPVCRetained Warning has already been emitted, so the
@@ -1959,10 +2040,8 @@ func observationFromStatefulSet(sts *appsv1.StatefulSet) managedWorkloadObservat
 	}
 }
 
-// managedReadiness maps a Deployment's rollout state to the Ready condition
-// (status + reason + message). Ready=True requires the Deployment to have
-// observed its current generation and to have enough updated + available
-// replicas, so a stale rollout (e.g. mid image change) is never reported Ready.
+// managedReadiness maps a Deployment's rollout state to the Ready condition.
+// It is the Deployment-specific wrapper around managedReadinessForWorkload.
 //
 // When the CacheBackend is autoscaled the HPA owns the desired replica count,
 // so the comparison target is the live Deployment's spec.replicas (which the
@@ -1974,6 +2053,11 @@ func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deploymen
 	return managedReadinessForWorkload(backend, observationFromDeployment(dep))
 }
 
+// managedReadinessForWorkload maps a managed workload rollout observation to
+// the Ready condition (status + reason + message). Ready=True requires the
+// workload controller to have observed its current generation and to have
+// enough updated + serving replicas (available for Deployments, ready for
+// StatefulSets), so a stale rollout is never reported Ready.
 func managedReadinessForWorkload(backend *cachev1alpha1.CacheBackend, workload managedWorkloadObservation) (metav1.ConditionStatus, string, string) {
 	want := desiredReplicasFromSpec(backend, workload.specReplicas)
 
