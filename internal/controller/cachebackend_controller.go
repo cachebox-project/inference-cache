@@ -116,6 +116,11 @@ const (
 	// the operator knows the storage was kept, not silently dropped. Event
 	// aggregation collapses the per-reconcile repeats into one event.
 	eventReasonOrphanedPVCRetained = "OrphanedPVCRetained"
+	// eventReasonSharedPVCRetained is the Warning fired when a persistent
+	// Deployment backend switches to deploymentKind=StatefulSet and the old
+	// shared PVC is retained but no longer mounted. StatefulSet storage uses
+	// per-replica volumeClaimTemplates instead.
+	eventReasonSharedPVCRetained = "SharedPVCRetained"
 )
 
 // Condition reasons published on a CacheBackend's Ready condition. Stable
@@ -352,6 +357,8 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// owned PVC exists, so this is a cheap cached Get on the common path.
 	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
 		r.warnRetainedPVC(ctx, backend)
+	} else if desiredDeploymentKind(backend) == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+		r.warnRetainedSharedPVCForStatefulSet(ctx, backend)
 	}
 
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
@@ -1418,6 +1425,7 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 // to replace or migrate it explicitly.
 func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	r.clearServerInstanceLatchShadow(backend)
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
@@ -1460,6 +1468,16 @@ func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx contex
 // transient Get/Patch error simply emits nothing (the next reconcile retries).
 // A PVC we do not own is left entirely alone.
 func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	r.warnRetainedDataPVC(ctx, backend, eventReasonOrphanedPVCRetained,
+		"spec.storage.pvc was removed but PVC %q is retained (owner-referenced; reclaimed only when this CacheBackend is deleted). The workload reverts to ephemeral storage; delete the CacheBackend to reclaim the volume, or re-add spec.storage.pvc to mount it again.")
+}
+
+func (r *CacheBackendReconciler) warnRetainedSharedPVCForStatefulSet(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	r.warnRetainedDataPVC(ctx, backend, eventReasonSharedPVCRetained,
+		"deploymentKind=StatefulSet uses per-replica volumeClaimTemplates; prior Deployment PVC %q is retained but no longer mounted (owner-referenced; reclaimed only when this CacheBackend is deleted, or reused if the backend switches back to deploymentKind=Deployment).")
+}
+
+func (r *CacheBackendReconciler) warnRetainedDataPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend, reason, message string) {
 	if r.Recorder == nil {
 		return
 	}
@@ -1484,8 +1502,7 @@ func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *c
 	if err := r.Patch(ctx, pvc, patch); err != nil {
 		return
 	}
-	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, eventReasonOrphanedPVCRetained, eventReasonOrphanedPVCRetained,
-		"spec.storage.pvc was removed but PVC %q is retained (owner-referenced; reclaimed only when this CacheBackend is deleted). The workload reverts to ephemeral storage; delete the CacheBackend to reclaim the volume, or re-add spec.storage.pvc to mount it again.", pvc.Name)
+	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, reason, reason, message, pvc.Name)
 }
 
 // reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
@@ -2000,10 +2017,10 @@ const invalidStorageMessage = "spec.storage.pvc on deploymentKind=Deployment req
 
 const immutableStatefulSetStorageMessage = "StatefulSet volumeClaimTemplates are immutable after creation; create a replacement CacheBackend or migrate data deliberately to change spec.storage.pvc"
 
-// annotationStorageRetainedWarned marks a retained (adopt-and-keep) PVC for
-// which the OrphanedPVCRetained Warning has already been emitted, so the
-// steady-state reconcile path warns once per orphaning rather than on every
-// resync. Cleared by applyPVC when the backend re-adopts the PVC.
+// annotationStorageRetainedWarned marks a retained shared PVC for which the
+// storage-retention Warning has already been emitted, so the steady-state
+// reconcile path warns once per retention episode rather than on every resync.
+// Cleared by applyPVC when the backend re-adopts the PVC.
 const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warned"
 
 type managedWorkloadObservation struct {

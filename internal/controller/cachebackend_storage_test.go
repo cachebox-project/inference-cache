@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -458,6 +459,63 @@ func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T)
 	}
 	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
 		t.Fatalf("OrphanedPVCRetained on the unmanaged/bypass path = %d, want 1", n)
+	}
+}
+
+func TestReconcileStorageKeptViaStatefulSetSwitchWarnsAndKeepsDeploymentPVC(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1") // provisions the shared Deployment PVC
+	getPVC(t, r, "cache-data", "ns1")
+	drainEvents(rec)
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	fresh.Spec.Replicas = ptrInt32(2)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("switch to StatefulSet kind: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); err != nil {
+		t.Fatalf("prior shared Deployment PVC must be retained across StatefulSet switch; get err=%v", err)
+	}
+	wantReason := eventReasonSharedPVCRetained
+	if n := countEvents(drainEvents(rec), wantReason); n != 1 {
+		t.Fatalf("SharedPVCRetained events after StatefulSet switch = %d, want exactly 1", n)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), wantReason); n != 0 {
+		t.Fatalf("SharedPVCRetained re-fired on resync = %d times, want 0", n)
+	}
+}
+
+func TestReconcileImmutableStatefulSetStorageClearsProbeRateLimiter(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(newScheme(t), cb)
+
+	reconcile(t, r, "cache", "ns1")
+	key := "ns1/cache"
+	now := time.Unix(2_000_000, 0)
+	r.probeLimiter.markCalled(key, now)
+	if got := r.probeLimiter.lastCalled(key); got != now {
+		t.Fatalf("planted rate-limit precondition failed: lastCalled = %v, want %v", got, now)
+	}
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend storage: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if got := r.probeLimiter.lastCalled(key); !got.IsZero() {
+		t.Fatalf("probeLimiter.lastCalled(%q) = %v after immutable StatefulSet storage drift; want zero", key, got)
 	}
 }
 

@@ -46,7 +46,7 @@ metadata:
 spec:
   type: LMCache
   deploymentKind: Deployment
-  # Single replica is required for a PVC-backed (ReadWriteOnce) backend.
+  # Single replica is required for a Deployment-backed ReadWriteOnce PVC.
   replicas: 1
   integration:
     engine: vllm
