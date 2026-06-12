@@ -400,6 +400,35 @@ func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testin
 	}
 }
 
+func TestReconcileStatefulSetRepairsPVCRetentionPolicy(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	cb.Spec.Replicas = ptrInt32(2)
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(newScheme(t), cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+		WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+	}
+	if err := r.Update(context.Background(), sts); err != nil {
+		t.Fatalf("drift statefulset retention policy: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	repaired := getStatefulSet(t, r, "cache", "ns1")
+	retention := repaired.Spec.PersistentVolumeClaimRetentionPolicy
+	if retention == nil ||
+		retention.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType ||
+		retention.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatalf("repaired persistentVolumeClaimRetentionPolicy = %+v, want Retain/Retain", retention)
+	}
+}
+
 func TestStatefulSetVolumeClaimTemplateComparisonIgnoresAPIServerDefaults(t *testing.T) {
 	volumeMode := corev1.PersistentVolumeFilesystem
 	live := corev1.PersistentVolumeClaim{
@@ -524,6 +553,39 @@ func TestReconcileStorageKeptViaStatefulSetSwitchWarnsAndKeepsDeploymentPVC(t *t
 	reconcile(t, r, "cache", "ns1")
 	if n := countEvents(drainEvents(rec), wantReason); n != 0 {
 		t.Fatalf("SharedPVCRetained re-fired on resync = %d times, want 0", n)
+	}
+}
+
+func TestReconcileRetainedPVCWarningsAreReasonScoped(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	getPVC(t, r, "cache-data", "ns1")
+	drainEvents(rec)
+
+	removed := getBackend(t, r, "cache", "ns1")
+	removed.Spec.Storage = nil
+	removed.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), removed); err != nil {
+		t.Fatalf("remove storage and switch to StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
+		t.Fatalf("OrphanedPVCRetained events after storage removal = %d, want 1", n)
+	}
+
+	readded := getBackend(t, r, "cache", "ns1")
+	withPVC(readded, "10Gi", nil)
+	readded.Spec.Replicas = ptrInt32(2)
+	if err := r.Update(context.Background(), readded); err != nil {
+		t.Fatalf("re-add storage while staying StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), eventReasonSharedPVCRetained); n != 1 {
+		t.Fatalf("SharedPVCRetained events after storage re-add on StatefulSet path = %d, want 1", n)
 	}
 }
 

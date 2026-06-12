@@ -1027,9 +1027,9 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 
 // applyStatefulSet creates or updates the backend StatefulSet idempotently,
 // owned by the CR. On update it reconciles mutable fields only: replicas,
-// serviceName, and pod template. volumeClaimTemplates and selector are
-// effectively immutable in Kubernetes, so they are established on create and
-// left intact afterward.
+// serviceName, PVC retention policy, and pod template. volumeClaimTemplates
+// and selector are effectively immutable in Kubernetes, so they are established
+// on create and left intact afterward.
 func (r *CacheBackendReconciler) applyStatefulSet(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.StatefulSet) error {
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
@@ -1042,6 +1042,7 @@ func (r *CacheBackendReconciler) applyStatefulSet(ctx context.Context, backend *
 			} else {
 				sts.Spec.Replicas = desired.Spec.Replicas
 				sts.Spec.ServiceName = desired.Spec.ServiceName
+				sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.Spec.PersistentVolumeClaimRetentionPolicy.DeepCopy()
 				sts.Spec.Template.Labels = desired.Spec.Template.Labels
 				reconcileManagedPodSpec(&sts.Spec.Template.Spec, &desired.Spec.Template.Spec)
 			}
@@ -1240,10 +1241,10 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 					}
 				}
 			}
-			// Re-adoption: clear the "already warned" marker (if any) left by a
-			// prior adopt-and-keep orphaning, so a future spec.storage.pvc
-			// removal warns again. delete on an absent key is a no-op.
-			delete(pvc.Annotations, annotationStorageRetainedWarned)
+			// Re-adoption: clear "already warned" markers (if any) left by prior
+			// retention modes, so a future removal or kind switch warns again.
+			// delete on an absent key is a no-op.
+			clearRetainedPVCWarningAnnotations(pvc.Annotations)
 			return controllerutil.SetControllerReference(backend, pvc, r.Scheme)
 		})
 		return e
@@ -1474,8 +1475,12 @@ func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx contex
 // every resync, so emitting unconditionally would re-fire the Warning forever.
 // We stamp the retained PVC with an annotation the first time we warn and skip
 // when it is already present, so the event fires once per orphaning rather than
-// per reconcile. applyPVC clears the annotation when the backend re-adopts the
-// PVC (spec.storage.pvc re-added), so a later removal warns again.
+// per reconcile. Each retention mode gets its own annotation so a PVC that was
+// already reported as an adopt-and-keep orphan can still later report that it
+// is retained but no longer mounted after a StatefulSet kind switch. applyPVC
+// clears these annotations when the backend re-adopts the PVC
+// (spec.storage.pvc re-added on the Deployment path), so a later removal warns
+// again.
 //
 // Fail-soft: a NotFound (the common case — no PVC was ever provisioned) or a
 // transient Get/Patch error simply emits nothing (the next reconcile retries).
@@ -1494,6 +1499,10 @@ func (r *CacheBackendReconciler) warnRetainedDataPVC(ctx context.Context, backen
 	if r.Recorder == nil {
 		return
 	}
+	warnedAnnotation := retainedPVCWarningAnnotation(reason)
+	if warnedAnnotation == "" {
+		return
+	}
 	pvc := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Name: pvcName(backend), Namespace: backend.Namespace}
 	if err := r.Get(ctx, key, pvc); err != nil {
@@ -1502,8 +1511,8 @@ func (r *CacheBackendReconciler) warnRetainedDataPVC(ctx context.Context, backen
 	if !metav1.IsControlledBy(pvc, backend) {
 		return
 	}
-	if pvc.Annotations[annotationStorageRetainedWarned] == "true" {
-		return // already warned for this orphaned PVC — stay quiet on resync.
+	if pvc.Annotations[warnedAnnotation] == "true" {
+		return // already warned for this reason on this PVC — stay quiet on resync.
 	}
 	// Stamp first, then emit: if the stamp write fails we skip the event and
 	// retry on the next reconcile, so a persistent Patch failure can't spam.
@@ -1511,7 +1520,7 @@ func (r *CacheBackendReconciler) warnRetainedDataPVC(ctx context.Context, backen
 	if pvc.Annotations == nil {
 		pvc.Annotations = map[string]string{}
 	}
-	pvc.Annotations[annotationStorageRetainedWarned] = "true"
+	pvc.Annotations[warnedAnnotation] = "true"
 	if err := r.Patch(ctx, pvc, patch); err != nil {
 		return
 	}
@@ -1881,7 +1890,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 		base.degradedMessage = "backend is not in a degraded state"
 	}
 
-	// Opt-out, or a Deployment that is not yet Available: nothing to gate.
+	// Opt-out, or a managed workload that is not yet serving: nothing to gate.
 	if !kvEventGateEnabled(backend) || readyStatus != metav1.ConditionTrue {
 		return base
 	}
@@ -2030,11 +2039,33 @@ const invalidStorageMessage = "spec.storage.pvc on deploymentKind=Deployment req
 
 const immutableStatefulSetStorageMessage = "StatefulSet volumeClaimTemplates are immutable after creation; create a replacement CacheBackend or migrate data deliberately to change spec.storage.pvc"
 
-// annotationStorageRetainedWarned marks a retained shared PVC for which the
-// storage-retention Warning has already been emitted, so the steady-state
-// reconcile path warns once per retention episode rather than on every resync.
-// Cleared by applyPVC when the backend re-adopts the PVC.
-const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warned"
+// Retained-PVC warning annotations mark the storage-retention Warnings already
+// emitted for a retained shared PVC, so the steady-state reconcile path warns
+// once per reason rather than on every resync. Stored on the PVC rather than
+// the CacheBackend so the guard follows the retained storage object. Cleared by
+// applyPVC when the backend re-adopts the PVC on the Deployment path.
+const (
+	annotationStorageRetainedWarnedLegacy = "inferencecache.io/storage-retained-warned"
+	annotationOrphanedPVCRetainedWarned   = "inferencecache.io/orphaned-pvc-retained-warned"
+	annotationSharedPVCRetainedWarned     = "inferencecache.io/shared-pvc-retained-warned"
+)
+
+func retainedPVCWarningAnnotation(reason string) string {
+	switch reason {
+	case eventReasonOrphanedPVCRetained:
+		return annotationOrphanedPVCRetainedWarned
+	case eventReasonSharedPVCRetained:
+		return annotationSharedPVCRetainedWarned
+	default:
+		return ""
+	}
+}
+
+func clearRetainedPVCWarningAnnotations(annotations map[string]string) {
+	delete(annotations, annotationStorageRetainedWarnedLegacy)
+	delete(annotations, annotationOrphanedPVCRetainedWarned)
+	delete(annotations, annotationSharedPVCRetainedWarned)
+}
 
 type managedWorkloadObservation struct {
 	kind               string
