@@ -10,15 +10,15 @@
 # survive injection (the adapter merges, never clobbers). A pod can opt
 # out per-instance with the annotation `inferencecache.io/skip-inject`.
 #
-# Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
-# canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler
-# from spec.autoscaling. spec.storage.pvc provisions a PersistentVolumeClaim
-# owner-referenced to the CacheBackend and mounts it into the cache-server
-# pod (see recipe-persistent-cache.yaml for a worked example). Switching the
+# The controller manages a Deployment or StatefulSet plus a ClusterIP Service
+# on port 65432 (the canonical LMCache lm:// port), plus an optional
+# HorizontalPodAutoscaler from spec.autoscaling. spec.storage.pvc provisions a
+# shared PVC for deploymentKind=Deployment or per-replica PVCs via
+# volumeClaimTemplates for deploymentKind=StatefulSet (see
+# recipe-persistent-cache.yaml for a worked example). Switching the
 # lmcache-server to actually spill KV to that volume — a disk-backed storage
 # device — is a separate follow-up; until then the volume is mounted but the
-# server still keeps KV in memory. A persistent backend must be single-replica
-# (a ReadWriteOnce PVC can't be multi-attached).
+# server still keeps KV in memory.
 #
 # Override the lmcache-server image (defaults to lmcache/standalone:latest)
 # or the server command via backendConfig until first-class spec fields land.

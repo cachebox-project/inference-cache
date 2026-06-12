@@ -341,6 +341,57 @@ func TestReconcileMultiReplicaViaAutoscalingGated(t *testing.T) {
 	expectEvent(t, drainEvents(rec), conditionReasonInvalidStorageConfiguration)
 }
 
+func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testing.T) {
+	scheme := newScheme(t)
+	fast := "fast"
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	cb.Spec.Replicas = ptrInt32(3)
+	withPVC(cb, "10Gi", &fast)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("StatefulSet persistent backend must not provision a Deployment; get err=%v", err)
+	}
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("StatefulSet persistent backend must not provision a shared PVC; get err=%v", err)
+	}
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 3 {
+		t.Fatalf("statefulset replicas = %v, want 3", sts.Spec.Replicas)
+	}
+	if len(sts.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("volumeClaimTemplates = %d, want 1: %#v", len(sts.Spec.VolumeClaimTemplates), sts.Spec.VolumeClaimTemplates)
+	}
+	tpl := sts.Spec.VolumeClaimTemplates[0]
+	if tpl.Name == "" {
+		t.Fatalf("volumeClaimTemplate name is empty")
+	}
+	if got := tpl.Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("10Gi")) != 0 {
+		t.Fatalf("volumeClaimTemplate size = %q, want 10Gi", got.String())
+	}
+	if tpl.Spec.StorageClassName == nil || *tpl.Spec.StorageClassName != "fast" {
+		t.Fatalf("volumeClaimTemplate storageClassName = %v, want fast", tpl.Spec.StorageClassName)
+	}
+	mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+	found := false
+	for _, mount := range mounts {
+		if mount.Name == tpl.Name && strings.HasPrefix(mount.MountPath, "/") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("lmcache-server mounts = %v, want absolute mount for volumeClaimTemplate %q", mounts, tpl.Name)
+	}
+	cond := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady)
+	if cond != nil && cond.Reason == conditionReasonInvalidStorageConfiguration {
+		t.Fatalf("StatefulSet per-replica PVC backend must not be gated as InvalidStorageConfiguration")
+	}
+}
+
 func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)
@@ -351,9 +402,8 @@ func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T)
 	getPVC(t, r, "cache-data", "ns1")
 	drainEvents(rec)
 
-	// Operator removes storage AND switches to StatefulSet, which dispatch routes
-	// to the unmanaged path — bypassing reconcileManaged entirely. The adopt-and-
-	// keep warning must still fire (it lives in dispatch), and the PVC must stay.
+	// Operator removes storage AND switches to StatefulSet. The adopt-and-keep
+	// warning must still fire (it lives in dispatch), and the PVC must stay.
 	fresh := getBackend(t, r, "cache", "ns1")
 	fresh.Spec.Storage = nil
 	fresh.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet

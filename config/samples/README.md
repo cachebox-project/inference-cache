@@ -30,7 +30,7 @@ before applying. All but `recipe-gpu-production` run without a GPU.
 | [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | `type: External` — point the operator at a cache server you manage yourself; the controller provisions nothing. |
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
-| [`recipe-persistent-cache.yaml`](recipe-persistent-cache.yaml) | `spec.storage.pvc` — provisions a PVC owner-referenced to the CacheBackend and mounts it into the cache-server pod (single replica; ReadWriteOnce). Adopt-and-keep on removal. (Server-side disk-backed KV is a separate follow-up; the volume is mounted but the server still keeps KV in memory.) |
+| [`recipe-persistent-cache.yaml`](recipe-persistent-cache.yaml) | `spec.storage.pvc` on `deploymentKind: Deployment` — provisions one owner-referenced ReadWriteOnce PVC and mounts it into the cache-server pod. Use `deploymentKind: StatefulSet` for per-replica PVCs. (Server-side disk-backed KV is a separate follow-up; the volume is mounted but the server still keeps KV in memory.) |
 
 **Prerequisites per recipe.** Most recipes are self-contained. One has an
 external dependency: `recipe-external-cache.yaml` needs a cache server already

@@ -58,12 +58,15 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. PVC-backed storage wire-up (spec.storage.pvc): a single-replica LMCache
-#      CacheBackend with spec.storage.pvc.size set provisions a PVC
-#      owner-referenced to the CacheBackend, mounts it into the cache-server
-#      pod, binds (waiting for the WaitForFirstConsumer pod schedule first),
-#      and populates status.capacity from the bound size. (Server-side
-#      disk-backed KV is a separate follow-up; not asserted here.)
+#   8b. PVC-backed storage wire-up (spec.storage.pvc): a single-replica
+#      Deployment LMCache CacheBackend with spec.storage.pvc.size set
+#      provisions a shared PVC owner-referenced to the CacheBackend, mounts
+#      it into the cache-server pod, binds (waiting for the
+#      WaitForFirstConsumer pod schedule first), and populates status.capacity
+#      from the bound size. A StatefulSet LMCache CacheBackend with
+#      spec.storage.pvc uses volumeClaimTemplates for per-replica PVCs.
+#      (Server-side disk-backed KV is a separate follow-up; not asserted
+#      here.)
 #   8c. CacheBackend.spec.resources defaults + threading: the CRD-schema
 #      default stamps spec.resources.limits.memory on every admitted
 #      CacheBackend (so the cache-server pod is bounded by the cgroup
@@ -1620,6 +1623,72 @@ if [ -z "$capacity" ]; then
   fail "status.capacity not populated after the PVC bound"
 fi
 log "persistent storage wired: PVC Bound, status.capacity=$capacity"
+
+# 5. StatefulSet persistent storage uses per-replica volumeClaimTemplates
+#    instead of the Deployment path's single shared PVC.
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: persistent-cache-sts
+  namespace: $STORAGE_SMOKE_NS
+spec:
+  type: LMCache
+  deploymentKind: StatefulSet
+  replicas: 2
+  integration:
+    engine: vllm
+  backendConfig:
+    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  storage:
+    pvc:
+      size: 1Gi
+EOF
+
+sts_deadline=$(($(date +%s) + 60))
+sts_service=""
+while [ "$(date +%s)" -lt "$sts_deadline" ]; do
+  sts_service="$(kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts \
+    -o jsonpath='{.spec.serviceName}' 2>/dev/null || true)"
+  [ -n "$sts_service" ] && break
+  sleep 2
+done
+if [ "$sts_service" != "persistent-cache-sts" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts -o yaml || true
+  fail "StatefulSet persistent-cache-sts not created with serviceName=persistent-cache-sts (serviceName=$sts_service)"
+fi
+if kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache-sts >/dev/null 2>&1; then
+  kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache-sts -o yaml || true
+  fail "deploymentKind=StatefulSet created an unexpected Deployment persistent-cache-sts"
+fi
+claim_template="$(kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].metadata.name}' 2>/dev/null || true)"
+claim_size="$(kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}' 2>/dev/null || true)"
+claim_mount="$(kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts \
+  -o jsonpath='{.spec.template.spec.containers[0].volumeMounts[?(@.name=="cache-data")].mountPath}' 2>/dev/null || true)"
+if [ "$claim_template" != "cache-data" ] || [ "$claim_size" != "1Gi" ] || [ -z "$claim_mount" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts -o yaml || true
+  fail "StatefulSet storage template/mount mismatch (template=$claim_template size=$claim_size mount=$claim_mount)"
+fi
+log "StatefulSet storage template wired: claimTemplate=$claim_template size=$claim_size mount=$claim_mount"
+
+log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the persistent StatefulSet to roll out"
+if ! kubectl -n "$STORAGE_SMOKE_NS" rollout status statefulset/persistent-cache-sts \
+     --timeout="${SAMPLE_GATE_TIMEOUT}s" >/dev/null 2>&1; then
+  kubectl -n "$STORAGE_SMOKE_NS" get statefulset persistent-cache-sts -o yaml || true
+  kubectl -n "$STORAGE_SMOKE_NS" get pods -l app.kubernetes.io/instance=persistent-cache-sts -o wide || true
+  kubectl -n "$STORAGE_SMOKE_NS" get pvc -o wide || true
+  fail "persistent StatefulSet did not roll out within ${SAMPLE_GATE_TIMEOUT}s"
+fi
+sts_pvc_count="$(kubectl -n "$STORAGE_SMOKE_NS" get pvc \
+  -l app.kubernetes.io/instance=persistent-cache-sts \
+  --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$sts_pvc_count" != "2" ]; then
+  kubectl -n "$STORAGE_SMOKE_NS" get pvc -o wide || true
+  fail "StatefulSet persistent-cache-sts PVC count=$sts_pvc_count, want 2 per-replica PVCs"
+fi
+log "StatefulSet persistent storage wired: per-replica PVC count=$sts_pvc_count"
 
 # Sample cleanup: drop the dedicated namespace (best-effort).
 kubectl delete namespace "$STORAGE_SMOKE_NS" \

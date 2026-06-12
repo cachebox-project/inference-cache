@@ -68,22 +68,24 @@ spec:
               (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
               HorizontalPodAutoscaler. On a managed Deployment backend
               (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
-              PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
-              when the CacheBackend is deleted), mounts it into the cache-server pod at the
-              runtime adapter's declared data path, and reports the bound PVC's actual size
-              in status.capacity.
+              single PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed
+              only when the CacheBackend is deleted), mounts it into the cache-server pod at
+              the runtime adapter's declared data path, and reports the bound PVC's actual
+              size in status.capacity. On a managed StatefulSet backend, spec.storage.pvc
+              renders a volumeClaimTemplate instead, giving each replica its own
+              ReadWriteOnce PVC.
 
               Two scoping rules apply:
 
-                - Only a managed Deployment backend provisions storage. A StatefulSet
-                  backend is routed to the unmanaged path today (see DeploymentKind), so it
-                  provisions nothing, storage included; per-replica volumeClaimTemplates are
-                  a follow-up. An External backend provisions no workload at all, so
-                  spec.storage.pvc is a no-op there.
-                - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
-                  multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
-                  Ready=False/InvalidStorageConfiguration rather than provisioned;
-                  per-replica persistent storage via StatefulSet is a separate follow-up.
+                - Managed Deployment backends provision one shared PVC. Managed StatefulSet
+                  backends provision per-replica PVCs via volumeClaimTemplates. External
+                  backends provision no workload at all, so spec.storage.pvc is a no-op
+                  there.
+                - A persistent Deployment backend must be single-replica. A ReadWriteOnce
+                  PVC cannot be multi-attached, so replicas (or an autoscaling ceiling) > 1
+                  is surfaced Ready=False/InvalidStorageConfiguration rather than
+                  provisioned. Use deploymentKind=StatefulSet for multi-replica persistent
+                  storage.
 
               NOTE: provisioning + mounting the PVC does not by itself make the cache server
               spill KV to it — switching the LMCache server to a disk-backed storage device
@@ -152,9 +154,9 @@ spec:
                 default: Deployment
                 description: |-
                   DeploymentKind identifies whether a managed backend is reconciled as a
-                  Deployment or StatefulSet. Defaults to Deployment — the only kind the
-                  Phase-1 reconciler templates; StatefulSet is reserved for future
-                  per-replica-PVC topologies and is a no-op today.
+                  Deployment or StatefulSet. Defaults to Deployment. StatefulSet uses the
+                  same adapter-rendered pod and service shape, but can back
+                  spec.storage.pvc with per-replica volumeClaimTemplates.
                 enum:
                 - Deployment
                 - StatefulSet
