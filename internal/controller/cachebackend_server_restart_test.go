@@ -369,6 +369,57 @@ func TestReconcileServerInstance_StatefulSetPodReplacementCascadesEngineDeployme
 	}
 }
 
+func TestReconcileServerInstance_ImmutableStatefulSetStorageDriftStillCascades(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+	switchFixtureBackendToStatefulSet(t, f, 1)
+
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := serverInstanceID(f.serverPod)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("baseline ObservedServerInstance = %q, want %q", got, baseline)
+	}
+
+	liveBackend := f.backend.DeepCopy()
+	liveBackend.Generation = 2
+	withPVC(liveBackend, "20Gi", nil)
+	if err := f.r.Update(context.Background(), liveBackend); err != nil {
+		t.Fatalf("add immutable StatefulSet storage drift: %v", err)
+	}
+
+	livePod := &corev1.Pod{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.serverPod.Name, Namespace: f.cacheNS}, livePod); err != nil {
+		t.Fatalf("get StatefulSet server pod: %v", err)
+	}
+	livePod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:         "lmcache-server",
+		Ready:        true,
+		RestartCount: 1,
+	}}
+	if err := f.r.Status().Update(context.Background(), livePod); err != nil {
+		t.Fatalf("bump StatefulSet server restart count: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	reconcile(t, f.r, f.cacheName, f.cacheNS)
+
+	want := fmt.Sprintf("%s:1", f.serverPod.UID)
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("cascade annotation during immutable StatefulSet storage drift = %q, want %q", got, want)
+	}
+	f.reload(t)
+	if got := f.backend.Status.ObservedServerInstance; got != want {
+		t.Fatalf("ObservedServerInstance during immutable StatefulSet storage drift = %q, want %q", got, want)
+	}
+	cond := findCondition(f.backend.Status.Conditions, conditionTypeReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonImmutableStatefulSetStorage {
+		t.Fatalf("Ready condition = %+v, want False/%s", cond, conditionReasonImmutableStatefulSetStorage)
+	}
+}
+
 func TestReconcileServerInstance_RateLimitedSecondCascadeIsDeferred(t *testing.T) {
 	f := newCascadeRestartFixture(t)
 	f.r.MinServerRestartCascadeInterval = 1 * time.Hour // make the window effectively block any second cascade

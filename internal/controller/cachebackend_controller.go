@@ -634,7 +634,19 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 			return ctrl.Result{}, err
 		}
 		if storageDrift {
-			return r.reconcileImmutableStatefulSetStorage(ctx, backend)
+			result, driftErr := r.reconcileImmutableStatefulSetStorage(ctx, backend)
+			if hpaErr := r.reconcileHPA(ctx, backend, workloadRefFromStatefulSet(sts)); hpaErr != nil && driftErr == nil {
+				driftErr = hpaErr
+			}
+			cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+			if cascadeWait > 0 && (result.RequeueAfter == 0 || cascadeWait < result.RequeueAfter) {
+				result.RequeueAfter = cascadeWait
+			}
+			pollCadence := r.minServerRestartCascadeInterval()
+			if result.RequeueAfter == 0 || pollCadence < result.RequeueAfter {
+				result.RequeueAfter = pollCadence
+			}
+			return result, driftErr
 		}
 		applyErr = r.applyStatefulSet(ctx, backend, sts)
 		if applyErr == nil {
@@ -1434,14 +1446,14 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 // volumeClaimTemplates after the StatefulSet already exists. Kubernetes does
 // not let the controller mutate those templates in place, so the safest
 // reconciliation is to leave the live workload untouched and tell the operator
-// to replace or migrate it explicitly.
+// to replace or migrate it explicitly. Because the live StatefulSet keeps
+// running, callers still reconcile HPA ownership and server-instance cascade
+// observation around this status update.
 func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	r.clearServerInstanceLatchShadow(backend)
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
-		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeReady,

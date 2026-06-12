@@ -7,6 +7,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -493,6 +494,35 @@ func TestReconcileStatefulSetStorageEditSurfacesImmutableDrift(t *testing.T) {
 	}
 	if updated.Status.ObservedGeneration != 2 {
 		t.Fatalf("status.observedGeneration = %d, want 2 so the immutable-storage condition is tied to the edited spec", updated.Status.ObservedGeneration)
+	}
+}
+
+func TestReconcileStatefulSetImmutableStorageDriftStillCleansUpHPA(t *testing.T) {
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 1, 3, nil)
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	_ = getHPA(t, r, "cache", "ns1")
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Generation = 2
+	fresh.Spec.Autoscaling = nil
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend autoscaling/storage: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(hpas.Items) != 0 {
+		t.Fatalf("HPAs = %d, want 0 after autoscaling cleared during immutable StatefulSet storage drift", len(hpas.Items))
 	}
 }
 
