@@ -334,6 +334,7 @@ func (v *CacheBackendValidator) collectErrors(cb *cachev1alpha1.CacheBackend) fi
 		errs = append(errs, rule(cb)...)
 	}
 	errs = append(errs, v.checkRuntimeAdapter(cb)...)
+	errs = append(errs, v.checkStatefulSetVolumeClaimTemplateNames(cb)...)
 	errs = append(errs, v.checkEngineOverrides(cb)...)
 	return errs
 }
@@ -898,6 +899,75 @@ func rejectStorageWithOverlongName(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 			fmt.Sprintf("too long for a persistent backend: the derived PVC name %q would exceed the %d-character limit; shorten the CacheBackend name or omit spec.storage.pvc", cb.Name+pvcNameSuffix, maxK8sNameLen),
 		),
 	}
+}
+
+// checkStatefulSetVolumeClaimTemplateNames rejects persistent StatefulSet
+// backends whose generated per-replica PVC name would exceed Kubernetes'
+// object-name limit. The controller uses the adapter-declared DataVolume name
+// as the volumeClaimTemplate name, and the StatefulSet controller expands that
+// into "<template-name>-<statefulset-name>-<ordinal>". The legacy
+// rejectStorageWithOverlongName rule only guards the Deployment shared-PVC
+// shape ("<cachebackend>-data"), so StatefulSet storage needs this adapter-aware
+// check at admission rather than discovering the invalid name when the
+// StatefulSet later fails to materialize PVCs.
+func (v *CacheBackendValidator) checkStatefulSetVolumeClaimTemplateNames(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
+		return nil
+	}
+	if cb.Spec.DeploymentKind != cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+		return nil
+	}
+	if cb.Spec.Type == "" {
+		return nil
+	}
+
+	registry := v.Registry
+	if registry == nil {
+		registry = defaultShippingRegistry()
+	}
+	adapter, err := registry.Select(adapterruntime.ResolveRuntimeID(cb), cb)
+	if err != nil {
+		// checkRuntimeAdapter already reports unsupported runtime/backend pairs.
+		return nil
+	}
+	resolved, err := adapter.ResolveCacheServer(cb)
+	if err != nil {
+		return field.ErrorList{
+			field.InternalError(
+				field.NewPath("spec", "storage", "pvc"),
+				fmt.Errorf("resolve cache server for StatefulSet PVC name validation: %w", err),
+			),
+		}
+	}
+	if resolved == nil || resolved.DataVolume == nil || resolved.DataVolume.VolumeName == "" {
+		return nil
+	}
+
+	claimName := fmt.Sprintf("%s-%s-%s",
+		resolved.DataVolume.VolumeName,
+		cb.Name,
+		statefulSetHighestOrdinal(cb),
+	)
+	if len(claimName) <= maxK8sNameLen {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("metadata", "name"),
+			cb.Name,
+			fmt.Sprintf("too long for a persistent StatefulSet backend: the derived per-replica PVC name %q would exceed the %d-character limit; shorten the CacheBackend name, lower the replica ceiling, or omit spec.storage.pvc", claimName, maxK8sNameLen),
+		),
+	}
+}
+
+func statefulSetHighestOrdinal(cb *cachev1alpha1.CacheBackend) string {
+	replicas := int32(1)
+	if cb.Spec.Autoscaling != nil && cb.Spec.Autoscaling.MaxReplicas > 0 {
+		replicas = cb.Spec.Autoscaling.MaxReplicas
+	} else if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 0 {
+		replicas = *cb.Spec.Replicas
+	}
+	return fmt.Sprintf("%d", replicas-1)
 }
 
 // rejectCrossNamespaceEndpointWithoutOptIn rejects an Endpoint that

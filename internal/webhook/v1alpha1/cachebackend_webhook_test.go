@@ -448,6 +448,19 @@ func TestValidator_StorageWithOverlongNameRejected(t *testing.T) {
 	if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
 		t.Fatalf("normal-length persistent backend rejected: %v", err)
 	}
+
+	// StatefulSet storage uses volumeClaimTemplates, and Kubernetes expands
+	// each per-replica PVC name as <template-name>-<statefulset-name>-<ordinal>.
+	// This name is shorter than the Deployment PVC limit above (241+5=246),
+	// but cache-data + name + ordinal would be 254 chars.
+	stateful := newBackend()
+	stateful.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	stateful.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	stateful.Name = strings.Repeat("s", 241)
+	stateful.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+		PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+	}
+	requireInvalidWithCause(t, v, stateful, "metadata.name", "per-replica PVC name")
 }
 
 func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
