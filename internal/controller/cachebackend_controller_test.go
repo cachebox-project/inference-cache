@@ -120,6 +120,18 @@ func getOptionalStatefulSet(t *testing.T, r *CacheBackendReconciler, name, names
 	return &sts, err
 }
 
+func markStatefulSetReady(t *testing.T, r *CacheBackendReconciler, name, namespace string, want int32) {
+	t.Helper()
+	sts := getStatefulSet(t, r, name, namespace)
+	sts.Status.ObservedGeneration = sts.Generation
+	sts.Status.Replicas = want
+	sts.Status.UpdatedReplicas = want
+	sts.Status.ReadyReplicas = want
+	if err := r.Status().Update(context.Background(), sts); err != nil {
+		t.Fatalf("update statefulset status to ready: %v", err)
+	}
+}
+
 func getBackend(t *testing.T, r *CacheBackendReconciler, name, namespace string) *cachev1alpha1.CacheBackend {
 	t.Helper()
 	var cb cachev1alpha1.CacheBackend
@@ -785,6 +797,115 @@ func TestReconcileStatefulSetKindCreatesStatefulSet(t *testing.T) {
 	}
 }
 
+func TestReconcileDeploymentToStatefulSetApplyFailureClearsStatus(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+
+	gr := schema.GroupResource{Group: "apps", Resource: "statefulsets"}
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*appsv1.StatefulSet); ok {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	markDeploymentReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	before := getBackend(t, r, "cache", "ns1")
+	if before.Status.Endpoint == "" {
+		t.Fatalf("test setup failed: status.endpoint empty before kind switch")
+	}
+	if ready := findCondition(before.Status.Conditions, conditionTypeReady); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("test setup failed: Ready = %+v, want True before kind switch", ready)
+	}
+
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	switching.Generation = 2
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch backend to StatefulSet: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (StatefulSet create was blocked)")
+	}
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("old Deployment should be deleted during kind switch; get err=%v", err)
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared after replacement apply failure", updated.Status.Endpoint)
+	}
+	if ready := findCondition(updated.Status.Conditions, conditionTypeReady); ready == nil || ready.Status == metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want non-True after replacement apply failure", ready)
+	}
+	if got := updated.Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 (replacement apply failed)", got)
+	}
+}
+
+func TestReconcileStatefulSetToDeploymentApplyFailureClearsStatus(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	cb.Spec.Replicas = ptrInt32(1)
+
+	gr := schema.GroupResource{Group: "apps", Resource: "deployments"}
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				return apierrors.NewForbidden(gr, obj.GetName(), errors.New("denied by admission webhook"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	markStatefulSetReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	before := getBackend(t, r, "cache", "ns1")
+	if before.Status.Endpoint == "" {
+		t.Fatalf("test setup failed: status.endpoint empty before kind switch")
+	}
+	if ready := findCondition(before.Status.Conditions, conditionTypeReady); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("test setup failed: Ready = %+v, want True before kind switch", ready)
+	}
+
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindDeployment
+	switching.Generation = 2
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch backend to Deployment: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	}); err == nil {
+		t.Fatalf("reconcile returned nil, want error (Deployment create was blocked)")
+	}
+	if _, err := getOptionalStatefulSet(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("old StatefulSet should be deleted during kind switch; get err=%v", err)
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	if updated.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared after replacement apply failure", updated.Status.Endpoint)
+	}
+	if ready := findCondition(updated.Status.Conditions, conditionTypeReady); ready == nil || ready.Status == metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want non-True after replacement apply failure", ready)
+	}
+	if got := updated.Status.ObservedGeneration; got != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 (replacement apply failed)", got)
+	}
+}
+
 func TestReconcileStatefulSetDoesNotScheduleDeploymentCascadePoll(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
@@ -1351,7 +1472,7 @@ func TestReconcileIgnoresMissingObject(t *testing.T) {
 func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Funcs, objs ...client.Object) *CacheBackendReconciler {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()

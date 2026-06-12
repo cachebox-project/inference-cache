@@ -256,9 +256,9 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // Reconcile drives a CacheBackend toward its desired state. External backends
 // only mirror their configured endpoint to status; managed backends (LMCache
 // in Phase 1) ask the registered runtime adapter for the cache-server pod
-// spec + service spec, wrap them into a Deployment + Service the controller
-// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
-// resolved endpoint.
+// spec + service spec, wrap them into a Deployment or StatefulSet plus a
+// Service the controller owns, optionally reconcile an HPA from
+// spec.autoscaling, and publish the resolved endpoint.
 //
 // On every reconcile — including ones that return an apply error — transitions
 // in the observed Ready condition (entering/leaving Ready=False/
@@ -619,8 +619,9 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	svc := r.buildService(backend, svcSpec)
 
 	var (
-		applyErr error
-		workload managedWorkloadObservation
+		applyErr               error
+		replacementUnavailable bool
+		workload               managedWorkloadObservation
 	)
 	switch desiredKind {
 	case cachev1alpha1.CacheBackendDeploymentKindStatefulSet:
@@ -648,17 +649,21 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		var live appsv1.StatefulSet
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sts), &live); err != nil {
 			if apierrors.IsNotFound(err) && applyErr != nil {
-				return ctrl.Result{}, applyErr
+				replacementUnavailable = true
+				workload = observationFromStatefulSet(sts)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("get statefulset %s/%s: %w", sts.Namespace, sts.Name, err)
 			}
-			return ctrl.Result{}, fmt.Errorf("get statefulset %s/%s: %w", sts.Namespace, sts.Name, err)
-		}
-		if !metav1.IsControlledBy(&live, backend) {
+		} else if !metav1.IsControlledBy(&live, backend) {
 			if applyErr != nil {
-				return ctrl.Result{}, applyErr
+				replacementUnavailable = true
+				workload = observationFromStatefulSet(sts)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("statefulset %s/%s lost controller reference after apply", sts.Namespace, sts.Name)
 			}
-			return ctrl.Result{}, fmt.Errorf("statefulset %s/%s lost controller reference after apply", sts.Namespace, sts.Name)
+		} else {
+			workload = observationFromStatefulSet(&live)
 		}
-		workload = observationFromStatefulSet(&live)
 	default:
 		if err := r.deleteOwnedStatefulSet(ctx, backend); err != nil {
 			return ctrl.Result{}, err
@@ -677,31 +682,36 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		var live appsv1.Deployment
 		if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
 			if apierrors.IsNotFound(err) && applyErr != nil {
-				// Apply failed before creating the Deployment, so there is no
-				// observed state to publish — surface the apply error to requeue.
-				return ctrl.Result{}, applyErr
+				// Apply failed before creating the Deployment. Continue to the
+				// status pass with an empty endpoint so a kind-switch failure
+				// does not keep advertising the workload deleted above.
+				replacementUnavailable = true
+				workload = observationFromDeployment(dep)
+			} else {
+				// Either a transient Get error, or NotFound after a successful apply
+				// (deleted out-of-band between apply and Get). Both must requeue;
+				// silently reporting success here would freeze status at a stale
+				// snapshot.
+				return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 			}
-			// Either a transient Get error, or NotFound after a successful apply
-			// (deleted out-of-band between apply and Get). Both must requeue;
-			// silently reporting success here would freeze status at a stale
-			// snapshot.
-			return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
-		}
-		// Never publish status derived from a foreign workload. The common case
-		// is an AlreadyOwned collision during apply (applyErr is set; surface
-		// it). The race case is that apply succeeded but the live Deployment's
-		// controller ref was changed out-of-band between Update and this Get —
-		// applyErr is nil, but we no longer own the object. Returning nil there
-		// would silently mark the reconcile successful AND lose the owned-object
-		// watch (no future event would re-trigger), so synthesize an explicit
-		// error to requeue.
-		if !metav1.IsControlledBy(&live, backend) {
+		} else if !metav1.IsControlledBy(&live, backend) {
+			// Never publish status derived from a foreign workload. The common
+			// case is an AlreadyOwned collision during apply (applyErr is set;
+			// surface it). The race case is that apply succeeded but the live
+			// Deployment's controller ref was changed out-of-band between Update
+			// and this Get — applyErr is nil, but we no longer own the object.
+			// Returning nil there would silently mark the reconcile successful
+			// AND lose the owned-object watch (no future event would re-trigger),
+			// so synthesize an explicit error to requeue.
 			if applyErr != nil {
-				return ctrl.Result{}, applyErr
+				replacementUnavailable = true
+				workload = observationFromDeployment(dep)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
 			}
-			return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
+		} else {
+			workload = observationFromDeployment(&live)
 		}
-		workload = observationFromDeployment(&live)
 	}
 
 	// Endpoint is derived from the *live* Service, not the desired one: if
@@ -711,12 +721,16 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	// when the Service hasn't materialized or is owned by someone else.
 	var liveSvc corev1.Service
 	endpoint := ""
-	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+	if !replacementUnavailable {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+			}
+		} else if metav1.IsControlledBy(&liveSvc, backend) {
+			endpoint = serviceEndpoint(&liveSvc)
 		}
-	} else if metav1.IsControlledBy(&liveSvc, backend) {
-		endpoint = serviceEndpoint(&liveSvc)
+	} else {
+		capacity = ""
 	}
 
 	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, workload, applyErr == nil)
