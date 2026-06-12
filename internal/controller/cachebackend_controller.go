@@ -742,58 +742,42 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	// for the latch field, gated separately. Capture the error and
 	// return it AFTER the cascade has run.
 
-	if desiredKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
-		// The cache-server restart cascade currently authenticates cache-server
-		// pods through the owned Deployment/ReplicaSet chain. A StatefulSet is a
-		// managed workload here, but it is outside that cascade observer's
-		// contract, so clear any prior Deployment-era latch rather than
-		// advertising a stale pod identity.
-		r.clearServerInstanceLatchShadow(backend)
-		if backend.Status.ObservedServerInstance != "" {
-			if err := r.patchStatus(ctx, backend, func() {
-				backend.Status.ObservedServerInstance = ""
-			}); err != nil && statusErr == nil {
-				statusErr = err
-			}
-		}
-	} else {
-		// Cache-server restart cascade: when the Ready cache-server pod
-		// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
-		// restart-sum advance from an in-place kubelet-driven container
-		// restart — see currentServerInstanceID's godoc for the shape),
-		// cascade-restart every engine Deployment that was injected
-		// against this backend so they re-establish their LMCache client
-		// socket (the upstream LMServerConnector opens its TCP socket in
-		// __init__ only and silently fails every subsequent PUT with EPIPE
-		// after a server restart, until the engine pod itself rolls). Always
-		// runs (even when applyErr != nil OR updateManagedStatus errored),
-		// since the cascade is independent of whether THIS reconcile pass
-		// made a successful apply or a successful unrelated status update:
-		// a transient apply / status-write churn must not delay engine
-		// recovery from a cache-server outage. A non-zero cascadeWait means
-		// the rate-limit window suppressed the cascade; honor it on the
-		// requeue so we retry exactly at the boundary.
-		cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
-		if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
-			requeueAfter = cascadeWait
-		}
-		// Schedule an unconditional periodic re-poll of the cache-server
-		// pod set for Deployment-managed backends. Reason: an in-place
-		// container restart (kubelet respawning a crashed cache-server
-		// container without bumping pod.UID) does NOT change owned-Deployment
-		// status counts, and the controller deliberately does not watch Pods
-		// cluster-wide (see refreshMatchedEnginePods godoc). The
-		// matched-engine-pods cadence above does not cover this case either:
-		// when an operator removes spec.engineSelector after engines were
-		// injected, len(matchedEnginePods)→0 and that cadence stops firing,
-		// leaving in-place restarts unobservable until something unrelated
-		// triggers a reconcile. Pinning a floor at the rate-limit interval
-		// bounds the observation latency for in-place restarts at one cadence
-		// (cheap: one Pod List + one Deployment Get per backend per cadence).
-		pollCadence := r.minServerRestartCascadeInterval()
-		if requeueAfter == 0 || pollCadence < requeueAfter {
-			requeueAfter = pollCadence
-		}
+	// Cache-server restart cascade: when the Ready cache-server pod
+	// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
+	// restart-sum advance from an in-place kubelet-driven container
+	// restart — see currentServerInstanceID's godoc for the shape),
+	// cascade-restart every engine Deployment that was injected
+	// against this backend so they re-establish their LMCache client
+	// socket (the upstream LMServerConnector opens its TCP socket in
+	// __init__ only and silently fails every subsequent PUT with EPIPE
+	// after a server restart, until the engine pod itself rolls). Always
+	// runs (even when applyErr != nil OR updateManagedStatus errored),
+	// since the cascade is independent of whether THIS reconcile pass
+	// made a successful apply or a successful unrelated status update:
+	// a transient apply / status-write churn must not delay engine
+	// recovery from a cache-server outage. A non-zero cascadeWait means
+	// the rate-limit window suppressed the cascade; honor it on the
+	// requeue so we retry exactly at the boundary.
+	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
+		requeueAfter = cascadeWait
+	}
+	// Schedule an unconditional periodic re-poll of the cache-server
+	// pod set for managed backends. Reason: an in-place container
+	// restart (kubelet respawning a crashed cache-server container
+	// without bumping pod.UID) does NOT change owned workload readiness
+	// status, and the controller deliberately does not watch Pods
+	// cluster-wide (see refreshMatchedEnginePods godoc). The
+	// matched-engine-pods cadence above does not cover this case either:
+	// when an operator removes spec.engineSelector after engines were
+	// injected, len(matchedEnginePods)→0 and that cadence stops firing,
+	// leaving in-place restarts unobservable until something unrelated
+	// triggers a reconcile. Pinning a floor at the rate-limit interval
+	// bounds the observation latency for in-place restarts at one cadence
+	// (cheap: one Pod List + one workload Get per backend per cadence).
+	pollCadence := r.minServerRestartCascadeInterval()
+	if requeueAfter == 0 || pollCadence < requeueAfter {
+		requeueAfter = pollCadence
 	}
 
 	if applyErr != nil {

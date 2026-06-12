@@ -11,6 +11,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -199,7 +200,7 @@ func newCascadeRestartFixture(t *testing.T, opts ...func(*cascadeRestartFixture)
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}, &corev1.PersistentVolumeClaim{}).
 		WithObjects(f.backend, f.serverDep, f.serverRS, f.serverPod, f.engineDep, f.engineRS, f.enginePod).
 		Build()
 	f.r = &CacheBackendReconciler{
@@ -309,6 +310,59 @@ func TestReconcileServerInstance_UIDChangeCascadesEngineDeployment(t *testing.T)
 	f.reload(t)
 	if got := f.backend.Status.ObservedServerInstance; got != serverInstanceID(f.serverPod) {
 		t.Fatalf("ObservedServerInstance = %q, want %q", got, serverInstanceID(f.serverPod))
+	}
+	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
+		t.Fatalf("cascade counter = %v, want 1", got)
+	}
+}
+
+func TestReconcileServerInstance_StatefulSetPodReplacementCascadesEngineDeployment(t *testing.T) {
+	f := newCascadeRestartFixture(t)
+	switchFixtureBackendToStatefulSet(t, f, 1)
+
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("baseline wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	baseline := serverInstanceID(f.serverPod)
+	if got := f.backend.Status.ObservedServerInstance; got != baseline {
+		t.Fatalf("baseline ObservedServerInstance = %q, want %q", got, baseline)
+	}
+	f.reloadEngineDep(t)
+	if _, ok := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; ok {
+		t.Fatalf("engine deployment got cascade annotation on StatefulSet first observation")
+	}
+
+	if err := f.r.Delete(context.Background(), f.serverPod); err != nil {
+		t.Fatalf("delete StatefulSet server pod: %v", err)
+	}
+	replacement := f.serverPod.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.Name = "cache-0-replacement"
+	replacement.UID = "cache-sts-pod-uid-2"
+	if err := f.r.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create StatefulSet replacement pod: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), replacement); err != nil {
+		t.Fatalf("ready StatefulSet replacement pod: %v", err)
+	}
+	f.serverPod = replacement
+	if err := setOwnedStatefulSetConverged(f, 1); err != nil {
+		t.Fatalf("set StatefulSet converged after pod replacement: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if wait := f.r.reconcileServerInstance(context.Background(), logr.Discard(), f.backend); wait != 0 {
+		t.Fatalf("replacement wait = %v, want 0", wait)
+	}
+	f.reload(t)
+	want := serverInstanceID(replacement)
+	if got := f.backend.Status.ObservedServerInstance; got != want {
+		t.Fatalf("ObservedServerInstance after StatefulSet replacement = %q, want %q", got, want)
+	}
+	f.reloadEngineDep(t)
+	if got := f.engineDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != want {
+		t.Fatalf("cascade annotation after StatefulSet replacement = %q, want %q", got, want)
 	}
 	if got := cascadeRestartsCount(t, f.cacheNS, f.cacheName, cascadeRestartReasonServerInstanceChanged); got != 1 {
 		t.Fatalf("cascade counter = %v, want 1", got)
@@ -1235,6 +1289,95 @@ func setOwnedDeploymentConverged(f *cascadeRestartFixture, replicas int32) error
 	live.Status.ObservedGeneration = live.Generation
 	if err := f.r.Status().Update(context.Background(), live); err != nil {
 		return fmt.Errorf("update serverDep.Status: %w", err)
+	}
+	return nil
+}
+
+func switchFixtureBackendToStatefulSet(t *testing.T, f *cascadeRestartFixture, replicas int32) {
+	t.Helper()
+	liveBackend := f.backend.DeepCopy()
+	liveBackend.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := f.r.Update(context.Background(), liveBackend); err != nil {
+		t.Fatalf("switch backend fixture to StatefulSet: %v", err)
+	}
+	f.reload(t)
+
+	if err := f.r.Delete(context.Background(), f.serverDep); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("delete Deployment fixture: %v", err)
+	}
+	if err := f.r.Delete(context.Background(), f.serverRS); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("delete ReplicaSet fixture: %v", err)
+	}
+
+	tru := true
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      f.cacheName,
+			Namespace: f.cacheNS,
+			UID:       "cache-sts-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: cachev1alpha1.GroupVersion.String(),
+				Kind:       "CacheBackend",
+				Name:       f.backend.Name,
+				UID:        f.backend.UID,
+				Controller: &tru,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    ptrInt32(replicas),
+			ServiceName: f.cacheName,
+			Selector:    &metav1.LabelSelector{MatchLabels: selectorLabels(f.cacheName)},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selectorLabels(f.cacheName)},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "lmcache-server", Image: "lmcache:test"}},
+				},
+			},
+		},
+	}
+	if err := f.r.Create(context.Background(), sts); err != nil {
+		t.Fatalf("create StatefulSet fixture: %v", err)
+	}
+
+	pod := f.serverPod.DeepCopy()
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "StatefulSet",
+		Name:       sts.Name,
+		UID:        sts.UID,
+		Controller: &tru,
+	}}
+	if err := f.r.Update(context.Background(), pod); err != nil {
+		t.Fatalf("move server pod ownerRef to StatefulSet: %v", err)
+	}
+	if err := f.r.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("preserve server pod status after StatefulSet ownerRef switch: %v", err)
+	}
+	f.serverPod = pod
+
+	if err := setOwnedStatefulSetConverged(f, replicas); err != nil {
+		t.Fatalf("set StatefulSet fixture converged: %v", err)
+	}
+}
+
+func setOwnedStatefulSetConverged(f *cascadeRestartFixture, replicas int32) error {
+	live := &appsv1.StatefulSet{}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.cacheName, Namespace: f.cacheNS}, live); err != nil {
+		return fmt.Errorf("get live StatefulSet: %w", err)
+	}
+	live.Spec.Replicas = ptrInt32(replicas)
+	if err := f.r.Update(context.Background(), live); err != nil {
+		return fmt.Errorf("update StatefulSet.Spec.Replicas: %w", err)
+	}
+	if err := f.r.Get(context.Background(), types.NamespacedName{Name: f.cacheName, Namespace: f.cacheNS}, live); err != nil {
+		return fmt.Errorf("reload live StatefulSet: %w", err)
+	}
+	live.Status.ReadyReplicas = replicas
+	live.Status.UpdatedReplicas = replicas
+	live.Status.Replicas = replicas
+	live.Status.ObservedGeneration = live.Generation
+	if err := f.r.Status().Update(context.Background(), live); err != nil {
+		return fmt.Errorf("update StatefulSet.Status: %w", err)
 	}
 	return nil
 }

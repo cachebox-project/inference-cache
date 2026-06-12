@@ -906,7 +906,7 @@ func TestReconcileStatefulSetToDeploymentApplyFailureClearsStatus(t *testing.T) 
 	}
 }
 
-func TestReconcileStatefulSetDoesNotScheduleDeploymentCascadePoll(t *testing.T) {
+func TestReconcileStatefulSetSchedulesServerInstancePoll(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
@@ -918,8 +918,8 @@ func TestReconcileStatefulSetDoesNotScheduleDeploymentCascadePoll(t *testing.T) 
 	if err != nil {
 		t.Fatalf("reconcile StatefulSet backend: %v", err)
 	}
-	if result.RequeueAfter != 0 {
-		t.Fatalf("StatefulSet reconcile RequeueAfter = %s, want 0; Deployment restart-cascade polling does not apply", result.RequeueAfter)
+	if result.RequeueAfter != DefaultMinServerRestartCascadeInterval {
+		t.Fatalf("StatefulSet reconcile RequeueAfter = %s, want %s server-instance poll cadence", result.RequeueAfter, DefaultMinServerRestartCascadeInterval)
 	}
 }
 
@@ -953,11 +953,11 @@ func TestReconcileSwitchToStatefulSetShedsDeployment(t *testing.T) {
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Reason != conditionReasonRolloutInProgress {
 		t.Fatalf("Ready condition = %+v, want rollout status from StatefulSet", cond)
 	}
-	if updated.Status.ObservedServerInstance != "" {
-		t.Fatalf("status.observedServerInstance = %q, want cleared after switch to StatefulSet", updated.Status.ObservedServerInstance)
+	if updated.Status.ObservedServerInstance != "deployment-pod-uid:0" {
+		t.Fatalf("status.observedServerInstance = %q, want prior latch retained until the StatefulSet has a Ready pod", updated.Status.ObservedServerInstance)
 	}
-	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
-		t.Fatalf("cascade shadow = %q after switch to StatefulSet; want cleared", shadow)
+	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "deployment-pod-uid:0" {
+		t.Fatalf("cascade shadow = %q after switch to StatefulSet; want prior latch retained until replacement observation", shadow)
 	}
 	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
 		t.Fatalf("deployment should be deleted after switch to StatefulSet kind; get err=%v", err)

@@ -565,12 +565,13 @@ type CacheBackendStatus struct {
 	Endpoint string `json:"endpoint,omitempty"`
 
 	// Capacity is a human-readable summary of the backend's provisioned
-	// capacity: the bound PersistentVolumeClaim's actual capacity when
-	// spec.storage.pvc is set and the PVC has bound (the real provisioned size,
-	// which may exceed the request), or empty for an ephemeral backend or while
-	// the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
-	// binds only once the pod schedules). It is informational; clients must not
-	// parse it.
+	// capacity: for Deployment-backed persistent storage, the bound shared
+	// PersistentVolumeClaim's actual capacity when the PVC has bound (the real
+	// provisioned size, which may exceed the request). Empty for an ephemeral
+	// backend, a StatefulSet backend (per-replica PVCs have no aggregate
+	// capacity projection yet), or while the Deployment PVC is still pending
+	// (e.g. a WaitForFirstConsumer StorageClass that binds only once the pod
+	// schedules). It is informational; clients must not parse it.
 	// +optional
 	Capacity string `json:"capacity,omitempty"`
 
@@ -625,42 +626,41 @@ type CacheBackendStatus struct {
 	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
 
 	// FirstAvailableAt latches the first time the managed cache-backend
-	// workload was observed Available — the stable anchor for the
-	// firstEventTimeout clock. It is deliberately a latched timestamp rather
-	// than the live Deployment's Available condition LastTransitionTime: that
-	// condition resets on an availability flap, which would restart the
+	// workload was observed serving (Deployment Available or StatefulSet Ready)
+	// — the stable anchor for the firstEventTimeout clock. It is deliberately
+	// a latched timestamp rather than the live workload transition time: that
+	// transition resets on an availability flap, which would restart the
 	// timeout window and let a backend that already breached the timeout
 	// (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
 	// without any KV event — contradicting the "once Degraded, stays Degraded
 	// until an event arrives" contract. Anchoring on this write-once value
 	// keeps the elapsed window monotonic, so Degraded is sticky. Written
-	// write-once when the workload first reports Available and never cleared
+	// write-once when the workload first reports serving and never cleared
 	// (inert while the backend is not managed). A genuinely recreated managed
-	// Deployment keeps the prior anchor; the gate re-evaluates from it, which
-	// is safe because the engine event source is unchanged by a cache-server
+	// workload keeps the prior anchor; the gate re-evaluates from it, which is
+	// safe because the engine event source is unchanged by a cache-server
 	// restart.
 	// +optional
 	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
 
-	// ObservedServerInstance is the controller's cascade-decision
-	// baseline — a stable identifier for the Ready cache-server pod
-	// set the controller last anchored against. NOT a live current-
-	// pod-set view: the controller intentionally pins this through
-	// transient rolling-update midpoints and through no-Ready
-	// windows so the cascade does not fire on rollbacks or transient
-	// outages. For the live pod inventory, operators should consult
+	// ObservedServerInstance is the controller's cascade-decision baseline — a
+	// stable identifier for the Ready cache-server pod set the controller last
+	// anchored against. NOT a live current-pod-set view: the controller
+	// intentionally pins this through transient rolling-update midpoints and
+	// through no-Ready windows so the cascade does not fire on rollbacks or
+	// transient outages. For the live pod inventory, operators should consult
 	// status.matchedEnginePods (engine side) and `kubectl get pod`
 	// (cache-server side).
 	//
-	// Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
-	// and lex-sorted by pod name. restart-sum is the per-pod
-	// containerStatuses[].RestartCount summed across cache-server
-	// containers (the names from the owned Deployment's pod
-	// template; foreign sidecars are excluded). Inert and cleared
-	// for External backends, unsupported-runtime backends, and on
-	// the InvalidStorageConfiguration gate (a persistent
-	// multi-replica spec the controller refuses to provision until
-	// the operator scales to 1 or removes spec.storage.pvc).
+	// Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined and
+	// lex-sorted by pod name. restart-sum is the per-pod
+	// containerStatuses[].RestartCount summed across cache-server containers
+	// (the names from the owned workload's pod template; foreign sidecars are
+	// excluded). Inert and cleared for External backends, unsupported-runtime
+	// backends, and on the InvalidStorageConfiguration gate (a persistent
+	// multi-replica Deployment spec the controller refuses to provision until
+	// the operator scales to 1, removes spec.storage.pvc, or switches to
+	// StatefulSet).
 	//
 	// Operator-side recovery for the upstream LMCache
 	// LMServerConnector EPIPE-on-restart bug. See
