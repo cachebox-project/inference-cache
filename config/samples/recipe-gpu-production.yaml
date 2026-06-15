@@ -24,10 +24,10 @@
 # `kubectl rollout restart deploy/prod-llm-engine` if the first pod comes up
 # unwired. See docs/concepts/cachebackend-engine-binding.md.
 #
-# IMAGES ARE PLACEHOLDERS — replace before production. Both the managed
-# cache-server image and the engine image below use moving `:latest` tags so the
-# recipe stays self-contained; pin each to an immutable digest for a real
-# deployment.
+# IMAGES ARE PLACEHOLDERS — replace before production. The engine image below
+# uses a moving `:latest` tag so the recipe stays self-contained; the managed
+# cache-server `serverImage` is pinned to a version (not `:latest`). Pin each to
+# an immutable digest for a real deployment.
 #
 # READY/OBSERVABILITY PREREQUISITE: the backend reaches Ready=True and reports
 # index entries only once the kvevent-subscriber sidecar is auto-attached, which
