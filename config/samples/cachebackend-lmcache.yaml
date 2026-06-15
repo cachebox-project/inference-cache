@@ -20,8 +20,9 @@
 # server still keeps KV in memory. A persistent backend must be single-replica
 # (a ReadWriteOnce PVC can't be multi-attached).
 #
-# Override the lmcache-server image (defaults to lmcache/standalone:latest)
-# or the server command via backendConfig until first-class spec fields land.
+# Override the lmcache-server image (defaults to a pinned lmcache/standalone
+# version; keep it wire-compatible with the engine's lmcache client) or the
+# server command via backendConfig until first-class spec fields land.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

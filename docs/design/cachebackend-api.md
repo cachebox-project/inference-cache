@@ -102,7 +102,7 @@ Server-side (consumed by `ResolveCacheServer` when rendering the cache-server po
 
 | Key | Default | Purpose |
 |---|---|---|
-| `serverImage` | `lmcache/standalone:latest` | Container image for the standalone lmcache-server. Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
+| `serverImage` | `lmcache/standalone:v0.4.7` *(pinned, non-floating; see version-alignment note below)* | Container image for the standalone lmcache-server. The default is pinned to a specific version — **not** a floating `:latest` — because the server's wire protocol must match the lmcache *client* compiled into the engine; a drifting `:latest` silently breaks tier-2 offload (see [LMCache server / client version alignment](#lmcache-server--client-version-alignment)). Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
 
 Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod to the cache):
@@ -128,6 +128,18 @@ The retired colocated-rendering keys (`image`, `profile`, `hfTokenSecret`) were 
 `model` is **not** retired: the pod-mutating webhook reads `backendConfig.model` as the served model id for the `kvevent-subscriber` sidecar's `--model-id` flag. When the key is unset, the adapter skips appending the sidecar (the subscriber binary requires the flag); the next pod admission after the operator sets the key picks it up. Set this to the served model identifier the engine container is loaded with (the value that ends up in the engine's `served_model_name`).
 
 The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` flag defaults to empty, in which case the adapter returns no sidecar regardless of `backendConfig.model`. Operators turn auto-attach on by passing a real (digest-pinned in production) image. This default protects an unconfigured install from `ImagePullBackOff` on a nonexistent sidecar image, which would otherwise block engine pod readiness.
+
+### LMCache server / client version alignment
+
+The standalone lmcache-server image (`backendConfig.serverImage`, default `lmcache/standalone:v0.4.7`) and the **lmcache client** compiled into the engine image (operator-supplied, or pip-installed into the engine at runtime) communicate over a versioned wire protocol. **They must be wire-compatible.** A mismatch does not fail loudly: remote KV stores fail (e.g. `[Errno 32] Broken pipe` / connection resets), the backend records 0 reload hits, and tier-2 (remote KV offload) is **silently disabled** with no surfaced error. The cache plane keeps serving and routing; it simply never gets a tier-2 hit, which is hard to distinguish from a cold cache.
+
+The **same silent store-failure signature can also come from an under-provisioned server that is OOMKilled under load** — the standalone server keeps KV in memory, and a default memory request far below a large model's working-set KV (e.g. a 32B model's KV is tens of GB) will OOM the server the moment stores begin, dropping every connection. Size the server's memory to the expected working set. (Surfacing tier-2 store-failure / hit-rate health so neither failure mode stays silent is a separate follow-up.)
+
+Because of this:
+
+- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `pkg/adapters/runtime/vllm_lmcache.go`.)
+- **Pin both sides.** When an operator overrides `serverImage`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest on `serverImage`.
+- IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus the pinned default; runtime detection / a tier-2 health signal is a separate follow-up.
 
 ### Persistent storage
 
