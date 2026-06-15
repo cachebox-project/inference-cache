@@ -1068,7 +1068,7 @@ func TestReconcileManagedPodSpecPrunesStaleContainersAndVolumesOnUpgrade(t *test
 		Containers: []corev1.Container{
 			{
 				Name:    "lmcache-server",
-				Image:   "lmcache/standalone:latest",
+				Image:   "lmcache/standalone:v0.4.7",
 				Command: []string{"lmcache_server"},
 				Args:    []string{"0.0.0.0", "65432", "cpu"},
 			},
