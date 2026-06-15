@@ -129,12 +129,14 @@ func (adapter) ReservedArgs() []string {
 // the integration cannot function without. Same set as the managed
 // vLLM+LMCache adapter; the rationale is identical (the engine must
 // find the cache at the operator-supplied endpoint, run on the
-// LMCache-targeting vLLM codepath, and honor the fail-open contract).
+// LMCache-targeting vLLM codepath, honor the fail-open contract, and pin
+// the deterministic NONE_HASH so LMCache reload matches under TP>1).
 func (adapter) ReservedEnv() []string {
 	return []string{
 		enginewire.EnvLMCacheRemoteURL,
 		enginewire.EnvVLLMUseV1,
 		enginewire.EnvInferenceCacheFailOpen,
+		enginewire.EnvPythonHashSeed,
 	}
 }
 

@@ -1,6 +1,74 @@
 package enginewire
 
-import "testing"
+import (
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+)
+
+// lookupInjectedEnv returns the value of the env var named name on the engine
+// container and whether it was present.
+func lookupInjectedEnv(env []corev1.EnvVar, name string) (string, bool) {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value, true
+		}
+	}
+	return "", false
+}
+
+// TestInjectVLLMLMCache_InjectsEnv pins the full set of env names the engine
+// wire injects, and asserts the PYTHONHASHSEED correctness invariant is
+// present with value "0". PYTHONHASHSEED pins the deterministic NONE_HASH
+// across the scheduler + TP worker processes so LMCache reload matches under
+// TP>1 — without it the reload silently 0-hits and the engine fully
+// recomputes (no crash, no error).
+func TestInjectVLLMLMCache_InjectsEnv(t *testing.T) {
+	pod := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: EngineContainerName}},
+	}
+	cache := &cachev1alpha1.CacheBackend{}
+
+	if err := InjectVLLMLMCache(pod, "cache.example:65432", cache); err != nil {
+		t.Fatalf("InjectVLLMLMCache: %v", err)
+	}
+	env := pod.Containers[0].Env
+
+	// The exact set of env names the wire injects. Adding/removing one is a
+	// contract change — this assertion is intentionally exact.
+	wantNames := map[string]bool{
+		EnvLMCacheRemoteURL:       true,
+		EnvLMCacheRemoteSerde:     true,
+		EnvLMCacheChunkSize:       true,
+		EnvLMCacheLocalCPU:        true,
+		EnvLMCacheMaxLocalCPU:     true,
+		EnvVLLMUseV1:              true,
+		EnvInferenceCacheFailOpen: true,
+		EnvPythonHashSeed:         true,
+	}
+	gotNames := make(map[string]bool, len(env))
+	for _, e := range env {
+		gotNames[e.Name] = true
+	}
+	for name := range wantNames {
+		if !gotNames[name] {
+			t.Errorf("injected env missing %q; got %v", name, gotNames)
+		}
+	}
+	for name := range gotNames {
+		if !wantNames[name] {
+			t.Errorf("injected env has unexpected entry %q; got %v", name, gotNames)
+		}
+	}
+
+	// Focused assertion: the PYTHONHASHSEED correctness invariant is injected
+	// with exactly "0" so every engine process derives the same NONE_HASH.
+	if v, ok := lookupInjectedEnv(env, EnvPythonHashSeed); !ok || v != "0" {
+		t.Fatalf("%s = (%q, %v), want 0", EnvPythonHashSeed, v, ok)
+	}
+}
 
 func TestLMCacheRemoteURL_BareHostGetsScheme(t *testing.T) {
 	got := LMCacheRemoteURL("cache.example:8200")

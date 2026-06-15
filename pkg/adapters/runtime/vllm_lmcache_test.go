@@ -484,6 +484,13 @@ func TestVLLMLMCacheInjectEngineConfig(t *testing.T) {
 	if v, _ := lookupEnv(engine.Env, EnvVLLMUseV1); v != "1" {
 		t.Fatalf("%s = %q, want 1", EnvVLLMUseV1, v)
 	}
+	// PYTHONHASHSEED=0 is a correctness invariant: it pins the deterministic
+	// NONE_HASH across the scheduler + TP worker processes so LMCache reload
+	// matches under TP>1 (silent 0-hit recompute otherwise). It must be
+	// injected with exactly "0".
+	if v, ok := lookupEnv(engine.Env, EnvPythonHashSeed); !ok || v != "0" {
+		t.Fatalf("%s = (%q, %v), want 0", EnvPythonHashSeed, v, ok)
+	}
 	// Existing env on the engine container is preserved.
 	if v, _ := lookupEnv(engine.Env, "HF_TOKEN"); v != "secret-token" {
 		t.Fatalf("HF_TOKEN was clobbered: got %q, want secret-token", v)
@@ -766,16 +773,18 @@ func TestVLLMLMCacheReservedArgs(t *testing.T) {
 	}
 }
 
-// TestVLLMLMCacheReservedEnv pins the reserved-env list. Three env names
+// TestVLLMLMCacheReservedEnv pins the reserved-env list. Four env names
 // are reserved here (the integration strictly requires them): the resolved
-// remote URL, the v1-codepath selector, and the spec.integration.failOpen
-// mirror. Known tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE /
-// LMCACHE_LOCAL_CPU / LMCACHE_MAX_LOCAL_CPU_SIZE) are NOT reserved, and the
-// test also asserts they are absent. (--kv-transfer-config is reserved on
-// the args side, covered by TestVLLMLMCacheReservedArgs.)
+// remote URL, the v1-codepath selector, the spec.integration.failOpen
+// mirror, and PYTHONHASHSEED (the deterministic-NONE_HASH correctness
+// invariant whose failure is a silent 0-hit reload under TP>1). Known
+// tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE / LMCACHE_LOCAL_CPU /
+// LMCACHE_MAX_LOCAL_CPU_SIZE) are NOT reserved, and the test also asserts
+// they are absent. (--kv-transfer-config is reserved on the args side,
+// covered by TestVLLMLMCacheReservedArgs.)
 func TestVLLMLMCacheReservedEnv(t *testing.T) {
 	got := vllmLMCacheAdapter{}.ReservedEnv()
-	want := []string{EnvLMCacheRemoteURL, EnvVLLMUseV1, EnvInferenceCacheFailOpen}
+	want := []string{EnvLMCacheRemoteURL, EnvVLLMUseV1, EnvInferenceCacheFailOpen, EnvPythonHashSeed}
 	if !equalStrSlice(got, want) {
 		t.Fatalf("ReservedEnv = %v, want %v", got, want)
 	}

@@ -34,6 +34,15 @@ const (
 	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
 	EnvVLLMUseV1              = "VLLM_USE_V1"
 	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
+	// EnvPythonHashSeed pins Python's hash seed so the NONE_HASH that seeds
+	// vLLM's prefix-cache block-hash chain is deterministic across the
+	// scheduler and the TP worker processes. Under TP>1 those are separate
+	// OS processes; with PYTHONHASHSEED unset each derives a different
+	// NONE_HASH, so the reload lookup's hashes never match the workers'
+	// stored hashes — LMCache reload silently 0-hits and the engine fully
+	// recomputes with no crash and no error. A correctness invariant, not a
+	// tunable.
+	EnvPythonHashSeed = "PYTHONHASHSEED"
 )
 
 // EngineContainerName is the conventional name of the vLLM container in an
@@ -47,19 +56,22 @@ const EngineContainerName = "vllm"
 // via spec.backendConfig. The CPU-safe LMCACHE_REMOTE_SERDE is "naive";
 // "cachegen" is faster but pulls in CUDA-only codepaths.
 const (
-	defaultChunkSize    = "256"
-	defaultRemoteSerde  = "naive"
-	defaultLocalCPU     = "False"
-	defaultMaxLocalCPU  = "20"
-	defaultVLLMUseV1    = "1"
-	kvTransferConfigArg = "--kv-transfer-config"
-	kvRoleConsumer      = "kv_consumer"
-	kvRoleProducer      = "kv_producer"
-	kvRoleBoth          = "kv_both"
-	cfgKeyChunkSize     = "chunkSize"
-	cfgKeyRemoteSerde   = "remoteSerde"
-	cfgKeyLocalCPU      = "localCPU"
-	cfgKeyMaxLocalCPU   = "maxLocalCPU"
+	defaultChunkSize   = "256"
+	defaultRemoteSerde = "naive"
+	defaultLocalCPU    = "False"
+	defaultMaxLocalCPU = "20"
+	defaultVLLMUseV1   = "1"
+	// defaultPythonHashSeed = "0" makes every engine process derive the same
+	// NONE_HASH so LMCache reload matches under TP>1 (see [EnvPythonHashSeed]).
+	defaultPythonHashSeed = "0"
+	kvTransferConfigArg   = "--kv-transfer-config"
+	kvRoleConsumer        = "kv_consumer"
+	kvRoleProducer        = "kv_producer"
+	kvRoleBoth            = "kv_both"
+	cfgKeyChunkSize       = "chunkSize"
+	cfgKeyRemoteSerde     = "remoteSerde"
+	cfgKeyLocalCPU        = "localCPU"
+	cfgKeyMaxLocalCPU     = "maxLocalCPU"
 )
 
 // InjectVLLMLMCache adds the LMCache connector arg and LMCACHE_* env to the
@@ -91,6 +103,7 @@ func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha
 		{Name: EnvLMCacheMaxLocalCPU, Value: ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)},
 		{Name: EnvVLLMUseV1, Value: defaultVLLMUseV1},
 		{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)},
+		{Name: EnvPythonHashSeed, Value: defaultPythonHashSeed},
 	}
 	args := []string{kvTransferConfigArg, KVTransferConfig(IntegrationRole(cache))}
 
