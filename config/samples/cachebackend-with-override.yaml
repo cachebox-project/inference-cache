@@ -72,7 +72,7 @@ spec:
     # so the index keys per-replica entries by model.
     model: Qwen/Qwen2.5-0.5B-Instruct
     # Pin to a real digest for non-local runs.
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 # Engine Deployment. Apply this alongside the CacheBackend above; the
 # order matters (see the top-of-file comment). Pod injection is

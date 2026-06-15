@@ -82,7 +82,7 @@ spec:
     # Real, ungated model (Apache-2.0) — no auth token required.
     model: Qwen/Qwen2.5-7B-Instruct
     # PLACEHOLDER — replace with a digest-pinned reference before production.
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 apiVersion: inferencecache.io/v1alpha1
 kind: CachePolicy
