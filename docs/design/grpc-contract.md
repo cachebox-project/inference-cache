@@ -150,7 +150,11 @@ Construction (XXH3-64, matching SMG `event_tree.rs` so the two interoperate on o
 - `SEED = 1337`.
 - Per-block `content_hash = XXH3_64(seed=SEED)` over the little-endian `uint32` encoding of each token id in the block.
 - Rolling positional prefix hash: `prefix_hash[0] = content_hash[0]`; `prefix_hash[i] = XXH3_64(seed=SEED)` over `prefix_hash[i-1].to_le_bytes(8) ++ content_hash[i].to_le_bytes(8)`.
+- Explicit parent chain (suffix events): when an event carries only the *new* suffix blocks of a longer, already-cached prefix, block 0 does **not** start a fresh sequence — it chains from the known parent instead: `prefix_hash[0] = XXH3_64(seed=SEED)` over `parent_prefix.to_le_bytes(8) ++ content_hash[0].to_le_bytes(8)` (`PrefixHashesFrom` with `hasParent=true`). This keeps hashes globally positional across incremental cache-warm events.
 - Wire encoding: each `prefix_hash` is the **8-byte big-endian** form of that `uint64`.
+- Partial trailing tokens (fewer than the block size) are dropped — engines cache only full blocks.
+
+Golden vectors: `pkg/fingerprint/testdata/golden_vectors.json` is the canonical, language-neutral fixture pinning this construction (each hash as both decimal `uint64` and 8-byte big-endian base64, including the parent-chain case). Every implementation — Go (`pkg/fingerprint`), the benchmark gateway client (Python), SMG `event_tree.rs` (Rust) — asserts byte-for-byte parity against it; a unilateral change to the construction fails tests in all of them.
 
 The fingerprint is positional (block `i`'s key identifies the whole prefix `0..i`), satisfying the parent-chained block-hash assumption above. Both ends must agree: the `kvevent-subscriber` computes it in-pod from the engine event's `token_ids` (the tokens never leave the pod — only the hash does); a gateway recomputes it from the prompt's tokens. Reference implementation: `pkg/fingerprint`. **Caveat:** the fingerprint is token-content-only, so prefixes that differ only by LoRA adapter (identical tokens) share a key unless partitioned by `model_id` — tracked as a follow-up.
 
