@@ -85,6 +85,7 @@ const (
 	EnvLMCacheMaxLocalCPU     = enginewire.EnvLMCacheMaxLocalCPU
 	EnvVLLMUseV1              = enginewire.EnvVLLMUseV1
 	EnvInferenceCacheFailOpen = enginewire.EnvInferenceCacheFailOpen
+	EnvPythonHashSeed         = enginewire.EnvPythonHashSeed
 	// EngineContainerName is the conventional name for the vLLM container in
 	// an engine pod the adapter mutates. When no container with this name is
 	// present, a single-container pod is treated as the engine; a multi-
@@ -230,6 +231,11 @@ func (vllmLMCacheAdapter) EngineContainerName() string { return EngineContainerN
 //   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the
 //     pod; allowing an override would silently desync the pod from the CR
 //     contract and from status.failOpen.
+//   - PYTHONHASHSEED pins the deterministic NONE_HASH that seeds vLLM's
+//     prefix-cache block-hash chain across the scheduler + TP worker
+//     processes; an override re-randomizes it under TP>1 and LMCache reload
+//     silently 0-hits (full recompute, no crash, no error). The failure mode
+//     is invisible, so the operator must not be able to suppress it.
 //
 // Tunables (LMCACHE_CHUNK_SIZE / LMCACHE_REMOTE_SERDE / LMCACHE_LOCAL_CPU /
 // LMCACHE_MAX_LOCAL_CPU_SIZE) are perf/mode knobs the operator may legitimately
@@ -239,6 +245,7 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 		EnvLMCacheRemoteURL,
 		EnvVLLMUseV1,
 		EnvInferenceCacheFailOpen,
+		EnvPythonHashSeed,
 	}
 }
 

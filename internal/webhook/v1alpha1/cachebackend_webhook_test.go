@@ -1399,7 +1399,7 @@ func (stubVLLMLMCacheAdapter) ReservedArgs() []string {
 	return []string{"--kv-transfer-config"}
 }
 func (stubVLLMLMCacheAdapter) ReservedEnv() []string {
-	return []string{"VLLM_USE_V1", "LMCACHE_REMOTE_URL", "INFERENCECACHE_FAIL_OPEN"}
+	return []string{"VLLM_USE_V1", "LMCACHE_REMOTE_URL", "INFERENCECACHE_FAIL_OPEN", "PYTHONHASHSEED"}
 }
 func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 
@@ -1437,7 +1437,7 @@ func (stubExternalAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *core
 // realistically rather than against an artificially-empty surface.
 func (stubExternalAdapter) ReservedArgs() []string { return []string{"--kv-transfer-config"} }
 func (stubExternalAdapter) ReservedEnv() []string {
-	return []string{"LMCACHE_REMOTE_URL", "VLLM_USE_V1", "INFERENCECACHE_FAIL_OPEN"}
+	return []string{"LMCACHE_REMOTE_URL", "VLLM_USE_V1", "INFERENCECACHE_FAIL_OPEN", "PYTHONHASHSEED"}
 }
 func (stubExternalAdapter) EngineContainerName() string { return "vllm" }
 func (stubExternalAdapter) SupportedPairs() []adapterruntime.SupportedPair {
@@ -1793,6 +1793,31 @@ func TestValidator_EngineOverrides_OverrideReservedEnvRejected(t *testing.T) {
 		"INFERENCECACHE_FAIL_OPEN")
 }
 
+func TestValidator_EngineOverrides_OverridePythonHashSeedRejected(t *testing.T) {
+	// PYTHONHASHSEED is reserved (the deterministic-NONE_HASH correctness
+	// invariant). An operator override must be hard-rejected, not silently
+	// applied — re-randomizing the seed 0-hits LMCache reload under TP>1.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "PYTHONHASHSEED", Value: "1"}},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"PYTHONHASHSEED")
+}
+
+func TestValidator_EngineOverrides_SuppressPythonHashSeedRejected(t *testing.T) {
+	// ...and suppression is equally rejected: the operator must not be able to
+	// drop the invariant either.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressEnv: []string{"PYTHONHASHSEED"},
+	})
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressEnv[0]",
+		"PYTHONHASHSEED")
+}
+
 func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {
 	// Positive case: a non-reserved arg + env + suppression combination
 	// must pass admission. This is the CPU-vLLM use case — the operator
@@ -2022,6 +2047,22 @@ func TestValidator_EngineOverrides_ExternalBackendAdmittedWhenSafe(t *testing.T)
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("External CR with non-reserved override rejected: %v", err)
 	}
+}
+
+func TestValidator_EngineOverrides_ExternalRejectsPythonHashSeedOverride(t *testing.T) {
+	// The External adapter reserves the same env as the managed adapter
+	// (shared LMCache wire), so a PYTHONHASHSEED override on an External CR
+	// is hard-rejected for the same reason — proving the correctness
+	// invariant holds across both spec.types, not just managed.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "PYTHONHASHSEED", Value: "1"}},
+	})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "shared.team-a.svc.cluster.local:9000"
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.env[0].name",
+		"PYTHONHASHSEED")
 }
 
 // Sanity check on the package-level wiring: SetupCacheBackendWebhookWithManager
