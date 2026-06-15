@@ -52,6 +52,11 @@ func TestInjectVLLMLMCache_InjectsEnv(t *testing.T) {
 	for _, e := range env {
 		gotNames[e.Name] = true
 	}
+	// Exact count guards against a duplicate injected entry slipping past the
+	// name-set checks below (the map collapses a duplicate to one key).
+	if len(env) != len(wantNames) {
+		t.Errorf("injected env count = %d, want %d (duplicate or missing entry); env = %v", len(env), len(wantNames), env)
+	}
 	for name := range wantNames {
 		if !gotNames[name] {
 			t.Errorf("injected env missing %q; got %v", name, gotNames)
