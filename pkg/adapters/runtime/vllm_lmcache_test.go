@@ -86,8 +86,8 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	if c.Name != "lmcache-server" {
 		t.Fatalf("container name = %q, want lmcache-server", c.Name)
 	}
-	if c.Image != "lmcache/standalone:latest" {
-		t.Fatalf("container image = %q, want lmcache/standalone:latest default", c.Image)
+	if c.Image != "lmcache/standalone:v0.4.7" {
+		t.Fatalf("container image = %q, want lmcache/standalone:v0.4.7 default", c.Image)
 	}
 	if len(c.Command) != 1 || c.Command[0] != "lmcache_server" {
 		t.Fatalf("command = %v, want [lmcache_server]", c.Command)

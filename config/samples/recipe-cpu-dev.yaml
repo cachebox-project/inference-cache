@@ -60,7 +60,7 @@ spec:
     # so it runs on CPU with no auth token.
     model: Qwen/Qwen2.5-0.5B-Instruct
     # Managed lmcache-server image. Pin to a digest for non-local runs.
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

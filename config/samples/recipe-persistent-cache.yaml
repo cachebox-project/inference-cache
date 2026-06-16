@@ -56,7 +56,7 @@ spec:
   backendConfig:
     model: Qwen/Qwen2.5-0.5B-Instruct
     # Managed lmcache-server image. Pin to a digest for non-local runs.
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
   storage:
     pvc:
       # Requested size. Increasable later (the controller patches the request

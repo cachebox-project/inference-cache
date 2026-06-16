@@ -22,9 +22,31 @@ import (
 // without a code change.
 const (
 	// defaultLMCacheServerImage is the upstream standalone LMCache server
-	// image; :latest is the overridable default (production should pin to a
-	// digest via BackendConfig).
-	defaultLMCacheServerImage = "lmcache/standalone:latest"
+	// image, pinned to a specific version rather than a floating :latest.
+	//
+	// Why pin off :latest: the lmcache-server and the lmcache *client*
+	// compiled into the vLLM engine communicate over a versioned wire
+	// protocol. A floating :latest can drift to a server build whose protocol
+	// no longer matches the engine's client; the mismatch disables tier-2
+	// offload silently (stores fail, 0 hits, no surfaced error). Pinning
+	// removes that silent-drift risk and makes renders reproducible.
+	//
+	// This is NOT auto-aligned with the engine's client: IC has no source of
+	// truth for the engine image's lmcache client version (it is operator-
+	// supplied or pip-installed at runtime). Operators MUST keep the version
+	// here (or their backendConfig.serverImage override) wire-compatible with
+	// their engine's lmcache client — see the "LMCache server / client version
+	// alignment" section in docs/design/cachebackend-api.md.
+	//
+	// Overridable via backendConfig.serverImage (production should pin to a
+	// digest there).
+	//
+	// TODO: wire-test and digest-pin before production. v0.4.7 is version-
+	// aligned (it exists upstream and matches the lmcache 0.4.7 client used in
+	// validation), but the standalone server image itself was not independently
+	// wire-tested here — confirm against a tested build and prefer an @sha256:
+	// digest. Do not substitute an invented digest.
+	defaultLMCacheServerImage = "lmcache/standalone:v0.4.7"
 	// defaultLMCacheServerPort is the canonical lm:// port the LMCache
 	// docs use for the standalone server.
 	defaultLMCacheServerPort = int32(65432)

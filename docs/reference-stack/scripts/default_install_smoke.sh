@@ -255,7 +255,7 @@ SAMPLE_ENGINE_IMAGE="${SAMPLE_ENGINE_IMAGE:-busybox:1.36}"
 # Tiny stand-in for the managed LMCache server image. The controller still
 # renders the canonical lmcache_server command/args and TCP readiness probe; the
 # image only provides a local binary that listens on the requested port so the
-# Deployment can become Available without pulling lmcache/standalone:latest.
+# Deployment can become Available without pulling lmcache/standalone:v0.4.7.
 SAMPLE_CACHE_SERVER_IMAGE="${SAMPLE_CACHE_SERVER_IMAGE:-install-smoke-lmcache-server:$TAG}"
 
 # Image refs match the Makefile's REGISTRY/repo defaults so `kustomize edit set
@@ -1183,7 +1183,7 @@ rm -f "${sample_tmp_engine}.bak"
 
 build_sample_cache_server_image
 escaped_sample_cache_server_image="$(printf '%s' "$SAMPLE_CACHE_SERVER_IMAGE" | sed 's/[&|\\]/\\&/g')"
-sed -i.bak "s|serverImage: lmcache/standalone:latest|serverImage: $escaped_sample_cache_server_image|g" \
+sed -i.bak "s|serverImage: lmcache/standalone:v0.4.7|serverImage: $escaped_sample_cache_server_image|g" \
   "$sample_tmp_cb"
 rm -f "${sample_tmp_cb}.bak"
 

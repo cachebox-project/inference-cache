@@ -92,7 +92,7 @@ spec:
       app: tenant-engine
   backendConfig:
     model: Qwen/Qwen2.5-0.5B-Instruct
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -110,7 +110,7 @@ spec:
       app: tenant-engine
   backendConfig:
     model: Qwen/Qwen2.5-0.5B-Instruct
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

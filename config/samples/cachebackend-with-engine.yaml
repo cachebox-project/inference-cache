@@ -96,7 +96,7 @@ spec:
     # per-replica entries by model.
     model: Qwen/Qwen2.5-0.5B-Instruct
     # Pin to a real digest for non-local runs.
-    serverImage: lmcache/standalone:latest
+    serverImage: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

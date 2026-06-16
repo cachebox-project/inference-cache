@@ -20,8 +20,9 @@
 # server still keeps KV in memory. A persistent backend must be single-replica
 # (a ReadWriteOnce PVC can't be multi-attached).
 #
-# Override the lmcache-server image (defaults to lmcache/standalone:latest)
-# or the server command via backendConfig until first-class spec fields land.
+# Override the lmcache-server image (defaults to a pinned lmcache/standalone
+# version; keep it wire-compatible with the engine's lmcache client) or the
+# server command via backendConfig until first-class spec fields land.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -45,8 +46,10 @@ spec:
     # so the index keys per-replica entries by model. Omit (or set empty)
     # to skip the subscriber sidecar (engine wiring still happens).
     model: meta-llama/Meta-Llama-3-8B-Instruct
-    # Pin to a real digest for non-local runs.
-    serverImage: lmcache/standalone:latest
+    # Matches the pinned adapter default; pin to an `@sha256:` digest for
+    # non-local runs, and keep the lmcache version wire-compatible with the
+    # engine's lmcache client (see docs/design/cachebackend-api.md).
+    serverImage: lmcache/standalone:v0.4.7
     # LMCache server storage device; "cpu" (in-memory) is the supported default.
     # Override `serverCommand` to switch to the newer
     # `python3 -m lmcache.v1.multiprocess.server` form once stabilised.
