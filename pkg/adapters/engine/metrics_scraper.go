@@ -61,8 +61,11 @@ const (
 	metricCPUUsage = "vllm:cpu_cache_usage_perc" // legacy
 	metricHits     = "vllm:prefix_cache_hits"    // Counter; exposition appends _total
 	metricQueries  = "vllm:prefix_cache_queries" // Counter; exposition appends _total
-	metricRunning  = "vllm:num_requests_running"
-	metricWaiting  = "vllm:num_requests_waiting"
+	// T2 (external offload tier, e.g. LMCache) cumulative token counters.
+	metricExtHits    = "vllm:external_prefix_cache_hits"    // Counter; exposition appends _total
+	metricExtQueries = "vllm:external_prefix_cache_queries" // Counter; exposition appends _total
+	metricRunning    = "vllm:num_requests_running"
+	metricWaiting    = "vllm:num_requests_waiting"
 
 	defaultScrapeTimeout = 5 * time.Second
 )
@@ -171,6 +174,14 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 	queries, haveQueries := sumCounter(families, metricQueries, s.cfg.ModelLabel)
 	hitRate := s.consumeHitRate(hits, queries, haveHits && haveQueries)
 
+	// T2 (external offload tier) cumulative token counters, forwarded as-is.
+	// The server derives a presence-aware tier-2 hit-rate (a 0% rate is only
+	// meaningful once t2_query_tokens > 0). On engines without an external
+	// tier the metrics are absent, sumCounter returns 0, and the server reads
+	// that as "tier-2 not exercised" — never a fabricated 0% hit-rate.
+	extHits, _ := sumCounter(families, metricExtHits, s.cfg.ModelLabel)
+	extQueries, _ := sumCounter(families, metricExtQueries, s.cfg.ModelLabel)
+
 	running, _ := singleGaugeValue(families, metricRunning, s.cfg.ModelLabel)
 	waiting, _ := singleGaugeValue(families, metricWaiting, s.cfg.ModelLabel)
 	pressure := pressureFrom(running+waiting, s.cfg.MaxConcurrencyCeiling)
@@ -184,6 +195,8 @@ func (s *MetricsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 		CacheMemoryBytes: cacheBytes,
 		HitRate:          float32(hitRate),
 		Pressure:         float32(pressure),
+		T2HitTokens:      int64(extHits),
+		T2QueryTokens:    int64(extQueries),
 	}, nil
 }
 

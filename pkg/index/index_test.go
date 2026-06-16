@@ -290,6 +290,21 @@ func TestPrefixAddedEventDoesNotRefreshAcrossSchemes(t *testing.T) {
 	}
 }
 
+func TestSnapshotCarriesT2Counters(t *testing.T) {
+	idx := New()
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m1", Tenant: "tenant-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 1}},
+		Stats:    &ReplicaStats{CacheMemoryBytes: 100, T2HitTokens: 600, T2QueryTokens: 1000}})
+
+	snap := idx.Snapshot()
+	if len(snap.Replicas) != 1 {
+		t.Fatalf("replicas = %d, want 1", len(snap.Replicas))
+	}
+	if r := snap.Replicas[0]; r.T2HitTokens != 600 || r.T2QueryTokens != 1000 {
+		t.Fatalf("t2 counters = (%d, %d), want (600, 1000)", r.T2HitTokens, r.T2QueryTokens)
+	}
+}
+
 func TestSnapshotAggregates(t *testing.T) {
 	idx := New()
 	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m1", Tenant: "tenant-a", HashScheme: "vllm",

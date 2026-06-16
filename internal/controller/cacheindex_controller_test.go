@@ -684,6 +684,55 @@ func TestRefreshHitRateStaysNil(t *testing.T) {
 	}
 }
 
+// TestRefreshT2HitRatePresence: the tier-2 (external offload) hit-rate is
+// presence-aware via the external query-token count. Three backends cover the
+// three states an operator must be able to tell apart:
+//   - healthy: queried + reloads served       -> "0.75"
+//   - broken : queried but zero reloads served -> "0"  (silent-degradation signal)
+//   - cold   : never queried                   -> nil  (must NOT read as 0)
+func TestRefreshT2HitRatePresence(t *testing.T) {
+	cbH := cbFixture("t2-healthy", "default", map[string]string{"app": "vllm-h"})
+	cbB := cbFixture("t2-broken", "default", map[string]string{"app": "vllm-b"})
+	cbC := cbFixture("t2-cold", "default", map[string]string{"app": "vllm-c"})
+	podH := enginePod("vllm-h-0", "default", map[string]string{"app": "vllm-h"})
+	podB := enginePod("vllm-b-0", "default", map[string]string{"app": "vllm-b"})
+	podC := enginePod("vllm-c-0", "default", map[string]string{"app": "vllm-c"})
+	var mu sync.Mutex
+	served := index.Snapshot{
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "vllm-h-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-b-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 500, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-c-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 0, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+		},
+	}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbH, cbB, cbC},
+		[]*corev1.Pod{podH, podB, podC},
+		&served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	assertT2 := func(name string, wantNil bool, want string) {
+		t.Helper()
+		ip := getBackendDirect(t, cl, name, "default").Status.IndexParticipation
+		if ip == nil {
+			t.Fatalf("%s: indexParticipation nil", name)
+		}
+		switch {
+		case wantNil && ip.T2HitRate != nil:
+			t.Fatalf("%s: t2HitRate = %q, want nil (tier-2 not exercised)", name, *ip.T2HitRate)
+		case !wantNil && (ip.T2HitRate == nil || *ip.T2HitRate != want):
+			t.Fatalf("%s: t2HitRate = %v, want %q", name, ip.T2HitRate, want)
+		}
+	}
+	assertT2("t2-healthy", false, "0.75")
+	assertT2("t2-broken", false, "0")
+	assertT2("t2-cold", true, "")
+}
+
 // TestRefreshScrapeFailureDoesNotClearParticipation (fail-soft): once
 // indexParticipation is published, a failing /snapshot scrape must NOT
 // clear it. Tested by seeding a status, then closing the server.

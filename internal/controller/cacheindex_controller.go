@@ -312,8 +312,10 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 	}
 
 	type agg struct {
-		prefixCount int64
-		lastEventAt time.Time
+		prefixCount   int64
+		lastEventAt   time.Time
+		t2HitTokens   int64
+		t2QueryTokens int64
 	}
 	// Seed perBackend for EVERY CacheBackend so attributePod can return an
 	// annotation-owned backend even after its selector was removed (or for
@@ -378,6 +380,8 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		if r.LastEventAt.After(a.lastEventAt) {
 			a.lastEventAt = r.LastEventAt
 		}
+		a.t2HitTokens += r.T2HitTokens
+		a.t2QueryTokens += r.T2QueryTokens
 	}
 
 	for i, a := range perBackend {
@@ -392,6 +396,21 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 			t := metav1.NewTime(a.lastEventAt)
 			desired.LastEventAt = &t
 		}
+		// Presence-aware tier-2 (external offload) hit-rate: surface it only
+		// once the tier was actually queried. A "0" here — queried, zero
+		// reloads — is the signal of a silently-degraded offload tier; nil
+		// means "not yet exercised" (no external lookups), which must NOT read
+		// as 0. Clamp defends against any counter anomaly.
+		if a.t2QueryTokens > 0 {
+			ratio := float64(a.t2HitTokens) / float64(a.t2QueryTokens)
+			if ratio < 0 {
+				ratio = 0
+			} else if ratio > 1 {
+				ratio = 1
+			}
+			rate := formatRate(float32(ratio))
+			desired.T2HitRate = &rate
+		}
 		// "Don't write noise zeros" gate: a backend that has no selector
 		// configured AND has never published participation AND has no
 		// real attribution this tick stays nil — writing a noise zero
@@ -399,7 +418,7 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		// A real non-zero attribution (e.g. via the injected-by
 		// annotation pointing at a selector-less backend) bypasses the
 		// gate so the data is still surfaced.
-		isZeroState := desired.PrefixCount == 0 && desired.LastEventAt == nil && desired.HitRate == nil
+		isZeroState := desired.PrefixCount == 0 && desired.LastEventAt == nil && desired.HitRate == nil && desired.T2HitRate == nil
 		hasSelector := cb.Spec.EngineSelector != nil && len(cb.Spec.EngineSelector.MatchLabels) > 0
 		if isZeroState && !hasSelector && cb.Status.IndexParticipation == nil {
 			continue

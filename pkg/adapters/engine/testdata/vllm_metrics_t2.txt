@@ -1,0 +1,15 @@
+# Engine exposing tier-2 (external offload / LMCache) cache counters alongside
+# the native (T1) prefix-cache counters. Used to verify the scraper forwards
+# the external counters as cumulative t2_hit_tokens / t2_query_tokens.
+# HELP vllm:prefix_cache_hits_total Counter of cached blocks reused.
+# TYPE vllm:prefix_cache_hits_total counter
+vllm:prefix_cache_hits_total{model_name="m"} 10
+# HELP vllm:prefix_cache_queries_total Counter of prefix cache queries.
+# TYPE vllm:prefix_cache_queries_total counter
+vllm:prefix_cache_queries_total{model_name="m"} 20
+# HELP vllm:external_prefix_cache_hits_total Tokens reused from the external offload tier.
+# TYPE vllm:external_prefix_cache_hits_total counter
+vllm:external_prefix_cache_hits_total{model_name="m"} 750
+# HELP vllm:external_prefix_cache_queries_total Tokens queried against the external offload tier.
+# TYPE vllm:external_prefix_cache_queries_total counter
+vllm:external_prefix_cache_queries_total{model_name="m"} 1000

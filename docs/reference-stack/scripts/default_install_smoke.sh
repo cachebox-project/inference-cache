@@ -532,7 +532,12 @@ fi
 if [ -z "$(crd_field_type 'status.properties.indexParticipation.properties.prefixCount')" ]; then
   fail "CRD is missing status.indexParticipation.prefixCount (the replacement for status.indexEntries)"
 fi
-log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; indexParticipation.prefixCount present)"
+# status.indexParticipation.t2HitRate is the tier-2 (LMCache) offload health
+# surface — assert the new status field is actually served by the installed CRD.
+if [ -z "$(crd_field_type 'status.properties.indexParticipation.properties.t2HitRate')" ]; then
+  fail "CRD is missing status.indexParticipation.t2HitRate (the tier-2 health surface)"
+fi
+log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; indexParticipation.prefixCount + t2HitRate present)"
 
 # --- CacheIndex poller assertion -------------------------------------------
 # The controller's CacheIndex poller is leader-elected and refreshes on a 30s

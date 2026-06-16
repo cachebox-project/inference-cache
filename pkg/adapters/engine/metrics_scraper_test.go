@@ -92,6 +92,42 @@ func TestScraperSecondTickHasHitRateDelta(t *testing.T) {
 	}
 }
 
+func TestScraperReadsT2ExternalCounters(t *testing.T) {
+	srv := fixtureServer(t, "vllm_metrics_t2.txt")
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{URL: srv.URL, ModelLabel: "m"}, nil)
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	// External counters are forwarded cumulatively (no delta) so the first
+	// scrape already carries them — the server derives presence from them.
+	if got := stats.GetT2HitTokens(); got != 750 {
+		t.Errorf("t2_hit_tokens = %d, want 750", got)
+	}
+	if got := stats.GetT2QueryTokens(); got != 1000 {
+		t.Errorf("t2_query_tokens = %d, want 1000", got)
+	}
+}
+
+func TestScraperT2CountersAbsentAreZero(t *testing.T) {
+	// An engine with no external offload tier exposes no external_prefix_cache_*
+	// metrics; the scraper reports 0/0, which the server reads as "tier-2 not
+	// exercised" — never a fabricated 0% hit-rate.
+	srv := fixtureServer(t, "vllm_metrics_cpu.txt")
+	defer srv.Close()
+
+	s := NewMetricsScraper(srv.Client(), ScraperConfig{URL: srv.URL}, nil)
+	stats, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	if stats.GetT2HitTokens() != 0 || stats.GetT2QueryTokens() != 0 {
+		t.Errorf("t2 = (%d,%d), want (0,0)", stats.GetT2HitTokens(), stats.GetT2QueryTokens())
+	}
+}
+
 func TestScraperHandlesCounterReset(t *testing.T) {
 	// tick2 then cpu.txt (which has smaller counters) simulates an engine
 	// restart that resets the prefix-cache counters to a lower value.
