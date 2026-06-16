@@ -148,8 +148,7 @@ func main() {
 	// An empty ProbeURL disables the gate — useful for local-dev runs that
 	// don't have a server reachable, and to keep fake-client unit tests from
 	// making real HTTP calls. The bearer-token path matches the snapshot
-	// poller + policy pusher so all three controller↔server channels share
-	// one projected SA token mount.
+	// poller, while the /policy pusher uses its own write-side projected token.
 	probeClient := &controller.ProbeClient{ProbeURL: opts.serverProbeURL}
 
 	if err := (&controller.CacheBackendReconciler{

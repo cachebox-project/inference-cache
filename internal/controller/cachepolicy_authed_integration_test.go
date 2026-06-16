@@ -80,11 +80,11 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	authn, err := auth.NewAuthenticator(auth.Options{
 		Reviewer:               auth.FromClientset(clientset),
 		ExpectedServiceAccount: expectedSA,
-		// /policy shares the controller-audience gate with /snapshot; this
-		// envtest pins the over-the-wire enforcement on the write side. The
-		// wrong-audience case below proves the apiserver actually rejects a
-		// token whose JWT audience doesn't match TokenReviewSpec.Audiences.
-		Audience: auth.ControllerAudience,
+		// /policy uses the write-side audience, separate from the
+		// controller audience used by /snapshot and /probe. The negative
+		// case below proves that a same-SA token minted for the read/probe
+		// audience cannot push policy.
+		Audience: auth.PolicyAudience,
 	})
 	if err != nil {
 		t.Fatalf("auth.NewAuthenticator: %v", err)
@@ -126,8 +126,9 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 		}
 		return path
 	}
-	controllerTokenFile := mintTokenFile(controllerSA, auth.ControllerAudience)
-	otherTokenFile := mintTokenFile(otherSA, auth.ControllerAudience)
+	policyTokenFile := mintTokenFile(controllerSA, auth.PolicyAudience)
+	otherTokenFile := mintTokenFile(otherSA, auth.PolicyAudience)
+	controllerAudienceTokenFile := mintTokenFile(controllerSA, auth.ControllerAudience)
 	wrongAudienceTokenFile := mintTokenFile(controllerSA, "wrong-audience")
 	emptyTokenFile := filepath.Join(t.TempDir(), "empty-token")
 	if err := os.WriteFile(emptyTokenFile, []byte(""), 0o600); err != nil {
@@ -138,7 +139,7 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 		Client:          k8s,
 		ServerPolicyURL: srv.URL + "/policy",
 		HTTPClient:      srv.Client(),
-		BearerTokenPath: controllerTokenFile,
+		BearerTokenPath: policyTokenFile,
 	}
 
 	// Happy path: controller SA token → middleware admits → handler 204
@@ -174,13 +175,22 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 	}
 
 	// Wrong audience: same controller SA, valid token shape, but the JWT
-	// audience does NOT match the middleware's TokenReviewSpec.Audiences.
-	// The apiserver rejects on audience grounds → TokenReview returns
-	// !Authenticated → middleware 401. Pins that audience binding is
-	// actually enforced over the wire on the /policy path (not just on
-	// /snapshot), and that flipping the audience without flipping the
-	// projection at the same time would correctly fail-closed instead of
-	// silently admitting.
+	// audience is the read/probe audience, NOT the policy audience the
+	// middleware passes to TokenReviewSpec.Audiences. The apiserver rejects
+	// on audience grounds → TokenReview returns !Authenticated → middleware
+	// 401. This pins that a leaked /snapshot token cannot push /policy.
+	r.BearerTokenPath = controllerAudienceTokenFile
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
+		t.Fatal("Reconcile with controller-audience controller-SA token: expected non-nil error (401), got nil")
+	}
+	if calls != 1 {
+		t.Fatalf("handler invoked %d times after controller-audience 401, want 1", calls)
+	}
+
+	// Wrong audience: same controller SA, valid token shape, but an arbitrary
+	// JWT audience still does NOT match the middleware's
+	// TokenReviewSpec.Audiences. This keeps the generic mismatch regression
+	// alongside the cross-endpoint audience check above.
 	r.BearerTokenPath = wrongAudienceTokenFile
 	if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
 		t.Fatal("Reconcile with wrong-audience controller-SA token: expected non-nil error (401), got nil")
@@ -191,7 +201,7 @@ func TestIntegrationCachePolicyPushAgainstAuthedEndpoint(t *testing.T) {
 
 	// Recovery: re-pointing at the controller token converges again — proves
 	// the auth path is not sticky-broken after a rejection tick.
-	r.BearerTokenPath = controllerTokenFile
+	r.BearerTokenPath = policyTokenFile
 	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile after re-pointing at controller SA token: %v", err)
 	}

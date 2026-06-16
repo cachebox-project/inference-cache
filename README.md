@@ -92,8 +92,10 @@ The default Kustomize overlay brings up both control-plane components:
   the CachePolicy reconciler POSTs to
   `http://inference-cache-server:8081/policy`, and the CacheBackend
   reconciler POSTs to `http://inference-cache-server:8081/probe` (default
-  for the `--server-probe-url` flag — set empty to disable the gate); all
-  three send the projected ServiceAccount token. Once both pods are Ready
+  for the `--server-probe-url` flag — set empty to disable the gate);
+  `/snapshot` + `/probe` send the controller-audience projected
+  ServiceAccount token, while `/policy` sends the write-side policy-audience
+  token. Once both pods are Ready
   `kubectl get cacheindex` reports live cluster-wide cache state.
   `FunctionalProbeOK` appears on each managed `CacheBackend` only after it
   clears the upstream KV-event readiness gate (i.e. real engine pods have

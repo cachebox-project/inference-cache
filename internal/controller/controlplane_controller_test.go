@@ -328,6 +328,15 @@ func TestPushSnapshotSendsBearerToken(t *testing.T) {
 	}
 }
 
+func TestControlPlaneDefaultBearerTokenPathIsPolicyScoped(t *testing.T) {
+	if DefaultPolicyBearerTokenPath != "/var/run/secrets/inferencecache.io/policy-token/token" {
+		t.Fatalf("DefaultPolicyBearerTokenPath = %q, want policy projected-token path", DefaultPolicyBearerTokenPath)
+	}
+	if DefaultPolicyBearerTokenPath == DefaultBearerTokenPath {
+		t.Fatalf("policy pushes must not default to the snapshot/probe token path %q", DefaultBearerTokenPath)
+	}
+}
+
 // TestPushSnapshotBearerTokenUnreadableFile pins the third bearerToken
 // branch the CacheIndexPoller's symmetric test covers: a token file that
 // EXISTS but cannot be read (permissions / IO error). The reconciler's

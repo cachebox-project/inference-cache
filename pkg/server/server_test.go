@@ -522,9 +522,9 @@ func TestSnapshotRejectsNonGet(t *testing.T) {
 // auth middleware wired in (using a fake TokenReviewer) and confirms BOTH
 // the snapshot listener AND /policy on the same listener respond 401 without
 // a bearer and 2xx with the controller SA. Pins the post-hardening shape:
-// /snapshot + /policy share one auth profile and one listener but emit
-// per-endpoint metrics, so a dashboard can distinguish read-side (info leak)
-// from write-side (active tampering) auth failures.
+// /snapshot + /policy share one ServiceAccount identity and one listener but
+// emit per-endpoint metrics, so a dashboard can distinguish read-side (info
+// leak) from write-side (active tampering) auth failures.
 func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 	const sa = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
 
@@ -607,6 +607,67 @@ func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestControllerAuth_PolicyUsesPolicyAudience(t *testing.T) {
+	const wantSA = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
+
+	reviewer := fakeReviewerFunc(func(_ context.Context, tr *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		wantAudience := map[string]string{
+			"snapshot-token": "inferencecache.io/controller",
+			"policy-token":   "inferencecache.io/policy",
+			"probe-token":    "inferencecache.io/controller",
+		}
+		want, ok := wantAudience[tr.Spec.Token]
+		if !ok || len(tr.Spec.Audiences) != 1 || tr.Spec.Audiences[0] != want {
+			return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: false}}, nil
+		}
+		return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{
+			Authenticated: true,
+			User:          authnv1.UserInfo{Username: wantSA},
+		}}, nil
+	})
+
+	const bufSize = 1024 * 1024
+	grpcListener := bufconn.Listen(bufSize)
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen public: %v", err)
+	}
+	snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen snapshot: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	svc := New(
+		WithControllerAuth(reviewer, wantSA, "inferencecache.io/controller"),
+		WithPolicyAudience("inferencecache.io/policy"),
+	)
+	go func() {
+		errCh <- svc.Serve(ctx, grpcListener, httpListener, snapshotListener)
+	}()
+	defer func() {
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Errorf("serve shutdown: %v", err)
+		}
+	}()
+
+	base := "http://" + snapshotListener.Addr().String()
+	if code, _ := getStringWithBearer(t, base+"/snapshot", "snapshot-token"); code != http.StatusOK {
+		t.Fatalf("GET /snapshot with controller-audience token status = %d, want 200", code)
+	}
+	if code := postPolicy(t, base+"/policy", "policy-token", emptyPolicySnapshotBody(t)); code != http.StatusNoContent {
+		t.Fatalf("POST /policy with policy-audience token status = %d, want 204", code)
+	}
+	if code := postPolicy(t, base+"/policy", "snapshot-token", emptyPolicySnapshotBody(t)); code != http.StatusUnauthorized {
+		t.Fatalf("POST /policy with controller-audience token status = %d, want 401", code)
+	}
+	if code := postProbe(t, base+"/probe", "probe-token", `{"backend":"smoke","model":"smoke-model","hashScheme":"vllm"}`); code != http.StatusOK {
+		t.Fatalf("POST /probe with controller-audience token status = %d, want 200", code)
+	}
+}
+
 // TestControllerAuth_PolicyRejectsForbidden confirms a valid but
 // non-controller SA token gets 403 on /policy and increments the
 // `forbidden` bucket of the policy counter — the alarming signal the
@@ -670,6 +731,26 @@ func TestControllerAuth_PolicyRejectsForbidden(t *testing.T) {
 // optional bearer token, returning the HTTP status. Distinct from
 // getStringWithBearer because /policy is POST-only.
 func postPolicy(t *testing.T, url, token, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	httpClient := http.Client{Timeout: 2 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	return resp.StatusCode
+}
+
+func postProbe(t *testing.T, url, token, body string) int {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {

@@ -641,7 +641,7 @@ func t2ErrorMessage(err error) string {
 // stand up an in-process server with the exact same decode path the binary
 // mounts. The handler is auth-agnostic; the auth + NetworkPolicy gating
 // lives in server.New, where the same TokenReview-backed bearer middleware
-// that protects /snapshot and /policy is also applied here. Body size is
+// pattern that protects /snapshot and /policy is also applied here. Body size is
 // capped at 4 KiB to bound memory if a buggy caller sends a runaway request
 // (the JSON envelope is ~hundreds of bytes).
 func probeHandler(prober *Prober) http.HandlerFunc {

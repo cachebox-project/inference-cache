@@ -48,9 +48,11 @@ therefore proves the index ingest path is accepting writes; it does
 not, on its own, prove the full subscriber wire is healthy end-to-end.
 A Stage A fail still definitively means the index ingest path is broken.
 
-`/probe` shares the controller-auth profile with `/snapshot` and
+`/probe` shares the controller-auth identity with `/snapshot` and
 `/policy` because all three endpoints serve one caller identity (the
-controller SA). The probe entries auto-clean on each Run via an
+controller SA). `/snapshot` and `/probe` use the controller audience;
+`/policy` uses a separate write-side policy audience. The probe entries
+auto-clean on each Run via an
 `ALL_CLEARED` event against the reserved replica, so the synthesized
 state never leaks into a real LookupRoute.
 
@@ -107,19 +109,23 @@ Isolation + cleanup guarantees:
 2. **L7 identity** — TokenReview-backed bearer middleware rejects every
    request whose token does not resolve to the configured controller
    `ServiceAccount` (`--allowed-controller-sa`).
-3. **L7 audience** — the controller mounts an audience-bound projected
-   SA token (audience `inferencecache.io/controller`); the server passes
-   `TokenReviewSpec.Audiences=[--controller-audience]` so a leaked
-   default-audience apiserver token from the same SA is rejected, and a
-   leaked controller-audience token is useless against the apiserver
-   **under the default apiserver audience configuration**. If the
-   cluster has been explicitly configured to also accept
-   `inferencecache.io/controller` as an apiserver audience the
-   cross-surface defense degrades; keep this audience distinct from
-   any audience the apiserver accepts.
+3. **L7 audience** — the controller mounts two audience-bound projected
+   SA tokens: `inferencecache.io/controller` at
+   `/var/run/secrets/inferencecache.io/controller-token/token` for
+   `/snapshot` + `/probe`, and `inferencecache.io/policy` at
+   `/var/run/secrets/inferencecache.io/policy-token/token` for `/policy`.
+   The server passes `TokenReviewSpec.Audiences=[--controller-audience]`
+   for `/snapshot` + `/probe`, and `[--policy-audience]` for `/policy`, so
+   a leaked default-audience apiserver token from the same SA is rejected,
+   a leaked controller-audience token cannot push policy, and a leaked
+   audience-bound bridge token is useless against the apiserver **under the
+   default apiserver audience configuration**. If the cluster has been
+   explicitly configured to also accept either inference-cache audience as an
+   apiserver audience the cross-surface defense degrades; keep these
+   audiences distinct from any audience the apiserver accepts.
 
-All three internal endpoints share one auth profile because they share
-one caller identity (the controller SA). `/snapshot` is the *read* side
+All three internal endpoints share one ServiceAccount identity profile.
+`/snapshot` is the *read* side
 (CacheIndex poll, info leak if exposed), `/policy` is the *write* side
 (CachePolicy push, active tampering if exposed), and `/probe` is the
 controller-driven *functional-self-test* side (per-CacheBackend
@@ -434,8 +440,7 @@ mis-interpreted.
   fallback) — that strategy work consumes the same policy store but
   layers on top of the threshold/deadline enforcement shipped here.
 - mTLS for `/snapshot`, `/policy`, and `/probe` — the current shape
-  ships TokenReview-backed bearer auth + audience binding + a NetworkPolicy
-  gate; mTLS is a separate hardening step tracked under the gRPC TLS
-  posture decision, and applies uniformly across the controller-facing
-  bridge (all three endpoints share one auth profile, so mTLS will gate
-  all three at once).
+  ships TokenReview-backed bearer auth + per-endpoint audience binding + a
+  NetworkPolicy gate; mTLS is a separate hardening step tracked under the
+  gRPC TLS posture decision, and applies uniformly across the
+  controller-facing bridge.

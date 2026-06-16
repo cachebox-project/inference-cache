@@ -73,12 +73,12 @@ var ErrProbeClientDisabled = errors.New("probe client: ProbeURL not configured")
 // HTTP-level failure as a wrapped error so the caller can decide how to
 // represent the gap in the FunctionalProbeOK condition.
 //
-// Auth posture mirrors CacheIndexPoller / ControlPlaneReconciler: the
-// projected SA token at BearerTokenPath is sent as Authorization: Bearer on
-// every request, re-read each call so kubelet rotations are picked up. An
-// absent token file is NOT an error — the request goes out unauthenticated
-// and the server's 401 surfaces as a "non-2xx" failure, matching what the
-// other two controller↔server HTTP channels do.
+// Auth posture mirrors CacheIndexPoller: the controller-audience projected SA
+// token at BearerTokenPath is sent as Authorization: Bearer on every request,
+// re-read each call so kubelet rotations are picked up. An absent token file
+// is NOT an error — the request goes out unauthenticated and the server's 401
+// surfaces as a "non-2xx" failure, matching the other controller↔server HTTP
+// channels.
 func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (cacheserver.ProbeResult, error) {
 	if c == nil || c.ProbeURL == "" {
 		return cacheserver.ProbeResult{}, ErrProbeClientDisabled
