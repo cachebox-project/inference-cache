@@ -2613,7 +2613,14 @@ spec:
   containers:
   - name: vllm
     image: python:3.11-slim
-    command: ["sleep", "3600"]
+    # The engine container is named "vllm", so the mutating webhook injects the
+    # LMCache engine wiring onto it — including the --kv-transfer-config ARG. A
+    # bare command ["sleep","3600"] would then run as
+    # `sleep 3600 --kv-transfer-config {...}` and exit 1 ("invalid time
+    # interval"). Wrapping in `sh -c` makes the injected args harmless
+    # positional params to the script, so the stand-in stays alive to prove
+    # the init container's report-only fail-open behavior.
+    command: ["/bin/sh", "-c", "sleep 3600"]
 EOF
 
 # Wait for the pod to become Ready. The init container runs the kernel-check
