@@ -76,12 +76,16 @@ groups:
         # BOTH. Upstream docs list the unsuffixed names at
         # https://docs.vllm.ai/en/latest/usage/metrics/; the series
         # have been present since vLLM ~0.18 (the release that added
-        # LMCache-style offload support). This operator does not
-        # currently scrape them
-        # (pkg/adapters/engine/metrics_scraper.go only reads
-        # vllm:prefix_cache_{hits,queries} for T1 plus
-        # vllm:*_cache_usage_perc), so the alert binds directly to
-        # vLLM's exposition. Operators should sanity-check the metric
+        # LMCache-style offload support). The operator's scraper
+        # (pkg/adapters/engine/metrics_scraper.go) now ALSO reads these
+        # external counters and projects them per-CacheBackend as the
+        # inferencecache_backend_t2_hit_rate gauge + the T2Degraded
+        # condition + the BackendT2Degraded alert in the
+        # inferencecache-cachebackend group below — prefer that for clean
+        # per-CacheBackend attribution. This per-pod alert still binds
+        # directly to vLLM's exposition for pod-level granularity and to
+        # stay useful where the operator's scrape path isn't wired.
+        # Operators should sanity-check the metric
         # exists on at least one engine pod before relying on the
         # alert: see the runbook's "verify the metric is exposed"
         # step.
@@ -239,6 +243,50 @@ groups:
         annotations:
           summary: "Synthetic CacheBackend probe failing on {{ $labels.backend }} in namespace {{ $labels.namespace }} (stage={{ $labels.stage }})."
           runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
+
+      - alert: BackendT2Degraded
+        # Per-CacheBackend tier-2 (external offload) health, read from the
+        # controller-emitted `inferencecache_backend_t2_hit_rate` gauge (the
+        # CacheIndex poller projects it from status.indexParticipation.t2HitRate,
+        # computed from the engine's vllm:external_prefix_cache_{hits,queries}
+        # counters). A value of 0 means the tier was queried but has served ZERO
+        # reloads since it was first exercised — the silent-degradation signal
+        # (offload store/connection failure, an under-sized offload server, or a
+        # scheduler/worker hash mismatch).
+        #
+        # This is the per-CacheBackend counterpart to LMCacheT2NoHits above. That
+        # alert reads vLLM's per-POD exposition directly and so needs a vLLM
+        # PodMonitor scoped to cache-bound pods (see its SCRAPE-SCOPING note);
+        # this one binds to the operator's own gauge, whose `backend` label is the
+        # canonical <namespace>/<name> — so attribution is per-CacheBackend with
+        # no scrape-scoping caveat. It is the Alertmanager-side mirror of the
+        # advisory T2Degraded CR condition (CacheBackend.status, not scraped).
+        #
+        # The query-token rate is the ACTIVITY GATE: it keeps a backend that took
+        # a few cold misses and then went idle from paging — its query counter goes
+        # flat (rate ~0, below the floor), so only a backend with sustained tier-2
+        # traffic AND zero reloads alerts. The 1000 tokens/sec floor matches the
+        # per-pod LMCacheT2NoHits (the counters are TOKENS, not requests — one
+        # ~1000-token prefixed request/sec clears it; idle replicas stay under).
+        # `max by` collapses the controller pod/instance labels (and any HA-replica
+        # duplicates), leaving a clean (namespace, backend) alert; `namespace` is
+        # the install scope Prometheus injects from the controller scrape target,
+        # so installs stay isolated. (inferencecache_backend_t2_query_tokens_total
+        # is a MONOTONIC counter the controller builds by accumulating only the
+        # positive per-tick deltas of the per-backend aggregate, so a replica/tenant
+        # drain or engine restart is clamped out and rate() never sees a phantom
+        # reset.)
+        expr: |
+          (max by (namespace, backend) (rate(inferencecache_backend_t2_query_tokens_total[10m])) > 1000)
+          and on (namespace, backend)
+          (max by (namespace, backend) (inferencecache_backend_t2_hit_rate) == 0)
+        for: 5m
+        labels:
+          severity: warning
+          component: inference-cache
+        annotations:
+          summary: "Tier-2 (external offload) on CacheBackend {{ $labels.backend }} is serving queries but zero reloads — silently degraded (store/connection failure, under-sized offload server, or scheduler/worker hash mismatch)."
+          runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#backendt2degraded"
 
   # ----------------------------------------------------------------------------
   # DEFERRED — the metrics these alerts consume are not yet exposed on

@@ -29,12 +29,13 @@ There are two distribution shapes, same rule set, drift-gated by
      favor of explicit `ServiceMonitor` / `PodMonitor` CRs.
   2. A [`PodMonitor`](../../config/observability/podmonitor.yaml) that
      tells Prometheus to scrape the controller pod's `:8080/metrics`.
-     Required for the controller-side alerts (`ServerProbeFail` reads
-     `inferencecache_backend_probe_result_total`, which the
-     CacheBackend reconciler emits; the existing
-     `inferencecache_backend_server_restart_cascades_total` is also
-     controller-emitted). Without this, those rules load but never
-     have a series to evaluate.
+     Required for the controller-side alerts: `ServerProbeFail` reads
+     `inferencecache_backend_probe_result_total` and `BackendT2Degraded`
+     reads `inferencecache_backend_t2_hit_rate` +
+     `inferencecache_backend_t2_query_tokens_total` — all controller-emitted
+     (as is the not-yet-alerted-on
+     `inferencecache_backend_server_restart_cascades_total`). Without this,
+     those rules load but never have a series to evaluate.
   3. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
      carrying the alerts.
 
@@ -79,9 +80,10 @@ There are two distribution shapes, same rule set, drift-gated by
   `inference-cache-server` pod (server-side series: index, lookup, auth)
   AND the `inference-cache-controller-manager` pod (controller-side
   series: per-stage probe-result counter, cache-server restart-cascade
-  counter). Server-only scrape leaves the controller-side alerts
-  (`ServerProbeFail` today) loaded but inert — they read
-  `inferencecache_backend_probe_result_total` which is controller-emitted.
+  counter, and the tier-2 hit-rate gauge + query-token counter). Server-only scrape leaves the controller-side alerts
+  (`ServerProbeFail`, `BackendT2Degraded`) loaded but inert — they read
+  controller-emitted series (`inferencecache_backend_probe_result_total`,
+  `inferencecache_backend_t2_hit_rate`, `inferencecache_backend_t2_query_tokens_total`).
   To keep the alerts' per-install scoping working, both scrapes must
   inject a `namespace` label. Two valid shapes:
   1. **Recommended** — Kubernetes service discovery
@@ -106,8 +108,8 @@ There are two distribution shapes, same rule set, drift-gated by
   shapes (1) and (2) require you to wire BOTH scrape entries
   explicitly when you are not on prometheus-operator.
 
-Both files contain the same six active alerts (five Stage 1 alerts plus
-the controller-side `ServerProbeFail`) plus commented-out placeholders for
+Both files contain the same seven active alerts (five Stage 1 alerts plus
+two controller-side, `ServerProbeFail` and `BackendT2Degraded`) plus commented-out placeholders for
 two more that depend on metrics not yet exposed (see [Deferred
 alerts](#deferred-alerts) below).
 
@@ -158,11 +160,11 @@ alerts](#deferred-alerts) below).
 >       interval: 30s
 > ```
 >
-> The other five alerts work as-is once this bundle is applied — they
+> The other six alerts work as-is once this bundle is applied — they
 > only read `inferencecache_*` series, which the shipped ServiceMonitor
 > (server-side: `IndexEmpty`, `LookupRouteDegenerate`,
 > `LookupRouteHighTimeout`, `IndexEvictionsSpike`) and PodMonitor
-> (controller-side: `ServerProbeFail`) cover between them.
+> (controller-side: `ServerProbeFail`, `BackendT2Degraded`) cover between them.
 >
 > **The alerts rely on a `namespace` label per install.** Both the shipped
 > `ServiceMonitor` for `inference-cache-server` and any prometheus-operator
@@ -332,12 +334,24 @@ the series have been present since vLLM 0.18 (the first release tagged
 in the upstream v0.18 docs page). Our alert and triage queries accept
 both the unsuffixed and `_total` forms via `{__name__=~"...(_total)?"}`.
 
-This operator has no in-process scrape of those upstream metrics — its
-own scraper (`pkg/adapters/engine/metrics_scraper.go`) only reads the T1
-`vllm:prefix_cache_{hits,queries}` plus `vllm:*_cache_usage_perc`. That
-means the alert binds directly to vLLM's exposition, and an upstream
-rename, deprecation, or version skew can silently make the alert inert
-while `promtool test rules` (which uses synthetic series) still passes.
+The operator's own scraper (`pkg/adapters/engine/metrics_scraper.go`)
+now ALSO reads these external counters (alongside the T1
+`vllm:prefix_cache_{hits,queries}` and `vllm:*_cache_usage_perc`) and
+projects them per-CacheBackend as the `inferencecache_backend_t2_hit_rate`
+gauge and the `T2Degraded` condition — see
+[`BackendT2Degraded`](#backendt2degraded), the per-CacheBackend
+counterpart to this alert. This per-POD alert still binds directly to
+vLLM's exposition: it gives pod-level granularity and keeps working even
+where the operator's index/scrape path isn't wired. The tradeoff is that
+an upstream rename, deprecation, or version skew can silently make THIS
+alert inert while `promtool test rules` (which uses synthetic series)
+still passes — prefer `BackendT2Degraded` for clean per-CacheBackend
+attribution where it's available. **But do not retire this per-pod alert:**
+`BackendT2Degraded` reads the *lifetime-cumulative* hit-rate, so its `== 0`
+only catches a tier that has **never** served a reload; a mid-life regression
+(served reloads before, now zero under continuing queries) keeps that cumulative
+ratio > 0 and is caught *only* by this windowed, rate-based `LMCacheT2NoHits`.
+Run both.
 
 **Operator responsibility:** before enabling the alert in production,
 confirm at least one engine pod publishes the series:
@@ -700,6 +714,100 @@ sum by (backend, stage, result) (
 
 ---
 
+### `BackendT2Degraded`
+
+- **Severity**: `warning`
+- **For**: 5 minutes
+- **Source metrics** (both controller-emitted, `backend` = canonical
+  `<namespace>/<name>`; Prometheus injects the install `namespace` from the
+  controller scrape target):
+  - `inferencecache_backend_t2_query_tokens_total` — cumulative tier-2 query tokens;
+    `rate()` over it is the **activity gate**.
+  - `inferencecache_backend_t2_hit_rate` — the reload hit-rate (`== 0` = zero
+    reloads), projected from `status.indexParticipation.t2HitRate` (computed
+    from the engine's `vllm:external_prefix_cache_{hits,queries}` counters).
+- **Expr**: fires when `rate(query_tokens[10m]) > 1000` tokens/sec **and**
+  `hit_rate == 0`.
+
+A managed CacheBackend's tier-2 (external offload, e.g. LMCache) is actively
+being queried but recalling **zero** reloads — its hit-rate gauge is sitting at
+exactly 0 while tier-2 query traffic continues. The offload tier looks "wired"
+(the CacheBackend is `Ready`, stores are landing) but nothing is ever recalled:
+every offload `put` is wasted work and the engine refills T2 forever without
+benefiting from it. This is the per-CacheBackend, controller-attributed
+counterpart to [`LMCacheT2NoHits`](#lmcachet2nohits) (which reads vLLM's per-pod
+exposition directly and needs a scoped vLLM PodMonitor); it is the
+Alertmanager-side mirror of the advisory `T2Degraded` condition on
+`CacheBackend.status` (which Prometheus does not scrape).
+
+> **Why the activity gate matters.** The hit-rate gauge is cumulative, so a
+> backend that took a few cold misses and then went idle keeps exporting `0`
+> long after it stopped serving traffic — `hit_rate == 0` alone would page it as
+> "degraded." The `rate(query_tokens) > 1000` tokens/sec clause is the gate: an
+> idle backend's query gauge goes flat (`rate ≈ 0`), so only a backend with
+> sustained tier-2 traffic *and* zero reloads alerts. (The 1000 tokens/sec floor
+> matches `LMCacheT2NoHits` — the counters are tokens, not requests.) A backend
+> that has never been queried exports no series and cannot trip the alert; an
+> engine restart resets its cumulative counters, which `rate()` handles.
+
+#### Likely causes
+
+The same failure class as [`LMCacheT2NoHits`](#lmcachet2nohits), surfaced
+per-CacheBackend:
+
+1. **Scheduler/worker hash mismatch under tensor parallelism** — e.g.
+   `PYTHONHASHSEED` unset on a TP>1 engine, so the scheduler's lookup hashes
+   never match the workers' stored hashes. Stores succeed, reloads are always 0.
+2. **Offload server under-provisioned / OOMKilled** — a large model's KV working
+   set exceeds the standalone offload server's memory; stores fail (broken pipe)
+   and nothing is recallable.
+3. **Client/server version skew** in the offload subsystem (old client library
+   vs newer server image, or vice versa) — the wire handshake succeeds but
+   `put`/`get` opcodes diverge.
+4. **External backend down / wrong endpoint** for an `External`-type CacheBackend.
+
+#### First-response runbook
+
+```bash
+# 1. Identify the degraded backend — the alert's `backend` label is <ns>/<name>.
+kubectl get cachebackend -A
+
+# 2. Confirm the symptom on the CR — the advisory condition mirrors the gauge:
+kubectl get cachebackend <name> -n <namespace> \
+  -o jsonpath='{range .status.conditions[?(@.type=="T2Degraded")]}{.status} {.reason}{"\n"}{end}'
+# True / T2ZeroHitRate == the tier was queried but served zero reloads.
+
+# 3. For a managed LMCache backend, check the engine pods for the TP>1 hash
+#    mismatch (cause 1) and the offload server for OOM (cause 2):
+kubectl get pod -l <engineSelector> \
+  -o jsonpath='{.items[*].spec.containers[0].env[?(@.name=="PYTHONHASHSEED")].value}'
+kubectl get pod -l <offload-server-selector> \
+  -o jsonpath='{range .items[*]}{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}{end}'
+# OOMKilled on the server == cause 2 (raise its memory request/limit).
+```
+
+Triage queries:
+
+```promql
+# The degraded backends right now — the alert's own expr (actively queried AND
+# recalling zero reloads):
+(max by (namespace, backend) (rate(inferencecache_backend_t2_query_tokens_total[10m])) > 1000)
+and on (namespace, backend)
+(max by (namespace, backend) (inferencecache_backend_t2_hit_rate) == 0)
+
+# Hit-rate and query-token rate across exercised backends, for context:
+max by (namespace, backend) (inferencecache_backend_t2_hit_rate)
+max by (namespace, backend) (rate(inferencecache_backend_t2_query_tokens_total[10m]))
+```
+
+The alert clears the moment the offload tier serves reloads again: a successful
+reload lifts `inferencecache_backend_t2_hit_rate` above 0, dropping the `== 0`
+clause — no engine restart or counter reset required. It also clears if tier-2
+query traffic falls below the rate floor, or if the backend is decommissioned and
+its series drain out of the index.
+
+---
+
 ## Deferred alerts
 
 Two more alerts are scoped to ship as part of the same observability
@@ -718,14 +826,14 @@ metric.
 
 ## How alerts compose
 
-The five Stage 1 alerts are not independent — they map onto a small set
+These active alerts are not independent — they map onto a small set
 of recurring failure modes:
 
 | Failure mode | Alerts that fire | Where to look first |
 |---|---|---|
 | Subscriber sidecar not injected | `IndexEmpty` (critical) | controller flags + webhook config |
 | Engine prefix-cache off | `IndexEmpty` (critical) | engine flags `--enable-prefix-caching` + `--kv-events-config` |
-| Offload tier version skew | `LMCacheT2NoHits` (warning) + maybe `LookupRouteDegenerate` if T2 is the only cache path | offload client/server image tags |
+| Offload tier silently degraded (version skew, server OOM, or `PYTHONHASHSEED` hash mismatch) | `BackendT2Degraded` (warning, per-CacheBackend) + `LMCacheT2NoHits` (warning, per-pod) + maybe `LookupRouteDegenerate` if T2 is the only cache path | `CacheBackend.status` `T2Degraded` condition; offload client/server image tags; offload server memory |
 | Tenant or `hash_scheme` mismatch | `LookupRouteDegenerate` (warning) alongside `inferencecache_index_entries > 0` | gateway-side request shape |
 | Server overload | `LookupRouteHighTimeout` (warning) + maybe `LookupRouteDegenerate` | `inferencecache_lookup_route_latency_seconds` p99, `process_resident_memory_bytes`, server's global `MaxEntries` |
 | Working set outgrew config | `IndexEvictionsSpike` (info) | server's global `MaxEntries` vs. observed working-set size; `CacheTenant.spec.quota.maxIndexEntries` per tenant |
