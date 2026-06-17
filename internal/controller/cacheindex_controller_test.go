@@ -21,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	"github.com/cachebox-project/inference-cache/pkg/index"
@@ -731,6 +733,227 @@ func TestRefreshT2HitRatePresence(t *testing.T) {
 	assertT2("t2-healthy", false, "0.75")
 	assertT2("t2-broken", false, "0")
 	assertT2("t2-cold", true, "")
+}
+
+// TestRefreshT2HitRateGauge: the poller mirrors t2HitRate onto the
+// inferencecache_backend_t2_hit_rate gauge (the Alertmanager surface), present
+// only for exercised backends, and prunes a series when its backend drains so a
+// stale 0 can't trip a false alert.
+func TestRefreshT2HitRateGauge(t *testing.T) {
+	resetBackendT2HitRateForTest()
+	defer resetBackendT2HitRateForTest() // leave global gauge state clean for the next metric test
+	cbH := cbFixture("t2-h", "default", map[string]string{"app": "vh"})
+	cbB := cbFixture("t2-b", "default", map[string]string{"app": "vb"})
+	cbC := cbFixture("t2-c", "default", map[string]string{"app": "vc"})
+	podH := enginePod("vh-0", "default", map[string]string{"app": "vh"})
+	podB := enginePod("vb-0", "default", map[string]string{"app": "vb"})
+	podC := enginePod("vc-0", "default", map[string]string{"app": "vc"})
+	var mu sync.Mutex
+	served := index.Snapshot{Replicas: []index.ReplicaSnapshot{
+		{ReplicaID: "vh-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+		{ReplicaID: "vb-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 500, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+		{ReplicaID: "vc-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 0, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+	}}
+	p, cl, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cbH, cbB, cbC},
+		[]*corev1.Pod{podH, podB, podC}, &served, &mu)
+	defer srv.Close()
+
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	// CollectAndCompare gathers what the poller actually exported and — unlike
+	// WithLabelValues — never creates the child it reads, so a series that
+	// production failed to emit is caught here, not silently materialized at 0.
+	// It pins the EXACT set: healthy 0.75, broken 0, cold (never queried) absent.
+	wantSteady := `# HELP inferencecache_backend_t2_hit_rate Tier-2 (external offload) reload hit-rate per CacheBackend in [0,1]; the series is present only once the tier is exercised, and 0 means it is wired but serving zero reloads.
+# TYPE inferencecache_backend_t2_hit_rate gauge
+inferencecache_backend_t2_hit_rate{backend="default/t2-b"} 0
+inferencecache_backend_t2_hit_rate{backend="default/t2-h"} 0.75
+`
+	if err := testutil.CollectAndCompare(backendT2HitRate, strings.NewReader(wantSteady)); err != nil {
+		t.Fatalf("steady-state gauge mismatch (want t2-h=0.75, t2-b=0, t2-c absent): %v", err)
+	}
+
+	// The query-token COUNTER (the activity signal BackendT2Degraded rate()s)
+	// accumulates only positive per-poll deltas; the FIRST observation establishes
+	// the baseline at 0 so a pre-existing cumulative cannot spike rate().
+	wantSteadyQ := `# HELP inferencecache_backend_t2_query_tokens_total Monotonic count of tier-2 (external offload) query tokens observed per CacheBackend (positive per-poll deltas of the engine's cumulative; drops from replica/tenant churn or restart are clamped out). Use rate() to gate on tier-2 activity.
+# TYPE inferencecache_backend_t2_query_tokens_total counter
+inferencecache_backend_t2_query_tokens_total{backend="default/t2-b"} 0
+inferencecache_backend_t2_query_tokens_total{backend="default/t2-h"} 0
+`
+	if err := testutil.CollectAndCompare(backendT2QueryTokensTotal, strings.NewReader(wantSteadyQ)); err != nil {
+		t.Fatalf("steady-state query-token counter mismatch (first obs -> baseline 0 for t2-h/t2-b, t2-c absent): %v", err)
+	}
+
+	// The broken backend's replica leaves the index snapshot (drains). Because the
+	// rate is cumulative, idleness alone would NOT prune it — drop-out does. Its
+	// series must be pruned, not left at a stale 0.
+	mu.Lock()
+	served.Replicas = []index.ReplicaSnapshot{
+		{ReplicaID: "vh-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 1200, T2QueryTokens: 1500, LastUpdate: time.Unix(1_700_000_100, 0).UTC()},
+	}
+	mu.Unlock()
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh 2: %v", err)
+	}
+	wantDrained := `# HELP inferencecache_backend_t2_hit_rate Tier-2 (external offload) reload hit-rate per CacheBackend in [0,1]; the series is present only once the tier is exercised, and 0 means it is wired but serving zero reloads.
+# TYPE inferencecache_backend_t2_hit_rate gauge
+inferencecache_backend_t2_hit_rate{backend="default/t2-h"} 0.8
+`
+	if err := testutil.CollectAndCompare(backendT2HitRate, strings.NewReader(wantDrained)); err != nil {
+		t.Fatalf("after drain, gauge mismatch (want t2-b pruned, t2-h=0.8): %v", err)
+	}
+	// vh-0's query tokens grew 1000 -> 1500, so the counter accumulated the +500
+	// delta; t2-b drained and was pruned.
+	wantDrainedQ := `# HELP inferencecache_backend_t2_query_tokens_total Monotonic count of tier-2 (external offload) query tokens observed per CacheBackend (positive per-poll deltas of the engine's cumulative; drops from replica/tenant churn or restart are clamped out). Use rate() to gate on tier-2 activity.
+# TYPE inferencecache_backend_t2_query_tokens_total counter
+inferencecache_backend_t2_query_tokens_total{backend="default/t2-h"} 500
+`
+	if err := testutil.CollectAndCompare(backendT2QueryTokensTotal, strings.NewReader(wantDrainedQ)); err != nil {
+		t.Fatalf("after drain, query-token counter mismatch (want t2-h=500 accumulated, t2-b pruned): %v", err)
+	}
+
+	// Deleting every backend -> empty list -> all gauge series pruned. The
+	// empty-list early return must still reconcile, else a stale 0 lingers and
+	// keeps alerting after the fleet is gone.
+	for _, cb := range []*cachev1alpha1.CacheBackend{cbH, cbB, cbC} {
+		if err := cl.Delete(context.Background(), cb); err != nil {
+			t.Fatalf("delete backend %s: %v", cb.Name, err)
+		}
+	}
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh 3: %v", err)
+	}
+	if n := testutil.CollectAndCount(backendT2HitRate); n != 0 {
+		t.Fatalf("after all backends deleted, series = %d, want 0 (empty-list path must prune)", n)
+	}
+	if n := testutil.CollectAndCount(backendT2QueryTokensTotal); n != 0 {
+		t.Fatalf("after all backends deleted, query-token series = %d, want 0", n)
+	}
+}
+
+// TestReconcileBackendT2HitRateSeries pins the stale-series lifecycle (for BOTH
+// per-backend tier-2 metrics) the false-alert guarantee depends on: a DELETED backend's series is
+// pruned, a DRAINED (present, not-exercised, not-tainted) backend's series is
+// pruned, and a TAINTED namespace's series is PRESERVED (a transient API error
+// must not drop a series and silently clear an alert).
+func TestReconcileBackendT2HitRateSeries(t *testing.T) {
+	resetBackendT2HitRateForTest()
+	defer resetBackendT2HitRateForTest() // leave global gauge state clean for the next metric test
+	kA, kB, kD := t2Key{"ns", "a"}, t2Key{"ns", "b"}, t2Key{"ns", "d"}
+	// set seeds BOTH per-backend tier-2 series for a key, so the lifecycle helper
+	// can be checked to prune them together (it owns both).
+	set := func(k t2Key, v float64) {
+		backendT2HitRate.WithLabelValues(k.label()).Set(v)
+		backendT2QueryTokensTotal.WithLabelValues(k.label()).Add(1)
+	}
+	keys := func(ks ...t2Key) map[t2Key]struct{} {
+		m := map[t2Key]struct{}{}
+		for _, k := range ks {
+			m[k] = struct{}{}
+		}
+		return m
+	}
+	// assertBoth pins that the helper keeps backendT2HitRate and
+	// backendT2QueryTokensTotal in lockstep — a regression that pruned one but not
+	// the other would leave a stale series that still trips (or masks) an alert.
+	assertBoth := func(tick string, want int) {
+		t.Helper()
+		if n := testutil.CollectAndCount(backendT2HitRate); n != want {
+			t.Fatalf("%s hit-rate series = %d, want %d", tick, n, want)
+		}
+		if n := testutil.CollectAndCount(backendT2QueryTokensTotal); n != want {
+			t.Fatalf("%s query-token series = %d, want %d (helper must prune both metrics)", tick, n, want)
+		}
+	}
+
+	// Tick 1: A, B, D all exercised + present -> all tracked, none pruned.
+	set(kA, 0.9)
+	set(kB, 0)
+	set(kD, 0.5)
+	reconcileBackendT2HitRateSeries(keys(kA, kB, kD), keys(kA, kB, kD), nil)
+	assertBoth("tick1", 3)
+
+	// Tick 2: A re-exercised; B present but its namespace is TAINTED (must be
+	// preserved); D is DELETED (absent from present -> pruned even under taint).
+	set(kA, 0.8)
+	reconcileBackendT2HitRateSeries(keys(kA), keys(kA, kB), map[string]struct{}{"ns": {}})
+	assertBoth("tick2 (D pruned, B taint-preserved)", 2)
+
+	// Tick 3: ns no longer tainted; B present but not exercised (drained) -> pruned.
+	set(kA, 0.8)
+	reconcileBackendT2HitRateSeries(keys(kA), keys(kA, kB), nil)
+	assertBoth("tick3 (B drained)", 1)
+}
+
+// TestT2QueryDelta pins the clamp-and-baseline logic the BackendT2Degraded
+// activity gate depends on: the monotonic query counter adds only positive
+// per-tick deltas, treats the first observation as a baseline (no spike from the
+// pre-existing cumulative), and clamps a drop (replica/tenant churn or engine
+// restart) to 0 — never negative.
+func TestT2QueryDelta(t *testing.T) {
+	resetBackendT2HitRateForTest()
+	defer resetBackendT2HitRateForTest()
+	k := t2Key{"ns", "x"}
+	if d := t2QueryDelta(k, 1000); d != 0 {
+		t.Fatalf("first-observation delta = %d, want 0 (baseline, no spike)", d)
+	}
+	if d := t2QueryDelta(k, 1500); d != 500 {
+		t.Fatalf("growth delta = %d, want 500", d)
+	}
+	if d := t2QueryDelta(k, 1400); d != 0 {
+		t.Fatalf("drop delta = %d, want 0 (clamped — churn/restart must not go negative)", d)
+	}
+	if d := t2QueryDelta(k, 1400); d != 0 {
+		t.Fatalf("flat delta = %d, want 0", d)
+	}
+	if d := t2QueryDelta(k, 1600); d != 200 {
+		t.Fatalf("resumed-growth delta = %d, want 200 (from the post-drop baseline 1400)", d)
+	}
+}
+
+// TestRefreshT2HitRateCumulativeAfterRegression documents the intentional
+// lifetime-cumulative semantics: a backend that served reloads and then regresses
+// to zero reloads under continuing queries keeps a NON-ZERO hit-rate, so the
+// `== 0` T2Degraded condition / BackendT2Degraded alert (which target a tier that
+// never served a reload) do not trip. A mid-life regression is caught instead by
+// the windowed per-pod LMCacheT2NoHits alert.
+func TestRefreshT2HitRateCumulativeAfterRegression(t *testing.T) {
+	resetBackendT2HitRateForTest()
+	defer resetBackendT2HitRateForTest()
+	cb := cbFixture("t2-r", "default", map[string]string{"app": "vr"})
+	pod := enginePod("vr-0", "default", map[string]string{"app": "vr"})
+	var mu sync.Mutex
+	served := index.Snapshot{Replicas: []index.ReplicaSnapshot{
+		{ReplicaID: "vr-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
+	}}
+	p, _, srv := buildPollerWithFixtures(t,
+		[]*cachev1alpha1.CacheBackend{cb}, []*corev1.Pod{pod}, &served, &mu)
+	defer srv.Close()
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh 1: %v", err)
+	}
+	// Healthy: 750/1000 = 0.75. Now queries climb (1000 -> 5000) while hits stay
+	// flat at 750 — the tier stopped serving reloads.
+	mu.Lock()
+	served.Replicas = []index.ReplicaSnapshot{
+		{ReplicaID: "vr-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 5000, LastUpdate: time.Unix(1_700_000_100, 0).UTC()},
+	}
+	mu.Unlock()
+	if err := p.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh 2: %v", err)
+	}
+	// The cumulative ratio decays (750/5000 = 0.15) but stays > 0, so the `== 0`
+	// surfaces do NOT fire on this mid-life regression. Intentional.
+	want := `# HELP inferencecache_backend_t2_hit_rate Tier-2 (external offload) reload hit-rate per CacheBackend in [0,1]; the series is present only once the tier is exercised, and 0 means it is wired but serving zero reloads.
+# TYPE inferencecache_backend_t2_hit_rate gauge
+inferencecache_backend_t2_hit_rate{backend="default/t2-r"} 0.15
+`
+	if err := testutil.CollectAndCompare(backendT2HitRate, strings.NewReader(want)); err != nil {
+		t.Fatalf("late-regression hit-rate must stay > 0 (cumulative 750/5000 = 0.15): %v", err)
+	}
 }
 
 // TestRefreshScrapeFailureDoesNotClearParticipation (fail-soft): once
