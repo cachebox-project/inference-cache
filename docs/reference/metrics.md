@@ -56,7 +56,7 @@ silently.
 |---|---|---|---|
 | `inferencecache_lookup_route_calls_total` | `model`, `reason_code`, `hint_used` | One increment per `LookupRoute` call, labeled by outcome. | `reason_code` ∈ values defined in [reason-codes.md](reason-codes.md). `hint_used="true"` ⇔ the response's `replica_scores` was non-empty — it covers **both** `PREFIX_MATCH` and `TENANT_HOT` (the latter is a softer locality hint emitted on a prefix miss when the tenant has warm replicas). The **prefix-hit SLO** of the cache plane is the ratio of `reason_code="PREFIX_MATCH"` over the total; the broader **hint ratio** (`hint_used="true"` over total) tracks how often any locality hint surfaces. Dashboards should chart both, since a healthy prefix-hit ratio is what drives the TTFT win. |
 | `inferencecache_snapshot_auth_total` | `result` | One increment per `/snapshot` request reaching the auth middleware, labeled by outcome. | `result` ∈ `ok` (bearer validated, controller SA, handler invoked), `unauth` (missing/empty/malformed bearer, OR TokenReview said `Authenticated=false` regardless of whether `Status.Error` is populated — this includes the **wrong-audience** case: a token whose JWT audience does not match the server's `--controller-audience` is reported by the apiserver as not authenticated, surfaced here in the same bucket), `forbidden` (TokenReview authenticated a non-controller identity), `error` (TokenReview Go-level transport failure, nil response, RBAC reject before review even ran — fail-closed 503). The `unauth` bucket intentionally collapses several apiserver-reported denials (plain bad token, `Status.Error` populated by the SA-token authenticator's JWT parser, wrong audience) because they're not distinguishable from the response shape; the middleware logs the apiserver's diagnostic at WARN to the server log so the operator can still tell them apart (e.g. `token audiences [...] is invalid for the target audiences [...]` clearly signals an audience mismatch — usually a manifest/flag drift between controller projection and server `--controller-audience`). A non-trivial `unauth` rate against a steady controller poller cadence is the first signal that the projected SA token / RBAC / audience / apiserver path is broken; `error` rate firing means the review never actually ran ("investigate the apiserver"). |
-| `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat: a wrong-audience controller token shows up in `unauth`, with the apiserver's `token audiences [...] is invalid` diagnostic at WARN. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Read- and write-side caches are independent — the same controller token cache-misses once per endpoint per TTL window in the steady state. |
+| `inferencecache_policy_auth_total` | `result` | One increment per `/policy` request reaching the auth middleware, labeled by outcome. Mirror of `inferencecache_snapshot_auth_total` for the controller's write-side push. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat: a wrong-audience token shows up in `unauth`, with the apiserver's `token audiences [...] is invalid` diagnostic at WARN. `/policy` uses the write-side `--policy-audience` (default `inferencecache.io/policy`), so a controller-audience snapshot/probe token is rejected here. The two counters live in parallel so dashboards distinguish read-side auth failures (snapshot scrape / info-leak attempt) from write-side ones (CachePolicy push / active-tampering attempt). Write-side `forbidden` rate is the alarming signal: it means a bearer was valid but issued to a non-controller identity, i.e. some other workload is trying to override cluster-wide cache policy. Endpoint caches are independent — each endpoint's valid token cache-misses once per TTL window in the steady state. |
 | `inferencecache_probe_auth_total` | `result` | One increment per `/probe` request reaching the auth middleware, labeled by outcome. Third controller↔server endpoint on the snapshot listener; this counter mirrors the snapshot/policy pair so dashboards distinguish probe-side auth failures from read-side (`/snapshot`) and write-side (`/policy`) ones. | Same `result` semantics as `inferencecache_snapshot_auth_total` above — `ok` / `unauth` / `forbidden` / `error` — and the same collapsed-bucket caveat. The probe-specific alarming signal is a non-trivial `unauth` rate without a paired `ok` rate: the CacheBackend reconciler drives `/probe` once per CacheBackend per ~30s, so silent `unauth` here means probe results never reach the reconciler and the `FunctionalProbeOK` condition degrades to unknown — invisible to operators unless this metric is on the dashboard. `forbidden` mirrors the policy-write semantics (some other workload is trying to drive a probe — alarming). All three caches are independent. |
 | `inferencecache_tenant_evictions_total` | `tenant_id`, `reason` | One increment per **distinct prefix** evicted from a tenant to bring it back within its `CacheTenant.spec.quota.maxIndexEntries` budget at ingest time (Fairness mode evicts the tenant's own oldest prefixes). | `reason` ∈ `over_entries` (only dimension today — the index-entry budget). A multi-replica prefix counts once (the eviction unit is the distinct prefix key, matching `maxIndexEntries`). A steadily rising rate for a `tenant_id` means that tenant is sustainably over budget — its declared cap is too small for its working set, or a client is churning prefixes. The series is created lazily on the first eviction, so a tenant that never exceeds budget emits nothing. |
 | `inferencecache_index_evictions_total` | `algorithm`, `reason` | One increment per **replica×prefix entry** removed by the index's own sweeps (distinct from the quota path above). | `algorithm` ∈ `lru` / `lfu` — the namespace's resolved `CachePolicy.spec.eviction`. `reason` ∈ `cap` (global `MaxEntries` exceeded — victims chosen by the algorithm: oldest-`lastSeen` for `lru`, lowest-access-count for `lfu`) / `ttl` (freshness sweep; algorithm-independent removal, but labeled with the namespace algorithm for attribution). Series are created lazily on the first eviction. A rising `reason="cap"` rate means the index is sustainably above `MaxEntries`; `lfu` keeps frequently-hit prefixes longer than `lru` under the same pressure. |
@@ -123,9 +123,9 @@ with OTEL collectors) without bumping `v1alpha1`.
   (in `pkg/server/metrics.go`) and wired into the per-endpoint authenticators
   in `pkg/server/server.go`. One increment per `/snapshot`, `/policy`, or
   `/probe` request reaching the middleware, labeled by `result`. All three
-  endpoints share the controller-auth profile but emit per-endpoint counters
-  so a dashboard can distinguish read-side, write-side, and probe-side
-  failures.
+  endpoints share the controller ServiceAccount identity profile but emit
+  per-endpoint counters and enforce endpoint-specific audiences so a dashboard
+  can distinguish read-side, write-side, and probe-side failures.
 
 ### Controller binary (`cmd/controller`)
 
@@ -169,25 +169,26 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
   snapshot — `CachePolicy` entries plus `CacheTenant` quota entries;
   replace-on-write), and `/probe` (controller-driven functional
   self-test, per CacheBackend). The gate has **THREE independent
-  layers**, each meant to catch a failure mode the others can't, and
-  the same gate applies to all three endpoints uniformly (one
-  middleware identity):
+  layers**, each meant to catch a failure mode the others can't, with one
+  ServiceAccount identity and endpoint-specific audiences:
   - **L3/L4:** a `NetworkPolicy` restricts ingress to the controller's
     pod selector.
   - **L7 identity:** TokenReview-backed bearer middleware rejects every
     request whose token does not resolve to the configured controller
     `ServiceAccount` (`--allowed-controller-sa`).
-  - **L7 audience:** the controller mounts an audience-bound projected
-    SA token (audience `inferencecache.io/controller` by default, mounted
-    at `/var/run/secrets/inferencecache.io/controller-token/token`); the
-    server passes `TokenReviewSpec.Audiences=[--controller-audience]` so
-    a default-audience apiserver token from the same controller SA is
-    rejected on any of the three endpoints. Under the default apiserver
-    audience configuration, a leaked controller-audience token is
-    useless against the apiserver and vice versa; the cross-surface
-    property holds only while the apiserver is not configured to also
-    accept `inferencecache.io/controller` as an apiserver audience
-    (keep the two distinct).
+  - **L7 audience:** the controller mounts two audience-bound projected
+    SA tokens: `inferencecache.io/controller` at
+    `/var/run/secrets/inferencecache.io/controller-token/token` for
+    `/snapshot` + `/probe`, and `inferencecache.io/policy` at
+    `/var/run/secrets/inferencecache.io/policy-token/token` for `/policy`.
+    The server passes `TokenReviewSpec.Audiences=[--controller-audience]`
+    on `/snapshot` + `/probe`, and `[--policy-audience]` on `/policy`, so a
+    default-audience apiserver token from the same controller SA is rejected,
+    and a leaked snapshot/probe token cannot push policy. Under the default
+    apiserver audience configuration, a leaked audience-bound bridge token is
+    useless against the apiserver and vice versa; the cross-surface property
+    holds only while the apiserver is not configured to also accept either
+    inference-cache audience as an apiserver audience.
 
   `inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
   and `inferencecache_probe_auth_total` (see the counter table above)

@@ -33,11 +33,11 @@ func main() {
 	// `--help` stays scannable: an empty value would silently disable
 	// audience binding while the rest of the boot log claims auth is
 	// enabled, which is the exact failure mode the startup check below
-	// rejects. The same audience gates /snapshot, /policy, and /probe
-	// since they share one middleware identity. Must match the audience
-	// listed in the controller's projected SA token volume (see
-	// config/manager/manager.yaml).
-	controllerAudience := flag.String("controller-audience", auth.ControllerAudience, "Audience the apiserver enforces on /snapshot, /policy, and /probe bearer tokens (TokenReviewSpec.Audiences). Must match the controller's projected SA token volume. REQUIRED non-empty when --allowed-controller-sa is set.")
+	// rejects. /snapshot + /probe use the controller audience; /policy uses
+	// its own write-side policy audience. Both must match the projected SA
+	// token volumes listed in config/manager/manager.yaml.
+	controllerAudience := flag.String("controller-audience", auth.ControllerAudience, "Audience the apiserver enforces on /snapshot and /probe bearer tokens (TokenReviewSpec.Audiences). Must match the controller-token projected SA token volume. REQUIRED non-empty when --allowed-controller-sa is set.")
+	policyAudience := flag.String("policy-audience", auth.PolicyAudience, "Audience the apiserver enforces on /policy bearer tokens (TokenReviewSpec.Audiences). Must match the policy-token projected SA token volume. REQUIRED non-empty when --allowed-controller-sa is set.")
 	// gRPC transport posture. Both set → the :9090 policy port
 	// terminates Service TLS in-process; both empty → plaintext (the default —
 	// config/default serves :9090 plaintext; TLS is the opt-in
@@ -74,7 +74,7 @@ func main() {
 	// so the full matrix (auth on/off, audience set/empty/whitespace, SA
 	// whitespace, insecure escape hatch) can be pinned by unit tests
 	// instead of relying on integration only.
-	if msg := validateControllerAuthFlags(*expectedSA, *controllerAudience, *insecureNoAuth); msg != "" {
+	if msg := validateControllerAuthFlags(*expectedSA, *controllerAudience, *policyAudience, *insecureNoAuth); msg != "" {
 		fmt.Fprintln(os.Stderr, msg)
 		os.Exit(2)
 	}
@@ -106,8 +106,14 @@ func main() {
 			slog.ErrorContext(ctx, "kube_client", "err", err)
 			os.Exit(1)
 		}
-		opts = append(opts, server.WithControllerAuth(auth.FromClientset(clientset), *expectedSA, *controllerAudience))
-		slog.InfoContext(ctx, "controller_auth_enabled", "expected_sa", *expectedSA, "audience", *controllerAudience)
+		opts = append(opts,
+			server.WithControllerAuth(auth.FromClientset(clientset), *expectedSA, *controllerAudience),
+			server.WithPolicyAudience(*policyAudience),
+		)
+		slog.InfoContext(ctx, "controller_auth_enabled",
+			"expected_sa", *expectedSA,
+			"controller_audience", *controllerAudience,
+			"policy_audience", *policyAudience)
 	} else {
 		// *insecureNoAuth == true, verified above.
 		slog.WarnContext(ctx, "controller_auth_disabled",
@@ -149,13 +155,13 @@ func main() {
 
 // validateControllerAuthFlags pins the operator-facing startup contract for
 // the controller-facing auth flags (--allowed-controller-sa,
-// --insecure-disable-auth, --controller-audience). Returns the diagnostic
-// message the server should print before exiting, or "" if the combination
-// is valid. Extracted from main() so the matrix can be unit-tested without
-// a subprocess harness.
+// --insecure-disable-auth, --controller-audience, --policy-audience). Returns
+// the diagnostic message the server should print before exiting, or "" if the
+// combination is valid. Extracted from main() so the matrix can be unit-tested
+// without a subprocess harness.
 //
-// The contract (/snapshot, /policy, and /probe share this gate since they
-// share one middleware identity):
+// The contract (/snapshot, /policy, and /probe share the same controller SA
+// identity gate):
 //   - --allowed-controller-sa AND --insecure-disable-auth are mutually
 //     exclusive (either you authenticate or you explicitly opted out; not both).
 //   - At least one must be set: the previous shape (silent unauth on empty
@@ -168,16 +174,16 @@ func main() {
 //     scrape AND every controller push would 403, and the operator would
 //     chase a logically-correct-but-mistyped flag. Fail fast at startup
 //     with the value echoed back.
-//   - When auth is on (--allowed-controller-sa set), --controller-audience
-//     must be a non-empty string that exactly matches its own trimmed form:
-//     any leading/trailing whitespace is rejected here at startup with a
-//     fail-fast diagnostic instead of being silently passed to
+//   - When auth is on (--allowed-controller-sa set), both --controller-audience
+//     and --policy-audience must be non-empty strings that exactly match their
+//     own trimmed forms: any leading/trailing whitespace is rejected here at
+//     startup with a fail-fast diagnostic instead of being silently passed to
 //     TokenReviewSpec.Audiences (where a stray " " would not match the JWT-
 //     baked audience and would silently produce a runtime 401 loop). The
 //     fully-empty / whitespace-only case is the same rejection path: there
 //     is no legitimate reason to disable audience binding via the CLI (the
 //     test-only legacy posture is reachable only via server.WithControllerAuth).
-func validateControllerAuthFlags(expectedSA, audience string, insecureNoAuth bool) string {
+func validateControllerAuthFlags(expectedSA, controllerAudience, policyAudience string, insecureNoAuth bool) string {
 	switch {
 	case expectedSA != "" && insecureNoAuth:
 		return "--allowed-controller-sa and --insecure-disable-auth are mutually exclusive"
@@ -185,10 +191,14 @@ func validateControllerAuthFlags(expectedSA, audience string, insecureNoAuth boo
 		return "missing --allowed-controller-sa; pass --insecure-disable-auth to run /snapshot, /policy, and /probe without authentication (local development only)"
 	case expectedSA != "" && strings.TrimSpace(expectedSA) != expectedSA:
 		return fmt.Sprintf("--allowed-controller-sa has leading/trailing whitespace (%q); the apiserver returns SA usernames without whitespace, so this value would never match and every controller request would 403", expectedSA)
-	case expectedSA != "" && strings.TrimSpace(audience) == "":
+	case expectedSA != "" && strings.TrimSpace(controllerAudience) == "":
 		return "--controller-audience cannot be empty or whitespace-only when --allowed-controller-sa is set; an empty/blank audience would silently disable the defense-in-depth gate that pairs with TokenReview.Audiences"
-	case expectedSA != "" && strings.TrimSpace(audience) != audience:
-		return fmt.Sprintf("--controller-audience has leading/trailing whitespace (%q); the JWT-baked audience will not match this value and the server would produce a runtime 401 loop instead of the fail-fast operators expect", audience)
+	case expectedSA != "" && strings.TrimSpace(controllerAudience) != controllerAudience:
+		return fmt.Sprintf("--controller-audience has leading/trailing whitespace (%q); the JWT-baked audience will not match this value and the server would produce a runtime 401 loop instead of the fail-fast operators expect", controllerAudience)
+	case expectedSA != "" && strings.TrimSpace(policyAudience) == "":
+		return "--policy-audience cannot be empty or whitespace-only when --allowed-controller-sa is set; an empty/blank audience would silently disable the defense-in-depth gate that pairs with TokenReview.Audiences"
+	case expectedSA != "" && strings.TrimSpace(policyAudience) != policyAudience:
+		return fmt.Sprintf("--policy-audience has leading/trailing whitespace (%q); the JWT-baked audience will not match this value and the server would produce a runtime 401 loop instead of the fail-fast operators expect", policyAudience)
 	}
 	return ""
 }

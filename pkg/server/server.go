@@ -68,15 +68,26 @@ type controllerAuthConfig struct {
 // the production binary always sets it. expectedSA is the canonical
 // ServiceAccount username, e.g.
 // "system:serviceaccount:inference-cache-system:inference-cache-controller-manager".
-// audience is the value passed to TokenReviewSpec.Audiences (audience
-// binding); pass an empty string to disable audience binding (legacy
-// posture). The production binary defaults audience to
-// auth.ControllerAudience and must keep it aligned with the controller's
-// projected SA token volume. The same audience gates all three endpoints
-// because they share one middleware identity (the controller SA).
+// audience is the value passed to TokenReviewSpec.Audiences for /snapshot
+// and /probe (audience binding); pass an empty string to disable audience
+// binding (legacy posture). The production binary defaults audience to
+// auth.ControllerAudience and must keep it aligned with the controller-token
+// projected SA token volume. /policy can be narrowed further with
+// WithPolicyAudience; if no policy audience override is supplied, /policy
+// falls back to this audience for backwards-compatible in-process tests.
 func WithControllerAuth(reviewer auth.TokenReviewer, expectedSA, audience string) Option {
 	return func(s *Service) {
 		s.controllerAuthCfg = &controllerAuthConfig{reviewer: reviewer, saName: expectedSA, audience: audience}
+	}
+}
+
+// WithPolicyAudience sets the audience passed to TokenReviewSpec.Audiences
+// for /policy requests. The production binary uses auth.PolicyAudience so the
+// write-side policy token cannot be replayed against /snapshot or /probe.
+// Empty keeps the WithControllerAuth audience fallback.
+func WithPolicyAudience(audience string) Option {
+	return func(s *Service) {
+		s.policyAudience = audience
 	}
 }
 
@@ -108,6 +119,7 @@ type Service struct {
 	snapshotHandler   http.Handler
 	policyHandler     http.Handler
 	controllerAuthCfg *controllerAuthConfig
+	policyAudience    string
 	metrics           *serverMetrics
 	index             *index.Index
 	policies          *PolicyStore
@@ -257,18 +269,20 @@ func New(opts ...Option) *Service {
 
 	// If auth is configured, wrap /snapshot, /policy, and /probe in the
 	// TokenReview middleware. Three Authenticator instances share the same
-	// Reviewer, ExpectedSA, and Audience but emit per-endpoint metrics
+	// Reviewer and ExpectedSA but emit per-endpoint metrics and can enforce
+	// endpoint-specific audiences.
 	// (inferencecache_snapshot_auth_total + inferencecache_policy_auth_total
 	// + inferencecache_probe_auth_total) so a dashboard can distinguish a
 	// read-side auth failure (info leak attempt) from a write-side one
 	// (active tampering attempt) from a probe-side one (silent Ready-gate
 	// degradation once the controller-wiring follow-up lands). The three
 	// caches are independent — one extra TokenReview per endpoint per TTL
-	// window in the steady state, negligible vs the apiserver's own auth
-	// cost. The shared Audience means the projected SA token at the
-	// controller's volume mount admits to all three endpoints uniformly;
-	// there's one trust boundary, not three.
+	// window in the steady state, negligible vs the apiserver's own auth cost.
 	if s.controllerAuthCfg != nil {
+		policyAudience := s.policyAudience
+		if policyAudience == "" {
+			policyAudience = s.controllerAuthCfg.audience
+		}
 		snapshotAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,
 			ExpectedServiceAccount: s.controllerAuthCfg.saName,
@@ -284,7 +298,7 @@ func New(opts ...Option) *Service {
 		policyAuthn, err := auth.NewAuthenticator(auth.Options{
 			Reviewer:               s.controllerAuthCfg.reviewer,
 			ExpectedServiceAccount: s.controllerAuthCfg.saName,
-			Audience:               s.controllerAuthCfg.audience,
+			Audience:               policyAudience,
 			Recorder:               s.metrics.PolicyAuthRecorder(),
 		})
 		if err != nil {

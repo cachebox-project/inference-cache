@@ -6,61 +6,76 @@ import (
 )
 
 // TestValidateControllerAuthFlags pins the operator-facing startup contract for
-// the controller-facing auth flag combinations that gate BOTH /snapshot and
-// /policy. Each row is a real shape an operator might wire — including the
-// failure modes the validation exists to catch (silent unauth,
-// audience-empty bypass, whitespace-bracketed values, both knobs on at once).
+// the controller-facing auth flag combinations that gate /snapshot, /policy,
+// and /probe. Each row is a real shape an operator might wire — including the
+// failure modes the validation exists to catch (silent unauth, audience-empty
+// bypass, whitespace-bracketed values, both knobs on at once).
 //
 // The diagnostic message is asserted only by substring (the user-visible cue
 // the failure points at) so the wording can evolve without breaking the
 // contract test.
 func TestValidateControllerAuthFlags(t *testing.T) {
 	const (
-		ctrlSA = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
-		aud    = "inferencecache.io/controller"
+		ctrlSA    = "system:serviceaccount:inference-cache-system:inference-cache-controller-manager"
+		ctrlAud   = "inferencecache.io/controller"
+		policyAud = "inferencecache.io/policy"
 	)
 
 	cases := []struct {
-		name       string
-		expectedSA string
-		audience   string
-		insecure   bool
-		wantSubstr string // "" → expect valid (empty return)
+		name               string
+		expectedSA         string
+		controllerAudience string
+		policyAudience     string
+		insecure           bool
+		wantSubstr         string // "" → expect valid (empty return)
 	}{
 		{
-			name:       "production: SA set, audience set, insecure off",
-			expectedSA: ctrlSA,
-			audience:   aud,
-			insecure:   false,
-			wantSubstr: "",
+			name:               "production: SA set, both audiences set, insecure off",
+			expectedSA:         ctrlSA,
+			controllerAudience: ctrlAud,
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "",
 		},
 		{
-			name:       "local-dev: SA empty, insecure on",
-			expectedSA: "",
-			audience:   aud, // audience flag value is ignored when auth is off
-			insecure:   true,
-			wantSubstr: "",
+			name:               "local-dev: SA empty, insecure on",
+			expectedSA:         "",
+			controllerAudience: ctrlAud,   // audience flag values are ignored when auth is off
+			policyAudience:     policyAud, // audience flag values are ignored when auth is off
+			insecure:           true,
+			wantSubstr:         "",
 		},
 		{
-			name:       "mutually exclusive: SA set AND insecure on",
-			expectedSA: ctrlSA,
-			audience:   aud,
-			insecure:   true,
-			wantSubstr: "mutually exclusive",
+			name:               "mutually exclusive: SA set AND insecure on",
+			expectedSA:         ctrlSA,
+			controllerAudience: ctrlAud,
+			policyAudience:     policyAud,
+			insecure:           true,
+			wantSubstr:         "mutually exclusive",
 		},
 		{
-			name:       "silent unauth blocked: neither flag set",
-			expectedSA: "",
-			audience:   aud,
-			insecure:   false,
-			wantSubstr: "missing --allowed-controller-sa",
+			name:               "silent unauth blocked: neither flag set",
+			expectedSA:         "",
+			controllerAudience: ctrlAud,
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "missing --allowed-controller-sa",
 		},
 		{
-			name:       "audience bypass blocked: SA set, audience empty",
-			expectedSA: ctrlSA,
-			audience:   "",
-			insecure:   false,
-			wantSubstr: "--controller-audience cannot be empty",
+			name:               "controller audience bypass blocked: SA set, audience empty",
+			expectedSA:         ctrlSA,
+			controllerAudience: "",
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "--controller-audience cannot be empty",
+		},
+		{
+			name:               "policy audience bypass blocked: SA set, policy audience empty",
+			expectedSA:         ctrlSA,
+			controllerAudience: ctrlAud,
+			policyAudience:     "",
+			insecure:           false,
+			wantSubstr:         "--policy-audience cannot be empty",
 		},
 		{
 			// Whitespace-only is the chart-value-pasted-with-yaml-indent
@@ -68,11 +83,20 @@ func TestValidateControllerAuthFlags(t *testing.T) {
 			// projected SA token's audience, so failing fast at startup
 			// beats a runtime 401 storm after the controller poller has
 			// been silently broken.
-			name:       "audience bypass blocked: SA set, audience whitespace-only",
-			expectedSA: ctrlSA,
-			audience:   "   \t  ",
-			insecure:   false,
-			wantSubstr: "--controller-audience cannot be empty",
+			name:               "controller audience bypass blocked: SA set, audience whitespace-only",
+			expectedSA:         ctrlSA,
+			controllerAudience: "   \t  ",
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "--controller-audience cannot be empty",
+		},
+		{
+			name:               "policy audience bypass blocked: SA set, audience whitespace-only",
+			expectedSA:         ctrlSA,
+			controllerAudience: ctrlAud,
+			policyAudience:     "   \t  ",
+			insecure:           false,
+			wantSubstr:         "--policy-audience cannot be empty",
 		},
 		{
 			// Leading/trailing whitespace around a real-looking value is
@@ -82,11 +106,20 @@ func TestValidateControllerAuthFlags(t *testing.T) {
 			// would 401-loop while boot reported auth as enabled. Reject
 			// with a fail-fast diagnostic that names the actual value
 			// so the operator sees the extra whitespace.
-			name:       "audience bypass blocked: SA set, audience has trailing whitespace",
-			expectedSA: ctrlSA,
-			audience:   "inferencecache.io/controller ",
-			insecure:   false,
-			wantSubstr: "leading/trailing whitespace",
+			name:               "controller audience bypass blocked: SA set, audience has trailing whitespace",
+			expectedSA:         ctrlSA,
+			controllerAudience: "inferencecache.io/controller ",
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "leading/trailing whitespace",
+		},
+		{
+			name:               "policy audience bypass blocked: SA set, audience has trailing whitespace",
+			expectedSA:         ctrlSA,
+			controllerAudience: ctrlAud,
+			policyAudience:     "inferencecache.io/policy ",
+			insecure:           false,
+			wantSubstr:         "leading/trailing whitespace",
 		},
 		{
 			// Same whitespace failure mode as the audience case, but for
@@ -95,24 +128,26 @@ func TestValidateControllerAuthFlags(t *testing.T) {
 			// value with stray spaces would never match and every
 			// controller scrape would 403. Fail fast at startup with
 			// the value echoed so the operator sees the whitespace.
-			name:       "SA bypass blocked: --allowed-controller-sa has trailing whitespace",
-			expectedSA: ctrlSA + " ",
-			audience:   "inferencecache.io/controller",
-			insecure:   false,
-			wantSubstr: "--allowed-controller-sa has leading/trailing whitespace",
+			name:               "SA bypass blocked: --allowed-controller-sa has trailing whitespace",
+			expectedSA:         ctrlSA + " ",
+			controllerAudience: "inferencecache.io/controller",
+			policyAudience:     policyAud,
+			insecure:           false,
+			wantSubstr:         "--allowed-controller-sa has leading/trailing whitespace",
 		},
 		{
-			name:       "audience empty is fine when insecure is on (no audience check needed)",
-			expectedSA: "",
-			audience:   "",
-			insecure:   true,
-			wantSubstr: "",
+			name:               "audiences empty are fine when insecure is on (no audience check needed)",
+			expectedSA:         "",
+			controllerAudience: "",
+			policyAudience:     "",
+			insecure:           true,
+			wantSubstr:         "",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := validateControllerAuthFlags(tc.expectedSA, tc.audience, tc.insecure)
+			got := validateControllerAuthFlags(tc.expectedSA, tc.controllerAudience, tc.policyAudience, tc.insecure)
 			if tc.wantSubstr == "" {
 				if got != "" {
 					t.Fatalf("expected valid, got error: %q", got)

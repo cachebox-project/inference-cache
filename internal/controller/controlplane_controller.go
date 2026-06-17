@@ -27,10 +27,19 @@ import (
 	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
 )
 
-// Default for the periodic re-push tick. The server's policy store is
-// in-memory soft state, so re-pushing keeps a restarted server in sync
-// even if it missed the most recent reconcile.
-const DefaultPolicyPushInterval = 30 * time.Second
+// Defaults for the ControlPlaneReconciler.
+const (
+	// DefaultPolicyPushInterval is the periodic re-push tick. The server's
+	// policy store is in-memory soft state, so re-pushing keeps a restarted
+	// server in sync even if it missed the most recent reconcile.
+	DefaultPolicyPushInterval = 30 * time.Second
+
+	// DefaultPolicyBearerTokenPath is the in-cluster location of the
+	// audience-bound projected ServiceAccount token the controller uses to
+	// push POST /policy. It is separate from DefaultBearerTokenPath because
+	// /policy is a write surface with its own auth.PolicyAudience.
+	DefaultPolicyBearerTokenPath = "/var/run/secrets/inferencecache.io/policy-token/token"
+)
 
 // ControlPlaneReconciler watches BOTH CachePolicy and CacheTenant resources
 // cluster-wide and PUSHES one combined resolved snapshot to the policy server's
@@ -70,8 +79,8 @@ type ControlPlaneReconciler struct {
 	// BearerTokenPath is the file the projected ServiceAccount token is
 	// mounted at, sent as Authorization: Bearer on every push so the server's
 	// TokenReview middleware can authenticate the controller.
-	// "" → DefaultBearerTokenPath. A path that does not exist is treated as
-	// "no token configured" — the POST goes out unauthenticated and the
+	// "" → DefaultPolicyBearerTokenPath. A path that does not exist is treated
+	// as "no token configured" — the POST goes out unauthenticated and the
 	// server's 401 surfaces as a normal failing tick (returning a retryable
 	// error to controller-runtime). Mirrors the CacheIndexPoller's posture.
 	BearerTokenPath string
@@ -241,7 +250,7 @@ func (r *ControlPlaneReconciler) pushSnapshot(ctx context.Context) error {
 func (r *ControlPlaneReconciler) bearerToken() (string, error) {
 	path := r.BearerTokenPath
 	if path == "" {
-		path = DefaultBearerTokenPath
+		path = DefaultPolicyBearerTokenPath
 	}
 	b, err := os.ReadFile(path)
 	switch {

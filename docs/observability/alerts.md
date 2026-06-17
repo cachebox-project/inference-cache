@@ -437,7 +437,7 @@ that happens to have published one NO_HINT and nothing else.
 ```bash
 # 1. Port-forward the public + controller-facing HTTP listeners.
 #    :8080 carries /metrics, /healthz, /readyz. :8081 carries the
-#    controller-only /snapshot + /policy endpoints (bearer-auth gated).
+#    controller-only /snapshot + /policy + /probe endpoints (bearer-auth gated).
 kubectl -n inference-cache-system port-forward svc/inference-cache-server 8080:8080 &
 kubectl -n inference-cache-system port-forward svc/inference-cache-server 8081:8081 &
 

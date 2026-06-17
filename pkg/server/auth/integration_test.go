@@ -82,10 +82,10 @@ func TestAuthMiddleware_AgainstEnvtestAPIServer(t *testing.T) {
 	defer srv.Close()
 
 	// mintToken issues a TokenRequest bound to the controller audience —
-	// matches the production posture where the controller's projected SA
-	// volume mints tokens with the same audience for use against BOTH
-	// /snapshot and /policy. Any callsite wanting to exercise the
-	// wrong-audience path uses mintTokenWithAudience.
+	// matches the production posture for /snapshot and /probe. /policy uses
+	// auth.PolicyAudience and is covered by the policy push integration test.
+	// Any callsite wanting to exercise the wrong-audience path uses
+	// mintTokenWithAudience.
 	mintToken := func(saName string) string {
 		return mintTokenWithAudience(t, ctx, clientset, ns, saName, auth.ControllerAudience)
 	}

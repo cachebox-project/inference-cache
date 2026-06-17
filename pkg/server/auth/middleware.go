@@ -106,7 +106,8 @@ type Options struct {
 	// a `projected` SA volume on the controller pod that mints with the
 	// same value. Empty string disables audience binding entirely — used
 	// only in legacy callers and in unit tests that don't exercise the
-	// audience path. See ControllerAudience for the production default.
+	// audience path. See ControllerAudience and PolicyAudience for the
+	// production endpoint defaults.
 	Audience string
 	// Recorder receives one Result per request. Optional; nil disables metrics.
 	Recorder ResultRecorder

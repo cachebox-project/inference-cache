@@ -7,13 +7,13 @@ metadata:
     app.kubernetes.io/name: inference-cache
     app.kubernetes.io/component: server
 # The server calls the apiserver's TokenReview API to authenticate the
-# controller's /snapshot scrapes and /policy pushes, so it needs a
+# controller's /snapshot scrapes, /policy pushes, and /probe checks, so it needs a
 # projected SA token.
 automountServiceAccountToken: true
 ---
 # Narrow ClusterRole + binding granting ONLY the permission the server
 # actually exercises: creating TokenReview objects to validate the
-# controller's bearer tokens on /snapshot and /policy. The canonical
+# controller's bearer tokens on /snapshot, /policy, and /probe. The canonical
 # alternative, system:auth-delegator, also grants SubjectAccessReview
 # (for authz delegation), which the server does not call —
 # least-privilege beats convenience here, especially for a
@@ -68,9 +68,9 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
-    # Internal controller-facing listener (serves /snapshot AND /policy).
+    # Internal controller-facing listener (serves /snapshot, /policy, AND /probe).
     # Restricted by NetworkPolicy to the controller's pod selector;
-    # authentication on both L7 endpoints is enforced by the server's
+    # authentication on all three L7 endpoints is enforced by the server's
     # TokenReview middleware.
     - name: snapshot
       port: 8081
@@ -106,7 +106,8 @@ spec:
     spec:
       serviceAccountName: inference-cache-server
       # Mount the projected SA token so the server can call TokenReview to
-      # authenticate the controller's /snapshot scrape and /policy push.
+      # authenticate the controller's /snapshot scrape, /policy push, and
+      # /probe check.
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 10
       securityContext:
@@ -123,11 +124,13 @@ spec:
             - --grpc-bind-address=:9090
             - --http-bind-address=:8080
             - --snapshot-bind-address=:8081
-            # Restrict /snapshot AND /policy to the controller's ServiceAccount.
-            # Both endpoints share this listener (and the NetworkPolicy on
+            # Restrict /snapshot, /policy, and /probe to the controller's ServiceAccount.
+            # All three endpoints share this listener (and the NetworkPolicy on
             # :8081); together the L7 auth and the L3/L4 pod-selector gate form
             # independent defences. See config/server/networkpolicy.yaml.
             - --allowed-controller-sa=system:serviceaccount:inference-cache-system:inference-cache-controller-manager
+            - --controller-audience=inferencecache.io/controller
+            - --policy-audience=inferencecache.io/policy
             # gRPC :9090 is PLAINTEXT in the default install. Service TLS is an
             # opt-in overlay (config/overlays/server-tls, via the
             # config/server/tls component) that adds --tls-cert-file /

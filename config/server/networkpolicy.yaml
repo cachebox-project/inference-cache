@@ -1,11 +1,11 @@
 # Restrict ingress to the cache server's internal :8081 controller-facing
-# listener (which serves /snapshot AND /policy) while leaving the
-# unauthenticated probe/metrics port (:8080) and the gRPC port (:9090) open
+# listener (which serves /snapshot, /policy, AND /probe) while leaving the
+# unauthenticated health/metrics port (:8080) and the gRPC port (:9090) open
 # to any in-cluster client.
 #
-# Defence in depth for /snapshot AND /policy — paired with the server-side
+# Defence in depth for /snapshot, /policy, AND /probe — paired with the server-side
 # TokenReview middleware that requires a controller ServiceAccount bearer
-# token on both endpoints. The L7 auth blocks any pod that lacks a valid SA
+# token on each endpoint. The L7 auth blocks any pod that lacks a valid SA
 # token; this L3/L4 gate stops a peer from ever reaching the listener (and
 # from harvesting metadata via a cleartext network capture, or POSTing a
 # rogue ResolvedPolicy snapshot that would replace cluster-wide policy
@@ -27,15 +27,15 @@
 #     (gRPC API + grpc.health.v1) from any source in the cluster. Kubelet
 #     probes and Prometheus scrapes cannot present a SA bearer, so these
 #     surfaces stay open.
-#   - Rule 2: TCP 8081 (/snapshot + /policy) only from pods carrying the
+#   - Rule 2: TCP 8081 (/snapshot + /policy + /probe) only from pods carrying the
 #     controller's labels — the only authorized caller of the bearer-gated
 #     endpoints.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   # Name retained from when this gate covered /snapshot only so upgrades
-  # don't orphan a renamed object. The policy now covers both /snapshot and
-  # /policy on :8081 — see the rule comments below.
+  # don't orphan a renamed object. The policy now covers /snapshot, /policy,
+  # and /probe on :8081 — see the rule comments below.
   name: inference-cache-server-snapshot
   namespace: inference-cache-system
   labels:
@@ -58,11 +58,12 @@ spec:
           port: 8080
         - protocol: TCP
           port: 9090
-    # Restricted: only the controller may reach /snapshot AND /policy on
+    # Restricted: only the controller may reach /snapshot, /policy, AND /probe on
     # :8081. Combined with the TokenReview-backed bearer auth on the
     # listener, this is the defence-in-depth gate the rest of the policy
     # exists for. /snapshot is the read side (CacheIndex poll) and /policy is
-    # the write side (CachePolicy push); both originate from the same SA.
+    # the write side (CachePolicy push); /probe is the functional-self-test
+    # side. All originate from the same SA.
     - from:
         - podSelector:
             matchLabels:
