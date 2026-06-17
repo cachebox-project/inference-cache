@@ -1,0 +1,106 @@
+package controller
+
+import (
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+)
+
+func podWithKernelStatus(state corev1.ContainerState) corev1.Pod {
+	return corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+		Name:  adapterruntime.LMCacheKernelCheckContainerName,
+		State: state,
+	}}}}
+}
+
+func termed(code int32, msg string) corev1.ContainerState {
+	return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Message: msg}}
+}
+
+func meta_SetStale(cb *cachev1alpha1.CacheBackend) {
+	meta.SetStatusCondition(&cb.Status.Conditions, metav1.Condition{
+		Type: conditionTypeEngineKernelsHealthy, Status: metav1.ConditionTrue, Reason: reasonKernelsHealthy,
+	})
+}
+
+func TestAggregateKernelHealth(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
+	cases := []struct {
+		name       string
+		pods       []corev1.Pod
+		wantStatus metav1.ConditionStatus
+		wantReason string
+		wantActive bool
+	}{
+		{"all ok", []corev1.Pod{podWithKernelStatus(termed(0, "OK"))}, metav1.ConditionTrue, reasonKernelsHealthy, true},
+		{"one fail", []corev1.Pod{
+			podWithKernelStatus(termed(0, "OK")),
+			podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13")),
+		}, metav1.ConditionFalse, reasonCUDAKernelMismatch, true},
+		{"strict crashloop fail via lastState", []corev1.Pod{{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+			Name:                 adapterruntime.LMCacheKernelCheckContainerName,
+			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			LastTerminationState: termed(1, "FAIL: ImportError: libcudart.so.13"),
+		}}}}}, metav1.ConditionFalse, reasonCUDAKernelMismatch, true},
+		{"garbage message is error not mismatch", []corev1.Pod{podWithKernelStatus(termed(127, ""))}, metav1.ConditionUnknown, reasonKernelCheckError, true},
+		{"pending", []corev1.Pod{podWithKernelStatus(corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
+		{"no kernel-check container => inactive", []corev1.Pod{{Status: corev1.PodStatus{}}}, "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cond, active := aggregateKernelHealth(cb, tc.pods)
+			if active != tc.wantActive {
+				t.Fatalf("active = %v, want %v", active, tc.wantActive)
+			}
+			if !active {
+				return
+			}
+			if cond.Status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", cond.Status, tc.wantStatus)
+			}
+			if cond.Reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", cond.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEvaluateEngineKernelHealthStrictDowngradesReady(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
+		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+	up := kvReadiness{readyStatus: metav1.ConditionTrue, readyReason: "KVEventsObserved"}
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))})
+	if !v.downgradeReady || v.readyReason != reasonEngineKernelDegraded {
+		t.Fatalf("strict mismatch must downgrade Ready with EngineKernelDegraded; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
+	}
+	out := downgradeKernelReadyVerdict(up, v)
+	if out.readyStatus != metav1.ConditionFalse {
+		t.Errorf("downgraded readyStatus = %q, want False", out.readyStatus)
+	}
+}
+
+func TestEvaluateEngineKernelHealthReportOnlyDoesNotDowngrade(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}} // no strict annotation
+	up := kvReadiness{readyStatus: metav1.ConditionTrue}
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13"))})
+	if v.downgradeReady {
+		t.Error("report-only (default) must NOT downgrade Ready")
+	}
+	if !v.shouldWriteCondition || v.condition.Status != metav1.ConditionFalse {
+		t.Errorf("report-only must still surface EngineKernelsHealthy=False; got write=%v status=%q", v.shouldWriteCondition, v.condition.Status)
+	}
+}
+
+func TestEvaluateEngineKernelHealthInactiveRemovesStaleCondition(t *testing.T) {
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
+	meta_SetStale(cb) // sets a stale EngineKernelsHealthy condition; see helper below
+	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, []corev1.Pod{{Status: corev1.PodStatus{}}})
+	if !v.removeCondition {
+		t.Error("inactive gate with an existing condition must request removeCondition")
+	}
+}
