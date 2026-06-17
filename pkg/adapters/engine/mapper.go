@@ -63,6 +63,8 @@ func (c Config) StatsUpdate(tsUs int64, stats *icpb.ReplicaStats) *icpb.CacheSta
 			CacheMemoryBytes: stats.GetCacheMemoryBytes(),
 			HitRate:          stats.GetHitRate(),
 			Pressure:         stats.GetPressure(),
+			T2HitTokens:      stats.GetT2HitTokens(),
+			T2QueryTokens:    stats.GetT2QueryTokens(),
 		},
 	}
 }

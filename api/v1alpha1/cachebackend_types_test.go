@@ -120,6 +120,11 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	// status.indexParticipation.prefixCount is the authoritative live count
 	// surface that replaced status.indexEntries.
 	requireMinimum(t, mustPath[map[string]any](t, statusSchema, "properties", "indexParticipation", "properties", "prefixCount"), 0)
+	// status.indexParticipation.t2HitRate (tier-2 health surface) must be served
+	// as a string — pins the marker so a regen can't silently drop the field.
+	if got := mustPath[map[string]any](t, statusSchema, "properties", "indexParticipation", "properties", "t2HitRate")["type"]; got != "string" {
+		t.Fatalf("status.indexParticipation.t2HitRate type = %v, want string", got)
+	}
 	requireMinimum(t, mustProperty(t, statusSchema, "matchedEnginePods"), 0)
 
 	// Autoscaling validation surface.
@@ -165,6 +170,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	replicas := int32(2)
 	storageClassName := "fast"
 	hitRate := "0.50"
+	t2HitRate := "0.66"
 	matchedEnginePods := int32(7)
 	firstEventTimeout := metav1.Duration{Duration: 5 * time.Minute}
 	firstKVEventAt := metav1.NewTime(time.Unix(1_700_000_000, 0).UTC())
@@ -220,6 +226,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			IndexParticipation: &CacheBackendIndexParticipation{
 				PrefixCount: 7,
 				HitRate:     &hitRate,
+				T2HitRate:   &t2HitRate,
 			},
 			MatchedEnginePods:      &matchedEnginePods,
 			FirstKVEventObservedAt: &firstKVEventAt,
@@ -326,6 +333,10 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Status.IndexParticipation.HitRate == nil ||
 		*copied.Status.IndexParticipation.HitRate != "0.50" {
 		t.Fatalf("status.indexParticipation.hitRate was not deep-copied")
+	}
+	if copied.Status.IndexParticipation.T2HitRate == nil ||
+		*copied.Status.IndexParticipation.T2HitRate != "0.66" {
+		t.Fatalf("status.indexParticipation.t2HitRate was not deep-copied")
 	}
 	if copied.Status.MatchedEnginePods == nil || *copied.Status.MatchedEnginePods != 7 {
 		t.Fatalf("status.matchedEnginePods was not deep-copied")

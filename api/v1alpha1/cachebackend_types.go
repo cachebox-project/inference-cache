@@ -714,6 +714,23 @@ type CacheBackendIndexParticipation struct {
 	// missing value as 0.
 	// +optional
 	HitRate *string `json:"hitRate,omitempty"`
+
+	// T2HitRate is the query-weighted reload hit-rate of the tier-2 (external
+	// offload, e.g. LMCache) cache across this backend's replicas, formatted as
+	// a decimal string in [0,1]. Sourced from the engines'
+	// vllm:external_prefix_cache_{hits,queries}_total counters and projected by
+	// the CacheIndex poller.
+	//
+	// Presence is load-bearing here: nil means the tier-2 cache has NOT been
+	// exercised yet (no external lookups across any replica) — distinct from
+	// "0". A value of "0" means the tier WAS queried but served zero reloads:
+	// tier-2 is wired but not actually helping. That is the operator-visible
+	// signature of a silently-degraded offload tier — a store/connection
+	// failure, an under-sized remote server, or a scheduler/worker hash
+	// mismatch all surface here as "0" rather than as nothing at all. A
+	// healthy reusing workload reads well above 0.
+	// +optional
+	T2HitRate *string `json:"t2HitRate,omitempty"`
 }
 
 // +kubebuilder:object:root=true

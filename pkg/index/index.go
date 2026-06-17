@@ -121,6 +121,12 @@ type ReplicaStats struct {
 	CacheMemoryBytes int64
 	HitRate          float32
 	Pressure         float32
+	// T2HitTokens / T2QueryTokens are cumulative tier-2 (external offload, e.g.
+	// LMCache) reload token counters as last reported by the replica. The
+	// poller derives a presence-aware per-CacheBackend hit-rate from the
+	// query-weighted ratio (a 0% rate is only meaningful once T2QueryTokens>0).
+	T2HitTokens   int64
+	T2QueryTokens int64
 }
 
 // PrefixRef is one prefix a replica reports holding: engine-opaque hash bytes
@@ -1541,6 +1547,10 @@ type ReplicaSnapshot struct {
 	LastUpdate       time.Time `json:"lastUpdate"`
 	PrefixCount      int       `json:"prefixCount"`
 	LastEventAt      time.Time `json:"lastEventAt,omitempty"`
+	// T2HitTokens / T2QueryTokens carry the replica's cumulative tier-2
+	// (external offload) reload token counters across the /snapshot wire.
+	T2HitTokens   int64 `json:"t2HitTokens,omitempty"`
+	T2QueryTokens int64 `json:"t2QueryTokens,omitempty"`
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
@@ -1646,6 +1656,8 @@ func (i *Index) Snapshot() Snapshot {
 			r.CacheMemoryBytes = s.stats.CacheMemoryBytes
 			r.HitRate = s.stats.HitRate
 			r.Pressure = s.stats.Pressure
+			r.T2HitTokens = s.stats.T2HitTokens
+			r.T2QueryTokens = s.stats.T2QueryTokens
 			r.LastUpdate = s.lastSeen
 		}
 		if a, ok := prefixByReplica[tr]; ok {

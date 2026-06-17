@@ -165,6 +165,17 @@ message ReplicaStats {
   // part of this contract update; producers can populate the field today,
   // and the server will silently keep accepting it either way.
   string client_version = 5;
+
+  // T2 (external offload tier, e.g. LMCache) cumulative reload accounting,
+  // sourced from the engine's vllm:external_prefix_cache_{hits,queries}_total
+  // counters (lifetime token totals, monotonic; reset on engine restart). The
+  // server derives a presence-aware tier-2 hit-rate per CacheBackend from these:
+  // a 0% rate is only meaningful once the tier was actually queried
+  // (t2_query_tokens > 0), which distinguishes "tier-2 silently broken" from
+  // "tier-2 not yet exercised". Both default to 0 for producers that don't
+  // populate them (additive, v1alpha1-compatible).
+  int64 t2_hit_tokens = 6;
+  int64 t2_query_tokens = 7;
 }
 
 message CacheStateUpdate {

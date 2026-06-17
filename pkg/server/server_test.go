@@ -1001,7 +1001,7 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 	svc.index.Ingest(index.Update{
 		ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
-		Stats:    &index.ReplicaStats{ReplicaID: "replica-a", CacheMemoryBytes: 2048, HitRate: 0.5},
+		Stats:    &index.ReplicaStats{ReplicaID: "replica-a", CacheMemoryBytes: 2048, HitRate: 0.5, T2HitTokens: 600, T2QueryTokens: 1000},
 	})
 
 	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{ModelId: "m", TenantId: "t"})
@@ -1016,6 +1016,9 @@ func TestGetCacheStateReturnsAggregate(t *testing.T) {
 	}
 	if resp.GetReplicas()[0].GetCacheMemoryBytes() != 2048 {
 		t.Fatalf("cache_memory_bytes = %d, want 2048", resp.GetReplicas()[0].GetCacheMemoryBytes())
+	}
+	if r := resp.GetReplicas()[0]; r.GetT2HitTokens() != 600 || r.GetT2QueryTokens() != 1000 {
+		t.Fatalf("t2 counters = (%d, %d), want (600, 1000)", r.GetT2HitTokens(), r.GetT2QueryTokens())
 	}
 }
 

@@ -670,6 +670,8 @@ func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCa
 			CacheMemoryBytes: r.CacheMemoryBytes,
 			HitRate:          r.HitRate,
 			Pressure:         r.Pressure,
+			T2HitTokens:      r.T2HitTokens,
+			T2QueryTokens:    r.T2QueryTokens,
 		})
 	}
 	return resp, nil
@@ -759,6 +761,8 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 			CacheMemoryBytes: st.GetCacheMemoryBytes(),
 			HitRate:          st.GetHitRate(),
 			Pressure:         st.GetPressure(),
+			T2HitTokens:      st.GetT2HitTokens(),
+			T2QueryTokens:    st.GetT2QueryTokens(),
 		}
 	}
 	return out

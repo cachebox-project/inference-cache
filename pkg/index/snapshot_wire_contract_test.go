@@ -49,6 +49,8 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 			LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
 			PrefixCount:      3,
 			LastEventAt:      time.Unix(1_700_000_500, 0).UTC(),
+			T2HitTokens:      600,
+			T2QueryTokens:    1000,
 		}},
 		Tenants: []TenantSnapshot{{
 			TenantID:     "team-a",
@@ -82,7 +84,7 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	}
 	wantReplica := []string{
 		"replicaId", "tenant", "cacheMemoryBytes", "hitRate", "pressure",
-		"lastUpdate", "prefixCount", "lastEventAt",
+		"lastUpdate", "prefixCount", "lastEventAt", "t2HitTokens", "t2QueryTokens",
 	}
 	assertExactKeys(t, "ReplicaSnapshot", replicas[0], wantReplica)
 
