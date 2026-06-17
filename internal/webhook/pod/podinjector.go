@@ -256,6 +256,25 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		)
 	}
 
+	// Inject the kernel-check init container (adapters that opt in via the
+	// optional InitContainerProvider interface — vLLM/LMCache today). Resolve
+	// it BEFORE the observation-sidecar append below, while Spec.Containers
+	// still holds only the engine container(s): the renderer reuses the engine
+	// container's image, and a single-container fallback would break once the
+	// sidecar is appended. A failure here MUST NOT block admission (the cache
+	// is an optimisation). Idempotent: skip if an init container by the same
+	// name is already present (re-admission, hand-authored template).
+	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
+		if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
+			log.V(1).Info("fail-open: kernel-check init container rejected",
+				"runtime", string(runtimeID), "error", iErr.Error())
+		} else if initC != nil && !hasContainer(mutated.Spec.InitContainers, initC.Name) {
+			mutated.Spec.InitContainers = append(mutated.Spec.InitContainers, *initC)
+			log.V(1).Info("kernel-check init container appended",
+				"runtime", string(runtimeID), "container", initC.Name)
+		}
+	}
+
 	// Auto-attach the observation sidecar. The adapter owns the
 	// shape decision: vLLM/LMCache returns a kvevent-subscriber container,
 	// the reference adapter (and any future External-type adapter) returns

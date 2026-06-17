@@ -13,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1405,6 +1406,139 @@ func TestHandle_FailOpenZeroPatchesWithoutForgedAnnotation(t *testing.T) {
 	if len(resp.Patches) != 0 {
 		t.Fatalf("expected zero patches on no-match without forged annotation; got %d", len(resp.Patches))
 	}
+}
+
+// TestHandle_KernelCheckInitContainer_AppendedOnGPUPod verifies that a GPU-
+// requesting engine pod bound to a managed LMCache CacheBackend gets the
+// kernel-check init container appended in Spec.InitContainers. The init
+// container name must match the constant from the adapter package so the
+// reconciler and the webhook share a single source of truth.
+func TestHandle_KernelCheckInitContainer_AppendedOnGPUPod(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+
+	// GPU-requesting engine pod: auto mode injects only when nvidia.com/gpu is
+	// present. Build it from the canonical helper then add the GPU resource.
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		},
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// The kernel-check init container must be present.
+	found := false
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("kernel-check init container %q missing from Spec.InitContainers; got: %v",
+			adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+	}
+	// Engine-side injection must still have landed.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
+// TestHandle_KernelCheckInitContainer_Idempotent verifies that a second
+// admission of a pod that already carries the kernel-check init container does
+// NOT double-append it. Exactly one init container by that name must be present.
+func TestHandle_KernelCheckInitContainer_Idempotent(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		},
+	}
+
+	// First admission injects the init container.
+	first := h.Handle(context.Background(), newRequest(t, pod, ns))
+	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, first)
+
+	count := 0
+	for _, ic := range injected.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 kernel-check init container after first admission, got %d: %v",
+			count, initContainerNames(injected))
+	}
+
+	// Second admission of the already-injected pod must not duplicate it.
+	second := h.Handle(context.Background(), newRequest(t, injected, ns))
+	if !second.Allowed {
+		t.Fatalf("re-admission rejected: %+v", second.Result)
+	}
+	readmitted := applyPatches(t, newRequest(t, injected, ns).Object.Raw, second)
+
+	count = 0
+	for _, ic := range readmitted.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 kernel-check init container after re-admission, got %d: %v",
+			count, initContainerNames(readmitted))
+	}
+}
+
+// TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses verifies that
+// setting AnnotationSkip on a pod suppresses the kernel-check init container
+// injection (the entire injection path is bypassed).
+func TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		},
+	}
+	pod.Annotations = map[string]string{AnnotationSkip: "true"}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed (skip annotation), got: %+v", resp.Result)
+	}
+	// skip-inject produces zero patches (no injection of any kind).
+	if len(resp.Patches) != 0 {
+		t.Fatalf("expected no patches when skip annotation set, got %d", len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			t.Fatalf("kernel-check init container must be absent when skip annotation is set; found %+v", ic)
+		}
+	}
+}
+
+// initContainerNames returns init container names for diagnostic messages.
+func initContainerNames(pod *corev1.Pod) []string {
+	out := make([]string, len(pod.Spec.InitContainers))
+	for i, c := range pod.Spec.InitContainers {
+		out[i] = c.Name
+	}
+	return out
 }
 
 // pin the GroupVersionKind so a future api/v1alpha1 split (e.g. moving
