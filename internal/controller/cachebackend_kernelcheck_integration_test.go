@@ -38,7 +38,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 	// lmcache-kernel-check init-container has terminated with a FAIL message,
 	// simulating a CUDA kernel mismatch. The pod's labels match the
 	// engineSelector set on the CacheBackend by kernelCheckBackend.
-	createEnginePodsWithKernelFail := func(t *testing.T, ns, backendName string) {
+	createEnginePodsWithKernelFail := func(t *testing.T, ns string) {
 		t.Helper()
 		sel := kernelCheckEngineLabels()
 		pod := &corev1.Pod{
@@ -114,7 +114,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		}
 
 		// Inject a matched engine pod with a FAIL kernel-check status.
-		createEnginePodsWithKernelFail(t, ns, "cache")
+		createEnginePodsWithKernelFail(t, ns)
 
 		// Reconcile: the kernel gate reads the pod's init-container status.
 		reconcile(t, r, "cache", ns)
@@ -153,19 +153,23 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 			t.Fatalf("create: %v", err)
 		}
 
-		// Drive to Ready=True.
+		// DEPLOY-TIME path: the cache-server Deployment is Available, but the
+		// engine pod fails its strict kernel check before any KV event, so the
+		// upstream KV-event gate has NOT yet been satisfied — deliberately do
+		// NOT patchLastEventAt. Without the strict override, Ready would be
+		// pinned to AwaitingFirstKVEvent and mask the root cause.
 		reconcile(t, r, "cache", ns)
 		setDeploymentHTTPReady(t, k8s, "cache", ns, time.Now())
-		patchLastEventAt(t, k8s, "cache", ns, time.Now())
 		reconcile(t, r, "cache", ns)
 
 		cb0 := getBackend(t, r, "cache", ns)
-		if ready := findCondition(cb0.Status.Conditions, conditionTypeReady); ready == nil || ready.Status != metav1.ConditionTrue {
-			t.Fatalf("pre-condition: Ready = %+v, want True before injecting kernel failure", ready)
+		if ready := findCondition(cb0.Status.Conditions, conditionTypeReady); ready == nil ||
+			ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+			t.Fatalf("pre-condition: Ready = %+v, want False/%s before injecting kernel failure", ready, reasonAwaitingFirstKVEvent)
 		}
 
-		// Inject matching pod with FAIL status.
-		createEnginePodsWithKernelFail(t, ns, "cache")
+		// Inject matching pod with FAIL status (engine pod stuck in Init).
+		createEnginePodsWithKernelFail(t, ns)
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)

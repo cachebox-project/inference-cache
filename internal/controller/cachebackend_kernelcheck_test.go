@@ -84,6 +84,24 @@ func TestEvaluateEngineKernelHealthStrictDowngradesReady(t *testing.T) {
 	}
 }
 
+func TestEvaluateEngineKernelHealthStrictDowngradesEvenBeforeFirstKVEvent(t *testing.T) {
+	// Deploy-time path: a strict init container fails BEFORE any KV event, so
+	// upstream is still AwaitingFirstKVEvent (Ready=False). A confirmed
+	// mismatch must still downgrade to EngineKernelDegraded — not be masked by
+	// the KV-event-waiting reason it causes.
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
+		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+	upstreamNotReady := kvReadiness{readyStatus: metav1.ConditionFalse, readyReason: "AwaitingFirstKVEvent"}
+	v := evaluateEngineKernelHealth(cb, upstreamNotReady, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
+	if !v.downgradeReady || v.readyReason != reasonEngineKernelDegraded {
+		t.Fatalf("strict mismatch must downgrade Ready to EngineKernelDegraded even pre-first-KV-event; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
+	}
+	out := downgradeKernelReadyVerdict(upstreamNotReady, v)
+	if out.readyStatus != metav1.ConditionFalse || out.readyReason != reasonEngineKernelDegraded {
+		t.Errorf("downgraded verdict = %q/%q, want False/EngineKernelDegraded", out.readyStatus, out.readyReason)
+	}
+}
+
 func TestEvaluateEngineKernelHealthReportOnlyDoesNotDowngrade(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}} // no strict annotation
 	up := kvReadiness{readyStatus: metav1.ConditionTrue}

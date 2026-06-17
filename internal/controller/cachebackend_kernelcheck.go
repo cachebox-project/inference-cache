@@ -92,11 +92,17 @@ func evaluateEngineKernelHealth(
 	v := kernelHealthVerdict{shouldWriteCondition: true, condition: cond}
 
 	// Strict-mode Ready downgrade — ONLY on a definite mismatch (False), never
-	// on Pending/Error (transient/indeterminate). Managed Ready only (the
-	// caller is the managed path), and only when upstream was otherwise Ready.
+	// on Pending/Error (transient/indeterminate). Unlike the functional-probe
+	// gate, this does NOT require upstream Ready=True first: in strict mode a
+	// failing init container holds the engine pod in Init, so it never emits a
+	// KV event and the upstream gate would otherwise pin Ready to
+	// AwaitingFirstKVEvent/NoKVEventsObserved — masking the actual root cause.
+	// A confirmed KernelLoadFailed is a hard fact read straight off the pod, so
+	// it takes precedence and surfaces EngineKernelDegraded as the Ready reason
+	// at deploy time, which is the point of opting into strict. (The Degraded
+	// condition still narrates the no-KV-events symptom separately.)
 	if backend.Annotations[adapterruntime.AnnotationLMCacheKernelCheck] == adapterruntime.KernelCheckModeStrict &&
-		cond.Status == metav1.ConditionFalse &&
-		upstream.readyStatus == metav1.ConditionTrue {
+		cond.Status == metav1.ConditionFalse {
 		v.downgradeReady = true
 		v.readyReason = reasonEngineKernelDegraded
 		v.readyMessage = "lmcache CUDA kernels failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's lmcache/CUDA alignment or set " + adapterruntime.AnnotationLMCacheKernelCheck + "=report-only"
