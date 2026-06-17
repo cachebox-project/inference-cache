@@ -131,3 +131,33 @@ func TestKernelCheckMultiContainerNoEngineNameSkips(t *testing.T) {
 		t.Fatal("must skip when the engine container can't be resolved (multi-container, no 'vllm' name)")
 	}
 }
+
+func TestKernelCheckCopiesEnginePullPolicyAndSecurityContext(t *testing.T) {
+	a := NewVLLMLMCacheAdapter().(InitContainerProvider)
+	nonRoot := true
+	engineSC := &corev1.SecurityContext{RunAsNonRoot: &nonRoot}
+	pod := gpuEnginePod("img")
+	pod.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
+	pod.Spec.Containers[0].SecurityContext = engineSC
+	c, err := a.KernelCheckInitContainer(cbWithKernelCheck(""), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected an init container")
+	}
+	// ImagePullPolicy copied from the engine (not hard-coded), so a mutable tag
+	// with Always can't run a stale cached check image.
+	if c.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("ImagePullPolicy = %q, want copied PullAlways", c.ImagePullPolicy)
+	}
+	// SecurityContext copied so a restricted-PSA-compliant engine pod stays
+	// admissible after the init container is appended.
+	if c.SecurityContext == nil || c.SecurityContext.RunAsNonRoot == nil || !*c.SecurityContext.RunAsNonRoot {
+		t.Errorf("SecurityContext not copied from engine: %+v", c.SecurityContext)
+	}
+	// Must be a deep copy, not an alias into the informer-cached pod.
+	if c.SecurityContext == engineSC {
+		t.Error("SecurityContext must be a deep copy, not an alias of the engine container's")
+	}
+}

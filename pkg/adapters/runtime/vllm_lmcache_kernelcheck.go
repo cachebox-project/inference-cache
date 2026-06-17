@@ -18,10 +18,15 @@ import (
 //	report-only                 → inject report-only (even on CPU; operator forced)
 //	strict                      → inject strict (exit 1 on failure → pod stuck in Init)
 //
-// The init container reuses the resolved engine container's IMAGE so the
-// check runs in the exact runtime that would load c_ops — no extra image pull
-// (safe to default-on, unlike the subscriber sidecar). It requests no GPU
-// (the missing-libcudart failure is caught at dlopen without a device).
+// The init container reuses the resolved engine container's IMAGE,
+// ImagePullPolicy, and SecurityContext so the check runs in the exact runtime
+// that would load c_ops — no extra image pull (safe to default-on, unlike the
+// subscriber sidecar), no skew between a cached check image and a freshly
+// pulled serving image (mutable tags + Always), and the same security posture
+// (so a pod valid under a restricted Pod Security Standard stays valid — the
+// init container can't make an otherwise-admissible engine pod fail admission,
+// preserving the fail-open contract). It requests no GPU (the missing-libcudart
+// failure is caught at dlopen without a device).
 //
 // Returns (nil, nil) when the engine container can't be resolved (multi-
 // container pod with no container named EngineContainerName) — emitting a
@@ -47,9 +52,15 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 		env = []corev1.EnvVar{{Name: EnvKernelCheckStrict, Value: "1"}}
 	}
 	return &corev1.Container{
-		Name:                     LMCacheKernelCheckContainerName,
-		Image:                    engine.Image,
-		ImagePullPolicy:          corev1.PullIfNotPresent,
+		Name:  LMCacheKernelCheckContainerName,
+		Image: engine.Image,
+		// Copy (don't hard-code) the engine's pull policy + security context so
+		// the check runs in the engine's exact image and security posture: a
+		// mutable tag with ImagePullPolicy=Always must not let the check run a
+		// stale cached image, and a restricted-PSA-compliant engine pod must
+		// stay admissible after the init container is appended.
+		ImagePullPolicy:          engine.ImagePullPolicy,
+		SecurityContext:          engine.SecurityContext.DeepCopy(),
 		Command:                  []string{"python3", "-c", kernelCheckScript},
 		Env:                      env,
 		Resources:                kernelCheckResources(),

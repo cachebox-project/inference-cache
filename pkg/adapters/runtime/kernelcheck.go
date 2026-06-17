@@ -58,12 +58,12 @@ const (
 // swallows the c_ops failure into a WARNING and overrides
 // sys.modules["lmcache.c_ops"] with a fallback shim, so a naive
 // `import lmcache.c_ops` ALWAYS succeeds — a silent no-op). Instead it
-// force-loads the native c_ops*.so from disk, which re-does the real dlopen
-// and raises on a missing/mismatched libcudart (empirically:
-// "ImportError: libcudart.so.13: cannot open shared object file"). torch MUST
-// be imported first — the extension DT_NEEDs libtorch's libc10.so.
+// dlopens the native c_ops*.so from disk via ctypes.CDLL, which re-does the
+// real dynamic load and raises on a missing/mismatched libcudart (empirically:
+// "OSError: libcudart.so.13: cannot open shared object file"). torch MUST be
+// imported first — the extension DT_NEEDs libtorch's libc10.so.
 const kernelCheckScript = `
-import sys, os, glob, importlib.util
+import sys, os, glob, importlib.util, ctypes
 STRICT = os.environ.get("KERNEL_CHECK_STRICT") == "1"
 MSG = "/dev/termination-log"
 def emit(s):
@@ -83,9 +83,16 @@ try:
     if not sos:
         fail("no native c_ops extension present (pure-python/CPU build)")
     import torch  # required: c_ops.so DT_NEEDED libtorch (libc10.so)
-    s = importlib.util.spec_from_file_location("c_ops_probe", sos[0])
-    m = importlib.util.module_from_spec(s)
-    s.loader.exec_module(m)
+    # dlopen the native extension to force the dynamic loader to resolve every
+    # DT_NEEDED lib (libtorch, libcudart, ...). This is where a CUDA-kernel
+    # mismatch surfaces (e.g. a cu13 wheel on a cu12 image → "libcudart.so.13:
+    # cannot open shared object file"). ctypes.CDLL is used rather than
+    # importlib.exec_module on purpose: exec_module derives the C init symbol
+    # (PyInit_<module>) from the spec name and would FAIL to find it for any
+    # name other than the extension's own, false-failing a HEALTHY engine.
+    # CDLL needs no init symbol — it tests exactly the dlopen/DT_NEEDED
+    # resolution where the kernel/CUDA mismatch lives.
+    ctypes.CDLL(sos[0])
     emit("OK")
 except SystemExit:
     raise
