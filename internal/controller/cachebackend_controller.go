@@ -1428,6 +1428,16 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// below so it lands atomically alongside Ready/Progressing/Degraded.
 	probeVerdict := evaluateFunctionalProbe(ctx, backend, gate, r.ProbeClient, &r.probeLimiter, r.probeRateLimit(), now)
 	gate = downgradeReadyVerdict(gate, probeVerdict)
+	// Engine-kernel health gate (lmcache c_ops load). Reads the kernel-check
+	// init-container status off matched engine pods; surfaces
+	// EngineKernelsHealthy and, in strict mode, downgrades Ready. Uses the
+	// uncached APIReader (no Pod informer), fail-soft on list errors.
+	kernelReader := client.Reader(r.APIReader)
+	if kernelReader == nil {
+		kernelReader = r.Client
+	}
+	kernelVerdict := evaluateEngineKernelHealth(backend, gate, listMatchedEnginePods(ctx, kernelReader, backend))
+	gate = downgradeKernelReadyVerdict(gate, kernelVerdict)
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
@@ -1483,6 +1493,16 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			meta.SetStatusCondition(&backend.Status.Conditions, cond)
 		case probeVerdict.removeCondition:
 			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		}
+		// Engine-kernel-health condition (lmcache c_ops load). Same
+		// write/remove/leave-alone contract as the functional-probe condition.
+		switch {
+		case kernelVerdict.shouldWriteCondition:
+			kc := kernelVerdict.condition
+			kc.ObservedGeneration = publishedGen
+			meta.SetStatusCondition(&backend.Status.Conditions, kc)
+		case kernelVerdict.removeCondition:
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		}
 	})
 	// Commit the rate-limit slot ONLY after the status patch succeeds. A
