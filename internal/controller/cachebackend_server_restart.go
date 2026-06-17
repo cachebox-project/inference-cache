@@ -392,11 +392,11 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 //     to invalidate, so by definition no engine sockets are stale —
 //     any engines that connected during the "" window connected to the
 //     very pod we are now baselining)
-//   - prior set strictly grows AND the owning Deployment is still
-//     rolling (a maxSurge midpoint: the old pod is still Ready while
-//     the new one comes up; the subsequent transition that drops the
-//     old pod IS a cascade). When the Deployment has converged at the
-//     wider count instead — operator-driven scale-up — the widened
+//   - prior set strictly grows AND the owning workload is still
+//     rolling (for example, a Deployment maxSurge midpoint: the old pod
+//     is still Ready while the new one comes up; the subsequent
+//     transition that drops the old pod IS a cascade). When the workload
+//     has converged at the wider count instead — operator-driven scale-up — the widened
 //     set IS persisted as the new baseline, so a later replacement of
 //     any of the added pods cascades correctly.
 //
@@ -421,7 +421,7 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 //     container restart)
 //
 // Fail-soft: every error path (server-instance observation —
-// owned Deployment Get, ReplicaSet owner-chain Get, Pod list;
+// owned workload Get, ReplicaSet owner-chain Get, Pod list;
 // engine-cascade observation/annotate; status patch) logs at V(1)
 // and returns a positive requeue duration (typically
 // minServerRestartCascadeInterval) rather than escalating to the
@@ -433,8 +433,8 @@ func (r *CacheBackendReconciler) minServerRestartCascadeInterval() time.Duration
 func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) time.Duration {
 	currentID, converged, err := r.currentServerInstanceID(ctx, backend)
 	if err != nil {
-		// A transient observation failure (owned Deployment Get,
-		// ReplicaSet owner-chain Get, or Pod list — see
+		// A transient observation failure (owned workload Get,
+		// ReplicaSet owner-chain Get for Deployment pods, or Pod list — see
 		// currentServerInstanceID for the chain) leaves us unable
 		// to decide whether a cascade is needed. Return the rate-
 		// limit interval as the requeue hint so the reconcile
@@ -544,7 +544,7 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 	// rolling-update widening (old + new pod both Ready briefly).
 	//
 	// Strict-superset transitions split into two cases by the owning
-	// Deployment's convergence flag (see currentServerInstanceID):
+	// workload's convergence flag (see currentServerInstanceID):
 	//
 	//  - NOT converged (rolling-update midpoint): do NOT persist the
 	//    widened set. If we did, a failed rollout that gets rolled
@@ -575,7 +575,7 @@ func (r *CacheBackendReconciler) reconcileServerInstance(ctx context.Context, lo
 					"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 				return r.minServerRestartCascadeInterval()
 			}
-			logger.V(1).Info("server-restart cascade skipped: superset at Deployment steady state (scale-up); latch advanced",
+			logger.V(1).Info("server-restart cascade skipped: superset at workload steady state (scale-up); latch advanced",
 				"namespace", backend.Namespace, "name", backend.Name,
 				"prior", prior, "current", currentID)
 			return 0
@@ -718,17 +718,19 @@ func parseInstanceMap(s string) map[string]int32 {
 
 // currentServerInstanceID returns a stable identifier representing
 // the current set of Ready cache-server pods for the backend, the
-// owning Deployment's convergence flag (true when the Deployment
-// controller has reached steady state — `spec.replicas` ==
+// owning workload's convergence flag (true when the Deployment or
+// StatefulSet controller has reached steady state — `spec.replicas` ==
 // `status.readyReplicas` == `status.updatedReplicas` and
 // `status.observedGeneration` >= `metadata.generation`), or "" when no
-// Ready pod exists yet. The candidate set is the owned Deployment's
-// pods — pods whose controller-owning ReplicaSet is controller-owned
-// by the backend-owned Deployment, identified by both name AND UID so
-// a foreign Ready pod that happens to carry the same controller-
-// managed labels (or a stale ownerRef name that resolves to a
-// different live object) cannot advance observedServerInstance and
-// spuriously trigger an engine rollout.
+// Ready pod exists yet. The candidate set is the owned workload's
+// pods — Deployment pods whose controller-owning ReplicaSet is
+// controller-owned by the backend-owned Deployment, or StatefulSet pods
+// directly controller-owned by the backend-owned StatefulSet. Every
+// ownership link is identified by both name AND UID so a foreign Ready
+// pod that happens to carry the same controller-managed labels (or a
+// stale ownerRef name that resolves to a different live object) cannot
+// advance observedServerInstance and spuriously trigger an engine
+// rollout.
 //
 // The identifier shape is `<pod-uid>:<restart-sum>` per Ready pod,
 // comma-joined and lex-sorted by pod name; for a single-replica
@@ -742,9 +744,10 @@ func parseInstanceMap(s string) map[string]int32 {
 // LMCache server process inside the pod is fresh.
 //
 // The convergence flag lets the caller distinguish a rolling-update
-// midpoint (NOT converged: maxSurge has briefly widened the Ready set
-// above target) from a steady-state scale-up (converged: the operator
-// raised replicas and the new pods are part of the steady state).
+// midpoint (NOT converged: the controller has not reached its target
+// Ready/updated replica count yet) from a steady-state scale-up
+// (converged: the operator raised replicas and the new pods are part of
+// the steady state).
 // reconcileServerInstance persists a strict-superset baseline only
 // when converged is true; otherwise it could pin a transient midpoint
 // that a rollback would later misread as a real replacement.
@@ -759,24 +762,38 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 		reader = r.Client
 	}
 
-	// Fetch the owned Deployment so we can authenticate candidate pods
-	// against its UID. Verify the live Deployment is still controlled by
-	// THIS CacheBackend before using it as the ownership anchor — name
-	// reuse / race conditions could otherwise let a foreign Deployment
-	// re-created under the same name be treated as ours. NotFound is the
-	// cold-start case (CR exists, the reconciler hasn't created the
-	// Deployment yet, or it was deleted out-of-band): no pods can be
-	// authoritatively attributed so report "no instance".
 	var ownedDep appsv1.Deployment
+	depOwned := false
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}, &ownedDep); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", false, nil
+		if !apierrors.IsNotFound(err) {
+			return "", false, fmt.Errorf("get owned cache-server deployment: %w", err)
 		}
-		return "", false, fmt.Errorf("get owned cache-server deployment: %w", err)
+	} else {
+		depOwned = metav1.IsControlledBy(&ownedDep, backend)
 	}
-	if !metav1.IsControlledBy(&ownedDep, backend) {
-		// Foreign Deployment sharing the backend's name. Refuse to
-		// attribute its pods to this CacheBackend.
+
+	var ownedSts appsv1.StatefulSet
+	stsOwned := false
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}, &ownedSts); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return "", false, fmt.Errorf("get owned cache-server statefulset: %w", err)
+		}
+	} else {
+		stsOwned = metav1.IsControlledBy(&ownedSts, backend)
+	}
+
+	var workload serverInstanceWorkloadObserver
+	switch {
+	case backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet && stsOwned:
+		workload = statefulSetServerInstanceObserver(&ownedSts)
+	case depOwned:
+		workload = deploymentServerInstanceObserver(ctx, r, reader, &ownedDep)
+	case stsOwned:
+		workload = statefulSetServerInstanceObserver(&ownedSts)
+	default:
+		// No backend-owned managed workload is present yet, or a foreign
+		// object with the same name is present. Refuse to attribute pods
+		// to this CacheBackend without a UID-authenticated workload anchor.
 		return "", false, nil
 	}
 
@@ -788,31 +805,28 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	); err != nil {
 		return "", false, fmt.Errorf("list cache-server pods: %w", err)
 	}
-	// Build the set of container names the owned Deployment renders.
+	// Build the set of container names the owned workload renders.
 	// containerRunSum sums restart counts ONLY for these — sidecars
 	// injected by other admission webhooks (Istio's istio-proxy,
 	// linkerd's linkerd-proxy, Datadog agents, etc.) are added to the
-	// pod's containerStatuses but are absent from the Deployment
-	// template, so including them would cascade-restart every engine
-	// any time a service-mesh sidecar crash-looped — completely
-	// unrelated to the LMCache server's actual state.
-	cacheServerContainers := make(map[string]struct{}, len(ownedDep.Spec.Template.Spec.Containers))
-	for _, c := range ownedDep.Spec.Template.Spec.Containers {
-		cacheServerContainers[c.Name] = struct{}{}
-	}
+	// pod's containerStatuses but are absent from the owned workload
+	// template, so including them would cascade-restart every engine any
+	// time a service-mesh sidecar crash-looped — completely unrelated to
+	// the LMCache server's actual state.
+	cacheServerContainers := workload.containerNames
 
 	// Collect every Ready, attributable pod's identifier. A pod that
 	// is mid-rollout (Pending / Terminating) does not represent a
 	// serving instance — including it would let a rollout's transient
 	// state trigger a cascade even though the prior instance is still
 	// serving. A pod that is Ready but not transitively controller-
-	// owned by THIS backend's Deployment is rejected — see the godoc
+	// owned by THIS backend's workload is rejected — see the godoc
 	// above for why the ownership check is required.
 	//
 	// The per-pod identifier is <podUID>:<containerRunSum> where
 	// containerRunSum is the sum of restart counts across the
 	// cache-server's own containers (filtered by the owned
-	// Deployment's template names). pod.UID alone is invariant across
+	// workload's template names). pod.UID alone is invariant across
 	// in-place container restarts (kubelet restarting a crashed
 	// container reuses the pod object), but the LMCache server
 	// process inside that pod is fresh and every engine still holds
@@ -831,7 +845,7 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 		if !podIsReady(p) {
 			continue
 		}
-		owned, err := r.podOwnedByDeployment(ctx, reader, p, &ownedDep)
+		owned, err := workload.ownsPod(p)
 		if err != nil {
 			return "", false, err
 		}
@@ -844,10 +858,10 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 		})
 	}
 
-	// Deployment convergence: spec.replicas == status.readyReplicas
+	// Workload convergence: spec.replicas == status.readyReplicas
 	// == status.updatedReplicas == len(live Ready pods), AND the
 	// controller has observed the current generation. When all four
-	// hold, the Deployment is in steady state and a strict-superset
+	// hold, the workload is in steady state and a strict-superset
 	// Ready set against the prior baseline reflects a legitimate
 	// scale-up (not a maxSurge midpoint). All four are required:
 	//   - readyReplicas == spec.replicas → right number of Ready pods
@@ -858,29 +872,18 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	//   - observedGeneration >= metadata.generation → the controller
 	//     has seen the current spec (rules out a just-changed spec
 	//     whose effects haven't propagated yet)
-	//   - len(live Ready pods) == spec.replicas → the live pod list
-	//     we just took for the identifier MATCHES the Deployment
-	//     status's claim. Without this clause, a stale Deployment
-	//     status (the apps controller hasn't yet observed the
-	//     maxSurge new pod) could report readyReplicas==1 while we
-	//     observed 2 Ready pods in the same reconcile — the
-	//     status counters would lie convergence even though the
-	//     midpoint is genuinely transient, and we would persist the
-	//     widened latch as a "scale-up" baseline. A later rollback
-	//     dropping the new pod would then look like a real
-	//     replacement (a UID disappeared from the latch) and
-	//     false-cascade. Cross-checking against the live count is
-	//     cheap and closes that race.
-	// nil spec.Replicas defaults to 1 per the Deployment defaulter
-	// (kubebuilder/apiserver default), so we collapse nil to 1.
-	wantReplicas := int32(1)
-	if ownedDep.Spec.Replicas != nil {
-		wantReplicas = *ownedDep.Spec.Replicas
-	}
-	converged := ownedDep.Status.ObservedGeneration >= ownedDep.Generation &&
-		ownedDep.Status.ReadyReplicas == wantReplicas &&
-		ownedDep.Status.UpdatedReplicas == wantReplicas &&
-		int32(len(ready)) == wantReplicas
+	//   - len(live Ready pods) == spec.replicas → the live pod list we
+	//     just took for the identifier MATCHES the workload status's
+	//     claim. Without this clause, stale apps-controller status
+	//     could report readyReplicas==1 while we observed 2 Ready pods
+	//     in the same reconcile — the status counters would lie
+	//     convergence even though the midpoint is genuinely transient,
+	//     and we would persist the widened latch as a "scale-up"
+	//     baseline. A later rollback dropping the new pod would then
+	//     look like a real replacement (a UID disappeared from the
+	//     latch) and false-cascade. Cross-checking against the live
+	//     count is cheap and closes that race.
+	converged := workload.converged(len(ready))
 
 	if len(ready) == 0 {
 		return "", converged, nil
@@ -893,9 +896,61 @@ func (r *CacheBackendReconciler) currentServerInstanceID(ctx context.Context, ba
 	return strings.Join(ids, ","), converged, nil
 }
 
+type serverInstanceWorkloadObserver struct {
+	containerNames map[string]struct{}
+	converged      func(readyCount int) bool
+	ownsPod        func(*corev1.Pod) (bool, error)
+}
+
+func deploymentServerInstanceObserver(ctx context.Context, r *CacheBackendReconciler, reader client.Reader, dep *appsv1.Deployment) serverInstanceWorkloadObserver {
+	return serverInstanceWorkloadObserver{
+		containerNames: workloadContainerNames(dep.Spec.Template.Spec.Containers),
+		converged: func(readyCount int) bool {
+			wantReplicas := int32(1)
+			if dep.Spec.Replicas != nil {
+				wantReplicas = *dep.Spec.Replicas
+			}
+			return dep.Status.ObservedGeneration >= dep.Generation &&
+				dep.Status.ReadyReplicas == wantReplicas &&
+				dep.Status.UpdatedReplicas == wantReplicas &&
+				int32(readyCount) == wantReplicas
+		},
+		ownsPod: func(p *corev1.Pod) (bool, error) {
+			return r.podOwnedByDeployment(ctx, reader, p, dep)
+		},
+	}
+}
+
+func statefulSetServerInstanceObserver(sts *appsv1.StatefulSet) serverInstanceWorkloadObserver {
+	return serverInstanceWorkloadObserver{
+		containerNames: workloadContainerNames(sts.Spec.Template.Spec.Containers),
+		converged: func(readyCount int) bool {
+			wantReplicas := int32(1)
+			if sts.Spec.Replicas != nil {
+				wantReplicas = *sts.Spec.Replicas
+			}
+			return sts.Status.ObservedGeneration >= sts.Generation &&
+				sts.Status.ReadyReplicas == wantReplicas &&
+				sts.Status.UpdatedReplicas == wantReplicas &&
+				int32(readyCount) == wantReplicas
+		},
+		ownsPod: func(p *corev1.Pod) (bool, error) {
+			return podOwnedByStatefulSet(p, sts), nil
+		},
+	}
+}
+
+func workloadContainerNames(containers []corev1.Container) map[string]struct{} {
+	names := make(map[string]struct{}, len(containers))
+	for _, c := range containers {
+		names[c.Name] = struct{}{}
+	}
+	return names
+}
+
 // containerRunSum returns the sum of restart counts across the cache-
 // server's own containers, scoped to the set of container names from
-// the owned Deployment's pod template. Used to detect in-place
+// the owned workload's pod template. Used to detect in-place
 // restarts of the cache-server container (kubelet respawning a crashed
 // container reuses the pod UID but increments restartCount). Sidecars
 // outside the owned set are excluded — see currentServerInstanceID's
@@ -946,6 +1001,18 @@ func (r *CacheBackendReconciler) podOwnedByDeployment(ctx context.Context, reade
 		return false, nil
 	}
 	return depRef.Name == dep.Name && depRef.UID == dep.UID, nil
+}
+
+// podOwnedByStatefulSet reports whether pod is directly controller-
+// owned by the given StatefulSet, matched on both name AND UID. Unlike
+// Deployments, StatefulSets own their pods directly rather than through
+// ReplicaSets, so the authoritative chain is one hop.
+func podOwnedByStatefulSet(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	stsRef := metav1.GetControllerOf(pod)
+	if stsRef == nil || stsRef.Kind != "StatefulSet" || !ownerRefIsAppsV1(stsRef) {
+		return false
+	}
+	return stsRef.Name == sts.Name && stsRef.UID == sts.UID
 }
 
 // ownerRefIsAppsV1 reports whether the owner reference points at

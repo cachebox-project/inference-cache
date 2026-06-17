@@ -647,7 +647,7 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("SwitchToStatefulSetKindCleansUpAndClearsStatus", func(t *testing.T) {
+	t.Run("SwitchToStatefulSetKindCreatesStatefulSetAndShedsDeployment", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		if err := k8s.Create(ctx, lmcacheBackend("cache", ns)); err != nil {
 			t.Fatalf("create: %v", err)
@@ -667,12 +667,16 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		if _, err := getOptionalDeployment(t, r, "cache", ns); err == nil {
 			t.Fatalf("deployment should be deleted after switch to StatefulSet kind")
 		}
-		cb := getBackend(t, r, "cache", ns)
-		if cb.Status.Endpoint != "" {
-			t.Fatalf("status.endpoint = %q, want cleared", cb.Status.Endpoint)
+		sts := getStatefulSet(t, r, "cache", ns)
+		if sts.Spec.ServiceName != "cache" {
+			t.Fatalf("statefulset serviceName = %q, want cache", sts.Spec.ServiceName)
 		}
-		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond != nil {
-			t.Fatalf("Ready condition = %+v, want removed", cond)
+		cb := getBackend(t, r, "cache", ns)
+		if cb.Status.Endpoint != "cache."+ns+".svc.cluster.local:65432" {
+			t.Fatalf("status.endpoint = %q, want service endpoint", cb.Status.Endpoint)
+		}
+		if cond := findCondition(cb.Status.Conditions, conditionTypeReady); cond == nil || cond.Reason != conditionReasonRolloutInProgress {
+			t.Fatalf("Ready condition = %+v, want rollout status from StatefulSet", cond)
 		}
 	})
 

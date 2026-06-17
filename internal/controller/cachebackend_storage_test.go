@@ -4,7 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -341,6 +344,188 @@ func TestReconcileMultiReplicaViaAutoscalingGated(t *testing.T) {
 	expectEvent(t, drainEvents(rec), conditionReasonInvalidStorageConfiguration)
 }
 
+func TestReconcileStatefulSetPersistentStorageUsesVolumeClaimTemplates(t *testing.T) {
+	scheme := newScheme(t)
+	fast := "fast"
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	cb.Spec.Replicas = ptrInt32(3)
+	withPVC(cb, "10Gi", &fast)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("StatefulSet persistent backend must not provision a Deployment; get err=%v", err)
+	}
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("StatefulSet persistent backend must not provision a shared PVC; get err=%v", err)
+	}
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 3 {
+		t.Fatalf("statefulset replicas = %v, want 3", sts.Spec.Replicas)
+	}
+	retention := sts.Spec.PersistentVolumeClaimRetentionPolicy
+	if retention == nil ||
+		retention.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType ||
+		retention.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatalf("StatefulSet persistentVolumeClaimRetentionPolicy = %+v, want Retain/Retain", retention)
+	}
+	if len(sts.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("volumeClaimTemplates = %d, want 1: %#v", len(sts.Spec.VolumeClaimTemplates), sts.Spec.VolumeClaimTemplates)
+	}
+	tpl := sts.Spec.VolumeClaimTemplates[0]
+	if tpl.Name == "" {
+		t.Fatalf("volumeClaimTemplate name is empty")
+	}
+	if got := tpl.Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("10Gi")) != 0 {
+		t.Fatalf("volumeClaimTemplate size = %q, want 10Gi", got.String())
+	}
+	if tpl.Spec.StorageClassName == nil || *tpl.Spec.StorageClassName != "fast" {
+		t.Fatalf("volumeClaimTemplate storageClassName = %v, want fast", tpl.Spec.StorageClassName)
+	}
+	mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+	found := false
+	for _, mount := range mounts {
+		if mount.Name == tpl.Name && strings.HasPrefix(mount.MountPath, "/") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("lmcache-server mounts = %v, want absolute mount for volumeClaimTemplate %q", mounts, tpl.Name)
+	}
+	cond := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady)
+	if cond != nil && cond.Reason == conditionReasonInvalidStorageConfiguration {
+		t.Fatalf("StatefulSet per-replica PVC backend must not be gated as InvalidStorageConfiguration")
+	}
+}
+
+func TestReconcileStatefulSetRepairsPVCRetentionPolicy(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	cb.Spec.Replicas = ptrInt32(2)
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(newScheme(t), cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+		WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+	}
+	if err := r.Update(context.Background(), sts); err != nil {
+		t.Fatalf("drift statefulset retention policy: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	repaired := getStatefulSet(t, r, "cache", "ns1")
+	retention := repaired.Spec.PersistentVolumeClaimRetentionPolicy
+	if retention == nil ||
+		retention.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType ||
+		retention.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatalf("repaired persistentVolumeClaimRetentionPolicy = %+v, want Retain/Retain", retention)
+	}
+}
+
+func TestStatefulSetVolumeClaimTemplateComparisonIgnoresAPIServerDefaults(t *testing.T) {
+	volumeMode := corev1.PersistentVolumeFilesystem
+	live := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-data"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+			VolumeMode: &volumeMode,
+		},
+	}
+	desired := live.DeepCopy()
+	desired.Spec.VolumeMode = nil
+
+	if !statefulSetVolumeClaimTemplatesEqual([]corev1.PersistentVolumeClaim{live}, []corev1.PersistentVolumeClaim{*desired}) {
+		t.Fatalf("defaulted volumeMode=Filesystem must not count as immutable StatefulSet storage drift")
+	}
+
+	changed := desired.DeepCopy()
+	changed.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("20Gi")
+	if statefulSetVolumeClaimTemplatesEqual([]corev1.PersistentVolumeClaim{live}, []corev1.PersistentVolumeClaim{*changed}) {
+		t.Fatalf("changed storage request must still count as immutable StatefulSet storage drift")
+	}
+}
+
+func TestReconcileStatefulSetStorageEditSurfacesImmutableDrift(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	sts := getStatefulSet(t, r, "cache", "ns1")
+	if len(sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("initial volumeClaimTemplates = %d, want none", len(sts.Spec.VolumeClaimTemplates))
+	}
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Generation = 2
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend storage: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	sts = getStatefulSet(t, r, "cache", "ns1")
+	if len(sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("StatefulSet volumeClaimTemplates were mutated after creation: %#v", sts.Spec.VolumeClaimTemplates)
+	}
+	for _, mount := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "cache-data" {
+			t.Fatalf("pod template mounted new immutable storage claim after creation: mounts=%v", sts.Spec.Template.Spec.Containers[0].VolumeMounts)
+		}
+	}
+	updated := getBackend(t, r, "cache", "ns1")
+	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
+	wantReason := conditionReasonImmutableStatefulSetStorage
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != wantReason {
+		t.Fatalf("Ready condition = %+v, want False/%s", cond, wantReason)
+	}
+	if updated.Status.ObservedGeneration != 2 {
+		t.Fatalf("status.observedGeneration = %d, want 2 so the immutable-storage condition is tied to the edited spec", updated.Status.ObservedGeneration)
+	}
+}
+
+func TestReconcileStatefulSetImmutableStorageDriftStillCleansUpHPA(t *testing.T) {
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 1, 3, nil)
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	withPVC(cb, "10Gi", nil)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	_ = getHPA(t, r, "cache", "ns1")
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Generation = 2
+	fresh.Spec.Autoscaling = nil
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend autoscaling/storage: %v", err)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(hpas.Items) != 0 {
+		t.Fatalf("HPAs = %d, want 0 after autoscaling cleared during immutable StatefulSet storage drift", len(hpas.Items))
+	}
+}
+
 func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	cb.Spec.Replicas = ptrInt32(1)
@@ -351,9 +536,8 @@ func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T)
 	getPVC(t, r, "cache-data", "ns1")
 	drainEvents(rec)
 
-	// Operator removes storage AND switches to StatefulSet, which dispatch routes
-	// to the unmanaged path — bypassing reconcileManaged entirely. The adopt-and-
-	// keep warning must still fire (it lives in dispatch), and the PVC must stay.
+	// Operator removes storage AND switches to StatefulSet. The adopt-and-keep
+	// warning must still fire (it lives in dispatch), and the PVC must stay.
 	fresh := getBackend(t, r, "cache", "ns1")
 	fresh.Spec.Storage = nil
 	fresh.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
@@ -367,6 +551,96 @@ func TestReconcileStorageRemovedViaKindSwitchStillWarnsAndKeepsPVC(t *testing.T)
 	}
 	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
 		t.Fatalf("OrphanedPVCRetained on the unmanaged/bypass path = %d, want 1", n)
+	}
+}
+
+func TestReconcileStorageKeptViaStatefulSetSwitchWarnsAndKeepsDeploymentPVC(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1") // provisions the shared Deployment PVC
+	getPVC(t, r, "cache-data", "ns1")
+	drainEvents(rec)
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	fresh.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	fresh.Spec.Replicas = ptrInt32(2)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("switch to StatefulSet kind: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalPVC(r, "cache-data", "ns1"); err != nil {
+		t.Fatalf("prior shared Deployment PVC must be retained across StatefulSet switch; get err=%v", err)
+	}
+	wantReason := eventReasonSharedPVCRetained
+	if n := countEvents(drainEvents(rec), wantReason); n != 1 {
+		t.Fatalf("SharedPVCRetained events after StatefulSet switch = %d, want exactly 1", n)
+	}
+
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), wantReason); n != 0 {
+		t.Fatalf("SharedPVCRetained re-fired on resync = %d times, want 0", n)
+	}
+}
+
+func TestReconcileRetainedPVCWarningsAreReasonScoped(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	withPVC(cb, "10Gi", nil)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	getPVC(t, r, "cache-data", "ns1")
+	drainEvents(rec)
+
+	removed := getBackend(t, r, "cache", "ns1")
+	removed.Spec.Storage = nil
+	removed.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	if err := r.Update(context.Background(), removed); err != nil {
+		t.Fatalf("remove storage and switch to StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), eventReasonOrphanedPVCRetained); n != 1 {
+		t.Fatalf("OrphanedPVCRetained events after storage removal = %d, want 1", n)
+	}
+
+	readded := getBackend(t, r, "cache", "ns1")
+	withPVC(readded, "10Gi", nil)
+	readded.Spec.Replicas = ptrInt32(2)
+	if err := r.Update(context.Background(), readded); err != nil {
+		t.Fatalf("re-add storage while staying StatefulSet: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	if n := countEvents(drainEvents(rec), eventReasonSharedPVCRetained); n != 1 {
+		t.Fatalf("SharedPVCRetained events after storage re-add on StatefulSet path = %d, want 1", n)
+	}
+}
+
+func TestReconcileImmutableStatefulSetStorageClearsProbeRateLimiter(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(newScheme(t), cb)
+
+	reconcile(t, r, "cache", "ns1")
+	key := "ns1/cache"
+	now := time.Unix(2_000_000, 0)
+	r.probeLimiter.markCalled(key, now)
+	if got := r.probeLimiter.lastCalled(key); got != now {
+		t.Fatalf("planted rate-limit precondition failed: lastCalled = %v, want %v", got, now)
+	}
+
+	fresh := getBackend(t, r, "cache", "ns1")
+	withPVC(fresh, "20Gi", nil)
+	if err := r.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update backend storage: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if got := r.probeLimiter.lastCalled(key); !got.IsZero() {
+		t.Fatalf("probeLimiter.lastCalled(%q) = %v after immutable StatefulSet storage drift; want zero", key, got)
 	}
 }
 

@@ -15,10 +15,11 @@
 #   * Removing spec.storage.pvc later LEAVES the PVC in place (adopt-and-keep) —
 #     destroying persistent storage on a spec edit would be data loss. To
 #     reclaim it, run `kubectl delete cachebackend persistent-cache`.
-#   * SINGLE-REPLICA ONLY: a ReadWriteOnce PVC cannot be multi-attached, so keep
+#   * deploymentKind: Deployment uses one shared ReadWriteOnce PVC, so keep
 #     replicas: 1 and do not set an autoscaling ceiling > 1, or the backend is
 #     surfaced Ready=False / InvalidStorageConfiguration and not provisioned.
-#     Per-replica PVCs via a StatefulSet are a separate ticket.
+#     Use deploymentKind: StatefulSet for multi-replica persistent backends;
+#     the controller then renders volumeClaimTemplates for per-replica PVCs.
 #
 # NOT YET KV-PERSISTENT: provisioning + mounting the PVC is wired, but the
 # lmcache-server still runs its in-memory storage device, so KV does NOT yet
@@ -45,7 +46,7 @@ metadata:
 spec:
   type: LMCache
   deploymentKind: Deployment
-  # Single replica is required for a PVC-backed (ReadWriteOnce) backend.
+  # Single replica is required for a Deployment-backed ReadWriteOnce PVC.
   replicas: 1
   integration:
     engine: vllm

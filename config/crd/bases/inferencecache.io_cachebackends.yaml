@@ -68,22 +68,24 @@ spec:
               (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
               HorizontalPodAutoscaler. On a managed Deployment backend
               (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
-              PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
-              when the CacheBackend is deleted), mounts it into the cache-server pod at the
-              runtime adapter's declared data path, and reports the bound PVC's actual size
-              in status.capacity.
+              single PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed
+              only when the CacheBackend is deleted), mounts it into the cache-server pod at
+              the runtime adapter's declared data path, and reports the bound PVC's actual
+              size in status.capacity. On a managed StatefulSet backend, spec.storage.pvc
+              renders a volumeClaimTemplate instead, giving each replica its own
+              ReadWriteOnce PVC.
 
               Two scoping rules apply:
 
-                - Only a managed Deployment backend provisions storage. A StatefulSet
-                  backend is routed to the unmanaged path today (see DeploymentKind), so it
-                  provisions nothing, storage included; per-replica volumeClaimTemplates are
-                  a follow-up. An External backend provisions no workload at all, so
-                  spec.storage.pvc is a no-op there.
-                - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
-                  multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
-                  Ready=False/InvalidStorageConfiguration rather than provisioned;
-                  per-replica persistent storage via StatefulSet is a separate follow-up.
+                - Managed Deployment backends provision one shared PVC. Managed StatefulSet
+                  backends provision per-replica PVCs via volumeClaimTemplates. External
+                  backends provision no workload at all, so spec.storage.pvc is a no-op
+                  there.
+                - A persistent Deployment backend must be single-replica. A ReadWriteOnce
+                  PVC cannot be multi-attached, so replicas (or an autoscaling ceiling) > 1
+                  is surfaced Ready=False/InvalidStorageConfiguration rather than
+                  provisioned. Use deploymentKind=StatefulSet for multi-replica persistent
+                  storage.
 
               NOTE: provisioning + mounting the PVC does not by itself make the cache server
               spill KV to it — switching the LMCache server to a disk-backed storage device
@@ -152,9 +154,9 @@ spec:
                 default: Deployment
                 description: |-
                   DeploymentKind identifies whether a managed backend is reconciled as a
-                  Deployment or StatefulSet. Defaults to Deployment — the only kind the
-                  Phase-1 reconciler templates; StatefulSet is reserved for future
-                  per-replica-PVC topologies and is a no-op today.
+                  Deployment or StatefulSet. Defaults to Deployment. StatefulSet uses the
+                  same adapter-rendered pod and service shape, but can back
+                  spec.storage.pvc with per-replica volumeClaimTemplates.
                 enum:
                 - Deployment
                 - StatefulSet
@@ -2133,12 +2135,13 @@ spec:
               capacity:
                 description: |-
                   Capacity is a human-readable summary of the backend's provisioned
-                  capacity: the bound PersistentVolumeClaim's actual capacity when
-                  spec.storage.pvc is set and the PVC has bound (the real provisioned size,
-                  which may exceed the request), or empty for an ephemeral backend or while
-                  the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
-                  binds only once the pod schedules). It is informational; clients must not
-                  parse it.
+                  capacity: for Deployment-backed persistent storage, the bound shared
+                  PersistentVolumeClaim's actual capacity when the PVC has bound (the real
+                  provisioned size, which may exceed the request). Empty for an ephemeral
+                  backend, a StatefulSet backend (per-replica PVCs have no aggregate
+                  capacity projection yet), or while the Deployment PVC is still pending
+                  (e.g. a WaitForFirstConsumer StorageClass that binds only once the pod
+                  schedules). It is informational; clients must not parse it.
                 type: string
               conditions:
                 description: Conditions describe the latest observations of the backend.
@@ -2214,19 +2217,19 @@ spec:
               firstAvailableAt:
                 description: |-
                   FirstAvailableAt latches the first time the managed cache-backend
-                  workload was observed Available — the stable anchor for the
-                  firstEventTimeout clock. It is deliberately a latched timestamp rather
-                  than the live Deployment's Available condition LastTransitionTime: that
-                  condition resets on an availability flap, which would restart the
+                  workload was observed serving (Deployment Available or StatefulSet Ready)
+                  — the stable anchor for the firstEventTimeout clock. It is deliberately
+                  a latched timestamp rather than the live workload transition time: that
+                  transition resets on an availability flap, which would restart the
                   timeout window and let a backend that already breached the timeout
                   (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
                   without any KV event — contradicting the "once Degraded, stays Degraded
                   until an event arrives" contract. Anchoring on this write-once value
                   keeps the elapsed window monotonic, so Degraded is sticky. Written
-                  write-once when the workload first reports Available and never cleared
+                  write-once when the workload first reports serving and never cleared
                   (inert while the backend is not managed). A genuinely recreated managed
-                  Deployment keeps the prior anchor; the gate re-evaluates from it, which
-                  is safe because the engine event source is unchanged by a cache-server
+                  workload keeps the prior anchor; the gate re-evaluates from it, which is
+                  safe because the engine event source is unchanged by a cache-server
                   restart.
                 format: date-time
                 type: string
@@ -2331,25 +2334,24 @@ spec:
                 type: integer
               observedServerInstance:
                 description: |-
-                  ObservedServerInstance is the controller's cascade-decision
-                  baseline — a stable identifier for the Ready cache-server pod
-                  set the controller last anchored against. NOT a live current-
-                  pod-set view: the controller intentionally pins this through
-                  transient rolling-update midpoints and through no-Ready
-                  windows so the cascade does not fire on rollbacks or transient
-                  outages. For the live pod inventory, operators should consult
+                  ObservedServerInstance is the controller's cascade-decision baseline — a
+                  stable identifier for the Ready cache-server pod set the controller last
+                  anchored against. NOT a live current-pod-set view: the controller
+                  intentionally pins this through transient rolling-update midpoints and
+                  through no-Ready windows so the cascade does not fire on rollbacks or
+                  transient outages. For the live pod inventory, operators should consult
                   status.matchedEnginePods (engine side) and `kubectl get pod`
                   (cache-server side).
 
-                  Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
-                  and lex-sorted by pod name. restart-sum is the per-pod
-                  containerStatuses[].RestartCount summed across cache-server
-                  containers (the names from the owned Deployment's pod
-                  template; foreign sidecars are excluded). Inert and cleared
-                  for External backends, unsupported-runtime backends, and on
-                  the InvalidStorageConfiguration gate (a persistent
-                  multi-replica spec the controller refuses to provision until
-                  the operator scales to 1 or removes spec.storage.pvc).
+                  Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined and
+                  lex-sorted by pod name. restart-sum is the per-pod
+                  containerStatuses[].RestartCount summed across cache-server containers
+                  (the names from the owned workload's pod template; foreign sidecars are
+                  excluded). Inert and cleared for External backends, unsupported-runtime
+                  backends, and on the InvalidStorageConfiguration gate (a persistent
+                  multi-replica Deployment spec the controller refuses to provision until
+                  the operator scales to 1, removes spec.storage.pvc, or switches to
+                  StatefulSet).
 
                   Operator-side recovery for the upstream LMCache
                   LMServerConnector EPIPE-on-restart bug. See

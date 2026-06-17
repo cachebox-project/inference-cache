@@ -107,7 +107,7 @@ const (
 	eventReasonFailClosedEnabled = "FailClosedEnabled"
 	eventReasonFailOpenRestored  = "FailOpenRestored"
 	// eventReasonInvalidStorageConfiguration is the Warning fired when a
-	// persistent (spec.storage.pvc) backend asks for more than one replica —
+	// persistent Deployment backend asks for more than one replica —
 	// a single ReadWriteOnce PVC cannot be multi-attached. Mirrors the
 	// Ready=False reason so a transition into the gated state is narrated once.
 	eventReasonInvalidStorageConfiguration = conditionReasonInvalidStorageConfiguration
@@ -116,6 +116,11 @@ const (
 	// the operator knows the storage was kept, not silently dropped. Event
 	// aggregation collapses the per-reconcile repeats into one event.
 	eventReasonOrphanedPVCRetained = "OrphanedPVCRetained"
+	// eventReasonSharedPVCRetained is the Warning fired when a persistent
+	// Deployment backend switches to deploymentKind=StatefulSet and the old
+	// shared PVC is retained but no longer mounted. StatefulSet storage uses
+	// per-replica volumeClaimTemplates instead.
+	eventReasonSharedPVCRetained = "SharedPVCRetained"
 )
 
 // Condition reasons published on a CacheBackend's Ready condition. Stable
@@ -238,6 +243,8 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
@@ -249,9 +256,9 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 // Reconcile drives a CacheBackend toward its desired state. External backends
 // only mirror their configured endpoint to status; managed backends (LMCache
 // in Phase 1) ask the registered runtime adapter for the cache-server pod
-// spec + service spec, wrap them into a Deployment + Service the controller
-// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
-// resolved endpoint.
+// spec + service spec, wrap them into a Deployment or StatefulSet plus a
+// Service the controller owns, optionally reconcile an HPA from
+// spec.autoscaling, and publish the resolved endpoint.
 //
 // On every reconcile — including ones that return an apply error — transitions
 // in the observed Ready condition (entering/leaving Ready=False/
@@ -336,20 +343,22 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 // dispatch routes a CacheBackend to the right reconcile path. External backends
-// only mirror their configured endpoint to status; unsupported / deferred kinds
-// shed any previously managed workload; LMCache (Phase 1) templates a
-// Deployment + Service.
+// only mirror their configured endpoint to status; unsupported runtime/backend
+// pairs shed any previously managed workload; managed backends template a
+// Deployment or StatefulSet + Service.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	// Adopt-and-keep visibility: if spec.storage.pvc is absent but we still own a
 	// data PVC from a prior persistent generation, warn (once). Done here, before
 	// the type/kind routing, so the warning fires regardless of how a now
-	// storage-less backend is dispatched — External, StatefulSet/unmanaged, an
-	// unsupported (runtime, type) pair, or managed-ephemeral all otherwise bypass
-	// the per-path provisioning logic. The PVC itself is retained by its owner
+	// storage-less backend is dispatched — External, an unsupported (runtime,
+	// type) pair, or managed-ephemeral all otherwise bypass the Deployment PVC
+	// provisioning logic. The PVC itself is retained by its owner
 	// reference (reclaimed only on CR delete); warnRetainedPVC no-ops when no
 	// owned PVC exists, so this is a cheap cached Get on the common path.
 	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
 		r.warnRetainedPVC(ctx, backend)
+	} else if desiredDeploymentKind(backend) == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+		r.warnRetainedSharedPVCForStatefulSet(ctx, backend)
 	}
 
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
@@ -358,14 +367,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
-	}
-
-	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
-	// module. Phase 1 manages a Deployment only.
-	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
-		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
-			"namespace", backend.Namespace, "name", backend.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
 	registry := r.Registry
@@ -453,7 +454,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// Clear the cache-server-instance latch — External backends
 		// have no controller-managed cache-server pods, and
 		// cleanupOwnedWorkload above has just deleted any prior
-		// managed Deployment. Leaving the latch set would expose a
+		// managed workload. Leaving the latch set would expose a
 		// stale UID to operators.
 		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
@@ -537,7 +538,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		backend.Status.Endpoint = ""
 		backend.Status.Capacity = ""
 		// Clear the cache-server-instance latch — cleanupOwnedWorkload
-		// above has just deleted any prior managed Deployment and we
+		// above has just deleted any prior managed workload and we
 		// no longer provision one, so a retained UID would advertise
 		// a stale identifier.
 		backend.Status.ObservedServerInstance = ""
@@ -550,8 +551,8 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 }
 
 // reconcileManaged renders the cache-server PodSpec + Service via the runtime
-// adapter, wraps them into a Deployment + Service owned by the CR, and
-// publishes the resolved endpoint to status.
+// adapter, wraps them into the selected managed workload + Service owned by the
+// CR, and publishes the resolved endpoint to status.
 //
 // Apply drives desired state; status reflects observed state. The two must not
 // block each other: if a desired-state write fails (e.g. a transient API-server
@@ -575,80 +576,154 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	podSpec := resolved.PodSpec
 	svcSpec := resolved.Service
 
-	// Persistent storage: provision a PVC and mount it when the adapter declares
-	// a data volume AND the operator asked for PVC-backed storage. The adapter
-	// owns the volume name + mount path (it knows where its data lives); the
-	// controller owns PVC identity, owner-ref GC, and the mutable-field reconcile.
+	desiredKind := desiredDeploymentKind(backend)
+
+	// Persistent storage: when the adapter declares a data volume AND the
+	// operator asked for PVC-backed storage, wire that volume according to the
+	// workload kind. Deployments get the legacy single shared PVC. StatefulSets
+	// get per-replica PVCs via volumeClaimTemplates, using the adapter-declared
+	// volume name + mount path.
 	capacity := ""
+	var volumeClaimTemplates []corev1.PersistentVolumeClaim
 	if resolved.DataVolume != nil && backend.Spec.Storage != nil && backend.Spec.Storage.PVC != nil {
-		// Multi-replica gate: a single ReadWriteOnce PVC cannot be multi-attached.
-		// Refuse to provision the workload until the operator scales to 1 or
-		// drops spec.storage.pvc. The pod is not created in this state.
-		if multiReplicaRequested(backend) {
-			return r.reconcileInvalidStorage(ctx, backend)
+		if desiredKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+			mountDataVolumeClaimTemplate(podSpec, resolved.DataVolume)
+			volumeClaimTemplates = []corev1.PersistentVolumeClaim{
+				buildVolumeClaimTemplate(backend, resolved.DataVolume),
+			}
+		} else {
+			// Multi-replica gate: a single ReadWriteOnce PVC cannot be multi-attached.
+			// Refuse to provision the Deployment until the operator scales to 1 or
+			// drops spec.storage.pvc. StatefulSet storage uses per-replica PVCs above.
+			if multiReplicaRequested(backend) {
+				return r.reconcileInvalidStorage(ctx, backend)
+			}
+			pvc, pvcErr := r.applyPVC(ctx, logger, backend)
+			if pvcErr != nil {
+				return ctrl.Result{}, pvcErr
+			}
+			// Merge the PVC-backed volume + mount into the rendered cache-server pod
+			// before it is wrapped into the Deployment. The apply path already
+			// propagates podSpec.Volumes + container VolumeMounts to the live
+			// Deployment (see reconcileManagedPodSpec), so no extra apply step is
+			// needed.
+			mountDataVolume(podSpec, resolved.DataVolume, pvc.Name)
+			capacity = boundCapacity(pvc)
 		}
-		pvc, pvcErr := r.applyPVC(ctx, logger, backend)
-		if pvcErr != nil {
-			return ctrl.Result{}, pvcErr
-		}
-		// Merge the PVC-backed volume + mount into the rendered cache-server pod
-		// before it is wrapped into the Deployment. The apply path already
-		// propagates podSpec.Volumes + container VolumeMounts to the live
-		// Deployment (see reconcileManagedPodSpec), so no extra apply step is
-		// needed.
-		mountDataVolume(podSpec, resolved.DataVolume, pvc.Name)
-		capacity = boundCapacity(pvc)
 	}
 	// (When spec.storage.pvc is absent the rendered pod carries no PVC volume, so
 	// the workload reverts to ephemeral on the next rollout. The adopt-and-keep
 	// Warning for a removed spec.storage.pvc is emitted in dispatch — it covers
 	// every routing outcome, not just this managed path.)
 
-	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
 
-	// Skip Service + HPA when applyDeployment failed. The HPA targets the
-	// Deployment by name, so running it after a foreign-ownership failure
-	// could scale another controller's workload; the Service is independent
-	// but pointless to expose alongside a Deployment we don't own. Status
-	// observation still runs below (it has its own ownership guards) so the
-	// CR isn't held hostage to apply churn.
-	applyErr := r.applyDeployment(ctx, backend, dep)
-	if applyErr == nil {
-		if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
-			applyErr = svcErr
+	var (
+		applyErr               error
+		replacementUnavailable bool
+		workload               managedWorkloadObservation
+	)
+	switch desiredKind {
+	case cachev1alpha1.CacheBackendDeploymentKindStatefulSet:
+		if err := r.deleteOwnedDeployment(ctx, backend); err != nil {
+			return ctrl.Result{}, err
 		}
-		if hpaErr := r.reconcileHPA(ctx, backend, dep); hpaErr != nil && applyErr == nil {
-			applyErr = hpaErr
+		sts := r.buildStatefulSet(backend, podSpec, svc.Name, volumeClaimTemplates)
+		storageDrift, err := r.statefulSetVolumeClaimTemplatesDrift(ctx, backend, sts)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-	}
+		if storageDrift {
+			result, driftErr := r.reconcileImmutableStatefulSetStorage(ctx, backend)
+			if hpaErr := r.reconcileHPA(ctx, backend, workloadRefFromStatefulSet(sts)); hpaErr != nil && driftErr == nil {
+				driftErr = hpaErr
+			}
+			cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+			if cascadeWait > 0 && (result.RequeueAfter == 0 || cascadeWait < result.RequeueAfter) {
+				result.RequeueAfter = cascadeWait
+			}
+			pollCadence := r.minServerRestartCascadeInterval()
+			if result.RequeueAfter == 0 || pollCadence < result.RequeueAfter {
+				result.RequeueAfter = pollCadence
+			}
+			return result, driftErr
+		}
+		applyErr = r.applyStatefulSet(ctx, backend, sts)
+		if applyErr == nil {
+			if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
+				applyErr = svcErr
+			}
+			if hpaErr := r.reconcileHPA(ctx, backend, workloadRefFromStatefulSet(sts)); hpaErr != nil && applyErr == nil {
+				applyErr = hpaErr
+			}
+		}
 
-	var live appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
-		if apierrors.IsNotFound(err) && applyErr != nil {
-			// Apply failed before creating the Deployment, so there is no
-			// observed state to publish — surface the apply error to requeue.
-			return ctrl.Result{}, applyErr
+		var live appsv1.StatefulSet
+		if err := r.Get(ctx, client.ObjectKeyFromObject(sts), &live); err != nil {
+			if apierrors.IsNotFound(err) && applyErr != nil {
+				replacementUnavailable = true
+				workload = observationFromStatefulSet(sts)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("get statefulset %s/%s: %w", sts.Namespace, sts.Name, err)
+			}
+		} else if !metav1.IsControlledBy(&live, backend) {
+			if applyErr != nil {
+				replacementUnavailable = true
+				workload = observationFromStatefulSet(sts)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("statefulset %s/%s lost controller reference after apply", sts.Namespace, sts.Name)
+			}
+		} else {
+			workload = observationFromStatefulSet(&live)
 		}
-		// Either a transient Get error, or NotFound after a successful apply
-		// (deleted out-of-band between apply and Get). Both must requeue;
-		// silently reporting success here would freeze status at a stale
-		// snapshot.
-		return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
-	}
-	// Never publish status derived from a foreign workload. The common case
-	// is an AlreadyOwned collision during apply (applyErr is set; surface
-	// it). The race case is that apply succeeded but the live Deployment's
-	// controller ref was changed out-of-band between Update and this Get —
-	// applyErr is nil, but we no longer own the object. Returning nil there
-	// would silently mark the reconcile successful AND lose the owned-object
-	// watch (no future event would re-trigger), so synthesize an explicit
-	// error to requeue.
-	if !metav1.IsControlledBy(&live, backend) {
-		if applyErr != nil {
-			return ctrl.Result{}, applyErr
+	default:
+		if err := r.deleteOwnedStatefulSet(ctx, backend); err != nil {
+			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
+		dep := r.buildDeployment(backend, podSpec)
+		applyErr = r.applyDeployment(ctx, backend, dep)
+		if applyErr == nil {
+			if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
+				applyErr = svcErr
+			}
+			if hpaErr := r.reconcileHPA(ctx, backend, workloadRefFromDeployment(dep)); hpaErr != nil && applyErr == nil {
+				applyErr = hpaErr
+			}
+		}
+
+		var live appsv1.Deployment
+		if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &live); err != nil {
+			if apierrors.IsNotFound(err) && applyErr != nil {
+				// Apply failed before creating the Deployment. Continue to the
+				// status pass with an empty endpoint so a kind-switch failure
+				// does not keep advertising the workload deleted above.
+				replacementUnavailable = true
+				workload = observationFromDeployment(dep)
+			} else {
+				// Either a transient Get error, or NotFound after a successful apply
+				// (deleted out-of-band between apply and Get). Both must requeue;
+				// silently reporting success here would freeze status at a stale
+				// snapshot.
+				return ctrl.Result{}, fmt.Errorf("get deployment %s/%s: %w", dep.Namespace, dep.Name, err)
+			}
+		} else if !metav1.IsControlledBy(&live, backend) {
+			// Never publish status derived from a foreign workload. The common
+			// case is an AlreadyOwned collision during apply (applyErr is set;
+			// surface it). The race case is that apply succeeded but the live
+			// Deployment's controller ref was changed out-of-band between Update
+			// and this Get — applyErr is nil, but we no longer own the object.
+			// Returning nil there would silently mark the reconcile successful
+			// AND lose the owned-object watch (no future event would re-trigger),
+			// so synthesize an explicit error to requeue.
+			if applyErr != nil {
+				replacementUnavailable = true
+				workload = observationFromDeployment(dep)
+			} else {
+				return ctrl.Result{}, fmt.Errorf("deployment %s/%s lost controller reference after apply", dep.Namespace, dep.Name)
+			}
+		} else {
+			workload = observationFromDeployment(&live)
+		}
 	}
 
 	// Endpoint is derived from the *live* Service, not the desired one: if
@@ -658,15 +733,19 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	// when the Service hasn't materialized or is owned by someone else.
 	var liveSvc corev1.Service
 	endpoint := ""
-	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+	if !replacementUnavailable {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(svc), &liveSvc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("get service %s/%s: %w", svc.Namespace, svc.Name, err)
+			}
+		} else if metav1.IsControlledBy(&liveSvc, backend) {
+			endpoint = serviceEndpoint(&liveSvc)
 		}
-	} else if metav1.IsControlledBy(&liveSvc, backend) {
-		endpoint = serviceEndpoint(&liveSvc)
+	} else {
+		capacity = ""
 	}
 
-	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
+	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, workload, applyErr == nil)
 	// Do NOT short-circuit on statusErr — the cascade is independent
 	// recovery for stale engine sockets and must not be skipped just
 	// because the unrelated managed-status patch (matchedEnginePods,
@@ -696,19 +775,18 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		requeueAfter = cascadeWait
 	}
 	// Schedule an unconditional periodic re-poll of the cache-server
-	// pod set on managed backends. Reason: an in-place container
+	// pod set for managed backends. Reason: an in-place container
 	// restart (kubelet respawning a crashed cache-server container
-	// without bumping pod.UID) does NOT change owned-Deployment status
-	// counts, and the controller deliberately does not watch Pods
+	// without bumping pod.UID) does NOT change owned workload readiness
+	// status, and the controller deliberately does not watch Pods
 	// cluster-wide (see refreshMatchedEnginePods godoc). The
-	// matched-engine-pods cadence above does not cover this case
-	// either: when an operator removes spec.engineSelector after
-	// engines were injected, len(matchedEnginePods)→0 and that
-	// cadence stops firing, leaving in-place restarts unobservable
-	// until something unrelated triggers a reconcile. Pinning a
-	// floor at the rate-limit interval bounds the observation
-	// latency for in-place restarts at one cadence (cheap: one
-	// Pod List + one Deployment Get per backend per cadence).
+	// matched-engine-pods cadence above does not cover this case either:
+	// when an operator removes spec.engineSelector after engines were
+	// injected, len(matchedEnginePods)→0 and that cadence stops firing,
+	// leaving in-place restarts unobservable until something unrelated
+	// triggers a reconcile. Pinning a floor at the rate-limit interval
+	// bounds the observation latency for in-place restarts at one cadence
+	// (cheap: one Pod List + one workload Get per backend per cadence).
 	pollCadence := r.minServerRestartCascadeInterval()
 	if requeueAfter == 0 || pollCadence < requeueAfter {
 		requeueAfter = pollCadence
@@ -778,6 +856,48 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 			},
 		},
 	}
+}
+
+// buildStatefulSet wraps the adapter-rendered PodSpec into a StatefulSet the
+// controller owns. The StatefulSet reuses the same Service/selector identity as
+// the Deployment path and carries volumeClaimTemplates when persistent storage
+// is requested.
+func (r *CacheBackendReconciler) buildStatefulSet(backend *cachev1alpha1.CacheBackend, podSpec *corev1.PodSpec, serviceName string, volumeClaimTemplates []corev1.PersistentVolumeClaim) *appsv1.StatefulSet {
+	replicas := initialReplicas(backend)
+	selector := selectorLabels(backend.Name)
+	podLabels := podTemplateLabels(backend)
+
+	pod := podSpec.DeepCopy()
+	applyPodOverrides(pod, backend.Spec.Template)
+
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backend.Name,
+			Namespace: backend.Namespace,
+			Labels:    podLabels,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    &replicas,
+			ServiceName: serviceName,
+			Selector:    &metav1.LabelSelector{MatchLabels: selector},
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec:       *pod,
+			},
+			VolumeClaimTemplates: volumeClaimTemplates,
+		},
+	}
+}
+
+func desiredDeploymentKind(backend *cachev1alpha1.CacheBackend) cachev1alpha1.CacheBackendDeploymentKind {
+	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+		return cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	}
+	return cachev1alpha1.CacheBackendDeploymentKindDeployment
 }
 
 // buildService wraps the adapter-rendered Service spec into a Service the
@@ -915,6 +1035,87 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 	return nil
 }
 
+// applyStatefulSet creates or updates the backend StatefulSet idempotently,
+// owned by the CR. On update it reconciles mutable fields only: replicas,
+// serviceName, PVC retention policy, and pod template. volumeClaimTemplates
+// and selector are effectively immutable in Kubernetes, so they are established
+// on create and left intact afterward.
+func (r *CacheBackendReconciler) applyStatefulSet(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.StatefulSet) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+			liveReplicas := sts.Spec.Replicas
+
+			sts.Labels = desired.Labels
+			if sts.ResourceVersion == "" {
+				sts.Spec = *desired.Spec.DeepCopy()
+			} else {
+				sts.Spec.Replicas = desired.Spec.Replicas
+				sts.Spec.ServiceName = desired.Spec.ServiceName
+				sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.Spec.PersistentVolumeClaimRetentionPolicy.DeepCopy()
+				sts.Spec.Template.Labels = desired.Spec.Template.Labels
+				reconcileManagedPodSpec(&sts.Spec.Template.Spec, &desired.Spec.Template.Spec)
+			}
+			if backend.Spec.Autoscaling != nil && liveReplicas != nil {
+				preserved := *liveReplicas
+				if floor := autoscalingFloor(backend.Spec.Autoscaling); preserved < floor {
+					preserved = floor
+				}
+				sts.Spec.Replicas = &preserved
+			}
+			return controllerutil.SetControllerReference(backend, sts, r.Scheme)
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("apply statefulset %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+	return nil
+}
+
+// statefulSetVolumeClaimTemplatesDrift reports whether an owned StatefulSet
+// already exists with immutable volumeClaimTemplates that differ from the
+// desired storage shape. It intentionally ignores metadata-only differences:
+// labels can drift without changing the per-replica PVC contract, while name
+// and spec differences require an operator-led replacement or migration.
+func (r *CacheBackendReconciler) statefulSetVolumeClaimTemplatesDrift(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *appsv1.StatefulSet) (bool, error) {
+	live := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get statefulset %s/%s for storage drift check: %w", desired.Namespace, desired.Name, err)
+	}
+	if !metav1.IsControlledBy(live, backend) {
+		return false, nil
+	}
+	return !statefulSetVolumeClaimTemplatesEqual(live.Spec.VolumeClaimTemplates, desired.Spec.VolumeClaimTemplates), nil
+}
+
+func statefulSetVolumeClaimTemplatesEqual(live, desired []corev1.PersistentVolumeClaim) bool {
+	if len(live) != len(desired) {
+		return false
+	}
+	for i := range live {
+		if live[i].Name != desired[i].Name {
+			return false
+		}
+		liveSpec := normalizeVolumeClaimTemplateSpec(live[i].Spec)
+		desiredSpec := normalizeVolumeClaimTemplateSpec(desired[i].Spec)
+		if !equality.Semantic.DeepEqual(liveSpec, desiredSpec) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeVolumeClaimTemplateSpec(spec corev1.PersistentVolumeClaimSpec) corev1.PersistentVolumeClaimSpec {
+	if spec.VolumeMode != nil && *spec.VolumeMode == corev1.PersistentVolumeFilesystem {
+		spec.VolumeMode = nil
+	}
+	return spec
+}
+
 // autoscalingFloor is the effective minReplicas value for the HPA — the
 // user's setting, or the default floor when unset. Mirrors the resolution
 // buildHPA does so the reconciler and the HPA agree on the lower bound.
@@ -951,10 +1152,10 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 	return nil
 }
 
-// pvcName is the stable name of the data PVC a persistent backend provisions.
+// pvcName is the stable name of the shared data PVC a persistent Deployment
+// backend provisions.
 // Derived from the CacheBackend name so it is deterministic across reconciles
-// and unique within the namespace (one shared PVC per backend on the Deployment
-// path; per-replica PVCs via StatefulSet volumeClaimTemplates are a follow-up).
+// and unique within the namespace.
 func pvcName(backend *cachev1alpha1.CacheBackend) string {
 	return backend.Name + "-data"
 }
@@ -969,8 +1170,9 @@ func pvcName(backend *cachev1alpha1.CacheBackend) string {
 // hazard and must not be gated. When autoscaling is unset, spec.replicas is the
 // ceiling. The ceiling — not the live count — is what matters: the operator's
 // intent to ever run more than one pod against the shared PVC is the hazard, and
-// admission deliberately surfaces this as Ready=False rather than rejecting
-// (per-replica PVCs via StatefulSet are a follow-up).
+// admission deliberately surfaces this as Ready=False rather than rejecting.
+// StatefulSet storage uses per-replica volumeClaimTemplates and bypasses this
+// shared-PVC hazard.
 func multiReplicaRequested(backend *cachev1alpha1.CacheBackend) bool {
 	if backend.Spec.Autoscaling != nil {
 		return backend.Spec.Autoscaling.MaxReplicas > 1
@@ -1049,10 +1251,10 @@ func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logge
 					}
 				}
 			}
-			// Re-adoption: clear the "already warned" marker (if any) left by a
-			// prior adopt-and-keep orphaning, so a future spec.storage.pvc
-			// removal warns again. delete on an absent key is a no-op.
-			delete(pvc.Annotations, annotationStorageRetainedWarned)
+			// Re-adoption: clear "already warned" markers (if any) left by prior
+			// retention modes, so a future removal or kind switch warns again.
+			// delete on an absent key is a no-op.
+			clearRetainedPVCWarningAnnotations(pvc.Annotations)
 			return controllerutil.SetControllerReference(backend, pvc, r.Scheme)
 		})
 		return e
@@ -1097,6 +1299,46 @@ func mountDataVolume(podSpec *corev1.PodSpec, dv *adapterruntime.AdapterDataVolu
 	}
 }
 
+// mountDataVolumeClaimTemplate adds the adapter-declared mount for a
+// StatefulSet volumeClaimTemplate. The StatefulSet controller materializes the
+// volume from VolumeClaimTemplates, so the pod template must not carry an
+// explicit PersistentVolumeClaim volume that would point every replica at one
+// shared claim.
+func mountDataVolumeClaimTemplate(podSpec *corev1.PodSpec, dv *adapterruntime.AdapterDataVolume) {
+	volumes := podSpec.Volumes[:0]
+	for _, volume := range podSpec.Volumes {
+		if volume.Name != dv.VolumeName {
+			volumes = append(volumes, volume)
+		}
+	}
+	podSpec.Volumes = volumes
+
+	mount := corev1.VolumeMount{Name: dv.VolumeName, MountPath: dv.MountPath}
+	for i := range podSpec.Containers {
+		podSpec.Containers[i].VolumeMounts = upsertVolumeMount(podSpec.Containers[i].VolumeMounts, mount)
+	}
+}
+
+func buildVolumeClaimTemplate(backend *cachev1alpha1.CacheBackend, dv *adapterruntime.AdapterDataVolume) corev1.PersistentVolumeClaim {
+	pvcSpec := backend.Spec.Storage.PVC
+	template := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   dv.VolumeName,
+			Labels: podTemplateLabels(backend),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: pvcSpec.Size},
+			},
+		},
+	}
+	if pvcSpec.StorageClassName != nil {
+		template.Spec.StorageClassName = pvcSpec.StorageClassName
+	}
+	return template
+}
+
 // upsertVolumeMount replaces a mount with the same Name (idempotent re-render)
 // or appends it, returning the updated slice.
 func upsertVolumeMount(mounts []corev1.VolumeMount, m corev1.VolumeMount) []corev1.VolumeMount {
@@ -1131,10 +1373,11 @@ func boundCapacity(pvc *corev1.PersistentVolumeClaim) string {
 }
 
 // reconcileInvalidStorage publishes the Ready=False/InvalidStorageConfiguration
-// terminal state for a persistent backend that asked for more than one replica,
-// WITHOUT provisioning the PVC or the workload. A single ReadWriteOnce PVC
-// cannot be mounted by multiple pods, so creating a multi-replica Deployment
-// that shares it would wedge all but one replica in ContainerCreating
+// terminal state for a persistent Deployment backend that asked for more than
+// one replica, WITHOUT provisioning the PVC or the workload. A single
+// ReadWriteOnce PVC cannot be mounted by multiple pods, so creating a
+// multi-replica Deployment that shares it would wedge all but one replica in
+// ContainerCreating
 // (multi-attach). The operator must scale to 1 or drop spec.storage.pvc; the
 // Warning event is emitted on the state transition (see emitTransitionEvents).
 //
@@ -1198,6 +1441,40 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 	return ctrl.Result{}, err
 }
 
+// reconcileImmutableStatefulSetStorage publishes a terminal drift condition
+// when a StatefulSet backend asks to add, remove, or reshape
+// volumeClaimTemplates after the StatefulSet already exists. Kubernetes does
+// not let the controller mutate those templates in place, so the safest
+// reconciliation is to leave the live workload untouched and tell the operator
+// to replace or migrate it explicitly. Because the live StatefulSet keeps
+// running, callers still reconcile HPA ownership and server-instance cascade
+// observation around this status update.
+func (r *CacheBackendReconciler) reconcileImmutableStatefulSetStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
+	err := r.patchStatus(ctx, backend, func() {
+		backend.Status.Endpoint = ""
+		backend.Status.Capacity = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             conditionReasonImmutableStatefulSetStorage,
+			Message:            immutableStatefulSetStorageMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             conditionReasonImmutableStatefulSetStorage,
+			Message:            "controller will not mutate StatefulSet volumeClaimTemplates after creation",
+			ObservedGeneration: backend.Generation,
+		})
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+	})
+	return ctrl.Result{}, err
+}
+
 // warnRetainedPVC emits a Warning ONCE when spec.storage.pvc has been removed
 // but the CR still owns a data PVC (adopt-and-keep). The PVC is intentionally
 // NOT deleted — destroying persistent storage on a spec edit is irreversible
@@ -1208,14 +1485,32 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 // every resync, so emitting unconditionally would re-fire the Warning forever.
 // We stamp the retained PVC with an annotation the first time we warn and skip
 // when it is already present, so the event fires once per orphaning rather than
-// per reconcile. applyPVC clears the annotation when the backend re-adopts the
-// PVC (spec.storage.pvc re-added), so a later removal warns again.
+// per reconcile. Each retention mode gets its own annotation so a PVC that was
+// already reported as an adopt-and-keep orphan can still later report that it
+// is retained but no longer mounted after a StatefulSet kind switch. applyPVC
+// clears these annotations when the backend re-adopts the PVC
+// (spec.storage.pvc re-added on the Deployment path), so a later removal warns
+// again.
 //
 // Fail-soft: a NotFound (the common case — no PVC was ever provisioned) or a
 // transient Get/Patch error simply emits nothing (the next reconcile retries).
 // A PVC we do not own is left entirely alone.
 func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	r.warnRetainedDataPVC(ctx, backend, eventReasonOrphanedPVCRetained,
+		"spec.storage.pvc was removed but PVC %q is retained (owner-referenced; reclaimed only when this CacheBackend is deleted). The workload reverts to ephemeral storage; delete the CacheBackend to reclaim the volume, or re-add spec.storage.pvc to mount it again.")
+}
+
+func (r *CacheBackendReconciler) warnRetainedSharedPVCForStatefulSet(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+	r.warnRetainedDataPVC(ctx, backend, eventReasonSharedPVCRetained,
+		"deploymentKind=StatefulSet uses per-replica volumeClaimTemplates; prior Deployment PVC %q is retained but no longer mounted (owner-referenced; reclaimed only when this CacheBackend is deleted, or reused if the backend switches back to deploymentKind=Deployment).")
+}
+
+func (r *CacheBackendReconciler) warnRetainedDataPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend, reason, message string) {
 	if r.Recorder == nil {
+		return
+	}
+	warnedAnnotation := retainedPVCWarningAnnotation(reason)
+	if warnedAnnotation == "" {
 		return
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -1226,8 +1521,8 @@ func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *c
 	if !metav1.IsControlledBy(pvc, backend) {
 		return
 	}
-	if pvc.Annotations[annotationStorageRetainedWarned] == "true" {
-		return // already warned for this orphaned PVC — stay quiet on resync.
+	if pvc.Annotations[warnedAnnotation] == "true" {
+		return // already warned for this reason on this PVC — stay quiet on resync.
 	}
 	// Stamp first, then emit: if the stamp write fails we skip the event and
 	// retry on the next reconcile, so a persistent Patch failure can't spam.
@@ -1235,12 +1530,11 @@ func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *c
 	if pvc.Annotations == nil {
 		pvc.Annotations = map[string]string{}
 	}
-	pvc.Annotations[annotationStorageRetainedWarned] = "true"
+	pvc.Annotations[warnedAnnotation] = "true"
 	if err := r.Patch(ctx, pvc, patch); err != nil {
 		return
 	}
-	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, eventReasonOrphanedPVCRetained, eventReasonOrphanedPVCRetained,
-		"spec.storage.pvc was removed but PVC %q is retained (owner-referenced; reclaimed only when this CacheBackend is deleted). The workload reverts to ephemeral storage; delete the CacheBackend to reclaim the volume, or re-add spec.storage.pvc to mount it again.", pvc.Name)
+	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, reason, reason, message, pvc.Name)
 }
 
 // reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
@@ -1350,24 +1644,37 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	}
 }
 
-// cleanupOwnedWorkload best-effort deletes the Deployment + Service + HPA this
-// CR owns, used when a backend is no longer a managed Deployment (type/kind
+// cleanupOwnedWorkload best-effort deletes the Deployment/StatefulSet + Service
+// + HPA this CR owns, used when a backend is no longer managed (type
 // changed). Normal CR deletion is handled by owner-reference garbage
 // collection; this covers the in-place mutation case where the CR itself
 // still exists.
 func (r *CacheBackendReconciler) cleanupOwnedWorkload(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
-
-	var dep appsv1.Deployment
-	if err := r.deleteIfOwned(ctx, key, &dep, backend); err != nil {
+	if err := r.deleteOwnedDeployment(ctx, backend); err != nil {
 		return err
 	}
+	if err := r.deleteOwnedStatefulSet(ctx, backend); err != nil {
+		return err
+	}
+	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
 	var svc corev1.Service
 	if err := r.deleteIfOwned(ctx, key, &svc, backend); err != nil {
 		return err
 	}
 	var hpa autoscalingv2.HorizontalPodAutoscaler
 	return r.deleteIfOwned(ctx, key, &hpa, backend)
+}
+
+func (r *CacheBackendReconciler) deleteOwnedDeployment(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
+	var dep appsv1.Deployment
+	return r.deleteIfOwned(ctx, key, &dep, backend)
+}
+
+func (r *CacheBackendReconciler) deleteOwnedStatefulSet(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	key := types.NamespacedName{Name: backend.Name, Namespace: backend.Namespace}
+	var sts appsv1.StatefulSet
+	return r.deleteIfOwned(ctx, key, &sts, backend)
 }
 
 // deleteIfOwned deletes obj only if it exists and is controller-owned by backend.
@@ -1384,10 +1691,11 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 	return nil
 }
 
-// updateManagedStatus derives the Ready + Progressing conditions from the Deployment and patches status only when it changes.
+// updateManagedStatus derives the Ready + Progressing conditions from the
+// managed workload and patches status only when it changes.
 //
 // applyOK is the convergence signal from reconcileManaged: when apply failed,
-// the live Deployment we read may still reflect a *prior* CR generation, so
+// the live workload we read may still reflect a *prior* CR generation, so
 // advancing Status.ObservedGeneration to the current CR generation would tell
 // clients the controller has caught up when it hasn't. The published
 // observedGeneration therefore stays at its prior value until apply succeeds
@@ -1401,9 +1709,9 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 // over-provisioned bind would otherwise be misreported. The Owns(PVC) watch
 // re-triggers this reconcile when the PVC binds so the empty→size transition is
 // observed promptly.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint, capacity string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint, capacity string, workload managedWorkloadObservation, applyOK bool) (time.Duration, error) {
 	now := time.Now()
-	readyStatus, reason, message := managedReadiness(backend, dep)
+	readyStatus, reason, message := managedReadinessForWorkload(backend, workload)
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
 	// first time the workload is Available — now. Using a latched value (not the
 	// live Deployment Available condition, which resets on a flap) keeps the
@@ -1414,8 +1722,8 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	} else if readyStatus == metav1.ConditionTrue {
 		anchor = now
 	}
-	// Layer the KV-event readiness gate on top of the Deployment-level readiness.
-	// Only the workload-Available state is gated; every other Deployment state
+	// Layer the KV-event readiness gate on top of workload-level readiness.
+	// Only the workload-Ready state is gated; every other workload state
 	// passes through unchanged.
 	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now)
 	// Layer the functional-probe gate on top of the
@@ -1519,7 +1827,7 @@ func minNonZero(a, b time.Duration) time.Duration {
 }
 
 // kvReadiness is the resolved readiness verdict after layering the KV-event
-// gate on top of the Deployment-level readiness. readyStatus/readyReason/
+// gate on top of workload-level readiness. readyStatus/readyReason/
 // readyMessage drive Conditions[Ready]; degraded* drive Conditions[Degraded];
 // requeueAfter is non-zero only inside the AwaitingFirstKVEvent window, where
 // it schedules the automatic Degraded flip once firstEventTimeout elapses
@@ -1535,7 +1843,7 @@ type kvReadiness struct {
 }
 
 // evaluateKVEventReadiness layers the KV-event readiness gate on top of the
-// Deployment-derived health. The signal it adds is whether at least one KV
+// managed workload's health. The signal it adds is whether at least one KV
 // event has been observed for this backend (status.indexParticipation.
 // lastEventAt, written by the CacheIndex poller from engine-pod reports).
 //
@@ -1543,15 +1851,15 @@ type kvReadiness struct {
 // useless to the cache plane — the inference engine may be serving HTTP while
 // its ZMQ KV-event publisher is mis-configured or crashed, so nothing flows
 // into the index and LookupRoute keeps returning NO_HINT. The managed
-// Deployment's own readiness cannot see that; the first-KV-event signal can.
+// workload's own readiness cannot see that; the first-KV-event signal can.
 //
 // State machine — the gate only refines the state once the managed
-// cache-backend Deployment is Available (managedReadiness Ready=True). Every
-// other Deployment state (rollout in progress, scaled to zero, replicas
+// cache-backend workload is serving (managedReadiness Ready=True). Every
+// other workload state (rollout in progress, scaled to zero, replicas
 // unavailable) passes through unchanged:
 //
 //	Workload Available? | event seen? | within timeout? | Ready | Degraded | reason
-//	No                  | -           | -               | (passthrough deployment readiness)
+//	No                  | -           | -               | (passthrough workload readiness)
 //	Yes                 | No          | Yes             | False | False    | AwaitingFirstKVEvent
 //	Yes                 | Yes         | -               | True  | False    | KVEventsObserved
 //	Yes                 | No          | No              | False | True     | NoKVEventsObserved
@@ -1565,16 +1873,16 @@ type kvReadiness struct {
 //
 // Timeout anchor: `anchor` is the caller-resolved start of the firstEventTimeout
 // clock — the write-once status.firstAvailableAt latch (the time the workload
-// was first observed Available). It is deliberately NOT the live Deployment's
-// Available condition LastTransitionTime, which resets on an availability flap:
+// was first observed serving). It is deliberately NOT the live workload's
+// availability transition time, which can reset on an availability flap:
 // a latched anchor keeps the elapsed window monotonic, so once a backend
 // breaches the timeout (Degraded / NoKVEventsObserved) a later flap cannot move
 // it back to AwaitingFirstKVEvent — it stays Degraded until an event arrives.
 // (Once firstKVEventObservedAt is latched the gate is satisfied regardless of
 // the anchor, since lastKVEventSeen short-circuits.)
 func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time) kvReadiness {
-	// Base verdict mirrors the Deployment-level readiness; the Degraded
-	// condition tracks the deployment-level Ready=False/ReplicasUnavailable
+	// Base verdict mirrors workload-level readiness; the Degraded
+	// condition tracks the workload-level Ready=False/ReplicasUnavailable
 	// shape so it is consistent on every path (including the opt-out and
 	// not-yet-Available paths below).
 	base := kvReadiness{
@@ -1592,7 +1900,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 		base.degradedMessage = "backend is not in a degraded state"
 	}
 
-	// Opt-out, or a Deployment that is not yet Available: nothing to gate.
+	// Opt-out, or a managed workload that is not yet serving: nothing to gate.
 	if !kvEventGateEnabled(backend) || readyStatus != metav1.ConditionTrue {
 		return base
 	}
@@ -1719,31 +2027,92 @@ const (
 	conditionReasonRolloutInProgress   = "RolloutInProgress"
 	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
 	// conditionReasonInvalidStorageConfiguration is set Ready=False when a
-	// persistent backend (spec.storage.pvc) requests more than one replica
+	// persistent Deployment backend requests more than one replica
 	// (spec.replicas > 1 or spec.autoscaling.maxReplicas > 1). A single
 	// ReadWriteOnce PVC cannot be mounted by multiple pods, so the controller
 	// refuses to provision the workload until the operator scales to 1 or drops
-	// spec.storage.pvc. Per-replica PVCs via StatefulSet volumeClaimTemplates
-	// are a separate follow-up.
+	// spec.storage.pvc. StatefulSet uses per-replica PVCs via
+	// volumeClaimTemplates instead.
 	conditionReasonInvalidStorageConfiguration = "InvalidStorageConfiguration"
+	// conditionReasonImmutableStatefulSetStorage is set Ready=False when a
+	// StatefulSet backend's desired volumeClaimTemplates no longer match the
+	// templates established at StatefulSet creation. Kubernetes treats those
+	// templates as immutable, so the controller surfaces the drift instead of
+	// applying a pod template that references uncreated or stale claims.
+	conditionReasonImmutableStatefulSetStorage = "ImmutableStatefulSetStorage"
 )
 
 // invalidStorageMessage is the Ready=False/InvalidStorageConfiguration message,
 // shared by the status condition and the Warning event so kubectl describe and
 // the event stream say the same thing.
-const invalidStorageMessage = "spec.storage.pvc requires a single replica: a ReadWriteOnce PVC cannot be multi-attached across replicas. Scale to spec.replicas=1 and spec.autoscaling.maxReplicas<=1, or remove spec.storage.pvc. Per-replica persistent storage via StatefulSet is a separate follow-up."
+const invalidStorageMessage = "spec.storage.pvc on deploymentKind=Deployment requires a single replica: a ReadWriteOnce PVC cannot be multi-attached across replicas. Scale to spec.replicas=1 and spec.autoscaling.maxReplicas<=1, remove spec.storage.pvc, or use deploymentKind=StatefulSet for per-replica PVCs."
 
-// annotationStorageRetainedWarned marks a retained (adopt-and-keep) PVC for
-// which the OrphanedPVCRetained Warning has already been emitted, so the
-// steady-state reconcile path warns once per orphaning rather than on every
-// resync. Cleared by applyPVC when the backend re-adopts the PVC.
-const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warned"
+const immutableStatefulSetStorageMessage = "StatefulSet volumeClaimTemplates are immutable after creation; create a replacement CacheBackend or migrate data deliberately to change spec.storage.pvc"
 
-// managedReadiness maps the Deployment's rollout state to the Ready
-// condition (status + reason + message). Ready=True requires the Deployment
-// to have observed its current generation and to have enough updated +
-// available replicas, so a stale rollout (e.g. mid image change) is never
-// reported Ready.
+// Retained-PVC warning annotations mark the storage-retention Warnings already
+// emitted for a retained shared PVC, so the steady-state reconcile path warns
+// once per reason rather than on every resync. Stored on the PVC rather than
+// the CacheBackend so the guard follows the retained storage object. Cleared by
+// applyPVC when the backend re-adopts the PVC on the Deployment path.
+const (
+	annotationStorageRetainedWarnedLegacy = "inferencecache.io/storage-retained-warned"
+	annotationOrphanedPVCRetainedWarned   = "inferencecache.io/orphaned-pvc-retained-warned"
+	annotationSharedPVCRetainedWarned     = "inferencecache.io/shared-pvc-retained-warned"
+)
+
+func retainedPVCWarningAnnotation(reason string) string {
+	switch reason {
+	case eventReasonOrphanedPVCRetained:
+		return annotationOrphanedPVCRetainedWarned
+	case eventReasonSharedPVCRetained:
+		return annotationSharedPVCRetainedWarned
+	default:
+		return ""
+	}
+}
+
+func clearRetainedPVCWarningAnnotations(annotations map[string]string) {
+	delete(annotations, annotationStorageRetainedWarnedLegacy)
+	delete(annotations, annotationOrphanedPVCRetainedWarned)
+	delete(annotations, annotationSharedPVCRetainedWarned)
+}
+
+type managedWorkloadObservation struct {
+	kind               string
+	generation         int64
+	observedGeneration int64
+	specReplicas       *int32
+	updatedReplicas    int32
+	servingReplicas    int32
+	servingNoun        string
+}
+
+func observationFromDeployment(dep *appsv1.Deployment) managedWorkloadObservation {
+	return managedWorkloadObservation{
+		kind:               "Deployment",
+		generation:         dep.Generation,
+		observedGeneration: dep.Status.ObservedGeneration,
+		specReplicas:       dep.Spec.Replicas,
+		updatedReplicas:    dep.Status.UpdatedReplicas,
+		servingReplicas:    dep.Status.AvailableReplicas,
+		servingNoun:        "available",
+	}
+}
+
+func observationFromStatefulSet(sts *appsv1.StatefulSet) managedWorkloadObservation {
+	return managedWorkloadObservation{
+		kind:               "StatefulSet",
+		generation:         sts.Generation,
+		observedGeneration: sts.Status.ObservedGeneration,
+		specReplicas:       sts.Spec.Replicas,
+		updatedReplicas:    sts.Status.UpdatedReplicas,
+		servingReplicas:    sts.Status.ReadyReplicas,
+		servingNoun:        "ready",
+	}
+}
+
+// managedReadiness maps a Deployment's rollout state to the Ready condition.
+// It is the Deployment-specific wrapper around managedReadinessForWorkload.
 //
 // When the CacheBackend is autoscaled the HPA owns the desired replica count,
 // so the comparison target is the live Deployment's spec.replicas (which the
@@ -1752,24 +2121,37 @@ const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warn
 // pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
 // happens to be 0 with autoscaling configured.
 func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (metav1.ConditionStatus, string, string) {
-	want := desiredReplicas(backend, dep)
+	return managedReadinessForWorkload(backend, observationFromDeployment(dep))
+}
+
+// managedReadinessForWorkload maps a managed workload rollout observation to
+// the Ready condition (status + reason + message). Ready=True requires the
+// workload controller to have observed its current generation and to have
+// enough updated + serving replicas (available for Deployments, ready for
+// StatefulSets), so a stale rollout is never reported Ready.
+func managedReadinessForWorkload(backend *cachev1alpha1.CacheBackend, workload managedWorkloadObservation) (metav1.ConditionStatus, string, string) {
+	want := desiredReplicasFromSpec(backend, workload.specReplicas)
 
 	// A backend scaled to zero is not serving; never report it Ready.
 	if want == 0 {
 		return metav1.ConditionFalse, conditionReasonScaledToZero, "backend scaled to zero replicas"
 	}
 
-	rolledOut := dep.Status.ObservedGeneration >= dep.Generation
+	noun := workload.servingNoun
+	if noun == "" {
+		noun = "available"
+	}
+	rolledOut := workload.observedGeneration >= workload.generation
 	switch {
-	case rolledOut && dep.Status.UpdatedReplicas >= want && dep.Status.AvailableReplicas >= want:
+	case rolledOut && workload.updatedReplicas >= want && workload.servingReplicas >= want:
 		return metav1.ConditionTrue, conditionReasonBackendReady,
-			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
-	case !rolledOut || dep.Status.UpdatedReplicas < want:
+			fmt.Sprintf("%d/%d replicas %s", workload.servingReplicas, want, noun)
+	case !rolledOut || workload.updatedReplicas < want:
 		return metav1.ConditionFalse, conditionReasonRolloutInProgress,
-			fmt.Sprintf("%d/%d replicas updated", dep.Status.UpdatedReplicas, want)
+			fmt.Sprintf("%d/%d replicas updated", workload.updatedReplicas, want)
 	default:
 		return metav1.ConditionFalse, conditionReasonReplicasUnavailable,
-			fmt.Sprintf("%d/%d replicas available", dep.Status.AvailableReplicas, want)
+			fmt.Sprintf("%d/%d replicas %s", workload.servingReplicas, want, noun)
 	}
 }
 
@@ -1795,17 +2177,21 @@ func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message st
 	}
 }
 
-// desiredReplicas is the per-reconcile source of truth for "how many replicas
-// should this backend be running". With autoscaling enabled the HPA writes
-// spec.replicas on the Deployment, so the live value is authoritative; without
-// it, the user's spec.replicas (default 1) wins.
+// desiredReplicas is the Deployment-specific compatibility wrapper for tests
+// and older helpers. With autoscaling enabled the HPA writes spec.replicas on
+// the workload, so the live value is authoritative; without it, the user's
+// spec.replicas (default 1) wins.
 func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	return desiredReplicasFromSpec(backend, dep.Spec.Replicas)
+}
+
+func desiredReplicasFromSpec(backend *cachev1alpha1.CacheBackend, specReplicas *int32) int32 {
 	if backend.Spec.Autoscaling != nil {
 		// First reconcile after an HPA spec is added may briefly see
-		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
+		// specReplicas still set by the controller; the HPA will overwrite
 		// it within one cycle. Until then, fall back to the controller value.
-		if dep.Spec.Replicas != nil {
-			return *dep.Spec.Replicas
+		if specReplicas != nil {
+			return *specReplicas
 		}
 		// Fall through to the floor.
 	}
@@ -1815,7 +2201,7 @@ func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment
 	return 1
 }
 
-// initialReplicas picks the Deployment's initial replica count. With
+// initialReplicas picks the managed workload's initial replica count. With
 // autoscaling configured, spec.autoscaling.minReplicas is the source of truth
 // (defaulting to 1 when unset), so the workload comes up at or above the HPA
 // floor on first apply instead of starting at 1 and waiting for the HPA to
@@ -1833,16 +2219,41 @@ func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
 	return 1
 }
 
+type managedWorkloadRef struct {
+	name      string
+	namespace string
+	kind      string
+	labels    map[string]string
+}
+
+func workloadRefFromDeployment(dep *appsv1.Deployment) managedWorkloadRef {
+	return managedWorkloadRef{
+		name:      dep.Name,
+		namespace: dep.Namespace,
+		kind:      "Deployment",
+		labels:    dep.Labels,
+	}
+}
+
+func workloadRefFromStatefulSet(sts *appsv1.StatefulSet) managedWorkloadRef {
+	return managedWorkloadRef{
+		name:      sts.Name,
+		namespace: sts.Namespace,
+		kind:      "StatefulSet",
+		labels:    sts.Labels,
+	}
+}
+
 // reconcileHPA creates, updates, or deletes the HorizontalPodAutoscaler that
-// drives the backend Deployment's replica count. The HPA exists iff
+// drives the managed workload's replica count. The HPA exists iff
 // spec.autoscaling is set; otherwise any controller-owned HPA is removed.
-func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) error {
+func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, workload managedWorkloadRef) error {
 	if backend.Spec.Autoscaling == nil {
 		// Autoscaling disabled — clean up any HPA we previously owned.
-		return r.deleteOwnedHPA(ctx, backend, deployment.Name)
+		return r.deleteOwnedHPA(ctx, backend, workload.name)
 	}
 
-	desired := buildHPA(backend, deployment)
+	desired := buildHPA(backend, workload)
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
 		hpa.Labels = desired.Labels
@@ -1856,9 +2267,9 @@ func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cach
 }
 
 // buildHPA renders the desired HorizontalPodAutoscaler for a CacheBackend whose
-// spec.autoscaling is set. Targets the managed Deployment by name. Phase 1 ships
+// spec.autoscaling is set. Targets the managed workload by name. Phase 1 ships
 // a CPU-utilization target; cache-aware (custom-metric) HPAs come later.
-func buildHPA(backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) *autoscalingv2.HorizontalPodAutoscaler {
+func buildHPA(backend *cachev1alpha1.CacheBackend, workload managedWorkloadRef) *autoscalingv2.HorizontalPodAutoscaler {
 	spec := backend.Spec.Autoscaling
 	minReplicas := defaultHPAMinReplicas
 	if spec.MinReplicas != nil {
@@ -1870,15 +2281,15 @@ func buildHPA(backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment
 	}
 	return &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deployment.Name,
-			Namespace: deployment.Namespace,
-			Labels:    deployment.Labels,
+			Name:      workload.name,
+			Namespace: workload.namespace,
+			Labels:    workload.labels,
 		},
 		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
 			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
 				APIVersion: "apps/v1",
-				Kind:       "Deployment",
-				Name:       deployment.Name,
+				Kind:       workload.kind,
+				Name:       workload.name,
 			},
 			MinReplicas: &minReplicas,
 			MaxReplicas: spec.MaxReplicas,
@@ -2233,6 +2644,7 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// AwaitingFirstKVEvent -> Ready transition.
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		// Owns(PVC) so a PVC binding (status.capacity goes from empty to the

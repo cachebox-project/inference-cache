@@ -25,7 +25,7 @@ import (
 //
 // Composition order on a managed CacheBackend's Reconcile:
 //
-//	managedReadiness     → Deployment-level ready/progressing
+//	managedReadiness     → workload-level ready/progressing
 //	    ↓
 //	evaluateKVEventReadiness → first-event readiness gate layered on top
 //	    ↓

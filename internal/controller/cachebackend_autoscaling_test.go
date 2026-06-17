@@ -63,6 +63,21 @@ func TestReconcileHPACreated(t *testing.T) {
 	}
 }
 
+func TestReconcileHPAStatefulSetTarget(t *testing.T) {
+	scheme := newScheme(t)
+	cb := autoscalingBackend("cache", "ns1", 2, 5, ptrInt32(60))
+	cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	getStatefulSet(t, r, "cache", "ns1")
+	hpa := getHPA(t, r, "cache", "ns1")
+	if hpa.Spec.ScaleTargetRef.Kind != "StatefulSet" || hpa.Spec.ScaleTargetRef.Name != "cache" {
+		t.Fatalf("HPA target = %+v, want StatefulSet/cache", hpa.Spec.ScaleTargetRef)
+	}
+}
+
 func TestReconcileHPADefaults(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
