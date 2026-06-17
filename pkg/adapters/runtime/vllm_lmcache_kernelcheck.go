@@ -47,22 +47,51 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 		return nil, nil
 	}
 
-	var env []corev1.EnvVar
-	if mode == KernelCheckModeStrict {
-		env = []corev1.EnvVar{{Name: EnvKernelCheckStrict, Value: "1"}}
+	strict := mode == KernelCheckModeStrict
+
+	// Copy the engine's env so the check loads c_ops in the engine's actual
+	// environment (an operator-set PYTHONPATH / LD_LIBRARY_PATH that c_ops
+	// needs to dlopen would otherwise be absent and false-fail the check).
+	env := append([]corev1.EnvVar(nil), engine.Env...)
+	if strict {
+		env = append(env, corev1.EnvVar{Name: EnvKernelCheckStrict, Value: "1"})
 	}
+
+	// Command form is mode-dependent so report-only is TRULY fail-open at the
+	// POD level, not just within the script. A bare `python3 -c` exits non-zero
+	// on interpreter-not-found (127) or an OOM/SIGKILL during `import torch`
+	// (137) — OUTSIDE the script's report-only exit-0 path — which Kubernetes
+	// retries and which would block the engine pod, breaking the "cache is
+	// never a serving dependency" contract. report-only therefore wraps the
+	// interpreter in a shell that always exits 0 (the script still writes its
+	// OK/FAIL termination message first, so the reconciler still sees the
+	// result). Strict runs python3 directly so a real failure — including the
+	// check being unable to run at all — propagates and holds the pod, which
+	// is the point of opting into strict.
+	command := []string{"python3", "-c", kernelCheckScript}
+	if !strict {
+		command = []string{"/bin/sh", "-c", `python3 -c "$0"; exit 0`, kernelCheckScript}
+	}
+
 	return &corev1.Container{
 		Name:  LMCacheKernelCheckContainerName,
 		Image: engine.Image,
-		// Copy (don't hard-code) the engine's pull policy + security context so
-		// the check runs in the engine's exact image and security posture: a
+		// Copy (don't hard-code) the engine's pull policy, security context,
+		// env, env-from, mounts, and working dir so the check runs in the
+		// engine's exact image, security posture, and load environment: a
 		// mutable tag with ImagePullPolicy=Always must not let the check run a
-		// stale cached image, and a restricted-PSA-compliant engine pod must
-		// stay admissible after the init container is appended.
+		// stale cached image; a restricted-PSA-compliant engine pod must stay
+		// admissible after the init container is appended; and an engine that
+		// depends on operator-supplied env/mounts to load c_ops must not be
+		// false-failed by a stripped-down checker.
 		ImagePullPolicy:          engine.ImagePullPolicy,
 		SecurityContext:          engine.SecurityContext.DeepCopy(),
-		Command:                  []string{"python3", "-c", kernelCheckScript},
+		WorkingDir:               engine.WorkingDir,
+		Command:                  command,
 		Env:                      env,
+		EnvFrom:                  append([]corev1.EnvFromSource(nil), engine.EnvFrom...),
+		VolumeMounts:             append([]corev1.VolumeMount(nil), engine.VolumeMounts...),
+		VolumeDevices:            append([]corev1.VolumeDevice(nil), engine.VolumeDevices...),
 		Resources:                kernelCheckResources(),
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,

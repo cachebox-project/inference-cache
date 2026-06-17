@@ -67,11 +67,21 @@ type kernelHealthVerdict struct {
 // passes the result in. The gate is inactive (removeCondition / no-op) when no
 // matched pod carries a kernel-check container (CPU backends, annotation=off,
 // no engineSelector).
+//
+// listedOK reports whether the pod list actually succeeded. When it is false
+// the caller couldn't observe the matched pods (a transient API/RBAC error),
+// so the verdict is a strict no-op: a list failure must not be read as "no
+// kernel-check pods" and clear a known EngineKernelsHealthy=False — that would
+// hide the last-known kernel failure behind a transient blip.
 func evaluateEngineKernelHealth(
 	backend *cachev1alpha1.CacheBackend,
 	upstream kvReadiness,
 	pods []corev1.Pod,
+	listedOK bool,
 ) kernelHealthVerdict {
+	if !listedOK {
+		return kernelHealthVerdict{}
+	}
 	cond, active := aggregateKernelHealth(backend, pods)
 	if !active {
 		if meta.FindStatusCondition(backend.Status.Conditions, conditionTypeEngineKernelsHealthy) != nil {
@@ -170,12 +180,15 @@ func findKernelCheckStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 
 // listMatchedEnginePods lists pods in the backend's namespace matching its
 // engineSelector via the uncached reader (same read posture as
-// refreshMatchedEnginePods — no Pod informer). Returns nil on no-selector or
-// list error (fail-soft).
-func listMatchedEnginePods(ctx context.Context, reader client.Reader, backend *cachev1alpha1.CacheBackend) []corev1.Pod {
+// refreshMatchedEnginePods — no Pod informer). The bool reports whether the
+// observation succeeded: a no-selector backend returns (nil, true) — there are
+// legitimately no engine pods — but a transient List error returns (nil,
+// false) so the caller can distinguish "no pods" from "couldn't look" and
+// avoid clearing a known condition on a blip.
+func listMatchedEnginePods(ctx context.Context, reader client.Reader, backend *cachev1alpha1.CacheBackend) ([]corev1.Pod, bool) {
 	sel := backend.Spec.EngineSelector
 	if sel == nil || len(sel.MatchLabels) == 0 || reader == nil {
-		return nil
+		return nil, true
 	}
 	var pods corev1.PodList
 	if err := reader.List(ctx, &pods,
@@ -184,9 +197,9 @@ func listMatchedEnginePods(ctx context.Context, reader client.Reader, backend *c
 	); err != nil {
 		log.FromContext(ctx).V(1).Info("kernel-health: pod list failed (fail-soft)",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return nil
+		return nil, false
 	}
-	return pods.Items
+	return pods.Items, true
 }
 
 // downgradeKernelReadyVerdict applies a strict-mode kernel downgrade to the

@@ -511,6 +511,10 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// External-mode CR doesn't surface a stale condition that no
 		// reconcile path will ever update.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// Same for EngineKernelsHealthy — it is published only from the managed
+		// path, so clear any left over from a prior managed state (the docs
+		// state External backends publish only Ready + Progressing).
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 	})
 }
 
@@ -546,6 +550,9 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// EngineKernelsHealthy is a managed-path-only condition; clear any left
+		// over so an unmanaged CR doesn't carry a stale kernel verdict.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 	})
 }
 
@@ -1194,6 +1201,10 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 		// Not a transient/recoverable workload fault; the Degraded condition
 		// (rollout/replica health) does not apply to an unprovisioned workload.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		// The kernel gate runs only in updateManagedStatus, which this
+		// invalid-storage early-return bypasses; clear EngineKernelsHealthy so a
+		// backend that flipped into this gate doesn't keep a stale verdict.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 	})
 	return ctrl.Result{}, err
 }
@@ -1436,7 +1447,8 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	if kernelReader == nil {
 		kernelReader = r.Client
 	}
-	kernelVerdict := evaluateEngineKernelHealth(backend, gate, listMatchedEnginePods(ctx, kernelReader, backend))
+	kernelPods, kernelListedOK := listMatchedEnginePods(ctx, kernelReader, backend)
+	kernelVerdict := evaluateEngineKernelHealth(backend, gate, kernelPods, kernelListedOK)
 	gate = downgradeKernelReadyVerdict(gate, kernelVerdict)
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration

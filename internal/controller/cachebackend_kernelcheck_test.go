@@ -74,7 +74,7 @@ func TestEvaluateEngineKernelHealthStrictDowngradesReady(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
 		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
 	up := kvReadiness{readyStatus: metav1.ConditionTrue, readyReason: "KVEventsObserved"}
-	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))})
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
 	if !v.downgradeReady || v.readyReason != reasonEngineKernelDegraded {
 		t.Fatalf("strict mismatch must downgrade Ready with EngineKernelDegraded; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
 	}
@@ -87,7 +87,7 @@ func TestEvaluateEngineKernelHealthStrictDowngradesReady(t *testing.T) {
 func TestEvaluateEngineKernelHealthReportOnlyDoesNotDowngrade(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}} // no strict annotation
 	up := kvReadiness{readyStatus: metav1.ConditionTrue}
-	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13"))})
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13"))}, true)
 	if v.downgradeReady {
 		t.Error("report-only (default) must NOT downgrade Ready")
 	}
@@ -99,8 +99,25 @@ func TestEvaluateEngineKernelHealthReportOnlyDoesNotDowngrade(t *testing.T) {
 func TestEvaluateEngineKernelHealthInactiveRemovesStaleCondition(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
 	setStaleKernelCondition(cb) // sets a stale EngineKernelsHealthy condition; see helper below
-	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, []corev1.Pod{{Status: corev1.PodStatus{}}})
+	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, []corev1.Pod{{Status: corev1.PodStatus{}}}, true)
 	if !v.removeCondition {
 		t.Error("inactive gate with an existing condition must request removeCondition")
+	}
+}
+
+func TestEvaluateEngineKernelHealthListErrorPreservesCondition(t *testing.T) {
+	// A transient pod-list failure (listedOK=false) must NOT be read as
+	// "no kernel-check pods" and clear a known EngineKernelsHealthy=False.
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
+	setStaleKernelCondition(cb)
+	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, nil, false)
+	if v.removeCondition {
+		t.Error("a list error must NOT remove the existing condition")
+	}
+	if v.shouldWriteCondition {
+		t.Error("a list error must NOT write a new condition")
+	}
+	if v.downgradeReady {
+		t.Error("a list error must NOT change Ready")
 	}
 }
