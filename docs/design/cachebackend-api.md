@@ -142,6 +142,53 @@ Because of this:
 - **Pin both sides.** When an operator overrides `serverImage`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest on `serverImage`.
 - IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus the pinned default; runtime detection / a tier-2 health signal is a separate follow-up.
 
+### LMCache client kernels ↔ engine-image CUDA / vLLM alignment
+
+The lmcache **client** compiled into the engine image ships native CUDA
+kernels (`lmcache.c_ops`). They must match the engine image's CUDA runtime. A
+mismatch — e.g. a `pip install lmcache` that pulls a CUDA-13-built wheel onto a
+CUDA-12.9 image — fails to load (`Failed to import backend lmcache.c_ops:
+libcudart.so.13`) and lmcache **silently falls back** to a single-stream torch
+path that does not parallelize. T2 reload still works in isolation but
+serializes under concurrency (measured ~10× slower), and the failure surfaces
+only as a log WARNING. This is the same silent-degradation class as the
+wire-protocol skew above, in its **local-kernel** variant.
+
+Because `import lmcache.c_ops` is overridden to a fallback shim on load failure
+(so it always succeeds and cannot be used as a health check), the control plane
+detects this at **deploy time** with an injected `lmcache-kernel-check` init
+container that force-loads the native extension from disk in the engine's own
+image. It reports onto the CacheBackend `EngineKernelsHealthy` condition (see
+[Conditions](#conditions)) and is configured per-CacheBackend via the
+`inferencecache.io/lmcache-kernel-check` annotation:
+
+| Annotation value | Behavior |
+|---|---|
+| `auto` (default / unset) | Inject in report-only mode **only** when the engine container requests a GPU (the kernels are GPU-only; a CPU build legitimately has none). |
+| `report-only` | Always inject; the check never blocks the engine pod (fail-open). The condition surfaces the result. |
+| `strict` | Always inject; on failure the engine pod stays in `Init` and never serves (fail-closed), and the managed CacheBackend `Ready` is downgraded with reason `EngineKernelDegraded`. |
+| `off` | Never inject. |
+
+**Boundaries (what the check does and does not prove):**
+
+- `EngineKernelsHealthy=True` means the native kernels **loaded** — it does
+  **not** mean T2 reload is fast under concurrency. The reload-serialization
+  symptom is validated separately by a real-GPU concurrency canary.
+- The check proves **load-time** linkage (it catches a missing/mismatched
+  `libcudart`). It does **not** prove **runtime executability**: a `libcudart`
+  present but paired with a too-old driver loads cleanly and fails only at
+  kernel launch. That residual is caught only at runtime.
+- **Strict-mode GPU cost:** a pod stuck in `Init` (failing the check in strict
+  mode) still holds its `nvidia.com/gpu` reservation while serving nothing.
+  Reclaim it by fixing the engine image's lmcache/CUDA alignment or switching
+  the annotation to `report-only`.
+- The check runs `import torch` (the native extension links libtorch), adding a
+  few seconds to GPU engine-pod startup. The engine imports torch anyway.
+
+`EngineKernelsHealthy` complements `FunctionalProbeOK` (which round-trips the
+server-side cache path): the kernel check catches the engine-side load cause
+that the round-trip probe cannot see.
+
 ### Persistent storage
 
 Setting `spec.storage.pvc` on a **managed Deployment backend** (`deploymentKind: Deployment`, the default) makes the controller provision a `PersistentVolumeClaim` and mount it into the cache-server pod. (A `StatefulSet` backend is routed to the unmanaged path today — see [`deploymentKind`](#spec) — so it provisions nothing, storage included; per-replica PVCs via `volumeClaimTemplates` are a follow-up. An `External` backend is operator-managed and provisions no workload at all, so `spec.storage.pvc` is a no-op there — persistence is configured on the pre-existing cache directly.) The seam is the runtime adapter: `ResolveCacheServer` returns a `ResolvedCacheServer` whose `DataVolume` declares the volume name + in-container mount path where the backend keeps persistent data (the adapter is the only layer that knows where its data lives). The controller, seeing the adapter wants persistent data *and* `spec.storage.pvc` set, provisions the PVC and merges the volume + mount into the rendered pod. Future backends (SGLang HiCache, Mooncake) plug in by declaring a different `DataVolume` — the controller stays generic.
@@ -173,7 +220,7 @@ Behavior:
 
 ### Conditions
 
-Four condition types are published on managed backends (`Ready`, `Degraded`, `Progressing`, `FunctionalProbeOK`); External backends publish `Ready` + `Progressing` only (there is no rollout to degrade and no probe to drive). The semantics differ for managed backends (where the controller renders a Deployment + Service) and for External (where the operator manages the cache out-of-band and the controller only mirrors the endpoint).
+Five condition types are published on managed backends (`Ready`, `Degraded`, `Progressing`, `FunctionalProbeOK`, `EngineKernelsHealthy`); External backends publish `Ready` + `Progressing` only (there is no rollout to degrade and no probe to drive). The semantics differ for managed backends (where the controller renders a Deployment + Service) and for External (where the operator manages the cache out-of-band and the controller only mirrors the endpoint).
 
 **Managed backends**:
 
@@ -183,6 +230,7 @@ Four condition types are published on managed backends (`Ready`, `Degraded`, `Pr
 | `Degraded` | True when the backend is in a terminal unhealthy state: rolled out but replicas unavailable (reason `ReplicasUnavailable`), or the managed workload is Available but no KV event observed within `firstEventTimeout` (reason `NoKVEventsObserved`). False (`NotDegraded`) otherwise. The functional-probe gate does NOT participate in `Degraded` — a probe failure is reflected only in `Ready` and `FunctionalProbeOK`, leaving `Degraded` reserved for managed-Deployment health (so an operator can tell "the probe says the cache plane is broken" apart from "the workload itself is in a terminal state"). |
 | `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply, awaiting first KV event). False once converged (`Synced`), stuck (`Degraded`), or scaled to zero (`ScaledToZero`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded" (or scaled to zero). |
 | `FunctionalProbeOK` | The most recent functional-probe outcome. `True/ProbeOK` when every enabled stage (ingest, routing, and — for LMCache — tier-2 put/get) round-tripped; `True/ProbeBypassed` when the operator opted this CR out via the `inferencecache.io/skip-functional-probe: "true"` annotation; `False/ProbeIngestFailed`, `False/ProbeRoutingFailed`, or `False/ProbeT2Failed` when the named stage failed, with the server's diagnostic in `.message`; `Unknown/ProbeError` when the controller could not reach the server's `/probe` endpoint at all (transport error, 5xx) AND no prior stage failure existed. **Sticky-False**: an HTTP error while a `False/Probe*Failed` is already published preserves the prior failure and keeps `Ready` downgraded, so a transient server outage cannot fade a known per-stage failure back to `Unknown` and then to `Ready=True`. See [functional-probe gate](#functional-probe-gate). |
+| `EngineKernelsHealthy` | Engine-side native CUDA-kernel (lmcache `c_ops`) load health, read from the `lmcache-kernel-check` init container on matched engine pods. `True/KernelsHealthy` when the native kernels loaded on every reporting pod; `False/CUDAKernelMismatch` when one or more failed to load (e.g. `libcudart` mismatch) — in `strict` mode this also downgrades `Ready` (reason `EngineKernelDegraded`); `Unknown/KernelCheckError` when a check terminated without a recognized result; `Unknown/KernelCheckPending` while a check is still running. Absent when no matched engine pod runs the check (CPU backends, annotation `off`). Default mode is fail-open observability — it does NOT gate `Ready` unless `strict`. See [client kernels ↔ image CUDA alignment](#lmcache-client-kernels--engine-image-cuda--vllm-alignment). |
 
 When the desired replica count is owned by an HPA (`spec.autoscaling` set) the controller compares the Ready condition against the HPA-written Deployment `spec.replicas` rather than the user-set `spec.replicas`.
 
