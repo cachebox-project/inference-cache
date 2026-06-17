@@ -160,8 +160,8 @@
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
 #  15. The LMCache kernel-check injection shape is correct end-to-end: a
-#      GPU-requesting engine pod labeled with the sample's engineSelector
-#      labels (app=qwen-demo) is admitted and carries a
+#      GPU-requesting engine pod (labeled app=kc-inject-engine, bound to a
+#      dedicated LMCache CacheBackend) is admitted and carries a
 #      lmcache-kernel-check init container whose image EQUALS the engine
 #      container's image (the adapter reuses it so no extra image pull
 #      occurs). Exercises the mutating pod webhook's auto mode (inject
