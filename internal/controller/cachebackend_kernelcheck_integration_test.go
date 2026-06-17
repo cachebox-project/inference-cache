@@ -24,11 +24,11 @@ import (
 // findCondition.
 //
 // Two scenarios:
-//  1. Report-only FAIL — EngineKernelsHealthy=False/CUDAKernelMismatch is
+//  1. Report-only FAIL — EngineKernelsHealthy=False/KernelLoadFailed is
 //     written, but Ready stays True (fail-open; the kernel gate never downgrades
 //     Ready unless the annotation is "strict").
 //  2. Strict FAIL — Ready is downgraded to False/EngineKernelDegraded alongside
-//     EngineKernelsHealthy=False/CUDAKernelMismatch.
+//     EngineKernelsHealthy=False/KernelLoadFailed.
 func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)
@@ -121,7 +121,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 
 		got := getBackend(t, r, "cache", ns)
 
-		// EngineKernelsHealthy=False/CUDAKernelMismatch must be written.
+		// EngineKernelsHealthy=False/KernelLoadFailed must be written.
 		kc := findCondition(got.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		if kc == nil {
 			t.Fatalf("EngineKernelsHealthy condition missing; conditions = %+v", got.Status.Conditions)
@@ -129,8 +129,8 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		if kc.Status != metav1.ConditionFalse {
 			t.Errorf("EngineKernelsHealthy.Status = %q, want False", kc.Status)
 		}
-		if kc.Reason != reasonCUDAKernelMismatch {
-			t.Errorf("EngineKernelsHealthy.Reason = %q, want %q", kc.Reason, reasonCUDAKernelMismatch)
+		if kc.Reason != reasonKernelLoadFailed {
+			t.Errorf("EngineKernelsHealthy.Reason = %q, want %q", kc.Reason, reasonKernelLoadFailed)
 		}
 
 		// Ready must STAY True — report-only never downgrades.
@@ -170,7 +170,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 
 		got := getBackend(t, r, "cache", ns)
 
-		// EngineKernelsHealthy=False/CUDAKernelMismatch.
+		// EngineKernelsHealthy=False/KernelLoadFailed.
 		kc := findCondition(got.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		if kc == nil {
 			t.Fatalf("EngineKernelsHealthy condition missing; conditions = %+v", got.Status.Conditions)
@@ -178,8 +178,8 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		if kc.Status != metav1.ConditionFalse {
 			t.Errorf("EngineKernelsHealthy.Status = %q, want False", kc.Status)
 		}
-		if kc.Reason != reasonCUDAKernelMismatch {
-			t.Errorf("EngineKernelsHealthy.Reason = %q, want %q", kc.Reason, reasonCUDAKernelMismatch)
+		if kc.Reason != reasonKernelLoadFailed {
+			t.Errorf("EngineKernelsHealthy.Reason = %q, want %q", kc.Reason, reasonKernelLoadFailed)
 		}
 
 		// Ready must be downgraded to False with EngineKernelDegraded.

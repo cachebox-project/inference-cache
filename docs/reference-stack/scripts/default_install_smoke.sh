@@ -173,7 +173,7 @@
 #      not importable" to /dev/termination-log. The main container starts
 #      normally (pod Ready), proving report-only did not block the engine.
 #      The C2 reconciler reads the termination message and publishes
-#      EngineKernelsHealthy=False / reason=CUDAKernelMismatch on the
+#      EngineKernelsHealthy=False / reason=KernelLoadFailed on the
 #      CacheBackend status.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
@@ -2543,7 +2543,7 @@ log "lmcache-kernel-check init container injected; image=$kc_init_image (matches
 
 # --- kernel-check report-only FAIL condition path (assertion 16) -----------
 # Block 2: prove the report-only FAIL path is fail-open and surfaces
-# EngineKernelsHealthy=False/CUDAKernelMismatch. A dedicated managed LMCache
+# EngineKernelsHealthy=False/KernelLoadFailed. A dedicated managed LMCache
 # CacheBackend (kc-cond) is annotated report-only. The matching engine pod
 # uses python:3.11-slim: the init container runs the kernel-check script, which
 # calls find_spec("lmcache") → None → emits "FAIL: lmcache not importable" to
@@ -2551,14 +2551,14 @@ log "lmcache-kernel-check init container injected; image=$kc_init_image (matches
 # starts normally, so the pod reaches Ready — proving fail-open semantics.
 # The C2 reconciler reads the termination message from
 # status.initContainerStatuses and publishes EngineKernelsHealthy=False /
-# reason=CUDAKernelMismatch on the CacheBackend.
+# reason=KernelLoadFailed on the CacheBackend.
 #
 # python:3.11-slim was chosen deliberately: it has python3 (so the init container
 # runs successfully, producing our FAIL: message) but does NOT have lmcache
 # installed (find_spec returns None → the FAIL: branch fires). Using a non-python
 # image (e.g. pause) would produce a 127 exit / KernelCheckError, not
-# CUDAKernelMismatch, which would break the condition assertion.
-log "asserting report-only FAIL path: EngineKernelsHealthy=False/CUDAKernelMismatch (assertion 16)"
+# KernelLoadFailed, which would break the condition assertion.
+log "asserting report-only FAIL path: EngineKernelsHealthy=False/KernelLoadFailed (assertion 16)"
 KC_COND_CB="kc-cond"
 KC_COND_ENGINE_POD="kc-cond-engine"
 kubectl apply -f - >/dev/null <<EOF
@@ -2649,11 +2649,11 @@ fi
 
 kc_cond_reason="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" \
   -o jsonpath='{.status.conditions[?(@.type=="EngineKernelsHealthy")].reason}' 2>/dev/null || true)"
-if [ "$kc_cond_reason" != "CUDAKernelMismatch" ]; then
+if [ "$kc_cond_reason" != "KernelLoadFailed" ]; then
   kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" -o yaml || true
-  fail "EngineKernelsHealthy reason=$kc_cond_reason on $KC_COND_CB; want CUDAKernelMismatch (FAIL: termination message must map to this reason)"
+  fail "EngineKernelsHealthy reason=$kc_cond_reason on $KC_COND_CB; want KernelLoadFailed (FAIL: termination message must map to this reason)"
 fi
-log "EngineKernelsHealthy=False/CUDAKernelMismatch on $KC_COND_CB — report-only FAIL path wired end-to-end"
+log "EngineKernelsHealthy=False/KernelLoadFailed on $KC_COND_CB — report-only FAIL path wired end-to-end"
 
 # Cleanup: drop the kernel-check smoke namespace.
 kubectl delete namespace "$KERNEL_CHECK_SMOKE_NS" \
@@ -2780,4 +2780,4 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/CUDAKernelMismatch), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), and every config/samples/ manifest applies cleanly — all work"

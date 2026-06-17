@@ -33,8 +33,14 @@ import (
 const (
 	conditionTypeEngineKernelsHealthy = "EngineKernelsHealthy"
 
-	reasonKernelsHealthy     = "KernelsHealthy"
-	reasonCUDAKernelMismatch = "CUDAKernelMismatch"
+	reasonKernelsHealthy = "KernelsHealthy"
+	// reasonKernelLoadFailed covers every way the native lmcache c_ops
+	// kernels did not load: a libcudart/CUDA-runtime mismatch (the root
+	// cause), a CPU/pure-python build with no compiled extension, or lmcache
+	// not being importable at all. The specific cause is carried verbatim in
+	// the condition .message (the detector's FAIL: line) — the reason stays
+	// generic so it never over-claims a CUDA mismatch for a packaging error.
+	reasonKernelLoadFailed   = "KernelLoadFailed"
 	reasonKernelCheckError   = "KernelCheckError"
 	reasonKernelCheckPending = "KernelCheckPending"
 
@@ -137,7 +143,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 	}
 	switch {
 	case nFail > 0:
-		return mk(metav1.ConditionFalse, reasonCUDAKernelMismatch,
+		return mk(metav1.ConditionFalse, reasonKernelLoadFailed,
 			fmt.Sprintf("native lmcache c_ops kernels failed to load on %d engine pod(s): %s", nFail, failMsg)), true
 	case nErr > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckError,

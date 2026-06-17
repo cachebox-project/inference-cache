@@ -22,7 +22,7 @@ func termed(code int32, msg string) corev1.ContainerState {
 	return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Message: msg}}
 }
 
-func meta_SetStale(cb *cachev1alpha1.CacheBackend) {
+func setStaleKernelCondition(cb *cachev1alpha1.CacheBackend) {
 	meta.SetStatusCondition(&cb.Status.Conditions, metav1.Condition{
 		Type: conditionTypeEngineKernelsHealthy, Status: metav1.ConditionTrue, Reason: reasonKernelsHealthy,
 	})
@@ -41,12 +41,12 @@ func TestAggregateKernelHealth(t *testing.T) {
 		{"one fail", []corev1.Pod{
 			podWithKernelStatus(termed(0, "OK")),
 			podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13")),
-		}, metav1.ConditionFalse, reasonCUDAKernelMismatch, true},
+		}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
 		{"strict crashloop fail via lastState", []corev1.Pod{{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
 			Name:                 adapterruntime.LMCacheKernelCheckContainerName,
 			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
 			LastTerminationState: termed(1, "FAIL: ImportError: libcudart.so.13"),
-		}}}}}, metav1.ConditionFalse, reasonCUDAKernelMismatch, true},
+		}}}}}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
 		{"garbage message is error not mismatch", []corev1.Pod{podWithKernelStatus(termed(127, ""))}, metav1.ConditionUnknown, reasonKernelCheckError, true},
 		{"pending", []corev1.Pod{podWithKernelStatus(corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
 		{"no kernel-check container => inactive", []corev1.Pod{{Status: corev1.PodStatus{}}}, "", "", false},
@@ -98,7 +98,7 @@ func TestEvaluateEngineKernelHealthReportOnlyDoesNotDowngrade(t *testing.T) {
 
 func TestEvaluateEngineKernelHealthInactiveRemovesStaleCondition(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
-	meta_SetStale(cb) // sets a stale EngineKernelsHealthy condition; see helper below
+	setStaleKernelCondition(cb) // sets a stale EngineKernelsHealthy condition; see helper below
 	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, []corev1.Pod{{Status: corev1.PodStatus{}}})
 	if !v.removeCondition {
 		t.Error("inactive gate with an existing condition must request removeCondition")
