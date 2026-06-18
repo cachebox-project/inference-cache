@@ -194,10 +194,10 @@ on a live backend takes effect as its pods roll.
   few seconds to GPU engine-pod startup. The engine imports torch anyway.
 - **Report-only fail-open is best-effort.** The init container runs the engine
   image's own `python3`; in report-only mode the detector always exits 0, so a
-  `c_ops` failure never blocks the pod. It sets no CPU/memory *limits* (so it
-  can't trip a namespace `LimitRange` the engine itself satisfies) and only
-  modest requests that are subsumed by the engine's, so it never enlarges the
-  pod's scheduling/quota footprint. The only residual ways it could block are
+  `c_ops` failure never blocks the pod. It sets no CPU/memory *requests or
+  limits*, so it can't trip a namespace `LimitRange` the engine itself satisfies
+  and never enlarges the pod's scheduling/quota footprint. The only residual
+  ways it could block are
   `python3` failing to start at all (which means the Python engine is itself
   broken — not a false outage caused by this check) or an OOM during `import
   torch` (with no memory limit set, the import is bounded only by the pod/node,

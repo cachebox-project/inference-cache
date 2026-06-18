@@ -42,8 +42,9 @@ const (
 	KernelCheckMsgFailPrefix = "FAIL:"
 
 	// EnvKernelCheckStrict is the env var the adapter sets on the init
-	// container to "1" in strict mode (empty/unset otherwise). The detector
-	// script reads it to decide its exit code.
+	// container: "1" in strict mode, "0" otherwise (rendered explicitly in both
+	// modes so it overrides any value inherited from the engine's env/envFrom).
+	// The detector script and the controller both treat only "1" as strict.
 	EnvKernelCheckStrict = "KERNEL_CHECK_STRICT"
 
 	// gpuResourceName is the extended resource an engine container requests

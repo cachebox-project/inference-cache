@@ -82,8 +82,9 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 	// shell, which would reintroduce the very pod-block the wrapper was meant
 	// to avoid — and such an image lacks python3/lmcache too, so the check is
 	// moot there.) The residual block window — python3 truly cannot start, or
-	// an OOM during `import torch` — is mitigated by the generous memory limit
-	// in kernelCheckResources and is documented in cachebackend-api.md.
+	// an OOM during `import torch` — is left bounded only by the pod/node: the
+	// init container sets no memory limit (see kernelCheckResources), so a tight
+	// limit can't OOM it. Documented in cachebackend-api.md.
 	command := []string{"python3", "-c", kernelCheckScript}
 
 	return &corev1.Container{
