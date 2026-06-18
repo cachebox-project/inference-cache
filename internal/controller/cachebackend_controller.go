@@ -74,6 +74,19 @@ const (
 	reasonNotDegraded = "NotDegraded"
 )
 
+// T2Degraded — advisory tier-2 (external offload, e.g. LMCache) health,
+// derived from status.indexParticipation.t2HitRate (written by the CacheIndex
+// poller). Published only once the tier has been exercised; it NEVER gates
+// Ready — tier-2 is an optimization, not a serving dependency (fail-open).
+const (
+	conditionTypeT2Degraded = "T2Degraded"
+	// reasonT2ZeroHitRate: the tier was queried but served zero reloads — wired
+	// but useless (a silently-degraded offload tier).
+	reasonT2ZeroHitRate = "T2ZeroHitRate"
+	// reasonT2Serving: the tier is serving reloads (hit-rate > 0).
+	reasonT2Serving = "T2Serving"
+)
+
 // Default HPA tuning when the autoscaling spec leaves them unset.
 const (
 	defaultHPAMinReplicas                 = int32(1)
@@ -515,6 +528,10 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// path, so clear any left over from a prior managed state (the docs
 		// state External backends publish only Ready + Progressing).
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		// T2Degraded is a managed-only advisory; an External backend's
+		// tier-2 (if any) is operator-managed and not evaluated here --
+		// clear any left over from a prior managed state.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 	})
 }
 
@@ -553,6 +570,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// EngineKernelsHealthy is a managed-path-only condition; clear any left
 		// over so an unmanaged CR doesn't carry a stale kernel verdict.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 	})
 }
 
@@ -1205,6 +1223,9 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 		// invalid-storage early-return bypasses; clear EngineKernelsHealthy so a
 		// backend that flipped into this gate doesn't keep a stale verdict.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		// The workload isn't provisioned, so tier-2 isn't being exercised —
+		// clear any stale T2Degraded advisory from a prior provisioned state.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 	})
 	return ctrl.Result{}, err
 }
@@ -1515,6 +1536,28 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			meta.SetStatusCondition(&backend.Status.Conditions, kc)
 		case kernelVerdict.removeCondition:
 			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		}
+		// T2Degraded (advisory) — derived from the poller-written
+		// status.indexParticipation.t2HitRate. Present only once tier-2 is
+		// exercised: True when it served zero reloads, False otherwise. It does
+		// NOT downgrade Ready (tier-2 is an optimization). formatRate renders an
+		// exact 0.0 as "0", so the string compare below is exact.
+		if ip := backend.Status.IndexParticipation; ip != nil && ip.T2HitRate != nil {
+			t2Status, t2Reason, t2Msg := metav1.ConditionFalse, reasonT2Serving,
+				"Tier-2 (external offload) cache is serving reloads (hitRate="+*ip.T2HitRate+")."
+			if *ip.T2HitRate == "0" {
+				t2Status, t2Reason, t2Msg = metav1.ConditionTrue, reasonT2ZeroHitRate,
+					"Tier-2 (external offload) cache is wired but served zero reloads; check the remote server's availability/sizing and the engine/server version + hash-scheme compatibility."
+			}
+			meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeT2Degraded,
+				Status:             t2Status,
+				Reason:             t2Reason,
+				Message:            t2Msg,
+				ObservedGeneration: publishedGen,
+			})
+		} else {
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 		}
 	})
 	// Commit the rate-limit slot ONLY after the status patch succeeds. A

@@ -278,6 +278,11 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		return fmt.Errorf("list CacheBackends: %w", err)
 	}
 	if len(backends.Items) == 0 {
+		// No backends present (e.g. the last one was just deleted) -> prune any
+		// lingering tier-2 gauge series so a stale value can't keep alerting
+		// after the fleet is gone. A List error above is a different case: we
+		// return before here and preserve series (we don't know the state).
+		reconcileBackendT2HitRateSeries(nil, nil, nil)
 		return nil
 	}
 
@@ -382,6 +387,9 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		a.t2QueryTokens += r.T2QueryTokens
 	}
 
+	// exercised tracks the backends whose tier-2 gauge we set this tick, so
+	// stale series can be pruned below (see reconcileBackendT2HitRateSeries).
+	exercised := map[t2Key]struct{}{}
 	for i, a := range perBackend {
 		cb := &backends.Items[i]
 		if _, tainted := taintedNamespaces[cb.Namespace]; tainted {
@@ -399,6 +407,17 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		// reloads — is the signal of a silently-degraded offload tier; nil
 		// means "not yet exercised" (no external lookups), which must NOT read
 		// as 0. Clamp defends against any counter anomaly.
+		//
+		// This ratio (and so the T2Degraded condition + the BackendT2Degraded
+		// `== 0` alert) is LIFETIME-CUMULATIVE: hits/queries over all the tier-2
+		// traffic the backend's replicas have ever reported. By design it flags a
+		// tier that has NEVER served a reload — the silent-from-start failures this
+		// signal targets (PYTHONHASHSEED, server OOM, version skew each produce zero
+		// reloads from the first query). A backend that served some reloads and only
+		// LATER regresses keeps a non-zero lifetime ratio, so `== 0` will not trip;
+		// that mid-life regression is caught instead by the windowed, per-pod
+		// LMCacheT2NoHits alert (rate(hits)==0 over a window). Keeping this
+		// cumulative keeps the condition and the alert consistent.
 		if a.t2QueryTokens > 0 {
 			ratio := float64(a.t2HitTokens) / float64(a.t2QueryTokens)
 			if ratio < 0 {
@@ -408,6 +427,13 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 			}
 			rate := formatRate(float32(ratio))
 			desired.T2HitRate = &rate
+			// Mirror the value onto the Prometheus gauge (the Alertmanager
+			// surface — CR status is not scraped) and record it so the gauge's
+			// stale series can be pruned after the loop.
+			key := t2Key{cb.Namespace, cb.Name}
+			backendT2HitRate.WithLabelValues(key.label()).Set(ratio)
+			backendT2QueryTokensTotal.WithLabelValues(key.label()).Add(float64(t2QueryDelta(key, a.t2QueryTokens)))
+			exercised[key] = struct{}{}
 		}
 		// "Don't write noise zeros" gate: a backend that has no selector
 		// configured AND has never published participation AND has no
@@ -434,6 +460,13 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 			continue
 		}
 	}
+	// Prune tier-2 gauge series for backends that drained (no longer exercised)
+	// or were deleted; namespaces tainted this tick are left untouched.
+	present := make(map[t2Key]struct{}, len(backends.Items))
+	for i := range backends.Items {
+		present[t2Key{backends.Items[i].Namespace, backends.Items[i].Name}] = struct{}{}
+	}
+	reconcileBackendT2HitRateSeries(exercised, present, taintedNamespaces)
 	return nil
 }
 
