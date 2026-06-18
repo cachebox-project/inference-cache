@@ -166,9 +166,10 @@ func requestsGPU(c *corev1.Container) bool {
 
 // kernelCheckResources is the small envelope the init container runs in. No
 // nvidia.com/gpu request: the missing-libcudart dlopen failure is caught at
-// load time without a device. The 2Gi memory limit gives the detector's
-// `import torch` (which pulls in CUDA runtime libs) headroom so the happy path
-// doesn't OOM — and since init-container limits are max'd with (not summed
+// load time without a device. The 4Gi memory limit gives the detector's
+// `import torch` (which pulls in CUDA runtime libs) ample headroom so the
+// happy path can't OOM — proactively avoiding the one residual way report-only
+// could fail closed. Since init-container limits are max'd with (not summed
 // onto) the app containers' limits, this never enlarges the pod's footprint on
 // a GPU node whose engine container already requests far more.
 func kernelCheckResources() corev1.ResourceRequirements {
@@ -179,7 +180,7 @@ func kernelCheckResources() corev1.ResourceRequirements {
 		},
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
 	}
 }

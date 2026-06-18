@@ -57,21 +57,20 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 		env = append(env, corev1.EnvVar{Name: EnvKernelCheckStrict, Value: "1"})
 	}
 
-	// Command form is mode-dependent so report-only is TRULY fail-open at the
-	// POD level, not just within the script. A bare `python3 -c` exits non-zero
-	// on interpreter-not-found (127) or an OOM/SIGKILL during `import torch`
-	// (137) — OUTSIDE the script's report-only exit-0 path — which Kubernetes
-	// retries and which would block the engine pod, breaking the "cache is
-	// never a serving dependency" contract. report-only therefore wraps the
-	// interpreter in a shell that always exits 0 (the script still writes its
-	// OK/FAIL termination message first, so the reconciler still sees the
-	// result). Strict runs python3 directly so a real failure — including the
-	// check being unable to run at all — propagates and holds the pod, which
-	// is the point of opting into strict.
+	// Both modes invoke the engine image's own python3 directly; the script's
+	// KERNEL_CHECK_STRICT-keyed exit code is what makes report-only fail-open
+	// (always exit 0, even on a c_ops failure) and strict fail-closed (exit 1).
+	// python3 is the right entrypoint: it is the engine's OWN interpreter, so
+	// it is guaranteed present on any functioning vLLM/LMCache image — if it
+	// can't run, the Python engine itself is already broken, which is not a
+	// false serving outage caused by this check. (We deliberately do NOT wrap
+	// in /bin/sh to "guarantee" exit 0: a minimal/distroless image may lack a
+	// shell, which would reintroduce the very pod-block the wrapper was meant
+	// to avoid — and such an image lacks python3/lmcache too, so the check is
+	// moot there.) The residual block window — python3 truly cannot start, or
+	// an OOM during `import torch` — is mitigated by the generous memory limit
+	// in kernelCheckResources and is documented in cachebackend-api.md.
 	command := []string{"python3", "-c", kernelCheckScript}
-	if !strict {
-		command = []string{"/bin/sh", "-c", `python3 -c "$0"; exit 0`, kernelCheckScript}
-	}
 
 	return &corev1.Container{
 		Name:  LMCacheKernelCheckContainerName,

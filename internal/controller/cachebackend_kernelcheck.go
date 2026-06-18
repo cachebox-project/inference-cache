@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -205,7 +206,26 @@ func listMatchedEnginePods(ctx context.Context, reader client.Reader, backend *c
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return nil, false
 	}
-	return pods.Items, true
+	// Scope attribution to pods THIS backend actually wired — match the
+	// webhook-stamped injected-by + injected-by-uid pair, not the engineSelector
+	// alone. With overlapping selectors (or a hand-authored kernel-check
+	// container), a pod wired to a DIFFERENT CacheBackend could otherwise drive
+	// this backend's verdict and, in strict mode, downgrade its Ready. This is
+	// the same ownership signal the cache-server-restart cascade uses.
+	wantInjectedBy := backend.Namespace + "/" + backend.Name
+	wantInjectedByUID := string(backend.UID)
+	owned := make([]corev1.Pod, 0, len(pods.Items))
+	for i := range pods.Items {
+		ann := pods.Items[i].Annotations
+		if ann[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
+			continue
+		}
+		if wantInjectedByUID == "" || ann[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
+			continue
+		}
+		owned = append(owned, pods.Items[i])
+	}
+	return owned, true
 }
 
 // downgradeKernelReadyVerdict applies a strict-mode kernel downgrade to the

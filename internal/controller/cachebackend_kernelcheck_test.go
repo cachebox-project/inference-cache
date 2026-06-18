@@ -1,13 +1,16 @@
 package controller
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -120,6 +123,42 @@ func TestEvaluateEngineKernelHealthInactiveRemovesStaleCondition(t *testing.T) {
 	v := evaluateEngineKernelHealth(cb, kvReadiness{readyStatus: metav1.ConditionTrue}, []corev1.Pod{{Status: corev1.PodStatus{}}}, true)
 	if !v.removeCondition {
 		t.Error("inactive gate with an existing condition must request removeCondition")
+	}
+}
+
+func TestListMatchedEnginePodsScopesByInjectedBy(t *testing.T) {
+	scheme := newScheme(t)
+	backend := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "mine", Namespace: "ns", UID: "uid-mine"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "x"}},
+		},
+	}
+	mkPod := func(name, injBy, injUID string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "ns", Labels: map[string]string{"app": "x"},
+			Annotations: map[string]string{
+				podwebhook.AnnotationInjectedBy:    injBy,
+				podwebhook.AnnotationInjectedByUID: injUID,
+			},
+		}}
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		mkPod("mine-pod", "ns/mine", "uid-mine"),    // wired by THIS backend
+		mkPod("other-pod", "ns/other", "uid-other"), // overlapping selector, different backend
+		mkPod("forged-pod", "ns/mine", "wrong-uid"), // forged injected-by, wrong UID
+	).Build()
+
+	pods, ok := listMatchedEnginePods(context.Background(), c, backend)
+	if !ok {
+		t.Fatal("listOK should be true on a successful list")
+	}
+	if len(pods) != 1 || pods[0].Name != "mine-pod" {
+		names := make([]string, len(pods))
+		for i := range pods {
+			names[i] = pods[i].Name
+		}
+		t.Fatalf("expected only [mine-pod] (injected-by + UID scoped); got %v", names)
 	}
 }
 

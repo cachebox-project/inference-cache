@@ -52,54 +52,57 @@ func TestKernelCheckAutoInjectsOnGPUPod(t *testing.T) {
 	if c.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Errorf("terminationMessagePolicy = %q, want File", c.TerminationMessagePolicy)
 	}
-	// auto == report-only: the command is shell-wrapped so the init container
-	// always exits 0 (fail-open), but still runs the detector script.
-	if len(c.Command) == 0 || c.Command[0] != "/bin/sh" {
-		t.Errorf("auto/report-only command = %v, want /bin/sh wrapper", c.Command)
+	// Both modes invoke the engine's own python3 directly (no shell dependency
+	// that a distroless image might lack); fail-open vs fail-closed is the
+	// script's STRICT-keyed exit code, not the command form.
+	if len(c.Command) < 3 || c.Command[0] != "python3" || c.Command[1] != "-c" {
+		t.Errorf("command = %v, want [python3 -c <script>]", c.Command)
 	}
 	if c.Command[len(c.Command)-1] != kernelCheckScript {
 		t.Error("command must carry the detector script as the final element")
 	}
-	for _, e := range c.Env {
-		if e.Name == EnvKernelCheckStrict && e.Value == "1" {
-			t.Error("auto mode must not set STRICT=1")
-		}
+	if hasStrictEnv(c) {
+		t.Error("auto mode must not set STRICT=1")
 	}
 	if _, ok := c.Resources.Limits[gpuResourceName]; ok {
 		t.Error("init container must not request nvidia.com/gpu")
 	}
 }
 
-func TestKernelCheckCommandFormByMode(t *testing.T) {
+func TestKernelCheckCommandIdenticalAcrossModesEnvDiffers(t *testing.T) {
 	a := NewVLLMLMCacheAdapter().(InitContainerProvider)
-
-	// report-only: shell wrapper that unconditionally exits 0 (fail-open at the
-	// pod level — python3-missing / OOM during import must not block the pod).
 	ro, _ := a.KernelCheckInitContainer(cbWithKernelCheck(KernelCheckModeReportOnly), gpuEnginePod("img"))
-	if ro == nil || ro.Command[0] != "/bin/sh" {
-		t.Fatalf("report-only command = %v, want /bin/sh wrapper", commandOf(ro))
-	}
-	joined := strings.Join(ro.Command, " ")
-	if !strings.Contains(joined, "exit 0") {
-		t.Errorf("report-only wrapper must force exit 0; got %v", ro.Command)
-	}
-
-	// strict: python3 runs directly so a real failure (incl. inability to run)
-	// propagates and holds the pod.
 	st, _ := a.KernelCheckInitContainer(cbWithKernelCheck(KernelCheckModeStrict), gpuEnginePod("img"))
-	if st == nil || st.Command[0] != "python3" {
-		t.Fatalf("strict command = %v, want direct python3", commandOf(st))
+	if ro == nil || st == nil {
+		t.Fatal("expected init containers for both modes")
 	}
-	if strings.Join(st.Command, " ") == joined {
-		t.Error("strict command must differ from the report-only fail-open wrapper")
+	// Identical command (direct python3, no /bin/sh) — only the env differs.
+	if strings.Join(ro.Command, "\x00") != strings.Join(st.Command, "\x00") {
+		t.Errorf("command must be identical across modes; report-only=%v strict=%v", ro.Command, st.Command)
+	}
+	if ro.Command[0] != "python3" {
+		t.Errorf("command[0] = %q, want python3", ro.Command[0])
+	}
+	// strict sets KERNEL_CHECK_STRICT=1 (script exits 1 on FAIL → pod blocks);
+	// report-only does not (script exits 0 → pod proceeds, fail-open).
+	if hasStrictEnv(ro) {
+		t.Error("report-only must not set KERNEL_CHECK_STRICT=1")
+	}
+	if !hasStrictEnv(st) {
+		t.Error("strict must set KERNEL_CHECK_STRICT=1")
 	}
 }
 
-func commandOf(c *corev1.Container) []string {
+func hasStrictEnv(c *corev1.Container) bool {
 	if c == nil {
-		return nil
+		return false
 	}
-	return c.Command
+	for _, e := range c.Env {
+		if e.Name == EnvKernelCheckStrict && e.Value == "1" {
+			return true
+		}
+	}
+	return false
 }
 
 func TestKernelCheckAutoSkipsCPUPod(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -38,7 +39,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 	// lmcache-kernel-check init-container has terminated with a FAIL message,
 	// simulating a CUDA kernel mismatch. The pod's labels match the
 	// engineSelector set on the CacheBackend by kernelCheckBackend.
-	createEnginePodsWithKernelFail := func(t *testing.T, ns string) {
+	createEnginePodsWithKernelFail := func(t *testing.T, ns string, cb *cachev1alpha1.CacheBackend) {
 		t.Helper()
 		sel := kernelCheckEngineLabels()
 		pod := &corev1.Pod{
@@ -46,6 +47,12 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 				Name:      "engine-pod-0",
 				Namespace: ns,
 				Labels:    sel,
+				// Stamp the webhook's injected-by pair so the kernel gate's
+				// ownership filter attributes this pod to THIS backend.
+				Annotations: map[string]string{
+					podwebhook.AnnotationInjectedBy:    ns + "/" + cb.Name,
+					podwebhook.AnnotationInjectedByUID: string(cb.UID),
+				},
 			},
 			Spec: corev1.PodSpec{
 				InitContainers: []corev1.Container{{
@@ -114,7 +121,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		}
 
 		// Inject a matched engine pod with a FAIL kernel-check status.
-		createEnginePodsWithKernelFail(t, ns)
+		createEnginePodsWithKernelFail(t, ns, cb)
 
 		// Reconcile: the kernel gate reads the pod's init-container status.
 		reconcile(t, r, "cache", ns)
@@ -169,7 +176,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		}
 
 		// Inject matching pod with FAIL status (engine pod stuck in Init).
-		createEnginePodsWithKernelFail(t, ns)
+		createEnginePodsWithKernelFail(t, ns, cb)
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)

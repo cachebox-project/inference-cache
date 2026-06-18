@@ -184,6 +184,15 @@ image. It reports onto the CacheBackend `EngineKernelsHealthy` condition (see
   the annotation to `report-only`.
 - The check runs `import torch` (the native extension links libtorch), adding a
   few seconds to GPU engine-pod startup. The engine imports torch anyway.
+- **Report-only fail-open is best-effort.** The init container runs the engine
+  image's own `python3`; in report-only mode the detector always exits 0, so a
+  `c_ops` failure never blocks the pod. The only residual ways it could block
+  are `python3` failing to start at all (which means the Python engine is
+  itself broken — not a false outage caused by this check) or an OOM during
+  `import torch` (mitigated by a generous init-container memory limit). The
+  check is deliberately *not* wrapped in a shell to force exit 0, because a
+  minimal/distroless image could lack `/bin/sh` and reintroduce the very block
+  the wrapper aimed to avoid.
 
 `EngineKernelsHealthy` complements `FunctionalProbeOK` (which round-trips the
 server-side cache path): the kernel check catches the engine-side load cause
