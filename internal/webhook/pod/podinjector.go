@@ -280,6 +280,17 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			}
 			log.V(1).Info("kernel-check init container injected",
 				"runtime", string(runtimeID), "container", initC.Name)
+		} else if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+			// The adapter DECLINED to inject (mode=off, or auto on a non-GPU /
+			// unresolvable pod). The webhook is authoritative for this
+			// container, so strip any pre-existing same-name init container: a
+			// hand-authored one would otherwise masquerade as a real check and
+			// the controller (which trusts the container by name) could publish
+			// or even strict-downgrade from it — violating `off` = absent. Only
+			// the explicit decline strips; a transient adapter error above is
+			// fail-open and leaves the pod untouched.
+			log.V(1).Info("kernel-check init container removed (adapter declined to inject)",
+				"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
 		}
 	}
 
@@ -527,4 +538,18 @@ func containerIndexByName(containers []corev1.Container, name string) int {
 		}
 	}
 	return -1
+}
+
+// removeContainerByName removes the first container named name from *containers
+// (preserving order) and reports whether one was removed. The kernel-check path
+// uses it to strip a hand-authored same-name init container when the adapter
+// declines to inject, keeping the webhook authoritative even in the
+// no-injection case.
+func removeContainerByName(containers *[]corev1.Container, name string) bool {
+	idx := containerIndexByName(*containers, name)
+	if idx < 0 {
+		return false
+	}
+	*containers = append((*containers)[:idx], (*containers)[idx+1:]...)
+	return true
 }

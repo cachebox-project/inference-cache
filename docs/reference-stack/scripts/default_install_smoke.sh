@@ -2527,6 +2527,11 @@ metadata:
     app: kc-inject-engine
 spec:
   restartPolicy: Never
+  # Pin to a non-existent node so the pod stays Pending on ANY cluster (incl. a
+  # GPU-capable one): we only inspect the webhook-mutated spec, and busybox has
+  # no python3, so it must never actually run the kernel-check init container.
+  nodeSelector:
+    inferencecache.io/smoke-never-schedule: "true"
   containers:
   - name: vllm
     image: busybox:1.36

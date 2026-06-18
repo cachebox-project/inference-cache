@@ -1540,6 +1540,33 @@ func TestHandle_KernelCheckInitContainer_ReplacesForged(t *testing.T) {
 	}
 }
 
+func TestHandle_KernelCheckInitContainer_StrippedWhenAdapterDeclines(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+
+	// A CPU engine pod (no GPU request) under the default `auto` mode: the
+	// adapter declines to inject. A hand-authored same-name init container must
+	// be STRIPPED so it can't masquerade as a real check (the controller trusts
+	// the container by name), preserving "auto on a non-GPU pod = absent".
+	pod := vllmEnginePod("engine-cpu", map[string]string{"app": "vllm"})
+	pod.Spec.InitContainers = []corev1.Container{{
+		Name:    adapterruntime.LMCacheKernelCheckContainerName,
+		Image:   "attacker/fake:latest",
+		Command: []string{"echo", "OK"},
+	}}
+
+	resp := h.Handle(context.Background(), newRequest(t, pod, ns))
+	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, resp)
+
+	for _, ic := range injected.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			t.Fatalf("forged kernel-check init container survived on a non-GPU (auto) pod; want it stripped: %v",
+				initContainerNames(injected))
+		}
+	}
+}
+
 // TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses verifies that
 // setting AnnotationSkip on a pod suppresses the kernel-check init container
 // injection (the entire injection path is bypassed).

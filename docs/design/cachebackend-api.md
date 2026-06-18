@@ -204,11 +204,13 @@ on a live backend takes effect as its pods roll.
   (so no scheduling/quota footprint increase); omitting limits avoids the
   max-limit trip. The other residual ways it could block are `python3` failing
   to start at all (which means the Python engine is itself broken — not a false
-  outage caused by this check) or an OOM during `import torch` (with no memory
-  limit set, the import is bounded only by the pod/node, so a tight limit can't
-  OOM it). The check is deliberately *not* wrapped in a
-  shell to force exit 0, because a minimal/distroless image could lack
-  `/bin/sh` and reintroduce the very block the wrapper aimed to avoid.
+  outage caused by this check) or an OOM during `import torch` (the check sets
+  no memory limit, so the import is bounded by the pod/node unless a namespace
+  `LimitRange` defaults a memory limit onto it — in which case a too-small
+  default could OOM the import, the same way it would constrain any unlimited
+  container). The check is deliberately *not* wrapped in a shell to force exit
+  0, because a minimal/distroless image could lack `/bin/sh` and reintroduce
+  the very block the wrapper aimed to avoid.
 
 `EngineKernelsHealthy` complements `FunctionalProbeOK` (which round-trips the
 server-side cache path): the kernel check catches the engine-side load cause
