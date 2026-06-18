@@ -2662,6 +2662,35 @@ if [ "$kc_cond_reason" != "KernelLoadFailed" ]; then
 fi
 log "EngineKernelsHealthy=False/KernelLoadFailed on $KC_COND_CB — report-only FAIL path wired end-to-end"
 
+# The validating webhook must reject an invalid lmcache-kernel-check annotation
+# value: a typo (e.g. "strcit") would otherwise silently fall back to report-only
+# and disable the fail-closed strict gate. Proves the rule on the real install.
+log "asserting an invalid lmcache-kernel-check annotation is rejected at admission"
+kc_badannot_yaml="$(cat <<EOF
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: kc-badannot
+  namespace: $KERNEL_CHECK_SMOKE_NS
+  annotations:
+    inferencecache.io/lmcache-kernel-check: "strcit"
+spec:
+  type: LMCache
+  engineSelector:
+    matchLabels:
+      app: kc-badannot
+EOF
+)"
+if kc_badannot_out="$(printf '%s\n' "$kc_badannot_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$kc_badannot_out"
+  fail "CacheBackend with an invalid lmcache-kernel-check annotation was admitted; the validating webhook should reject it"
+fi
+if ! grep -q "must be one of" <<<"$kc_badannot_out"; then
+  echo "$kc_badannot_out"
+  fail "invalid kernel-check annotation rejected, but not by the expected rule (missing 'must be one of' message)"
+fi
+log "invalid lmcache-kernel-check annotation rejected at admission"
+
 # Cleanup: drop the kernel-check smoke namespace.
 kubectl delete namespace "$KERNEL_CHECK_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true

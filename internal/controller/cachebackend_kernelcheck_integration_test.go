@@ -39,9 +39,16 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 	// lmcache-kernel-check init-container has terminated with a FAIL message,
 	// simulating a CUDA kernel mismatch. The pod's labels match the
 	// engineSelector set on the CacheBackend by kernelCheckBackend.
-	createEnginePodsWithKernelFail := func(t *testing.T, ns string, cb *cachev1alpha1.CacheBackend) {
+	createEnginePodsWithKernelFail := func(t *testing.T, ns string, cb *cachev1alpha1.CacheBackend, strict bool) {
 		t.Helper()
 		sel := kernelCheckEngineLabels()
+		// The pod's admitted mode is recorded on its kernel-check init container
+		// env — that, not the CR annotation, is what the gate reads to decide a
+		// strict Ready downgrade.
+		var initEnv []corev1.EnvVar
+		if strict {
+			initEnv = []corev1.EnvVar{{Name: adapterruntime.EnvKernelCheckStrict, Value: "1"}}
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "engine-pod-0",
@@ -58,6 +65,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 				InitContainers: []corev1.Container{{
 					Name:  adapterruntime.LMCacheKernelCheckContainerName,
 					Image: "registry.example.com/lmcache-kernel-check:test",
+					Env:   initEnv,
 				}},
 				Containers: []corev1.Container{{
 					Name:  "vllm",
@@ -120,8 +128,9 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 			t.Fatalf("pre-condition: Ready = %+v, want True before injecting kernel failure", ready)
 		}
 
-		// Inject a matched engine pod with a FAIL kernel-check status.
-		createEnginePodsWithKernelFail(t, ns, cb)
+		// Inject a matched engine pod with a FAIL kernel-check status, admitted
+		// in report-only mode (no strict env).
+		createEnginePodsWithKernelFail(t, ns, cb, false)
 
 		// Reconcile: the kernel gate reads the pod's init-container status.
 		reconcile(t, r, "cache", ns)
@@ -175,8 +184,10 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 			t.Fatalf("pre-condition: Ready = %+v, want False/%s before injecting kernel failure", ready, reasonAwaitingFirstKVEvent)
 		}
 
-		// Inject matching pod with FAIL status (engine pod stuck in Init).
-		createEnginePodsWithKernelFail(t, ns, cb)
+		// Inject matching pod with FAIL status, admitted in STRICT mode (its
+		// init-container env carries KERNEL_CHECK_STRICT=1 — pod truth, what the
+		// gate reads to downgrade Ready).
+		createEnginePodsWithKernelFail(t, ns, cb, true)
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)

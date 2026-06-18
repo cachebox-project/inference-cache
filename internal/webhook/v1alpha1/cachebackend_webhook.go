@@ -162,6 +162,30 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
+	rejectInvalidKernelCheckAnnotation,
+}
+
+// rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
+// inferencecache.io/lmcache-kernel-check annotation. The annotation is the
+// operator's opt-in surface for the engine-side kernel check (auto /
+// report-only / strict / off); a typo like "strcit" would otherwise fall back
+// to "auto" and silently relax a fail-closed strict gate to report-only
+// observability, with no signal to the operator. Validate it at admission
+// instead. An unset annotation (or an explicit empty value) is accepted.
+func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	v, ok := cb.Annotations[adapterruntime.AnnotationLMCacheKernelCheck]
+	if !ok || adapterruntime.IsValidKernelCheckMode(v) {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("metadata", "annotations").Key(adapterruntime.AnnotationLMCacheKernelCheck),
+			v,
+			fmt.Sprintf("must be one of %q, %q, %q, %q (or unset)",
+				adapterruntime.KernelCheckModeAuto, adapterruntime.KernelCheckModeReportOnly,
+				adapterruntime.KernelCheckModeStrict, adapterruntime.KernelCheckModeOff),
+		),
+	}
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and

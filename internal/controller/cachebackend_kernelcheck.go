@@ -83,7 +83,7 @@ func evaluateEngineKernelHealth(
 	if !listedOK {
 		return kernelHealthVerdict{}
 	}
-	cond, active := aggregateKernelHealth(backend, pods)
+	cond, active, strictFail := aggregateKernelHealth(backend, pods)
 	if !active {
 		if meta.FindStatusCondition(backend.Status.Conditions, conditionTypeEngineKernelsHealthy) != nil {
 			return kernelHealthVerdict{removeCondition: true}
@@ -92,18 +92,20 @@ func evaluateEngineKernelHealth(
 	}
 	v := kernelHealthVerdict{shouldWriteCondition: true, condition: cond}
 
-	// Strict-mode Ready downgrade — ONLY on a definite mismatch (False), never
-	// on Pending/Error (transient/indeterminate). Unlike the functional-probe
-	// gate, this does NOT require upstream Ready=True first: in strict mode a
-	// failing init container holds the engine pod in Init, so it never emits a
-	// KV event and the upstream gate would otherwise pin Ready to
-	// AwaitingFirstKVEvent/NoKVEventsObserved — masking the actual root cause.
-	// A confirmed KernelLoadFailed is a hard fact read straight off the pod, so
-	// it takes precedence and surfaces EngineKernelDegraded as the Ready reason
-	// at deploy time, which is the point of opting into strict. (The Degraded
-	// condition still narrates the no-KV-events symptom separately.)
-	if backend.Annotations[adapterruntime.AnnotationLMCacheKernelCheck] == adapterruntime.KernelCheckModeStrict &&
-		cond.Status == metav1.ConditionFalse {
+	// Strict-mode Ready downgrade — ONLY on a definite mismatch (False) AND only
+	// when a FAILing pod was actually ADMITTED in strict mode (its kernel-check
+	// init container carries KERNEL_CHECK_STRICT=1), never on Pending/Error.
+	// Deriving strict-ness from the pod — not the CacheBackend's current
+	// annotation — is deliberate: the annotation only affects how NEW pods are
+	// injected, so flipping it on a live backend would otherwise downgrade Ready
+	// for pods actually running report-only (or stop reporting the kernel reason
+	// for pods still stuck in a strict init loop). The pod is the source of
+	// truth for how it is behaving. Unlike the functional-probe gate, this does
+	// NOT require upstream Ready=True first: a strict init failure holds the pod
+	// in Init so it never emits a KV event, and the upstream gate would pin
+	// Ready to AwaitingFirstKVEvent/NoKVEventsObserved — masking the root cause.
+	// (The Degraded condition still narrates the no-KV-events symptom.)
+	if cond.Status == metav1.ConditionFalse && strictFail {
 		v.downgradeReady = true
 		v.readyReason = reasonEngineKernelDegraded
 		v.readyMessage = "lmcache CUDA kernels failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's lmcache/CUDA alignment or set " + adapterruntime.AnnotationLMCacheKernelCheck + "=report-only"
@@ -115,7 +117,11 @@ func evaluateEngineKernelHealth(
 // statuses into a single condition. Returns active=false when no matched pod
 // carries a kernel-check init container. Precedence: mismatch > error >
 // pending > healthy — a single confirmed mismatch is the most actionable.
-func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Pod) (metav1.Condition, bool) {
+// strictFail is true when at least one FAILing pod was admitted in strict mode
+// (its kernel-check init container carries KERNEL_CHECK_STRICT=1) — the signal
+// the caller uses to decide a Ready downgrade, read from the pod itself rather
+// than the (possibly since-changed) CacheBackend annotation.
+func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Pod) (cond metav1.Condition, active bool, strictFail bool) {
 	var seen bool
 	var failMsg string
 	var nFail, nErr, nPending, nOK int
@@ -140,6 +146,9 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 			if failMsg == "" {
 				failMsg = msg
 			}
+			if kernelCheckAdmittedStrict(&pods[i]) {
+				strictFail = true
+			}
 		case msg == adapterruntime.KernelCheckMsgOK:
 			nOK++
 		default:
@@ -147,7 +156,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 		}
 	}
 	if !seen {
-		return metav1.Condition{}, false
+		return metav1.Condition{}, false, false
 	}
 	mk := func(status metav1.ConditionStatus, reason, message string) metav1.Condition {
 		return metav1.Condition{
@@ -161,17 +170,36 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 	switch {
 	case nFail > 0:
 		return mk(metav1.ConditionFalse, reasonKernelLoadFailed,
-			fmt.Sprintf("native lmcache c_ops kernels failed to load on %d engine pod(s): %s", nFail, failMsg)), true
+			fmt.Sprintf("native lmcache c_ops kernels failed to load on %d engine pod(s): %s", nFail, failMsg)), true, strictFail
 	case nErr > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckError,
-			fmt.Sprintf("kernel-check init container on %d engine pod(s) terminated without a recognized result message", nErr)), true
+			fmt.Sprintf("kernel-check init container on %d engine pod(s) terminated without a recognized result message", nErr)), true, strictFail
 	case nPending > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckPending,
-			fmt.Sprintf("kernel-check init container has not completed on %d engine pod(s)", nPending)), true
+			fmt.Sprintf("kernel-check init container has not completed on %d engine pod(s)", nPending)), true, strictFail
 	default:
 		return mk(metav1.ConditionTrue, reasonKernelsHealthy,
-			fmt.Sprintf("native lmcache c_ops kernels loaded on %d engine pod(s)", nOK)), true
+			fmt.Sprintf("native lmcache c_ops kernels loaded on %d engine pod(s)", nOK)), true, strictFail
 	}
+}
+
+// kernelCheckAdmittedStrict reports whether the pod's lmcache-kernel-check init
+// container was admitted in strict mode — i.e. it carries KERNEL_CHECK_STRICT=1.
+// This is the pod's own record of how it behaves, independent of the
+// CacheBackend annotation's current value.
+func kernelCheckAdmittedStrict(pod *corev1.Pod) bool {
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if c.Name != adapterruntime.LMCacheKernelCheckContainerName {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == adapterruntime.EnvKernelCheckStrict && e.Value == "1" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // findKernelCheckStatus returns the lmcache-kernel-check init-container status

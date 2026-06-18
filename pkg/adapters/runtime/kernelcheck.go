@@ -110,9 +110,24 @@ type InitContainerProvider interface {
 	KernelCheckInitContainer(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error)
 }
 
+// IsValidKernelCheckMode reports whether s is an accepted value for the
+// AnnotationLMCacheKernelCheck annotation. The empty string is accepted (the
+// annotation is unset / treated as auto); any other unrecognized value is
+// rejected by admission (see the CacheBackend validating webhook) so a typo
+// like "strcit" can't silently relax strict enforcement back to report-only.
+func IsValidKernelCheckMode(s string) bool {
+	switch s {
+	case "", KernelCheckModeAuto, KernelCheckModeReportOnly, KernelCheckModeStrict, KernelCheckModeOff:
+		return true
+	default:
+		return false
+	}
+}
+
 // resolveKernelCheckMode returns the effective mode for a CacheBackend.
-// Unrecognized values fall back to auto (forgiving — a typo shouldn't
-// silently disable the gate).
+// Unrecognized values fall back to auto; admission rejects them before they
+// reach here (IsValidKernelCheckMode), so in practice only the known values
+// arrive — the fallback is a defense-in-depth default, not the typo guard.
 func resolveKernelCheckMode(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
 		return KernelCheckModeAuto

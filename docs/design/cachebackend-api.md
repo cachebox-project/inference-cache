@@ -169,6 +169,14 @@ image. It reports onto the CacheBackend `EngineKernelsHealthy` condition (see
 | `strict` | Always inject; on failure the engine pod stays in `Init` and never serves (fail-closed), and the managed CacheBackend `Ready` is downgraded with reason `EngineKernelDegraded`. |
 | `off` | Never inject. |
 
+The annotation value is validated at admission — an unrecognized value (e.g. a
+`strcit` typo) is **rejected**, so a typo cannot silently relax strict
+enforcement back to report-only. Changing the annotation affects only
+**newly-admitted** engine pods; the `EngineKernelsHealthy` condition and any
+strict `Ready` downgrade reflect each pod's *actual admitted mode* (read from
+the pod, not the CacheBackend's current annotation), so flipping the annotation
+on a live backend takes effect as its pods roll.
+
 **Boundaries (what the check does and does not prove):**
 
 - `EngineKernelsHealthy=True` means the native kernels **loaded** — it does

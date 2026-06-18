@@ -21,6 +21,18 @@ func podWithKernelStatus(state corev1.ContainerState) corev1.Pod {
 	}}}}
 }
 
+// strictPodWithKernelStatus is a pod whose kernel-check init container was
+// admitted in STRICT mode (KERNEL_CHECK_STRICT=1 on its spec env), plus the
+// given terminated status. The strict-ness lives on the pod, not the CR.
+func strictPodWithKernelStatus(state corev1.ContainerState) corev1.Pod {
+	p := podWithKernelStatus(state)
+	p.Spec.InitContainers = []corev1.Container{{
+		Name: adapterruntime.LMCacheKernelCheckContainerName,
+		Env:  []corev1.EnvVar{{Name: adapterruntime.EnvKernelCheckStrict, Value: "1"}},
+	}}
+	return p
+}
+
 func termed(code int32, msg string) corev1.ContainerState {
 	return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Message: msg}}
 }
@@ -56,7 +68,7 @@ func TestAggregateKernelHealth(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cond, active := aggregateKernelHealth(cb, tc.pods)
+			cond, active, _ := aggregateKernelHealth(cb, tc.pods)
 			if active != tc.wantActive {
 				t.Fatalf("active = %v, want %v", active, tc.wantActive)
 			}
@@ -74,12 +86,13 @@ func TestAggregateKernelHealth(t *testing.T) {
 }
 
 func TestEvaluateEngineKernelHealthStrictDowngradesReady(t *testing.T) {
-	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
-		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+	// No strict annotation on the CR — the downgrade is driven by the POD's
+	// admitted strict mode (its init container's KERNEL_CHECK_STRICT=1).
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
 	up := kvReadiness{readyStatus: metav1.ConditionTrue, readyReason: "KVEventsObserved"}
-	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{strictPodWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
 	if !v.downgradeReady || v.readyReason != reasonEngineKernelDegraded {
-		t.Fatalf("strict mismatch must downgrade Ready with EngineKernelDegraded; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
+		t.Fatalf("strict-admitted pod mismatch must downgrade Ready with EngineKernelDegraded; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
 	}
 	out := downgradeKernelReadyVerdict(up, v)
 	if out.readyStatus != metav1.ConditionFalse {
@@ -92,16 +105,32 @@ func TestEvaluateEngineKernelHealthStrictDowngradesEvenBeforeFirstKVEvent(t *tes
 	// upstream is still AwaitingFirstKVEvent (Ready=False). A confirmed
 	// mismatch must still downgrade to EngineKernelDegraded — not be masked by
 	// the KV-event-waiting reason it causes.
-	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
-		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
 	upstreamNotReady := kvReadiness{readyStatus: metav1.ConditionFalse, readyReason: "AwaitingFirstKVEvent"}
-	v := evaluateEngineKernelHealth(cb, upstreamNotReady, []corev1.Pod{podWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
+	v := evaluateEngineKernelHealth(cb, upstreamNotReady, []corev1.Pod{strictPodWithKernelStatus(termed(1, "FAIL: ImportError: libcudart.so.13"))}, true)
 	if !v.downgradeReady || v.readyReason != reasonEngineKernelDegraded {
 		t.Fatalf("strict mismatch must downgrade Ready to EngineKernelDegraded even pre-first-KV-event; got downgrade=%v reason=%q", v.downgradeReady, v.readyReason)
 	}
 	out := downgradeKernelReadyVerdict(upstreamNotReady, v)
 	if out.readyStatus != metav1.ConditionFalse || out.readyReason != reasonEngineKernelDegraded {
 		t.Errorf("downgraded verdict = %q/%q, want False/EngineKernelDegraded", out.readyStatus, out.readyReason)
+	}
+}
+
+func TestEvaluateEngineKernelHealthAnnotationStrictButReportOnlyPodDoesNotDowngrade(t *testing.T) {
+	// The CR annotation says strict, but the pod was admitted report-only (no
+	// KERNEL_CHECK_STRICT env) — e.g. the operator flipped the annotation after
+	// the pod was already running. Pod truth wins: do NOT downgrade Ready (that
+	// pod is actually serving), though the condition still surfaces False.
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
+		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+	up := kvReadiness{readyStatus: metav1.ConditionTrue}
+	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13"))}, true)
+	if v.downgradeReady {
+		t.Error("a report-only-admitted pod must not downgrade Ready even when the CR annotation now says strict")
+	}
+	if !v.shouldWriteCondition || v.condition.Status != metav1.ConditionFalse {
+		t.Errorf("the condition must still surface False; got write=%v status=%q", v.shouldWriteCondition, v.condition.Status)
 	}
 }
 
