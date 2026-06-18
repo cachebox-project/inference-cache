@@ -15,9 +15,22 @@ import (
 )
 
 func podWithKernelStatus(state corev1.ContainerState) corev1.Pod {
-	return corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
-		Name:  adapterruntime.LMCacheKernelCheckContainerName,
-		State: state,
+	return corev1.Pod{
+		Spec: corev1.PodSpec{InitContainers: []corev1.Container{{
+			Name: adapterruntime.LMCacheKernelCheckContainerName,
+		}}},
+		Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+			Name:  adapterruntime.LMCacheKernelCheckContainerName,
+			State: state,
+		}}},
+	}
+}
+
+// specOnlyKernelPod has the kernel-check init container in its spec but no
+// observed status yet — a just-created / unscheduled pod.
+func specOnlyKernelPod() corev1.Pod {
+	return corev1.Pod{Spec: corev1.PodSpec{InitContainers: []corev1.Container{{
+		Name: adapterruntime.LMCacheKernelCheckContainerName,
 	}}}}
 }
 
@@ -57,14 +70,18 @@ func TestAggregateKernelHealth(t *testing.T) {
 			podWithKernelStatus(termed(0, "OK")),
 			podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13")),
 		}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
-		{"strict crashloop fail via lastState", []corev1.Pod{{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
-			Name:                 adapterruntime.LMCacheKernelCheckContainerName,
-			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
-			LastTerminationState: termed(1, "FAIL: ImportError: libcudart.so.13"),
-		}}}}}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
+		{"strict crashloop fail via lastState", []corev1.Pod{{
+			Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: adapterruntime.LMCacheKernelCheckContainerName}}},
+			Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+				Name:                 adapterruntime.LMCacheKernelCheckContainerName,
+				State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				LastTerminationState: termed(1, "FAIL: ImportError: libcudart.so.13"),
+			}}},
+		}}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
 		{"garbage message is error not mismatch", []corev1.Pod{podWithKernelStatus(termed(127, ""))}, metav1.ConditionUnknown, reasonKernelCheckError, true},
-		{"pending", []corev1.Pod{podWithKernelStatus(corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
-		{"no kernel-check container => inactive", []corev1.Pod{{Status: corev1.PodStatus{}}}, "", "", false},
+		{"running, no terminated status => pending", []corev1.Pod{podWithKernelStatus(corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
+		{"spec present but status not observed yet => pending", []corev1.Pod{specOnlyKernelPod()}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
+		{"no kernel-check container in spec => inactive", []corev1.Pod{{Status: corev1.PodStatus{}}}, "", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

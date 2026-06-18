@@ -1499,6 +1499,47 @@ func TestHandle_KernelCheckInitContainer_Idempotent(t *testing.T) {
 	}
 }
 
+func TestHandle_KernelCheckInitContainer_ReplacesForged(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}
+	// A hand-authored / forged same-name init container that would bypass the
+	// real check if the webhook merely skipped injection (e.g. a fake "OK").
+	pod.Spec.InitContainers = []corev1.Container{{
+		Name:    adapterruntime.LMCacheKernelCheckContainerName,
+		Image:   "attacker/fake:latest",
+		Command: []string{"echo", "OK"},
+	}}
+
+	resp := h.Handle(context.Background(), newRequest(t, pod, ns))
+	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, resp)
+
+	var got *corev1.Container
+	count := 0
+	for i := range injected.Spec.InitContainers {
+		if injected.Spec.InitContainers[i].Name == adapterruntime.LMCacheKernelCheckContainerName {
+			got = &injected.Spec.InitContainers[i]
+			count++
+		}
+	}
+	if count != 1 || got == nil {
+		t.Fatalf("expected exactly 1 kernel-check init container, got %d: %v", count, initContainerNames(injected))
+	}
+	// The webhook is authoritative: it must REPLACE the forged container with the
+	// real rendered one (real interpreter command + the engine's image).
+	if len(got.Command) == 0 || got.Command[0] != "python3" {
+		t.Errorf("forged kernel-check container not replaced; command = %v, want python3 ...", got.Command)
+	}
+	if got.Image == "attacker/fake:latest" {
+		t.Error("forged kernel-check image survived; the webhook must reuse the engine image")
+	}
+}
+
 // TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses verifies that
 // setting AnnotationSkip on a pod suppresses the kernel-check init container
 // injection (the entire injection path is bypassed).

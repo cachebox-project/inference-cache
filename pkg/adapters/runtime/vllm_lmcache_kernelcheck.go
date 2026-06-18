@@ -51,11 +51,25 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 
 	// Copy the engine's env so the check loads c_ops in the engine's actual
 	// environment (an operator-set PYTHONPATH / LD_LIBRARY_PATH that c_ops
-	// needs to dlopen would otherwise be absent and false-fail the check).
-	env := append([]corev1.EnvVar(nil), engine.Env...)
+	// needs to dlopen would otherwise be absent and false-fail the check) — but
+	// strip any pre-existing KERNEL_CHECK_STRICT and set it explicitly per mode.
+	// Inheriting a stray KERNEL_CHECK_STRICT=1 from the engine container would
+	// otherwise flip report-only into a fail-CLOSED check and make the
+	// controller mis-classify the pod as strict. Setting it explicitly in
+	// container.Env also overrides any value sourced from the engine's
+	// EnvFrom (container.Env wins over envFrom for the same key).
+	strictVal := "0"
 	if strict {
-		env = append(env, corev1.EnvVar{Name: EnvKernelCheckStrict, Value: "1"})
+		strictVal = "1"
 	}
+	env := make([]corev1.EnvVar, 0, len(engine.Env)+1)
+	for _, e := range engine.Env {
+		if e.Name == EnvKernelCheckStrict {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env, corev1.EnvVar{Name: EnvKernelCheckStrict, Value: strictVal})
 
 	// Both modes invoke the engine image's own python3 directly; the script's
 	// KERNEL_CHECK_STRICT-keyed exit code is what makes report-only fail-open

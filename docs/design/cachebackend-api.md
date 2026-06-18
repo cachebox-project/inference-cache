@@ -165,7 +165,7 @@ image. It reports onto the CacheBackend `EngineKernelsHealthy` condition (see
 | Annotation value | Behavior |
 |---|---|
 | `auto` (default / unset) | Inject in report-only mode **only** when the engine container requests a GPU (the kernels are GPU-only; a CPU build legitimately has none). |
-| `report-only` | Always inject; the check never blocks the engine pod (fail-open). The condition surfaces the result. |
+| `report-only` | Always inject; a `c_ops` load failure makes the detector exit 0, so it does not block the engine pod (best-effort fail-open — see the residual cases in [Boundaries](#boundaries-what-the-check-does-and-does-not-prove)). The condition surfaces the result. |
 | `strict` | Always inject; on failure the engine pod stays in `Init` and never serves (fail-closed), and the managed CacheBackend `Ready` is downgraded with reason `EngineKernelDegraded`. |
 | `off` | Never inject. |
 

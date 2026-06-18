@@ -2,7 +2,6 @@ package runtime
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -79,7 +78,7 @@ try:
     locs = list(spec.submodule_search_locations) if spec else []
     if not locs:
         fail("lmcache not importable")
-    sos = glob.glob(os.path.join(locs[0], "c_ops*.so"))
+    sos = sorted(glob.glob(os.path.join(locs[0], "c_ops*.so")))
     if not sos:
         fail("no native c_ops extension present (pure-python/CPU build)")
     import torch  # required: c_ops.so DT_NEEDED libtorch (libc10.so)
@@ -179,24 +178,19 @@ func requestsGPU(c *corev1.Container) bool {
 	return false
 }
 
-// kernelCheckResources is the small envelope the init container runs in. Only
-// modest REQUESTS, no limits, and no nvidia.com/gpu:
+// kernelCheckResources is the (intentionally empty) resource envelope for the
+// init container — no requests, no limits, no nvidia.com/gpu:
 //   - No nvidia.com/gpu: the missing-libcudart dlopen failure is caught at load
 //     time without a device.
-//   - No CPU/memory LIMITS: an explicit limit (e.g. 1 CPU / 4Gi) could exceed a
-//     namespace LimitRange's per-container max that the engine container still
-//     satisfies, which would fail the engine pod at admission — breaking the
-//     report-only "never blocks the pod" contract. Omitting the limit lets any
-//     LimitRange default apply within bounds, and leaves `import torch` bounded
-//     only by the pod/node (so a tight limit can't OOM it either).
-//   - Modest requests, subsumed by the engine container's larger requests
-//     (init requests are max'd with — not summed onto — app requests), so the
-//     check never enlarges the pod's scheduling/quota footprint.
+//   - No CPU/memory limits: an explicit limit could exceed a namespace
+//     LimitRange's per-container max that the engine container still satisfies,
+//     failing the engine pod at admission — breaking the report-only "never
+//     blocks the pod" contract. Omitting it leaves `import torch` bounded only
+//     by the pod/node, so a tight limit can't OOM it either.
+//   - No requests: even a modest request would raise the pod's effective
+//     request when the engine container requests less, contradicting the "never
+//     enlarges scheduling/quota footprint" guarantee. With none, a namespace
+//     LimitRange default (if any) applies within bounds.
 func kernelCheckResources() corev1.ResourceRequirements {
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("50m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
-		},
-	}
+	return corev1.ResourceRequirements{}
 }

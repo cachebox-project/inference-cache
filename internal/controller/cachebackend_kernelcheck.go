@@ -126,17 +126,25 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 	var failMsg string
 	var nFail, nErr, nPending, nOK int
 	for i := range pods {
-		st := findKernelCheckStatus(&pods[i])
-		if st == nil {
+		// A pod participates in the gate if it carries the kernel-check init
+		// container in its SPEC (the webhook injected it) — even before its
+		// status is observed. Keying on the spec (not the status) means a
+		// just-created / unscheduled / not-yet-observed pod surfaces
+		// KernelCheckPending instead of being mistaken for "no check configured"
+		// and clearing a known condition.
+		if !kernelCheckInSpec(&pods[i]) {
 			continue
 		}
 		seen = true
-		term := st.State.Terminated
-		if term == nil && st.LastTerminationState.Terminated != nil {
-			term = st.LastTerminationState.Terminated // CrashLoopBackOff: read last terminated
+		var term *corev1.ContainerStateTerminated
+		if st := findKernelCheckStatus(&pods[i]); st != nil {
+			term = st.State.Terminated
+			if term == nil && st.LastTerminationState.Terminated != nil {
+				term = st.LastTerminationState.Terminated // CrashLoopBackOff: read last terminated
+			}
 		}
 		if term == nil {
-			nPending++
+			nPending++ // spec present, but no terminated status observed yet
 			continue
 		}
 		msg := strings.TrimSpace(term.Message)
@@ -181,6 +189,19 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 		return mk(metav1.ConditionTrue, reasonKernelsHealthy,
 			fmt.Sprintf("native lmcache c_ops kernels loaded on %d engine pod(s)", nOK)), true, strictFail
 	}
+}
+
+// kernelCheckInSpec reports whether the pod carries the lmcache-kernel-check
+// init container in its spec (i.e. the webhook injected it). Used to decide
+// whether a pod participates in the gate, independent of whether its status
+// has been observed yet.
+func kernelCheckInSpec(pod *corev1.Pod) bool {
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == adapterruntime.LMCacheKernelCheckContainerName {
+			return true
+		}
+	}
+	return false
 }
 
 // kernelCheckAdmittedStrict reports whether the pod's lmcache-kernel-check init

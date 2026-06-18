@@ -105,6 +105,39 @@ func hasStrictEnv(c *corev1.Container) bool {
 	return false
 }
 
+func strictEnvValue(c *corev1.Container) (string, int) {
+	v, n := "", 0
+	if c == nil {
+		return v, n
+	}
+	for _, e := range c.Env {
+		if e.Name == EnvKernelCheckStrict {
+			v = e.Value
+			n++
+		}
+	}
+	return v, n
+}
+
+func TestKernelCheckStripsInheritedStrictEnv(t *testing.T) {
+	a := NewVLLMLMCacheAdapter().(InitContainerProvider)
+	pod := gpuEnginePod("img")
+	// The engine container carries a stray KERNEL_CHECK_STRICT=1. It must NOT
+	// leak into the report-only check (which would turn it fail-closed) and must
+	// not appear twice.
+	pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: EnvKernelCheckStrict, Value: "1"}}
+
+	ro, _ := a.KernelCheckInitContainer(cbWithKernelCheck(KernelCheckModeReportOnly), pod)
+	if v, n := strictEnvValue(ro); v != "0" || n != 1 {
+		t.Errorf("report-only KERNEL_CHECK_STRICT = %q x%d, want \"0\" x1 (inherited value stripped + overridden)", v, n)
+	}
+
+	st, _ := a.KernelCheckInitContainer(cbWithKernelCheck(KernelCheckModeStrict), pod)
+	if v, n := strictEnvValue(st); v != "1" || n != 1 {
+		t.Errorf("strict KERNEL_CHECK_STRICT = %q x%d, want \"1\" x1", v, n)
+	}
+}
+
 func TestKernelCheckAutoSkipsCPUPod(t *testing.T) {
 	a := NewVLLMLMCacheAdapter().(InitContainerProvider)
 	cpuPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
