@@ -65,6 +65,9 @@ func TestKernelCheckAutoInjectsOnGPUPod(t *testing.T) {
 		t.Error("auto mode must not set STRICT=1")
 	}
 	if _, ok := c.Resources.Limits[gpuResourceName]; ok {
+		t.Error("init container must not set an nvidia.com/gpu limit")
+	}
+	if _, ok := c.Resources.Requests[gpuResourceName]; ok {
 		t.Error("init container must not request nvidia.com/gpu")
 	}
 }

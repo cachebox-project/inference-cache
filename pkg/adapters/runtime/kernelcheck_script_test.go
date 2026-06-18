@@ -26,16 +26,21 @@ func runScript(t *testing.T, pkgParent string, strict bool) (string, int) {
 	// installed in the runner's site-packages can't leak in and skew the
 	// fixture; only what we put on PYTHONPATH is visible.
 	cmd := exec.Command(py, "-S", "-c", script)
-	// Drop any ambient KERNEL_CHECK_STRICT from the inherited env so a developer
-	// or CI box that happens to export it can't flip report-only runs to strict;
-	// the test sets it explicitly only when it means to.
-	env := []string{"PYTHONPATH=" + pkgParent, "KERNEL_CHECK_MSG=" + msg}
+	// Build a hermetic env: drop any ambient PYTHONPATH / KERNEL_CHECK_MSG /
+	// KERNEL_CHECK_STRICT the developer or CI box may export, then append our
+	// controlled values LAST. exec uses the last value for a duplicate key, so
+	// appending last also guarantees ours win even if the filter ever misses one
+	// — a stray ambient value can't skew the detector assertions.
+	env := make([]string, 0, len(os.Environ())+3)
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, EnvKernelCheckStrict+"=") {
+		if strings.HasPrefix(kv, "PYTHONPATH=") ||
+			strings.HasPrefix(kv, "KERNEL_CHECK_MSG=") ||
+			strings.HasPrefix(kv, EnvKernelCheckStrict+"=") {
 			continue
 		}
 		env = append(env, kv)
 	}
+	env = append(env, "PYTHONPATH="+pkgParent, "KERNEL_CHECK_MSG="+msg)
 	if strict {
 		env = append(env, EnvKernelCheckStrict+"=1")
 	}

@@ -123,7 +123,7 @@ func evaluateEngineKernelHealth(
 // than the (possibly since-changed) CacheBackend annotation.
 func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Pod) (cond metav1.Condition, active bool, strictFail bool) {
 	var seen bool
-	var failMsg string
+	var failMsg, errDetail string
 	var nFail, nErr, nPending, nOK int
 	for i := range pods {
 		// A pod participates in the gate if it carries the kernel-check init
@@ -160,7 +160,21 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 		case msg == adapterruntime.KernelCheckMsgOK:
 			nOK++
 		default:
+			// Terminated without our OK/FAIL: contract — python3 missing
+			// (exit 127), OOMKilled (137), an empty /dev/termination-log, or a
+			// crash before emit. Capture the exit code / kubelet reason / raw
+			// message so the operator-facing condition is actionable rather than
+			// just "unrecognized".
 			nErr++
+			if errDetail == "" {
+				errDetail = fmt.Sprintf("exit %d", term.ExitCode)
+				if term.Reason != "" {
+					errDetail += " " + term.Reason
+				}
+				if msg != "" {
+					errDetail += ": " + msg
+				}
+			}
 		}
 	}
 	if !seen {
@@ -181,7 +195,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 			fmt.Sprintf("native lmcache c_ops kernels failed to load on %d engine pod(s): %s", nFail, failMsg)), true, strictFail
 	case nErr > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckError,
-			fmt.Sprintf("kernel-check init container on %d engine pod(s) terminated without a recognized result message", nErr)), true, strictFail
+			fmt.Sprintf("kernel-check init container on %d engine pod(s) terminated without a recognized result message (%s)", nErr, errDetail)), true, strictFail
 	case nPending > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckPending,
 			fmt.Sprintf("kernel-check init container has not completed on %d engine pod(s)", nPending)), true, strictFail

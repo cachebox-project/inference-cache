@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -99,6 +100,23 @@ func TestAggregateKernelHealth(t *testing.T) {
 				t.Errorf("reason = %q, want %q", cond.Reason, tc.wantReason)
 			}
 		})
+	}
+}
+
+func TestAggregateKernelHealthErrorIncludesExitDetail(t *testing.T) {
+	// A KernelCheckError (terminated without our OK/FAIL: message — e.g. OOMKilled)
+	// must carry the exit code / reason / raw message so the condition is
+	// actionable, not just "unrecognized".
+	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns"}}
+	pod := podWithKernelStatus(corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+		ExitCode: 137, Reason: "OOMKilled",
+	}})
+	cond, active, _ := aggregateKernelHealth(cb, []corev1.Pod{pod})
+	if !active || cond.Reason != reasonKernelCheckError {
+		t.Fatalf("want active KernelCheckError; got active=%v reason=%q", active, cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "exit 137") || !strings.Contains(cond.Message, "OOMKilled") {
+		t.Errorf("KernelCheckError message must include the exit code + reason; got %q", cond.Message)
 	}
 }
 
