@@ -147,7 +147,25 @@
 #      LookupRoute(unknown model) the plaintext phase (7) ran and asserts the
 #      identical fail-open NO_HINT, proving the existing call pattern is
 #      unchanged over TLS (pure transport wrapper, no contract/behavior change).
-#  14. Every sample manifest under config/samples/ applies cleanly against
+#  14. The LMCache kernel-check injection shape is correct end-to-end: a
+#      GPU-requesting engine pod (labeled app=kc-inject-engine, bound to a
+#      dedicated LMCache CacheBackend) is admitted and carries a
+#      lmcache-kernel-check init container whose image EQUALS the engine
+#      container's image (the adapter reuses it so no extra image pull
+#      occurs). Exercises the mutating pod webhook's auto mode (inject
+#      iff GPU requested) end-to-end on the real installed bundle.
+#  15. The report-only FAIL condition path works fail-open: a dedicated
+#      LMCache CacheBackend (kc-cond) is annotated report-only, and a
+#      matching engine pod using python:3.11-slim runs the kernel-check
+#      init container, which exits 0 (fail-open) but writes "FAIL: lmcache
+#      not importable" to /dev/termination-log. The main container starts
+#      normally (pod Ready), proving report-only did not block the engine.
+#      The C2 reconciler reads the termination message and publishes
+#      EngineKernelsHealthy=False / reason=KernelLoadFailed on the
+#      CacheBackend status. The validating webhook also rejects an invalid
+#      lmcache-kernel-check annotation value (a typo would otherwise silently
+#      relax strict enforcement to report-only).
+#  16. Every sample manifest under config/samples/ applies cleanly against
 #      the live install: a server-side dry-run apply of each *.yaml/*.yml
 #      exercises CRD structural validation + the validating admission webhook
 #      on the real cluster. Complements `make verify-samples` (which runs the
@@ -159,22 +177,6 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
-#  15. The LMCache kernel-check injection shape is correct end-to-end: a
-#      GPU-requesting engine pod (labeled app=kc-inject-engine, bound to a
-#      dedicated LMCache CacheBackend) is admitted and carries a
-#      lmcache-kernel-check init container whose image EQUALS the engine
-#      container's image (the adapter reuses it so no extra image pull
-#      occurs). Exercises the mutating pod webhook's auto mode (inject
-#      iff GPU requested) end-to-end on the real installed bundle.
-#  16. The report-only FAIL condition path works fail-open: a dedicated
-#      LMCache CacheBackend (kc-cond) is annotated report-only, and a
-#      matching engine pod using python:3.11-slim runs the kernel-check
-#      init container, which exits 0 (fail-open) but writes "FAIL: lmcache
-#      not importable" to /dev/termination-log. The main container starts
-#      normally (pod Ready), proving report-only did not block the engine.
-#      The C2 reconciler reads the termination message and publishes
-#      EngineKernelsHealthy=False / reason=KernelLoadFailed on the
-#      CacheBackend status.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -2446,7 +2448,7 @@ if ! has_reason_code "$tls_lookup_resp" "NO_HINT"; then
 fi
 log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HINT, identical to the plaintext phase"
 
-# --- kernel-check init-container injection shape (assertion 15) ------------
+# --- kernel-check init-container injection shape (assertion 14) ------------
 # Block 1: prove the mutating pod webhook injects lmcache-kernel-check when
 # auto mode fires (GPU-requesting container). A dedicated LMCache CacheBackend
 # (kc-inject) is created in the kernel-check smoke namespace so the webhook
@@ -2456,7 +2458,12 @@ log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HI
 # GPU, so the pod stays Pending — that is expected and correct; the webhook
 # runs at admission, before scheduling. Only the SPEC is inspected here (no
 # status, no pod running).
-log "asserting lmcache-kernel-check init-container injection shape (assertion 15)"
+log "asserting lmcache-kernel-check init-container injection shape (assertion 14)"
+# Start from a clean namespace: on a rerun against a kept cluster, leftover pods
+# would be UPDATED by `kubectl apply` (the mutating webhook only fires on
+# CREATE), so the assertions could pass/fail on stale injected specs. Delete and
+# recreate so every fixture pod is created fresh and re-admitted.
+kubectl delete namespace "$KERNEL_CHECK_SMOKE_NS" --ignore-not-found=true --wait=true >/dev/null 2>&1 || true
 kubectl create namespace "$KERNEL_CHECK_SMOKE_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
 
@@ -2541,7 +2548,7 @@ if [ "$kc_init_image" != "busybox:1.36" ]; then
 fi
 log "lmcache-kernel-check init container injected; image=$kc_init_image (matches engine container — no extra pull)"
 
-# --- kernel-check report-only FAIL condition path (assertion 16) -----------
+# --- kernel-check report-only FAIL condition path (assertion 15) -----------
 # Block 2: prove the report-only FAIL path is fail-open and surfaces
 # EngineKernelsHealthy=False/KernelLoadFailed. A dedicated managed LMCache
 # CacheBackend (kc-cond) is annotated report-only. The matching engine pod
@@ -2558,7 +2565,7 @@ log "lmcache-kernel-check init container injected; image=$kc_init_image (matches
 # installed (find_spec returns None → the FAIL: branch fires). Using a non-python
 # image (e.g. pause) would produce a 127 exit / KernelCheckError, not
 # KernelLoadFailed, which would break the condition assertion.
-log "asserting report-only FAIL path: EngineKernelsHealthy=False/KernelLoadFailed (assertion 16)"
+log "asserting report-only FAIL path: EngineKernelsHealthy=False/KernelLoadFailed (assertion 15)"
 KC_COND_CB="kc-cond"
 KC_COND_ENGINE_POD="kc-cond-engine"
 kubectl apply -f - >/dev/null <<EOF

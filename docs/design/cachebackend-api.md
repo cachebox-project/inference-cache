@@ -194,13 +194,16 @@ on a live backend takes effect as its pods roll.
   few seconds to GPU engine-pod startup. The engine imports torch anyway.
 - **Report-only fail-open is best-effort.** The init container runs the engine
   image's own `python3`; in report-only mode the detector always exits 0, so a
-  `c_ops` failure never blocks the pod. The only residual ways it could block
-  are `python3` failing to start at all (which means the Python engine is
-  itself broken — not a false outage caused by this check) or an OOM during
-  `import torch` (mitigated by a generous init-container memory limit). The
-  check is deliberately *not* wrapped in a shell to force exit 0, because a
-  minimal/distroless image could lack `/bin/sh` and reintroduce the very block
-  the wrapper aimed to avoid.
+  `c_ops` failure never blocks the pod. It sets no CPU/memory *limits* (so it
+  can't trip a namespace `LimitRange` the engine itself satisfies) and only
+  modest requests that are subsumed by the engine's, so it never enlarges the
+  pod's scheduling/quota footprint. The only residual ways it could block are
+  `python3` failing to start at all (which means the Python engine is itself
+  broken — not a false outage caused by this check) or an OOM during `import
+  torch` (with no memory limit set, the import is bounded only by the pod/node,
+  so a tight limit can't OOM it). The check is deliberately *not* wrapped in a
+  shell to force exit 0, because a minimal/distroless image could lack
+  `/bin/sh` and reintroduce the very block the wrapper aimed to avoid.
 
 `EngineKernelsHealthy` complements `FunctionalProbeOK` (which round-trips the
 server-side cache path): the kernel check catches the engine-side load cause

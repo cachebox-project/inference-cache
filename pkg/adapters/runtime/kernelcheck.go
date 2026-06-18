@@ -179,23 +179,24 @@ func requestsGPU(c *corev1.Container) bool {
 	return false
 }
 
-// kernelCheckResources is the small envelope the init container runs in. No
-// nvidia.com/gpu request: the missing-libcudart dlopen failure is caught at
-// load time without a device. The 4Gi memory limit gives the detector's
-// `import torch` (which pulls in CUDA runtime libs) ample headroom so the
-// happy path can't OOM — proactively avoiding the one residual way report-only
-// could fail closed. Since init-container limits are max'd with (not summed
-// onto) the app containers' limits, this never enlarges the pod's footprint on
-// a GPU node whose engine container already requests far more.
+// kernelCheckResources is the small envelope the init container runs in. Only
+// modest REQUESTS, no limits, and no nvidia.com/gpu:
+//   - No nvidia.com/gpu: the missing-libcudart dlopen failure is caught at load
+//     time without a device.
+//   - No CPU/memory LIMITS: an explicit limit (e.g. 1 CPU / 4Gi) could exceed a
+//     namespace LimitRange's per-container max that the engine container still
+//     satisfies, which would fail the engine pod at admission — breaking the
+//     report-only "never blocks the pod" contract. Omitting the limit lets any
+//     LimitRange default apply within bounds, and leaves `import torch` bounded
+//     only by the pod/node (so a tight limit can't OOM it either).
+//   - Modest requests, subsumed by the engine container's larger requests
+//     (init requests are max'd with — not summed onto — app requests), so the
+//     check never enlarges the pod's scheduling/quota footprint.
 func kernelCheckResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("50m"),
 			corev1.ResourceMemory: resource.MustParse("256Mi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
 	}
 }

@@ -107,9 +107,11 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		}
 		ns := freshNS(t, k8s)
 
-		// Use a backend WITHOUT the strict annotation — default is report-only
-		// (fail-open): the kernel gate surfaces the condition but must not
-		// downgrade Ready.
+		// Backend without the strict annotation, paired below with an engine pod
+		// admitted in report-only mode (no KERNEL_CHECK_STRICT env on its init
+		// container). The gate surfaces the condition but must NOT downgrade
+		// Ready — fail-open. (The CR annotation default is `auto`; what gates the
+		// downgrade is the pod's admitted mode, not the annotation.)
 		cb := kernelCheckBackend("cache", ns, "" /* no strict annotation */)
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
@@ -229,7 +231,7 @@ func kernelCheckEngineLabels() map[string]string {
 // EngineSelector so the kernel-check gate has matched pods to inspect. The
 // KV-event gate (gatedLMCacheBackend) is inherited. kernelCheckMode is set as
 // the AnnotationLMCacheKernelCheck annotation value; pass "" to leave the
-// annotation absent (report-only default).
+// annotation absent (the CR default mode is `auto`).
 func kernelCheckBackend(name, ns, kernelCheckMode string) *cachev1alpha1.CacheBackend {
 	cb := gatedLMCacheBackend(name, ns)
 	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
