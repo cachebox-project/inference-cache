@@ -234,7 +234,7 @@ LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 EXTERNAL_BACKEND_TIMEOUT="${EXTERNAL_BACKEND_TIMEOUT:-30}" # seconds
 EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 
-# Kernel-check smoke tunables (assertions 15 + 16).
+# Kernel-check smoke tunables (assertions 14 + 15).
 # KERNEL_CHECK_SMOKE_NS is a dedicated namespace created + deleted by those
 # two phases so they don't leave fixtures in other namespaces.
 KERNEL_CHECK_SMOKE_NS="${KERNEL_CHECK_SMOKE_NS:-ic-smoke-kernel-check}"

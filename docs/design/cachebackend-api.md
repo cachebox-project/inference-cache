@@ -194,14 +194,19 @@ on a live backend takes effect as its pods roll.
   few seconds to GPU engine-pod startup. The engine imports torch anyway.
 - **Report-only fail-open is best-effort.** The init container runs the engine
   image's own `python3`; in report-only mode the detector always exits 0, so a
-  `c_ops` failure never blocks the pod. It sets no CPU/memory *requests or
-  limits*, so it can't trip a namespace `LimitRange` the engine itself satisfies
-  and never enlarges the pod's scheduling/quota footprint. The only residual
-  ways it could block are
-  `python3` failing to start at all (which means the Python engine is itself
-  broken — not a false outage caused by this check) or an OOM during `import
-  torch` (with no memory limit set, the import is bounded only by the pod/node,
-  so a tight limit can't OOM it). The check is deliberately *not* wrapped in a
+  `c_ops` failure never blocks the pod. The init container declares small CPU/
+  memory requests and no limits — the most broadly-compatible shape, but note
+  that *no* resource shape is fail-open under every namespace policy: a
+  `ResourceQuota`/`LimitRange` that requires per-container requests rejects a
+  container with none, while a `LimitRange` per-container max can reject large
+  ones. Small requests stay below any max the GBs-needing engine already
+  satisfies and are subsumed by the engine's in the pod's effective request
+  (so no scheduling/quota footprint increase); omitting limits avoids the
+  max-limit trip. The other residual ways it could block are `python3` failing
+  to start at all (which means the Python engine is itself broken — not a false
+  outage caused by this check) or an OOM during `import torch` (with no memory
+  limit set, the import is bounded only by the pod/node, so a tight limit can't
+  OOM it). The check is deliberately *not* wrapped in a
   shell to force exit 0, because a minimal/distroless image could lack
   `/bin/sh` and reintroduce the very block the wrapper aimed to avoid.
 
@@ -246,7 +251,7 @@ Five condition types are published on managed backends (`Ready`, `Degraded`, `Pr
 
 | Type | Meaning |
 |---|---|
-| `Ready` | True once the backend Deployment has rolled out its current generation, has enough updated + available replicas to serve traffic, **and** — when the [KV-event readiness gate](#kv-event-readiness-gate) applies — at least one KV event has been observed for the backend (reason `KVEventsObserved`), **and** — when the [functional-probe gate](#functional-probe-gate) applies — the most recent probe call succeeded across every stage the backend runs. Workload Available but no event yet is `Ready=False`, reason `AwaitingFirstKVEvent`. Workload Available and KV-event observed but the probe reported a stage failure is `Ready=False` with reason `ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`. Deployment-level reasons: `BackendReady` (both gates disabled and Available), `RolloutInProgress`, `ScaledToZero`, `ReplicasUnavailable`. The `BackendDegraded` / `BackendRecovered` Events narrate the `ReplicasUnavailable` → `BackendReady` / `KVEventsObserved` transitions. |
+| `Ready` | True once the backend Deployment has rolled out its current generation, has enough updated + available replicas to serve traffic, **and** — when the [KV-event readiness gate](#kv-event-readiness-gate) applies — at least one KV event has been observed for the backend (reason `KVEventsObserved`), **and** — when the [functional-probe gate](#functional-probe-gate) applies — the most recent probe call succeeded across every stage the backend runs. Workload Available but no event yet is `Ready=False`, reason `AwaitingFirstKVEvent`. Workload Available and KV-event observed but the probe reported a stage failure is `Ready=False` with reason `ProbeIngestFailed` / `ProbeRoutingFailed` / `ProbeT2Failed`. Deployment-level reasons: `BackendReady` (both gates disabled and Available), `RolloutInProgress`, `ScaledToZero`, `ReplicasUnavailable`. **And** — when a matched engine pod admitted in **strict** kernel-check mode reports a kernel load failure — `Ready=False` with reason `EngineKernelDegraded` (see [`EngineKernelsHealthy`](#conditions)); report-only mode never downgrades `Ready`. The `BackendDegraded` / `BackendRecovered` Events narrate the `ReplicasUnavailable` → `BackendReady` / `KVEventsObserved` transitions. |
 | `Degraded` | True when the backend is in a terminal unhealthy state: rolled out but replicas unavailable (reason `ReplicasUnavailable`), or the managed workload is Available but no KV event observed within `firstEventTimeout` (reason `NoKVEventsObserved`). False (`NotDegraded`) otherwise. The functional-probe gate does NOT participate in `Degraded` — a probe failure is reflected only in `Ready` and `FunctionalProbeOK`, leaving `Degraded` reserved for managed-Deployment health (so an operator can tell "the probe says the cache plane is broken" apart from "the workload itself is in a terminal state"). |
 | `Progressing` | True while the controller is still driving the live state toward the desired state (rollout in flight, first apply, awaiting first KV event). False once converged (`Synced`), stuck (`Degraded`), or scaled to zero (`ScaledToZero`). The pair (`Ready=False`, `Progressing=True`) means "still converging"; (`Ready=False`, `Progressing=False`) means "stuck/degraded" (or scaled to zero). |
 | `FunctionalProbeOK` | The most recent functional-probe outcome. `True/ProbeOK` when every enabled stage (ingest, routing, and — for LMCache — tier-2 put/get) round-tripped; `True/ProbeBypassed` when the operator opted this CR out via the `inferencecache.io/skip-functional-probe: "true"` annotation; `False/ProbeIngestFailed`, `False/ProbeRoutingFailed`, or `False/ProbeT2Failed` when the named stage failed, with the server's diagnostic in `.message`; `Unknown/ProbeError` when the controller could not reach the server's `/probe` endpoint at all (transport error, 5xx) AND no prior stage failure existed. **Sticky-False**: an HTTP error while a `False/Probe*Failed` is already published preserves the prior failure and keeps `Ready` downgraded, so a transient server outage cannot fade a known per-stage failure back to `Unknown` and then to `Ready=True`. See [functional-probe gate](#functional-probe-gate). |

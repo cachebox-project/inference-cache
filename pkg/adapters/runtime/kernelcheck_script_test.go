@@ -26,13 +26,20 @@ func runScript(t *testing.T, pkgParent string, strict bool) (string, int) {
 	// installed in the runner's site-packages can't leak in and skew the
 	// fixture; only what we put on PYTHONPATH is visible.
 	cmd := exec.Command(py, "-S", "-c", script)
-	cmd.Env = append(os.Environ(),
-		"PYTHONPATH="+pkgParent,
-		"KERNEL_CHECK_MSG="+msg,
-	)
-	if strict {
-		cmd.Env = append(cmd.Env, "KERNEL_CHECK_STRICT=1")
+	// Drop any ambient KERNEL_CHECK_STRICT from the inherited env so a developer
+	// or CI box that happens to export it can't flip report-only runs to strict;
+	// the test sets it explicitly only when it means to.
+	env := []string{"PYTHONPATH=" + pkgParent, "KERNEL_CHECK_MSG=" + msg}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, EnvKernelCheckStrict+"=") {
+			continue
+		}
+		env = append(env, kv)
 	}
+	if strict {
+		env = append(env, EnvKernelCheckStrict+"=1")
+	}
+	cmd.Env = env
 	err = cmd.Run()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {

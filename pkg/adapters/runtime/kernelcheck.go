@@ -2,6 +2,7 @@ package runtime
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -179,19 +180,29 @@ func requestsGPU(c *corev1.Container) bool {
 	return false
 }
 
-// kernelCheckResources is the (intentionally empty) resource envelope for the
-// init container — no requests, no limits, no nvidia.com/gpu:
+// kernelCheckResources is the resource envelope for the init container: small
+// CPU/memory requests, no limits, no nvidia.com/gpu. There is no resource shape
+// that is fail-open under EVERY namespace policy (a ResourceQuota/LimitRange may
+// REQUIRE per-container requests, while a LimitRange max may REJECT large
+// ones); this is the most broadly-compatible compromise:
 //   - No nvidia.com/gpu: the missing-libcudart dlopen failure is caught at load
 //     time without a device.
-//   - No CPU/memory limits: an explicit limit could exceed a namespace
-//     LimitRange's per-container max that the engine container still satisfies,
-//     failing the engine pod at admission — breaking the report-only "never
-//     blocks the pod" contract. Omitting it leaves `import torch` bounded only
-//     by the pod/node, so a tight limit can't OOM it either.
-//   - No requests: even a modest request would raise the pod's effective
-//     request when the engine container requests less, contradicting the "never
-//     enlarges scheduling/quota footprint" guarantee. With none, a namespace
-//     LimitRange default (if any) applies within bounds.
+//   - Small requests (not none): a namespace with a `requests.*` ResourceQuota
+//     or a min-only LimitRange rejects a container that specifies no request,
+//     which would block the engine pod — so the check declares modest ones. The
+//     engine container (a GPU vLLM image needing GiB of RAM) requests far more,
+//     so these are below any per-container max it already satisfies AND are
+//     subsumed by it in the pod's effective request (init requests are max'd
+//     with, not summed onto, app requests) — no scheduling/quota footprint
+//     increase.
+//   - No limits: an explicit limit could exceed a LimitRange per-container max
+//     the engine still satisfies; omitting it lets any LimitRange default apply
+//     within bounds and leaves `import torch` bounded only by the pod/node.
 func kernelCheckResources() corev1.ResourceRequirements {
-	return corev1.ResourceRequirements{}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
 }
