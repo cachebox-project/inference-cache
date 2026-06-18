@@ -1355,6 +1355,21 @@ if [ -n "$fp_status" ]; then
 fi
 log "functional-probe cascade-prevention holds: FunctionalProbeOK absent while Ready=False/AwaitingFirstKVEvent"
 
+# T2Degraded (advisory tier-2 offload health) must likewise be ABSENT on a
+# backend that has not exercised its tier-2 cache: the condition is derived from
+# status.indexParticipation.t2HitRate, which stays nil until external lookups
+# are observed. A fresh smoke backend drives no tier-2 traffic, so the operator
+# must NOT see a T2Degraded breadcrumb here — a present condition (even
+# False) would be a misleading "tier-2 is being tracked" signal where the
+# tier was never used.
+t2_status="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.status.conditions[?(@.type=="T2Degraded")].status}' 2>/dev/null || true)"
+if [ -n "$t2_status" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "T2Degraded condition present (status=$t2_status) on a backend that has not exercised tier-2 — it must be absent until external lookups are observed"
+fi
+log "T2Degraded absent until tier-2 is exercised (no-traffic steady state)"
+
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the
 # Event with this UID, not the empty one a webhook-recorded Event
