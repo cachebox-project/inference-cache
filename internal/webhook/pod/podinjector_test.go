@@ -909,7 +909,7 @@ func TestHandle_EndpointNotPublished_FailOpen(t *testing.T) {
 	}
 }
 
-func TestHandle_SkipAnnotation_Passthrough(t *testing.T) {
+func TestHandle_SkipAnnotation_StampsInjectSkipped(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
