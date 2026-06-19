@@ -2087,9 +2087,10 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 			return out
 		}
 		count := int32(len(pods.Items))
+		nonTerminalCount := nonTerminalPodCount(pods.Items)
 		desired, desiredKnown, desiredReliable := r.desiredEngineReplicas(ctx, backend, matcher)
 		selectorDiagnosticReliable = desiredReliable
-		if desiredReliable && desiredKnown && desired != count {
+		if desiredReliable && desiredKnown && desired != nonTerminalCount {
 			out.churn = true
 		}
 
@@ -2157,6 +2158,19 @@ func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, back
 		desired += replicas
 	}
 	return desired, found, true
+}
+
+func nonTerminalPodCount(pods []corev1.Pod) int32 {
+	var count int32
+	for i := range pods {
+		switch pods[i].Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			continue
+		default:
+			count++
+		}
+	}
+	return count
 }
 
 func engineSelectorUnmatchedMessage(matchLabels map[string]string) string {

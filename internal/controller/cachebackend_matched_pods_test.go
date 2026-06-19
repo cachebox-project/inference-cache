@@ -673,6 +673,49 @@ func TestReconcileMatchedEnginePodsUsesChurnCadenceWhenDeploymentDesiredDisagree
 	}
 }
 
+func TestReconcileMatchedEnginePodsUsesSteadyCadenceWithTerminalPods(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(2),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	failedPod := engineLikePod("evicted", "ns1", matchedSelector)
+	failedPod.Status.Phase = corev1.PodFailed
+	r := newReconciler(scheme,
+		cb,
+		dep,
+		engineLikePod("e1", "ns1", matchedSelector),
+		engineLikePod("e2", "ns1", matchedSelector),
+		failedPod,
+	)
+	r.MatchedEnginePodsRequeueInterval = 30 * time.Second
+	r.MatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want steady 30s when desired replicas match non-terminal pods", res.RequeueAfter)
+	}
+	got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods
+	if got == nil || *got != 3 {
+		t.Fatalf("status.matchedEnginePods = %v, want all-phase observed count 3", got)
+	}
+}
+
 func TestReconcileMatchedEnginePodsUsesSteadyCadenceWithoutMatchingDeployment(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
