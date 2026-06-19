@@ -221,6 +221,22 @@ func TestReconcileMatchedEnginePodsEmitsUnmatchedEventOnInitialZeroAndTransition
 	expectEvent(t, events, "no Pods in namespace match")
 }
 
+func TestReconcileMatchedEnginePodsEmitsUnmatchedEventWhenMessageAddedToExistingZero(t *testing.T) {
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	cb.Status.MatchedEnginePods = ptrInt32(0)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.EngineSelectorMessage == "" {
+		t.Fatalf("status.engineSelectorMessage empty, want no-match diagnosis added")
+	}
+	events := drainEvents(rec)
+	expectEvent(t, events, "Normal "+eventReasonEngineSelectorUnmatched)
+	expectEvent(t, events, "no Pods in namespace match")
+}
+
 func TestReconcileMatchedEnginePodsNoUnmatchedEventWithoutSelector(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
 	r, rec := newReconcilerWithRecorder(t, cb)

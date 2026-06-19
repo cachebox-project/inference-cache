@@ -2114,7 +2114,8 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 
 	if r.Recorder != nil && backend.Status.MatchedEnginePods != nil &&
 		*backend.Status.MatchedEnginePods == 0 && backend.Status.EngineSelectorMessage != "" &&
-		(before.Status.MatchedEnginePods == nil || *before.Status.MatchedEnginePods > 0) {
+		(before.Status.MatchedEnginePods == nil || *before.Status.MatchedEnginePods > 0 ||
+			before.Status.EngineSelectorMessage == "") {
 		r.Recorder.Eventf(backend, nil, corev1.EventTypeNormal,
 			eventReasonEngineSelectorUnmatched, eventReasonEngineSelectorUnmatched,
 			"%s", backend.Status.EngineSelectorMessage)

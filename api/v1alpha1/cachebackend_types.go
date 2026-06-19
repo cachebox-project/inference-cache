@@ -598,9 +598,10 @@ type CacheBackendStatus struct {
 	// EngineSelectorMessage explains the current engineSelector matching
 	// observation when it needs operator attention. It is set when
 	// spec.engineSelector.matchLabels is configured but matchedEnginePods is
-	// observed as 0, and cleared once at least one pod matches or the selector
-	// is removed. The message echoes the selector so an operator can compare it
-	// directly with engine Deployment pod-template labels.
+	// observed as 0 while engine pods are expected, and cleared once at least
+	// one pod matches, the matching Deployment is intentionally scaled to zero,
+	// or the selector is removed. The message echoes the selector so an operator
+	// can compare it directly with engine Deployment pod-template labels.
 	// +optional
 	EngineSelectorMessage string `json:"engineSelectorMessage,omitempty"`
 
