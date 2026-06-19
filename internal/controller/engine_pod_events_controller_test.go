@@ -167,6 +167,19 @@ func TestEnginePodEvents_EmitsSkippedEventOnSkippedPod(t *testing.T) {
 	}
 }
 
+func TestEnginePodEvents_NoSkippedEventOnForgedInjectSkippedMarker(t *testing.T) {
+	const ns = "engines"
+	pod := skippedPod("engine-forged-skip", ns, map[string]string{"app": "vllm"})
+	delete(pod.Annotations, podwebhook.AnnotationSkip)
+	r, rec := newEnginePodEventsReconciler(t, pod)
+
+	reconcilePod(t, r, ns, pod.Name)
+
+	if got := drainRecorder(rec); len(got) != 0 {
+		t.Fatalf("expected no skipped event when %s is absent; got %v", podwebhook.AnnotationSkip, got)
+	}
+}
+
 func TestEnginePodEventsPredicateIncludesInjectedAndSkippedPods(t *testing.T) {
 	const ns = "engines"
 	if !enginePodEventCandidate(injectedPod("engine-a", ns, ns+"/primary", nil)) {
@@ -174,6 +187,16 @@ func TestEnginePodEventsPredicateIncludesInjectedAndSkippedPods(t *testing.T) {
 	}
 	if !enginePodEventCandidate(skippedPod("engine-skip", ns, nil)) {
 		t.Fatalf("skipped pod was not accepted by predicate")
+	}
+	forgedSkip := skippedPod("forged-skip", ns, nil)
+	delete(forgedSkip.Annotations, podwebhook.AnnotationSkip)
+	if enginePodEventCandidate(forgedSkip) {
+		t.Fatalf("pod with only %s was accepted by predicate", podwebhook.AnnotationInjectSkipped)
+	}
+	falseSkip := skippedPod("false-skip", ns, nil)
+	falseSkip.Annotations[podwebhook.AnnotationSkip] = "false"
+	if enginePodEventCandidate(falseSkip) {
+		t.Fatalf("pod with falsey %s was accepted by predicate", podwebhook.AnnotationSkip)
 	}
 	if enginePodEventCandidate(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: ns}}) {
 		t.Fatalf("plain pod was accepted by predicate")

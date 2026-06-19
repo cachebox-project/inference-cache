@@ -1148,8 +1148,8 @@ func TestSkipAnnotationOptsOut(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.val, func(t *testing.T) {
-			if got := skipAnnotationOptsOut(tc.val); got != tc.want {
-				t.Fatalf("skipAnnotationOptsOut(%q): got %v want %v", tc.val, got, tc.want)
+			if got := SkipAnnotationOptsOut(tc.val); got != tc.want {
+				t.Fatalf("SkipAnnotationOptsOut(%q): got %v want %v", tc.val, got, tc.want)
 			}
 		})
 	}

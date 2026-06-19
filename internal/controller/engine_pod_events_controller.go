@@ -40,9 +40,10 @@ const (
 )
 
 // EnginePodEventsReconciler watches engine pods that the mutating Pod
-// webhook stamped with [podwebhook.AnnotationInjectedBy] or
-// [podwebhook.AnnotationInjectSkipped] and emits a describe-visible Kubernetes
-// Event keyed by the live pod's UID.
+// webhook stamped with [podwebhook.AnnotationInjectedBy] or with the explicit
+// operator opt-out pair ([podwebhook.AnnotationSkip] plus
+// [podwebhook.AnnotationInjectSkipped]) and emits a describe-visible
+// Kubernetes Event keyed by the live pod's UID.
 //
 // Out of scope on purpose:
 //   - No-match events. A pod with no podwebhook.AnnotationInjectedBy could be (a)
@@ -90,8 +91,9 @@ type EnginePodEventsReconciler struct {
 // Skip table (each case returns `(ctrl.Result{}, nil)` — admission is
 // CREATE-only, so a skipped reconcile is a permanent drop, but
 // deliberately so for these cases):
-//   - Pod has neither `injected-by` nor `inject-skipped` annotation. The
-//     predicate already filters this out; defense in depth.
+//   - Pod has neither `injected-by` nor the skip-inject + inject-skipped
+//     operator opt-out pair. The predicate already filters this out; defense
+//     in depth.
 //   - `injected-by` value does not parse as `<ns>/<name>` (malformed or
 //     stale under an older annotation contract).
 //   - `injected-by-uid` annotation is missing. The webhook always writes
@@ -119,7 +121,8 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	cbRef := pod.Annotations[podwebhook.AnnotationInjectedBy]
 	if cbRef == "" {
-		if pod.Annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation {
+		if podwebhook.SkipAnnotationOptsOut(pod.Annotations[podwebhook.AnnotationSkip]) &&
+			pod.Annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation {
 			if r.Recorder == nil {
 				return ctrl.Result{}, nil
 			}
@@ -310,7 +313,8 @@ func (r *EnginePodEventsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func enginePodEventCandidate(obj client.Object) bool {
 	annotations := obj.GetAnnotations()
 	return annotations[podwebhook.AnnotationInjectedBy] != "" ||
-		annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation
+		(podwebhook.SkipAnnotationOptsOut(annotations[podwebhook.AnnotationSkip]) &&
+			annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation)
 }
 
 // createOnlyPredicate enqueues a Pod only on CREATE. UPDATE/DELETE/GENERIC

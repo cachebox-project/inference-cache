@@ -140,7 +140,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		pod.Namespace = req.Namespace
 	}
 
-	if skipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
+	if SkipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
 		return skipInjection(req, &pod)
 	}
 
@@ -350,14 +350,14 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 	return nil, nil
 }
 
-// skipAnnotationOptsOut returns true when the value of [AnnotationSkip]
+// SkipAnnotationOptsOut returns true when the value of [AnnotationSkip]
 // should be treated as an opt-out. Truthy values (anything strconv.ParseBool
 // accepts as true) opt out; non-empty values that ParseBool can't interpret
 // (e.g. "yes", "skip", an operator's free-form note) also opt out — making
 // the annotation "set with any meaningful value disables injection."
 // Explicitly falsey values ("false", "0", "f", "no") leave injection
 // enabled, so `inferencecache.io/skip-inject: "false"` does NOT disable.
-func skipAnnotationOptsOut(value string) bool {
+func SkipAnnotationOptsOut(value string) bool {
 	if value == "" {
 		return false
 	}
@@ -386,14 +386,14 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 
 // failOpen builds the admission response for any fail-open return path
 // AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy on the persisted pod means "the webhook successfully
-// stamped this pod" — that's what the engine-pod-events controller keys
-// `InjectedByCacheBackend` off of. The annotation is user-controllable
-// (anyone with pod-create RBAC can set it) and the webhook does not
-// overwrite it on fail-open paths, so a copy/paste from an injected pod's
-// metadata, or an attacker forging the annotation, would otherwise trip
-// the controller into emitting "Injected engine config" for a pod the
-// webhook never touched.
+// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
+// "the webhook successfully made this decision" — those are what the
+// engine-pod-events controller keys `InjectedByCacheBackend` and
+// `SkippedByOperator` off of. The annotations are user-controllable (anyone
+// with pod-create RBAC can set them) and the webhook does not overwrite them
+// on fail-open paths, so a copy/paste from a mutated pod's metadata, or an
+// attacker forging the annotations, would otherwise trip the controller into
+// emitting an event for a pod the webhook never touched.
 //
 // Fix: on every fail-open return, strip the annotation if it was
 // preset. Steady-state cost stays at zero patches per pod for the common
