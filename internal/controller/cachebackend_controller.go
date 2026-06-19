@@ -2086,12 +2086,13 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 			return out
 		}
 		count := int32(len(pods.Items))
-		if desired, ok := r.desiredEngineReplicas(ctx, backend, matcher); ok && desired != count {
+		desired, desiredKnown := r.desiredEngineReplicas(ctx, backend, matcher)
+		if desiredKnown && desired != count {
 			out.churn = true
 		}
 
 		message := ""
-		if count == 0 {
+		if count == 0 && (!desiredKnown || desired > 0) {
 			message = engineSelectorUnmatchedMessage(sel.MatchLabels)
 		}
 		if backend.Status.MatchedEnginePods != nil &&

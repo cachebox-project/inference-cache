@@ -96,6 +96,36 @@ func TestReconcileMatchedEnginePodsZeroWhenSelectorMatchesNothing(t *testing.T) 
 	}
 }
 
+func TestReconcileMatchedEnginePodsNoUnmatchedDiagnosticWhenDeploymentScaledToZero(t *testing.T) {
+	const ns = "ns1"
+	cb := lmcacheBackendWithSelector("cache", ns, matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(0),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	r, rec := newReconcilerWithRecorder(t, cb, dep)
+
+	reconcile(t, r, "cache", ns)
+
+	got := getBackend(t, r, "cache", ns)
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 0 {
+		t.Fatalf("status.matchedEnginePods = %v, want observed 0", got.Status.MatchedEnginePods)
+	}
+	if got.Status.EngineSelectorMessage != "" {
+		t.Fatalf("status.engineSelectorMessage = %q, want empty for intentionally scaled-to-zero Deployment", got.Status.EngineSelectorMessage)
+	}
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
+}
+
 func TestReconcileMatchedEnginePodsNilWhenSelectorAbsent(t *testing.T) {
 	scheme := newScheme(t)
 	// A CacheBackend without an engineSelector matches no pods by
