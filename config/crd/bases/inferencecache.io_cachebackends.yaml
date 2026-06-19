@@ -2204,6 +2204,15 @@ spec:
                 description: Endpoint is the observed endpoint clients should use
                   for this backend.
                 type: string
+              engineSelectorMessage:
+                description: |-
+                  EngineSelectorMessage explains the current engineSelector matching
+                  observation when it needs operator attention. It is set when
+                  spec.engineSelector.matchLabels is configured but matchedEnginePods is
+                  observed as 0, and cleared once at least one pod matches or the selector
+                  is removed. The message echoes the selector so an operator can compare it
+                  directly with engine Deployment pod-template labels.
+                type: string
               failOpen:
                 description: |-
                   FailOpen mirrors the effective spec.integration.failOpen value the

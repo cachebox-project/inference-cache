@@ -595,6 +595,15 @@ type CacheBackendStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	MatchedEnginePods *int32 `json:"matchedEnginePods,omitempty"`
 
+	// EngineSelectorMessage explains the current engineSelector matching
+	// observation when it needs operator attention. It is set when
+	// spec.engineSelector.matchLabels is configured but matchedEnginePods is
+	// observed as 0, and cleared once at least one pod matches or the selector
+	// is removed. The message echoes the selector so an operator can compare it
+	// directly with engine Deployment pod-template labels.
+	// +optional
+	EngineSelectorMessage string `json:"engineSelectorMessage,omitempty"`
+
 	// FailOpen mirrors the effective spec.integration.failOpen value the
 	// controller most recently observed. Surfaced so operators can confirm
 	// whether the cache is currently a soft optimization (true) or a

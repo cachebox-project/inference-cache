@@ -921,8 +921,12 @@ func TestHandle_SkipAnnotation_Passthrough(t *testing.T) {
 	if !resp.Allowed {
 		t.Fatalf("expected Allowed, got: %+v", resp.Result)
 	}
-	if len(resp.Patches) != 0 {
-		t.Fatalf("expected no patches when opt-out annotation set, got %d", len(resp.Patches))
+	if len(resp.Patches) == 0 {
+		t.Fatalf("expected skip-inject path to stamp %s, got no patches", AnnotationInjectSkipped)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if got := mutated.Annotations[AnnotationInjectSkipped]; got != InjectSkippedReasonSkipAnnotation {
+		t.Fatalf("annotation %s = %q, want %q", AnnotationInjectSkipped, got, InjectSkippedReasonSkipAnnotation)
 	}
 }
 
@@ -1156,12 +1160,65 @@ func TestHandle_SkipAnnotationFalse_StillInjects(t *testing.T) {
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
-	pod.Annotations = map[string]string{AnnotationSkip: "false"}
+	pod.Annotations = map[string]string{
+		AnnotationSkip:          "false",
+		AnnotationInjectSkipped: InjectSkippedReasonSkipAnnotation,
+	}
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
 	if !resp.Allowed || len(resp.Patches) == 0 {
 		t.Fatalf("explicit skip-inject=false must still inject; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if got := mutated.Annotations[AnnotationInjectSkipped]; got != "" {
+		t.Fatalf("annotation %s = %q, want absent when skip-inject=false", AnnotationInjectSkipped, got)
+	}
+}
+
+func TestHandle_FailOpenClearsStaleInjectSkipped(t *testing.T) {
+	const ns = "engines"
+	h := newHandler(t /* no CacheBackend seeded, so no selector match */)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Annotations = map[string]string{AnnotationInjectSkipped: InjectSkippedReasonSkipAnnotation}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("fail-open with stale %s must admit with a clearing patch; Allowed=%v patches=%d",
+			AnnotationInjectSkipped, resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if got := mutated.Annotations[AnnotationInjectSkipped]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on fail-open", AnnotationInjectSkipped, got)
+	}
+}
+
+func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Annotations = map[string]string{
+		AnnotationSkip:          "true",
+		AnnotationInjectedBy:    ns + "/" + cb.Name,
+		AnnotationInjectedByUID: string(cb.UID),
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("skip-inject=true must admit with a patch; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if got := mutated.Annotations[AnnotationInjectSkipped]; got != InjectSkippedReasonSkipAnnotation {
+		t.Fatalf("annotation %s = %q, want %q", AnnotationInjectSkipped, got, InjectSkippedReasonSkipAnnotation)
+	}
+	if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedBy, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedByUID, got)
 	}
 }
 
