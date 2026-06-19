@@ -2055,6 +2055,7 @@ type matchedEnginePodsRefresh struct {
 func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, backend *cachev1alpha1.CacheBackend) matchedEnginePodsRefresh {
 	before := backend.DeepCopy()
 	var out matchedEnginePodsRefresh
+	selectorDiagnosticReliable := true
 
 	sel := backend.Spec.EngineSelector
 	if sel == nil || len(sel.MatchLabels) == 0 {
@@ -2086,14 +2087,21 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 			return out
 		}
 		count := int32(len(pods.Items))
-		desired, desiredKnown := r.desiredEngineReplicas(ctx, backend, matcher)
-		if desiredKnown && desired != count {
+		desired, desiredKnown, desiredReliable := r.desiredEngineReplicas(ctx, backend, matcher)
+		selectorDiagnosticReliable = desiredReliable
+		if desiredReliable && desiredKnown && desired != count {
 			out.churn = true
 		}
 
-		message := ""
-		if count == 0 && (!desiredKnown || desired > 0) {
-			message = engineSelectorUnmatchedMessage(sel.MatchLabels)
+		message := backend.Status.EngineSelectorMessage
+		if count > 0 {
+			message = ""
+		} else if desiredReliable {
+			if !desiredKnown || desired > 0 {
+				message = engineSelectorUnmatchedMessage(sel.MatchLabels)
+			} else {
+				message = ""
+			}
 		}
 		if backend.Status.MatchedEnginePods != nil &&
 			*backend.Status.MatchedEnginePods == count &&
@@ -2112,7 +2120,7 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 		return out
 	}
 
-	if r.Recorder != nil && backend.Status.MatchedEnginePods != nil &&
+	if r.Recorder != nil && selectorDiagnosticReliable && backend.Status.MatchedEnginePods != nil &&
 		*backend.Status.MatchedEnginePods == 0 && backend.Status.EngineSelectorMessage != "" &&
 		(before.Status.MatchedEnginePods == nil || *before.Status.MatchedEnginePods > 0 ||
 			before.Status.EngineSelectorMessage == "") {
@@ -2123,7 +2131,7 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 	return out
 }
 
-func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, backend *cachev1alpha1.CacheBackend, matcher labels.Selector) (int32, bool) {
+func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, backend *cachev1alpha1.CacheBackend, matcher labels.Selector) (int32, bool, bool) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
@@ -2132,7 +2140,7 @@ func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, back
 	if err := reader.List(ctx, &deps, client.InNamespace(backend.Namespace)); err != nil {
 		log.FromContext(ctx).V(1).Info("matchedEnginePods desired-replica refresh skipped: deployment list failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return 0, false
+		return 0, false, false
 	}
 	var desired int32
 	var found bool
@@ -2148,7 +2156,7 @@ func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, back
 		}
 		desired += replicas
 	}
-	return desired, found
+	return desired, found, true
 }
 
 func engineSelectorUnmatchedMessage(matchLabels map[string]string) string {

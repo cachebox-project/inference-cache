@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -415,6 +416,60 @@ func TestReconcileMatchedEnginePodsFailSoftOnListError(t *testing.T) {
 	if *got != 5 {
 		t.Fatalf("status.matchedEnginePods = %d after transient list error; want preserved (5)", *got)
 	}
+}
+
+func TestReconcileMatchedEnginePodsNoUnmatchedDiagnosticOnDeploymentListError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(0),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+
+	listErr := errors.New("synthetic deployment list failure")
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*appsv1.DeploymentList); ok {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb, dep).
+		WithInterceptorFuncs(funcs).
+		Build()
+	rec := events.NewFakeRecorder(16)
+	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 0 {
+		t.Fatalf("status.matchedEnginePods = %v, want observed 0", got.Status.MatchedEnginePods)
+	}
+	if got.Status.EngineSelectorMessage != "" {
+		t.Fatalf("status.engineSelectorMessage = %q, want preserved empty when Deployment list fails", got.Status.EngineSelectorMessage)
+	}
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
 }
 
 // TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError pins the second
