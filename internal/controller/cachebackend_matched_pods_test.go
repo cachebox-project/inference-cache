@@ -571,3 +571,24 @@ func TestReconcileMatchedEnginePodsUsesChurnCadenceWhenDeploymentDesiredDisagree
 		t.Fatalf("RequeueAfter = %s, want steady 30s once desired replicas match observed pods", res.RequeueAfter)
 	}
 }
+
+func TestReconcileMatchedEnginePodsUsesSteadyCadenceWithoutMatchingDeployment(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	r := newReconciler(scheme, cb,
+		engineLikePod("e1", "ns1", matchedSelector),
+		engineLikePod("e2", "ns1", matchedSelector),
+	)
+	r.MatchedEnginePodsRequeueInterval = 30 * time.Second
+	r.MatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want steady 30s for matching pods without a matching Deployment", res.RequeueAfter)
+	}
+}

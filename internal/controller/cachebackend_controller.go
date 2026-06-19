@@ -2133,20 +2133,20 @@ func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, back
 		return 0, false
 	}
 	var desired int32
+	var found bool
 	for i := range deps.Items {
 		dep := &deps.Items[i]
 		if !matcher.Matches(labels.Set(dep.Spec.Template.Labels)) {
 			continue
 		}
+		found = true
 		replicas := int32(1)
 		if dep.Spec.Replicas != nil {
 			replicas = *dep.Spec.Replicas
 		}
-		if replicas > 0 {
-			desired += replicas
-		}
+		desired += replicas
 	}
-	return desired, true
+	return desired, found
 }
 
 func engineSelectorUnmatchedMessage(matchLabels map[string]string) string {
