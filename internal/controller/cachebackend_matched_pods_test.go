@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -88,6 +90,41 @@ func TestReconcileMatchedEnginePodsZeroWhenSelectorMatchesNothing(t *testing.T) 
 	if *got != 0 {
 		t.Fatalf("status.matchedEnginePods = %d, want 0", *got)
 	}
+	msg := getBackend(t, r, "cache", "ns1").Status.EngineSelectorMessage
+	if !strings.Contains(msg, "spec.engineSelector.matchLabels={app:engine}") ||
+		!strings.Contains(msg, "no Pods in namespace match") {
+		t.Fatalf("status.engineSelectorMessage = %q, want selector echo and no-match diagnosis", msg)
+	}
+}
+
+func TestReconcileMatchedEnginePodsNoUnmatchedDiagnosticWhenDeploymentScaledToZero(t *testing.T) {
+	const ns = "ns1"
+	cb := lmcacheBackendWithSelector("cache", ns, matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(0),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	r, rec := newReconcilerWithRecorder(t, cb, dep)
+
+	reconcile(t, r, "cache", ns)
+
+	got := getBackend(t, r, "cache", ns)
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 0 {
+		t.Fatalf("status.matchedEnginePods = %v, want observed 0", got.Status.MatchedEnginePods)
+	}
+	if got.Status.EngineSelectorMessage != "" {
+		t.Fatalf("status.engineSelectorMessage = %q, want empty for intentionally scaled-to-zero Deployment", got.Status.EngineSelectorMessage)
+	}
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
 }
 
 func TestReconcileMatchedEnginePodsNilWhenSelectorAbsent(t *testing.T) {
@@ -129,6 +166,85 @@ func TestReconcileMatchedEnginePodsClearsWhenSelectorRemoved(t *testing.T) {
 	if got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods; got != nil {
 		t.Fatalf("after clearing selector, status.matchedEnginePods = %v (*=%d), want nil", got, *got)
 	}
+	if msg := getBackend(t, r, "cache", "ns1").Status.EngineSelectorMessage; msg != "" {
+		t.Fatalf("after clearing selector, status.engineSelectorMessage = %q, want cleared", msg)
+	}
+}
+
+func TestReconcileMatchedEnginePodsClearsMessageWhenPodsReturn(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	if msg := getBackend(t, r, "cache", "ns1").Status.EngineSelectorMessage; msg == "" {
+		t.Fatalf("status.engineSelectorMessage empty after zero-match observation, want diagnosis")
+	}
+
+	if err := r.Create(context.Background(), engineLikePod("e1", "ns1", matchedSelector)); err != nil {
+		t.Fatalf("create matching pod: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 1 {
+		t.Fatalf("matchedEnginePods = %v, want 1", got.Status.MatchedEnginePods)
+	}
+	if got.Status.EngineSelectorMessage != "" {
+		t.Fatalf("status.engineSelectorMessage = %q, want cleared after a pod matches", got.Status.EngineSelectorMessage)
+	}
+}
+
+func TestReconcileMatchedEnginePodsEmitsUnmatchedEventOnInitialZeroAndTransition(t *testing.T) {
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+	events := drainEvents(rec)
+	expectEvent(t, events, "Normal "+eventReasonEngineSelectorUnmatched)
+	expectEvent(t, events, "spec.engineSelector.matchLabels={app:engine}")
+
+	reconcile(t, r, "cache", "ns1")
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
+
+	if err := r.Create(context.Background(), engineLikePod("e1", "ns1", matchedSelector)); err != nil {
+		t.Fatalf("create matching pod: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
+
+	if err := r.Delete(context.Background(), engineLikePod("e1", "ns1", matchedSelector)); err != nil {
+		t.Fatalf("delete matching pod: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	events = drainEvents(rec)
+	expectEvent(t, events, "Normal "+eventReasonEngineSelectorUnmatched)
+	expectEvent(t, events, "no Pods in namespace match")
+}
+
+func TestReconcileMatchedEnginePodsEmitsUnmatchedEventWhenMessageAddedToExistingZero(t *testing.T) {
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	cb.Status.MatchedEnginePods = ptrInt32(0)
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.EngineSelectorMessage == "" {
+		t.Fatalf("status.engineSelectorMessage empty, want no-match diagnosis added")
+	}
+	events := drainEvents(rec)
+	expectEvent(t, events, "Normal "+eventReasonEngineSelectorUnmatched)
+	expectEvent(t, events, "no Pods in namespace match")
+}
+
+func TestReconcileMatchedEnginePodsNoUnmatchedEventWithoutSelector(t *testing.T) {
+	cb := lmcacheBackend("cache", "ns1")
+	r, rec := newReconcilerWithRecorder(t, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
 }
 
 // TestReconcileSchedulesRequeueWhenSelectorRemovedButStatusStillSet pins
@@ -302,6 +418,60 @@ func TestReconcileMatchedEnginePodsFailSoftOnListError(t *testing.T) {
 	}
 }
 
+func TestReconcileMatchedEnginePodsNoUnmatchedDiagnosticOnDeploymentListError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add cache scheme: %v", err)
+	}
+
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(0),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+
+	listErr := errors.New("synthetic deployment list failure")
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*appsv1.DeploymentList); ok {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithObjects(cb, dep).
+		WithInterceptorFuncs(funcs).
+		Build()
+	rec := events.NewFakeRecorder(16)
+	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 0 {
+		t.Fatalf("status.matchedEnginePods = %v, want observed 0", got.Status.MatchedEnginePods)
+	}
+	if got.Status.EngineSelectorMessage != "" {
+		t.Fatalf("status.engineSelectorMessage = %q, want preserved empty when Deployment list fails", got.Status.EngineSelectorMessage)
+	}
+	expectNoEvent(t, drainEvents(rec), eventReasonEngineSelectorUnmatched)
+}
+
 // TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError pins the second
 // half of refreshMatchedEnginePods' fail-soft contract: when the namespaced
 // pod List succeeds but the follow-up Status().Patch to write the new count
@@ -456,5 +626,113 @@ func TestReconcileMatchedEnginePodsUsesAPIReaderForPods(t *testing.T) {
 	}
 	if *got != 2 {
 		t.Fatalf("status.matchedEnginePods = %d, want 2 (APIReader's pods, not Client's)", *got)
+	}
+}
+
+func TestReconcileMatchedEnginePodsUsesChurnCadenceWhenDeploymentDesiredDisagrees(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(2),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb, dep, engineLikePod("e1", "ns1", matchedSelector))
+	r.MatchedEnginePodsRequeueInterval = 30 * time.Second
+	r.MatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 5*time.Second {
+		t.Fatalf("RequeueAfter = %s, want 5s while desired replicas (2) != matched pods (1)", res.RequeueAfter)
+	}
+
+	if err := r.Create(context.Background(), engineLikePod("e2", "ns1", matchedSelector)); err != nil {
+		t.Fatalf("create second matching pod: %v", err)
+	}
+	res, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile after convergence: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want steady 30s once desired replicas match observed pods", res.RequeueAfter)
+	}
+}
+
+func TestReconcileMatchedEnginePodsUsesSteadyCadenceWithTerminalPods(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(2),
+			Selector: &metav1.LabelSelector{MatchLabels: matchedSelector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: matchedSelector},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	failedPod := engineLikePod("evicted", "ns1", matchedSelector)
+	failedPod.Status.Phase = corev1.PodFailed
+	r := newReconciler(scheme,
+		cb,
+		dep,
+		engineLikePod("e1", "ns1", matchedSelector),
+		engineLikePod("e2", "ns1", matchedSelector),
+		failedPod,
+	)
+	r.MatchedEnginePodsRequeueInterval = 30 * time.Second
+	r.MatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want steady 30s when desired replicas match non-terminal pods", res.RequeueAfter)
+	}
+	got := getBackend(t, r, "cache", "ns1").Status.MatchedEnginePods
+	if got == nil || *got != 3 {
+		t.Fatalf("status.matchedEnginePods = %v, want all-phase observed count 3", got)
+	}
+}
+
+func TestReconcileMatchedEnginePodsUsesSteadyCadenceWithoutMatchingDeployment(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	r := newReconciler(scheme, cb,
+		engineLikePod("e1", "ns1", matchedSelector),
+		engineLikePod("e2", "ns1", matchedSelector),
+	)
+	r.MatchedEnginePodsRequeueInterval = 30 * time.Second
+	r.MatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want steady 30s for matching pods without a matching Deployment", res.RequeueAfter)
 	}
 }

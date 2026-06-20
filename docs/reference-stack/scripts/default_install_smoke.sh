@@ -1413,6 +1413,111 @@ if [ -z "$seen" ]; then
 fi
 log "InjectedByCacheBackend Event present on the engine pod (UID matches the persisted pod)"
 
+# --- binding diagnostics: unmatched selector + explicit skip ----------------
+# A deliberately non-matching CacheBackend should expose the selector drift on
+# the CR itself: status.engineSelectorMessage echoes the selector, and a Normal
+# EngineSelectorUnmatched Event provides the push-style breadcrumb.
+log "applying a non-matching CacheBackend to assert selector diagnostics"
+cat <<EOF | kubectl -n "$SAMPLE_NS" apply -f - >/dev/null
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: unmatched-cache
+spec:
+  type: External
+  endpoint: unmatched-cache.example.com:8200
+  engineSelector:
+    matchLabels:
+      app: definitely-not-qwen
+EOF
+
+log "waiting up to ${SAMPLE_MATCH_TIMEOUT}s for unmatched selector status + Event"
+deadline=$(($(date +%s) + SAMPLE_MATCH_TIMEOUT))
+unmatched_msg=""
+unmatched_event=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  unmatched_msg="$(kubectl -n "$SAMPLE_NS" get cb unmatched-cache \
+    -o jsonpath='{.status.engineSelectorMessage}' 2>/dev/null || true)"
+  unmatched_event="$(kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=EngineSelectorUnmatched \
+    -o jsonpath="{range .items[?(@.regarding.name=='unmatched-cache')]}{.reason}{'\n'}{end}" \
+    2>/dev/null || true)"
+  case "$unmatched_msg" in
+    *"app:definitely-not-qwen"*"no Pods in namespace match"*)
+      [ -n "$unmatched_event" ] && break
+      ;;
+  esac
+  sleep 2
+done
+case "$unmatched_msg" in
+  *"app:definitely-not-qwen"*"no Pods in namespace match"*) ;;
+  *)
+    kubectl -n "$SAMPLE_NS" get cb unmatched-cache -o yaml || true
+    fail "status.engineSelectorMessage=$unmatched_msg, want selector echo + no Pods diagnostic"
+    ;;
+esac
+if [ -z "$unmatched_event" ]; then
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=EngineSelectorUnmatched -o yaml || true
+  fail "EngineSelectorUnmatched Event not observed on CacheBackend/unmatched-cache within ${SAMPLE_MATCH_TIMEOUT}s"
+fi
+log "unmatched selector diagnostics present: $unmatched_msg"
+
+# A pod that explicitly opts out must be distinguishable from a drifted pod:
+# the webhook stamps inject-skipped, and the engine-pod-events controller turns
+# that stamp into a describe-visible SkippedByOperator Event keyed to the
+# persisted pod UID.
+log "creating a skip-inject pod to assert opt-out visibility"
+cat <<EOF | kubectl -n "$SAMPLE_NS" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: skipped-engine
+  annotations:
+    inferencecache.io/skip-inject: "true"
+  labels:
+    app: skip-demo
+spec:
+  containers:
+    - name: engine
+      image: $SAMPLE_ENGINE_IMAGE
+      command: ["sh", "-c", "sleep 3600"]
+EOF
+skipped_uid="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+  -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+if [ -z "$skipped_uid" ]; then
+  fail "skipped-engine pod did not persist with a UID"
+fi
+deadline=$(($(date +%s) + 30))
+skip_reason=""
+skip_event=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  skip_reason="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+    -o jsonpath='{.metadata.annotations.inferencecache\.io/inject-skipped}' 2>/dev/null || true)"
+  skip_event="$(kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=SkippedByOperator \
+    -o jsonpath="{range .items[?(@.regarding.uid=='$skipped_uid')]}{.reason}{'\n'}{end}" \
+    2>/dev/null || true)"
+  [ "$skip_reason" = "skip-inject-annotation" ] && [ -n "$skip_event" ] && break
+  sleep 2
+done
+if [ "$skip_reason" != "skip-inject-annotation" ]; then
+  kubectl -n "$SAMPLE_NS" get pod skipped-engine -o yaml || true
+  fail "annotation inferencecache.io/inject-skipped=$skip_reason, want skip-inject-annotation"
+fi
+skipped_injected_by="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+  -o jsonpath='{.metadata.annotations.inferencecache\.io/injected-by}' 2>/dev/null || true)"
+if [ -n "$skipped_injected_by" ]; then
+  kubectl -n "$SAMPLE_NS" get pod skipped-engine -o yaml || true
+  fail "skipped pod unexpectedly carries inferencecache.io/injected-by=$skipped_injected_by"
+fi
+if [ -z "$skip_event" ]; then
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=SkippedByOperator -o yaml || true
+  fail "SkippedByOperator Event not observed on skipped pod uid=$skipped_uid within 30s"
+fi
+log "skip-inject visibility present: inject-skipped=$skip_reason and SkippedByOperator Event"
+
 # --- cache-server restart cascade ------------------------------------------
 # When the cache-server pod is replaced (OOM-kill, eviction, image roll,
 # operator-initiated restart, …), every injected engine pod holds a stale

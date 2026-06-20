@@ -588,12 +588,22 @@ type CacheBackendStatus struct {
 	//
 	// This is a snapshot at reconcile time, not a real-time counter: it
 	// is not updated on every pod birth/death. For per-pod real-time
-	// visibility, watch the K8s `InjectedByCacheBackend` Event the
-	// controller emits on the engine pod after the mutating Pod webhook
-	// stamps it (visible in `kubectl describe pod`).
+	// visibility, watch the K8s `InjectedByCacheBackend` Event for
+	// injected pods and `SkippedByOperator` / `inferencecache.io/inject-skipped`
+	// for pods that explicitly opted out (visible in `kubectl describe pod`).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MatchedEnginePods *int32 `json:"matchedEnginePods,omitempty"`
+
+	// EngineSelectorMessage explains the current engineSelector matching
+	// observation when it needs operator attention. It is set when
+	// spec.engineSelector.matchLabels is configured but matchedEnginePods is
+	// observed as 0 while engine pods are expected, and cleared once at least
+	// one pod matches, the matching Deployment is intentionally scaled to zero,
+	// or the selector is removed. The message echoes the selector so an operator
+	// can compare it directly with engine Deployment pod-template labels.
+	// +optional
+	EngineSelectorMessage string `json:"engineSelectorMessage,omitempty"`
 
 	// FailOpen mirrors the effective spec.integration.failOpen value the
 	// controller most recently observed. Surfaced so operators can confirm

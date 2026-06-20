@@ -34,6 +34,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
@@ -816,6 +817,26 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 		t.Fatalf("apiserver returned empty UID for persisted pod — envtest invariant broken")
 	}
 
+	skipped := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "engine-skipped",
+			Namespace: ns,
+			Annotations: map[string]string{
+				podwebhook.AnnotationSkip:          "true",
+				podwebhook.AnnotationInjectSkipped: podwebhook.InjectSkippedReasonSkipAnnotation,
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+		},
+	}
+	if err := k8s.Create(context.Background(), skipped); err != nil {
+		t.Fatalf("create skipped pod: %v", err)
+	}
+	if skipped.UID == "" {
+		t.Fatalf("apiserver returned empty UID for skipped pod; envtest invariant broken")
+	}
+
 	// An unannotated pod that should NOT generate an event. Pins the
 	// predicate filtering.
 	unrelated := &corev1.Pod{
@@ -833,8 +854,9 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 	// event lags pod creation by a few hundred ms.
 	deadline := time.Now().Add(20 * time.Second)
 	var sawInjected bool
+	var sawSkipped bool
 	var sawSpurious bool
-	for time.Now().Before(deadline) && !sawInjected {
+	for time.Now().Before(deadline) && (!sawInjected || !sawSkipped) {
 		var list eventsv1.EventList
 		if err := k8s.List(context.Background(), &list, client.InNamespace(ns)); err == nil {
 			for _, ev := range list.Items {
@@ -844,12 +866,18 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 				if ev.Regarding.UID == pod.UID && ev.Reason == "InjectedByCacheBackend" {
 					sawInjected = true
 				}
+				if ev.Regarding.UID == skipped.UID && ev.Reason == "SkippedByOperator" {
+					sawSkipped = true
+				}
 				if ev.Regarding.UID == unrelated.UID && ev.Reason == "InjectedByCacheBackend" {
+					sawSpurious = true
+				}
+				if ev.Regarding.UID == unrelated.UID && ev.Reason == "SkippedByOperator" {
 					sawSpurious = true
 				}
 			}
 		}
-		if sawInjected {
+		if sawInjected && sawSkipped {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -857,8 +885,11 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 	if !sawInjected {
 		t.Errorf("did not observe InjectedByCacheBackend event with involvedObject.uid=%q within timeout", pod.UID)
 	}
+	if !sawSkipped {
+		t.Errorf("did not observe SkippedByOperator event with involvedObject.uid=%q within timeout", skipped.UID)
+	}
 	if sawSpurious {
-		t.Errorf("controller emitted InjectedByCacheBackend on an unannotated pod (uid=%q) — predicate failed", unrelated.UID)
+		t.Errorf("controller emitted an engine-pod event on an unannotated pod (uid=%q); predicate failed", unrelated.UID)
 	}
 }
 
@@ -882,16 +913,18 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	// Inject a short cadence so the test doesn't bake the 30s production
-	// delay into per-test runtime. 250ms is shorter than the controller's
-	// natural reconcile latency on envtest but long enough that the
-	// manager isn't spinning on reconciles for the duration of the test.
-	const testRequeueInterval = 250 * time.Millisecond
+	// Keep the steady cadence long and inject a short churn cadence so this
+	// test proves the conditional fast path: while desired Deployment replicas
+	// and observed matching pods disagree, the controller self-requeues quickly
+	// without a Pod watch.
+	const steadyRequeueInterval = 30 * time.Second
+	const churnRequeueInterval = 250 * time.Millisecond
 	if err := (&CacheBackendReconciler{
-		Client:                           mgr.GetClient(),
-		Scheme:                           mgr.GetScheme(),
-		Log:                              logr.Discard(),
-		MatchedEnginePodsRequeueInterval: testRequeueInterval,
+		Client:                                mgr.GetClient(),
+		Scheme:                                mgr.GetScheme(),
+		Log:                                   logr.Discard(),
+		MatchedEnginePodsRequeueInterval:      steadyRequeueInterval,
+		MatchedEnginePodsChurnRequeueInterval: churnRequeueInterval,
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
@@ -909,6 +942,22 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 
 	ns := freshNS(t, k8s)
 	sel := map[string]string{"app": "test-engine"}
+	engineDep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptrInt32(2),
+			Selector: &metav1.LabelSelector{MatchLabels: sel},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: sel},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "engine", Image: "registry.example.com/vllm:test"}},
+				},
+			},
+		},
+	}
+	if err := k8s.Create(context.Background(), engineDep); err != nil {
+		t.Fatalf("create engine Deployment: %v", err)
+	}
 	cb := lmcacheBackend("cache", ns)
 	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: sel}
 	if err := k8s.Create(context.Background(), cb); err != nil {
@@ -925,10 +974,10 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 	}
 	waitForCount := func(want int32, what string) {
 		t.Helper()
-		// With the injected fast cadence (250ms), the next requeue
+		// With the injected churn cadence (250ms), the next requeue
 		// after a pod change lands well under a second. Add 5s of
 		// envtest-jitter slack on top.
-		deadline := time.Now().Add(testRequeueInterval + 5*time.Second)
+		deadline := time.Now().Add(churnRequeueInterval + 5*time.Second)
 		for time.Now().Before(deadline) {
 			got := read()
 			if got != nil && *got == want {
@@ -962,6 +1011,80 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 		}
 	}
 	waitForCount(2, "after creating 2 matching pods")
+}
+
+func TestIntegrationCacheBackendEngineSelectorUnmatchedDiagnostics(t *testing.T) {
+	skipWithoutEnvtest(t)
+	k8s, scheme, cfg := startEnv(t)
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptrBool(true)},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := (&CacheBackendReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    logr.Discard(),
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := mgr.Start(mgrCtx); err != nil {
+			t.Logf("manager stopped: %v", err)
+		}
+	}()
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatalf("cache did not sync")
+	}
+
+	ns := freshNS(t, k8s)
+	cb := lmcacheBackend("cache", ns)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "definitely-not-present"},
+	}
+	if err := k8s.Create(context.Background(), cb); err != nil {
+		t.Fatalf("create CacheBackend: %v", err)
+	}
+
+	var lastMsg string
+	var sawEvent bool
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var live cachev1alpha1.CacheBackend
+		if err := k8s.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: ns}, &live); err != nil {
+			t.Fatalf("get CacheBackend: %v", err)
+		}
+		lastMsg = live.Status.EngineSelectorMessage
+
+		var list eventsv1.EventList
+		if err := k8s.List(context.Background(), &list, client.InNamespace(ns)); err == nil {
+			for _, ev := range list.Items {
+				if ev.Regarding.Name == "cache" &&
+					ev.Regarding.Kind == "CacheBackend" &&
+					ev.Reason == eventReasonEngineSelectorUnmatched {
+					sawEvent = true
+				}
+			}
+		}
+
+		if live.Status.MatchedEnginePods != nil &&
+			*live.Status.MatchedEnginePods == 0 &&
+			strings.Contains(lastMsg, "spec.engineSelector.matchLabels={app:definitely-not-present}") &&
+			strings.Contains(lastMsg, "no Pods in namespace match") &&
+			sawEvent {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	t.Fatalf("unmatched selector diagnostics did not converge: message=%q sawEvent=%v", lastMsg, sawEvent)
 }
 
 // TestIntegrationCacheBackendMatchedEnginePods exercises the

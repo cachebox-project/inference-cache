@@ -236,6 +236,39 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("get second pod: %v", err)
 	}
 	mustHaveContainerEnv(t, &got2, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+
+	skipped := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "vllm-engine-skip",
+			Namespace:   ns,
+			Labels:      map[string]string{"app": "vllm-test"},
+			Annotations: map[string]string{AnnotationSkip: "true"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  adapterruntime.EngineContainerName,
+				Image: "vllm/vllm-openai-cpu:latest",
+				Args:  []string{"--model", "Qwen/Qwen2.5-0.5B-Instruct"},
+			}},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, skipped); err != nil {
+		t.Fatalf("create skipped Pod: %v", err)
+	}
+	var gotSkipped corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: skipped.Name}, &gotSkipped); err != nil {
+		t.Fatalf("get skipped pod: %v", err)
+	}
+	if got := gotSkipped.Annotations[AnnotationInjectSkipped]; got != InjectSkippedReasonSkipAnnotation {
+		t.Fatalf("annotation %s: got %q want %q", AnnotationInjectSkipped, got, InjectSkippedReasonSkipAnnotation)
+	}
+	if got := gotSkipped.Annotations[AnnotationInjectedBy]; got != "" {
+		t.Fatalf("annotation %s: got %q want absent on skipped pod", AnnotationInjectedBy, got)
+	}
+	if envtestHasContainerEnv(&gotSkipped, adapterruntime.EnvLMCacheRemoteURL) {
+		t.Fatalf("skipped pod unexpectedly has %s env; webhook must not inject engine wiring when %s=true",
+			adapterruntime.EnvLMCacheRemoteURL, AnnotationSkip)
+	}
 }
 
 // mustHaveContainerEnv fails the test if the first container's env array
@@ -254,6 +287,18 @@ func mustHaveContainerEnv(t *testing.T, pod *corev1.Pod, name, value string) {
 		}
 	}
 	t.Fatalf("env %s missing on %s; have %v", name, pod.Name, pod.Spec.Containers[0].Env)
+}
+
+func envtestHasContainerEnv(pod *corev1.Pod, name string) bool {
+	if len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // envtestFindContainer returns the container in pod with the given name, or
