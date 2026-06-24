@@ -81,7 +81,8 @@ const (
 // result-side floor — see docs/design/lookuproute-ranking.md §2.6; or the
 // top per-replica score fell below the per-namespace routingFloorScore
 // post-score floor on the distinguishing-power-aware ranker — see
-// docs/design/lookuproute-ranking.md §2.7), with
+// docs/design/lookuproute-ranking.md §2.7), with POLICY_REQUIRES_CHAIN
+// (CachePolicy.spec.strategy.requireChain requires a wire block-hash chain), with
 // TIMEOUT (lookupTimeoutMs budget breach), or with
 // one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
 // when the lookup misses AND the index can identify which contract key did not
