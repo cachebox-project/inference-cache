@@ -215,8 +215,9 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// prefix_hash / token_ids that would make us ignore it) and nothing else
 	// bounds the call, apply a default safety timeout so tokenization can't block
 	// the hot path indefinitely — it fails open instead.
+	chainMatchingEnabled := s.policyChainMatchingEnabled(tenant)
 	willTokenize := req.GetPromptText() != "" &&
-		len(req.GetBlockHashes()) == 0 && len(req.GetBlockTokenCounts()) == 0 &&
+		(!chainMatchingEnabled || (len(req.GetBlockHashes()) == 0 && len(req.GetBlockTokenCounts()) == 0)) &&
 		len(req.GetPrefixHash()) == 0 && len(req.GetTokenIds()) == 0
 	if _, has := ctx.Deadline(); !has && willTokenize && s.tokenizeTimeout > 0 {
 		var cancel context.CancelFunc
@@ -245,14 +246,14 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	var in lookupInputs
 	if hasDeadline {
 		ch := make(chan lookupInputs, 1)
-		go func() { ch <- s.resolveLookupChain(ctx, req) }()
+		go func() { ch <- s.resolveLookupChain(ctx, req, chainMatchingEnabled) }()
 		select {
 		case in = <-ch:
 		case <-ctx.Done():
 			return s.timeoutResponse(model, time.Since(start), nil), nil
 		}
 	} else {
-		in = s.resolveLookupChain(ctx, req)
+		in = s.resolveLookupChain(ctx, req, chainMatchingEnabled)
 	}
 	// A deadline-aware tokenizer may have returned a context error that surfaced
 	// as failOpen; if the budget actually expired that is a TIMEOUT, not NO_HINT.
@@ -274,13 +275,13 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// canonical tokens: a prompt_text caller needs them to call the engine even
 	// when there is no routing hint.
 	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 &&
-		effectivePrefixTokens(in.blockTokenCounts, req.GetPrefixTokenCount()) < minTokens {
+		effectivePrefixTokens(in.blockTokenCounts, in.exactTokenCount) < minTokens {
 		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
 	lookupBlockHashes := in.blockHashes
 	lookupBlockTokenCounts := in.blockTokenCounts
-	if !s.policyChainMatchingEnabled(tenant) {
+	if !chainMatchingEnabled {
 		lookupBlockHashes = nil
 		lookupBlockTokenCounts = nil
 	}
@@ -290,8 +291,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		Model:            model,
 		Tenant:           tenant,
 		HashScheme:       req.GetHashScheme(),
-		PrefixHash:       req.GetPrefixHash(),
-		TokenCount:       req.GetPrefixTokenCount(),
+		PrefixHash:       in.exactPrefixHash,
+		TokenCount:       in.exactTokenCount,
 		BlockHashes:      lookupBlockHashes,
 		BlockTokenCounts: lookupBlockTokenCounts,
 		TTFTBudgetMs:     slo.GetTtftMs(),
@@ -364,6 +365,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 type lookupInputs struct {
 	blockHashes      [][]byte // effective chain (empty → fall back to req.prefix_hash exact match)
 	blockTokenCounts []int32  // parallel per-block token counts
+	exactPrefixHash  []byte   // effective legacy exact key
+	exactTokenCount  int32    // token count for the effective exact key
 	echoTokens       []uint32 // canonical tokens to echo (prompt_text path only)
 	failOpen         bool     // true → return NO_HINT (tokenizer unavailable/errored)
 }
@@ -388,19 +391,39 @@ type lookupInputs struct {
 // otherwise surface a TENANT_HOT locality hint for a prompt that has no
 // cacheable block — symmetric with the "chain misses never fall to TENANT_HOT"
 // rule in grpc-contract.md).
-func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) lookupInputs {
+func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest, chainMatchingEnabled bool) lookupInputs {
 	// An explicit fingerprint attempt: the caller set a prefix_hash and/or a
 	// block-hash chain. Pass req's values through to the index (which exact-
-	// matches prefix_hash and walks the chain). A one-sided / malformed chain —
-	// block_hashes and block_token_counts present with mismatched lengths, or one
-	// set without the other — must fail open with NO_HINT rather than fall through
-	// to a lower-precedence input (token_ids / prompt_text) or a TENANT_HOT hint.
+	// matches prefix_hash and walks the chain). When chain matching is enabled,
+	// a one-sided / malformed chain — block_hashes and block_token_counts present
+	// with mismatched lengths, or one set without the other — must fail open with
+	// NO_HINT rather than fall through to a lower-precedence input (token_ids /
+	// prompt_text) or a TENANT_HOT hint. When chain matching is disabled, chain
+	// fields are ignored and the request uses the legacy exact path.
 	bh, btc := req.GetBlockHashes(), req.GetBlockTokenCounts()
+	exactPrefixHash, exactTokenCount := req.GetPrefixHash(), req.GetPrefixTokenCount()
+	if !chainMatchingEnabled {
+		if len(exactPrefixHash) > 0 {
+			return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
+		}
+		if len(bh) > 0 && len(bh) == len(btc) {
+			return lookupInputs{exactPrefixHash: bh[len(bh)-1], exactTokenCount: sumBlockTokenCounts(btc)}
+		}
+		if len(bh) > 0 || len(btc) > 0 {
+			bh = nil
+			btc = nil
+		}
+	}
 	if len(bh) > 0 || len(btc) > 0 || len(req.GetPrefixHash()) > 0 {
 		if len(bh) != len(btc) {
 			return lookupInputs{failOpen: true}
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
+		return lookupInputs{
+			blockHashes:      bh,
+			blockTokenCounts: btc,
+			exactPrefixHash:  exactPrefixHash,
+			exactTokenCount:  exactTokenCount,
+		}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
 		if len(toks) > MaxLookupTokens {
@@ -410,7 +433,12 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		if len(bh) == 0 {
 			return lookupInputs{failOpen: true} // shorter than one block — nothing the engine can prefix-cache
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
+		return lookupInputs{
+			blockHashes:      chainHashesIfEnabled(bh, chainMatchingEnabled),
+			blockTokenCounts: chainCountsIfEnabled(btc, chainMatchingEnabled),
+			exactPrefixHash:  bh[len(bh)-1],
+			exactTokenCount:  sumBlockTokenCounts(btc),
+		}
 	}
 	if text := req.GetPromptText(); text != "" {
 		if len(text) > MaxPromptTextBytes {
@@ -440,13 +468,41 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 			// the engine even though there is no routing hint.
 			return lookupInputs{failOpen: true, echoTokens: toks}
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
+		return lookupInputs{
+			blockHashes:      chainHashesIfEnabled(bh, chainMatchingEnabled),
+			blockTokenCounts: chainCountsIfEnabled(btc, chainMatchingEnabled),
+			exactPrefixHash:  bh[len(bh)-1],
+			exactTokenCount:  sumBlockTokenCounts(btc),
+			echoTokens:       toks,
+		}
 	}
-	return lookupInputs{}
+	return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
 }
 
 func requestCarriesValidBlockHashChain(req *icpb.LookupRouteRequest) bool {
 	return len(req.GetBlockHashes()) > 0 && len(req.GetBlockHashes()) == len(req.GetBlockTokenCounts())
+}
+
+func chainHashesIfEnabled(hashes [][]byte, enabled bool) [][]byte {
+	if !enabled {
+		return nil
+	}
+	return hashes
+}
+
+func chainCountsIfEnabled(counts []int32, enabled bool) []int32 {
+	if !enabled {
+		return nil
+	}
+	return counts
+}
+
+func sumBlockTokenCounts(counts []int32) int32 {
+	var sum int32
+	for _, count := range counts {
+		sum += count
+	}
+	return sum
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
