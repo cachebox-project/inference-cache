@@ -74,6 +74,7 @@ type CachePolicyValidationRule func(cp *cachev1alpha1.CachePolicy) field.ErrorLi
 // changes.
 var DefaultCachePolicyValidationRules = []CachePolicyValidationRule{
 	rejectNonPositiveEvictionTTL,
+	rejectIncoherentStrategy,
 }
 
 // SetupCachePolicyWebhookWithManager registers the defaulting and validating
@@ -244,6 +245,27 @@ func rejectNonPositiveEvictionTTL(cp *cachev1alpha1.CachePolicy) field.ErrorList
 			field.NewPath("spec", "evictionTTL"),
 			cp.Spec.EvictionTTL.Duration.String(),
 			"evictionTTL must be greater than zero when set (a non-positive TTL would be silently clamped to the index default)",
+		),
+	}
+}
+
+// rejectIncoherentStrategy rejects a policy that requires chain-form lookups
+// while also disabling the chain matcher. That shape would reject legacy
+// exact-prefix callers and make chain callers unmatchable, so surface it at
+// admission instead of letting the server produce surprising misses.
+func rejectIncoherentStrategy(cp *cachev1alpha1.CachePolicy) field.ErrorList {
+	strategy := cp.Spec.Strategy
+	if strategy == nil || strategy.EnableChainMatching == nil || strategy.RequireChain == nil {
+		return nil
+	}
+	if *strategy.EnableChainMatching || !*strategy.RequireChain {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "strategy", "requireChain"),
+			*strategy.RequireChain,
+			"requireChain requires enableChainMatching to be true",
 		),
 	}
 }

@@ -27,6 +27,7 @@ const (
 )
 
 // CachePolicySpec defines cache lookup and eviction policy.
+// +kubebuilder:validation:XValidation:rule="!has(self.strategy) || !has(self.strategy.enableChainMatching) || self.strategy.enableChainMatching || !has(self.strategy.requireChain) || !self.strategy.requireChain",message="strategy.requireChain requires strategy.enableChainMatching"
 type CachePolicySpec struct {
 	// Eviction is the index entry-eviction algorithm applied when the index
 	// exceeds its entry cap. LRU evicts the oldest-by-lastSeen entry first;
@@ -123,6 +124,38 @@ type CachePolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
+
+	// Strategy controls which LookupRoute matching strategies may produce a
+	// hint for this namespace. Defaults preserve the historical behavior:
+	// longest-prefix chain matching is enabled, callers are not required to
+	// send a chain, and TENANT_HOT remains enabled as a soft locality fallback.
+	// +optional
+	Strategy *CachePolicyStrategySpec `json:"strategy,omitempty"`
+}
+
+// CachePolicyStrategySpec controls per-namespace LookupRoute strategy gates.
+type CachePolicyStrategySpec struct {
+	// EnableChainMatching allows LookupRoute requests that carry block_hashes
+	// to use the longest-common-leading-run chain matcher. When false, the
+	// server ignores request block_hashes and falls back to the legacy exact
+	// prefix_hash path.
+	// +optional
+	// +kubebuilder:default=true
+	EnableChainMatching *bool `json:"enableChainMatching,omitempty"`
+
+	// RequireChain rejects LookupRoute requests that do not carry a valid
+	// block_hash chain with reason_code=POLICY_REQUIRES_CHAIN before touching
+	// the index. It is only coherent when EnableChainMatching is true.
+	// +optional
+	// +kubebuilder:default=false
+	RequireChain *bool `json:"requireChain,omitempty"`
+
+	// EnableTenantHot allows the TENANT_HOT fallback when no prefix match is
+	// found but the tenant has recently warm replicas. When false, TENANT_HOT
+	// results are downgraded to NO_HINT.
+	// +optional
+	// +kubebuilder:default=true
+	EnableTenantHot *bool `json:"enableTenantHot,omitempty"`
 }
 
 // CachePolicyStatus defines observed policy state.

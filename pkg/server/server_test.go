@@ -1625,6 +1625,92 @@ func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	}
 }
 
+func TestLookupRouteRequireChainGateReturnsPolicyReason(t *testing.T) {
+	svc := newTestService()
+	reqChain := true
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace: "team-a",
+		Strategy:  &ResolvedLookupStrategy{RequireChain: &reqChain},
+	}})
+	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
+		t.Fatal("index lookup should not run when policy requires a chain and request has no chain")
+		return index.LookupResult{}
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != reasonPolicyRequiresChain {
+		t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonPolicyRequiresChain)
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("policy gate must not return scores, got %+v", resp.GetReplicaScores())
+	}
+}
+
+func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
+	svc := newTestService()
+	enableChain := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace: "team-a",
+		Strategy:  &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+	}})
+	var got index.LookupRequest
+	svc.lookupFn = func(req index.LookupRequest) index.LookupResult {
+		got = req
+		return index.LookupResult{Strategy: index.StrategyNone}
+	}
+
+	_, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "team-a", HashScheme: "vllm",
+		PrefixHash: []byte("legacy-exact"),
+		BlockHashes: [][]byte{
+			[]byte("b1"),
+			[]byte("b2"),
+		},
+		BlockTokenCounts: []int32{64, 64},
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if len(got.BlockHashes) != 0 || len(got.BlockTokenCounts) != 0 {
+		t.Fatalf("chain fields reached index despite enableChainMatching=false: hashes=%d counts=%d", len(got.BlockHashes), len(got.BlockTokenCounts))
+	}
+	if string(got.PrefixHash) != "legacy-exact" {
+		t.Fatalf("PrefixHash = %q, want legacy exact prefix hash", string(got.PrefixHash))
+	}
+}
+
+func TestLookupRouteDisableTenantHotDowngradesToNoHint(t *testing.T) {
+	svc := newTestService()
+	enableTenantHot := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace: "t",
+		Strategy:  &ResolvedLookupStrategy{EnableTenantHot: &enableTenantHot},
+	}})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("miss"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != reasonNoHint {
+		t.Fatalf("reason = %q, want NO_HINT when tenant-hot is disabled", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("tenant-hot disabled must not return scores, got %+v", resp.GetReplicaScores())
+	}
+}
+
 // TestLookupRouteMalformedChainNeverFallsThroughToTenantHot guards the
 // orchestrator: a chain-bearing request with mismatched parallel-array
 // lengths must hard-fail to NO_HINT, NOT fall through to TENANT_HOT — a

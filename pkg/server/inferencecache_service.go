@@ -51,11 +51,12 @@ const MaxConcurrentTokenize = 64
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
 const (
-	reasonPrefixMatch = "PREFIX_MATCH"
-	reasonTenantHot   = "TENANT_HOT"
-	reasonNoHint      = "NO_HINT"
-	reasonTimeout     = "TIMEOUT"
-	reasonOK          = "OK"
+	reasonPrefixMatch         = "PREFIX_MATCH"
+	reasonTenantHot           = "TENANT_HOT"
+	reasonNoHint              = "NO_HINT"
+	reasonTimeout             = "TIMEOUT"
+	reasonOK                  = "OK"
+	reasonPolicyRequiresChain = "POLICY_REQUIRES_CHAIN"
 
 	// Diagnostic codes for LookupRoute contract-key mismatches. Emitted on
 	// the miss path when the index can tell the caller that one of
@@ -262,6 +263,10 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		// hot-path time so an expensive tokenizer failure is visible.
 		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
 	}
+	hasChain := len(in.blockHashes) > 0 && len(in.blockTokenCounts) > 0
+	if s.policyChainRequired(tenant) && !hasChain {
+		return s.policyGateResponse(model, reasonPolicyRequiresChain, time.Since(start), in.echoTokens), nil
+	}
 
 	// Pre-lookup gate on the effective prefix token count (from the resolved
 	// chain, falling back to the legacy prefix_token_count). Short-circuit a
@@ -273,6 +278,13 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
 	}
 
+	lookupBlockHashes := in.blockHashes
+	lookupBlockTokenCounts := in.blockTokenCounts
+	if !s.policyChainMatchingEnabled(tenant) {
+		lookupBlockHashes = nil
+		lookupBlockTokenCounts = nil
+	}
+
 	slo := req.GetSlo()
 	lookupReq := index.LookupRequest{
 		Model:            model,
@@ -280,8 +292,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		HashScheme:       req.GetHashScheme(),
 		PrefixHash:       req.GetPrefixHash(),
 		TokenCount:       req.GetPrefixTokenCount(),
-		BlockHashes:      in.blockHashes,
-		BlockTokenCounts: in.blockTokenCounts,
+		BlockHashes:      lookupBlockHashes,
+		BlockTokenCounts: lookupBlockTokenCounts,
 		TTFTBudgetMs:     slo.GetTtftMs(),
 		TBTBudgetMs:      slo.GetTbtMs(),
 	}
@@ -291,6 +303,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// call would just churn allocations behind the index lock during a sweep).
 	if !hasDeadline {
 		result := s.lookupFn(lookupReq)
+		result = s.applyLookupStrategyGates(result, tenant)
 		return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 	}
 
@@ -338,6 +351,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// Report total hot-path time (tokenization + lookup), not just the index
 	// lookup, so the new prompt_text path isn't under-reported on the latency
 	// metric. The budget check above still uses the lookup-only `elapsed`.
+	result = s.applyLookupStrategyGates(result, tenant)
 	return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 }
 
@@ -541,6 +555,19 @@ func (s *inferenceCacheService) noHintResponse(model string, elapsed time.Durati
 	return resp
 }
 
+// policyGateResponse builds an empty fail-open response for a CachePolicy gate
+// that deliberately uses a more specific reason_code than NO_HINT. The gateway
+// behavior is still the same: no replica scores, route normally.
+func (s *inferenceCacheService) policyGateResponse(model, reason string, elapsed time.Duration, echoTokens []uint32) *icpb.LookupRouteResponse {
+	resp := &icpb.LookupRouteResponse{
+		ReasonCode:      reason,
+		LookupLatencyUs: elapsed.Microseconds(),
+		TokenIds:        echoTokens,
+	}
+	s.metrics.observeLookup(model, reason, false, elapsed)
+	return resp
+}
+
 // policyTimeout returns the per-tenant LookupRoute deadline, or 0 if none.
 func (s *inferenceCacheService) policyTimeout(tenant string) time.Duration {
 	if s.policies == nil {
@@ -619,6 +646,34 @@ func (s *inferenceCacheService) policyRoutingFloorScore(tenant string) float32 {
 		return 0
 	}
 	return s.policies.RoutingFloorScore(tenant)
+}
+
+func (s *inferenceCacheService) policyChainMatchingEnabled(tenant string) bool {
+	if s.policies == nil {
+		return DefaultEnableChainMatching
+	}
+	return s.policies.ChainMatchingEnabled(tenant)
+}
+
+func (s *inferenceCacheService) policyChainRequired(tenant string) bool {
+	if s.policies == nil {
+		return DefaultRequireChain
+	}
+	return s.policies.ChainRequired(tenant)
+}
+
+func (s *inferenceCacheService) policyTenantHotEnabled(tenant string) bool {
+	if s.policies == nil {
+		return DefaultEnableTenantHot
+	}
+	return s.policies.TenantHotEnabled(tenant)
+}
+
+func (s *inferenceCacheService) applyLookupStrategyGates(result index.LookupResult, tenant string) index.LookupResult {
+	if result.Strategy == index.StrategyTenantHot && !s.policyTenantHotEnabled(tenant) {
+		return index.LookupResult{Strategy: index.StrategyNone}
+	}
+	return result
 }
 
 // reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's

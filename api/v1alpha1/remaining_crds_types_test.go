@@ -30,6 +30,10 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
+	policyStrategy := mustProperty(t, policySpec, "strategy")
+	requireDefault(t, mustProperty(t, policyStrategy, "enableChainMatching"), true)
+	requireDefault(t, mustProperty(t, policyStrategy, "requireChain"), false)
+	requireDefault(t, mustProperty(t, policyStrategy, "enableTenantHot"), true)
 	// Fields trimmed at v1alpha1 because they were declarative-only — guard
 	// against accidental re-introduction via a stale regen.
 	for _, removed := range []string{"failOpen", "tenantScoped"} {
@@ -81,20 +85,35 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	ttl := metav1.Duration{Duration: time.Minute}
 	minimumPrefixTokens := int32(32)
 	lookupTimeoutMs := int32(20)
+	enableChainMatching := true
+	requireChain := false
+	enableTenantHot := true
 	policy := &CachePolicy{
 		Spec: CachePolicySpec{
 			Eviction:            CachePolicyEvictionAlgorithmLRU,
 			EvictionTTL:         &ttl,
 			MinimumPrefixTokens: &minimumPrefixTokens,
 			LookupTimeoutMs:     &lookupTimeoutMs,
+			Strategy: &CachePolicyStrategySpec{
+				EnableChainMatching: &enableChainMatching,
+				RequireChain:        &requireChain,
+				EnableTenantHot:     &enableTenantHot,
+			},
 		},
 		Status: CachePolicyStatus{Conditions: []metav1.Condition{{Type: "Ready", Message: "ok"}}},
 	}
 	policyCopy := policy.DeepCopy()
 	policy.Spec.EvictionTTL.Duration = 2 * time.Minute
+	*policy.Spec.Strategy.EnableChainMatching = false
+	*policy.Spec.Strategy.RequireChain = true
+	*policy.Spec.Strategy.EnableTenantHot = false
 	policy.Status.Conditions[0].Message = "changed"
 	if policyCopy.Spec.Eviction != CachePolicyEvictionAlgorithmLRU ||
 		policyCopy.Spec.EvictionTTL.Duration != time.Minute ||
+		policyCopy.Spec.Strategy == nil ||
+		policyCopy.Spec.Strategy.EnableChainMatching == nil || !*policyCopy.Spec.Strategy.EnableChainMatching ||
+		policyCopy.Spec.Strategy.RequireChain == nil || *policyCopy.Spec.Strategy.RequireChain ||
+		policyCopy.Spec.Strategy.EnableTenantHot == nil || !*policyCopy.Spec.Strategy.EnableTenantHot ||
 		policyCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}

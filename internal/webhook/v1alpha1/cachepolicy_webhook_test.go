@@ -96,6 +96,37 @@ func TestRejectNonPositiveEvictionTTL(t *testing.T) {
 	}
 }
 
+func TestRejectIncoherentStrategy(t *testing.T) {
+	falseV, trueV := false, true
+	tests := []struct {
+		name    string
+		strat   *cachev1alpha1.CachePolicyStrategySpec
+		wantErr bool
+	}{
+		{"nil strategy ok", nil, false},
+		{"default-like ok", &cachev1alpha1.CachePolicyStrategySpec{EnableChainMatching: &trueV, RequireChain: &falseV}, false},
+		{"require chain with chain matching ok", &cachev1alpha1.CachePolicyStrategySpec{EnableChainMatching: &trueV, RequireChain: &trueV}, false},
+		{"chain disabled without require ok", &cachev1alpha1.CachePolicyStrategySpec{EnableChainMatching: &falseV, RequireChain: &falseV}, false},
+		{"require chain while chain disabled rejected", &cachev1alpha1.CachePolicyStrategySpec{EnableChainMatching: &falseV, RequireChain: &trueV}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := policy("p1", "team-a")
+			cp.Spec.Strategy = tc.strat
+			errs := rejectIncoherentStrategy(cp)
+			if tc.wantErr && len(errs) == 0 {
+				t.Fatalf("expected an error, got none")
+			}
+			if !tc.wantErr && len(errs) != 0 {
+				t.Fatalf("expected no error, got %v", errs)
+			}
+			if tc.wantErr && errs[0].Field != "spec.strategy.requireChain" {
+				t.Errorf("field = %q, want spec.strategy.requireChain", errs[0].Field)
+			}
+		})
+	}
+}
+
 // --- ValidateCreate: single-policy-per-namespace -----------------------------
 
 func TestCachePolicyValidateCreate_SinglePerNamespace(t *testing.T) {

@@ -35,3 +35,13 @@ spec:
   # applied first per-replica, then this score floor on the top survivor).
   routingFloorScore: "0.1"
   lookupTimeoutMs: 20
+  strategy:
+    # Enable longest-common-prefix block-hash chain matching when callers
+    # send block_hashes + block_token_counts. Disable to force legacy exact
+    # prefix_hash matching for this namespace.
+    enableChainMatching: true
+    # Require chain-form callers. When true, non-chain LookupRoute requests
+    # fail open with reason_code=POLICY_REQUIRES_CHAIN before index lookup.
+    requireChain: false
+    # Allow TENANT_HOT soft locality hints on prefix misses.
+    enableTenantHot: true

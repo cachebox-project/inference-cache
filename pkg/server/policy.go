@@ -16,34 +16,35 @@ import (
 // ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
 // ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
 // v5 added ResolvedPolicy.RoutingFloorScore (the per-namespace post-score
-// floor for the distinguishing-power-aware LookupRoute ranker).
+// floor for the distinguishing-power-aware LookupRoute ranker). v6 added
+// ResolvedPolicy.Strategy (per-namespace LookupRoute strategy gates).
 //
 // Rollout asymmetry — the bump is "additive when the new field can be
 // defaulted; rejected when it can't":
 //
-//   - **Newer server / older body.** A v5 server accepts a v3 or v4 body and
+//   - **Newer server / older body.** A v6 server accepts a v3, v4, or v5 body and
 //     normalizes each policy's missing MinimumMatchedTokens to
-//     DefaultMinimumMatchedTokens and missing RoutingFloorScore to
-//     DefaultRoutingFloorScore — so a server-first rollout (v5 server while
-//     controller is still v3 or v4) does NOT drop existing CachePolicy
-//     state (TTL, timeouts, eviction, prefix gates, quotas). The normalized
-//     result is identical to a no-CachePolicy fallback for the new fields
-//     while every prior knob stays enforced. The lenience window is bounded
-//     by PolicyMinimumAcceptedVersion (the oldest body this server still
-//     understands); bodies older than that are still rejected as
-//     "unsupported".
-//   - **Older server / newer body.** The reverse — a v4 server receiving a
-//     v5 push — still hard-fails. Because the handler decodes the body
+//     DefaultMinimumMatchedTokens, missing RoutingFloorScore to
+//     DefaultRoutingFloorScore, and missing Strategy to the historical gates
+//     (chain matching on, chain not required, tenant-hot on) — so a
+//     server-first rollout does NOT drop existing CachePolicy state (TTL,
+//     timeouts, eviction, prefix gates, quotas). The normalized result is
+//     identical to a no-CachePolicy fallback for the new fields while every
+//     prior knob stays enforced. The lenience window is bounded by
+//     PolicyMinimumAcceptedVersion (the oldest body this server still
+//     understands); bodies older than that are still rejected as "unsupported".
+//   - **Older server / newer body.** The reverse — a v5 server receiving a
+//     v6 push — still hard-fails. Because the handler decodes the body
 //     before checking version, DisallowUnknownFields is the FIRST line of
-//     defense: the new routingFloorScore field on each policy is unknown
-//     to the v4 Go struct, so decode rejects the body with
-//     `decode policy snapshot: json: unknown field "routingFloorScore"`.
+//     defense: the new strategy field on each policy is unknown to the v5
+//     Go struct, so decode rejects the body with
+//     `decode policy snapshot: json: unknown field "strategy"`.
 //     Even on a hypothetical breaking change where the field rename or
 //     removal slips past DisallowUnknownFields, the explicit version-band
 //     check below catches it with `unsupported policy snapshot version`.
 //     Both diagnostics are fail-loud; the operator sees one specific message,
 //     not silent state loss.
-const PolicyPropagationVersion = 5
+const PolicyPropagationVersion = 6
 
 // PolicyMinimumAcceptedVersion is the oldest /policy schema this server
 // understands. Bodies below this version are rejected outright; bodies at
@@ -78,6 +79,12 @@ const DefaultMinimumMatchedTokens int32 = 64
 // installed a policy CR. Tunable per-namespace via
 // CachePolicy.spec.routingFloorScore.
 const DefaultRoutingFloorScore float32 = 0.1
+
+const (
+	DefaultEnableChainMatching = true
+	DefaultRequireChain        = false
+	DefaultEnableTenantHot     = true
+)
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -138,6 +145,19 @@ type ResolvedPolicy struct {
 	// capture which entries a delivered hint credits); the TTL sweep is
 	// algorithm-independent.
 	Eviction string `json:"eviction,omitempty"`
+
+	// Strategy gates the LookupRoute strategy family at the server boundary.
+	// Pointer booleans preserve the distinction between "field omitted by an
+	// older controller / hand-written body" and "operator explicitly set false".
+	Strategy *ResolvedLookupStrategy `json:"strategy,omitempty"`
+}
+
+// ResolvedLookupStrategy carries the server-enforced LookupRoute strategy
+// gates flattened from CachePolicy.spec.strategy.
+type ResolvedLookupStrategy struct {
+	EnableChainMatching *bool `json:"enableChainMatching,omitempty"`
+	RequireChain        *bool `json:"requireChain,omitempty"`
+	EnableTenantHot     *bool `json:"enableTenantHot,omitempty"`
 }
 
 // ResolvedTenant is the slice of a CacheTenant the server enforces at ingest
@@ -379,6 +399,38 @@ func (s *PolicyStore) LookupTimeout(tenant string) time.Duration {
 	return 0
 }
 
+// ChainMatchingEnabled reports whether LookupRoute may use block-hash chain
+// longest-prefix matching for this tenant. Missing policy/strategy/field all
+// preserve the historical default: chain matching enabled.
+func (s *PolicyStore) ChainMatchingEnabled(tenant string) bool {
+	p, ok := s.Lookup(tenant)
+	if !ok || p.Strategy == nil || p.Strategy.EnableChainMatching == nil {
+		return DefaultEnableChainMatching
+	}
+	return *p.Strategy.EnableChainMatching
+}
+
+// ChainRequired reports whether LookupRoute requests for this tenant must
+// carry a block-hash chain. Missing policy/strategy/field preserves the
+// historical default: legacy exact-prefix callers are still accepted.
+func (s *PolicyStore) ChainRequired(tenant string) bool {
+	p, ok := s.Lookup(tenant)
+	if !ok || p.Strategy == nil || p.Strategy.RequireChain == nil {
+		return DefaultRequireChain
+	}
+	return *p.Strategy.RequireChain
+}
+
+// TenantHotEnabled reports whether the TENANT_HOT fallback may surface for
+// this tenant. Missing policy/strategy/field preserves the historical default.
+func (s *PolicyStore) TenantHotEnabled(tenant string) bool {
+	p, ok := s.Lookup(tenant)
+	if !ok || p.Strategy == nil || p.Strategy.EnableTenantHot == nil {
+		return DefaultEnableTenantHot
+	}
+	return *p.Strategy.EnableTenantHot
+}
+
 // TenantQuota satisfies index.TenantQuotaResolver: returns the tenant's maximum
 // index-entry budget and whether a quota is configured. ok=false (no matching
 // CacheTenant, or the resolver is nil) means no enforcement — the index leaves
@@ -468,16 +520,14 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Normalize older bodies so server-first rollouts (newer server, older
-		// controller still pushing v3 or v4) preserve every other knob a CR
-		// carries. Today: v3 bodies have neither minimumMatchedTokens nor
-		// routingFloorScore; v4 bodies have the former but not the latter.
+		// controller still pushing v3/v4/v5) preserve every other knob a CR
+		// carries. Today: older bodies may omit minimumMatchedTokens,
+		// routingFloorScore, or strategy.
 		// JSON decodes the missing fields to their zero values
 		// (int32(0) / nil *float32), which would be indistinguishable from
-		// the v4/v5 explicit opt-outs. Fill in DefaultMinimumMatchedTokens
-		// and DefaultRoutingFloorScore so the post-rollout effective floors
-		// on a v3/v4-carrying policy match the no-CachePolicy fallback paths
-		// PolicyStore.MinimumMatchedTokens / PolicyStore.RoutingFloorScore
-		// use. See normalizePolicySnapshotForVersion below for the
+		// the explicit opt-outs. Fill in the server defaults so the
+		// post-rollout effective policy matches the no-CachePolicy fallback
+		// paths. See normalizePolicySnapshotForVersion below for the
 		// version-by-version field-by-field details.
 		normalizePolicySnapshotForVersion(&snap)
 		store.ReplaceSnapshot(snap.Policies, snap.Tenants)
@@ -489,7 +539,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 // in-memory store sees the same shape regardless of which (supported) wire
 // version the controller pushed.
 //
-// Two normalizations today:
+// Three normalizations today:
 //
 //   - **v3 → v4 minimumMatchedTokens default.** A v3 body's missing field
 //     would otherwise land as 0 (the v4 explicit opt-out), silently
@@ -505,10 +555,13 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 //     for every namespace with a CR during a server-first rollout. Filling
 //     in DefaultRoutingFloorScore matches the no-CachePolicy fallback
 //     PolicyStore.RoutingFloorScore applies.
+//   - **v3/v4/v5 → v6 strategy defaults.** Missing strategy gates preserve
+//     the pre-v6 behavior: chain matching enabled, chain not required, and
+//     tenant-hot enabled.
 //
 // Bodies already at PolicyPropagationVersion are returned untouched so an
 // operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall
-// benchmarking) reaches the store as written.
+// benchmarking, or `enableTenantHot: false`) reaches the store as written.
 func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 	if snap.Version >= PolicyPropagationVersion {
 		return
@@ -533,5 +586,28 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 				snap.Policies[i].RoutingFloorScore = &v
 			}
 		}
+	}
+	if snap.Version < 6 {
+		for i := range snap.Policies {
+			applyResolvedLookupStrategyDefaults(&snap.Policies[i])
+		}
+	}
+}
+
+func applyResolvedLookupStrategyDefaults(p *ResolvedPolicy) {
+	if p.Strategy == nil {
+		p.Strategy = &ResolvedLookupStrategy{}
+	}
+	if p.Strategy.EnableChainMatching == nil {
+		v := DefaultEnableChainMatching
+		p.Strategy.EnableChainMatching = &v
+	}
+	if p.Strategy.RequireChain == nil {
+		v := DefaultRequireChain
+		p.Strategy.RequireChain = &v
+	}
+	if p.Strategy.EnableTenantHot == nil {
+		v := DefaultEnableTenantHot
+		p.Strategy.EnableTenantHot = &v
 	}
 }

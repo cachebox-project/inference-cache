@@ -339,6 +339,13 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}
+	if cp.Spec.Strategy != nil {
+		rp.Strategy = &cacheserver.ResolvedLookupStrategy{
+			EnableChainMatching: cp.Spec.Strategy.EnableChainMatching,
+			RequireChain:        cp.Spec.Strategy.RequireChain,
+			EnableTenantHot:     cp.Spec.Strategy.EnableTenantHot,
+		}
+	}
 	// Flatten the eviction algorithm to its lower-case canonical form. The CRD
 	// enum is upper-case (K8s convention) and defaults to LRU; an empty value
 	// (CR predating apiserver defaulting, or constructed without it) also maps
