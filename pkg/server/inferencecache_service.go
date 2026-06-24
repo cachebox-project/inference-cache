@@ -402,14 +402,13 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 	// fields are ignored and the request uses the legacy exact path.
 	bh, btc := req.GetBlockHashes(), req.GetBlockTokenCounts()
 	exactPrefixHash, exactTokenCount := req.GetPrefixHash(), req.GetPrefixTokenCount()
+	ignoredChain := false
 	if !chainMatchingEnabled {
 		if len(exactPrefixHash) > 0 {
 			return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
 		}
-		if len(bh) > 0 && len(bh) == len(btc) {
-			return lookupInputs{exactPrefixHash: bh[len(bh)-1], exactTokenCount: sumBlockTokenCounts(btc)}
-		}
 		if len(bh) > 0 || len(btc) > 0 {
+			ignoredChain = true
 			bh = nil
 			btc = nil
 		}
@@ -475,6 +474,9 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 			exactTokenCount:  sumBlockTokenCounts(btc),
 			echoTokens:       toks,
 		}
+	}
+	if ignoredChain {
+		return lookupInputs{failOpen: true}
 	}
 	return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
 }

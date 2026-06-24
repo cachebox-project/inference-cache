@@ -1695,6 +1695,7 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 		wantPrefixHash  []byte
 		wantTokenCount  int32
 		wantEchoedToken []uint32
+		wantNoLookup    bool
 	}{
 		{
 			name: "legacy prefix wins over well formed chain",
@@ -1725,7 +1726,7 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 			wantTokenCount: 99,
 		},
 		{
-			name: "chain only uses final block as exact prefix",
+			name: "chain only fails open",
 			req: &icpb.LookupRouteRequest{
 				BlockHashes: [][]byte{
 					[]byte("b1"),
@@ -1733,8 +1734,7 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 				},
 				BlockTokenCounts: []int32{64, 64},
 			},
-			wantPrefixHash: []byte("b2"),
-			wantTokenCount: 128,
+			wantNoLookup: true,
 		},
 		{
 			name:           "token ids use derived final block as exact prefix",
@@ -1787,6 +1787,15 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 			resp, err := svc.LookupRoute(context.Background(), tc.req)
 			if err != nil {
 				t.Fatalf("LookupRoute: %v", err)
+			}
+			if tc.wantNoLookup {
+				if called {
+					t.Fatal("index lookup was called")
+				}
+				if resp.GetReasonCode() != reasonNoHint {
+					t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonNoHint)
+				}
+				return
 			}
 			if !called {
 				t.Fatal("index lookup was not called")
