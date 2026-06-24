@@ -107,7 +107,7 @@ message ReplicaScore {
 
 message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
-  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
+  string reason_code = 2; // PREFIX_MATCH | TENANT_HOT | NO_HINT | POLICY_REQUIRES_CHAIN | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
   int64 lookup_latency_us = 3;
   // Canonical token IDs the server tokenized for this request, echoed back ONLY
   // when the server itself tokenized prompt_text. A gateway that sent token_ids

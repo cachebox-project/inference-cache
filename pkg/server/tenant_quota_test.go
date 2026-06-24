@@ -46,27 +46,27 @@ func TestPolicyPropagationVersionIsV6(t *testing.T) {
 		t.Fatalf("PolicyPropagationVersion = %d, want 6", PolicyPropagationVersion)
 	}
 	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
-	// v3 and v4 must be accepted so a server-first rollout does not drop a
-	// v3/v4 controller's policy state mid-upgrade (normalizePolicySnapshotForVersion
-	// fills the missing fields with their server-side defaults); bodies below
-	// v3 are still rejected — there is no documented path to normalize the
-	// older Tenants / Eviction shapes.
+	// v3, v4, and v5 must be accepted so a server-first rollout does not drop
+	// an older controller's policy state mid-upgrade
+	// (normalizePolicySnapshotForVersion fills the missing fields with their
+	// server-side defaults); bodies below v3 are still rejected — there is no
+	// documented path to normalize the older Tenants / Eviction shapes.
 	if PolicyMinimumAcceptedVersion != 3 {
 		t.Fatalf("PolicyMinimumAcceptedVersion = %d, want 3", PolicyMinimumAcceptedVersion)
 	}
 }
 
 // TestPolicySnapshotV3AcceptedWithFloorDefault pins the server-first rollout
-// invariant: a v5 server MUST accept a v3 controller's snapshot AND normalize
-// BOTH missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens
-// and routingFloorScore to DefaultRoutingFloorScore — on each policy.
+// invariant: a v6 server MUST accept a v3 controller's snapshot AND normalize
+// missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens,
+// routingFloorScore to DefaultRoutingFloorScore, and strategy to its defaults —
+// on each policy.
 // Without those normalizations, the v3 body would decode the missing fields
-// as their zero values (`int32(0)` / `nil` pointer) — the v4 / v5 explicit-
-// opt-outs — silently disabling both floors for every namespace with a CR
-// mid-rollout. The all-other-knobs assertion (TTL, eviction, prefix gate,
-// timeout, tenant quota) protects against a regression where v3 itself
-// stops being accepted, which would drop every policy field, not just the
-// new ones.
+// as their zero values (`int32(0)` / nil pointers) — explicit opt-out shapes
+// in later versions — silently disabling new defaults for every namespace with
+// a CR mid-rollout. The all-other-knobs assertion (TTL, eviction, prefix gate,
+// timeout, tenant quota) protects against a regression where v3 itself stops
+// being accepted, which would drop every policy field, not just the new ones.
 func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
@@ -156,7 +156,7 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 //     every namespace.
 //
 // Written against a literal v4 body (not PolicyPropagationVersion, which is
-// now v5) so the v4-specific behavior under v3→v4→v5 server stays pinned
+// now v6) so the v4-specific behavior under v3→v4→v5→v6 server stays pinned
 // even after the constant advances.
 func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testing.T) {
 	store := NewPolicyStore()
@@ -216,7 +216,7 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 
 	zero := float32(0)
 	body, err := json.Marshal(PolicySnapshot{
-		Version: PolicyPropagationVersion,
+		Version: 5,
 		Policies: []ResolvedPolicy{
 			{Namespace: "raw-recall", RoutingFloorScore: &zero},
 		},

@@ -1626,28 +1626,57 @@ func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 }
 
 func TestLookupRouteRequireChainGateReturnsPolicyReason(t *testing.T) {
-	svc := newTestService()
-	reqChain := true
-	svc.policies.Replace([]ResolvedPolicy{{
-		Namespace: "team-a",
-		Strategy:  &ResolvedLookupStrategy{RequireChain: &reqChain},
-	}})
-	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
-		t.Fatal("index lookup should not run when policy requires a chain and request has no chain")
-		return index.LookupResult{}
+	tests := []struct {
+		name string
+		req  *icpb.LookupRouteRequest
+	}{
+		{
+			name: "legacy exact prefix hash",
+			req:  &icpb.LookupRouteRequest{PrefixHash: []byte("p")},
+		},
+		{
+			name: "malformed chain",
+			req: &icpb.LookupRouteRequest{
+				BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+				BlockTokenCounts: []int32{16},
+			},
+		},
+		{
+			name: "token ids synthesize chain but do not carry one",
+			req:  &icpb.LookupRouteRequest{TokenIds: make([]uint32, 32)},
+		},
+		{
+			name: "prompt text could synthesize chain but does not carry one",
+			req:  &icpb.LookupRouteRequest{PromptText: "hello"},
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService()
+			reqChain := true
+			svc.policies.Replace([]ResolvedPolicy{{
+				Namespace: "team-a",
+				Strategy:  &ResolvedLookupStrategy{RequireChain: &reqChain},
+			}})
+			svc.lookupFn = func(index.LookupRequest) index.LookupResult {
+				t.Fatal("index lookup should not run when policy requires a carried chain and request lacks one")
+				return index.LookupResult{}
+			}
 
-	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
-		ModelId: "m", TenantId: "team-a", HashScheme: "vllm", PrefixHash: []byte("p"),
-	})
-	if err != nil {
-		t.Fatalf("LookupRoute: %v", err)
-	}
-	if resp.GetReasonCode() != reasonPolicyRequiresChain {
-		t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonPolicyRequiresChain)
-	}
-	if len(resp.GetReplicaScores()) != 0 {
-		t.Fatalf("policy gate must not return scores, got %+v", resp.GetReplicaScores())
+			tc.req.ModelId = "m"
+			tc.req.TenantId = "team-a"
+			tc.req.HashScheme = "vllm"
+			resp, err := svc.LookupRoute(context.Background(), tc.req)
+			if err != nil {
+				t.Fatalf("LookupRoute: %v", err)
+			}
+			if resp.GetReasonCode() != reasonPolicyRequiresChain {
+				t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonPolicyRequiresChain)
+			}
+			if len(resp.GetReplicaScores()) != 0 {
+				t.Fatalf("policy gate must not return scores, got %+v", resp.GetReplicaScores())
+			}
+		})
 	}
 }
 

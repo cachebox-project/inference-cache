@@ -227,6 +227,9 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	if err := ctx.Err(); err != nil {
 		return s.timeoutResponse(model, time.Since(start), nil), nil
 	}
+	if s.policyChainRequired(tenant) && !requestCarriesValidBlockHashChain(req) {
+		return s.policyGateResponse(model, reasonPolicyRequiresChain, time.Since(start), nil), nil
+	}
 	_, hasDeadline := ctx.Deadline()
 
 	// Dual-input resolution: turn token_ids / prompt_text into the block-hash
@@ -262,10 +265,6 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		// tokenized carries whatever tokens it produced, and reports the elapsed
 		// hot-path time so an expensive tokenizer failure is visible.
 		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
-	}
-	hasChain := len(in.blockHashes) > 0 && len(in.blockTokenCounts) > 0
-	if s.policyChainRequired(tenant) && !hasChain {
-		return s.policyGateResponse(model, reasonPolicyRequiresChain, time.Since(start), in.echoTokens), nil
 	}
 
 	// Pre-lookup gate on the effective prefix token count (from the resolved
@@ -443,6 +442,10 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
 	}
 	return lookupInputs{}
+}
+
+func requestCarriesValidBlockHashChain(req *icpb.LookupRouteRequest) bool {
+	return len(req.GetBlockHashes()) > 0 && len(req.GetBlockHashes()) == len(req.GetBlockTokenCounts())
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records

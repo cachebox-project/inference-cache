@@ -201,16 +201,15 @@ intervention.
 - `version` — schema version. Bumped on every schema change so version
   skew is observable; **whether the bump is rejected at decode is set
   separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
-  Rollout asymmetry note in §Versioning and forward-compat below. v4 and
-  v5 and v6 are additive and defaultable, so the v6 server still accepts
+  Rollout asymmetry note in §Versioning and forward-compat below. v4, v5,
+  and v6 are additive and defaultable, so the v6 server still accepts
   v3, v4, and v5 bodies; a hypothetical breaking change would bump
   `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
   value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
-  (HTTP 400). Currently `6` (bumped from `1` to `2` when `tenants` was
-  added, to `3` when `policies[].eviction` was added, to `4` when
-  `policies[].minimumMatchedTokens` was added, and to `5` when
-  `policies[].routingFloorScore` was added, and to `6` when
-  `policies[].strategy` was added).
+  (HTTP 400). Currently `6`. Version history: `2` added `tenants`; `3`
+  added `policies[].eviction`; `4` added
+  `policies[].minimumMatchedTokens`; `5` added
+  `policies[].routingFloorScore`; `6` added `policies[].strategy`.
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -400,13 +399,12 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
-`version` is `6`: it was bumped from `1` to `2` when the `tenants` slice
-was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
-algorithm) was added, to `4` when `policies[].minimumMatchedTokens`
-(the result-side matched-tokens floor) was added, and to `5` when
-`policies[].routingFloorScore` (the per-namespace post-score floor for
-the distinguishing-power-aware ranker) was added, and to `6` when
-`policies[].strategy` (per-namespace LookupRoute strategy gates) was added.
+`version` is `6`: `2` added the `tenants` slice; `3` added
+`policies[].eviction` (the per-namespace cap-eviction algorithm); `4` added
+`policies[].minimumMatchedTokens` (the result-side matched-tokens floor); `5`
+added `policies[].routingFloorScore` (the per-namespace post-score floor for
+the distinguishing-power-aware ranker); `6` added `policies[].strategy`
+(per-namespace LookupRoute strategy gates).
 The server decodes with
 `DisallowUnknownFields`, so an older server receiving a newer body still
 fails loud on the unknown field even before its version check fires.
