@@ -51,11 +51,12 @@ const MaxConcurrentTokenize = 64
 // String, not enum — forward-compat per the gRPC contract decision (a new
 // code is a server-only addition; old clients degrade to NO_HINT).
 const (
-	reasonPrefixMatch = "PREFIX_MATCH"
-	reasonTenantHot   = "TENANT_HOT"
-	reasonNoHint      = "NO_HINT"
-	reasonTimeout     = "TIMEOUT"
-	reasonOK          = "OK"
+	reasonPrefixMatch         = "PREFIX_MATCH"
+	reasonTenantHot           = "TENANT_HOT"
+	reasonNoHint              = "NO_HINT"
+	reasonTimeout             = "TIMEOUT"
+	reasonOK                  = "OK"
+	reasonPolicyRequiresChain = "POLICY_REQUIRES_CHAIN"
 
 	// Diagnostic codes for LookupRoute contract-key mismatches. Emitted on
 	// the miss path when the index can tell the caller that one of
@@ -80,7 +81,8 @@ const (
 // result-side floor — see docs/design/lookuproute-ranking.md §2.6; or the
 // top per-replica score fell below the per-namespace routingFloorScore
 // post-score floor on the distinguishing-power-aware ranker — see
-// docs/design/lookuproute-ranking.md §2.7), with
+// docs/design/lookuproute-ranking.md §2.7), with POLICY_REQUIRES_CHAIN
+// (CachePolicy.spec.strategy.requireChain requires a wire block-hash chain), with
 // TIMEOUT (lookupTimeoutMs budget breach), or with
 // one of the diagnostic codes UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME
 // when the lookup misses AND the index can identify which contract key did not
@@ -213,8 +215,9 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// prefix_hash / token_ids that would make us ignore it) and nothing else
 	// bounds the call, apply a default safety timeout so tokenization can't block
 	// the hot path indefinitely — it fails open instead.
+	chainMatchingEnabled := s.policyChainMatchingEnabled(tenant)
 	willTokenize := req.GetPromptText() != "" &&
-		len(req.GetBlockHashes()) == 0 && len(req.GetBlockTokenCounts()) == 0 &&
+		(!chainMatchingEnabled || (len(req.GetBlockHashes()) == 0 && len(req.GetBlockTokenCounts()) == 0)) &&
 		len(req.GetPrefixHash()) == 0 && len(req.GetTokenIds()) == 0
 	if _, has := ctx.Deadline(); !has && willTokenize && s.tokenizeTimeout > 0 {
 		var cancel context.CancelFunc
@@ -225,6 +228,9 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// any further work serves a caller that has given up. Still fail open.
 	if err := ctx.Err(); err != nil {
 		return s.timeoutResponse(model, time.Since(start), nil), nil
+	}
+	if s.policyChainRequired(tenant) && !requestCarriesValidBlockHashChain(req) {
+		return s.policyGateResponse(model, reasonPolicyRequiresChain, time.Since(start), nil), nil
 	}
 	_, hasDeadline := ctx.Deadline()
 
@@ -240,14 +246,14 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	var in lookupInputs
 	if hasDeadline {
 		ch := make(chan lookupInputs, 1)
-		go func() { ch <- s.resolveLookupChain(ctx, req) }()
+		go func() { ch <- s.resolveLookupChain(ctx, req, chainMatchingEnabled) }()
 		select {
 		case in = <-ch:
 		case <-ctx.Done():
 			return s.timeoutResponse(model, time.Since(start), nil), nil
 		}
 	} else {
-		in = s.resolveLookupChain(ctx, req)
+		in = s.resolveLookupChain(ctx, req, chainMatchingEnabled)
 	}
 	// A deadline-aware tokenizer may have returned a context error that surfaced
 	// as failOpen; if the budget actually expired that is a TIMEOUT, not NO_HINT.
@@ -269,8 +275,15 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// canonical tokens: a prompt_text caller needs them to call the engine even
 	// when there is no routing hint.
 	if minTokens := s.policyMinimumPrefixTokens(tenant); minTokens > 0 &&
-		effectivePrefixTokens(in.blockTokenCounts, req.GetPrefixTokenCount()) < minTokens {
+		effectivePrefixTokens(in.blockTokenCounts, in.exactTokenCount) < minTokens {
 		return s.noHintResponse(model, time.Since(start), in.echoTokens), nil
+	}
+
+	lookupBlockHashes := in.blockHashes
+	lookupBlockTokenCounts := in.blockTokenCounts
+	if !chainMatchingEnabled {
+		lookupBlockHashes = nil
+		lookupBlockTokenCounts = nil
 	}
 
 	slo := req.GetSlo()
@@ -278,10 +291,10 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 		Model:            model,
 		Tenant:           tenant,
 		HashScheme:       req.GetHashScheme(),
-		PrefixHash:       req.GetPrefixHash(),
-		TokenCount:       req.GetPrefixTokenCount(),
-		BlockHashes:      in.blockHashes,
-		BlockTokenCounts: in.blockTokenCounts,
+		PrefixHash:       in.exactPrefixHash,
+		TokenCount:       in.exactTokenCount,
+		BlockHashes:      lookupBlockHashes,
+		BlockTokenCounts: lookupBlockTokenCounts,
 		TTFTBudgetMs:     slo.GetTtftMs(),
 		TBTBudgetMs:      slo.GetTbtMs(),
 	}
@@ -291,6 +304,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// call would just churn allocations behind the index lock during a sweep).
 	if !hasDeadline {
 		result := s.lookupFn(lookupReq)
+		result = s.applyLookupStrategyGates(result, tenant)
 		return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 	}
 
@@ -338,6 +352,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// Report total hot-path time (tokenization + lookup), not just the index
 	// lookup, so the new prompt_text path isn't under-reported on the latency
 	// metric. The budget check above still uses the lookup-only `elapsed`.
+	result = s.applyLookupStrategyGates(result, tenant)
 	return s.buildLookupResponse(model, tenant, result, time.Since(start), in.echoTokens), nil
 }
 
@@ -350,6 +365,8 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 type lookupInputs struct {
 	blockHashes      [][]byte // effective chain (empty → fall back to req.prefix_hash exact match)
 	blockTokenCounts []int32  // parallel per-block token counts
+	exactPrefixHash  []byte   // effective legacy exact key
+	exactTokenCount  int32    // token count for the effective exact key
 	echoTokens       []uint32 // canonical tokens to echo (prompt_text path only)
 	failOpen         bool     // true → return NO_HINT (tokenizer unavailable/errored)
 }
@@ -374,19 +391,38 @@ type lookupInputs struct {
 // otherwise surface a TENANT_HOT locality hint for a prompt that has no
 // cacheable block — symmetric with the "chain misses never fall to TENANT_HOT"
 // rule in grpc-contract.md).
-func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest) lookupInputs {
+func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icpb.LookupRouteRequest, chainMatchingEnabled bool) lookupInputs {
 	// An explicit fingerprint attempt: the caller set a prefix_hash and/or a
 	// block-hash chain. Pass req's values through to the index (which exact-
-	// matches prefix_hash and walks the chain). A one-sided / malformed chain —
-	// block_hashes and block_token_counts present with mismatched lengths, or one
-	// set without the other — must fail open with NO_HINT rather than fall through
-	// to a lower-precedence input (token_ids / prompt_text) or a TENANT_HOT hint.
+	// matches prefix_hash and walks the chain). When chain matching is enabled,
+	// a one-sided / malformed chain — block_hashes and block_token_counts present
+	// with mismatched lengths, or one set without the other — must fail open with
+	// NO_HINT rather than fall through to a lower-precedence input (token_ids /
+	// prompt_text) or a TENANT_HOT hint. When chain matching is disabled, chain
+	// fields are ignored and the request uses the legacy exact path.
 	bh, btc := req.GetBlockHashes(), req.GetBlockTokenCounts()
+	exactPrefixHash, exactTokenCount := req.GetPrefixHash(), req.GetPrefixTokenCount()
+	ignoredChain := false
+	if !chainMatchingEnabled {
+		if len(exactPrefixHash) > 0 {
+			return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
+		}
+		if len(bh) > 0 || len(btc) > 0 {
+			ignoredChain = true
+			bh = nil
+			btc = nil
+		}
+	}
 	if len(bh) > 0 || len(btc) > 0 || len(req.GetPrefixHash()) > 0 {
 		if len(bh) != len(btc) {
 			return lookupInputs{failOpen: true}
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
+		return lookupInputs{
+			blockHashes:      bh,
+			blockTokenCounts: btc,
+			exactPrefixHash:  exactPrefixHash,
+			exactTokenCount:  exactTokenCount,
+		}
 	}
 	if toks := req.GetTokenIds(); len(toks) > 0 {
 		if len(toks) > MaxLookupTokens {
@@ -396,7 +432,12 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 		if len(bh) == 0 {
 			return lookupInputs{failOpen: true} // shorter than one block — nothing the engine can prefix-cache
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc}
+		return lookupInputs{
+			blockHashes:      chainHashesIfEnabled(bh, chainMatchingEnabled),
+			blockTokenCounts: chainCountsIfEnabled(btc, chainMatchingEnabled),
+			exactPrefixHash:  bh[len(bh)-1],
+			exactTokenCount:  sumBlockTokenCounts(btc),
+		}
 	}
 	if text := req.GetPromptText(); text != "" {
 		if len(text) > MaxPromptTextBytes {
@@ -426,9 +467,44 @@ func (s *inferenceCacheService) resolveLookupChain(ctx context.Context, req *icp
 			// the engine even though there is no routing hint.
 			return lookupInputs{failOpen: true, echoTokens: toks}
 		}
-		return lookupInputs{blockHashes: bh, blockTokenCounts: btc, echoTokens: toks}
+		return lookupInputs{
+			blockHashes:      chainHashesIfEnabled(bh, chainMatchingEnabled),
+			blockTokenCounts: chainCountsIfEnabled(btc, chainMatchingEnabled),
+			exactPrefixHash:  bh[len(bh)-1],
+			exactTokenCount:  sumBlockTokenCounts(btc),
+			echoTokens:       toks,
+		}
 	}
-	return lookupInputs{}
+	if ignoredChain {
+		return lookupInputs{failOpen: true}
+	}
+	return lookupInputs{exactPrefixHash: exactPrefixHash, exactTokenCount: exactTokenCount}
+}
+
+func requestCarriesValidBlockHashChain(req *icpb.LookupRouteRequest) bool {
+	return len(req.GetBlockHashes()) > 0 && len(req.GetBlockHashes()) == len(req.GetBlockTokenCounts())
+}
+
+func chainHashesIfEnabled(hashes [][]byte, enabled bool) [][]byte {
+	if !enabled {
+		return nil
+	}
+	return hashes
+}
+
+func chainCountsIfEnabled(counts []int32, enabled bool) []int32 {
+	if !enabled {
+		return nil
+	}
+	return counts
+}
+
+func sumBlockTokenCounts(counts []int32) int32 {
+	var sum int32
+	for _, count := range counts {
+		sum += count
+	}
+	return sum
 }
 
 // buildLookupResponse turns a LookupResult into the proto envelope and records
@@ -541,6 +617,19 @@ func (s *inferenceCacheService) noHintResponse(model string, elapsed time.Durati
 	return resp
 }
 
+// policyGateResponse builds an empty fail-open response for a CachePolicy gate
+// that deliberately uses a more specific reason_code than NO_HINT. The gateway
+// behavior is still the same: no replica scores, route normally.
+func (s *inferenceCacheService) policyGateResponse(model, reason string, elapsed time.Duration, echoTokens []uint32) *icpb.LookupRouteResponse {
+	resp := &icpb.LookupRouteResponse{
+		ReasonCode:      reason,
+		LookupLatencyUs: elapsed.Microseconds(),
+		TokenIds:        echoTokens,
+	}
+	s.metrics.observeLookup(model, reason, false, elapsed)
+	return resp
+}
+
 // policyTimeout returns the per-tenant LookupRoute deadline, or 0 if none.
 func (s *inferenceCacheService) policyTimeout(tenant string) time.Duration {
 	if s.policies == nil {
@@ -619,6 +708,34 @@ func (s *inferenceCacheService) policyRoutingFloorScore(tenant string) float32 {
 		return 0
 	}
 	return s.policies.RoutingFloorScore(tenant)
+}
+
+func (s *inferenceCacheService) policyChainMatchingEnabled(tenant string) bool {
+	if s.policies == nil {
+		return DefaultEnableChainMatching
+	}
+	return s.policies.ChainMatchingEnabled(tenant)
+}
+
+func (s *inferenceCacheService) policyChainRequired(tenant string) bool {
+	if s.policies == nil {
+		return DefaultRequireChain
+	}
+	return s.policies.ChainRequired(tenant)
+}
+
+func (s *inferenceCacheService) policyTenantHotEnabled(tenant string) bool {
+	if s.policies == nil {
+		return DefaultEnableTenantHot
+	}
+	return s.policies.TenantHotEnabled(tenant)
+}
+
+func (s *inferenceCacheService) applyLookupStrategyGates(result index.LookupResult, tenant string) index.LookupResult {
+	if result.Strategy == index.StrategyTenantHot && !s.policyTenantHotEnabled(tenant) {
+		return index.LookupResult{Strategy: index.StrategyNone}
+	}
+	return result
 }
 
 // reasonForStrategy maps the index's ranking Strategy onto the gRPC contract's

@@ -147,7 +147,42 @@ spec:
                   error visible to the operator instead.
                 pattern: ^(0|[1-9][0-9]{0,7})(\.[0-9]{1,6})?$
                 type: string
+              strategy:
+                description: |-
+                  Strategy controls which LookupRoute matching strategies may produce a
+                  hint for this namespace. Defaults preserve the historical behavior:
+                  longest-prefix chain matching is enabled, callers are not required to
+                  send a chain, and TENANT_HOT remains enabled as a soft locality fallback.
+                properties:
+                  enableChainMatching:
+                    default: true
+                    description: |-
+                      EnableChainMatching allows LookupRoute requests that carry block_hashes
+                      to use the longest-common-leading-run chain matcher. When false, the
+                      server ignores request block_hashes and falls back to the legacy exact
+                      prefix_hash path.
+                    type: boolean
+                  enableTenantHot:
+                    default: true
+                    description: |-
+                      EnableTenantHot allows the TENANT_HOT fallback when no prefix match is
+                      found but the tenant has recently warm replicas. When false, TENANT_HOT
+                      results are downgraded to NO_HINT.
+                    type: boolean
+                  requireChain:
+                    default: false
+                    description: |-
+                      RequireChain rejects LookupRoute requests that do not carry a valid
+                      block_hash chain with reason_code=POLICY_REQUIRES_CHAIN before touching
+                      the index. It is only coherent when EnableChainMatching is true.
+                    type: boolean
+                type: object
             type: object
+            x-kubernetes-validations:
+            - message: strategy.requireChain requires strategy.enableChainMatching
+              rule: '!has(self.strategy) || !has(self.strategy.enableChainMatching)
+                || self.strategy.enableChainMatching || !has(self.strategy.requireChain)
+                || !self.strategy.requireChain'
           status:
             description: CachePolicyStatus defines observed policy state.
             properties:

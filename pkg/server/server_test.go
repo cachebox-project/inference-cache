@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -19,8 +20,10 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	authnv1 "k8s.io/api/authentication/v1"
 
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
 // newTestService builds a service backed by a fresh, empty index + policy
@@ -1622,6 +1625,254 @@ func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	}
 	if resp.GetReasonCode() != "NO_HINT" {
 		t.Fatalf("reason = %q, want NO_HINT when chain budget is below the threshold", resp.GetReasonCode())
+	}
+}
+
+func TestLookupRouteRequireChainGateReturnsPolicyReason(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *icpb.LookupRouteRequest
+	}{
+		{
+			name: "legacy exact prefix hash",
+			req:  &icpb.LookupRouteRequest{PrefixHash: []byte("p")},
+		},
+		{
+			name: "malformed chain",
+			req: &icpb.LookupRouteRequest{
+				BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+				BlockTokenCounts: []int32{16},
+			},
+		},
+		{
+			name: "token ids synthesize chain but do not carry one",
+			req:  &icpb.LookupRouteRequest{TokenIds: make([]uint32, 32)},
+		},
+		{
+			name: "prompt text could synthesize chain but does not carry one",
+			req:  &icpb.LookupRouteRequest{PromptText: "hello"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService()
+			reqChain := true
+			svc.policies.Replace([]ResolvedPolicy{{
+				Namespace: "team-a",
+				Strategy:  &ResolvedLookupStrategy{RequireChain: &reqChain},
+			}})
+			svc.lookupFn = func(index.LookupRequest) index.LookupResult {
+				t.Fatal("index lookup should not run when policy requires a carried chain and request lacks one")
+				return index.LookupResult{}
+			}
+
+			tc.req.ModelId = "m"
+			tc.req.TenantId = "team-a"
+			tc.req.HashScheme = "vllm"
+			resp, err := svc.LookupRoute(context.Background(), tc.req)
+			if err != nil {
+				t.Fatalf("LookupRoute: %v", err)
+			}
+			if resp.GetReasonCode() != reasonPolicyRequiresChain {
+				t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonPolicyRequiresChain)
+			}
+			if len(resp.GetReplicaScores()) != 0 {
+				t.Fatalf("policy gate must not return scores, got %+v", resp.GetReplicaScores())
+			}
+		})
+	}
+}
+
+func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
+	tokenHashes, tokenCounts := fingerprint.Chain(tokenSeq(1_000, 32), 16)
+	promptTokens := tokenSeq(2_000, 32)
+	promptHashes, promptCounts := fingerprint.Chain(promptTokens, 16)
+
+	tests := []struct {
+		name            string
+		req             *icpb.LookupRouteRequest
+		tokenizer       tokenize.Tokenizer
+		wantPrefixHash  []byte
+		wantTokenCount  int32
+		wantEchoedToken []uint32
+		wantNoLookup    bool
+	}{
+		{
+			name: "legacy prefix wins over well formed chain",
+			req: &icpb.LookupRouteRequest{
+				PrefixHash:       []byte("legacy-exact"),
+				PrefixTokenCount: 99,
+				BlockHashes: [][]byte{
+					[]byte("b1"),
+					[]byte("b2"),
+				},
+				BlockTokenCounts: []int32{64, 64},
+			},
+			wantPrefixHash: []byte("legacy-exact"),
+			wantTokenCount: 99,
+		},
+		{
+			name: "malformed chain is ignored when legacy prefix exists",
+			req: &icpb.LookupRouteRequest{
+				PrefixHash:       []byte("legacy-exact"),
+				PrefixTokenCount: 99,
+				BlockHashes: [][]byte{
+					[]byte("b1"),
+					[]byte("b2"),
+				},
+				BlockTokenCounts: []int32{64},
+			},
+			wantPrefixHash: []byte("legacy-exact"),
+			wantTokenCount: 99,
+		},
+		{
+			name: "chain only fails open",
+			req: &icpb.LookupRouteRequest{
+				BlockHashes: [][]byte{
+					[]byte("b1"),
+					[]byte("b2"),
+				},
+				BlockTokenCounts: []int32{64, 64},
+			},
+			wantNoLookup: true,
+		},
+		{
+			name:           "token ids use derived final block as exact prefix",
+			req:            &icpb.LookupRouteRequest{TokenIds: tokenSeq(1_000, 32)},
+			wantPrefixHash: tokenHashes[len(tokenHashes)-1],
+			wantTokenCount: sumBlockTokenCounts(tokenCounts),
+		},
+		{
+			name: "malformed chain is ignored before token ids",
+			req: &icpb.LookupRouteRequest{
+				BlockHashes:      [][]byte{[]byte("b1"), []byte("b2")},
+				BlockTokenCounts: []int32{64},
+				TokenIds:         tokenSeq(1_000, 32),
+			},
+			wantPrefixHash: tokenHashes[len(tokenHashes)-1],
+			wantTokenCount: sumBlockTokenCounts(tokenCounts),
+		},
+		{
+			name:            "prompt text uses derived final block as exact prefix",
+			req:             &icpb.LookupRouteRequest{PromptText: "hello"},
+			tokenizer:       fakeTokenizer{tokens: promptTokens},
+			wantPrefixHash:  promptHashes[len(promptHashes)-1],
+			wantTokenCount:  sumBlockTokenCounts(promptCounts),
+			wantEchoedToken: promptTokens,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService()
+			if tc.tokenizer != nil {
+				svc.tokenizer = tc.tokenizer
+			}
+			enableChain := false
+			svc.policies.Replace([]ResolvedPolicy{{
+				Namespace: "team-a",
+				Strategy:  &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+			}})
+			var got index.LookupRequest
+			var called bool
+			svc.lookupFn = func(req index.LookupRequest) index.LookupResult {
+				got = req
+				called = true
+				return index.LookupResult{Strategy: index.StrategyNone}
+			}
+
+			tc.req.ModelId = "m"
+			tc.req.TenantId = "team-a"
+			tc.req.HashScheme = "vllm"
+			resp, err := svc.LookupRoute(context.Background(), tc.req)
+			if err != nil {
+				t.Fatalf("LookupRoute: %v", err)
+			}
+			if tc.wantNoLookup {
+				if called {
+					t.Fatal("index lookup was called")
+				}
+				if resp.GetReasonCode() != reasonNoHint {
+					t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonNoHint)
+				}
+				return
+			}
+			if !called {
+				t.Fatal("index lookup was not called")
+			}
+			if len(got.BlockHashes) != 0 || len(got.BlockTokenCounts) != 0 {
+				t.Fatalf("chain fields reached index despite enableChainMatching=false: hashes=%d counts=%d", len(got.BlockHashes), len(got.BlockTokenCounts))
+			}
+			if !bytes.Equal(got.PrefixHash, tc.wantPrefixHash) {
+				t.Fatalf("PrefixHash = %x, want %x", got.PrefixHash, tc.wantPrefixHash)
+			}
+			if got.TokenCount != tc.wantTokenCount {
+				t.Fatalf("TokenCount = %d, want %d", got.TokenCount, tc.wantTokenCount)
+			}
+			if !equalU32(resp.GetTokenIds(), tc.wantEchoedToken) {
+				t.Fatalf("echoed token_ids = %v, want %v", resp.GetTokenIds(), tc.wantEchoedToken)
+			}
+		})
+	}
+}
+
+func TestLookupRouteDisableChainMatchingMinPrefixIgnoresChainCounts(t *testing.T) {
+	svc := newTestService()
+	enableChain := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace:           "team-a",
+		MinimumPrefixTokens: 100,
+		Strategy:            &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+	}})
+	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
+		t.Fatal("index lookup should not run when the effective exact prefix is below the threshold")
+		return index.LookupResult{}
+	}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId:          "m",
+		TenantId:         "team-a",
+		HashScheme:       "vllm",
+		PrefixHash:       []byte("legacy-exact"),
+		PrefixTokenCount: 10,
+		BlockHashes: [][]byte{
+			[]byte("b1"),
+			[]byte("b2"),
+		},
+		BlockTokenCounts: []int32{100, 100},
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != reasonNoHint {
+		t.Fatalf("reason = %q, want %s", resp.GetReasonCode(), reasonNoHint)
+	}
+}
+
+func TestLookupRouteDisableTenantHotDowngradesToNoHint(t *testing.T) {
+	svc := newTestService()
+	enableTenantHot := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace: "t",
+		Strategy:  &ResolvedLookupStrategy{EnableTenantHot: &enableTenantHot},
+	}})
+	svc.index.Ingest(index.Update{
+		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},
+		Stats:    &index.ReplicaStats{HitRate: 0.9, Pressure: 0.0},
+	})
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("miss"),
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != reasonNoHint {
+		t.Fatalf("reason = %q, want NO_HINT when tenant-hot is disabled", resp.GetReasonCode())
+	}
+	if len(resp.GetReplicaScores()) != 0 {
+		t.Fatalf("tenant-hot disabled must not return scores, got %+v", resp.GetReplicaScores())
 	}
 }
 

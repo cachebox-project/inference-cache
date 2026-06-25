@@ -23,7 +23,7 @@ snapshot. The CR is purely declarative: the controller pushes its resolved field
 server, which is where enforcement actually happens (see
 [Propagation](#propagation-controller--server) below).
 
-## The six spec knobs
+## The seven spec knobs
 
 | Field | Type | Default | When to tune |
 |---|---|---|---|
@@ -33,6 +33,7 @@ server, which is where enforcement actually happens (see
 | `minimumMatchedTokens` | int32 (min `0`) | `64` (4 KV blocks) | Minimum *realized* matched-token count for a response to surface as `PREFIX_MATCH`. Applied AFTER the lookup runs, against the *actual* per-replica overlap. Replicas whose match falls below the floor are filtered; if none survive, the reason code downgrades to `NO_HINT` so the gateway round-robins honestly instead of being credited with a trivial chat-template-only match. Set to `0` to disable entirely (e.g. raw-recall benchmarking). Distinct from `minimumPrefixTokens` — see [Three lookup-filter knobs, one role each](#three-lookup-filter-knobs-one-role-each) below. |
 | `routingFloorScore` | stringified float, e.g. `"0.1"`, `"5"`, `"0"` | `"0.1"` | Per-replica *score* floor below which a `PREFIX_MATCH` response downgrades to `NO_HINT`. Applied AFTER the lookup runs, against the per-replica score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`). Overlaps held by every replica (chat-template framing, RAG corpus headers, custom system prompts shared across the deployment) produce `distinguishing_power = 0` and score = 0 — this floor catches them. Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica), then this score floor gates the top survivor. Set to `"0"` to disable entirely (raw-recall benchmarking / debug). |
 | `lookupTimeoutMs` | int32 (min `0`) | unset = no deadline | Per-lookup latency budget in milliseconds. A breach returns reason code `TIMEOUT` (still fail-open — empty result, never an error to the gateway). See the foot-gun in [Gotchas](#two-gotchas). |
+| `strategy` | object | chain matching on, chain not required, tenant-hot on | Per-namespace LookupRoute strategy gates. Use `enableChainMatching: false` to force exact `prefix_hash` matching, `requireChain: true` to reject non-chain callers with `POLICY_REQUIRES_CHAIN`, or `enableTenantHot: false` to suppress soft tenant-hot hints. |
 
 `status` carries only `observedGeneration` + `conditions`, and both are **reserved** — the
 reconciler does not write `CachePolicy.status` today.
@@ -56,6 +57,10 @@ spec:
   minimumMatchedTokens: 64   # filter sub-floor replicas per-replica; NO_HINT if all drop (result-side matched-tokens floor, default 64)
   routingFloorScore: "0.1"   # downgrade whole response to NO_HINT when top score is below floor (result-side score floor, default "0.1")
   lookupTimeoutMs: 20        # positive => a real 20ms deadline (NOT 0 — see Gotchas)
+  strategy:
+    enableChainMatching: true # default: use block-hash longest-prefix matching when callers send chains
+    requireChain: false       # default: legacy exact prefix_hash callers still work
+    enableTenantHot: true     # default: allow soft TENANT_HOT locality hints
 ```
 
 A copy-pasteable starting point ships at

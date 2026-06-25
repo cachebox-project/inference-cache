@@ -161,11 +161,11 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v5)
+## Wire schema (v6)
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "policies": [
     {
       "namespace": "team-a",
@@ -174,7 +174,12 @@ intervention.
       "minimumMatchedTokens": 128,
       "routingFloorScore": 5,
       "lookupTimeoutMs": 25,
-      "eviction": "lfu"
+      "eviction": "lfu",
+      "strategy": {
+        "enableChainMatching": true,
+        "requireChain": false,
+        "enableTenantHot": true
+      }
     },
     {
       "namespace": "team-b",
@@ -196,15 +201,15 @@ intervention.
 - `version` — schema version. Bumped on every schema change so version
   skew is observable; **whether the bump is rejected at decode is set
   separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
-  Rollout asymmetry note in §Versioning and forward-compat below. v4 and
-  v5 are both additive and defaultable, so the v5 server still accepts
-  v3 and v4 bodies; a hypothetical breaking change would bump
+  Rollout asymmetry note in §Versioning and forward-compat below. v4, v5,
+  and v6 are additive and defaultable, so the v6 server still accepts
+  v3, v4, and v5 bodies; a hypothetical breaking change would bump
   `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
   value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
-  (HTTP 400). Currently `5` (bumped from `1` to `2` when `tenants` was
-  added, to `3` when `policies[].eviction` was added, to `4` when
-  `policies[].minimumMatchedTokens` was added, and to `5` when
-  `policies[].routingFloorScore` was added).
+  (HTTP 400). Currently `6`. Version history: `2` added `tenants`; `3`
+  added `policies[].eviction`; `4` added
+  `policies[].minimumMatchedTokens`; `5` added
+  `policies[].routingFloorScore`; `6` added `policies[].strategy`.
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -268,6 +273,15 @@ intervention.
   `"lfu"`). Optional. `""` ⇒ "use server default" (`LRU`). The controller
   lower-cases the CRD's upper-case enum; the index normalizes any
   unrecognized value back to `LRU`.
+- `policies[].strategy` — object pointer (omitempty). Optional. Missing
+  strategy or missing nested booleans resolve to the defaults:
+  `enableChainMatching=true`, `requireChain=false`, `enableTenantHot=true`.
+  `enableChainMatching=false` strips block-hash chain fields before lookup and
+  uses the legacy exact `prefix_hash` path; `requireChain=true` returns
+  `POLICY_REQUIRES_CHAIN` before the index lookup when a request has no valid
+  chain; `enableTenantHot=false` downgrades tenant-hot fallbacks to `NO_HINT`.
+  The CachePolicy validating webhook and CRD CEL reject
+  `enableChainMatching=false` with `requireChain=true`.
 - `tenants[]` — full snapshot of the `CacheTenant` CRs that carry an
   enforceable quota, keyed by `tenantID` (a different axis from the
   namespace-keyed `policies[]`). A `CacheTenant` without
@@ -350,6 +364,7 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 | `minimumMatchedTokens` | Post-lookup floor on each replica's realized `matched_tokens`. The handler resolves the per-tenant floor via `PolicyStore.MinimumMatchedTokens`, which falls back to `DefaultMinimumMatchedTokens` (= 64) for tenants with no `CachePolicy`. Replicas whose `matched_tokens` falls below the floor are filtered from the scored result; if none survive, the response downgrades to `reason_code: NO_HINT` with empty scores. The downgrade runs **before** the LFU `CreditHits` step so a non-delivered hint never bumps the per-entry access counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
 | `routingFloorScore` | Post-score floor on the per-replica score from the distinguishing-power-aware ranker. The handler resolves the per-tenant floor via `PolicyStore.RoutingFloorScore`, which falls back to `DefaultRoutingFloorScore` (`0.1`) for tenants with no `CachePolicy`. When the top surviving replica's score falls below the floor, the response downgrades to `reason_code: NO_HINT` with empty scores. Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica filter), then this score floor checks the top survivor. Both downgrades run **before** the LFU `CreditHits` step so a non-delivered hint never bumps an LFU counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). |
+| `strategy.enableChainMatching` / `strategy.requireChain` / `strategy.enableTenantHot` | Handler-side strategy gates. Chain matching disabled strips request block-hash fields before the index call; chain required rejects non-chain requests with `reason_code: POLICY_REQUIRES_CHAIN` before touching the index; tenant-hot disabled downgrades tenant-hot results to `NO_HINT`. The index remains policy-agnostic. |
 | `CacheTenant.spec.quota.maxIndexEntries` | `pkg/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
 
 The server is fail-open by construction on the hot path (no error
@@ -384,12 +399,13 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `pkg/server.PolicyPropagationVersion` on every request.
 
-`version` is `5`: it was bumped from `1` to `2` when the `tenants` slice
-was added, to `3` when `policies[].eviction` (the per-namespace cap-eviction
-algorithm) was added, to `4` when `policies[].minimumMatchedTokens`
-(the result-side matched-tokens floor) was added, and to `5` when
-`policies[].routingFloorScore` (the per-namespace post-score floor for
-the distinguishing-power-aware ranker) was added. The server decodes with
+`version` is `6`: `2` added the `tenants` slice; `3` added
+`policies[].eviction` (the per-namespace cap-eviction algorithm); `4` added
+`policies[].minimumMatchedTokens` (the result-side matched-tokens floor); `5`
+added `policies[].routingFloorScore` (the per-namespace post-score floor for
+the distinguishing-power-aware ranker); `6` added `policies[].strategy`
+(per-namespace LookupRoute strategy gates).
+The server decodes with
 `DisallowUnknownFields`, so an older server receiving a newer body still
 fails loud on the unknown field even before its version check fires.
 
@@ -398,26 +414,24 @@ deliberately asymmetric so a server-first rollout (newer server, older
 controller still pushing the prior schema) does NOT drop existing policy
 state mid-upgrade:
 
-- A v5 server accepts any body whose `version` is in
+- A v6 server accepts any body whose `version` is in
   `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
-  `[3, 5]`. Bodies outside the band are rejected with
+  `[3, 6]`. Bodies outside the band are rejected with
   `unsupported policy snapshot version`.
 - For accepted older bodies, each new field is *normalized* before reaching
-  the store. v3 has neither `minimumMatchedTokens` nor `routingFloorScore`;
-  v4 has the former but not the latter. JSON decodes the missing fields as
-  their zero values, which would be indistinguishable from the v4/v5
-  explicit opt-outs (`0` / nil-pointer) and silently disable both floors
-  for every namespace with a CR during the rollout. The server fills in
-  `DefaultMinimumMatchedTokens` (`64`) for v3 bodies and
-  `DefaultRoutingFloorScore` (`0.1`) for v3 and v4 bodies, so the
-  effective floors match the no-CachePolicy fallbacks
-  `PolicyStore.MinimumMatchedTokens` / `PolicyStore.RoutingFloorScore`
-  apply to tenants without a CR. Every other knob (TTL, prefix gate,
-  timeout, eviction, tenant quota) reaches the store byte-for-byte.
-- v5 bodies are NOT normalized — an operator's explicit
-  `routingFloorScore: 0` opt-out (or `minimumMatchedTokens: 0`) reaches
-  the store as written. Each normalization fires only when the version
-  says the corresponding new field could not have been present.
+  the store. v3 has neither `minimumMatchedTokens`, `routingFloorScore`, nor
+  `strategy`; v4 has the first but not the latter two; v5 has both floors but
+  not `strategy`. JSON decodes missing fields as their zero values, which
+  would be indistinguishable from explicit opt-outs and silently change policy
+  during the rollout. The server fills in `DefaultMinimumMatchedTokens` (`64`)
+  for v3 bodies, `DefaultRoutingFloorScore` (`0.1`) for v3 and v4 bodies, and
+  strategy defaults (`true` / `false` / `true`) for v3, v4, and v5 bodies. Every
+  other knob (TTL, prefix gate, timeout, eviction, tenant quota) reaches the
+  store byte-for-byte.
+- v6 bodies are NOT normalized — an operator's explicit `routingFloorScore: 0`,
+  `minimumMatchedTokens: 0`, or `strategy.enableTenantHot: false` reaches the
+  store as written. Each normalization fires only when the version says the
+  corresponding new field could not have been present.
 
 The carve-out only applies to **additive, defaultable** schema changes: a
 new field whose absence has a safe well-defined synthesized value. A

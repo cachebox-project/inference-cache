@@ -74,6 +74,7 @@ type CachePolicyValidationRule func(cp *cachev1alpha1.CachePolicy) field.ErrorLi
 // changes.
 var DefaultCachePolicyValidationRules = []CachePolicyValidationRule{
 	rejectNonPositiveEvictionTTL,
+	rejectIncoherentStrategy,
 }
 
 // SetupCachePolicyWebhookWithManager registers the defaulting and validating
@@ -95,9 +96,8 @@ func SetupCachePolicyWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:webhook:path=/mutate-inferencecache-io-v1alpha1-cachepolicy,mutating=true,failurePolicy=fail,sideEffects=None,groups=inferencecache.io,resources=cachepolicies,verbs=create;update,versions=v1alpha1,name=mcachepolicy.inferencecache.io,admissionReviewVersions=v1
 
 // Default implements [admission.Defaulter]. It is intentionally a no-op
-// beyond logging: CachePolicy's only default (spec.eviction=LRU) is applied
-// by the apiserver from its `+kubebuilder:default=` marker before this
-// handler runs.
+// beyond logging: CachePolicy defaults are applied by the apiserver from
+// `+kubebuilder:default=` markers before this handler runs.
 func (d *CachePolicyDefaulter) Default(ctx context.Context, cp *cachev1alpha1.CachePolicy) error {
 	logf.FromContext(ctx).V(1).Info("defaulting CachePolicy (no-op; kubebuilder markers apply defaults)",
 		"namespace", cp.Namespace, "name", cp.Name)
@@ -244,6 +244,27 @@ func rejectNonPositiveEvictionTTL(cp *cachev1alpha1.CachePolicy) field.ErrorList
 			field.NewPath("spec", "evictionTTL"),
 			cp.Spec.EvictionTTL.Duration.String(),
 			"evictionTTL must be greater than zero when set (a non-positive TTL would be silently clamped to the index default)",
+		),
+	}
+}
+
+// rejectIncoherentStrategy rejects a policy that requires chain-form lookups
+// while also disabling the chain matcher. That shape would reject legacy
+// exact-prefix callers and make chain callers unmatchable, so surface it at
+// admission instead of letting the server produce surprising misses.
+func rejectIncoherentStrategy(cp *cachev1alpha1.CachePolicy) field.ErrorList {
+	strategy := cp.Spec.Strategy
+	if strategy == nil || strategy.EnableChainMatching == nil || strategy.RequireChain == nil {
+		return nil
+	}
+	if *strategy.EnableChainMatching || !*strategy.RequireChain {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "strategy", "requireChain"),
+			*strategy.RequireChain,
+			"requireChain requires enableChainMatching to be true",
 		),
 	}
 }
