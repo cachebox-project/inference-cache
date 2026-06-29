@@ -498,7 +498,7 @@ fi
 log "inference-cache-server memory limit = $server_mem_limit ($server_mem_bytes bytes; >= 1Gi → sized for DefaultMaxEntries=1M)"
 
 # --- CacheBackend CRD schema-trim assertion --------------------------------
-# The installed CRD must reflect the inert-field trim: the three removed fields
+# The installed CRD must reflect the inert-field trim: the five removed fields
 # are absent from the served v1alpha1 schema, and the field that replaced the
 # removed status.indexEntries — status.indexParticipation.prefixCount — is
 # present. Probing the live CRD in the cluster (not just the repo manifest)
