@@ -159,6 +159,11 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
+#  15. The operator `inferencecache doctor` CLI runs end-to-end against the live
+#      install: build the binary, apply a CacheBackend, run the config-only
+#      checks, and assert it emits the documented JSON envelope, surfaces a
+#      CacheBackend (CB0xx) finding, and exits with a code matching the reported
+#      summary.exitCode (the CI-gating contract).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -2670,4 +2675,44 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), and every config/samples/ manifest applies cleanly — all work"
+# --- inferencecache doctor CLI assertion -----------------------------------
+# The operator-facing `inferencecache doctor` CLI must run end-to-end against a
+# real install, not just envtest. Build it and run the config-only checks (no
+# live server probe required) against a freshly-applied CacheBackend, asserting
+# it emits the documented JSON envelope, actually inspected the backend (a CB0xx
+# finding), and that its process exit code matches the reported summary.exitCode
+# — the CI-gating contract operators rely on.
+log "asserting 'inferencecache doctor' runs against the live install"
+mkdir -p "$LOG_DIR"
+DOCTOR_BIN="$LOG_DIR/inferencecache"
+if ! go build -o "$DOCTOR_BIN" ./cmd/inferencecache >"$LOG_DIR/doctor-build.log" 2>&1; then
+  cat "$LOG_DIR/doctor-build.log" >&2 || true
+  fail "could not build cmd/inferencecache for the doctor smoke assertion"
+fi
+DOCTOR_NS=doctor-smoke
+kubectl create namespace "$DOCTOR_NS" >/dev/null 2>&1 || true
+kubectl apply -n "$DOCTOR_NS" -f config/samples/cache_v1alpha1_cachebackend.yaml >/dev/null
+doctor_rc=0
+"$DOCTOR_BIN" doctor --config-only --namespace "$DOCTOR_NS" --output json --no-color \
+  >"$LOG_DIR/doctor.json" 2>"$LOG_DIR/doctor.err" || doctor_rc=$?
+kubectl delete namespace "$DOCTOR_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+case "$doctor_rc" in
+  0|1|2) : ;;
+  *) cat "$LOG_DIR/doctor.json" "$LOG_DIR/doctor.err" >&2 || true
+     fail "inferencecache doctor exited $doctor_rc (want a CI-gating 0/1/2)" ;;
+esac
+if ! grep -q '"summary"' "$LOG_DIR/doctor.json" || ! grep -q '"findings"' "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "inferencecache doctor did not emit the expected JSON envelope (summary + findings)"
+fi
+if ! grep -q '"code": "CB0' "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "inferencecache doctor produced no CacheBackend (CB0xx) finding despite an applied backend"
+fi
+if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "doctor process exit ($doctor_rc) does not match the reported summary.exitCode"
+fi
+log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"

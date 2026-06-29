@@ -1,0 +1,21 @@
+[1minferencecache doctor[0m
+
+[1m[31mFAIL[0m
+  [31mFAIL SV001[0m  host:9090
+      gRPC health check failed: connection refused
+
+[1m[33mWARN[0m
+  [33mWARN CB002[0m  cachebackend/ns1/bad
+      status.matchedEnginePods is 0 (LikelySelectorMismatch)
+
+[1m[36mINFO[0m
+  [36mINFO CP001[0m  namespace/ns1
+      no CachePolicy — server defaults apply
+
+[1m[32mOK[0m
+  [32mOK   SV003[0m  host:9090
+      gRPC health check reports SERVING
+  [32mOK   EP000[0m
+      cluster-wide note with no resource
+
+[1mSummary: 2 OK, 1 INFO, 1 WARN, 1 FAIL  (exit 2)[0m
