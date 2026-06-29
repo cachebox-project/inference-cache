@@ -478,9 +478,9 @@ deliberately asymmetric so a server-first rollout (newer server, older
 controller still pushing the prior schema) does NOT drop existing policy
 state mid-upgrade:
 
-- A v6 server accepts any body whose `version` is in
+- A v7 server accepts any body whose `version` is in
   `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
-  `[3, 6]`. Bodies outside the band are rejected with
+  `[3, 7]`. Bodies outside the band are rejected with
   `unsupported policy snapshot version`.
 - For accepted older bodies, each new field is *normalized* before reaching
   the store. v3 has none of `minimumMatchedTokens`, `routingFloorScore`,

@@ -153,12 +153,14 @@ func (*inferenceCacheService) RenderTemplate(context.Context, *icpb.RenderTempla
 // and returns them ranked. The handler honors the tenant's CachePolicy and
 // runs the ranking-v2 orchestrator (index.LookupRoute) which:
 //
-//   - minimumPrefixTokens: a pre-lookup gate on the request's prefix token
-//     count. If the request's prefix is shorter than the threshold the index
-//     is never touched and the response is NO_HINT. Matches the CRD doc
-//     ("minimum prefix token count before lookup", docs/design/policy-crds.md)
-//     and avoids spending lock/lookup budget on requests that wouldn't yield
-//     a useful hint anyway.
+//   - minimumPrefixTokens: a gate on the request's prefix token count. With
+//     affinityRouting Disabled, a request shorter than the threshold
+//     short-circuits to NO_HINT without touching the index. With
+//     affinityRouting Enabled (the default), the request runs the full
+//     lookup so the index can classify UNKNOWN_* diagnostics first, then a
+//     sub-threshold positive hint is downgraded result-side and the affinity
+//     fallback may surface AFFINITY_HINT. Matches the CRD doc ("minimum
+//     prefix token count before lookup", docs/design/policy-crds.md).
 //   - lookupTimeoutMs: a deadline is applied around the lookup. If the caller's
 //     ctx is already past its deadline, or if the in-memory lookup exceeds the
 //     policy budget, the response is TIMEOUT (still fail-open: empty scores).

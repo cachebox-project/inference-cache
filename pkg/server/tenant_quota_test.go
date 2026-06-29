@@ -275,7 +275,7 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 	}
 }
 
-func TestPolicySnapshotV6ExplicitStrategyPreserved(t *testing.T) {
+func TestPolicySnapshotExplicitStrategyPreserved(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
 	defer srv.Close()

@@ -593,7 +593,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 // in-memory store sees the same shape regardless of which (supported) wire
 // version the controller pushed.
 //
-// Three normalizations today:
+// Four normalizations today:
 //
 //   - **v3 → v4 minimumMatchedTokens default.** A v3 body's missing field
 //     would otherwise land as 0 (the v4 explicit opt-out), silently
@@ -612,6 +612,10 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 //   - **v3/v4/v5 → v6 strategy defaults.** Missing strategy gates preserve
 //     the pre-v6 behavior: chain matching enabled, chain not required, and
 //     tenant-hot enabled.
+//   - **v3/v4/v5/v6 → v7 affinityRouting default.** A body older than v7 has
+//     no affinityRouting key; the nil *bool is filled with
+//     DefaultAffinityRoutingEnabled so a server-first rollout does not
+//     silently disable the consistent-hash fallback for namespaces with a CR.
 //
 // Bodies already at PolicyPropagationVersion are returned untouched so an
 // operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall

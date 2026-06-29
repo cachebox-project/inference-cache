@@ -250,7 +250,10 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 //     pkg/fingerprint, as a gateway would) returns PREFIX_MATCH with the
 //     publishing replica as the hint, with the full two-block chain matched —
 //     including the block delivered in a second, parent-chained event;
-//   - a novel prompt's fingerprint returns NO_HINT with no replica scores.
+//   - a novel prompt's fingerprint does not PREFIX_MATCH; with affinity
+//     routing on by default and a serving replica present it returns
+//     AFFINITY_HINT with one zero-matched-tokens replica pick (no real
+//     prefix overlap).
 func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	const tenant = "e2e-route"
 	tokens := tokenSeq(5_000, 2*e2eBlockTok) // two blocks
