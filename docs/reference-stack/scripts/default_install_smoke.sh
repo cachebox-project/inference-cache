@@ -1231,6 +1231,50 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
+# --- EngineCompatibility (hybrid-attention crash-loop) assertion ------------
+# A hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, …)
+# crash-loops at engine init when a KV connector is injected — vLLM disables
+# its hybrid KV-cache manager and fails KV-spec unification. We cannot run a
+# real hybrid model on the CPU kind node, so we reproduce the SIGNATURE the
+# controller keys on: force the injected engine container (already stamped
+# inferencecache.io/injected-by by the binding phase above) into
+# CrashLoopBackOff and assert the advisory
+# EngineCompatibility=False/EngineConnectorIncompatible condition surfaces —
+# instead of leaving it a silent crash-loop. The controller does NOT watch
+# engine pods (no informer, by design), so we poke the CacheBackend to drive
+# the reconcile that reads them.
+log "crash-looping the injected engine to assert EngineCompatibility surfaces"
+kubectl -n "$SAMPLE_NS" patch deploy qwen-engine \
+  -p '{"spec":{"template":{"spec":{"containers":[{"name":"vllm","command":["sh","-c","exit 1"]}]}}}}' >/dev/null
+deadline=$(($(date +%s) + 180))
+clbo=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  clbo=$(kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo \
+    -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason} {end}{end}' 2>/dev/null || true)
+  case "$clbo" in *CrashLoopBackOff*) break;; esac
+  sleep 4
+done
+case "$clbo" in
+  *CrashLoopBackOff*) : ;;
+  *) kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo -o wide || true
+     fail "engine pod did not reach CrashLoopBackOff within 180s (waiting reasons: $clbo)" ;;
+esac
+deadline=$(($(date +%s) + 120))
+ec_reason=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  kubectl -n "$SAMPLE_NS" annotate cb qwen-demo-cache \
+    inferencecache.io/smoke-poke="$(date +%s)" --overwrite >/dev/null 2>&1 || true
+  ec_reason=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].reason}' 2>/dev/null || true)
+  if [ "$ec_reason" = "EngineConnectorIncompatible" ]; then break; fi
+  sleep 4
+done
+if [ "$ec_reason" != "EngineConnectorIncompatible" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o jsonpath='{.status.conditions}' || true
+  fail "EngineCompatibility reason=$ec_reason, want EngineConnectorIncompatible after the injected engine crash-looped"
+fi
+log "EngineCompatibility=False/EngineConnectorIncompatible surfaced on the crash-looping injected engine"
+
 # --- spec.resources defaults + thread-through ------------------------------
 # The minimal paired-sample CacheBackend declares no spec.resources, so the
 # CRD-schema default must stamp limits.memory=8Gi (and the matching
