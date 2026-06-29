@@ -157,14 +157,17 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 			if kernelCheckAdmittedStrict(&pods[i]) {
 				strictFail = true
 			}
-		case msg == adapterruntime.KernelCheckMsgOK:
+		case msg == adapterruntime.KernelCheckMsgOK && term.ExitCode == 0:
 			nOK++
 		default:
-			// Terminated without our OK/FAIL: contract — python3 missing
-			// (exit 127), OOMKilled (137), an empty /dev/termination-log, or a
-			// crash before emit. Capture the exit code / kubelet reason / raw
-			// message so the operator-facing condition is actionable rather than
-			// just "unrecognized".
+			// Terminated without our OK/FAIL: contract: python3 missing (exit
+			// 127), OOMKilled (137), an empty /dev/termination-log, a crash
+			// before emit, OR an "OK" message paired with a non-zero exit (the
+			// detector reported success but the container did not exit cleanly —
+			// treat as indeterminate, not healthy, so a write-OK-then-crash can't
+			// false-green). Capture the exit code / kubelet reason / raw message
+			// so the operator-facing condition is actionable rather than just
+			// "unrecognized".
 			nErr++
 			if errDetail == "" {
 				errDetail = fmt.Sprintf("exit %d", term.ExitCode)

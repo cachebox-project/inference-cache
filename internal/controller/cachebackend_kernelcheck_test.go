@@ -80,6 +80,7 @@ func TestAggregateKernelHealth(t *testing.T) {
 			}}},
 		}}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
 		{"garbage message is error not mismatch", []corev1.Pod{podWithKernelStatus(termed(127, ""))}, metav1.ConditionUnknown, reasonKernelCheckError, true},
+		{"OK message but non-zero exit is error not healthy", []corev1.Pod{podWithKernelStatus(termed(1, "OK"))}, metav1.ConditionUnknown, reasonKernelCheckError, true},
 		{"running, no terminated status => pending", []corev1.Pod{podWithKernelStatus(corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
 		{"spec present but status not observed yet => pending", []corev1.Pod{specOnlyKernelPod()}, metav1.ConditionUnknown, reasonKernelCheckPending, true},
 		{"no kernel-check container in spec => inactive", []corev1.Pod{{Status: corev1.PodStatus{}}}, "", "", false},
