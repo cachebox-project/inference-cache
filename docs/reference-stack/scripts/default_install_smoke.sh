@@ -1235,17 +1235,18 @@ log "status.matchedEnginePods=1"
 # A hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, …)
 # crash-loops at engine init when a KV connector is injected — vLLM disables
 # its hybrid KV-cache manager and fails KV-spec unification. We cannot run a
-# real hybrid model on the CPU kind node, so we reproduce the SIGNATURE the
-# controller keys on: force the injected engine container (already stamped
-# inferencecache.io/injected-by by the binding phase above) into
-# CrashLoopBackOff and assert the advisory
-# EngineCompatibility=False/EngineConnectorIncompatible condition surfaces —
-# instead of leaving it a silent crash-loop. The controller does NOT watch
-# engine pods (no informer, by design), so we poke the CacheBackend to drive
-# the reconcile that reads them.
-log "crash-looping the injected engine to assert EngineCompatibility surfaces"
-kubectl -n "$SAMPLE_NS" patch deploy qwen-engine \
-  -p '{"spec":{"template":{"spec":{"containers":[{"name":"vllm","command":["sh","-c","exit 1"]}]}}}}' >/dev/null
+# real hybrid model on the CPU kind node, but we don't have to: the binding
+# phase's engine is the busybox stand-in (SAMPLE_ENGINE_IMAGE), which CANNOT
+# run `vllm serve`, so its injected engine container is already in
+# CrashLoopBackOff — the exact signature the controller keys on. We must NOT
+# mutate the qwen-engine Deployment here: a later phase cascade-restarts it to
+# assert status.observedServerInstance advances, and a command override would
+# stick and break that check. So we only wait for the natural crash-loop and
+# assert the advisory EngineCompatibility=False/EngineConnectorIncompatible
+# condition surfaces (instead of a silent crash-loop). The controller does NOT
+# watch engine pods (no informer, by design), so we poke the CacheBackend to
+# drive the reconcile that reads them.
+log "asserting EngineCompatibility surfaces on the crash-looping injected engine"
 deadline=$(($(date +%s) + 180))
 clbo=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
