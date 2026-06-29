@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1644,4 +1645,53 @@ func findCondition(conds []metav1.Condition, t string) *metav1.Condition {
 		}
 	}
 	return nil
+}
+
+// TestReplicasUnavailableMessageNamesServerOOM is the end-to-end check for the
+// sizing warning: when a managed backend's workload is ReplicasUnavailable AND a
+// cache-server container was OOMKilled, the Ready (and so Degraded) condition
+// message names the OOM and the actionable fix, instead of a bare replica count.
+func TestReplicasUnavailableMessageNamesServerOOM(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	cb.Spec.Replicas = ptrInt32(1)
+	r := newReconciler(scheme, cb)
+	reconcile(t, r, "cache", "ns1")
+
+	// Drive the workload to ReplicasUnavailable: rolled out, 0/1 available.
+	dep := getDeployment(t, r, "cache", "ns1")
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.AvailableReplicas = 0
+	if err := r.Status().Update(context.Background(), dep); err != nil {
+		t.Fatalf("update deployment status: %v", err)
+	}
+	// A server pod whose cache-server container was OOMKilled (CrashLoopBackOff
+	// after the kubelet restarted it -> OOMKilled on lastState).
+	serverContainer := dep.Spec.Template.Spec.Containers[0].Name
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-pod-1", Namespace: "ns1", Labels: selectorLabels("cache")},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name:                 serverContainer,
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}},
+		}}},
+	}
+	if err := r.Create(context.Background(), pod); err != nil {
+		t.Fatalf("create OOM pod: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	updated := getBackend(t, r, "cache", "ns1")
+	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready = %+v, want False", cond)
+	}
+	if !strings.Contains(cond.Message, "OOMKilled") || !strings.Contains(cond.Message, "spec.resources.limits.memory") {
+		t.Fatalf("Ready message should name the server OOM + sizing fix, got %q", cond.Message)
+	}
+	// The Degraded condition surfaces the same enriched message.
+	if d := findCondition(updated.Status.Conditions, conditionTypeDegraded); d == nil || !strings.Contains(d.Message, "OOMKilled") {
+		t.Fatalf("Degraded condition should also name the OOM, got %+v", d)
+	}
 }

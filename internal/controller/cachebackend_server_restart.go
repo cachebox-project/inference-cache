@@ -913,6 +913,49 @@ func containerRunSum(pod *corev1.Pod, cacheServerContainers map[string]struct{})
 	return sum
 }
 
+// detectServerOOM returns a human-readable diagnostic when a managed cache-server
+// container was OOMKilled — its memory limit is too small for the model's KV
+// working set, the silent under-provisioning failure mode — else "". It is
+// best-effort: a pod-list error returns "" rather than failing the reconcile, and
+// the caller consults it only when the workload is already ReplicasUnavailable, so
+// it adds no pod List on the healthy path. The scan is scoped to the owned
+// Deployment's container names (so a crashed service-mesh sidecar is never misread
+// as the cache server) and reads BOTH the current and last termination state — a
+// freshly-OOMKilled container, and one the kubelet has already restarted into
+// CrashLoopBackOff (where OOMKilled is on lastState).
+func (r *CacheBackendReconciler) detectServerOOM(ctx context.Context, backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) string {
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods,
+		client.InNamespace(backend.Namespace),
+		client.MatchingLabelsSelector{Selector: labels.SelectorFromSet(selectorLabels(backend.Name))},
+	); err != nil {
+		return ""
+	}
+	serverContainers := make(map[string]struct{}, len(dep.Spec.Template.Spec.Containers))
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		serverContainers[c.Name] = struct{}{}
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		for j := range p.Status.ContainerStatuses {
+			cs := &p.Status.ContainerStatuses[j]
+			if _, ok := serverContainers[cs.Name]; !ok {
+				continue
+			}
+			for _, term := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
+				if term != nil && term.Reason == "OOMKilled" {
+					return fmt.Sprintf("cache-server container %q in pod %q was OOMKilled — its memory limit is too small for the model's KV working set; raise spec.resources.limits.memory", cs.Name, p.Name)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // podOwnedByDeployment reports whether pod is transitively controller-
 // owned (pod → ReplicaSet → Deployment) by the given Deployment,
 // matched on both name AND UID at every link. The (owned, err) split

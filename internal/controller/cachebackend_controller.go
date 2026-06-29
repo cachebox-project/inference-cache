@@ -1404,6 +1404,18 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint, capacity string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
 	now := time.Now()
 	readyStatus, reason, message := managedReadiness(backend, dep)
+	// When the workload is replicas-unavailable, check whether the cache-server
+	// was OOMKilled and fold the actionable sizing diagnostic into the message.
+	// It flows to the Ready/Degraded condition message AND the BackendDegraded
+	// Warning event (degradedMessage surfaces the Ready message), turning a silent
+	// under-provisioning OOM into a loud "raise spec.resources.limits.memory"
+	// signal. The reason stays ReplicasUnavailable so the Degraded gate and
+	// Progressing derivation are unchanged — only the message is enriched.
+	if reason == conditionReasonReplicasUnavailable {
+		if oom := r.detectServerOOM(ctx, backend, dep); oom != "" {
+			message = message + " — " + oom
+		}
+	}
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
 	// first time the workload is Available — now. Using a latched value (not the
 	// live Deployment Available condition, which resets on a flap) keeps the
