@@ -31,7 +31,7 @@ jobs:
     # withheld secrets, so the Codex step would fail with no OPENAI_API_KEY.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+      github.event.pull_request.user.login != 'dependabot[bot]'
     permissions:
       contents: read
     outputs:
