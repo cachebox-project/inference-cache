@@ -1867,3 +1867,59 @@ func (c *countingClient) Patch(ctx context.Context, obj client.Object, p client.
 	}
 	return c.Client.Patch(ctx, obj, p, opts...)
 }
+
+// TestDetectServerOOM pins the sizing-warning detection: a cache-server container
+// OOMKilled (on current OR last termination state) is reported; a crashed
+// service-mesh sidecar (not in the owned Deployment's container set) is NOT; a
+// healthy server reports nothing.
+func TestDetectServerOOM(t *testing.T) {
+	scheme := newScheme(t)
+	const ns, name = "team-a", "qwen-cache"
+	backend := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: "be-uid"}}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: "dep-uid"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "lmcache-server"}},
+		}}},
+	}
+	oomPod := func(container string, onLast bool) *corev1.Pod {
+		term := &corev1.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}
+		cs := corev1.ContainerStatus{Name: container}
+		if onLast {
+			cs.LastTerminationState.Terminated = term
+		} else {
+			cs.State.Terminated = term
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-pod", Namespace: ns, Labels: selectorLabels(name)},
+			Status:     corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{cs}},
+		}
+	}
+	build := func(objs ...client.Object) *CacheBackendReconciler {
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	}
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"oom on lastState (CrashLoopBackOff after restart)", oomPod("lmcache-server", true), true},
+		{"oom on currentState (freshly killed)", oomPod("lmcache-server", false), true},
+		{"sidecar OOM (not a cache-server container) is ignored", oomPod("istio-proxy", true), false},
+		{"healthy running server", &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-pod", Namespace: ns, Labels: selectorLabels(name)},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "lmcache-server", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}}},
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := build(backend, dep, tc.pod).detectServerOOM(context.Background(), backend, dep)
+			if (got != "") != tc.want {
+				t.Fatalf("detectServerOOM = %q, want detected=%v", got, tc.want)
+			}
+		})
+	}
+}
