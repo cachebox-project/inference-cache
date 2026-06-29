@@ -1555,22 +1555,30 @@ type ReplicaSnapshot struct {
 
 // TenantSnapshot is the aggregate footprint for one tenant.
 //
-// MemoryUsed is the sum of the tenant's replicas' cache_memory_bytes — a
-// cluster-wide observability figure only (the engine owns this memory; it is
-// not a per-tenant budget). IndexEntries is the tenant's live distinct-prefix
-// count, the quantity CacheTenant.spec.quota.maxIndexEntries bounds; across all
-// tenants these sum to Snapshot.TotalPrefixes by construction (see Aggregate).
+// IndexEntries is the tenant's live distinct-prefix count, the quantity
+// CacheTenant.spec.quota.maxIndexEntries bounds; across all tenants these sum
+// to Snapshot.TotalPrefixes by construction (see Aggregate).
+//
+// MemoryUsed is deprecated and never populated (always 0): cache_memory_bytes
+// is the engine total across all tenants on a replica, so summing it per tenant
+// double-counts on shared engines. The field is retained in the wire shape for
+// controller/server skew-compatibility (an older controller still finds the
+// key) and scheduled for removal at v1beta1. For memory, read the per-replica
+// ReplicaSnapshot.CacheMemoryBytes (engine total per replica). See
+// docs/design/crd-contract.md and docs/concepts/cachetenant-identity-and-quota.md
+// for the enforcement-boundary rationale.
 type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
-	MemoryUsed   int64   `json:"memoryUsed"`
 	IndexEntries int64   `json:"indexEntries"`
 	HitRate      float32 `json:"hitRate"`
+	// Deprecated: always 0; read ReplicaSnapshot.CacheMemoryBytes instead.
+	MemoryUsed int64 `json:"memoryUsed"`
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest
-// stats reported for each replica id; tenant memory/hit-rate dedup replicas
-// within a tenant (it is an approximation — a replica serving multiple models
-// for a tenant is counted once). Results are sorted for deterministic output.
+// stats reported for each replica id; tenant hit-rate dedups replicas within a
+// tenant (it is an approximation — a replica serving multiple models for a
+// tenant is counted once). Results are sorted for deterministic output.
 //
 // Reserved tenants (see WithReservedTenants) are excluded from the snapshot
 // entirely — replicas, tenants, and totals — so a probe in flight cannot
@@ -1588,7 +1596,6 @@ func (i *Index) Snapshot() Snapshot {
 	// across tenancy. We then aggregate ONLY across models / hash_schemes
 	// within the same (tenant, replicaID).
 	latestByReplica := make(map[tenantReplica]statEntry)
-	latestByTenantReplica := make(map[tenantReplica]statEntry)
 	for sk, s := range i.stats {
 		if i.isReservedTenant(sk.tenant) {
 			continue
@@ -1596,9 +1603,6 @@ func (i *Index) Snapshot() Snapshot {
 		tr := tenantReplica{sk.tenant, sk.replicaID}
 		if cur, ok := latestByReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
 			latestByReplica[tr] = s
-		}
-		if cur, ok := latestByTenantReplica[tr]; !ok || s.lastSeen.After(cur.lastSeen) {
-			latestByTenantReplica[tr] = s
 		}
 	}
 
@@ -1668,12 +1672,11 @@ func (i *Index) Snapshot() Snapshot {
 	}
 
 	type tenantAgg struct {
-		mem    int64
 		sumHit float64
 		n      int
 	}
 	byTenant := make(map[string]*tenantAgg)
-	for tr, s := range latestByTenantReplica {
+	for tr, s := range latestByReplica {
 		// Untenanted stats bucket under "" — the same key the entry walk uses, so a
 		// tenant's stats and its indexEntries land together.
 		bucket := tr.tenant
@@ -1682,7 +1685,6 @@ func (i *Index) Snapshot() Snapshot {
 			a = &tenantAgg{}
 			byTenant[bucket] = a
 		}
-		a.mem += s.stats.CacheMemoryBytes
 		a.sumHit += float64(s.stats.HitRate)
 		a.n++
 	}
@@ -1698,19 +1700,14 @@ func (i *Index) Snapshot() Snapshot {
 			return
 		}
 		tenantSeen[t] = struct{}{}
-		var (
-			mem int64
-			hit float32
-		)
+		var hit float32
 		if a := byTenant[t]; a != nil {
-			mem = a.mem
 			if a.n > 0 {
 				hit = float32(a.sumHit / float64(a.n))
 			}
 		}
 		snap.Tenants = append(snap.Tenants, TenantSnapshot{
 			TenantID:     t,
-			MemoryUsed:   mem,
 			IndexEntries: agg.PerTenant[t],
 			HitRate:      hit,
 		})

@@ -310,8 +310,12 @@ func TestSnapshotAggregates(t *testing.T) {
 	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m1", Tenant: "tenant-a", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 1}},
 		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
-	// Same replica reports again under a different model for the same tenant: the
-	// tenant footprint must count the replica once (dedup), not double its memory.
+	// Same replica reports again under a different model for the same tenant.
+	// Tenant HitRate dedups replicas (counts replica-a once). Tenant
+	// IndexEntries counts distinct (tenant, model, hash_scheme, prefix_hash)
+	// keys — replica is not in the aggregate key, so the same prefix from two
+	// replicas would still count once, but a second MODEL on the same replica
+	// is a distinct key and adds a row to the tenant's entry count.
 	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m2", Tenant: "tenant-a", HashScheme: "vllm",
 		Prefixes: []PrefixRef{{PrefixHash: hash("p2"), TokenCount: 1}},
 		Stats:    &ReplicaStats{CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5}})
@@ -357,15 +361,25 @@ func TestSnapshotAggregates(t *testing.T) {
 		t.Fatalf("tenants on replicas = %q / %q, want tenant-a / tenant-b",
 			snap.Replicas[0].Tenant, snap.Replicas[1].Tenant)
 	}
-	// Tenants sorted by id; tenant-a counts replica-a once despite two reports.
+	// Tenants sorted by id. tenant-a's IndexEntries == 2: two distinct
+	// (tenant, model, hash_scheme, prefix_hash) keys ((tenant-a, m1, vllm, p1)
+	// and (tenant-a, m2, vllm, p2)) — the second Ingest added a new key
+	// because the model differed. HitRate is deduped per replica (replica-a
+	// counted once), so tenant-a's HitRate is 0.8 from that single replica.
 	if len(snap.Tenants) != 2 {
 		t.Fatalf("tenants = %+v, want 2", snap.Tenants)
 	}
-	if snap.Tenants[0].TenantID != "tenant-a" || snap.Tenants[0].MemoryUsed != 100 {
-		t.Fatalf("tenant-a = %+v, want memoryUsed 100 (deduped)", snap.Tenants[0])
+	if snap.Tenants[0].TenantID != "tenant-a" || snap.Tenants[0].IndexEntries != 2 || snap.Tenants[0].HitRate != 0.8 {
+		t.Fatalf("tenant-a = %+v, want indexEntries 2 hitRate 0.8 (deduped)", snap.Tenants[0])
 	}
-	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].MemoryUsed != 200 {
-		t.Fatalf("tenant-b = %+v, want memoryUsed 200", snap.Tenants[1])
+	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].IndexEntries != 1 || snap.Tenants[1].HitRate != 0.6 {
+		t.Fatalf("tenant-b = %+v, want indexEntries 1 hitRate 0.6", snap.Tenants[1])
+	}
+	// MemoryUsed is deprecated and never accumulated: it stays 0 even though
+	// both tenants' replicas reported non-zero CacheMemoryBytes.
+	if snap.Tenants[0].MemoryUsed != 0 || snap.Tenants[1].MemoryUsed != 0 {
+		t.Fatalf("tenant MemoryUsed must be 0 (deprecated, not accumulated): a=%d b=%d",
+			snap.Tenants[0].MemoryUsed, snap.Tenants[1].MemoryUsed)
 	}
 }
 

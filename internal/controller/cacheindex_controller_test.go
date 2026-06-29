@@ -37,7 +37,11 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
 		},
 		Tenants: []index.TenantSnapshot{
-			{TenantID: "t1", IndexEntries: 5, MemoryUsed: 100, HitRate: 0.8},
+			// MemoryUsed is non-zero here on purpose: it simulates an older /
+			// skewed server still reporting the deprecated, double-counted
+			// per-tenant memory. The controller must DISCARD it (hard-zero),
+			// asserted below.
+			{TenantID: "t1", IndexEntries: 5, HitRate: 0.8, MemoryUsed: 777},
 		},
 	}
 
@@ -54,6 +58,12 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	}
 	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].IndexEntries != 5 || st.Tenants[0].HitRate != "0.8" {
 		t.Fatalf("tenant = %+v, want id t1 indexEntries 5 hitRate 0.8", st.Tenants[0])
+	}
+	// Deprecated memoryUsed must be hard-zeroed regardless of what the snapshot
+	// carried (skew-compat: an older server may still report a non-zero,
+	// double-counted value — the controller is authoritative for keeping it 0).
+	if st.Tenants[0].MemoryUsed != 0 {
+		t.Fatalf("tenant MemoryUsed = %d, want 0 (controller must discard the snapshot's deprecated value)", st.Tenants[0].MemoryUsed)
 	}
 	// The per-tenant indexEntries sum to prefixes.summary.total (single tenant here).
 	var sum int64
