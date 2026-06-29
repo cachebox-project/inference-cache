@@ -355,6 +355,17 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 		rp.Eviction = string(cp.Spec.Eviction)
 	}
 	rp.Eviction = strings.ToLower(rp.Eviction)
+	// AffinityRouting maps the CRD's upper-case enum to the server's *bool
+	// shape. nil → server uses DefaultAffinityRoutingEnabled (effectively
+	// the same as the kubebuilder default), Enabled → &true, Disabled →
+	// &false. The apiserver materializes the kubebuilder default at
+	// admission, so an operator who wrote a "bare" CachePolicy still
+	// arrives here with a non-nil pointer — preserving operator intent
+	// through the flatten.
+	if cp.Spec.AffinityRouting != nil {
+		v := *cp.Spec.AffinityRouting == cachev1alpha1.CachePolicyAffinityRoutingEnabled
+		rp.AffinityRouting = &v
+	}
 	return rp
 }
 

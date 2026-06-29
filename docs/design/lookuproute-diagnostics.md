@@ -83,9 +83,19 @@ The rule does **not** apply to:
   the diagnostic resumes the moment any replica reports, which is the
   asymmetric case the SDK guidance is targeted at (one tenant
   populated, the gateway pointing at another).
-- **Policy-gate misses.** The `CachePolicy.spec.minimumPrefixTokens` short-
-  circuit returns `NO_HINT` because the lookup never touched the index;
-  there's no key-level mismatch to surface.
+- **Policy-gate misses.** With `affinityRouting: Disabled` the
+  `CachePolicy.spec.minimumPrefixTokens` short-circuit returns
+  `NO_HINT` because the lookup never touched the index — there's no
+  key-level mismatch to surface. With `affinityRouting: Enabled`
+  (the kubebuilder default) the same below-threshold request runs the
+  full lookup so the index can classify the contract keys: a
+  wrong-tenant/model/scheme request still surfaces as the matching
+  `UNKNOWN_*` diagnostic (those keep precedence over `AFFINITY_HINT`),
+  while a same-key small-prompt request gets its `PREFIX_MATCH` /
+  `TENANT_HOT` downgraded to `StrategyNone` and the affinity fallback
+  surfaces `AFFINITY_HINT`. Affinity-enabled is the only configuration
+  where a below-`minimumPrefixTokens` request can return a diagnostic
+  code at all.
 - **`TIMEOUT` paths.** Deadline-breach lookups never run the classification
   step; they return `TIMEOUT` directly.
 
@@ -112,7 +122,14 @@ deeper-scoped keys are right.
 On a `LookupRoute` request the server runs (in order):
 
 1. **Pre-lookup policy gate** — `CachePolicy.spec.minimumPrefixTokens`. Below
-   the threshold → `NO_HINT`. Untouched by this design.
+   the threshold AND `affinityRouting: Disabled` → short-circuit to
+   `NO_HINT` (the cheap historical path). Below the threshold AND
+   `affinityRouting: Enabled` (the kubebuilder default) → the request
+   runs the full lookup so the `UNKNOWN_*` diagnostic classification
+   below can still surface; if it doesn't, the handler downgrades any
+   resulting `PREFIX_MATCH` / `TENANT_HOT` to `StrategyNone` and the
+   affinity fallback may then return `AFFINITY_HINT`. The classification
+   step itself is untouched by this design.
 2. **Deadline / timeout** — if the lookup exceeds the policy budget or the
    caller's context is already past its deadline → `TIMEOUT`. Untouched.
 3. **Prefix-match lookup** — the existing `lookupExact` / `lookupChain`

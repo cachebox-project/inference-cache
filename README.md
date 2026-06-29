@@ -4,7 +4,8 @@ A Kubernetes-native cache plane for LLM inference.
 
 ## Repository layout
 
-One operator, split across two binaries plus the CRDs.
+One operator, split across two control-plane binaries (controller + server) plus
+the operator CLI and the CRDs.
 
 **CRDs — the API**
 - `api/v1alpha1/` — Go types (`CacheBackend`; `CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex` as they land) + generated deepcopy
@@ -22,6 +23,10 @@ One operator, split across two binaries plus the CRDs.
 - `pkg/index/` — cache-state aggregator (`CacheIndex`)
 - `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
 - `pkg/adapters/engine/` — engine KV-event hook (feeds the index)
+
+**`inferencecache`** (`cmd/inferencecache`) — operator CLI; `doctor` runs a read-only pre-flight diagnostic
+- `cmd/inferencecache/` — cobra entrypoint
+- `pkg/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
 
 **Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
 
@@ -210,7 +215,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 
 ## Common Targets
 
-- `make build`: build controller and server binaries
+- `make build`: build the controller, server, kvevent-subscriber, and inferencecache binaries
 - `make test`: run unit tests
 - `make lint`: run gofmt and go vet
 - `make ci-lint`: run golangci-lint
@@ -218,7 +223,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code
 - `make manifests`: regenerate CRD, RBAC, and webhook manifests
-- `make image-build`: build controller and server images
+- `make image-build`: build controller, server, and kvevent-subscriber images
 
 ## Documentation
 

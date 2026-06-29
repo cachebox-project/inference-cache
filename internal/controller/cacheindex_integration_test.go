@@ -47,7 +47,6 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			Tenants: []index.TenantSnapshot{{
 				TenantID:     "tenant-a",
 				IndexEntries: 7,
-				MemoryUsed:   2048,
 				HitRate:      0.75,
 			}},
 		}
@@ -102,8 +101,37 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		}
 		tenant := ci.Status.Tenants[0]
 		if tenant.ID != "tenant-a" || tenant.IndexEntries != 7 ||
-			tenant.MemoryUsed != 2048 || tenant.HitRate != "0.75" {
+			tenant.HitRate != "0.75" {
 			t.Fatalf("tenant status = %+v, want tenant-a aggregate from snapshot", tenant)
+		}
+		// Persisted-status guard for the deprecated tenants[].memoryUsed: it must
+		// serialize as an explicit 0, NOT be dropped by omitempty, so the
+		// published v1alpha1 shape stays stable for clients. The typed decode
+		// above can't tell a persisted 0 from a missing key, so probe the raw
+		// object from the apiserver.
+		tenantsRaw, found, err := unstructured.NestedSlice(raw.Object, "status", "tenants")
+		if err != nil || !found || len(tenantsRaw) != 1 {
+			t.Fatalf("read persisted status.tenants: found=%v err=%v len=%d", found, err, len(tenantsRaw))
+		}
+		tenant0, ok := tenantsRaw[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("persisted status.tenants[0] is not an object: %T", tenantsRaw[0])
+		}
+		memRaw, memFound := tenant0["memoryUsed"]
+		if !memFound {
+			t.Fatal("persisted status.tenants[0].memoryUsed key is missing — the deprecated field must serialize as an explicit 0, not be omitted")
+		}
+		switch v := memRaw.(type) {
+		case int64:
+			if v != 0 {
+				t.Fatalf("persisted status.tenants[0].memoryUsed = %d, want explicit 0", v)
+			}
+		case float64:
+			if v != 0 {
+				t.Fatalf("persisted status.tenants[0].memoryUsed = %v, want explicit 0", v)
+			}
+		default:
+			t.Fatalf("persisted status.tenants[0].memoryUsed has unexpected type %T", memRaw)
 		}
 	})
 
@@ -118,7 +146,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				HitRate:          0.8,
 				LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
 			}},
-			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, MemoryUsed: 100, HitRate: 0.8}},
+			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8}},
 		}
 		var requests int
 		srv := newSnapshotServer(t, &served, &snapshotServerHooks{
@@ -168,7 +196,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 					HitRate:          0.9,
 					LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
 				}},
-				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, MemoryUsed: 500, HitRate: 0.9}},
+				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9}},
 			}
 		}()
 

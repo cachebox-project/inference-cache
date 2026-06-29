@@ -1466,8 +1466,8 @@ func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
 	served := index.Snapshot{
 		TotalPrefixes: 5,
 		Tenants: []index.TenantSnapshot{
-			{TenantID: "", MemoryUsed: 10, IndexEntries: 2}, // untenanted bucket
-			{TenantID: "team", MemoryUsed: 20, IndexEntries: 3},
+			{TenantID: "", IndexEntries: 2}, // untenanted bucket
+			{TenantID: "team", IndexEntries: 3},
 		},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

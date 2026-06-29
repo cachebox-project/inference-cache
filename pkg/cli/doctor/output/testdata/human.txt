@@ -1,0 +1,21 @@
+inferencecache doctor
+
+FAIL
+  FAIL SV001  host:9090
+      gRPC health check failed: connection refused
+
+WARN
+  WARN CB002  cachebackend/ns1/bad
+      status.matchedEnginePods is 0 (LikelySelectorMismatch)
+
+INFO
+  INFO CP001  namespace/ns1
+      no CachePolicy — server defaults apply
+
+OK
+  OK   SV003  host:9090
+      gRPC health check reports SERVING
+  OK   EP000
+      cluster-wide note with no resource
+
+Summary: 2 OK, 1 INFO, 1 WARN, 1 FAIL  (exit 2)

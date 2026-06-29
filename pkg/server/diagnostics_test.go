@@ -110,6 +110,12 @@ func TestLookupRouteGenuineMissStillNoHint(t *testing.T) {
 
 	t.Run("matching keys + novel prefix stays NO_HINT", func(t *testing.T) {
 		svc := newTestService()
+		// Disable affinity so the StrategyNone downgrade stays NO_HINT
+		// (the historical shape this subtest pins). The affinity
+		// behavior on the same scenario is covered in
+		// affinity_routing_test.go.
+		fal := false
+		svc.policies.Replace([]ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
 		// Use Stats: nil so the warm-replica TENANT_HOT path can't fire — we
 		// want to isolate the "real miss" branch end-to-end.
 		svc.index.Ingest(index.Update{

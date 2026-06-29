@@ -249,3 +249,52 @@ func TestPolicyHandlerCapsBodySize(t *testing.T) {
 		t.Fatalf("oversize body should not return 204")
 	}
 }
+
+func TestPolicyStoreAffinityRoutingEnabled(t *testing.T) {
+	store := NewPolicyStore()
+
+	// No CachePolicy at all → server-wide default (Enabled).
+	if got := store.AffinityRoutingEnabled("ns-none"); got != true {
+		t.Fatalf("no policy: expected default=true, got %v", got)
+	}
+
+	tru, fal := true, false
+	store.Replace([]ResolvedPolicy{
+		{Namespace: "ns-nil"},
+		{Namespace: "ns-true", AffinityRouting: &tru},
+		{Namespace: "ns-false", AffinityRouting: &fal},
+	})
+
+	if got := store.AffinityRoutingEnabled("ns-nil"); got != true {
+		t.Fatalf("policy with nil field: expected default=true, got %v", got)
+	}
+	if got := store.AffinityRoutingEnabled("ns-true"); got != true {
+		t.Fatalf("policy with &true: expected true, got %v", got)
+	}
+	if got := store.AffinityRoutingEnabled("ns-false"); got != false {
+		t.Fatalf("policy with &false: expected false, got %v", got)
+	}
+}
+
+func TestPolicyHandlerNormalizesAffinityForOlderBodies(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	// v5 body — no affinityRouting field. Normalizer must fill in
+	// DefaultAffinityRoutingEnabled so the server-first rollout case
+	// (newer server, older controller) doesn't silently switch every
+	// existing namespace's affinity off.
+	body := `{"version":5,"policies":[{"namespace":"foo"}]}`
+	resp, err := srv.Client().Post(srv.URL, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+	if got := store.AffinityRoutingEnabled("foo"); got != true {
+		t.Fatalf("v5 backfill: expected true, got %v", got)
+	}
+}

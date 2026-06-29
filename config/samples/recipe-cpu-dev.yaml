@@ -16,6 +16,17 @@
 # degrades to Ready=False / NoKVEventsObserved with Degraded=True; PREFIXES stays
 # 0. See docs/quickstart.md.
 #
+# Once the KV-event gate above clears, the controller drives a synthetic
+# functional self-test (in-process index.Ingest → index.LookupRoute →
+# optional tier-2 round-trip; the gRPC PublishEvent / ReportCacheState
+# subscriber path is NOT exercised) and publishes a FunctionalProbeOK
+# condition on this CR. A per-stage probe
+# failure surfaces Ready=False / ProbeIngestFailed | ProbeRoutingFailed |
+# ProbeT2Failed with the server's diagnostic in the condition message; the
+# gate is disabled by passing --server-probe-url="" to the controller. See
+# the Troubleshooting section of docs/quickstart.md for the per-reason
+# runbook.
+#
 # CPU caveat: LMCache offload is functional on the CPU image (the repo's
 # CPU substrate canary exercises cross-pod KV reuse via the lmcache-server), but
 # representative offload performance wants a GPU — see docs/reference-stack/.

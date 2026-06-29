@@ -34,8 +34,11 @@ import (
 //     updated in the same commit. Coordinate with anything else that
 //     decodes /snapshot.
 func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
-	// Construct a Snapshot whose every leaf field is non-zero so the
-	// json encoder emits all keys (including ones marked omitempty).
+	// Construct a Snapshot whose leaf fields are set so the json encoder
+	// emits all keys (including ones marked omitempty). One exception:
+	// TenantSnapshot.MemoryUsed is deprecated and deliberately left 0 — its
+	// JSON tag carries NO omitempty, so the key stays on the wire even at 0
+	// (the skew-compat guarantee). Do NOT "fix" it to a non-zero value.
 	// Tags marked omitempty whose values would be zero are excluded from
 	// the frozen list below ON PURPOSE — they're documented optional and
 	// their absence on the wire is part of the contract.
@@ -54,9 +57,12 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 		}},
 		Tenants: []TenantSnapshot{{
 			TenantID:     "team-a",
-			MemoryUsed:   100,
 			IndexEntries: 3,
 			HitRate:      0.5,
+			// Deprecated, always 0 in production; pinned here because the JSON
+			// tag carries no omitempty, so the key stays on the wire (skew-safe
+			// for an older controller still decoding it).
+			MemoryUsed: 0,
 		}},
 		TotalPrefixes: 3,
 		HotPrefixes:   0,
@@ -96,7 +102,7 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	if len(tenants) != 1 {
 		t.Fatalf("expected one tenant row; got %d", len(tenants))
 	}
-	wantTenant := []string{"tenantId", "memoryUsed", "indexEntries", "hitRate"}
+	wantTenant := []string{"tenantId", "indexEntries", "hitRate", "memoryUsed"}
 	assertExactKeys(t, "TenantSnapshot", tenants[0], wantTenant)
 }
 

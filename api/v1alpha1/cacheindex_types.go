@@ -53,14 +53,27 @@ type TenantCacheStatus struct {
 	// construction — the per-tenant breakdown of the cluster prefix count.
 	// +optional
 	IndexEntries int64 `json:"indexEntries,omitempty"`
-	// MemoryUsed is the approximate cache memory attributed to the tenant
-	// (summed over the tenant's distinct replicas).
-	// +optional
-	MemoryUsed int64 `json:"memoryUsed,omitempty"`
 	// HitRate is the tenant's mean replica hit rate in [0,1], as a decimal
 	// string (e.g. "0.82").
 	// +optional
 	HitRate string `json:"hitRate,omitempty"`
+	// MemoryUsed is deprecated and always 0. Per-tenant memory is not honestly
+	// attributable on a shared engine: ReplicaStats.cache_memory_bytes is the
+	// engine total across ALL tenants on a replica, so summing it per tenant
+	// double-counts the same bytes once per tenant (same enforcement-boundary
+	// problem that removed CacheTenant.status.memoryUsed). The field is retained
+	// zeroed for v1alpha1 wire/shape compatibility and scheduled for removal at
+	// v1beta1; for a real memory signal read the per-replica engine total at
+	// status.replicas[].cacheMemoryBytes.
+	//
+	// Deprecated: always 0; read status.replicas[].cacheMemoryBytes instead.
+	//
+	// Intentionally NOT omitempty: the field must always serialize as
+	// `memoryUsed: 0` so a consumer of the published v1alpha1 status sees the
+	// key stay put (omitempty would drop the key on the zero value and break
+	// the deprecate-in-place shape contract).
+	// +optional
+	MemoryUsed int64 `json:"memoryUsed"`
 }
 
 // PrefixSummary summarizes the prefix entries held across the cluster.
