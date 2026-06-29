@@ -162,7 +162,7 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v6)
+## Wire schema (v7)
 
 ```json
 {

@@ -574,7 +574,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Normalize older bodies so server-first rollouts (newer server, older
-		// controller still pushing v3/v4/v5) preserve every other knob a CR
+		// controller still pushing v3/v4/v5/v6) preserve every other knob a CR
 		// carries. Today: older bodies may omit minimumMatchedTokens,
 		// routingFloorScore, strategy, or affinityRouting.
 		// JSON decodes the missing fields to their zero values
@@ -651,7 +651,7 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 		}
 	}
 	if snap.Version < 7 {
-		// A v3/v4/v5 body has no affinityRouting key, so the decoded pointer
+		// A v3/v4/v5/v6 body has no affinityRouting key, so the decoded pointer
 		// is nil. Synthesize the safety default so a server-first rollout
 		// does not silently disable affinity for every namespace with a CR.
 		// An operator's explicit `affinityRouting: Disabled` is already a
