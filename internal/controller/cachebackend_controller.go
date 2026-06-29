@@ -567,6 +567,12 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// tier-2 (if any) is operator-managed and not evaluated here --
 		// clear any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
+		// EngineCompatibility is likewise a managed-only advisory (set only in
+		// updateManagedStatus from an injected engine pod's crash-loop). An
+		// External backend injects no connector and is not evaluated here, so
+		// clear any left over from a prior managed state rather than leave a
+		// stale incompatibility warning the External contract never updates.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
 	})
 }
 
@@ -603,6 +609,10 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
+		// EngineCompatibility is a managed-only advisory; an Unmanaged backend
+		// is no longer evaluated for injected engine-pod crash-loops, so clear
+		// any left over from a prior managed state.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
 	})
 }
 
@@ -1254,6 +1264,10 @@ func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, ba
 		// The workload isn't provisioned, so tier-2 isn't being exercised —
 		// clear any stale T2Degraded advisory from a prior provisioned state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
+		// Likewise clear EngineCompatibility: with no provisioned workload the
+		// injected engine-pod crash-loop signal is no longer evaluated, so a
+		// prior incompatibility warning would otherwise linger stale.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
 	})
 	return ctrl.Result{}, err
 }

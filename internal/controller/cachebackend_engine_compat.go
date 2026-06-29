@@ -18,10 +18,10 @@ import (
 // failure, distinct from a transient first-boot restart.
 const crashLoopBackOffReason = "CrashLoopBackOff"
 
-// detectEngineConnectorCrashLoop reports whether an engine pod THIS backend
-// injected a KV connector into has an ENGINE container stuck in
-// CrashLoopBackOff — the live signature of a structural engine↔connector
-// incompatibility — and whether the engine pods could be observed at all.
+// detectEngineConnectorCrashLoop reports whether the ENGINE container of a pod
+// THIS backend injected a KV connector into is stuck in CrashLoopBackOff — the
+// live signature of a structural engine↔connector incompatibility — and whether
+// the engine pods could be observed at all.
 //
 // The canonical cause is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet,
 // Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …): vLLM disables its hybrid
@@ -47,7 +47,14 @@ const crashLoopBackOffReason = "CrashLoopBackOff"
 // sticky pods that can still crash-loop must be found by the wiring stamp.
 // Requiring the matching UID rejects a forged annotation and a survivor of a
 // deleted/recreated CR of the same name — the same hardening the restart
-// cascade applies. Connector-agnostic; only our own injection's fallout.
+// cascade applies.
+//
+// The crash-loop check is scoped to the single ENGINE container the connector
+// was injected into (the adapter-declared engine container name), NOT every
+// container on the pod. A service-mesh proxy, a user logging sidecar, or our own
+// kvevent-subscriber crash-looping is a different failure with a different fix —
+// only the engine container's crash-loop is the connector-incompatibility
+// signature. Connector-agnostic; only our own injection's fallout.
 func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Context, backend *cachev1alpha1.CacheBackend) (string, bool) {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
@@ -61,6 +68,7 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 	}
 	wantInjectedBy := backend.Namespace + "/" + backend.Name
 	wantInjectedByUID := string(backend.UID)
+	engineContainer := r.engineContainerName(backend)
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Annotations[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
@@ -69,23 +77,57 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
-		for j := range p.Status.ContainerStatuses {
-			cs := &p.Status.ContainerStatuses[j]
-			// Skip OUR injected sidecar: a crashing kvevent-subscriber is a
-			// different failure (and a different fix) than the engine being
-			// connector-incompatible. Only an engine container's crash-loop is
-			// the hybrid-attention signature.
-			if cs.Name == adapterruntime.SubscriberContainerName {
-				continue
-			}
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason == crashLoopBackOffReason {
-				return fmt.Sprintf("container %q in engine pod %q is in CrashLoopBackOff after the cache plane injected a KV connector — "+
-					"if this is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …), "+
-					"vLLM cannot run a KV connector alongside its hybrid KV-cache manager (KV-spec unification fails at init); remove "+
-					"the connector or run the engine events-only via the inferencecache.io/skip-inject annotation until an events-only "+
-					"integration mode ships.", cs.Name, p.Name), true
-			}
+		cs := engineContainerStatus(p, engineContainer)
+		if cs == nil {
+			continue
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason == crashLoopBackOffReason {
+			return fmt.Sprintf("container %q in engine pod %q is in CrashLoopBackOff after the cache plane injected a KV connector — "+
+				"if this is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …), "+
+				"vLLM cannot run a KV connector alongside its hybrid KV-cache manager (KV-spec unification fails at init); remove "+
+				"the connector or run the engine events-only via the inferencecache.io/skip-inject annotation until an events-only "+
+				"integration mode ships.", cs.Name, p.Name), true
 		}
 	}
 	return "", true
+}
+
+// engineContainerName resolves the runtime adapter for the backend and returns
+// the name of the engine container the adapter injects the KV connector into
+// (e.g. "vllm"). Returns "" when no adapter wires this (runtime, backend) pair
+// or the adapter declares no canonical engine container (the reference adapter)
+// — in either case no connector is injected, so there is nothing to diagnose.
+func (r *CacheBackendReconciler) engineContainerName(backend *cachev1alpha1.CacheBackend) string {
+	registry := r.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	adapter, err := registry.Select(adapterruntime.ResolveRuntimeID(backend), backend)
+	if err != nil {
+		return ""
+	}
+	return adapter.EngineContainerName()
+}
+
+// engineContainerStatus returns the status of the engine container the connector
+// was injected into, mirroring the webhook's overrideTargetIndex targeting:
+// match by the adapter-declared engine container name, and — only when that name
+// is set but absent from the pod — fall back to the sole container of a
+// single-container pod. Returns nil when the engine container cannot be
+// identified, so an unrelated crash-looping sidecar (service-mesh proxy, user
+// logging sidecar, kvevent-subscriber) is never misread as the connector
+// incompatibility signature.
+func engineContainerStatus(pod *corev1.Pod, engineContainerName string) *corev1.ContainerStatus {
+	if engineContainerName == "" {
+		return nil
+	}
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == engineContainerName {
+			return &pod.Status.ContainerStatuses[i]
+		}
+	}
+	if len(pod.Spec.Containers) == 1 && len(pod.Status.ContainerStatuses) == 1 {
+		return &pod.Status.ContainerStatuses[0]
+	}
+	return nil
 }

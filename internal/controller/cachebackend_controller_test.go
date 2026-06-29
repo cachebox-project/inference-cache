@@ -690,6 +690,81 @@ func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
 	}
 }
 
+// TestReconcileLifecycleExitsClearEngineCompatibility pins that every managed →
+// non-managed lifecycle exit clears the managed-only EngineCompatibility
+// advisory. Without it, a backend that surfaced an injected-engine crash-loop
+// warning and is then flipped to External, an unmanaged kind, or the
+// InvalidStorage gate would keep advertising a stale incompatibility no path
+// re-evaluates — the same staleness the sibling T2Degraded clears guard against.
+func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+	}{
+		{
+			name: "managed → External",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+				cb.Spec.Endpoint = "external.ns1.svc:8080"
+			},
+		},
+		{
+			name: "managed → Unmanaged (StatefulSet kind)",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+			},
+		},
+		{
+			name: "managed → InvalidStorage gate",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				two := int32(2)
+				cb.Spec.Replicas = &two
+				cb.Spec.Storage = &cachev1alpha1.CacheBackendStorageSpec{
+					PVC: &cachev1alpha1.CacheBackendPVCSpec{Size: resource.MustParse("10Gi")},
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+			reconcile(t, r, "cache", "ns1")
+
+			// Plant a False/EngineConnectorIncompatible condition as if a prior
+			// managed reconcile had observed an injected engine crash-looping,
+			// so the clearing assertion below is not vacuous.
+			live := getBackend(t, r, "cache", "ns1")
+			live.Status.Conditions = append(live.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeEngineCompatibility,
+				Status:             metav1.ConditionFalse,
+				Reason:             reasonEngineConnectorIncompatible,
+				Message:            "planted",
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: live.Generation,
+			})
+			if err := r.Status().Update(context.Background(), live); err != nil {
+				t.Fatalf("plant EngineCompatibility precondition: %v", err)
+			}
+			if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c == nil {
+				t.Fatalf("planted EngineCompatibility precondition failed (test would be vacuous)")
+			}
+
+			// Trigger the lifecycle exit.
+			switching := getBackend(t, r, "cache", "ns1")
+			tc.mutate(switching)
+			if err := r.Update(context.Background(), switching); err != nil {
+				t.Fatalf("apply lifecycle-exit spec change: %v", err)
+			}
+			reconcile(t, r, "cache", "ns1")
+
+			if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c != nil {
+				t.Fatalf("EngineCompatibility = %+v after %s; want cleared (a stale managed-only advisory would linger on a CR no managed path re-evaluates)", c, tc.name)
+			}
+		})
+	}
+}
+
 func TestReconcileStatefulSetKindDeferred(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
