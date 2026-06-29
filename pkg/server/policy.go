@@ -620,10 +620,6 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 // Bodies already at PolicyPropagationVersion are returned untouched so an
 // operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall
 // benchmarking, or `enableTenantHot: false`, or `affinityRouting: false`) reaches the store as written.
-//   - **v3/v4/v5/v6 → v7 affinityRouting default.** A body older than v7 has
-//     no affinityRouting key; the nil *bool is filled with
-//     DefaultAffinityRoutingEnabled so a server-first rollout does not
-//     silently disable affinity for every namespace with a CR.
 func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 	if snap.Version >= PolicyPropagationVersion {
 		return

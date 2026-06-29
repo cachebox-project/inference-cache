@@ -272,6 +272,32 @@ func TestLookupRouteTokenIDsNovelAffinityFallback(t *testing.T) {
 	}
 }
 
+// A prompt_text caller that lands on the affinity fallback must still get the
+// canonical tokens echoed back — a tokenizer-less gateway needs them to call the
+// engine even when the routing hint is an affinity pick, not a prefix match.
+func TestLookupRoutePromptTextAffinityEchoesTokens(t *testing.T) {
+	const blockSz = 16
+	svc := newTestService()
+	// A serving replica for the scope (so affinity has a candidate), holding a
+	// different prefix than the prompt — the prompt misses and falls to affinity.
+	ingestFingerprintPrefix(svc.index, "r1", "m", "tenant-x", "vllm", tokenSeq(1_000, 64), blockSz)
+	novel := tokenSeq(77_000_000, 64) // never stored → no prefix match
+	svc.tokenizer = fakeTokenizer{tokens: novel}
+
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm", PromptText: "hello world",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "AFFINITY_HINT" {
+		t.Fatalf("reason = %q, want AFFINITY_HINT (novel prompt_text + serving replica)", resp.GetReasonCode())
+	}
+	if !equalU32(resp.GetTokenIds(), novel) {
+		t.Errorf("prompt_text affinity echoed %v, want the canonical tokens", resp.GetTokenIds())
+	}
+}
+
 // A one-sided / malformed chain — block_token_counts set without block_hashes —
 // must fail open with NO_HINT and never fall through to token_ids/prompt_text or
 // surface a TENANT_HOT hint, even with a warm tenant.

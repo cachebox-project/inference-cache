@@ -661,6 +661,11 @@ func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest
 		ReasonCode:      reasonAffinityHint,
 		ReplicaScores:   []*icpb.ReplicaScore{{ReplicaId: rid}},
 		LookupLatencyUs: elapsed.Microseconds(),
+		// Echo the canonical tokens the server tokenized (prompt_text path) so a
+		// tokenizer-less gateway can still forward exactly those to the engine even
+		// when the routing hint is an affinity pick. Empty on the block_hashes /
+		// token_ids paths (the caller already holds the tokens).
+		TokenIds: in.echoTokens,
 	}
 	s.metrics.observeLookup(model, resp.ReasonCode, true, elapsed)
 	return resp
