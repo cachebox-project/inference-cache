@@ -26,6 +26,13 @@
 # backends) requires the controller to run with --kvevent-subscriber-image set
 # (empty by default). Without it the engine is wired to the external cache (KV
 # reuse works) but no KV events / index entries are reported. See docs/quickstart.md.
+#
+# External backends are EXEMPT from both readiness gates that apply to managed
+# backends: the KV-event gate (Ready=True comes from admission accepting the
+# endpoint, not from an observed event) AND the functional-probe gate
+# (FunctionalProbeOK is never published — the controller does not drive a
+# round-trip against a cache it does not manage). The condition will not
+# appear in this CR's .status.conditions[] under any circumstances.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

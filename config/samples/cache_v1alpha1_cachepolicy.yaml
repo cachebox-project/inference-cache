@@ -13,25 +13,57 @@ spec:
   # count); set `eviction: LFU` to evict the least-frequently-used entries when
   # the index is over its cap.
   evictionTTL: 30m
-  # minimumPrefixTokens is a REQUEST-side gate: a request whose claimed prefix
-  # token count falls below this short-circuits to NO_HINT without touching the
-  # index. Saves work on requests too short to usefully hit the cache.
+  # minimumPrefixTokens is a REQUEST-side gate: a request whose claimed
+  # prefix token count falls below this fails the prefix-match path. With
+  # affinityRouting: Disabled the request short-circuits to NO_HINT
+  # without touching the index (the cheap path). With affinityRouting:
+  # Enabled (the default, set below) the request goes through the full
+  # lookup so the index can still classify UNKNOWN_HASH_SCHEME /
+  # UNKNOWN_TENANT / UNKNOWN_MODEL diagnostics — those keep precedence
+  # over AFFINITY_HINT — and only then falls through to the affinity
+  # fallback. Either way the gate filters tiny requests out of the
+  # prefix-match path.
   minimumPrefixTokens: 32
   # minimumMatchedTokens is a RESULT-side floor on REALIZED matched-tokens
   # overlap: replicas whose match falls below this are filtered from the
-  # response, and if none survive the reason code downgrades to NO_HINT.
-  # Defaults to 64 (4 KV blocks at the typical 16-token block size) — above
-  # the trivial chat-template framing every replica has identically, below
-  # useful real-prompt overlaps. Distinct from minimumPrefixTokens. Set to 0
-  # to disable entirely (e.g. raw-recall benchmarking).
+  # response, and if none survive the response downgrades off the
+  # PREFIX_MATCH path. With affinityRouting: Enabled (the default set
+  # below) the downgrade surfaces as AFFINITY_HINT with a stable single
+  # replica pick; with affinityRouting: Disabled it surfaces as NO_HINT
+  # with empty scores. Defaults to 64 (4 KV blocks at the typical
+  # 16-token block size) — above the trivial chat-template framing every
+  # replica has identically, below useful real-prompt overlaps. Distinct
+  # from minimumPrefixTokens. Set to 0 to disable entirely (e.g.
+  # raw-recall benchmarking).
   minimumMatchedTokens: 64
   # routingFloorScore is a RESULT-side floor on the per-replica SCORE after
   # the distinguishing-power-aware ranker runs. With three replicas and a
   # chat-template-only match, distinguishing_power collapses to 0, score is
-  # 0, and the response downgrades to NO_HINT instead of being credited as
-  # routing. Default "0.1" catches the score=0 case; raise (e.g. "5") to
+  # 0, and the response downgrades off the PREFIX_MATCH path — with
+  # affinityRouting: Enabled (the default below) that becomes
+  # AFFINITY_HINT, with affinityRouting: Disabled it stays NO_HINT.
+  # Default "0.1" catches the score=0 case; raise (e.g. "5") to
   # filter marginal matches, "0" disables the floor (raw-recall
-  # benchmarking). Composes with minimumMatchedTokens (matched-tokens floor
-  # applied first per-replica, then this score floor on the top survivor).
+  # benchmarking). Composes with minimumMatchedTokens (matched-tokens
+  # floor applied first per-replica, then this score floor on the top
+  # survivor).
   routingFloorScore: "0.1"
   lookupTimeoutMs: 20
+  strategy:
+    # Enable longest-common-prefix block-hash chain matching when callers
+    # send block_hashes + block_token_counts. Disable to force legacy exact
+    # prefix_hash matching for this namespace.
+    enableChainMatching: true
+    # Require chain-form callers. When true, non-chain LookupRoute requests
+    # fail open with reason_code=POLICY_REQUIRES_CHAIN before index lookup.
+    requireChain: false
+    # Allow TENANT_HOT soft locality hints on prefix misses.
+    enableTenantHot: true
+  # affinityRouting controls consistent-hash fallback routing on the
+  # NO_HINT path. When Enabled (default), repeat prompts pin to a stable
+  # replica derived from a SHA-256 hash of the block-hash chain so T1
+  # stays warm on diffuse single-turn workloads (chatbot, RAG with
+  # distinct corpus chunks per request). When Disabled, NO_HINT is
+  # returned and the gateway round-robins. Operators see the share via
+  # inferencecache_lookup_route_calls_total{reason_code="AFFINITY_HINT"}.
+  affinityRouting: Enabled

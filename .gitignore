@@ -28,6 +28,7 @@ dist/
 /server
 /controller
 /kvevent-subscriber
+/inferencecache
 
 # Go workspace file
 go.work

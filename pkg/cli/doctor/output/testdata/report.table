@@ -1,0 +1,6 @@
+STATUS  CODE   CHECK                RESOURCE              MESSAGE
+FAIL    SV001  ServerReachability   host:9090             gRPC health check failed: connection refused
+WARN    CB002  CacheBackendHealth   cachebackend/ns1/bad  status.matchedEnginePods is 0 (LikelySelectorMismatch)
+INFO    CP001  CachePolicyCoverage  namespace/ns1         no CachePolicy — server defaults apply
+OK      SV003  ServerReachability   host:9090             gRPC health check reports SERVING
+OK      EP000  Summary              -                     cluster-wide note with no resource

@@ -1,0 +1,264 @@
+package checks
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
+	"github.com/cachebox-project/inference-cache/pkg/cli/doctor"
+)
+
+const (
+	checkServerReachability   = "ServerReachability"
+	checkSnapshotReachability = "SnapshotReachability"
+	checkPolicyReachability   = "PolicyReachability"
+	checkProbeReachability    = "ProbeReachability"
+)
+
+// snapshotBodyLimit caps how much of the /snapshot response doctor reads before
+// validating it as JSON — the aggregate is small, and an unbounded read would
+// let a misbehaving endpoint balloon doctor's memory.
+const snapshotBodyLimit = 8 << 20 // 8 MiB
+
+// ServerReachability dials the cache-plane server's gRPC health service and
+// checks that the default service ("") reports SERVING. A nil health client
+// (the gRPC target could not be resolved/dialed) or any Check error is a FAIL;
+// a non-SERVING status is a FAIL; SERVING is an OK.
+func ServerReachability(ctx context.Context, h HealthChecker, target string) []doctor.Finding {
+	ref := target
+	if h == nil {
+		return []doctor.Finding{{
+			Code:     doctor.CodeServerUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkServerReachability,
+			Resource: ref,
+			Message:  "could not establish a gRPC connection to the cache-plane server; pass --server-endpoint (host:port) or check that the inference-cache-server Service exists and is reachable",
+		}}
+	}
+
+	resp, err := h.Check(ctx, &healthpb.HealthCheckRequest{Service: ""})
+	if err != nil {
+		return []doctor.Finding{{
+			Code:     doctor.CodeServerUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkServerReachability,
+			Resource: ref,
+			Message:  fmt.Sprintf("gRPC health check failed: %v", err),
+		}}
+	}
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		return []doctor.Finding{{
+			Code:     doctor.CodeServerNotServing,
+			Status:   doctor.StatusFail,
+			Check:    checkServerReachability,
+			Resource: ref,
+			Message:  fmt.Sprintf("server reported health status %s, want SERVING", resp.GetStatus()),
+		}}
+	}
+	return []doctor.Finding{{
+		Code:     doctor.CodeServerServing,
+		Status:   doctor.StatusOK,
+		Check:    checkServerReachability,
+		Resource: ref,
+		Message:  "gRPC health check reports SERVING",
+	}}
+}
+
+// SnapshotReachability issues an HTTP GET to the server's /snapshot endpoint and
+// confirms it returns 200 with a JSON-parseable body. When a bearer token is
+// supplied it is presented; when it is empty doctor probes the unauthenticated
+// path and additionally emits an INFO flagging that the snapshot answered
+// without authentication (the auth hardening is not yet wired everywhere).
+func SnapshotReachability(ctx context.Context, doer HTTPDoer, url, token string) []doctor.Finding {
+	if doer == nil || url == "" {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  "could not resolve the server /snapshot endpoint; pass --server-endpoint or check the inference-cache-server Service",
+		}}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("could not build /snapshot request: %v", err),
+		}}
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := doer.Do(req)
+	if err != nil {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("GET /snapshot failed: %v", err),
+		}}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// The endpoint is reachable but auth-gated and our token (if any) was
+		// rejected. Degrade gracefully — flag the auth state rather than failing
+		// connectivity. On a default auth-gated install, doctor needs an
+		// audience-bound controller token via --snapshot-token-file to verify
+		// the body.
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotAuthGated,
+			Status:   doctor.StatusWarn,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("/snapshot is reachable but returned HTTP %d (auth enforced): doctor's token was missing or rejected — pass an audience-bound controller token via --snapshot-token-file to verify the snapshot body", resp.StatusCode),
+		}}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotUnreachable,
+			Status:   doctor.StatusFail,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("GET /snapshot returned HTTP %d, want 200", resp.StatusCode),
+		}}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, snapshotBodyLimit))
+	if err != nil {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotBadBody,
+			Status:   doctor.StatusWarn,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  fmt.Sprintf("GET /snapshot returned 200 but the body could not be read: %v", err),
+		}}
+	}
+	if !json.Valid(body) {
+		return []doctor.Finding{{
+			Code:     doctor.CodeSnapshotBadBody,
+			Status:   doctor.StatusWarn,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  "GET /snapshot returned 200 but the body did not parse as JSON",
+		}}
+	}
+
+	findings := []doctor.Finding{{
+		Code:     doctor.CodeSnapshotOK,
+		Status:   doctor.StatusOK,
+		Check:    checkSnapshotReachability,
+		Resource: url,
+		Message:  "GET /snapshot returned 200 with a JSON-parseable body",
+	}}
+	if token == "" {
+		findings = append(findings, doctor.Finding{
+			Code:     doctor.CodeSnapshotUnauthenticated,
+			Status:   doctor.StatusInfo,
+			Check:    checkSnapshotReachability,
+			Resource: url,
+			Message:  "/snapshot answered without a bearer token — no ServiceAccount token was available, or snapshot authentication is not enforced on this install",
+		})
+	}
+	return findings
+}
+
+// routeCodes bundles the three stable codes a route-existence probe can emit,
+// so PolicyReachability and ProbeReachability share one implementation.
+type routeCodes struct {
+	missing    string // not wired: nil deps / build error / transport error / 404
+	wired      string // mounted: 2xx / 401 / 403 / 405
+	unexpected string // mounted but answered an unexpected status (e.g. 5xx)
+}
+
+// PolicyReachability confirms the controller-write /policy route exists without
+// mutating it. See routeReachability for the shared semantics.
+func PolicyReachability(ctx context.Context, doer HTTPDoer, url string) []doctor.Finding {
+	return routeReachability(ctx, doer, url, checkPolicyReachability, "/policy", routeCodes{
+		missing:    doctor.CodePolicyRouteMissing,
+		wired:      doctor.CodePolicyRouteWired,
+		unexpected: doctor.CodePolicyRouteUnexpected,
+	})
+}
+
+// ProbeReachability confirms the controller-driven /probe functional-self-test
+// route exists. /probe shares the snapshot listener and auth profile with
+// /snapshot + /policy; doctor only verifies the route is wired (a non-mutating
+// HEAD), never POSTs a probe. See routeReachability for the shared semantics.
+func ProbeReachability(ctx context.Context, doer HTTPDoer, url string) []doctor.Finding {
+	return routeReachability(ctx, doer, url, checkProbeReachability, "/probe", routeCodes{
+		missing:    doctor.CodeProbeRouteMissing,
+		wired:      doctor.CodeProbeRouteWired,
+		unexpected: doctor.CodeProbeRouteUnexpected,
+	})
+}
+
+// routeReachability issues a non-mutating HTTP HEAD and classifies the result.
+// A mounted route answers with its own status (200, 401 from auth, or 405 from
+// a handler that rejects HEAD) — all of which prove the route is wired. A 404
+// is what the server's ServeMux returns when the route is NOT registered, so it
+// is a FAIL: the route doctor claims to verify is absent. A transport-level
+// failure (connection refused, DNS, timeout) is likewise a FAIL. Any other
+// status (e.g. 5xx) is mounted-but-erroring — a WARN, not a missing route.
+func routeReachability(ctx context.Context, doer HTTPDoer, url, check, name string, codes routeCodes) []doctor.Finding {
+	missing := func(msg string) []doctor.Finding {
+		return []doctor.Finding{{
+			Code: codes.missing, Status: doctor.StatusFail,
+			Check: check, Resource: url, Message: msg,
+		}}
+	}
+	if doer == nil || url == "" {
+		return missing("could not resolve the server " + name + " endpoint; pass --server-endpoint or check the inference-cache-server Service")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return missing(fmt.Sprintf("could not build %s request: %v", name, err))
+	}
+	resp, err := doer.Do(req)
+	if err != nil {
+		return missing(fmt.Sprintf("HEAD %s failed to connect: %v", name, err))
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return missing(fmt.Sprintf("HEAD %s returned HTTP 404 — the %s route is not mounted on the server (a wired route answers 200/401/403/405, never 404)", name, name))
+	case routeStatusWired(resp.StatusCode):
+		return []doctor.Finding{{
+			Code: codes.wired, Status: doctor.StatusOK,
+			Check: check, Resource: url,
+			Message: fmt.Sprintf("%s route is wired (HTTP %d to a non-mutating HEAD)", name, resp.StatusCode),
+		}}
+	default:
+		return []doctor.Finding{{
+			Code: codes.unexpected, Status: doctor.StatusWarn,
+			Check: check, Resource: url,
+			Message: fmt.Sprintf("%s is mounted but answered HTTP %d (expected 2xx/401/403/405) — the server or its middleware may be erroring", name, resp.StatusCode),
+		}}
+	}
+}
+
+// routeStatusWired reports whether a HEAD status proves a healthy, mounted
+// route: any 2xx, or the auth/method-mismatch codes a wired handler legitimately
+// returns.
+func routeStatusWired(code int) bool {
+	if code >= 200 && code < 300 {
+		return true
+	}
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed:
+		return true
+	default:
+		return false
+	}
+}

@@ -41,7 +41,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
 	// health was removed in this PR. Both are guarded by requireNoProperty checks below.
-	for _, field := range []string{"endpoint", "capacity", "matchedEnginePods", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
+	for _, field := range []string{"endpoint", "capacity", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -229,6 +229,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				T2HitRate:   &t2HitRate,
 			},
 			MatchedEnginePods:      &matchedEnginePods,
+			EngineSelectorMessage:  "spec.engineSelector.matchLabels={app:engine}; no Pods in namespace match",
 			FirstKVEventObservedAt: &firstKVEventAt,
 			FirstAvailableAt:       &firstAvailableAt,
 			Conditions: []metav1.Condition{{
@@ -259,6 +260,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Template.RuntimeClassName = "kata"
 	*backend.Spec.Template.TerminationGracePeriodSeconds = 60
 	*backend.Status.MatchedEnginePods = 11
+	backend.Status.EngineSelectorMessage = "changed"
 	*backend.Status.FirstKVEventObservedAt = metav1.NewTime(time.Unix(0, 0).UTC())
 	*backend.Status.FirstAvailableAt = metav1.NewTime(time.Unix(0, 0).UTC())
 	backend.Status.Conditions[0].Message = "changed"
@@ -340,6 +342,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Status.MatchedEnginePods == nil || *copied.Status.MatchedEnginePods != 7 {
 		t.Fatalf("status.matchedEnginePods was not deep-copied")
+	}
+	if copied.Status.EngineSelectorMessage != "spec.engineSelector.matchLabels={app:engine}; no Pods in namespace match" {
+		t.Fatalf("status.engineSelectorMessage was not deep-copied")
 	}
 	if copied.Spec.Integration.FirstEventTimeout == nil || copied.Spec.Integration.FirstEventTimeout.Duration != 5*time.Minute {
 		t.Fatalf("integration.firstEventTimeout was not deep-copied")

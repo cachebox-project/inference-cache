@@ -46,7 +46,7 @@ service InferenceCache {
   reason ∈ `OK | TEMPLATE_NOT_FOUND | RENDER_ERROR`
 - **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; repeated uint32 token_ids = 9; string prompt_text = 10; }`
 - **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; repeated uint32 token_ids = 4; }`
-  reason ∈ `PREFIX_MATCH | TENANT_HOT | NO_HINT | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME`
+  reason ∈ `PREFIX_MATCH | TENANT_HOT | AFFINITY_HINT | NO_HINT | POLICY_REQUIRES_CHAIN | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME`
 - **LookupPDRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string pd_topology_ref; }`
 - **LookupPDRouteResponse** `{ string prefill_replica_id; string decode_replica_id; string transport_hint; string reason_code; }`
   transport_hint ∈ `Mooncake | NIXL | Direct`
@@ -68,7 +68,7 @@ service InferenceCache {
 ## Contract guarantees
 
 - **Side-effect-free** lookups (`RenderTemplate`, `LookupRoute`, `LookupPDRoute`, `GetCacheState`) apart from emitting metrics — safe on the gateway hot path. **One narrow exception:** in a namespace whose `CachePolicy.spec.eviction` is `LFU`, a `LookupRoute` call that *delivers* a prefix-match hint credits the matched entries' per-entry access counters (soft, lock-free eviction-ordering state). It never changes the response, never errors, and a `TIMEOUT`'d lookup credits nothing; the counter only influences which entries the cap-based sweep evicts later (see [policy-propagation.md](policy-propagation.md)). LRU namespaces and non-hit responses stay strictly side-effect-free apart from metrics.
-- **Fail-open**: an empty `replica_scores` response is always valid and the client treats it as a no-op, regardless of the accompanying `reason_code` (`NO_HINT`, `TIMEOUT`, or the diagnostic `UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` codes — see "Diagnostic reason codes" below). The server should answer within `slo` / the client's lookup timeout; otherwise the client proceeds without a hint.
+- **Fail-open**: an empty `replica_scores` response is always valid and the client treats it as a no-op, regardless of the accompanying `reason_code` (`NO_HINT`, `POLICY_REQUIRES_CHAIN`, `TIMEOUT`, or the diagnostic `UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` codes — see "Diagnostic reason codes" below). The server should answer within `slo` / the client's lookup timeout; otherwise the client proceeds without a hint.
 - **`TIMEOUT` is fail-open too.** When a `CachePolicy.spec.lookupTimeoutMs` is configured for the tenant and the lookup exceeds it (or the caller's ctx is already past its deadline on arrival), `LookupRoute` returns empty `replica_scores` with `reason_code: TIMEOUT` rather than an error. Clients treat it like `NO_HINT`. See [reason-codes.md](../reference/reason-codes.md).
 - **Engine-opaque `prefix_hash` / `block_hashes`**: the server matches bytes only *within a matching `hash_scheme`* and never interprets them — vLLM and SGLang hashing stay disjoint, no cross-engine false hits. An empty/unspecified `hash_scheme` is **not** a valid domain: such ingest entries are dropped and such lookups return `NO_HINT` (fail open), so a missing tag can never collapse engines into one compatibility domain. The same rule applies to chain-bearing ingests and lookups.
 - **Deterministic `RenderTemplate`** for a fixed `(template_ref, variables, template_revision)`.
@@ -84,16 +84,19 @@ What B4 originally landed (now partly superseded by B6, see below): fail-open st
 
 Still out of scope (later modules): template rendering (D-series), PD routing (Phase 2), and the event/metric **streams** `StreamCacheEvents` / `StreamMetrics` (M10). Java stubs are generated when the gateway client (E1) needs them.
 
-**Update — B6 (cache index):** `LookupRoute`, `ReportCacheState`, `PublishEvent`, and `GetCacheState` are now backed by the in-memory `CacheIndex` (`pkg/index`): `ReportCacheState` ingests additive deltas; `PublishEvent` applies scheme-safe deltas only — `PREFIX_EVICTED` / `ALL_CLEARED` (removals) and `REPLICA_UPDATED` (replica liveness), while `PREFIX_ADDED` is a no-op (events carry no `hash_scheme`, so additions/refreshes come via `ReportCacheState`); `LookupRoute` returns ranked replicas (`PREFIX_MATCH` / `TENANT_HOT`), a fail-open miss (`NO_HINT` — no match, no warm-tenant fallback, below the `CachePolicy.spec.minimumPrefixTokens` request-side gate, every candidate replica matched fewer tokens than the `CachePolicy.spec.minimumMatchedTokens` result-side floor — see "Matched-tokens floor" below — or the top per-replica score fell below the `CachePolicy.spec.routingFloorScore` post-score floor on the distinguishing-power-aware ranker — see [`lookuproute-ranking.md` §2.7](./lookuproute-ranking.md#27-the-replica-distinguishing-power-factor)), a deadline breach (`TIMEOUT` — `CachePolicy.spec.lookupTimeoutMs`, still fail-open), or one of the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` — set-but-wrong contract key, see "Diagnostic reason codes" below); and `GetCacheState` returns the `(tenant, model)` aggregate. The lookup/index metrics (`inferencecache_index_entries`, `inferencecache_lookup_route_*`) are emitted on `/metrics`. `RenderTemplate`, `LookupPDRoute`, and the streams remain fail-open stubs.
+**Update — B6 (cache index):** `LookupRoute`, `ReportCacheState`, `PublishEvent`, and `GetCacheState` are now backed by the in-memory `CacheIndex` (`pkg/index`): `ReportCacheState` ingests additive deltas; `PublishEvent` applies scheme-safe deltas only — `PREFIX_EVICTED` / `ALL_CLEARED` (removals) and `REPLICA_UPDATED` (replica liveness), while `PREFIX_ADDED` is a no-op (events carry no `hash_scheme`, so additions/refreshes come via `ReportCacheState`); `LookupRoute` returns ranked replicas (`PREFIX_MATCH` / `TENANT_HOT`), the `AFFINITY_HINT` stable-replica fallback when the prefix-match path downgrades to `StrategyNone` and `CachePolicy.spec.affinityRouting` is `Enabled` (the kubebuilder default — see "Affinity routing" below), a fail-open miss (`NO_HINT` — no match, no warm-tenant fallback, no usable affinity assignment, below the `CachePolicy.spec.minimumPrefixTokens` request-side gate under `affinityRouting: Disabled`, every candidate replica matched fewer tokens than the `CachePolicy.spec.minimumMatchedTokens` result-side floor — see "Matched-tokens floor" below — or the top per-replica score fell below the `CachePolicy.spec.routingFloorScore` post-score floor on the distinguishing-power-aware ranker — see [`lookuproute-ranking.md` §2.7](./lookuproute-ranking.md#27-the-replica-distinguishing-power-factor); with `affinityRouting: Enabled` the matched-tokens and routing-floor downgrades surface as `AFFINITY_HINT` instead, since the affinity fallback runs on the `StrategyNone` branch), a policy gate (`POLICY_REQUIRES_CHAIN` — `CachePolicy.spec.strategy.requireChain=true` and no valid wire block-hash chain, still fail-open), a deadline breach (`TIMEOUT` — `CachePolicy.spec.lookupTimeoutMs`, still fail-open), or one of the diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME` — set-but-wrong contract key, see "Diagnostic reason codes" below — which keep precedence over `AFFINITY_HINT`); and `GetCacheState` returns the `(tenant, model)` aggregate. The lookup/index metrics (`inferencecache_index_entries`, `inferencecache_lookup_route_*`) are emitted on `/metrics`. `RenderTemplate`, `LookupPDRoute`, and the streams remain fail-open stubs.
 
 #### Matched-tokens floor
 
 `PREFIX_MATCH` requires the realized per-replica overlap to clear the per-namespace
 `CachePolicy.spec.minimumMatchedTokens` floor, applied AFTER the index lookup returns.
 Replicas whose matched-tokens count falls below the floor are filtered from the
-response; when no replica survives, the reason code downgrades to `NO_HINT` and the
-gateway round-robins honestly instead of being credited with a trivial 1-block
-chat-template-only match. The server applies a default of `64` (4 KV blocks at the
+response; when no replica survives, the response downgrades off the PREFIX_MATCH
+path to `StrategyNone`, which surfaces as `AFFINITY_HINT` with a stable
+single-replica pick under `affinityRouting: Enabled` (the kubebuilder default — see
+"Affinity routing" below) or as `NO_HINT` under `affinityRouting: Disabled` (the
+opt-out, where the gateway round-robins honestly instead of being credited with a
+trivial 1-block chat-template-only match). The server applies a default of `64` (4 KV blocks at the
 typical 16-token block size) to any tenant with no `CachePolicy` installed; an
 explicit `minimumMatchedTokens: 0` disables the floor for that namespace. Distinct
 from the pre-lookup `minimumPrefixTokens` request-side gate — see the policy field
@@ -105,6 +108,90 @@ unchanged and old clients continue to fail open on a downgrade.
 **Update — B6 (CacheIndex status surface):** the cluster-wide aggregate is now exposed two ways: an internal HTTP `/snapshot` endpoint on the server (JSON; metadata only — replica/tenant stats + prefix counts, never KV/prompt data), and a cluster-scoped, status-only `CacheIndex` CRD (`kubectl get cacheindex`) that the controller maintains by scraping `/snapshot`. This is outside the gRPC contract (no proto change); see the `CacheIndex` type in `api/v1alpha1` and the `CacheIndexPoller` in `internal/controller`.
 
 **Update — B6 follow-up (`LookupRoute` ranking v2):** the `LookupRoute` ranker layers additive strategies on top of the original `matched_tokens × freshness` baseline, **without any proto change** (all inputs were already on the contract). Today the full score is `matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power` where `pressure_factor = max(0, 1 - PressureWeight × ReplicaStats.pressure)`, `slo_bias = 1 + freshness × SLOTightBias` when `SLO.ttft_ms` is below a configurable threshold (otherwise 1), and `distinguishing_power = 1 − num_matching_replicas / total_replicas` (1.0 when `total_replicas ≤ 1`; see [`lookuproute-ranking.md` §2.7](./lookuproute-ranking.md#27-the-replica-distinguishing-power-factor)). On a prefix miss, the server falls back to **`TENANT_HOT`**: ranked replicas that are warm for the request's `(tenant, model, hash_scheme)` — i.e. the replica has at least one prefix entry in the requested engine domain AND its latest stats are recent (within a configurable window, default 5m) with `hit_rate` above a floor (default 0.1). `TENANT_HOT` responses carry `matched_tokens=0` because there is no prefix overlap; the gateway must rely on `reason_code`, not `matched_tokens`, to recognize the soft hint. The pressure/SLO factors collapse to 1 when their supporting input is absent (no stats → pressure_factor = 1; no SLO hint → slo_bias = 1; `TenantHotMaxAge=0` disables the TENANT_HOT fallback entirely); the distinguishing-power factor collapses to 1 only for single-replica deployments — multi-replica deployments always see a cardinality-adjusted score. See [`lookuproute-ranking.md`](./lookuproute-ranking.md) and [`reason-codes.md`](../reference/reason-codes.md) for the full knob table.
+
+**Update — `CachePolicy.spec.strategy`:** the server enforces three per-namespace strategy gates before results leave the handler. `enableChainMatching=false` strips block-hash chain inputs and forces the legacy exact `prefix_hash` path; `requireChain=true` returns empty scores with `POLICY_REQUIRES_CHAIN` before touching the index when a request has no valid wire block-hash chain; `enableTenantHot=false` downgrades a `TENANT_HOT` result to `NO_HINT`. Defaults are `true` / `false` / `true`, preserving the previous behavior.
+
+## Affinity routing (consistent-hash fallback)
+
+When the prefix-match ranker would otherwise downgrade to `NO_HINT` — no
+chain or exact match, every candidate filtered by the matched-tokens
+floor, or the top per-replica score below the `routingFloorScore` — the
+server can return `AFFINITY_HINT` instead: a single stable replica
+picked by consistently hashing the request's prompt fingerprint over the
+index-known SCHEME-AWARE replica set for `(tenant, model, hash_scheme)`.
+Same prompt content → same replica every time, so repeats of the same
+prompt warm that replica's T1 (engine prefix cache) even when the
+prefix-match path has nothing to match. The canonical target is
+**diffuse single-turn** workloads — chatbots, RAG with distinct corpus
+chunks per request — where prompts rarely overlap so prefix matching
+never finds anything and the gateway would otherwise round-robin every
+prompt to a different replica.
+
+The fingerprint is `SHA-256` over the **server-resolved** block-hash
+chain — passed through for callers that send `block_hashes`, or derived
+from `token_ids` / `prompt_text` by the same dual-input resolution the
+prefix-match path uses, so affinity fires for every input mode (each
+hash length-prefixed with a 4-byte BigEndian `uint32` so cross-width
+proto `bytes` can't silently collide — vLLM hashes are 8B today, SGLang
+may differ); when the resolved chain is empty, the resolved exact
+`prefix_hash` bytes are used directly; when both are empty there is no
+fingerprint and the server falls through to `NO_HINT`. The
+SHA-256 is computed once inside `Index.AffinityHint` — the seed passed
+in is the raw canonical fingerprint, so an operator who logs the seed
+bytes can independently reproduce the routing decision. The replica set
+is read from `servingByScope` (the same `(tenant, model, hash_scheme)`
+serving-membership accelerator the `TENANT_HOT` Pass 2 check uses, so a
+vLLM request can never pin to an SGLang replica that doesn't serve the
+vLLM domain), sorted by `replica_id`, modulo `len(replicas)`. With no
+replica known to serve the request's engine domain, the server falls
+through to `NO_HINT`.
+
+| Code | Emitted when |
+|---|---|
+| `AFFINITY_HINT` | The prefix-match ranker would have returned `NO_HINT` AND `CachePolicy.spec.affinityRouting` is `Enabled` (the kubebuilder default) AND the request has a usable fingerprint AND the index knows at least one replica SERVING the request's `(tenant, model, hash_scheme)` engine domain. The response carries exactly one `ReplicaScore` whose `score`, `matched_tokens`, and `estimated_cache_hit_prob` are all `0` — there is no cache-evidence claim, only a stable assignment. |
+
+`AFFINITY_HINT` is **fail-soft**, not fail-open: unlike `NO_HINT` (no
+information) it carries a positive routing assertion ("send this prompt
+to this replica") derived from a content hash rather than direct cache
+evidence. The assignment is stable across calls so repeat prompts warm
+T1, but the *quality* of the assignment is the operator's
+responsibility to evaluate — when
+`inferencecache_lookup_route_calls_total{reason_code="AFFINITY_HINT"}`
+dominates the `PREFIX_MATCH` share, that's the signal to either accept
+stable pinning as the intended workload mode or to tune cache-state
+ingest so the prefix-match path can find more.
+
+**Precedence.** `TIMEOUT` keeps absolute precedence (the lookup never
+completed). `UNKNOWN_TENANT` / `UNKNOWN_MODEL` /
+`UNKNOWN_HASH_SCHEME` keep their diagnostic precedence over
+`AFFINITY_HINT` — those are configuration-error signals, not
+no-match-from-known-state signals; covering them with a stable replica
+pick would hide the gateway misconfiguration. A request with an empty
+`hash_scheme`, or with chain arrays that disagree in length, is
+structurally malformed and stays on `NO_HINT` for the same reason.
+`AFFINITY_HINT` never preempts a real `PREFIX_MATCH` or `TENANT_HOT`
+that cleared the request-side gates — it is strictly the bottom-of-the-
+stack fallback above `NO_HINT`. One exception: a request below the
+per-namespace `minimumPrefixTokens` gate has its positive-hint result
+(both `PREFIX_MATCH` and `TENANT_HOT`) downgraded to `StrategyNone` so
+the affinity fallback can still fire on it. The operator intent "tiny
+prompts don't surface a positive hint" outranks the TENANT_HOT-vs-
+affinity precedence; the affinity fallback's stable replica pick is
+considered acceptable for tiny prompts because it carries no
+cache-evidence claim and the gate's purpose is to bound the noisy
+prefix-match path, not to block stable replica pinning. Old
+clients degrade `AFFINITY_HINT` to their no-hint default per the
+forward-compatibility rule below; gateway-SDKs that are updated treat
+it identically to `PREFIX_MATCH` for routing purposes (the wire shape
+is the same: one ranked replica). The distinct code is the operator-
+facing signal for measuring the affinity-vs-real-match share, not a
+gateway-side branching point.
+
+Disable per-namespace via `CachePolicy.spec.affinityRouting: Disabled`
+— the server then returns `NO_HINT` on this path and the gateway
+round-robins as before. Useful for raw-recall benchmarking and ranker
+debugging where the goal is to see the prefix-match path's unaided
+behavior.
 
 ## Diagnostic reason codes
 
@@ -134,7 +221,7 @@ The contract supports expressing a prefix as an **ordered, engine-aligned chain 
 - `PrefixEntry` gains `repeated bytes block_hashes` + parallel `repeated int32 block_token_counts` — ordered, engine block-boundary aligned, same `hash_scheme` semantics as `prefix_hash`. Engines that hash per block (vLLM, SGLang) can report the chain in a single entry; the server expands it into per-block index entries on ingest. Legacy entries that only carry `prefix_hash` + `token_count` continue to work as exact-match. A chain lookup can still hit a legacy single-blob entry when the request's first block hash (`block_hashes[0]`) matches the legacy `prefix_hash` exactly; deeper blocks of the request can never match a single-blob entry (so the partial run against a legacy entry is at most one block), and the leading-run rule means a legacy entry never contributes to a multi-block partial match — for that the producer must either report a chain `PrefixEntry` or emit one legacy `PrefixEntry` per block (as the existing vLLM subscriber does, populating the per-block index keys end-to-end).
 - `LookupRouteRequest` gains the same parallel `block_hashes` / `block_token_counts` fields. When the request carries a non-empty chain (parallel lengths must match), the server walks block-by-block; otherwise it falls back to exact-match on `prefix_hash` (the old path is unchanged).
 
-**Matching semantics.** For each replica, the server finds the **longest leading run** `[block_hashes[0]..block_hashes[k]]` such that the replica holds every block in that run (within the request's `hash_scheme`). `matched_tokens` on the returned `ReplicaScore` is the sum of the request's `block_token_counts[0..k]` — i.e. the token count of the partial prefix the replica already has cached. `reason_code` is `PREFIX_MATCH` when at least one replica's `matched_tokens` clears the per-namespace `CachePolicy.spec.minimumMatchedTokens` floor — see "Matched-tokens floor" above — AND the top surviving replica's score (after the distinguishing-power factor multiplies in) clears the per-namespace `CachePolicy.spec.routingFloorScore` floor — see [`lookuproute-ranking.md` §2.7](./lookuproute-ranking.md#27-the-replica-distinguishing-power-factor). A chain match that produces only sub-floor per-replica overlaps (e.g. a 1-block run under the default 64-token floor) downgrades to `NO_HINT` via the matched-tokens filter; a chain match that clears the per-replica filter but whose top score still falls below the routing floor (e.g. every replica reached the same depth — distinguishing-power = 0 → score 0) downgrades to `NO_HINT` via the routing-floor gate. When no replica matches the first block the request lands on the same miss-classifier as the exact-match path (see "Diagnostic reason codes" above): same-key chain misses surface as `NO_HINT` (genuinely novel prefix); chain misses with a wrong contract key surface as the matching `UNKNOWN_*` code. Chain misses never fall through to `TENANT_HOT` — a chain caller is asking specifically for longest-prefix matching, and a softer locality hint would be a wrong answer to that specific question. The freshness signal used for ranking is the **oldest** `lastSeen` across the matched blocks (weakest link).
+**Matching semantics.** For each replica, the server finds the **longest leading run** `[block_hashes[0]..block_hashes[k]]` such that the replica holds every block in that run (within the request's `hash_scheme`). `matched_tokens` on the returned `ReplicaScore` is the sum of the request's `block_token_counts[0..k]` — i.e. the token count of the partial prefix the replica already has cached. `reason_code` is `PREFIX_MATCH` when at least one replica's `matched_tokens` clears the per-namespace `CachePolicy.spec.minimumMatchedTokens` floor — see "Matched-tokens floor" above — AND the top surviving replica's score (after the distinguishing-power factor multiplies in) clears the per-namespace `CachePolicy.spec.routingFloorScore` floor — see [`lookuproute-ranking.md` §2.7](./lookuproute-ranking.md#27-the-replica-distinguishing-power-factor). A chain match that produces only sub-floor per-replica overlaps (e.g. a 1-block run under the default 64-token floor) is downgraded by the matched-tokens filter; a chain match that clears the per-replica filter but whose top score still falls below the routing floor (e.g. every replica reached the same depth — distinguishing-power = 0 → score 0) is downgraded by the routing-floor gate. Either downgrade lands on `StrategyNone`, which surfaces as `AFFINITY_HINT` with a stable single-replica pick when `CachePolicy.spec.affinityRouting` is `Enabled` (the kubebuilder default — see "Affinity routing" below) or as `NO_HINT` when the operator opted out with `affinityRouting: Disabled`. When no replica matches the first block the request lands on the same miss-classifier as the exact-match path (see "Diagnostic reason codes" above): same-key chain misses surface as `NO_HINT` / `AFFINITY_HINT` (genuinely novel prefix; affinity again decides the fallback shape); chain misses with a wrong contract key surface as the matching `UNKNOWN_*` code (those keep precedence over `AFFINITY_HINT`). Chain misses never fall through to `TENANT_HOT` — a chain caller is asking specifically for longest-prefix matching, and a softer locality hint would be a wrong answer to that specific question. The freshness signal used for ranking is the **oldest** `lastSeen` across the matched blocks (weakest link).
 
 **Precedence and fail-soft.** When a `PrefixEntry` or `LookupRouteRequest` carries both the chain (`block_hashes` + `block_token_counts`) and the legacy single-blob fields, the chain takes precedence and the legacy fields are ignored — except that chain ingest also writes the legacy single-blob key when `prefix_hash` is set, so unmigrated `LookupRoute` callers using exact `prefix_hash` still hit. When the chain is set but the two parallel arrays disagree in length the message is malformed: the server **drops the entry on ingest and returns `NO_HINT` on lookup** — it does not silently downgrade to the legacy single-blob path. A stale hint is acceptable in this soft-state index; a wrong hint is not.
 
@@ -165,4 +252,4 @@ The fingerprint is positional (block `i`'s key identifies the whole prefix `0..i
 2. `token_ids` — the server derives the block-hash chain directly via `pkg/fingerprint` (`Chain(token_ids, block_size)` → the same per-block positional hashes the subscriber ingests). No tokenizer needed, so this works in every server build.
 3. `prompt_text` — the server wraps the text as a **single `user` chat message**, applies `model_id`'s chat template **with the assistant generation prompt appended**, tokenizes (the server-owned tokenizer), then fingerprints as in (2). This single-turn wrapping is the only supported shape today; multi-turn message arrays and already-rendered / completion-style prompts are not (a structured-messages field is a future addition), and `token_ids` is the escape hatch for callers needing exact control. This path requires a server built with the tokenizer (build tag `smgcgo`) **and** an explicit, vetted `--tokenizer-models-dir`; without either it **fails open to `NO_HINT`** rather than erroring. Tokenizers are **loaded eagerly at startup** from that directory (one subdir per model) and served from memory — the lookup path itself performs **no per-request I/O or downloads** and a request `model_id` is never joined onto a filesystem path, so `LookupRoute` stays side-effect-free apart from metrics (the model_id is confined to the pre-loaded set; an unknown model fails open). Tokenization is still bounded by the tenant's `lookupTimeoutMs`, or a default safety timeout when none is set. The canonical `token_ids` the server produced are echoed in `LookupRouteResponse.token_ids` (4) **only on this path**, so the caller forwards exactly those tokens to the engine (e.g. OpenAI `/v1/completions` with a token-id `prompt`) — the engine then caches the same tokens the lookup was fingerprinted over, so routing key and engine cache key match **by construction**, with no tokenizer-parity dependence between gateway and engine.
 
-`model_id` / `tenant_id` / `hash_scheme` are still supplied by the caller on every path — they are engine/routing config, not tokenizer knowledge. The block size used to fingerprint token_ids / prompt_text MUST match the engine's KV block size and the kvevent-subscriber's; it defaults to 16 (vLLM's default) and is set with the server's `--engine-block-size` flag. All input paths funnel into the identical block-chain matching semantics (the longest-leading-run rule above), so `reason_code`, the matched-tokens / routing-floor gates, and fail-open behavior are unchanged. A `token_ids` / `prompt_text` input too short to fill one block yields an empty chain → fail-open `NO_HINT`. `LookupRoute` stays side-effect-free apart from metrics (tokenization is transient: the server sees prompt text only to hash it, never stores it).
+`model_id` / `tenant_id` / `hash_scheme` are still supplied by the caller on every path — they are engine/routing config, not tokenizer knowledge. The block size used to fingerprint token_ids / prompt_text MUST match the engine's KV block size and the kvevent-subscriber's; it defaults to 16 (vLLM's default) and is set with the server's `--engine-block-size` flag. All input paths funnel into the identical block-chain matching semantics (the longest-leading-run rule above), so the matched-tokens / routing-floor gates and fail-open behavior are unchanged once a chain is accepted. A `token_ids` / `prompt_text` input too short to fill one block yields an empty chain → fail-open `NO_HINT`; with `CachePolicy.spec.strategy.requireChain=true`, callers must send a valid wire `block_hashes` + `block_token_counts` chain, otherwise the server fails open with `POLICY_REQUIRES_CHAIN` before resolving dual-input fallbacks. `LookupRoute` stays side-effect-free apart from metrics (tokenization is transient: the server sees prompt text only to hash it, never stores it).

@@ -177,6 +177,11 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
+#  15. The operator `inferencecache doctor` CLI runs end-to-end against the live
+#      install: build the binary, apply a CacheBackend, run the config-only
+#      checks, and assert it emits the documented JSON envelope, surfaces a
+#      CacheBackend (CB0xx) finding, and exits with a code matching the reported
+#      summary.exitCode (the CI-gating contract).
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -627,6 +632,26 @@ if [ -z "$ci_changed" ] || [ "$ci_changed" = "<none>" ] || [ "$ci_changed" = "<u
 fi
 log "CacheIndex printer columns render Prefixes=$ci_prefixes Changed=$ci_changed"
 
+# --- CacheIndex CRD per-tenant-memory deprecation assertion ----------------
+# Per-tenant memory cannot be honestly attributed on a shared, tenant-unaware
+# engine (status.tenants[].memoryUsed double-counts the same bytes once per
+# tenant), so the field is DEPRECATED and always 0 — but retained in the
+# v1alpha1 schema for wire/shape compatibility (removal deferred to v1beta1).
+# The honest per-replica engine total stays. Probing the live CRD proves both
+# fields are in the installed bundle, not just the repo.
+ci_field_type() {
+  kubectl get crd cacheindices.inferencecache.io \
+    -o "jsonpath={.spec.versions[?(@.name=='v1alpha1')].schema.openAPIV3Schema.properties.$1.type}" \
+    2>/dev/null || true
+}
+if [ -z "$(ci_field_type 'status.properties.tenants.items.properties.memoryUsed')" ]; then
+  fail "CRD is missing status.tenants[].memoryUsed (deprecated+zeroed but retained in the v1alpha1 schema for compat — must remain until v1beta1)"
+fi
+if [ -z "$(ci_field_type 'status.properties.replicas.items.properties.cacheMemoryBytes')" ]; then
+  fail "CRD is missing status.replicas[].cacheMemoryBytes (the honest per-replica engine total)"
+fi
+log "CacheIndex CRD serves deprecated status.tenants[].memoryUsed (retained, always 0) and the honest status.replicas[].cacheMemoryBytes"
+
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing
 # table columns render. The gRPC side-effect assertion below proves this CR
@@ -1017,31 +1042,39 @@ fi
 
 # --- CachePolicy PUSH adoption assertion -----------------------------------
 # No read-back endpoint exists for /policy, by design. Prove the server adopted
-# the controller-pushed CachePolicy via existing gRPC side effects on three
-# orthogonal axes:
-#   1. minimumPrefixTokens (request-side gate, applied BEFORE the index lookup).
-#      Seed one prefix; the request below the policy threshold short-circuits
-#      to NO_HINT without touching the index; the request above hits.
+# the controller-pushed CachePolicy via existing gRPC side effects on two
+# orthogonal axes (routingFloorScore is probed separately by the patch-and-
+# wait block further below):
+#   1. minimumPrefixTokens (request-side gate; applied BEFORE the index
+#      lookup under affinityRouting=Disabled or as a post-lookup
+#      result-side downgrade under affinityRouting=Enabled — the default).
+#      Seed one prefix; the request below the policy threshold no longer
+#      reaches the prefix-match path. With affinityRouting=Enabled (the
+#      kubebuilder default carried by the sample CR) the fallback fires and
+#      the response is AFFINITY_HINT — *not* PREFIX_MATCH, which is what
+#      proves the gate adopted. With affinityRouting=Disabled this same path
+#      would return NO_HINT; either non-PREFIX_MATCH outcome proves the gate.
 #   2. minimumMatchedTokens (result-side floor, applied AFTER the lookup, against
 #      the realized matched-token overlap). Seed a SECOND prefix whose stored
 #      tokenCount is above minimumPrefixTokens (so it clears the request-side
 #      gate) but BELOW minimumMatchedTokens (so the realized match downgrades
-#      to NO_HINT). Without this assertion the floor could be silently dropped
-#      and the smoke would still pass on the request-side gate alone. The
-#      sample carries minimumMatchedTokens explicitly (config/samples/
-#      cache_v1alpha1_cachepolicy.yaml).
+#      away from PREFIX_MATCH). Without this assertion the floor could be
+#      silently dropped and the smoke would still pass on the request-side
+#      gate alone. The sample carries minimumMatchedTokens explicitly
+#      (config/samples/cache_v1alpha1_cachepolicy.yaml). The downgrade
+#      again surfaces as AFFINITY_HINT (or NO_HINT under affinity Disabled).
 #
 # Note: with no CachePolicy at all the server-wide DefaultMinimumMatchedTokens
-# (= 64) ALSO downgrades the trivial 32-token match to NO_HINT — the no-policy
-# fallback fires the same floor as the sample CR sets. The point of the
-# trivial-match assertion is therefore "the pushed CR did not silently drop the
-# result-side floor" rather than "without the CR this would have been
-# PREFIX_MATCH". The low-prefix lookup is the standalone proof that policy
-# adoption happened (its NO_HINT outcome IS owned by the pushed
-# minimumPrefixTokens: 32 — no-policy would have ungated the request and
-# returned PREFIX_MATCH on the 64-token stored prefix). Together they cover
-# both policy enforcement axes end-to-end. Avoids engine pods/images, model
-# traffic, and any new transport.
+# (= 64) ALSO downgrades the trivial 32-token match away from PREFIX_MATCH —
+# the no-policy fallback fires the same floor as the sample CR sets. The
+# point of the trivial-match assertion is therefore "the pushed CR did not
+# silently drop the result-side floor" rather than "without the CR this would
+# have been PREFIX_MATCH". The low-prefix lookup is the standalone proof
+# that policy adoption happened (its non-PREFIX_MATCH outcome IS owned by
+# the pushed minimumPrefixTokens: 32 — no-policy would have ungated the
+# request and returned PREFIX_MATCH on the 64-token stored prefix). Together
+# they cover both policy enforcement axes end-to-end. Avoids engine
+# pods/images, model traffic, and any new transport.
 log "seeding two prefixes and asserting CachePolicy minimumPrefixTokens (request-side gate) AND minimumMatchedTokens (result-side floor) are both enforced by LookupRoute"
 policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"
@@ -1063,11 +1096,14 @@ policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_
 log "ReportCacheState response: $policy_report_resp"
 
 # Three lookups exercise the three orthogonal policy-enforcement paths:
-#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path works).
-#   - policy_low: below the request-side gate → NO_HINT (request-side gate fires).
-#   - policy_trivial: above the request-side gate but matched_tokens=32 < floor 64
-#     → NO_HINT (result-side floor fires — the assertion the request-side gate
-#     alone cannot make).
+#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path
+#     works; affinity does NOT preempt a real match).
+#   - policy_low: below the request-side gate → AFFINITY_HINT (request-side
+#     gate fires; the affinity fallback then picks the only known replica).
+#   - policy_trivial: above the request-side gate but matched_tokens=32 <
+#     floor 64 → AFFINITY_HINT (result-side floor fires — the assertion the
+#     request-side gate alone cannot make — and again the affinity fallback
+#     surfaces the single known replica).
 policy_high_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":64}
 EOF
@@ -1086,24 +1122,24 @@ policy_high_resp=""
 policy_low_resp=""
 policy_trivial_resp=""
 until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
-  && has_reason_code "$policy_low_resp" "NO_HINT" \
-  && has_reason_code "$policy_trivial_resp" "NO_HINT"; do
+  && has_reason_code "$policy_low_resp" "AFFINITY_HINT" \
+  && has_reason_code "$policy_trivial_resp" "AFFINITY_HINT"; do
   policy_high_resp="$(grpcurl_lookup_route "$policy_high_payload" "$LOG_DIR/grpcurl-policy-high.err")" || true
   policy_low_resp="$(grpcurl_lookup_route "$policy_low_payload" "$LOG_DIR/grpcurl-policy-low.err")" || true
   policy_trivial_resp="$(grpcurl_lookup_route "$policy_trivial_payload" "$LOG_DIR/grpcurl-policy-trivial.err")" || true
 
   if has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
-    && has_reason_code "$policy_low_resp" "NO_HINT" \
-    && has_reason_code "$policy_trivial_resp" "NO_HINT"; then
+    && has_reason_code "$policy_low_resp" "AFFINITY_HINT" \
+    && has_reason_code "$policy_trivial_resp" "AFFINITY_HINT"; then
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
     echo "above-threshold LookupRoute response (want PREFIX_MATCH):" >&2
     echo "$policy_high_resp" >&2
-    echo "below-request-gate LookupRoute response (want NO_HINT):" >&2
+    echo "below-request-gate LookupRoute response (want AFFINITY_HINT — request gate fires; affinity fallback picks the known replica):" >&2
     echo "$policy_low_resp" >&2
-    echo "trivial-match (below result floor) LookupRoute response (want NO_HINT):" >&2
+    echo "trivial-match (below result floor) LookupRoute response (want AFFINITY_HINT — matched-tokens floor fires; affinity fallback picks the known replica):" >&2
     echo "$policy_trivial_resp" >&2
     for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err" "$LOG_DIR/grpcurl-policy-trivial.err"; do
       if [ -s "$err_file" ]; then
@@ -1111,22 +1147,25 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
         cat "$err_file" >&2
       fi
     done
-    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request NO_HINT, trivial-match NO_HINT)"
+    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request AFFINITY_HINT, trivial-match AFFINITY_HINT — the non-PREFIX_MATCH outcomes prove both gates fired with affinityRouting=Enabled)"
   fi
   sleep 2
 done
-log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned NO_HINT; trivial-match (matched_tokens<floor) lookup returned NO_HINT — both minimum-token policy knobs enforced end-to-end"
+log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned AFFINITY_HINT; trivial-match (matched_tokens<floor) lookup returned AFFINITY_HINT — both minimum-token policy knobs enforced end-to-end (the non-PREFIX_MATCH outcomes prove the gates fired; the affinity fallback then surfaces the single known replica)"
 
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server
 # resolver → buildLookupResponse downgrade. The same 64-token prefix that
-# returned PREFIX_MATCH above goes to NO_HINT after we patch the live
-# CachePolicy to routingFloorScore="1000" (well above any plausible score:
-# matched_tokens (64) × freshness (~1) × distinguishing_power (1.0 — only
-# one replica was seeded, so the factor degenerates) = ~64, which is below
-# the strict 1000 floor). Restoring "0.1" must flip the response back to
-# PREFIX_MATCH — proving replace-on-write semantics carry the new field too.
-# Without engine pods or model traffic, this is the minimum end-to-end
+# returned PREFIX_MATCH above is forced off the prefix-match path after we
+# patch the live CachePolicy to routingFloorScore="1000" (well above any
+# plausible score: matched_tokens (64) × freshness (~1) ×
+# distinguishing_power (1.0 — only one replica was seeded, so the factor
+# degenerates) = ~64, which is below the strict 1000 floor). With the
+# kubebuilder-default affinityRouting=Enabled the response settles at
+# AFFINITY_HINT (the floor fired and the affinity fallback picked the
+# single known replica). Restoring "0.1" must flip the response back to
+# PREFIX_MATCH — proving replace-on-write semantics carry the new field
+# too. Without engine pods or model traffic, this is the minimum end-to-end
 # exercise of the new operator-facing knob.
 log "asserting CachePolicy.spec.routingFloorScore is propagated and gates LookupRoute"
 
@@ -1161,8 +1200,8 @@ wait_floor_reason() {
 }
 
 apply_floor "1000"
-wait_floor_reason "$policy_high_payload" "NO_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
-log "routingFloorScore=1000 enforced: same 64-token match now NO_HINT (score below floor)"
+wait_floor_reason "$policy_high_payload" "AFFINITY_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
+log "routingFloorScore=1000 enforced: same 64-token match now AFFINITY_HINT (score below floor; affinity fallback picks the known replica)"
 
 apply_floor "0.1"
 wait_floor_reason "$policy_high_payload" "PREFIX_MATCH" "$LOG_DIR/grpcurl-policy-floor-restored.err" "routingFloorScore=0.1 high-token lookup"
@@ -1451,6 +1490,111 @@ if [ -z "$seen" ]; then
   fail "InjectedByCacheBackend Event not observed on pod uid=$engine_uid within 30s"
 fi
 log "InjectedByCacheBackend Event present on the engine pod (UID matches the persisted pod)"
+
+# --- binding diagnostics: unmatched selector + explicit skip ----------------
+# A deliberately non-matching CacheBackend should expose the selector drift on
+# the CR itself: status.engineSelectorMessage echoes the selector, and a Normal
+# EngineSelectorUnmatched Event provides the push-style breadcrumb.
+log "applying a non-matching CacheBackend to assert selector diagnostics"
+cat <<EOF | kubectl -n "$SAMPLE_NS" apply -f - >/dev/null
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: unmatched-cache
+spec:
+  type: External
+  endpoint: unmatched-cache.example.com:8200
+  engineSelector:
+    matchLabels:
+      app: definitely-not-qwen
+EOF
+
+log "waiting up to ${SAMPLE_MATCH_TIMEOUT}s for unmatched selector status + Event"
+deadline=$(($(date +%s) + SAMPLE_MATCH_TIMEOUT))
+unmatched_msg=""
+unmatched_event=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  unmatched_msg="$(kubectl -n "$SAMPLE_NS" get cb unmatched-cache \
+    -o jsonpath='{.status.engineSelectorMessage}' 2>/dev/null || true)"
+  unmatched_event="$(kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=EngineSelectorUnmatched \
+    -o jsonpath="{range .items[?(@.regarding.name=='unmatched-cache')]}{.reason}{'\n'}{end}" \
+    2>/dev/null || true)"
+  case "$unmatched_msg" in
+    *"app:definitely-not-qwen"*"no Pods in namespace match"*)
+      [ -n "$unmatched_event" ] && break
+      ;;
+  esac
+  sleep 2
+done
+case "$unmatched_msg" in
+  *"app:definitely-not-qwen"*"no Pods in namespace match"*) ;;
+  *)
+    kubectl -n "$SAMPLE_NS" get cb unmatched-cache -o yaml || true
+    fail "status.engineSelectorMessage=$unmatched_msg, want selector echo + no Pods diagnostic"
+    ;;
+esac
+if [ -z "$unmatched_event" ]; then
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=EngineSelectorUnmatched -o yaml || true
+  fail "EngineSelectorUnmatched Event not observed on CacheBackend/unmatched-cache within ${SAMPLE_MATCH_TIMEOUT}s"
+fi
+log "unmatched selector diagnostics present: $unmatched_msg"
+
+# A pod that explicitly opts out must be distinguishable from a drifted pod:
+# the webhook stamps inject-skipped, and the engine-pod-events controller turns
+# that stamp into a describe-visible SkippedByOperator Event keyed to the
+# persisted pod UID.
+log "creating a skip-inject pod to assert opt-out visibility"
+cat <<EOF | kubectl -n "$SAMPLE_NS" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: skipped-engine
+  annotations:
+    inferencecache.io/skip-inject: "true"
+  labels:
+    app: skip-demo
+spec:
+  containers:
+    - name: engine
+      image: $SAMPLE_ENGINE_IMAGE
+      command: ["sh", "-c", "sleep 3600"]
+EOF
+skipped_uid="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+  -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+if [ -z "$skipped_uid" ]; then
+  fail "skipped-engine pod did not persist with a UID"
+fi
+deadline=$(($(date +%s) + 30))
+skip_reason=""
+skip_event=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  skip_reason="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+    -o jsonpath='{.metadata.annotations.inferencecache\.io/inject-skipped}' 2>/dev/null || true)"
+  skip_event="$(kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=SkippedByOperator \
+    -o jsonpath="{range .items[?(@.regarding.uid=='$skipped_uid')]}{.reason}{'\n'}{end}" \
+    2>/dev/null || true)"
+  [ "$skip_reason" = "skip-inject-annotation" ] && [ -n "$skip_event" ] && break
+  sleep 2
+done
+if [ "$skip_reason" != "skip-inject-annotation" ]; then
+  kubectl -n "$SAMPLE_NS" get pod skipped-engine -o yaml || true
+  fail "annotation inferencecache.io/inject-skipped=$skip_reason, want skip-inject-annotation"
+fi
+skipped_injected_by="$(kubectl -n "$SAMPLE_NS" get pod skipped-engine \
+  -o jsonpath='{.metadata.annotations.inferencecache\.io/injected-by}' 2>/dev/null || true)"
+if [ -n "$skipped_injected_by" ]; then
+  kubectl -n "$SAMPLE_NS" get pod skipped-engine -o yaml || true
+  fail "skipped pod unexpectedly carries inferencecache.io/injected-by=$skipped_injected_by"
+fi
+if [ -z "$skip_event" ]; then
+  kubectl -n "$SAMPLE_NS" get events.events.k8s.io \
+    --field-selector reason=SkippedByOperator -o yaml || true
+  fail "SkippedByOperator Event not observed on skipped pod uid=$skipped_uid within 30s"
+fi
+log "skip-inject visibility present: inject-skipped=$skip_reason and SkippedByOperator Event"
 
 # --- cache-server restart cascade ------------------------------------------
 # When the cache-server pod is replaced (OOM-kill, eviction, image roll,
@@ -2843,4 +2987,44 @@ if [ "$sample_fail" -ne 0 ]; then
 fi
 log "all config/samples/ manifests applied cleanly ($sample_ok ok, $sample_skip skipped; server dry-run)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), and every config/samples/ manifest applies cleanly — all work"
+# --- inferencecache doctor CLI assertion -----------------------------------
+# The operator-facing `inferencecache doctor` CLI must run end-to-end against a
+# real install, not just envtest. Build it and run the config-only checks (no
+# live server probe required) against a freshly-applied CacheBackend, asserting
+# it emits the documented JSON envelope, actually inspected the backend (a CB0xx
+# finding), and that its process exit code matches the reported summary.exitCode
+# — the CI-gating contract operators rely on.
+log "asserting 'inferencecache doctor' runs against the live install"
+mkdir -p "$LOG_DIR"
+DOCTOR_BIN="$LOG_DIR/inferencecache"
+if ! go build -o "$DOCTOR_BIN" ./cmd/inferencecache >"$LOG_DIR/doctor-build.log" 2>&1; then
+  cat "$LOG_DIR/doctor-build.log" >&2 || true
+  fail "could not build cmd/inferencecache for the doctor smoke assertion"
+fi
+DOCTOR_NS=doctor-smoke
+kubectl create namespace "$DOCTOR_NS" >/dev/null 2>&1 || true
+kubectl apply -n "$DOCTOR_NS" -f config/samples/cache_v1alpha1_cachebackend.yaml >/dev/null
+doctor_rc=0
+"$DOCTOR_BIN" doctor --config-only --namespace "$DOCTOR_NS" --output json --no-color \
+  >"$LOG_DIR/doctor.json" 2>"$LOG_DIR/doctor.err" || doctor_rc=$?
+kubectl delete namespace "$DOCTOR_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+case "$doctor_rc" in
+  0|1|2) : ;;
+  *) cat "$LOG_DIR/doctor.json" "$LOG_DIR/doctor.err" >&2 || true
+     fail "inferencecache doctor exited $doctor_rc (want a CI-gating 0/1/2)" ;;
+esac
+if ! grep -q '"summary"' "$LOG_DIR/doctor.json" || ! grep -q '"findings"' "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "inferencecache doctor did not emit the expected JSON envelope (summary + findings)"
+fi
+if ! grep -q '"code": "CB0' "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "inferencecache doctor produced no CacheBackend (CB0xx) finding despite an applied backend"
+fi
+if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
+  cat "$LOG_DIR/doctor.json" >&2 || true
+  fail "doctor process exit ($doctor_rc) does not match the reported summary.exitCode"
+fi
+log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"

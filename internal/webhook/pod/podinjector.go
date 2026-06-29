@@ -65,6 +65,15 @@ const AnnotationInjectedBy = "inferencecache.io/injected-by"
 // the event.
 const AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
 
+// AnnotationInjectSkipped is stamped when the webhook intentionally skips
+// injection because the operator set [AnnotationSkip]. It lets a persisted pod
+// distinguish an explicit opt-out from selector drift or fail-open admission.
+const AnnotationInjectSkipped = "inferencecache.io/inject-skipped"
+
+// InjectSkippedReasonSkipAnnotation is the stable value written to
+// [AnnotationInjectSkipped] when [AnnotationSkip] opts the pod out.
+const InjectSkippedReasonSkipAnnotation = "skip-inject-annotation"
+
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=ignore,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod.inferencecache.io,admissionReviewVersions=v1
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
@@ -131,8 +140,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		pod.Namespace = req.Namespace
 	}
 
-	if skipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
-		return failOpen(req, &pod, "skipped via "+AnnotationSkip)
+	if SkipAnnotationOptsOut(pod.Annotations[AnnotationSkip]) {
+		return skipInjection(req, &pod)
 	}
 
 	cache, err := h.selectCacheBackend(ctx, &pod)
@@ -314,6 +323,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	if mutated.Annotations == nil {
 		mutated.Annotations = map[string]string{}
 	}
+	delete(mutated.Annotations, AnnotationInjectSkipped)
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
 	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
 
@@ -378,14 +388,14 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 	return nil, nil
 }
 
-// skipAnnotationOptsOut returns true when the value of [AnnotationSkip]
+// SkipAnnotationOptsOut returns true when the value of [AnnotationSkip]
 // should be treated as an opt-out. Truthy values (anything strconv.ParseBool
 // accepts as true) opt out; non-empty values that ParseBool can't interpret
 // (e.g. "yes", "skip", an operator's free-form note) also opt out — making
 // the annotation "set with any meaningful value disables injection."
 // Explicitly falsey values ("false", "0", "f", "no") leave injection
 // enabled, so `inferencecache.io/skip-inject: "false"` does NOT disable.
-func skipAnnotationOptsOut(value string) bool {
+func SkipAnnotationOptsOut(value string) bool {
 	if value == "" {
 		return false
 	}
@@ -414,14 +424,14 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 
 // failOpen builds the admission response for any fail-open return path
 // AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy on the persisted pod means "the webhook successfully
-// stamped this pod" — that's what the engine-pod-events controller keys
-// `InjectedByCacheBackend` off of. The annotation is user-controllable
-// (anyone with pod-create RBAC can set it) and the webhook does not
-// overwrite it on fail-open paths, so a copy/paste from an injected pod's
-// metadata, or an attacker forging the annotation, would otherwise trip
-// the controller into emitting "Injected engine config" for a pod the
-// webhook never touched.
+// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
+// "the webhook successfully made this decision" — those are what the
+// engine-pod-events controller keys `InjectedByCacheBackend` and
+// `SkippedByOperator` off of. The annotations are user-controllable (anyone
+// with pod-create RBAC can set them) and the webhook does not overwrite them
+// on fail-open paths, so a copy/paste from a mutated pod's metadata, or an
+// attacker forging the annotations, would otherwise trip the controller into
+// emitting an event for a pod the webhook never touched.
 //
 // Fix: on every fail-open return, strip the annotation if it was
 // preset. Steady-state cost stays at zero patches per pod for the common
@@ -431,12 +441,14 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
-	if !hasInjectedBy && !hasInjectedByUID {
+	hasInjectSkipped := pod.Annotations[AnnotationInjectSkipped] != ""
+	if !hasInjectedBy && !hasInjectedByUID && !hasInjectSkipped {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
 	delete(cleared.Annotations, AnnotationInjectedByUID)
+	delete(cleared.Annotations, AnnotationInjectSkipped)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
 		// canonical "no annotations" shape.
@@ -450,6 +462,27 @@ func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.R
 		// no worse than the pre-fix behavior — so this isn't a fail-
 		// closed condition.
 		return admission.Allowed(reason)
+	}
+	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
+}
+
+func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
+	mutated := pod.DeepCopy()
+	if mutated.Annotations == nil {
+		mutated.Annotations = map[string]string{}
+	}
+	delete(mutated.Annotations, AnnotationInjectedBy)
+	delete(mutated.Annotations, AnnotationInjectedByUID)
+	mutated.Annotations[AnnotationInjectSkipped] = InjectSkippedReasonSkipAnnotation
+
+	if pod.Annotations[AnnotationInjectSkipped] == InjectSkippedReasonSkipAnnotation &&
+		pod.Annotations[AnnotationInjectedBy] == "" &&
+		pod.Annotations[AnnotationInjectedByUID] == "" {
+		return admission.Allowed("skipped via " + AnnotationSkip)
+	}
+	raw, err := json.Marshal(mutated)
+	if err != nil {
+		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
 }

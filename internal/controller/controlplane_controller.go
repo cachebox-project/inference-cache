@@ -339,6 +339,13 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}
+	if cp.Spec.Strategy != nil {
+		rp.Strategy = &cacheserver.ResolvedLookupStrategy{
+			EnableChainMatching: cp.Spec.Strategy.EnableChainMatching,
+			RequireChain:        cp.Spec.Strategy.RequireChain,
+			EnableTenantHot:     cp.Spec.Strategy.EnableTenantHot,
+		}
+	}
 	// Flatten the eviction algorithm to its lower-case canonical form. The CRD
 	// enum is upper-case (K8s convention) and defaults to LRU; an empty value
 	// (CR predating apiserver defaulting, or constructed without it) also maps
@@ -348,6 +355,17 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 		rp.Eviction = string(cp.Spec.Eviction)
 	}
 	rp.Eviction = strings.ToLower(rp.Eviction)
+	// AffinityRouting maps the CRD's upper-case enum to the server's *bool
+	// shape. nil → server uses DefaultAffinityRoutingEnabled (effectively
+	// the same as the kubebuilder default), Enabled → &true, Disabled →
+	// &false. The apiserver materializes the kubebuilder default at
+	// admission, so an operator who wrote a "bare" CachePolicy still
+	// arrives here with a non-nil pointer — preserving operator intent
+	// through the flatten.
+	if cp.Spec.AffinityRouting != nil {
+		v := *cp.Spec.AffinityRouting == cachev1alpha1.CachePolicyAffinityRoutingEnabled
+		rp.AffinityRouting = &v
+	}
 	return rp
 }
 

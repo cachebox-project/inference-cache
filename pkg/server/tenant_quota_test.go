@@ -32,40 +32,43 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 	}
 }
 
-// TestPolicyPropagationVersionIsV5 pins the wire-format version. v2 accompanied
+// TestPolicyPropagationVersionIsV7 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
 // cap-eviction algorithm); v4 accompanied ResolvedPolicy.MinimumMatchedTokens
 // (the result-side matched-tokens floor); v5 accompanied
 // ResolvedPolicy.RoutingFloorScore (the per-namespace post-score floor for
-// the distinguishing-power-aware LookupRoute ranker). A controller/server
+// the distinguishing-power-aware LookupRoute ranker); v6 accompanied
+// ResolvedPolicy.Strategy (per-namespace LookupRoute strategy gates); v7
+// accompanied ResolvedPolicy.AffinityRouting (the per-namespace toggle for
+// consistent-hash fallback routing on the NO_HINT path). A controller/server
 // version mismatch outside the accepted band is rejected with a clear
 // "unsupported version" rather than a decode error.
-func TestPolicyPropagationVersionIsV5(t *testing.T) {
-	if PolicyPropagationVersion != 5 {
-		t.Fatalf("PolicyPropagationVersion = %d, want 5", PolicyPropagationVersion)
+func TestPolicyPropagationVersionIsV7(t *testing.T) {
+	if PolicyPropagationVersion != 7 {
+		t.Fatalf("PolicyPropagationVersion = %d, want 7", PolicyPropagationVersion)
 	}
 	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
-	// v3 and v4 must be accepted so a server-first rollout does not drop a
-	// v3/v4 controller's policy state mid-upgrade (normalizePolicySnapshotForVersion
-	// fills the missing fields with their server-side defaults); bodies below
-	// v3 are still rejected — there is no documented path to normalize the
-	// older Tenants / Eviction shapes.
+	// v3, v4, and v5 must be accepted so a server-first rollout does not drop
+	// an older controller's policy state mid-upgrade
+	// (normalizePolicySnapshotForVersion fills the missing fields with their
+	// server-side defaults); bodies below v3 are still rejected — there is no
+	// documented path to normalize the older Tenants / Eviction shapes.
 	if PolicyMinimumAcceptedVersion != 3 {
 		t.Fatalf("PolicyMinimumAcceptedVersion = %d, want 3", PolicyMinimumAcceptedVersion)
 	}
 }
 
 // TestPolicySnapshotV3AcceptedWithFloorDefault pins the server-first rollout
-// invariant: a v5 server MUST accept a v3 controller's snapshot AND normalize
-// BOTH missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens
-// and routingFloorScore to DefaultRoutingFloorScore — on each policy.
+// invariant: a v7 server MUST accept a v3 controller's snapshot AND normalize
+// missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens,
+// routingFloorScore to DefaultRoutingFloorScore, strategy to its defaults, and
+// affinityRouting to DefaultAffinityRoutingEnabled — on each policy.
 // Without those normalizations, the v3 body would decode the missing fields
-// as their zero values (`int32(0)` / `nil` pointer) — the v4 / v5 explicit-
-// opt-outs — silently disabling both floors for every namespace with a CR
-// mid-rollout. The all-other-knobs assertion (TTL, eviction, prefix gate,
-// timeout, tenant quota) protects against a regression where v3 itself
-// stops being accepted, which would drop every policy field, not just the
-// new ones.
+// as their zero values (`int32(0)` / nil pointers) — explicit opt-out shapes
+// in later versions — silently disabling new defaults for every namespace with
+// a CR mid-rollout. The all-other-knobs assertion (TTL, eviction, prefix gate,
+// timeout, tenant quota) protects against a regression where v3 itself stops
+// being accepted, which would drop every policy field, not just the new ones.
 func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
@@ -109,6 +112,16 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	if *pA.RoutingFloorScore != DefaultRoutingFloorScore {
 		t.Fatalf("team-a RoutingFloorScore after v3 push = %v, want DefaultRoutingFloorScore (%v) — v3 → v5 routing-floor normalization synthesized the wrong value", *pA.RoutingFloorScore, DefaultRoutingFloorScore)
 	}
+	if !store.ChainMatchingEnabled("team-a") || store.ChainRequired("team-a") || !store.TenantHotEnabled("team-a") {
+		t.Fatalf("team-a strategy defaults after v3 push = chain=%v require=%v tenantHot=%v, want true/false/true",
+			store.ChainMatchingEnabled("team-a"), store.ChainRequired("team-a"), store.TenantHotEnabled("team-a"))
+	}
+	if pA.AffinityRouting == nil {
+		t.Fatalf("team-a AffinityRouting after v3 push is nil — v3 → v7 affinity-routing normalization missing (must synthesize DefaultAffinityRoutingEnabled)")
+	}
+	if *pA.AffinityRouting != DefaultAffinityRoutingEnabled {
+		t.Fatalf("team-a AffinityRouting after v3 push = %v, want DefaultAffinityRoutingEnabled (%v) — v3 → v7 affinity-routing normalization synthesized the wrong value", *pA.AffinityRouting, DefaultAffinityRoutingEnabled)
+	}
 	// Every other knob the v3 body carried must reach the store unchanged.
 	if pA.EvictionTTL != 900_000_000_000 || pA.MinimumPrefixTokens != 32 || pA.LookupTimeoutMs != 25 || pA.Eviction != "lfu" {
 		t.Fatalf("team-a non-floor fields disturbed by normalization: %+v", pA)
@@ -123,6 +136,13 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	}
 	if pB.RoutingFloorScore == nil || *pB.RoutingFloorScore != DefaultRoutingFloorScore {
 		t.Fatalf("team-b RoutingFloorScore after v3 push = %v, want &DefaultRoutingFloorScore (%v)", pB.RoutingFloorScore, DefaultRoutingFloorScore)
+	}
+	if !store.ChainMatchingEnabled("team-b") || store.ChainRequired("team-b") || !store.TenantHotEnabled("team-b") {
+		t.Fatalf("team-b strategy defaults after v3 push = chain=%v require=%v tenantHot=%v, want true/false/true",
+			store.ChainMatchingEnabled("team-b"), store.ChainRequired("team-b"), store.TenantHotEnabled("team-b"))
+	}
+	if pB.AffinityRouting == nil || *pB.AffinityRouting != DefaultAffinityRoutingEnabled {
+		t.Fatalf("team-b AffinityRouting after v3 push = %v, want &DefaultAffinityRoutingEnabled (%v)", pB.AffinityRouting, DefaultAffinityRoutingEnabled)
 	}
 
 	// Tenant quotas survive the version normalization unchanged.
@@ -139,15 +159,21 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 //     rewritten to the default. The matched-tokens normalization only fires
 //     for v3 (and below); v4 bodies reach the store byte-for-byte for that
 //     field.
-//  2. The missing routingFloorScore on the same v4 body MUST be normalized
-//     to DefaultRoutingFloorScore. v4 predates the routing-floor field, so
-//     a v5 server receiving a v4 body must synthesize the default the same
-//     way it does for v3 — otherwise a v4 controller pushing to a v5 server
-//     during a server-first rollout silently disables the new floor for
-//     every namespace.
+//  2. The missing routingFloorScore on the same v4 body MUST be
+//     normalized to DefaultRoutingFloorScore. v4 predates the
+//     routing-floor field, so a v5+ server receiving a v4 body must
+//     synthesize the default the same way it does for v3 — otherwise
+//     a v4 controller pushing during a server-first rollout silently
+//     disables the new floor for every namespace.
+//  3. The missing affinityRouting on the same v4 body MUST be
+//     normalized to DefaultAffinityRoutingEnabled. v4 predates the
+//     affinity-routing field too, so a v7 server receiving a v4
+//     body must synthesize the default; otherwise a v4 controller
+//     pushing during a server-first rollout silently flips affinity
+//     off for every namespace.
 //
 // Written against a literal v4 body (not PolicyPropagationVersion, which is
-// now v5) so the v4-specific behavior under v3→v4→v5 server stays pinned
+// now v7) so the v4-specific behavior under v3→v4→v5→v6→v7 server stays pinned
 // even after the constant advances.
 func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testing.T) {
 	store := NewPolicyStore()
@@ -188,14 +214,34 @@ func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testi
 	if *p.RoutingFloorScore != DefaultRoutingFloorScore {
 		t.Fatalf("RoutingFloorScore after v4 push = %v, want DefaultRoutingFloorScore (%v) — v4 → v5 routing-floor normalization synthesized the wrong value", *p.RoutingFloorScore, DefaultRoutingFloorScore)
 	}
+	if !store.ChainMatchingEnabled("raw-recall") || store.ChainRequired("raw-recall") || !store.TenantHotEnabled("raw-recall") {
+		t.Fatalf("strategy defaults after v4 push = chain=%v require=%v tenantHot=%v, want true/false/true",
+			store.ChainMatchingEnabled("raw-recall"), store.ChainRequired("raw-recall"), store.TenantHotEnabled("raw-recall"))
+	}
+
+	// The v4 body did not carry affinityRouting either. The v4 → v7
+	// normalization must synthesize the default; otherwise a server-first
+	// rollout silently flips affinity off for this namespace.
+	if p.AffinityRouting == nil {
+		t.Fatal("AffinityRouting after v4 push is nil — v4 → v7 affinity normalization missing")
+	}
+	if *p.AffinityRouting != DefaultAffinityRoutingEnabled {
+		t.Fatalf("AffinityRouting after v4 push = %v, want DefaultAffinityRoutingEnabled (%v) — v4 → v7 affinity normalization synthesized the wrong value", *p.AffinityRouting, DefaultAffinityRoutingEnabled)
+	}
 }
 
-// TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved pins the v5-side
-// invariant complementary to the v3/v4 normalization tests above: a v5
-// controller that EXPLICITLY pushes routingFloorScore=0 (the documented
-// opt-out, useful for raw-recall benchmarks) must NOT have its zero
-// rewritten to the default. The normalization only fires for v3 / v4
-// bodies; v5 bodies reach the store byte-for-byte for routingFloorScore.
+// TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved pins the
+// at-version-boundary invariant complementary to the v3/v4
+// normalization tests above: a v5 controller that EXPLICITLY pushes
+// routingFloorScore=0 (the documented opt-out, useful for raw-recall
+// benchmarks) must NOT have its zero rewritten to the default when
+// processed by a v7 server. The normalization only fires for the
+// fields the body's version says could not have been present
+// (routingFloorScore was added at v5, so a v5 body's &0 reaches the
+// store byte-for-byte). The test uses a literal Version: 5 — NOT
+// PolicyPropagationVersion — so it actually exercises the v5
+// at-boundary normalization rule rather than the
+// already-current-version no-op path.
 func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 	store := NewPolicyStore()
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
@@ -203,7 +249,7 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 
 	zero := float32(0)
 	body, err := json.Marshal(PolicySnapshot{
-		Version: PolicyPropagationVersion,
+		Version: 5, // literal v5 — must reach the store byte-for-byte even on a v7 server.
 		Policies: []ResolvedPolicy{
 			{Namespace: "raw-recall", RoutingFloorScore: &zero},
 		},
@@ -221,7 +267,48 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 	}
 
 	if got := store.RoutingFloorScore("raw-recall"); got != 0 {
-		t.Fatalf("explicit v5 opt-out got rewritten to %v, want 0 — v5 body must NOT be normalized", got)
+		t.Fatalf("explicit v5 opt-out got rewritten to %v, want 0 — v5 body must NOT be normalized for the routingFloorScore field", got)
+	}
+	if !store.ChainMatchingEnabled("raw-recall") || store.ChainRequired("raw-recall") || !store.TenantHotEnabled("raw-recall") {
+		t.Fatalf("strategy defaults after v5 push = chain=%v require=%v tenantHot=%v, want true/false/true",
+			store.ChainMatchingEnabled("raw-recall"), store.ChainRequired("raw-recall"), store.TenantHotEnabled("raw-recall"))
+	}
+}
+
+func TestPolicySnapshotExplicitStrategyPreserved(t *testing.T) {
+	store := NewPolicyStore()
+	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
+	defer srv.Close()
+
+	enable := true
+	disable := false
+	require := true
+	body, err := json.Marshal(PolicySnapshot{
+		Version: PolicyPropagationVersion,
+		Policies: []ResolvedPolicy{{
+			Namespace: "strict",
+			Strategy: &ResolvedLookupStrategy{
+				EnableChainMatching: &enable,
+				RequireChain:        &require,
+				EnableTenantHot:     &disable,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp, err := srv.Client().Post(srv.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	if !store.ChainMatchingEnabled("strict") || !store.ChainRequired("strict") || store.TenantHotEnabled("strict") {
+		t.Fatalf("explicit strategy not preserved: chain=%v require=%v tenantHot=%v, want true/true/false",
+			store.ChainMatchingEnabled("strict"), store.ChainRequired("strict"), store.TenantHotEnabled("strict"))
 	}
 }
 

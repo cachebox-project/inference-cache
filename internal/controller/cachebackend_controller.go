@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -105,6 +106,12 @@ const (
 // avoid baking the 30s delay into the suite.
 const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 
+// DefaultMatchedEnginePodsChurnRequeueInterval is the faster cadence used when
+// the observed pod count disagrees with the desired-replica sum of Deployments
+// whose pod-template labels match the CacheBackend's engineSelector. It keeps
+// rolling restarts and scale churn visible without adding a Pod watch.
+const DefaultMatchedEnginePodsChurnRequeueInterval = 5 * time.Second
+
 // Event reasons emitted on a CacheBackend.
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
@@ -115,10 +122,11 @@ const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 // explicitly fail-closed is loud because the cache then becomes a serving
 // dependency.
 const (
-	eventReasonBackendDegraded   = "BackendDegraded"
-	eventReasonBackendRecovered  = "BackendRecovered"
-	eventReasonFailClosedEnabled = "FailClosedEnabled"
-	eventReasonFailOpenRestored  = "FailOpenRestored"
+	eventReasonBackendDegraded         = "BackendDegraded"
+	eventReasonBackendRecovered        = "BackendRecovered"
+	eventReasonFailClosedEnabled       = "FailClosedEnabled"
+	eventReasonFailOpenRestored        = "FailOpenRestored"
+	eventReasonEngineSelectorUnmatched = "EngineSelectorUnmatched"
 	// eventReasonInvalidStorageConfiguration is the Warning fired when a
 	// persistent (spec.storage.pvc) backend asks for more than one replica —
 	// a single ReadWriteOnce PVC cannot be multi-attached. Mirrors the
@@ -189,6 +197,10 @@ type CacheBackendReconciler struct {
 	// shorter value so they don't bake the 30s production delay into
 	// per-test runtime.
 	MatchedEnginePodsRequeueInterval time.Duration
+	// MatchedEnginePodsChurnRequeueInterval overrides the faster cadence used
+	// while observed matching Pods disagree with matching Deployment desired
+	// replicas. Zero means "use [DefaultMatchedEnginePodsChurnRequeueInterval]".
+	MatchedEnginePodsChurnRequeueInterval time.Duration
 
 	// ProbeClient is the controller's POST /probe wrapper.
 	// Nil disables the functional-probe gate — the FunctionalProbeOK
@@ -244,6 +256,15 @@ func (r *CacheBackendReconciler) matchedEnginePodsRequeueInterval() time.Duratio
 		return r.MatchedEnginePodsRequeueInterval
 	}
 	return DefaultMatchedEnginePodsRequeueInterval
+}
+
+// matchedEnginePodsChurnRequeueInterval returns the faster churn cadence for
+// selector-matched engine pod counts.
+func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Duration {
+	if r.MatchedEnginePodsChurnRequeueInterval > 0 {
+		return r.MatchedEnginePodsChurnRequeueInterval
+	}
+	return DefaultMatchedEnginePodsChurnRequeueInterval
 }
 
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
@@ -303,7 +324,7 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// fights the status writes dispatch already issued, and is fail-soft on
 	// transient List/Patch errors so it never escalates a transient
 	// apiserver hiccup into a Reconcile error.
-	r.refreshMatchedEnginePods(ctx, &backend)
+	matchedRefresh := r.refreshMatchedEnginePods(ctx, &backend)
 	// Self-requeue when there's matchedEnginePods work to keep doing on
 	// the next tick:
 	//
@@ -331,6 +352,9 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if needsRequeue := (backend.Spec.EngineSelector != nil && len(backend.Spec.EngineSelector.MatchLabels) > 0) ||
 		backend.Status.MatchedEnginePods != nil; needsRequeue {
 		cadence := r.matchedEnginePodsRequeueInterval()
+		if matchedRefresh.churn {
+			cadence = r.matchedEnginePodsChurnRequeueInterval()
+		}
 		if result.RequeueAfter == 0 || cadence < result.RequeueAfter {
 			result.RequeueAfter = cadence
 		}
@@ -2020,6 +2044,10 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 	return nil
 }
 
+type matchedEnginePodsRefresh struct {
+	churn bool
+}
+
 // refreshMatchedEnginePods refreshes status.matchedEnginePods from the live
 // pod-label set in the CacheBackend's namespace. Runs once per reconcile and
 // only touches the matchedEnginePods sub-field (via Status().Patch with
@@ -2056,15 +2084,18 @@ func (r *CacheBackendReconciler) patchStatus(ctx context.Context, backend *cache
 // Never returns an error: the matchedEnginePods refresh must not escalate
 // a transient observation failure into a Reconcile error that retries the
 // rest of the reconcile machinery unnecessarily.
-func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
+func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, backend *cachev1alpha1.CacheBackend) matchedEnginePodsRefresh {
 	before := backend.DeepCopy()
+	var out matchedEnginePodsRefresh
+	selectorDiagnosticReliable := true
 
 	sel := backend.Spec.EngineSelector
 	if sel == nil || len(sel.MatchLabels) == 0 {
-		if backend.Status.MatchedEnginePods == nil {
-			return
+		if backend.Status.MatchedEnginePods == nil && backend.Status.EngineSelectorMessage == "" {
+			return out
 		}
 		backend.Status.MatchedEnginePods = nil
+		backend.Status.EngineSelectorMessage = ""
 	} else {
 		matcher := labels.SelectorFromSet(sel.MatchLabels)
 		var pods corev1.PodList
@@ -2085,20 +2116,110 @@ func (r *CacheBackendReconciler) refreshMatchedEnginePods(ctx context.Context, b
 		); err != nil {
 			log.FromContext(ctx).V(1).Info("matchedEnginePods refresh skipped: pod list failed",
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-			return
+			return out
 		}
 		count := int32(len(pods.Items))
-		if backend.Status.MatchedEnginePods != nil && *backend.Status.MatchedEnginePods == count {
-			return
+		nonTerminalCount := nonTerminalPodCount(pods.Items)
+		desired, desiredKnown, desiredReliable := r.desiredEngineReplicas(ctx, backend, matcher)
+		selectorDiagnosticReliable = desiredReliable
+		if desiredReliable && desiredKnown && desired != nonTerminalCount {
+			out.churn = true
+		}
+
+		message := backend.Status.EngineSelectorMessage
+		if count > 0 {
+			message = ""
+		} else if desiredReliable {
+			if !desiredKnown || desired > 0 {
+				message = engineSelectorUnmatchedMessage(sel.MatchLabels)
+			} else {
+				message = ""
+			}
+		}
+		if backend.Status.MatchedEnginePods != nil &&
+			*backend.Status.MatchedEnginePods == count &&
+			backend.Status.EngineSelectorMessage == message {
+			return out
 		}
 		backend.Status.MatchedEnginePods = &count
+		backend.Status.EngineSelectorMessage = message
 	}
 
 	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
 		backend.Status.MatchedEnginePods = before.Status.MatchedEnginePods
+		backend.Status.EngineSelectorMessage = before.Status.EngineSelectorMessage
 		log.FromContext(ctx).V(1).Info("matchedEnginePods refresh: status patch failed",
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return out
 	}
+
+	if r.Recorder != nil && selectorDiagnosticReliable && backend.Status.MatchedEnginePods != nil &&
+		*backend.Status.MatchedEnginePods == 0 && backend.Status.EngineSelectorMessage != "" &&
+		(before.Status.MatchedEnginePods == nil || *before.Status.MatchedEnginePods > 0 ||
+			before.Status.EngineSelectorMessage == "") {
+		r.Recorder.Eventf(backend, nil, corev1.EventTypeNormal,
+			eventReasonEngineSelectorUnmatched, eventReasonEngineSelectorUnmatched,
+			"%s", backend.Status.EngineSelectorMessage)
+	}
+	return out
+}
+
+func (r *CacheBackendReconciler) desiredEngineReplicas(ctx context.Context, backend *cachev1alpha1.CacheBackend, matcher labels.Selector) (int32, bool, bool) {
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
+	var deps appsv1.DeploymentList
+	if err := reader.List(ctx, &deps, client.InNamespace(backend.Namespace)); err != nil {
+		log.FromContext(ctx).V(1).Info("matchedEnginePods desired-replica refresh skipped: deployment list failed",
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return 0, false, false
+	}
+	var desired int32
+	var found bool
+	for i := range deps.Items {
+		dep := &deps.Items[i]
+		if !matcher.Matches(labels.Set(dep.Spec.Template.Labels)) {
+			continue
+		}
+		found = true
+		replicas := int32(1)
+		if dep.Spec.Replicas != nil {
+			replicas = *dep.Spec.Replicas
+		}
+		desired += replicas
+	}
+	return desired, found, true
+}
+
+func nonTerminalPodCount(pods []corev1.Pod) int32 {
+	var count int32
+	for i := range pods {
+		switch pods[i].Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			continue
+		default:
+			count++
+		}
+	}
+	return count
+}
+
+func engineSelectorUnmatchedMessage(matchLabels map[string]string) string {
+	return fmt.Sprintf("spec.engineSelector.matchLabels={%s}; no Pods in namespace match", formatMatchLabels(matchLabels))
+}
+
+func formatMatchLabels(matchLabels map[string]string) string {
+	keys := make([]string, 0, len(matchLabels))
+	for k := range matchLabels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+":"+matchLabels[k])
+	}
+	return strings.Join(parts, ",")
 }
 
 // stateSnapshot captures the prior-status fields that drive transition events.

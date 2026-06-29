@@ -26,7 +26,33 @@ const (
 	CachePolicyEvictionAlgorithmLFU CachePolicyEvictionAlgorithm = "LFU"
 )
 
+// CachePolicyAffinityRouting toggles consistent-hash fallback routing in
+// LookupRoute. The ranker's normal prefix-match path is unchanged; this
+// only governs what the server returns on the StrategyNone branch — the
+// full set of cases that path covers: genuine no-match (the request's
+// prefix is novel under matching contract keys), the request gated below
+// minimumPrefixTokens (request-side), every replica's realized match
+// below minimumMatchedTokens (result-side per-replica floor), or the top
+// per-replica score below routingFloorScore (result-side score floor).
+// When Enabled, the server consistently hashes the request's prompt
+// fingerprint to a stable replica and returns AFFINITY_HINT so repeat
+// prompts pin to the same replica and warm T1. When Disabled, the
+// server returns NO_HINT and the gateway round-robins. Defaults to
+// Enabled because diffuse single-turn workloads are common and the
+// fallback is near-free.
+type CachePolicyAffinityRouting string
+
+const (
+	// CachePolicyAffinityRoutingEnabled returns AFFINITY_HINT on the
+	// NO_HINT path so repeat prompts pin to a stable replica.
+	CachePolicyAffinityRoutingEnabled CachePolicyAffinityRouting = "Enabled"
+	// CachePolicyAffinityRoutingDisabled keeps the legacy NO_HINT behavior
+	// (gateway round-robins).
+	CachePolicyAffinityRoutingDisabled CachePolicyAffinityRouting = "Disabled"
+)
+
 // CachePolicySpec defines cache lookup and eviction policy.
+// +kubebuilder:validation:XValidation:rule="!has(self.strategy) || !has(self.strategy.enableChainMatching) || self.strategy.enableChainMatching || !has(self.strategy.requireChain) || !self.strategy.requireChain",message="strategy.requireChain requires strategy.enableChainMatching"
 type CachePolicySpec struct {
 	// Eviction is the index entry-eviction algorithm applied when the index
 	// exceeds its entry cap. LRU evicts the oldest-by-lastSeen entry first;
@@ -45,7 +71,16 @@ type CachePolicySpec struct {
 	// +optional
 	EvictionTTL *metav1.Duration `json:"evictionTTL,omitempty"`
 
-	// MinimumPrefixTokens is the minimum prefix length required before lookup.
+	// MinimumPrefixTokens is the minimum requested prefix token count
+	// before a positive cache-evidence hint (PREFIX_MATCH or TENANT_HOT)
+	// is surfaced. With affinityRouting: Disabled the gate fires as a
+	// pre-lookup short-circuit straight to NO_HINT (cheap path). With
+	// affinityRouting: Enabled (the default) the request runs the full
+	// lookup so UNKNOWN_* diagnostics surface; if the ranker would have
+	// returned PREFIX_MATCH or TENANT_HOT the handler downgrades it to
+	// StrategyNone, and the affinity fallback surfaces AFFINITY_HINT
+	// (which carries no cache-evidence claim and is acceptable for
+	// tiny prompts).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MinimumPrefixTokens *int32 `json:"minimumPrefixTokens,omitempty"`
@@ -56,9 +91,13 @@ type CachePolicySpec struct {
 	// effective prefix tokens BEFORE the index is consulted; this is a
 	// result-side floor applied AFTER the lookup, against the actual matched
 	// overlap. Replicas whose match falls below this threshold are filtered
-	// from the response; if no replica clears the floor, the reason_code is
-	// downgraded to NO_HINT so the gateway round-robins honestly instead of
-	// being credited with a trivial chat-template-only match. Defaults to 64
+	// from the response; if no replica clears the floor, the response is
+	// downgraded off the PREFIX_MATCH path. With affinityRouting: Enabled
+	// (the default) and a usable seed + serving replica, the downgrade
+	// surfaces as AFFINITY_HINT (single stable replica pick); with
+	// affinityRouting: Disabled it surfaces as NO_HINT so the gateway
+	// round-robins honestly instead of being credited with a trivial
+	// chat-template-only match. Defaults to 64
 	// (4 blocks at the typical 16-token block size — well above the framing
 	// tokens identical across every replica). Set to 0 to disable the floor
 	// entirely.
@@ -68,7 +107,11 @@ type CachePolicySpec struct {
 	MinimumMatchedTokens *int32 `json:"minimumMatchedTokens,omitempty"`
 
 	// RoutingFloorScore is the per-replica score below which a PREFIX_MATCH
-	// response downgrades to NO_HINT. The LookupRoute ranker computes
+	// response is downgraded off the prefix-match path. The downgrade
+	// lands on StrategyNone, which surfaces as AFFINITY_HINT under
+	// affinityRouting: Enabled (the kubebuilder default) with a usable
+	// seed + serving replica or as NO_HINT under affinityRouting:
+	// Disabled. The LookupRoute ranker computes
 	//
 	//   score = matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power
 	//
@@ -93,9 +136,12 @@ type CachePolicySpec struct {
 	// Composes with MinimumMatchedTokens (above): the MatchedTokens floor is
 	// applied first (filters sub-floor replicas per-replica), then the
 	// RoutingFloorScore floor is applied to the top-ranked survivor's
-	// score. Both floors can downgrade a PREFIX_MATCH to NO_HINT
-	// independently; an operator can disable either by setting it to its
-	// opt-out value (0 / "0").
+	// score. Both floors can downgrade a PREFIX_MATCH off the prefix-match
+	// path independently; the final reason code on the downgrade is
+	// AFFINITY_HINT under affinityRouting: Enabled (the kubebuilder
+	// default) with a usable seed + serving replica, or NO_HINT under
+	// affinityRouting: Disabled. An operator can disable either floor by
+	// setting it to its opt-out value (0 / "0").
 	//
 	// Encoded as a stringified float to avoid introducing the first
 	// float-typed field into the CachePolicy schema (the others are
@@ -123,6 +169,64 @@ type CachePolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
+
+	// Strategy controls which LookupRoute matching strategies may produce a
+	// hint for this namespace. Defaults preserve the historical behavior:
+	// longest-prefix chain matching is enabled, callers are not required to
+	// send a chain, and TENANT_HOT remains enabled as a soft locality fallback.
+	// +optional
+	Strategy *CachePolicyStrategySpec `json:"strategy,omitempty"`
+
+	// AffinityRouting controls consistent-hash fallback routing when the
+	// prefix-match ranker would return NO_HINT. With Enabled (default),
+	// each request's prompt fingerprint (length-prefixed concatenation of
+	// its block-hash chain, then SHA-256 inside Index.AffinityHint to
+	// avoid cross-width collisions) is mod'd against the index-known
+	// SCHEME-AWARE replica set for (tenant, model, hash_scheme) — read
+	// from the same servingByScope accelerator the TENANT_HOT path uses,
+	// so a vLLM request can never pin to an SGLang replica. The server
+	// returns AFFINITY_HINT with that single stable replica. The same
+	// prompt repeats route to the same replica, warming T1 even on
+	// diffuse single-turn workloads where the prefix-match ranker has no
+	// signal. With Disabled, NO_HINT is returned as before and the
+	// gateway round-robins. Distinct reason code so operators can measure
+	// the affinity-vs-real-match share via
+	// inferencecache_lookup_route_calls_total{reason_code=...}.
+	//
+	// Affinity bypasses minimumPrefixTokens (stable-replica pinning is
+	// effectively free even for short prompts); the diagnostic
+	// UNKNOWN_TENANT / UNKNOWN_MODEL / UNKNOWN_HASH_SCHEME codes keep
+	// their precedence over AFFINITY_HINT.
+	//
+	// +optional
+	// +kubebuilder:validation:Enum=Enabled;Disabled
+	// +kubebuilder:default=Enabled
+	AffinityRouting *CachePolicyAffinityRouting `json:"affinityRouting,omitempty"`
+}
+
+// CachePolicyStrategySpec controls per-namespace LookupRoute strategy gates.
+type CachePolicyStrategySpec struct {
+	// EnableChainMatching allows LookupRoute requests that carry block_hashes
+	// to use the longest-common-leading-run chain matcher. When false, the
+	// server ignores request block_hashes and falls back to the legacy exact
+	// prefix_hash path.
+	// +optional
+	// +kubebuilder:default=true
+	EnableChainMatching *bool `json:"enableChainMatching,omitempty"`
+
+	// RequireChain rejects LookupRoute requests that do not carry a valid
+	// block_hash chain with reason_code=POLICY_REQUIRES_CHAIN before touching
+	// the index. It is only coherent when EnableChainMatching is true.
+	// +optional
+	// +kubebuilder:default=false
+	RequireChain *bool `json:"requireChain,omitempty"`
+
+	// EnableTenantHot allows the TENANT_HOT fallback when no prefix match is
+	// found but the tenant has recently warm replicas. When false, TENANT_HOT
+	// results are downgraded to NO_HINT.
+	// +optional
+	// +kubebuilder:default=true
+	EnableTenantHot *bool `json:"enableTenantHot,omitempty"`
 }
 
 // CachePolicyStatus defines observed policy state.

@@ -22,8 +22,8 @@ The status carries three nested views of the same index, each answering a differ
 | Surface | Status path | Meaning |
 |---|---|---|
 | Cluster total | `status.prefixes.summary.total` | Distinct prefixes across the whole index. (`status.prefixes.summary.hot` is reserved and always `0` today — the hot-prefix aggregation into this field is not wired yet, even though per-entry LFU access counters already exist internally.) |
-| Per-tenant | `status.tenants[]` — `{id, indexEntries, memoryUsed, hitRate}` | Per-tenant footprint. `indexEntries` summed across all tenant rows equals the cluster total by construction (it is the per-tenant breakdown of `prefixes.summary.total`). The empty-string `id` is the untenanted bucket. **`memoryUsed` is approximate** — summed over the tenant's distinct replicas — and is **not** honest per-tenant byte accounting on a shared engine (engine memory is tenant-unaware, so a tenant sharing an engine double-counts its total). Treat it as a coarse signal, not a budget; see the enforcement boundary in [`cachetenant-identity-and-quota.md`](cachetenant-identity-and-quota.md). |
-| Per-replica | `status.replicas[]` — `{id, tenant, cacheMemoryBytes, hitRate, pressure, lastUpdate}` | Per-replica cache health. Only replicas that **reported stats** appear here; prefix-only replicas show up in `CacheBackend.status.indexParticipation` instead, not on this surface. |
+| Per-tenant | `status.tenants[]` — `{id, indexEntries, hitRate, memoryUsed}` | Per-tenant footprint. `indexEntries` summed across all tenant rows equals the cluster total by construction (it is the per-tenant breakdown of `prefixes.summary.total`). The empty-string `id` is the untenanted bucket. **`memoryUsed` is deprecated and always `0`** — engine memory is tenant-unaware (a tenant sharing an engine would double-count its total), so it is not honestly attributable; the field is retained zeroed for v1alpha1 compatibility and scheduled for removal at v1beta1. For memory, read the per-replica row below; see the enforcement boundary in [`cachetenant-identity-and-quota.md`](cachetenant-identity-and-quota.md). |
+| Per-replica | `status.replicas[]` — `{id, tenant, cacheMemoryBytes, hitRate, pressure, lastUpdate}` | Per-replica cache health. `cacheMemoryBytes` is the engine total for that replica (covers ALL tenants on a tenant-shared engine — honest at the replica level, not decomposable per tenant). Only replicas that **reported stats** appear here; prefix-only replicas show up in `CacheBackend.status.indexParticipation` instead, not on this surface. |
 
 Two top-level fields round out the object: `status.observedServer` (the full snapshot URL the aggregate was scraped from, e.g. `http://…:8081/snapshot`) and `status.lastUpdated` (last data change, per the note above).
 
@@ -64,12 +64,12 @@ status:
   tenants:
     - id: team-search             # indexEntries across tenants sums to prefixes.summary.total
       indexEntries: 902
-      memoryUsed: 734003200
       hitRate: "0.81"
+      memoryUsed: 0               # deprecated, always 0 (read replicas[].cacheMemoryBytes)
     - id: team-rag
       indexEntries: 526
-      memoryUsed: 411041792
       hitRate: "0.64"
+      memoryUsed: 0
   replicas:
     - id: qwen-engine-7d9c5-abcde
       tenant: team-search
