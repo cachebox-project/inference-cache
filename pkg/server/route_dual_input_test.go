@@ -242,8 +242,13 @@ func TestLookupRoutePromptTextDefaultTokenizeTimeout(t *testing.T) {
 	}
 }
 
-// A novel pre-tokenized prefix the server has never seen must fail open.
-func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
+// A novel pre-tokenized prefix the server has never seen does not PREFIX_MATCH,
+// but with affinity routing on by default (a serving replica exists for this
+// tenant/model/scheme) the server seeds the consistent-hash fallback from the
+// SERVER-RESOLVED token_ids chain and returns AFFINITY_HINT with a stable,
+// zero-matched-tokens replica pick — proving affinity fires for dual-input
+// callers, not just pre-fingerprinted block_hashes requests.
+func TestLookupRouteTokenIDsNovelAffinityFallback(t *testing.T) {
 	stored := tokenSeq(1_000, 64)
 	batch := &engine.EventBatch{Events: []engine.Event{engine.BlockStored{
 		BlockHashes: [][]byte{be8(1), be8(2), be8(3), be8(4)}, TokenIDs: stored, BlockSize: 16,
@@ -259,8 +264,11 @@ func TestLookupRouteTokenIDsNovelMisses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
-	if resp.GetReasonCode() != "NO_HINT" {
-		t.Errorf("novel token_ids reason = %q, want NO_HINT", resp.GetReasonCode())
+	if resp.GetReasonCode() != "AFFINITY_HINT" {
+		t.Errorf("novel token_ids reason = %q, want AFFINITY_HINT (server-resolved chain seeds affinity)", resp.GetReasonCode())
+	}
+	if scores := resp.GetReplicaScores(); len(scores) != 1 || scores[0].GetMatchedTokens() != 0 {
+		t.Errorf("want one affinity pick with matched_tokens 0 (no real overlap), got %+v", scores)
 	}
 }
 

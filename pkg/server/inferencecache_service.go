@@ -590,7 +590,7 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 	// seed + serving replica. Diagnostic strategies keep precedence and are
 	// not rewritten. See tryAffinityResponse.
 	if result.Strategy == index.StrategyNone {
-		if resp := s.tryAffinityResponse(req, tenant, model, elapsed); resp != nil {
+		if resp := s.tryAffinityResponse(req, in, tenant, model, elapsed); resp != nil {
 			return resp
 		}
 	}
@@ -642,14 +642,14 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 // malformed. In both cases the request is gateway misconfiguration,
 // not a genuine no-match — handing it a stable replica would paper
 // over the bug and mislead operators about cache health.
-func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest, tenant, model string, elapsed time.Duration) *icpb.LookupRouteResponse {
+func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest, in lookupInputs, tenant, model string, elapsed time.Duration) *icpb.LookupRouteResponse {
 	if !s.affinityRoutingEnabled(tenant) {
 		return nil
 	}
 	if !affinityEligible(req) {
 		return nil
 	}
-	seed := canonicalAffinitySeed(req)
+	seed := canonicalAffinitySeed(in)
 	if seed == nil {
 		return nil
 	}
@@ -725,13 +725,15 @@ func affinityEligible(req *icpb.LookupRouteRequest) bool {
 // reproduce the routing decision, which is the debuggability story.
 //
 // Encoding rules:
-//   - block_hashes non-empty: for each hash, BigEndian uint32(len) then
-//     the hash bytes — length-prefixed because proto bytes have no fixed
-//     width (vLLM hashes are 8B, SGLang may differ) and pure concat
-//     would let [ab,cd] collide with [abcd].
-//   - block_hashes empty AND prefix_hash non-empty: a fresh copy of the
-//     prefix_hash bytes (legacy single-hash callers). Copying defends
-//     against any caller that mutates the request after we return.
+//   - in.blockHashes non-empty (the resolved chain — passed through for
+//     explicit-chain callers, server-derived from token_ids / prompt_text):
+//     for each hash, BigEndian uint32(len) then the hash bytes —
+//     length-prefixed because proto bytes have no fixed width (vLLM hashes
+//     are 8B, SGLang may differ) and pure concat would let [ab,cd] collide
+//     with [abcd].
+//   - in.blockHashes empty AND in.exactPrefixHash non-empty: a fresh copy
+//     of the resolved exact-prefix bytes (legacy single-hash callers).
+//     Copying defends against any caller that mutates the inputs later.
 //   - Both empty: return nil so AffinityHint returns ok=false and the
 //     handler falls through to NO_HINT.
 //
@@ -739,8 +741,8 @@ func affinityEligible(req *icpb.LookupRouteRequest) bool {
 // because the replica set AffinityHint chooses from is already filtered
 // by (tenant, model, hash_scheme) — those coordinates select the
 // candidate set; the seed selects the entry within it.
-func canonicalAffinitySeed(req *icpb.LookupRouteRequest) []byte {
-	if bh := req.GetBlockHashes(); len(bh) > 0 {
+func canonicalAffinitySeed(in lookupInputs) []byte {
+	if bh := in.blockHashes; len(bh) > 0 {
 		total := 0
 		for _, b := range bh {
 			total += 4 + len(b)
@@ -754,7 +756,7 @@ func canonicalAffinitySeed(req *icpb.LookupRouteRequest) []byte {
 		}
 		return out
 	}
-	if ph := req.GetPrefixHash(); len(ph) > 0 {
+	if ph := in.exactPrefixHash; len(ph) > 0 {
 		out := make([]byte, len(ph))
 		copy(out, ph)
 		return out

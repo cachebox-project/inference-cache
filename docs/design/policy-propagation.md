@@ -166,7 +166,7 @@ intervention.
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "policies": [
     {
       "namespace": "team-a",
@@ -301,15 +301,15 @@ intervention.
   `enableChainMatching=false` with `requireChain=true`.
 - `policies[].affinityRouting` — `*bool` (omitempty). Optional. Mirrors
   the shape of `routingFloorScore` exactly: a nil/missing field on a
-  v3/v4/v5 body is normalized to `DefaultAffinityRoutingEnabled`
+  v3/v4/v5/v6 body is normalized to `DefaultAffinityRoutingEnabled`
   (`true`) (see Rollout asymmetry below) so the in-memory store ends
   up byte-for-byte identical to the post-rollout v7 shape, regardless
   of which side of the rollout boundary the body came from. Note that
   the wire SHAPE distinguishes `nil` (omitempty drops the field
   entirely) from `&false` (the literal `"affinityRouting": false`),
   so the normalizer's input is unambiguous; the choice to normalize
-  nil → `&true` is a SEMANTIC convention so v3/v4/v5 bodies behave
-  like fresh v6 CRD-defaulted bodies. v7 bodies are NOT normalized;
+  nil → `&true` is a SEMANTIC convention so v3/v4/v5/v6 bodies behave
+  like fresh v7 CRD-defaulted bodies. v7 bodies are NOT normalized;
   the v7 wire field can take three shapes:
   - **Normal CRD-defaulted shape (the common case).** The CRD has a
     `+kubebuilder:default=Enabled` marker, so an admitted CachePolicy

@@ -127,12 +127,15 @@ chunks per request — where prompts rarely overlap so prefix matching
 never finds anything and the gateway would otherwise round-robin every
 prompt to a different replica.
 
-The fingerprint is `SHA-256` over the request's
-`block_hashes` (each hash length-prefixed with a 4-byte BigEndian
-`uint32` so cross-width proto `bytes` can't silently collide — vLLM
-hashes are 8B today, SGLang may differ); when `block_hashes` is empty,
-the legacy `prefix_hash` bytes are used directly; when both are empty
-there is no fingerprint and the server falls through to `NO_HINT`. The
+The fingerprint is `SHA-256` over the **server-resolved** block-hash
+chain — passed through for callers that send `block_hashes`, or derived
+from `token_ids` / `prompt_text` by the same dual-input resolution the
+prefix-match path uses, so affinity fires for every input mode (each
+hash length-prefixed with a 4-byte BigEndian `uint32` so cross-width
+proto `bytes` can't silently collide — vLLM hashes are 8B today, SGLang
+may differ); when the resolved chain is empty, the resolved exact
+`prefix_hash` bytes are used directly; when both are empty there is no
+fingerprint and the server falls through to `NO_HINT`. The
 SHA-256 is computed once inside `Index.AffinityHint` — the seed passed
 in is the raw canonical fingerprint, so an operator who logs the seed
 bytes can independently reproduce the routing decision. The replica set
