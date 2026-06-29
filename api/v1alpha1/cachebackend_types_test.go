@@ -38,7 +38,8 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	}
 
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
-	// health was removed in this PR. Both are guarded by requireNoProperty checks below.
+	// health was removed in an earlier change; capacity is removed in this PR.
+	// All three are guarded by requireNoProperty checks below.
 	for _, field := range []string{"endpoint", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)

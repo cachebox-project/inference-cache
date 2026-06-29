@@ -531,7 +531,18 @@ fi
 if [ -z "$(crd_field_type 'status.properties.indexParticipation.properties.t2HitRate')" ]; then
   fail "CRD is missing status.indexParticipation.t2HitRate (the tier-2 health surface)"
 fi
-log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; indexParticipation.prefixCount + t2HitRate present)"
+# spec.storage{,.pvc} + status.capacity were removed in the storage-retirement
+# trim — the lm:// server we provision is in-memory, so a local PVC cannot
+# honestly back it; durability is a backend choice. Assert the installed CRD no
+# longer serves them, so an operator cannot set a storage field the controller
+# no longer honors (the operator-facing surface change this smoke must catch).
+if [ -n "$(crd_field_type 'spec.properties.storage')" ]; then
+  fail "CRD still serves removed spec.storage (storage-retirement trim not installed)"
+fi
+if [ -n "$(crd_field_type 'status.properties.capacity')" ]; then
+  fail "CRD still serves removed status.capacity (storage-retirement trim not installed)"
+fi
+log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries/storage/capacity absent; indexParticipation.prefixCount + t2HitRate present)"
 
 # --- CacheIndex poller assertion -------------------------------------------
 # The controller's CacheIndex poller is leader-elected and refreshes on a 30s
