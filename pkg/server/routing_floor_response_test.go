@@ -21,7 +21,12 @@ import (
 // matched-tokens floor (default 64) is cleared by every replica — so
 // none get filtered. But distinguishing_power = 1 - 3/3 = 0, every score
 // = 0, and the post-score floor (DefaultRoutingFloorScore = 0.1) is what
-// downgrades the response to NO_HINT.
+// downgrades the response off the PREFIX_MATCH path. The final wire
+// code is then affinity-toggle-dependent (AFFINITY_HINT with the
+// kubebuilder default and a usable seed + serving replica; NO_HINT
+// otherwise) — the tests below disable affinity to keep pinning the
+// historic NO_HINT shape; the AFFINITY_HINT side is covered by
+// affinity_routing_test.go.
 //
 // This is the test that proves the new floor catches the workload shape
 // the existing matched-tokens floor was scoped to miss. Using a 1500-
@@ -31,6 +36,14 @@ import (
 // would pass for the wrong reason.
 func TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix(t *testing.T) {
 	svc := newTestService()
+	// Isolate this test to the routing-floor downgrade invariant. The
+	// affinity-routing fallback would otherwise rewrite the downgraded
+	// StrategyNone into AFFINITY_HINT — that's the right behavior for
+	// the affinity path (covered in affinity_routing_test.go) but
+	// orthogonal to the routing-floor → NO_HINT invariant this test
+	// pins.
+	fal := false
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "no-policy", AffinityRouting: &fal}})
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
 			ReplicaID: rid, Model: "m", Tenant: "no-policy", HashScheme: "vllm",
@@ -94,7 +107,12 @@ func TestLookupRouteRoutingFloorScoreKeepsUniqueMatch(t *testing.T) {
 // would still pass.
 func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: f32Ptr(100)}})
+	// Disable affinity so the routing-floor downgrade lands as NO_HINT,
+	// the historic shape this test pins. See the sibling
+	// TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix
+	// comment for the rationale.
+	fal := false
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: f32Ptr(100), AffinityRouting: &fal}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r0", Model: "m", Tenant: "strict", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unique"), TokenCount: 64}},

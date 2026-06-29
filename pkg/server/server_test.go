@@ -1331,10 +1331,19 @@ func TestLookupRouteAboveMinimumPrefixTokensProceedsToLookup(t *testing.T) {
 // pins the documented semantics: the threshold gates the request BEFORE
 // the lookup. To prove the index is not touched even when a match exists,
 // we inject a lookupFn that fails the test if ever called.
+//
+// The "skip the index lookup" optimization only applies when affinity
+// routing is Disabled — with affinity Enabled (the kubebuilder default)
+// the request goes through the full lookup so the index can classify
+// UNKNOWN_HASH_SCHEME / UNKNOWN_MODEL diagnostics (which keep precedence
+// over AFFINITY_HINT) and only then fall through to the affinity
+// fallback. This test pins the optimization shape that still applies
+// with affinity Disabled.
 func TestLookupRouteBelowMinimumPrefixTokensReturnsNoHintWithoutTouchingIndex(t *testing.T) {
 	svc := newTestService()
+	fal := false
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", MinimumPrefixTokens: 200},
+		{Namespace: "team-a", MinimumPrefixTokens: 200, AffinityRouting: &fal},
 	})
 	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
 		t.Fatal("index lookup should not run when the request is below the policy threshold")
@@ -1605,10 +1614,14 @@ func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 
 // TestLookupRouteBelowMinimumPrefixTokensViaChainCounts confirms the gate
 // still fires when the chain's summed token budget is below the threshold.
+// See the comment on the sibling
+// TestLookupRouteBelowMinimumPrefixTokensReturnsNoHintWithoutTouchingIndex
+// for why this test scopes itself to affinityRouting=Disabled.
 func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
+	fal := false
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-a", MinimumPrefixTokens: 200},
+		{Namespace: "team-a", MinimumPrefixTokens: 200, AffinityRouting: &fal},
 	})
 	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
 		t.Fatal("index lookup should not run when chain budget is below the threshold")
@@ -1819,10 +1832,15 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 func TestLookupRouteDisableChainMatchingMinPrefixIgnoresChainCounts(t *testing.T) {
 	svc := newTestService()
 	enableChain := false
+	affDisabled := false
 	svc.policies.Replace([]ResolvedPolicy{{
 		Namespace:           "team-a",
 		MinimumPrefixTokens: 100,
 		Strategy:            &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+		// affinity Disabled so the below-threshold request still short-circuits
+		// to NO_HINT without an index lookup (affinity Enabled would run the
+		// full lookup to classify diagnostics before any fallback).
+		AffinityRouting: &affDisabled,
 	}})
 	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
 		t.Fatal("index lookup should not run when the effective exact prefix is below the threshold")
@@ -1852,9 +1870,14 @@ func TestLookupRouteDisableChainMatchingMinPrefixIgnoresChainCounts(t *testing.T
 func TestLookupRouteDisableTenantHotDowngradesToNoHint(t *testing.T) {
 	svc := newTestService()
 	enableTenantHot := false
+	affDisabled := false
 	svc.policies.Replace([]ResolvedPolicy{{
 		Namespace: "t",
 		Strategy:  &ResolvedLookupStrategy{EnableTenantHot: &enableTenantHot},
+		// affinity Disabled so the tenant-hot downgrade surfaces as NO_HINT in
+		// isolation (affinity Enabled would pick up the StrategyNone result and
+		// return AFFINITY_HINT — covered by the affinity tests).
+		AffinityRouting: &affDisabled,
 	}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
@@ -1960,6 +1983,15 @@ func TestEffectivePrefixTokensChainTakesPrecedence(t *testing.T) {
 // is about the same-key novel-chain case.)
 func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
 	svc := newTestService()
+	// Isolate this test to its named concern (chain miss must not surface
+	// TENANT_HOT). The affinity-routing fallback would otherwise
+	// turn this exact chain-miss-with-replicas-known scenario into
+	// AFFINITY_HINT — that's the right behavior for the affinity path
+	// (covered in affinity_routing_test.go) but orthogonal to the chain
+	// vs TENANT_HOT invariant this test pins.
+	fal := false
+	svc.policies.Replace([]ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
+
 	svc.index.Ingest(index.Update{
 		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unrelated"), TokenCount: 64}},

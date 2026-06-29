@@ -6,7 +6,9 @@ no request-side prefix-length gate, a **result-side matched-tokens floor of 64
 (4 KV blocks) so trivial chat-template-only overlaps do not surface as
 `PREFIX_MATCH`**, a **result-side routing-floor-score of `0.1` so
 every-replica-holds-it overlaps that the matched-tokens floor can't catch (long
-RAG headers, custom system prompts) also downgrade to `NO_HINT`** — see
+RAG headers, custom system prompts) also downgrade off the `PREFIX_MATCH` path
+to `AFFINITY_HINT` under the default-enabled `affinityRouting` (or `NO_HINT`
+when an operator opts out)** — see
 [the three lookup-filter knobs](#three-lookup-filter-knobs-one-role-each)
 below for the rationale and the explicit opt-outs, no lookup deadline). So **most
 namespaces need no CachePolicy at all** — you reach for one only when a specific
@@ -29,9 +31,10 @@ server, which is where enforcement actually happens (see
 |---|---|---|---|
 | `eviction` | enum `LRU` \| `LFU` | `LRU` | Cap-based eviction algorithm — which entries get dropped when the index exceeds its entry cap. `LRU` drops oldest-by-`lastSeen`; `LFU` drops the lowest access-count entry (ties broken on oldest `lastSeen`). Switch to `LFU` when a few prefixes are hot and you want them to survive cap pressure. Access counts do **not** age. |
 | `evictionTTL` | duration | server default `30m` | Maximum usable lifetime of a cache entry. The freshness sweep removes entries older than this regardless of eviction algorithm. Must be strictly positive when set (admission rejects `0`/negative). |
-| `minimumPrefixTokens` | int32 (min `0`) | unset = no threshold | Minimum *requested* prefix token count before a lookup is attempted. A request shorter than this short-circuits to `NO_HINT` **without touching the index** — saves work when short prompts can't usefully hit the cache. Applied BEFORE the lookup runs, against the *request's* claimed prefix length. |
-| `minimumMatchedTokens` | int32 (min `0`) | `64` (4 KV blocks) | Minimum *realized* matched-token count for a response to surface as `PREFIX_MATCH`. Applied AFTER the lookup runs, against the *actual* per-replica overlap. Replicas whose match falls below the floor are filtered; if none survive, the reason code downgrades to `NO_HINT` so the gateway round-robins honestly instead of being credited with a trivial chat-template-only match. Set to `0` to disable entirely (e.g. raw-recall benchmarking). Distinct from `minimumPrefixTokens` — see [Three lookup-filter knobs, one role each](#three-lookup-filter-knobs-one-role-each) below. |
-| `routingFloorScore` | stringified float, e.g. `"0.1"`, `"5"`, `"0"` | `"0.1"` | Per-replica *score* floor below which a `PREFIX_MATCH` response downgrades to `NO_HINT`. Applied AFTER the lookup runs, against the per-replica score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`). Overlaps held by every replica (chat-template framing, RAG corpus headers, custom system prompts shared across the deployment) produce `distinguishing_power = 0` and score = 0 — this floor catches them. Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica), then this score floor gates the top survivor. Set to `"0"` to disable entirely (raw-recall benchmarking / debug). |
+| `minimumPrefixTokens` | int32 (min `0`) | unset = no threshold | Minimum *requested* prefix token count before a `PREFIX_MATCH` / `TENANT_HOT` result is surfaced. With `affinityRouting: Disabled` a request shorter than this short-circuits to `NO_HINT` **without touching the index** — the cheap historical path. With `affinityRouting: Enabled` (the default) the request still runs the full lookup so the index can classify `UNKNOWN_*` diagnostics, then the handler downgrades any `PREFIX_MATCH` / `TENANT_HOT` result to `StrategyNone`; the affinity fallback then returns `AFFINITY_HINT` with a stable replica pick. Either path enforces the operator intent ("tiny prompts don't surface `PREFIX_MATCH` or `TENANT_HOT` — i.e. don't surface a positive *cache-evidence* hint"); the affinity fallback's stable replica pick carries no cache-evidence claim and is considered acceptable for tiny prompts because the gate's purpose is to bound the noisy prefix-match path, not to block stable replica pinning. |
+| `minimumMatchedTokens` | int32 (min `0`) | `64` (4 KV blocks) | Minimum *realized* matched-token count for a response to surface as `PREFIX_MATCH`. Applied AFTER the lookup runs, against the *actual* per-replica overlap. Replicas whose match falls below the floor are filtered; if none survive, the response is downgraded to `StrategyNone`, which surfaces as `AFFINITY_HINT` under `affinityRouting: Enabled` (the default) with a usable seed + serving replica or as `NO_HINT` under `affinityRouting: Disabled`. Set to `0` to disable enforcement entirely (e.g. raw-recall benchmarking). Distinct from `minimumPrefixTokens` — see [Three lookup-filter knobs, one role each](#three-lookup-filter-knobs-one-role-each) below. |
+| `routingFloorScore` | stringified float, e.g. `"0.1"`, `"5"`, `"0"` | `"0.1"` | Per-replica *score* floor below which a `PREFIX_MATCH` response is downgraded off the prefix-match path. Applied AFTER the lookup runs, against the per-replica score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`). Overlaps held by every replica (chat-template framing, RAG corpus headers, custom system prompts shared across the deployment) produce `distinguishing_power = 0` and score = 0 — this floor catches them. The downgrade lands on `StrategyNone`, which surfaces as `AFFINITY_HINT` (default-enabled affinity) or `NO_HINT` (affinity disabled). Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica), then this score floor gates the top survivor. Set to `"0"` to disable entirely (raw-recall benchmarking / debug). |
+| `affinityRouting` | enum `Enabled` \| `Disabled` | `Enabled` | Toggles the consistent-hash fallback on the `StrategyNone` branch. With `Enabled` (the default), any `StrategyNone` result with a usable seed + at least one replica in `servingByScope[(tenant, model, hash_scheme)]` surfaces as `AFFINITY_HINT` with a stable single-replica pick (`SHA-256(canonical_seed) mod len(sorted servingByScope)`) — repeat prompts pin to the same replica and warm T1 on diffuse single-turn workloads. With `Disabled`, the same response stays on `NO_HINT` and the gateway round-robins; useful for raw-recall benchmarking and ranker debugging. Diagnostic codes (`UNKNOWN_*`) and `TIMEOUT` keep precedence over `AFFINITY_HINT`. |
 | `lookupTimeoutMs` | int32 (min `0`) | unset = no deadline | Per-lookup latency budget in milliseconds. A breach returns reason code `TIMEOUT` (still fail-open — empty result, never an error to the gateway). See the foot-gun in [Gotchas](#two-gotchas). |
 | `strategy` | object | chain matching on, chain not required, tenant-hot on | Per-namespace LookupRoute strategy gates. Use `enableChainMatching: false` to force exact `prefix_hash` matching, `requireChain: true` to reject non-chain callers with `POLICY_REQUIRES_CHAIN`, or `enableTenantHot: false` to suppress soft tenant-hot hints. |
 
@@ -53,9 +56,10 @@ metadata:
 spec:
   eviction: LFU              # keep frequently-used prefixes under cap pressure
   evictionTTL: 30m           # drop entries older than 30m since last REPORT
-  minimumPrefixTokens: 32    # short prompts short-circuit to NO_HINT (request-side gate)
-  minimumMatchedTokens: 64   # filter sub-floor replicas per-replica; NO_HINT if all drop (result-side matched-tokens floor, default 64)
-  routingFloorScore: "0.1"   # downgrade whole response to NO_HINT when top score is below floor (result-side score floor, default "0.1")
+  minimumPrefixTokens: 32    # tiny prompts can't surface a positive hint (request-side; under affinityRouting: Enabled — the default — the request runs the full lookup so UNKNOWN_* diagnostics still surface; under Disabled it short-circuits to NO_HINT without touching the index)
+  minimumMatchedTokens: 64   # filter sub-floor replicas per-replica; if all drop the response leaves the PREFIX_MATCH path (downgrades to StrategyNone) and surfaces as AFFINITY_HINT under default-enabled affinity or NO_HINT when disabled (result-side matched-tokens floor, default 64)
+  routingFloorScore: "0.1"   # downgrade off PREFIX_MATCH when top score is below the floor — surfaces as AFFINITY_HINT under default-enabled affinity or NO_HINT when disabled (result-side score floor, default "0.1")
+  affinityRouting: Enabled   # consistent-hash fallback on the StrategyNone branch; set Disabled for raw-recall benchmarking / debug
   lookupTimeoutMs: 20        # positive => a real 20ms deadline (NOT 0 — see Gotchas)
   strategy:
     enableChainMatching: true # default: use block-hash longest-prefix matching when callers send chains
@@ -76,9 +80,9 @@ rates without an operator-visible signal.
 
 | Knob | Stage | Compared against | Default | Sub-floor outcome |
 |---|---|---|---|---|
-| `minimumPrefixTokens` | BEFORE the index lookup | the *request's* claimed prefix token count (chain sum wins over the legacy single-blob count) | unset = no threshold | Short-circuit to `NO_HINT` — the index is never touched. Saves work on requests that wouldn't usefully hit the cache anyway. |
-| `minimumMatchedTokens` | AFTER the index lookup | each replica's *realized* matched-token overlap | `64` (4 KV blocks at the typical 16-token block size) | Filter that replica from the response. If no replica survives, the reason code downgrades to `NO_HINT`. Stops trivial chat-template-only matches from being counted as routing hits. |
-| `routingFloorScore` | AFTER the index lookup, after `minimumMatchedTokens` | the *top* surviving replica's score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`) | `"0.1"` | Downgrade the entire response to `NO_HINT` (drop all surviving rows). Catches the "every replica has the prefix" shape that `minimumMatchedTokens` can't catch when the shared prefix is long (RAG headers, custom system prompts, few-shot examples). |
+| `minimumPrefixTokens` | BEFORE the index lookup (under `affinityRouting: Disabled`) or AFTER the lookup as a `PREFIX_MATCH`/`TENANT_HOT` → `StrategyNone` downgrade (under `affinityRouting: Enabled` — the default) | the *request's* claimed prefix token count (chain sum wins over the legacy single-blob count) | unset = no threshold | Under affinity Disabled: short-circuit to `NO_HINT` — the index is never touched. Under affinity Enabled: full lookup runs (so the index can classify `UNKNOWN_*` diagnostics), then a positive-hint result is downgraded; the affinity fallback then surfaces `AFFINITY_HINT`. Either way: tiny prompts don't surface a positive *cache-evidence* hint (`PREFIX_MATCH` or `TENANT_HOT`). `AFFINITY_HINT` is a positive *routing* assertion but carries no cache-evidence claim, which is why it's acceptable for tiny prompts. |
+| `minimumMatchedTokens` | AFTER the index lookup | each replica's *realized* matched-token overlap | `64` (4 KV blocks at the typical 16-token block size) | Filter that replica from the response. If no replica survives, the response is downgraded to `StrategyNone`, which surfaces as `AFFINITY_HINT` under default-enabled affinity or `NO_HINT` when disabled. Stops trivial chat-template-only matches from being counted as `PREFIX_MATCH` routing hits. |
+| `routingFloorScore` | AFTER the index lookup, after `minimumMatchedTokens` | the *top* surviving replica's score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`) | `"0.1"` | Downgrade the entire response to `StrategyNone` (drop all surviving rows), which surfaces as `AFFINITY_HINT` or `NO_HINT` per the affinity toggle. Catches the "every replica has the prefix" shape that `minimumMatchedTokens` can't catch when the shared prefix is long (RAG headers, custom system prompts, few-shot examples). |
 
 **Why all three?**
 
@@ -97,18 +101,33 @@ rates without an operator-visible signal.
   which collapses to 0 for every-replica-has-it overlaps *regardless of
   length*. Catches RAG headers and custom system prompts; the
   `routingFloorScore` floor (default `0.1`) is what downgrades that
-  score=0 case to `NO_HINT`. See
+  score=0 case off the `PREFIX_MATCH` path. With `affinityRouting:
+  Enabled` (the default) the downgrade surfaces as `AFFINITY_HINT`
+  with a stable replica pick; with `affinityRouting: Disabled` it
+  stays on `NO_HINT`. See
   [`docs/design/lookuproute-ranking.md` §2.7](../design/lookuproute-ranking.md#27-the-replica-distinguishing-power-factor).
 
 **Composition order:**
-1. `minimumPrefixTokens` runs BEFORE the index lookup. Below threshold →
-   short-circuit `NO_HINT`, the index is never touched.
+1. `minimumPrefixTokens` runs BEFORE the index lookup under
+   `affinityRouting: Disabled` — below threshold → short-circuit
+   `NO_HINT`, the index is never touched. Under `affinityRouting:
+   Enabled` (the default) the request runs the full lookup so
+   `UNKNOWN_*` diagnostics still surface, and the handler instead
+   downgrades any positive-hint result (PREFIX_MATCH or TENANT_HOT)
+   to `StrategyNone` as a result-side filter.
 2. `minimumMatchedTokens` runs AFTER the index returns. Per-replica
    filter via `LookupResult.RetainReplicas`. If no replica survives →
-   `NO_HINT`.
+   `StrategyNone`, which surfaces as `AFFINITY_HINT` (default-enabled
+   affinity) or `NO_HINT` (disabled).
 3. `routingFloorScore` runs LAST. Whole-response gate: if the top
    surviving replica's score is below the floor → downgrade to
-   `NO_HINT` with empty scores.
+   `StrategyNone` (drop all scores), which surfaces as `AFFINITY_HINT`
+   or `NO_HINT` per the affinity toggle.
+4. `affinityRouting` decides the final wire reason code on every
+   `StrategyNone` branch reached above: with a usable seed + at least
+   one replica in `servingByScope[(tenant, model, hash_scheme)]`,
+   `Enabled` returns `AFFINITY_HINT` with a single stable replica;
+   `Disabled` (or no seed / no serving replica) returns `NO_HINT`.
 
 **Opt-out values.** Setting `minimumMatchedTokens: 0` AND
 `routingFloorScore: "0"` simultaneously reproduces the pre-floor
@@ -162,10 +181,14 @@ For the wire schema, auth posture, and the one-policy-per-namespace dedup backst
 
 - **Empty or default-happy cluster.** Server defaults (TTL 30m, LRU, **no request-side
   prefix threshold**, **result-side `minimumMatchedTokens` floor of 64**,
-  **result-side `routingFloorScore` floor of `0.1`**, no lookup deadline) are
+  **result-side `routingFloorScore` floor of `0.1`**, **consistent-hash
+  fallback (`affinityRouting`) enabled**, no lookup deadline) are
   deliberately sane — a fresh cluster needs no `CachePolicy`. Note that BOTH
   result-side floors are enabled by default (they filter trivial chat-template-only
-  matches AND every-replica-has-it overlaps even without a CR), so "no CachePolicy"
+  matches AND every-replica-has-it overlaps even without a CR) AND the
+  consistent-hash fallback is enabled (so a `StrategyNone` response with a
+  usable seed + serving replica surfaces as `AFFINITY_HINT` rather than
+  `NO_HINT`), so "no CachePolicy"
   is not the same as "no enforcement at all" — only the request-side gate is unset.
   Install a CR with `minimumMatchedTokens: 0` AND `routingFloorScore: "0"` if you
   specifically want the pre-floor behavior (raw-recall benchmarking, ranker debugging).
