@@ -9,6 +9,8 @@ package index
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"math"
 	"sort"
 	"strings"
@@ -217,16 +219,22 @@ type ReplicaScore struct {
 type Strategy int
 
 const (
-	// StrategyNone — no candidates from any strategy. Handler emits NO_HINT.
+	// StrategyNone — no candidates from any strategy. The handler emits
+	// AFFINITY_HINT (with a stable single-replica pick from
+	// servingByScope) when CachePolicy.spec.affinityRouting is Enabled
+	// — the kubebuilder default — and the request has a usable seed
+	// plus a serving replica; otherwise it emits NO_HINT.
 	StrategyNone Strategy = iota
 	// StrategyPrefixMatch — at least one replica holds the requested prefix
 	// in this hash_scheme. Handler emits PREFIX_MATCH, BUT the service-layer
 	// matched-tokens floor (CachePolicy.spec.minimumMatchedTokens, default 64
 	// — see docs/design/lookuproute-ranking.md §2.6) can still downgrade the
-	// response to NO_HINT before it ships to the wire: replicas whose
-	// matched_tokens falls below the floor are filtered, and if none survive
-	// the strategy is replaced with StrategyNone in buildLookupResponse. The
-	// index itself stays policy-unaware — this Strategy is the *pre-policy*
+	// response off the prefix-match path before it ships to the wire:
+	// replicas whose matched_tokens falls below the floor are filtered,
+	// and if none survive the strategy is replaced with StrategyNone in
+	// buildLookupResponse (which then surfaces as AFFINITY_HINT under
+	// default-enabled affinity or NO_HINT when disabled). The index
+	// itself stays policy-unaware — this Strategy is the *pre-policy*
 	// prefix-match outcome.
 	StrategyPrefixMatch
 	// StrategyTenantHot — no exact prefix match, but the tenant has recently
@@ -836,11 +844,15 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 // is unchanged for existing callers (no block-hash chain), but the
 // per-replica score now folds in the replica-distinguishing-power factor on
 // top of the matched_tokens × freshness × pressure × slo_bias baseline. The
-// service layer can also downgrade an exact-match response to NO_HINT when
-// the top score falls below the per-namespace routingFloorScore OR when
-// every replica's matched_tokens falls below the per-namespace
-// minimumMatchedTokens floor — see pkg/server/inferencecache_service.go
-// buildLookupResponse. Old gateway clients that only inspect reason_code
+// service layer can also downgrade an exact-match response off the
+// PREFIX_MATCH path when the top score falls below the per-namespace
+// routingFloorScore OR when every replica's matched_tokens falls below
+// the per-namespace minimumMatchedTokens floor — see
+// pkg/server/inferencecache_service.go buildLookupResponse. The downgrade
+// lands on StrategyNone, which surfaces as AFFINITY_HINT under
+// default-enabled affinity with a usable seed + serving replica or as
+// NO_HINT under affinityRouting: Disabled. Old gateway clients that only
+// inspect reason_code
 // continue to fail open on a downgrade.
 func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
@@ -1402,6 +1414,79 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 	return scores
 }
 
+// AffinityHint returns a stable replica assignment for the given (tenant,
+// model, hashScheme) using consistent hashing of seed against the
+// currently-known replica set that actually SERVES the requested engine
+// domain. Returns ok=false if no replicas serve the scope or seed is
+// empty.
+//
+// The replica set is read under RLock from servingByScope — the same
+// per-(tenant, model, hash_scheme) serving-membership accelerator
+// TENANT_HOT's Pass 2 check uses — and sorted by replicaID for
+// determinism across restarts and across stats-event arrival order. The
+// scheme-aware set is what makes affinity routing correct in a mixed-
+// engine-domain deployment: hashing over the scheme-blind replicasByModel
+// would let a vLLM request pin to an SGLang replica that has never
+// reported a vLLM prefix entry, contradicting the engine-disjoint hash
+// contract documented in grpc-contract.md (and matching the same fix
+// pattern as TENANT_HOT, which also moved from per-(tenant, model) to
+// per-(tenant, model, hash_scheme) for this reason).
+//
+// The seed is the raw canonical request fingerprint (length-prefixed
+// concatenation of block_hashes, or the legacy prefix_hash bytes); the
+// SHA-256 is computed HERE, exactly once, so the documented contract
+// "SHA-256 over the canonical sequence" matches what the implementation
+// does — no second hash anywhere on the path. An operator who logs the
+// seed bytes can independently compute the same SHA-256 and reproduce
+// the routing decision, which is the debuggability story.
+//
+// The assignment shifts when the replica set changes (the standard
+// modulo trade-off); a Phase-2 follow-up may replace the modulo with
+// Rendezvous / HRW without altering this method's signature.
+//
+// Wired by pkg/server/inferencecache_service.buildLookupResponse on the
+// StrategyNone branch when CachePolicy.spec.affinityRouting is Enabled
+// (the kubebuilder default). The index is policy-unaware; the toggle
+// lives entirely in the server.
+func (i *Index) AffinityHint(tenant, model, hashScheme string, seed []byte) (replicaID string, ok bool) {
+	if len(seed) == 0 {
+		return "", false
+	}
+	replicas := i.replicasForRouting(tenant, model, hashScheme)
+	if len(replicas) == 0 {
+		return "", false
+	}
+	sum := sha256.Sum256(seed)
+	idx := binary.BigEndian.Uint64(sum[:8]) % uint64(len(replicas))
+	return replicas[idx], true
+}
+
+// replicasForRouting returns the sorted list of replica IDs the index
+// currently tracks AS SERVING the (tenant, model, hashScheme) engine
+// domain. Derived from servingByScope, the same per-scope serving-
+// membership accelerator the TENANT_HOT path uses for its scheme-aware
+// Pass 2 check. Sorted by replicaID for determinism across restarts and
+// stats-event arrival order. Empty hashScheme returns nil — an
+// engine-domain-less request has no scheme-disjoint replica set to
+// route against, so affinity falls through to NO_HINT in the caller.
+func (i *Index) replicasForRouting(tenant, model, hashScheme string) []string {
+	if hashScheme == "" {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	set, ok := i.servingByScope[scopeKey{tenant: tenant, model: model, hashScheme: hashScheme}]
+	if !ok || len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for rid := range set {
+		out = append(out, rid)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // sloTightBiasCoefficient returns the coefficient applied to the freshness
 // term inside (1 + freshness × coefficient). 0 → no bias (baseline). The
 // bias only fires when (a) the ranker has SLOTightTTFTMs and SLOTightBias
@@ -1883,8 +1968,12 @@ func (i *Index) evictionFor(tenant string) string {
 // so every-replica-holds-it overlaps (chat-template framing, RAG corpus
 // headers, custom system prompts shared across the deployment) collapse to
 // zero — the per-namespace post-score floor (CachePolicy.spec.routingFloorScore)
-// then downgrades the response to NO_HINT and the gateway round-robins
-// honestly instead of being credited with a trivial routing decision. A
+// then downgrades the response off the PREFIX_MATCH path to
+// StrategyNone, which surfaces as AFFINITY_HINT under default-enabled
+// affinity (with a usable seed + serving replica) so repeat prompts
+// pin to a stable replica, or as NO_HINT under affinityRouting:
+// Disabled so the gateway round-robins honestly instead of being
+// credited with a trivial routing decision. A
 // uniquely-held match (matching=1, total=N) sees the strongest factor
 // (1 - 1/N), proportional to how diluted the prefix is in the cluster.
 //

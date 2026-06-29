@@ -43,9 +43,13 @@ The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
    so a 1-block chat-template-only overlap is not reported as a routing
    hit. If at least one replica clears the floor, return them ranked
    best-first (ties broken by replica ID) with `reason_code: PREFIX_MATCH`.
-   If none clear the floor, the response downgrades to `reason_code: NO_HINT`
-   with empty scores. (The handler returns every qualifying candidate — there is
-   no top-K limit today; the gateway typically uses the top entry.)
+   If none clear the floor, the response downgrades to `StrategyNone`,
+   which surfaces as `reason_code: AFFINITY_HINT` under default-enabled
+   `CachePolicy.spec.affinityRouting` with a usable seed + serving
+   replica or as `reason_code: NO_HINT` with empty scores under
+   `affinityRouting: Disabled`. (The handler returns every qualifying
+   candidate — there is no top-K limit today; the gateway typically
+   uses the top entry.)
 
 The intuition: more matched tokens → bigger TTFT win from the prefix-cache
 hit, and a fresher report is stronger evidence the replica still holds the
@@ -161,16 +165,22 @@ A few details that matter for correctness:
   `PREFIX_MATCH` *provided* at least one replica's `matched_tokens`
   clears the per-namespace `minimumMatchedTokens` floor. A chain match
   that produces only sub-floor per-replica overlaps (e.g. a 1-block run
-  under the default 64-token floor) downgrades to `NO_HINT` exactly the
-  way an exact-match result does — the floor is a §2-and-§2.5 wrapping
-  filter, not a separate strategy. On a miss, the request goes through
+  under the default 64-token floor) is downgraded to `StrategyNone`
+  (which then surfaces as `AFFINITY_HINT` under default-enabled
+  affinity or `NO_HINT` when disabled) exactly the way an exact-match
+  result does — the floor is a §2-and-§2.5 wrapping filter, not a
+  separate strategy. On a miss, the request goes through
   the same miss-classifier as the exact-match path: a same-key
-  first-block miss yields `NO_HINT`; a contract-key mismatch yields the
-  matching `UNKNOWN_*` code (see
-  [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)). The
+  first-block miss yields `StrategyNone` (which then surfaces as
+  `AFFINITY_HINT` under default-enabled affinity with a usable seed +
+  serving replica, or as `NO_HINT` under `affinityRouting: Disabled`);
+  a contract-key mismatch yields the matching `UNKNOWN_*` code (see
+  [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md)) — and
+  the `UNKNOWN_*` codes keep precedence over `AFFINITY_HINT`. The
   engine-opaque guards (empty `hash_scheme`, mismatched parallel-array
   lengths) and the cold-start carve-out continue to surface as
-  `NO_HINT`.
+  `NO_HINT` regardless of the affinity toggle (structurally malformed
+  input and a globally-empty index are not affinity-eligible).
 
 ### Worked example — 5 blocks, 3 deep
 
@@ -182,7 +192,10 @@ Block sizes are 64 tokens each so every per-replica run clears the
 default §2.6 matched-tokens floor; the §2.5 walk illustrates chain
 ranking in isolation from the floor. (A 16-token-per-block example
 under the default `minimumMatchedTokens: 64` would have *every* replica
-in this table filtered out and the response downgraded to `NO_HINT` —
+in this table filtered out and the response downgraded off the
+`PREFIX_MATCH` path to `StrategyNone` — which then surfaces as
+`AFFINITY_HINT` under default-enabled affinity with a usable seed +
+serving replica, or as `NO_HINT` under `affinityRouting: Disabled` —
 correct, but it would shadow the longest-prefix mechanics the section
 is teaching.)
 
@@ -231,7 +244,10 @@ of `"0.1"`, A's top score 124 clears comfortably so the response ships
 as `PREFIX_MATCH`. Raising `minimumMatchedTokens: 128` would filter C
 out via the per-replica §2.6 filter (leaving `[A, B]`); raising
 `routingFloorScore: "200"` would downgrade the whole response to
-`NO_HINT` via the §2.7 whole-response gate (A's 124 falls below 200).
+`StrategyNone` via the §2.7 whole-response gate (A's 124 falls below
+200), which then surfaces as `AFFINITY_HINT` under default-enabled
+affinity with a usable seed + serving replica or as `NO_HINT` under
+`affinityRouting: Disabled`.
 
 ### Backward-compat — what an unmigrated producer or client sees
 
@@ -406,7 +422,11 @@ distinguishing_power_R = 1 - num_matching_at_R's_depth / total_replicas
 - **`total_replicas ≤ 1` degrades the factor to `1.0`** so a
   single-replica deployment preserves the baseline ranking exactly —
   there's nothing to distinguish among; the factor would otherwise be
-  definitionally `0` and downgrade every hint to `NO_HINT`.
+  definitionally `0` and downgrade every hint off the `PREFIX_MATCH`
+  path (the final reason code on the downgrade is affinity-toggle-
+  dependent: `AFFINITY_HINT` under default-enabled affinity with a
+  usable seed + serving replica, or `NO_HINT` under
+  `affinityRouting: Disabled`).
 
 The full ranker formula composing all factors today:
 
@@ -422,21 +442,24 @@ baseline.
 
 | Workload shape (3-replica deployment) | num_matching | total | factor | Behavior |
 |---|---|---|---|---|
-| Chat-template framing — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
-| RAG corpus header — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
-| Custom shared system prompt — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `NO_HINT` |
+| Chat-template framing — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `StrategyNone` → `AFFINITY_HINT` (default-enabled affinity) or `NO_HINT` (disabled) |
+| RAG corpus header — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `StrategyNone` → `AFFINITY_HINT` or `NO_HINT` per the affinity toggle |
+| Custom shared system prompt — every replica holds it | 3 | 3 | 0 | Score=0 → caught by post-score floor → `StrategyNone` → `AFFINITY_HINT` or `NO_HINT` per the affinity toggle |
 | Specific RAG context — only 1 replica holds it | 1 | 3 | 0.67 | Strong score → `PREFIX_MATCH` |
 | Partial-diffusion overlap (2 of 3) | 2 | 3 | 0.33 | Weaker score, still `PREFIX_MATCH` if it clears the floor |
 | Uniquely-deep chain match (chain §2.5) | 1 at depth 4 | 3 | 0.67 at depth 4, 0 at depth 1 | Deep matcher dominates ranking |
-| Single-replica deployment | 1 | 1 | 1.0 (degraded) | Distinguishing-power factor preserved at baseline; the matched-tokens (§2.6) and routing-floor (§2.7) floors still run, so a single-replica match below `minimumMatchedTokens` (default 64) still downgrades to `NO_HINT`. Set both floors to their opt-outs to reproduce pre-floor every-match-surfaces behavior. |
+| Single-replica deployment | 1 | 1 | 1.0 (degraded) | Distinguishing-power factor preserved at baseline; the matched-tokens (§2.6) and routing-floor (§2.7) floors still run, so a single-replica match below `minimumMatchedTokens` (default 64) still downgrades off the `PREFIX_MATCH` path (to `AFFINITY_HINT` or `NO_HINT` per the affinity toggle). Set both floors to their opt-outs to reproduce pre-floor every-match-surfaces behavior. |
 
 ### The post-score floor — `CachePolicy.spec.routingFloorScore`
 
 The factor zeroes the score for trivial overlaps; the **routing floor
 score** decides how much "near-zero score" still counts as a useful
 routing hint. A `PREFIX_MATCH` whose top score falls below the
-per-namespace `routingFloorScore` is downgraded to `NO_HINT` so the
-gateway round-robins honestly. Applied in the service layer (after the
+per-namespace `routingFloorScore` is downgraded to `StrategyNone`,
+which surfaces as `AFFINITY_HINT` under default-enabled affinity (with
+a usable seed + serving replica) or as `NO_HINT` when disabled — so
+the gateway round-robins honestly under opt-out or pin-stable under
+the default. Applied in the service layer (after the
 index ranks), BEFORE the LFU `CreditHits` step, so a non-delivered hint
 never bumps an LFU counter.
 
@@ -463,11 +486,15 @@ deliberately, applied in order in the service handler:
    via `LookupResult.RetainReplicas` (LFU hits pruned in lockstep). A
    surviving long-prefix replica still ships; only sub-floor siblings
    are dropped. If no replica survives, the whole response downgrades
-   to `NO_HINT`.
+   to `StrategyNone`, which surfaces as `AFFINITY_HINT` under
+   default-enabled affinity with a usable seed + serving replica or as
+   `NO_HINT` under `affinityRouting: Disabled`.
 2. **§2.7 second — whole-response gate.** If at least one replica
    survived §2.6, the top score (post-distinguishing-power) is
    compared to `routingFloorScore`. Below the floor → downgrade the
-   whole response to `NO_HINT` and ship empty scores.
+   whole response to `StrategyNone` and ship empty scores; the
+   `StrategyNone` then surfaces as `AFFINITY_HINT` or `NO_HINT` per
+   the affinity toggle.
 
 Both downgrades run **before** `CreditHits`, so neither pathway bumps an
 LFU counter for an undelivered hint. The two floors are orthogonal: an
@@ -509,12 +536,15 @@ With default thresholds (`minimumMatchedTokens: 64`,
 
 If the operator raises `routingFloorScore: "200"`, `r0`'s 170.7 falls
 below; the top score doesn't clear, the response downgrades to
-`NO_HINT` with empty scores (whole-response gate, not per-replica
-filtering — even `r0`'s scored row is dropped).
+`StrategyNone` (whole-response gate, not per-replica filtering — even
+`r0`'s scored row is dropped) and surfaces as `AFFINITY_HINT` under
+default-enabled affinity with a usable seed + serving replica, or as
+`NO_HINT` under `affinityRouting: Disabled`.
 
 If `r0` had not held the deeper chain — i.e. all three replicas only
 matched `[b1]` — every score would collapse to 0 (all-three-at-depth-1
-→ factor 0) and the response downgrades to `NO_HINT` entirely.
+→ factor 0) and the response downgrades to `StrategyNone` entirely
+(same `AFFINITY_HINT` / `NO_HINT` split per the affinity toggle).
 
 ### Scope caveat — what this factor does NOT handle
 
@@ -760,16 +790,31 @@ LookupRoute(req):
    if hash_scheme is empty            → NO_HINT             (engine domain unknown — fail open)
    if there is an exact or chain match:
        drop replicas whose matched_tokens < §2.6 floor      (per-namespace minimumMatchedTokens; default 64)
-       if no replica survives          → NO_HINT             (trivial overlap only — gateway round-robins honestly)
-       else if top survivor's score < §2.7 floor → NO_HINT  (per-namespace routingFloorScore; default 0.1 — distinguishing-power = 0 catches every-replica-has-it overlaps regardless of token count)
+       if no replica survives          → StrategyNone        (downgrade — see fallback step below)
+       else if top survivor's score < §2.7 floor → StrategyNone  (per-namespace routingFloorScore; default 0.1)
        else                            → PREFIX_MATCH        (ranked by the full score over the survivors)
    else if any tenant-warm replicas   → TENANT_HOT          (ranked by the full score, soft hint)
    else (miss-classifier runs):
-       if index is globally empty     → NO_HINT             (cold start — no data to compare against)
-       if tenant_id not in index      → UNKNOWN_TENANT      (configuration drift)
-       if (tenant, model) not in index → UNKNOWN_MODEL       (configuration drift)
-       if scope not in index          → UNKNOWN_HASH_SCHEME (configuration drift)
-       else                            → NO_HINT             (genuine novel prefix — fail open)
+       if index is globally empty     → StrategyNone        (cold start — downgrade — see fallback step below)
+       if tenant_id not in index      → UNKNOWN_TENANT      (configuration drift; keeps precedence over AFFINITY_HINT)
+       if (tenant, model) not in index → UNKNOWN_MODEL       (configuration drift; keeps precedence over AFFINITY_HINT)
+       if scope not in index          → UNKNOWN_HASH_SCHEME (configuration drift; keeps precedence over AFFINITY_HINT)
+       else                            → StrategyNone        (genuine novel prefix — downgrade — see fallback step below)
+
+   # Result-side gates run in the handler (buildLookupResponse):
+   if request.effectivePrefixTokens < minimumPrefixTokens AND result ∈ {PREFIX_MATCH, TENANT_HOT}:
+       result ← StrategyNone                                 (operator intent: tiny prompts don't surface a positive hint;
+                                                              pre-lookup short-circuit only fires under affinityRouting: Disabled)
+
+   # Final affinity fallback for the StrategyNone branch:
+   if result == StrategyNone:
+       if affinityRouting: Enabled (kubebuilder default) AND request is structurally well-formed
+          (non-empty hash_scheme, chain arrays agree in length) AND request has a usable seed
+          (non-empty block_hashes OR non-empty prefix_hash) AND ≥1 replica in
+          servingByScope[(tenant, model, hash_scheme)]:
+              → AFFINITY_HINT  (single stable replica from SHA-256(seed) % len(sorted servingByScope))
+       else:
+              → NO_HINT        (fail open; gateway round-robins)
 ```
 
 See [`lookuproute-diagnostics.md`](./lookuproute-diagnostics.md) for the
@@ -801,9 +846,10 @@ set so that:
 
 | Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
 |---|---|---|
-| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64) AND the top surviving replica's score (after the §2.7 distinguishing-power factor multiplies in) clears the per-namespace `routingFloorScore` floor (default `"0.1"`). Sub-floor matched-tokens are filtered per-replica; sub-floor score downgrades the whole response. | Strongest hint — route to top-ranked    |
-| `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`                                                                                                                                                    | Softer hint — use or fall back          |
-| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), the top per-replica score falls below the per-namespace §2.7 `routingFloorScore` floor (default `"0.1"`) — the every-replica-has-it case that drives distinguishing_power to 0 — or any other unspecified outcome | Default routing; cache plane invisible  |
+| `PREFIX_MATCH`        | At least one replica holds the exact prefix — or the leading block-hash run (§2.5) — in the requested engine domain AND its `matched_tokens` clears the per-namespace `minimumMatchedTokens` floor (§2.6; default 64) AND the top surviving replica's score (after the §2.7 distinguishing-power factor multiplies in) clears the per-namespace `routingFloorScore` floor (default `"0.1"`). Sub-floor matched-tokens are filtered per-replica; sub-floor score downgrades the whole response to `StrategyNone` (which then surfaces as `AFFINITY_HINT` or `NO_HINT` per the affinity toggle — see below). | Strongest hint — route to top-ranked    |
+| `TENANT_HOT`          | Prefix miss, but the tenant has recently warm replicas serving this `hash_scheme`. NB: a tiny request below the per-namespace `minimumPrefixTokens` is also downgraded out of TENANT_HOT to `StrategyNone` (the same operator intent that downgrades sub-gate `PREFIX_MATCH`). | Softer hint — use or fall back          |
+| `AFFINITY_HINT`       | The prefix-match path would otherwise return `NO_HINT` (no match, OR matched-tokens / routing-floor downgrade, OR minimumPrefixTokens downgrade) AND `CachePolicy.spec.affinityRouting` is `Enabled` (the kubebuilder default) AND the request is structurally well-formed (non-empty `hash_scheme`, balanced chain arrays) AND the request has a usable seed AND `servingByScope[(tenant, model, hash_scheme)]` is non-empty. The server returns a single stable replica picked by `SHA-256(canonical_seed) % len(sorted servingByScope)`. Diagnostic codes (`UNKNOWN_*`) and `TIMEOUT` keep precedence over `AFFINITY_HINT`. | Stable-pin hint — route to the single returned replica; treat as PREFIX_MATCH for routing, distinct code for metrics |
+| `NO_HINT`             | Empty `hash_scheme`, malformed chain, no prefix match with no diagnosable contract-key mismatch (a genuine novel prefix or a cold-start window where the index holds no data yet), every replica's `matched_tokens` falls below the per-namespace §2.6 `minimumMatchedTokens` floor (default 64), the top per-replica score falls below the per-namespace §2.7 `routingFloorScore` floor (default `"0.1"`) — the every-replica-has-it case that drives distinguishing_power to 0 — or any other unspecified outcome. With `affinityRouting: Enabled` (the default) any downgrade case that has a usable seed + serving replica surfaces as `AFFINITY_HINT` instead; the `NO_HINT` cases below default-enabled affinity are the ones where no usable seed or no serving replica is available. | Default routing; cache plane invisible  |
 | `UNKNOWN_TENANT`      | Prefix miss + `TENANT_HOT` miss + the supplied `tenant_id` has zero prefix entries while some other tenant in the index does                                                                                                         | Likely SDK/producer mismatch — fail-open; surface as configuration error |
 | `UNKNOWN_MODEL`       | Prefix miss + `TENANT_HOT` miss + the tenant has entries but the requested `(tenant, model)` does not                                                                                                                                | Same — fail-open; configuration error   |
 | `UNKNOWN_HASH_SCHEME` | Prefix miss + `TENANT_HOT` miss + `(tenant, model)` has entries but the requested `hash_scheme` is absent for it                                                                                                                     | Same — fail-open; configuration error   |
@@ -956,8 +1002,16 @@ on the empty `hash_scheme` and the response is unconditionally
 `NO_HINT` with empty scores — fail open.
 
 This is also the response shape whenever the prefix-match path is empty
-AND no replica qualifies for `TENANT_HOT`. The gateway treats all three
-"no useful hint" outcomes identically: route per its default policy.
+AND no replica qualifies for `TENANT_HOT` AND no usable affinity
+fallback fires (`affinityRouting: Disabled` on the per-namespace
+policy, OR no replica known to serve the `(tenant, model, hash_scheme)`
+engine domain, OR no usable seed). When affinity IS Enabled (the
+kubebuilder default) and the request has a usable seed plus at least
+one serving replica, the response surfaces as `AFFINITY_HINT` instead
+— with a single stable replica pick — and the gateway routes to it.
+The gateway treats `NO_HINT` and the diagnostic codes identically
+(route per its default policy), while `AFFINITY_HINT` is treated as a
+positive routing assertion.
 
 ## 9. Where the code lives
 

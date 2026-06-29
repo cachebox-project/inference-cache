@@ -978,31 +978,39 @@ fi
 
 # --- CachePolicy PUSH adoption assertion -----------------------------------
 # No read-back endpoint exists for /policy, by design. Prove the server adopted
-# the controller-pushed CachePolicy via existing gRPC side effects on three
-# orthogonal axes:
-#   1. minimumPrefixTokens (request-side gate, applied BEFORE the index lookup).
-#      Seed one prefix; the request below the policy threshold short-circuits
-#      to NO_HINT without touching the index; the request above hits.
+# the controller-pushed CachePolicy via existing gRPC side effects on two
+# orthogonal axes (routingFloorScore is probed separately by the patch-and-
+# wait block further below):
+#   1. minimumPrefixTokens (request-side gate; applied BEFORE the index
+#      lookup under affinityRouting=Disabled or as a post-lookup
+#      result-side downgrade under affinityRouting=Enabled — the default).
+#      Seed one prefix; the request below the policy threshold no longer
+#      reaches the prefix-match path. With affinityRouting=Enabled (the
+#      kubebuilder default carried by the sample CR) the fallback fires and
+#      the response is AFFINITY_HINT — *not* PREFIX_MATCH, which is what
+#      proves the gate adopted. With affinityRouting=Disabled this same path
+#      would return NO_HINT; either non-PREFIX_MATCH outcome proves the gate.
 #   2. minimumMatchedTokens (result-side floor, applied AFTER the lookup, against
 #      the realized matched-token overlap). Seed a SECOND prefix whose stored
 #      tokenCount is above minimumPrefixTokens (so it clears the request-side
 #      gate) but BELOW minimumMatchedTokens (so the realized match downgrades
-#      to NO_HINT). Without this assertion the floor could be silently dropped
-#      and the smoke would still pass on the request-side gate alone. The
-#      sample carries minimumMatchedTokens explicitly (config/samples/
-#      cache_v1alpha1_cachepolicy.yaml).
+#      away from PREFIX_MATCH). Without this assertion the floor could be
+#      silently dropped and the smoke would still pass on the request-side
+#      gate alone. The sample carries minimumMatchedTokens explicitly
+#      (config/samples/cache_v1alpha1_cachepolicy.yaml). The downgrade
+#      again surfaces as AFFINITY_HINT (or NO_HINT under affinity Disabled).
 #
 # Note: with no CachePolicy at all the server-wide DefaultMinimumMatchedTokens
-# (= 64) ALSO downgrades the trivial 32-token match to NO_HINT — the no-policy
-# fallback fires the same floor as the sample CR sets. The point of the
-# trivial-match assertion is therefore "the pushed CR did not silently drop the
-# result-side floor" rather than "without the CR this would have been
-# PREFIX_MATCH". The low-prefix lookup is the standalone proof that policy
-# adoption happened (its NO_HINT outcome IS owned by the pushed
-# minimumPrefixTokens: 32 — no-policy would have ungated the request and
-# returned PREFIX_MATCH on the 64-token stored prefix). Together they cover
-# both policy enforcement axes end-to-end. Avoids engine pods/images, model
-# traffic, and any new transport.
+# (= 64) ALSO downgrades the trivial 32-token match away from PREFIX_MATCH —
+# the no-policy fallback fires the same floor as the sample CR sets. The
+# point of the trivial-match assertion is therefore "the pushed CR did not
+# silently drop the result-side floor" rather than "without the CR this would
+# have been PREFIX_MATCH". The low-prefix lookup is the standalone proof
+# that policy adoption happened (its non-PREFIX_MATCH outcome IS owned by
+# the pushed minimumPrefixTokens: 32 — no-policy would have ungated the
+# request and returned PREFIX_MATCH on the 64-token stored prefix). Together
+# they cover both policy enforcement axes end-to-end. Avoids engine
+# pods/images, model traffic, and any new transport.
 log "seeding two prefixes and asserting CachePolicy minimumPrefixTokens (request-side gate) AND minimumMatchedTokens (result-side floor) are both enforced by LookupRoute"
 policy_model="install-smoke-policy"
 policy_replica="policy-smoke-replica"
@@ -1024,11 +1032,14 @@ policy_report_resp="$(grpcurl_report_cache_state "$policy_report_payload" "$LOG_
 log "ReportCacheState response: $policy_report_resp"
 
 # Three lookups exercise the three orthogonal policy-enforcement paths:
-#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path works).
-#   - policy_low: below the request-side gate → NO_HINT (request-side gate fires).
-#   - policy_trivial: above the request-side gate but matched_tokens=32 < floor 64
-#     → NO_HINT (result-side floor fires — the assertion the request-side gate
-#     alone cannot make).
+#   - policy_high: above both gates → PREFIX_MATCH (control: ingest path
+#     works; affinity does NOT preempt a real match).
+#   - policy_low: below the request-side gate → AFFINITY_HINT (request-side
+#     gate fires; the affinity fallback then picks the only known replica).
+#   - policy_trivial: above the request-side gate but matched_tokens=32 <
+#     floor 64 → AFFINITY_HINT (result-side floor fires — the assertion the
+#     request-side gate alone cannot make — and again the affinity fallback
+#     surfaces the single known replica).
 policy_high_payload="$(cat <<EOF
 {"modelId":"$policy_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$policy_hash_b64","prefixTokenCount":64}
 EOF
@@ -1047,24 +1058,24 @@ policy_high_resp=""
 policy_low_resp=""
 policy_trivial_resp=""
 until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
-  && has_reason_code "$policy_low_resp" "NO_HINT" \
-  && has_reason_code "$policy_trivial_resp" "NO_HINT"; do
+  && has_reason_code "$policy_low_resp" "AFFINITY_HINT" \
+  && has_reason_code "$policy_trivial_resp" "AFFINITY_HINT"; do
   policy_high_resp="$(grpcurl_lookup_route "$policy_high_payload" "$LOG_DIR/grpcurl-policy-high.err")" || true
   policy_low_resp="$(grpcurl_lookup_route "$policy_low_payload" "$LOG_DIR/grpcurl-policy-low.err")" || true
   policy_trivial_resp="$(grpcurl_lookup_route "$policy_trivial_payload" "$LOG_DIR/grpcurl-policy-trivial.err")" || true
 
   if has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
-    && has_reason_code "$policy_low_resp" "NO_HINT" \
-    && has_reason_code "$policy_trivial_resp" "NO_HINT"; then
+    && has_reason_code "$policy_low_resp" "AFFINITY_HINT" \
+    && has_reason_code "$policy_trivial_resp" "AFFINITY_HINT"; then
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl -n "$POLICY_SMOKE_NS" get cachepolicy cachepolicy-sample -o yaml || true
     echo "above-threshold LookupRoute response (want PREFIX_MATCH):" >&2
     echo "$policy_high_resp" >&2
-    echo "below-request-gate LookupRoute response (want NO_HINT):" >&2
+    echo "below-request-gate LookupRoute response (want AFFINITY_HINT — request gate fires; affinity fallback picks the known replica):" >&2
     echo "$policy_low_resp" >&2
-    echo "trivial-match (below result floor) LookupRoute response (want NO_HINT):" >&2
+    echo "trivial-match (below result floor) LookupRoute response (want AFFINITY_HINT — matched-tokens floor fires; affinity fallback picks the known replica):" >&2
     echo "$policy_trivial_resp" >&2
     for err_file in "$LOG_DIR/grpcurl-policy-high.err" "$LOG_DIR/grpcurl-policy-low.err" "$LOG_DIR/grpcurl-policy-trivial.err"; do
       if [ -s "$err_file" ]; then
@@ -1072,22 +1083,25 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
         cat "$err_file" >&2
       fi
     done
-    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request NO_HINT, trivial-match NO_HINT)"
+    fail "server did not adopt the pushed CachePolicy within ${POLICY_PUSH_TIMEOUT}s (want above PREFIX_MATCH, below-request AFFINITY_HINT, trivial-match AFFINITY_HINT — the non-PREFIX_MATCH outcomes prove both gates fired with affinityRouting=Enabled)"
   fi
   sleep 2
 done
-log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned NO_HINT; trivial-match (matched_tokens<floor) lookup returned NO_HINT — both minimum-token policy knobs enforced end-to-end"
+log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned AFFINITY_HINT; trivial-match (matched_tokens<floor) lookup returned AFFINITY_HINT — both minimum-token policy knobs enforced end-to-end (the non-PREFIX_MATCH outcomes prove the gates fired; the affinity fallback then surfaces the single known replica)"
 
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server
 # resolver → buildLookupResponse downgrade. The same 64-token prefix that
-# returned PREFIX_MATCH above goes to NO_HINT after we patch the live
-# CachePolicy to routingFloorScore="1000" (well above any plausible score:
-# matched_tokens (64) × freshness (~1) × distinguishing_power (1.0 — only
-# one replica was seeded, so the factor degenerates) = ~64, which is below
-# the strict 1000 floor). Restoring "0.1" must flip the response back to
-# PREFIX_MATCH — proving replace-on-write semantics carry the new field too.
-# Without engine pods or model traffic, this is the minimum end-to-end
+# returned PREFIX_MATCH above is forced off the prefix-match path after we
+# patch the live CachePolicy to routingFloorScore="1000" (well above any
+# plausible score: matched_tokens (64) × freshness (~1) ×
+# distinguishing_power (1.0 — only one replica was seeded, so the factor
+# degenerates) = ~64, which is below the strict 1000 floor). With the
+# kubebuilder-default affinityRouting=Enabled the response settles at
+# AFFINITY_HINT (the floor fired and the affinity fallback picked the
+# single known replica). Restoring "0.1" must flip the response back to
+# PREFIX_MATCH — proving replace-on-write semantics carry the new field
+# too. Without engine pods or model traffic, this is the minimum end-to-end
 # exercise of the new operator-facing knob.
 log "asserting CachePolicy.spec.routingFloorScore is propagated and gates LookupRoute"
 
@@ -1122,8 +1136,8 @@ wait_floor_reason() {
 }
 
 apply_floor "1000"
-wait_floor_reason "$policy_high_payload" "NO_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
-log "routingFloorScore=1000 enforced: same 64-token match now NO_HINT (score below floor)"
+wait_floor_reason "$policy_high_payload" "AFFINITY_HINT" "$LOG_DIR/grpcurl-policy-floor-strict.err" "routingFloorScore=1000 high-token lookup"
+log "routingFloorScore=1000 enforced: same 64-token match now AFFINITY_HINT (score below floor; affinity fallback picks the known replica)"
 
 apply_floor "0.1"
 wait_floor_reason "$policy_high_payload" "PREFIX_MATCH" "$LOG_DIR/grpcurl-policy-floor-restored.err" "routingFloorScore=0.1 high-token lookup"
