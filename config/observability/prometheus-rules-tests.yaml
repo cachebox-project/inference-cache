@@ -1,8 +1,9 @@
-# Unit tests for the alerting rules in alerting-rules.yaml. Each Stage 1
-# alert has both a "should fire" and a "should not fire" case; together they
-# pin the threshold and confirm the alert is not spuriously firing on healthy
-# baselines. Run with `promtool test rules prometheus-rules-tests.yaml` (or
-# via `make verify-prometheus`).
+# Unit tests for the alerting rules in alerting-rules.yaml. Each active alert
+# — the server-side Stage 1 alerts plus the controller-side ServerProbeFail and
+# BackendT2Degraded — has "should fire" and "should not fire" cases; together
+# they pin the threshold and confirm the alert is not spuriously firing on
+# healthy baselines. Run with `promtool test rules prometheus-rules-tests.yaml`
+# (or via `make verify-prometheus`).
 #
 # Synthetic time-series notation: `N+Mx20` is "start at N, add M every step,
 # produce 21 samples total". The default step is `interval:` (30s here). For
@@ -479,3 +480,116 @@ tests:
       - eval_time: 15m
         alertname: ServerProbeFail
         exp_alerts: []
+
+  # --------------------------------------------------------------------------
+  # BackendT2Degraded (for: 5m, warning)
+  #
+  # Per-CacheBackend tier-2 health from two controller series:
+  #   inferencecache_backend_t2_query_tokens_total (cumulative; the ACTIVITY GATE via
+  #     rate(); backend=<namespace>/<name>) and
+  #   inferencecache_backend_t2_hit_rate (the ratio; == 0 means zero reloads).
+  # `namespace` is the install scope Prometheus injects from the controller
+  # scrape. Fires only on rate(query_tokens) > 1000 tokens/sec AND hit_rate == 0.
+  # query_tokens 0+60000x40 = 2000 tokens/sec (above the floor); 40 samples at
+  # 30s = 20m, past the [10m] rate window plus the 5m `for:` dwell.
+  # --------------------------------------------------------------------------
+  - interval: 30s
+    name: BackendT2Degraded fires when a queried backend serves zero reloads
+    input_series:
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+60000x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+0x40'
+    alert_rule_test:
+      # Before the 5m `for:` dwell elapses the alert is only pending, not firing,
+      # even though the rate gate is already satisfied — this pins the dwell.
+      - eval_time: 3m
+        alertname: BackendT2Degraded
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: BackendT2Degraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              namespace: inference-cache-system
+              backend: team-a/sample
+            exp_annotations:
+              summary: "Tier-2 (external offload) on CacheBackend team-a/sample is serving queries but zero reloads — silently degraded (store/connection failure, under-sized offload server, or scheduler/worker hash mismatch)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#backendt2degraded"
+
+  - interval: 30s
+    name: BackendT2Degraded does not fire when the backend is serving reloads (hit-rate > 0)
+    input_series:
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+60000x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0.75+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackendT2Degraded
+        exp_alerts: []
+
+  - interval: 30s
+    # THE activity gate: a backend that took a few cold misses (hit-rate 0) and
+    # then went idle (query gauge flat -> rate 0, below the 1000/sec floor) must
+    # NOT page. This is the false positive a cumulative-only `== 0` form would hit.
+    name: BackendT2Degraded does not fire on an idle backend even with hit-rate zero
+    input_series:
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '500+0x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackendT2Degraded
+        exp_alerts: []
+
+  - interval: 30s
+    # Coverage for the 1000 tokens/sec floor: a low-traffic backend (500/sec,
+    # below the floor) with zero reloads must NOT page.
+    name: BackendT2Degraded does not fire below the query-rate floor
+    input_series:
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+15000x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="inference-cache-system",backend="team-a/sample"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackendT2Degraded
+        exp_alerts: []
+
+  - interval: 30s
+    # Two installs sharing one Prometheus, each with an actively-queried zero-hit
+    # backend of the same name in a different install namespace. Both alert
+    # independently -- `max by (namespace, backend)` preserves the install scope.
+    name: BackendT2Degraded keeps installs separate when backend names collide
+    input_series:
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="install-a",backend="team-a/cache"}'
+        values: '0+60000x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="install-a",backend="team-a/cache"}'
+        values: '0+0x40'
+      - series: 'inferencecache_backend_t2_query_tokens_total{namespace="install-b",backend="team-a/cache"}'
+        values: '0+60000x40'
+      - series: 'inferencecache_backend_t2_hit_rate{namespace="install-b",backend="team-a/cache"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackendT2Degraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              namespace: install-a
+              backend: team-a/cache
+            exp_annotations:
+              summary: "Tier-2 (external offload) on CacheBackend team-a/cache is serving queries but zero reloads — silently degraded (store/connection failure, under-sized offload server, or scheduler/worker hash mismatch)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#backendt2degraded"
+          - exp_labels:
+              severity: warning
+              component: inference-cache
+              namespace: install-b
+              backend: team-a/cache
+            exp_annotations:
+              summary: "Tier-2 (external offload) on CacheBackend team-a/cache is serving queries but zero reloads — silently degraded (store/connection failure, under-sized offload server, or scheduler/worker hash mismatch)."
+              runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#backendt2degraded"
