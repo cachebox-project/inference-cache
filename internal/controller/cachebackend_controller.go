@@ -374,14 +374,36 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
+	registry := r.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := adapterruntime.ResolveRuntimeID(backend)
+
 	// Events-only (tier-1 routing) provisions no backend server: the engine is
 	// wired for cache-aware routing via the kvevent-subscriber alone, with no KV
 	// connector and nothing to deploy. Shed any workload a prior Offload
 	// generation owned, then run the server-less status path (the KV-event
 	// readiness gate, no Service/endpoint/cascade). Checked before the
-	// StatefulSet / adapter routing because the mode decides provisioning
-	// regardless of deploymentKind, and the controller needs no adapter here.
+	// StatefulSet routing because the mode decides provisioning regardless of
+	// deploymentKind (a server-less backend ignores deploymentKind).
+	//
+	// First confirm an adapter is selectable for this (runtime, backend) pair.
+	// Admission rejects an unsupported pair at write time, but a stored /
+	// admission-bypassed EventsOnly CR with an unsupported (engine, type) pair
+	// would otherwise be reconciled as ACTIVE events-only even though the pod
+	// webhook can't select an adapter for it (so it can never inject the
+	// subscriber → no events ever flow). Treat the no-adapter case the same as
+	// the Offload no-adapter path below: shed any workload and reconcile as
+	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
+	// a working routing tier the substrate can never feed.
 	if backend.Spec.IsEventsOnly() {
+		if _, err := registry.Select(runtimeID, backend); err != nil {
+			logger.V(1).Info("no runtime adapter for events-only backend; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.Type,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -396,11 +418,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	registry := r.Registry
-	if registry == nil {
-		registry = adapterruntime.DefaultRegistry()
-	}
-	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	adapter, err := registry.Select(runtimeID, backend)
 	if err != nil {
 		// No adapter knows how to wire this (runtime, backend) pair. The

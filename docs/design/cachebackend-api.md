@@ -180,9 +180,15 @@ Because of this:
 
 ### Conditions
 
-Up to five condition types are published on managed backends (`Ready`, `Degraded`, `Progressing`, `FunctionalProbeOK`, and — once a tier-2/LMCache backend has been exercised — `T2Degraded`); External backends publish `Ready` + `Progressing` only (there is no rollout to degrade and no probe to drive). The semantics differ for managed backends (where the controller renders a Deployment + Service) and for External (where the operator manages the cache out-of-band and the controller only mirrors the endpoint).
+The set of published condition types depends on the backend's integration mode and type:
 
-**Managed backends**:
+- **Offload-managed backends** (`spec.integration.mode=Offload` on a managed type, where the controller renders a Deployment + Service) publish up to five: `Ready`, `Degraded`, `Progressing`, `FunctionalProbeOK`, and — once a tier-2/LMCache backend has been exercised — `T2Degraded`.
+- **Events-only backends** (`spec.integration.mode=EventsOnly`) publish exactly three: `Ready`, `Degraded`, `Progressing`. `FunctionalProbeOK` and `T2Degraded` are **Offload-managed-only** and are **never** published on an events-only backend — there is no provisioned server to functionally probe and no tier-2 offload to mark degraded (see [Events-only mode](#events-only-mode-specintegrationmode--eventsonly)).
+- **External backends** publish `Ready` + `Progressing` only (there is no rollout to degrade and no probe to drive; the operator manages the cache out-of-band and the controller only mirrors the endpoint).
+
+The `Ready` / `Degraded` / `Progressing` semantics below apply to both Offload-managed and events-only backends (an events-only backend has no workload to roll out, so it is "up" the moment it exists and the KV-event gate starts immediately — see [Events-only mode](#events-only-mode-specintegrationmode--eventsonly)); the `FunctionalProbeOK` and `T2Degraded` rows are Offload-managed-only.
+
+**Managed backends** (Offload-managed; the `FunctionalProbeOK` / `T2Degraded` rows do not apply to events-only):
 
 | Type | Meaning |
 |---|---|

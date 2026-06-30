@@ -263,7 +263,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// adapter) return EngineContainerName() == "" and overrideIdx stays
 	// -1, so the merge is skipped — the override surface is for production
 	// adapters that target a specific engine container.
-	if overrides != nil && overrideIdx >= 0 {
+	//
+	// Skip the merge entirely for events-only: InjectEngineConfig injected
+	// nothing in this mode (it is a no-op), so the engine container is left
+	// untouched by contract. Running the override merge here would let the
+	// override surface append non-adapter-owned args/env to the engine
+	// container even though the canonical injection contributed none —
+	// contradicting "the engine container is left otherwise untouched".
+	if overrides != nil && overrideIdx >= 0 && !cache.Spec.IsEventsOnly() {
 		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
 			preArgs, mutated.Spec.Containers[overrideIdx].Args,
 			preEnv, mutated.Spec.Containers[overrideIdx].Env,
@@ -279,13 +286,43 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// optimisation, and the next admission will retry. Idempotent: skip
 	// the append if a container by the same name is already on the pod
 	// (re-admission, manual sidecar in the pod template, etc.).
+	// sidecarPresent reports whether the observation sidecar is on the pod
+	// after this admission — either appended just now, or already present from
+	// a prior admission / a pod template that pre-baked it. Events-only wiring
+	// hinges on it (see the `wired` gate below).
+	sidecarPresent := false
 	if sidecar, sErr := adapter.ObservationSidecar(cache, mutated); sErr != nil {
 		log.V(1).Info("fail-open: adapter rejected observation sidecar",
 			"runtime", string(runtimeID), "error", sErr.Error())
-	} else if sidecar != nil && !hasContainer(mutated.Spec.Containers, sidecar.Name) {
-		mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
-		log.V(1).Info("observation sidecar appended",
-			"runtime", string(runtimeID), "container", sidecar.Name)
+	} else if sidecar != nil {
+		if hasContainer(mutated.Spec.Containers, sidecar.Name) {
+			// Already attached (re-admission or hand-baked sidecar) — the
+			// pod is wired even though this pass appends nothing.
+			sidecarPresent = true
+		} else {
+			mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
+			sidecarPresent = true
+			log.V(1).Info("observation sidecar appended",
+				"runtime", string(runtimeID), "container", sidecar.Name)
+		}
+	}
+
+	// Only stamp the injection annotations when something was actually wired.
+	// For Offload the connector is always injected by InjectEngineConfig, so
+	// the pod is always wired. For events-only InjectEngineConfig is a no-op,
+	// so the ONLY wiring is the observation sidecar — and it is skipped when
+	// the subscriber image is unconfigured (or backendConfig.model is unset),
+	// in which case nothing was injected at all. Stamping
+	// injected-by/injected-by-uid on a pod the webhook didn't touch would trip
+	// the downstream InjectedByCacheBackend event controller on a non-existent
+	// injection, so route the no-wiring case through the fail-open no-injection
+	// path (which strips any forged injection annotations the inbound pod
+	// carried, matching the fail-open contract).
+	wired := !cache.Spec.IsEventsOnly() || sidecarPresent
+	if !wired {
+		log.V(1).Info("events-only: no subscriber configured; admitting with no wiring",
+			"runtime", string(runtimeID))
+		return failOpen(req, &pod, "events-only: no subscriber configured (fail-open, no wiring)")
 	}
 
 	if mutated.Annotations == nil {

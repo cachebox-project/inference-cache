@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -396,6 +397,143 @@ func TestHandle_OffloadManagedBackend_EmptyEndpoint_FailsOpen(t *testing.T) {
 	// but assert the annotation absence explicitly for clarity).
 	if pod.Annotations[AnnotationInjectedBy] != "" {
 		t.Fatalf("fail-open path must not stamp %s", AnnotationInjectedBy)
+	}
+}
+
+func TestHandle_EventsOnly_NoSubscriberImage_InjectsNothingNoStamp(t *testing.T) {
+	// An events-only backend whose subscriber image is unconfigured (the
+	// default-install posture: --kvevent-subscriber-image is empty, so the
+	// adapter's ObservationSidecar returns nil) has NOTHING to wire — the
+	// connector injection is a no-op for events-only, and no sidecar is
+	// appended. The webhook must therefore inject nothing AND stamp no
+	// injected-by/injected-by-uid annotation: a stamp on an untouched pod
+	// would trip the downstream InjectedByCacheBackend event controller on a
+	// non-existent injection. Contrast with
+	// TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector,
+	// where the subscriber image IS configured → subscriber appended +
+	// injected-by stamped.
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	// newHandler uses the nil-Registry fallback (DefaultRegistry + External)
+	// with NO subscriber image configured — so ObservationSidecar returns nil.
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed (fail-open, no wiring), got: %+v", resp.Result)
+	}
+	// Nothing was wired: no connector (events-only no-op), no sidecar (no
+	// image) → the inbound pod (which carries no injection annotations) is
+	// byte-identical, so zero patches.
+	if len(resp.Patches) != 0 {
+		t.Fatalf("events-only with no subscriber image must inject nothing, got %d patches: %+v",
+			len(resp.Patches), resp.Patches)
+	}
+
+	// No subscriber container appended.
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+		t.Fatalf("no subscriber image configured — must NOT append a sidecar; found %+v", c)
+	}
+	// No injected-by / injected-by-uid stamped — nothing was wired.
+	if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
+		t.Fatalf("no-wiring events-only must NOT stamp %s; got %q", AnnotationInjectedBy, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
+		t.Fatalf("no-wiring events-only must NOT stamp %s; got %q", AnnotationInjectedByUID, got)
+	}
+}
+
+func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
+	// Defence-in-depth on the no-wiring events-only path: an inbound pod that
+	// forged injected-by/injected-by-uid (copy/pasted from a real injection,
+	// or set by an attacker with pod-create RBAC) must come out of admission
+	// with those annotations STRIPPED when the webhook wired nothing —
+	// otherwise the downstream InjectedByCacheBackend event controller would
+	// fire on a pod the webhook never touched. This is the fail-open
+	// no-injection contract that finding-1's routing through failOpen restores.
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	h := newHandler(t, cb) // no subscriber image → nothing to wire
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Annotations = map[string]string{
+		AnnotationInjectedBy:    ns + "/routing-only",
+		AnnotationInjectedByUID: string(cb.UID),
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed (fail-open), got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
+		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedBy, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
+		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedByUID, got)
+	}
+}
+
+func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.T) {
+	// In events-only mode InjectEngineConfig is a no-op, so the engine
+	// container is left otherwise untouched. spec.integration.engineOverrides
+	// must NOT be applied: the override merge is scoped to adapter-owned
+	// args/env, and since the adapter contributed none here, running it would
+	// append non-adapter-owned args/env to the engine container, contradicting
+	// the "engine container is left untouched" contract. The subscriber sidecar
+	// still attaches (subscriber image configured), so the pod is wired and
+	// injected-by IS stamped — but the engine container's args/env are
+	// byte-identical to the inbound pod template.
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		Args: []string{"--max-model-len", "8192"},
+		Env:  []corev1.EnvVar{{Name: "OVERRIDE_FLAG", Value: "should-not-apply"}},
+	}
+	h := newHandlerWithSubscriber(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	// Snapshot the engine container's pre-admission args/env to compare after.
+	wantArgs := append([]string(nil), pod.Spec.Containers[0].Args...)
+	wantEnv := append([]corev1.EnvVar(nil), pod.Spec.Containers[0].Env...)
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	if engine == nil {
+		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
+	}
+	// The override args/env must NOT have been applied.
+	if argPresent(engine.Args, "--max-model-len") {
+		t.Fatalf("events-only must NOT apply engineOverrides args to the engine container; args = %v", engine.Args)
+	}
+	for _, e := range engine.Env {
+		if e.Name == "OVERRIDE_FLAG" {
+			t.Fatalf("events-only must NOT apply engineOverrides env to the engine container; found %s=%q", e.Name, e.Value)
+		}
+	}
+	// The engine container's args/env are unchanged from the inbound template.
+	if !reflect.DeepEqual(engine.Args, wantArgs) {
+		t.Fatalf("events-only engine args mutated: got %v, want %v (unchanged)", engine.Args, wantArgs)
+	}
+	if !reflect.DeepEqual(engine.Env, wantEnv) {
+		t.Fatalf("events-only engine env mutated: got %v, want %v (unchanged)", engine.Env, wantEnv)
+	}
+	// The subscriber IS still injected (image configured) and the pod is wired,
+	// so injected-by is stamped — confirms the engine-untouched guarantee is
+	// independent of the sidecar-append path.
+	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil {
+		t.Fatalf("subscriber sidecar must still attach for a configured events-only backend; containers = %v", containerNames(mutated))
+	}
+	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
+		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
 	}
 }
 

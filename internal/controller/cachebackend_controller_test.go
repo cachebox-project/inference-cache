@@ -715,6 +715,54 @@ func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 	}
 }
 
+func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
+	// An EventsOnly backend whose (engine, type) pair has no registered
+	// adapter must reconcile as UNMANAGED, NOT as active events-only.
+	// Admission rejects an unsupported pair at write time, but a
+	// stored/admission-bypassed CR reaching the controller must not be
+	// advertised as a working routing tier: the pod webhook can't select an
+	// adapter for an unsupported pair, so it could never inject the
+	// kvevent-subscriber and no KV event would ever flow. dispatch confirms an
+	// adapter is selectable before routing to reconcileEventsOnly; on failure it
+	// falls to reconcileUnmanaged. Mooncake has no shipping adapter (the default
+	// registry only supports (vllm, LMCache) + External), so it is the
+	// unsupported-type fixture here.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	// reconcileUnmanaged removes the Ready / Progressing conditions; the
+	// events-only path (reconcileEventsOnly) would have PUBLISHED them. Their
+	// absence is the discriminator between "reconciled as unmanaged" and
+	// "reconciled as active events-only".
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Ready (unmanaged path); got %+v", ready)
+	}
+	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Progressing (unmanaged path); got %+v", prog)
+	}
+	// And no workload is provisioned (unmanaged sheds everything).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for unmanaged events-only", len(deps.Items))
+	}
+}
+
 func TestReconcileExternalMirrorsEndpointToStatus(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{

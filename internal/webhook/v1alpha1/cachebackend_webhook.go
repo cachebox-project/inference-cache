@@ -29,11 +29,12 @@ import (
 // tests pin the same constants the handler uses.
 //
 // Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
-// spec.replicas=1, spec.integration.engine=vllm, spec.integration.role=
-// ReadWrite, spec.integration.failOpen=true, spec.resources={requests:
-// {memory:4Gi}, limits:{memory:8Gi}}) are expressed via `+kubebuilder:default=`
-// markers on the API types and stamped by the apiserver before this webhook
-// runs. The webhook only handles defaults the schema cannot express:
+// spec.replicas=1, spec.integration.engine=vllm, spec.integration.mode=Offload,
+// spec.integration.role=ReadWrite, spec.integration.failOpen=true,
+// spec.resources={requests:{memory:4Gi}, limits:{memory:8Gi}}) are expressed
+// via `+kubebuilder:default=` markers on the API types and stamped by the
+// apiserver before this webhook runs. The webhook only handles defaults the
+// schema cannot express:
 //
 //   - spec.integration.firstEventTimeout: the CRD-schema default only fires
 //     when spec.integration is present in the submitted object; when the
@@ -59,8 +60,8 @@ const (
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
 // defaults (spec.type, deploymentKind, replicas, integration.engine,
-// integration.role, integration.failOpen, resources) ride on schema
-// markers and are stamped by the apiserver before this handler runs;
+// integration.mode, integration.role, integration.failOpen, resources) ride on
+// schema markers and are stamped by the apiserver before this handler runs;
 // the webhook only handles the schema-inexpressible ones:
 //
 //   - Materialises spec.integration solely to persist
