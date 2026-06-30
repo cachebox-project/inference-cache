@@ -544,6 +544,10 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// External-mode CR doesn't surface a stale condition that no
 		// reconcile path will ever update.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// Same for EngineKernelsHealthy — it is published only from the managed
+		// path, so clear any left over from a prior managed state (the docs
+		// state External backends publish only Ready + Progressing).
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		// T2Degraded is a managed-only advisory; an External backend's
 		// tier-2 (if any) is operator-managed and not evaluated here --
 		// clear any left over from a prior managed state.
@@ -588,6 +592,9 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// EngineKernelsHealthy is a managed-path-only condition; clear any left
+		// over so an unmanaged CR doesn't carry a stale kernel verdict.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 		// EngineCompatibility is a managed-only advisory; an Unmanaged backend
 		// is no longer evaluated for injected engine-pod crash-loops, so clear
@@ -1144,6 +1151,17 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// below so it lands atomically alongside Ready/Progressing/Degraded.
 	probeVerdict := evaluateFunctionalProbe(ctx, backend, gate, r.ProbeClient, &r.probeLimiter, r.probeRateLimit(), now)
 	gate = downgradeReadyVerdict(gate, probeVerdict)
+	// Engine-kernel health gate (lmcache c_ops load). Reads the kernel-check
+	// init-container status off matched engine pods; surfaces
+	// EngineKernelsHealthy and, in strict mode, downgrades Ready. Uses the
+	// uncached APIReader (no Pod informer), fail-soft on list errors.
+	kernelReader := client.Reader(r.APIReader)
+	if kernelReader == nil {
+		kernelReader = r.Client
+	}
+	kernelPods, kernelListedOK := listMatchedEnginePods(ctx, kernelReader, backend)
+	kernelVerdict := evaluateEngineKernelHealth(backend, gate, kernelPods, kernelListedOK)
+	gate = downgradeKernelReadyVerdict(gate, kernelVerdict)
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 	publishedGen := backend.Status.ObservedGeneration
 	if applyOK {
@@ -1204,6 +1222,16 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 			meta.SetStatusCondition(&backend.Status.Conditions, cond)
 		case probeVerdict.removeCondition:
 			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		}
+		// Engine-kernel-health condition (lmcache c_ops load). Same
+		// write/remove/leave-alone contract as the functional-probe condition.
+		switch {
+		case kernelVerdict.shouldWriteCondition:
+			kc := kernelVerdict.condition
+			kc.ObservedGeneration = publishedGen
+			meta.SetStatusCondition(&backend.Status.Conditions, kc)
+		case kernelVerdict.removeCondition:
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		}
 		// T2Degraded (advisory) — derived from the poller-written
 		// status.indexParticipation.t2HitRate. Present only once tier-2 is

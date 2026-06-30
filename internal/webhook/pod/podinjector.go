@@ -265,6 +265,44 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		)
 	}
 
+	// Inject the kernel-check init container (adapters that opt in via the
+	// optional InitContainerProvider interface — vLLM/LMCache today). Resolve
+	// it BEFORE the observation-sidecar append below, while Spec.Containers
+	// still holds only the engine container(s): the renderer reuses the engine
+	// container's image, and a single-container fallback would break once the
+	// sidecar is appended. A failure here MUST NOT block admission (the cache
+	// is an optimisation). The webhook is AUTHORITATIVE for this container:
+	// REPLACE any existing one of the same name in place rather than skipping —
+	// otherwise a pre-planted / hand-authored same-name init container could
+	// suppress the real check and bypass strict enforcement (the controller
+	// trusts the container by name + termination message). On a normal
+	// re-admission the rendered spec is identical, so the replace is a no-op.
+	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
+		if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
+			log.V(1).Info("fail-open: kernel-check init container rejected",
+				"runtime", string(runtimeID), "error", iErr.Error())
+		} else if initC != nil {
+			if idx := containerIndexByName(mutated.Spec.InitContainers, initC.Name); idx >= 0 {
+				mutated.Spec.InitContainers[idx] = *initC
+			} else {
+				mutated.Spec.InitContainers = append(mutated.Spec.InitContainers, *initC)
+			}
+			log.V(1).Info("kernel-check init container injected",
+				"runtime", string(runtimeID), "container", initC.Name)
+		} else if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+			// The adapter DECLINED to inject (mode=off, or auto on a non-GPU /
+			// unresolvable pod). The webhook is authoritative for this
+			// container, so strip any pre-existing same-name init container: a
+			// hand-authored one would otherwise masquerade as a real check and
+			// the controller (which trusts the container by name) could publish
+			// or even strict-downgrade from it — violating `off` = absent. Only
+			// the explicit decline strips; a transient adapter error above is
+			// fail-open and leaves the pod untouched.
+			log.V(1).Info("kernel-check init container removed (adapter declined to inject)",
+				"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
+		}
+	}
+
 	// Auto-attach the observation sidecar. The adapter owns the
 	// shape decision: vLLM/LMCache returns a kvevent-subscriber container,
 	// the reference adapter (and any future External-type adapter) returns
@@ -519,10 +557,32 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 // Used to keep the observation-sidecar append idempotent across re-admissions
 // and against pod templates that pre-baked the sidecar.
 func hasContainer(containers []corev1.Container, name string) bool {
+	return containerIndexByName(containers, name) >= 0
+}
+
+// containerIndexByName returns the index of the first container named name, or
+// -1 if absent. The kernel-check injection uses it to REPLACE (not skip) an
+// existing same-name container in place, so the webhook stays authoritative
+// for that container.
+func containerIndexByName(containers []corev1.Container, name string) int {
 	for i := range containers {
 		if containers[i].Name == name {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
+}
+
+// removeContainerByName removes the first container named name from *containers
+// (preserving order) and reports whether one was removed. The kernel-check path
+// uses it to strip a hand-authored same-name init container when the adapter
+// declines to inject, keeping the webhook authoritative even in the
+// no-injection case.
+func removeContainerByName(containers *[]corev1.Container, name string) bool {
+	idx := containerIndexByName(*containers, name)
+	if idx < 0 {
+		return false
+	}
+	*containers = append((*containers)[:idx], (*containers)[idx+1:]...)
+	return true
 }

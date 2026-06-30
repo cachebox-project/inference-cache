@@ -141,7 +141,25 @@
 #      LookupRoute(unknown model) the plaintext phase (7) ran and asserts the
 #      identical fail-open NO_HINT, proving the existing call pattern is
 #      unchanged over TLS (pure transport wrapper, no contract/behavior change).
-#  14. Every sample manifest under config/samples/ applies cleanly against
+#  14. The LMCache kernel-check injection shape is correct end-to-end: a
+#      GPU-requesting engine pod (labeled app=kc-inject-engine, bound to a
+#      dedicated LMCache CacheBackend) is admitted and carries a
+#      lmcache-kernel-check init container whose image EQUALS the engine
+#      container's image (the adapter reuses it so no extra image pull
+#      occurs). Exercises the mutating pod webhook's auto mode (inject
+#      iff GPU requested) end-to-end on the real installed bundle.
+#  15. The report-only FAIL condition path works fail-open: a dedicated
+#      LMCache CacheBackend (kc-cond) is annotated report-only, and a
+#      matching engine pod using python:3.11-slim runs the kernel-check
+#      init container, which exits 0 (fail-open) but writes "FAIL: lmcache
+#      not importable" to /dev/termination-log. The main container starts
+#      normally (pod Ready), proving report-only did not block the engine.
+#      The C2 reconciler reads the termination message and publishes
+#      EngineKernelsHealthy=False / reason=KernelLoadFailed on the
+#      CacheBackend status. The validating webhook also rejects an invalid
+#      lmcache-kernel-check annotation value (a typo would otherwise silently
+#      relax strict enforcement to report-only).
+#  16. Every sample manifest under config/samples/ applies cleanly against
 #      the live install: a server-side dry-run apply of each *.yaml/*.yml
 #      exercises CRD structural validation + the validating admission webhook
 #      on the real cluster. Complements `make verify-samples` (which runs the
@@ -191,7 +209,8 @@
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
 #           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
+#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS, KERNEL_CHECK_SMOKE_NS,
+#           KERNEL_CHECK_POD_TIMEOUT, KERNEL_CHECK_COND_TIMEOUT.
 
 set -euo pipefail
 
@@ -212,6 +231,17 @@ LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 # lease the External-reconcile path inherits from the C2 reconciler loop.
 EXTERNAL_BACKEND_TIMEOUT="${EXTERNAL_BACKEND_TIMEOUT:-30}" # seconds
 EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
+
+# Kernel-check smoke tunables (assertions 14 + 15).
+# KERNEL_CHECK_SMOKE_NS is a dedicated namespace created + deleted by those
+# two phases so they don't leave fixtures in other namespaces.
+KERNEL_CHECK_SMOKE_NS="${KERNEL_CHECK_SMOKE_NS:-ic-smoke-kernel-check}"
+# Budget for the report-only engine pod to become Ready (init container runs
+# python:3.11-slim; the image pull dominates on a cold node but is small).
+KERNEL_CHECK_POD_TIMEOUT="${KERNEL_CHECK_POD_TIMEOUT:-120}"
+# Budget for the C2 reconciler to read the init-container termination message
+# and publish EngineKernelsHealthy=False. One reconcile cycle + poll buffer.
+KERNEL_CHECK_COND_TIMEOUT="${KERNEL_CHECK_COND_TIMEOUT:-60}"
 
 # Sample-smoke tunables — apply config/samples/cachebackend-with-engine.yaml,
 # assert the operator-facing signals, exercise the RequeueAfter drift case.
@@ -330,6 +360,14 @@ collect_diagnostics() {
     >"$LOG_DIR/external-engine-pod.yaml" 2>&1 || true
   kubectl get deploy,svc -n "$EXT_SMOKE_NS" \
     >"$LOG_DIR/external-ns-workloads.txt" 2>&1 || true
+  # Kernel-check smoke artefacts. Best-effort — the objects may not
+  # exist if the smoke aborted before that section.
+  kubectl get cb -n "$KERNEL_CHECK_SMOKE_NS" -o yaml \
+    >"$LOG_DIR/kernel-check-cachebackends.yaml" 2>&1 || true
+  kubectl get pod -n "$KERNEL_CHECK_SMOKE_NS" -o yaml \
+    >"$LOG_DIR/kernel-check-pods.yaml" 2>&1 || true
+  kubectl get events.events.k8s.io -n "$KERNEL_CHECK_SMOKE_NS" \
+    >"$LOG_DIR/kernel-check-events.txt" 2>&1 || true
 }
 
 cleanup() {
@@ -2543,6 +2581,265 @@ if ! has_reason_code "$tls_lookup_resp" "NO_HINT"; then
 fi
 log "existing call pattern intact over TLS: LookupRoute(unknown model) → NO_HINT, identical to the plaintext phase"
 
+# --- kernel-check init-container injection shape (assertion 14) ------------
+# Block 1: prove the mutating pod webhook injects lmcache-kernel-check when
+# auto mode fires (GPU-requesting container). A dedicated LMCache CacheBackend
+# (kc-inject) is created in the kernel-check smoke namespace so the webhook
+# can resolve a matching backend at pod admission time. The engine pod carries
+# the backend's engineSelector label (app=kc-inject-engine), requests
+# nvidia.com/gpu → auto mode injects the init container. The kind node has no
+# GPU, so the pod stays Pending — that is expected and correct; the webhook
+# runs at admission, before scheduling. Only the SPEC is inspected here (no
+# status, no pod running).
+log "asserting lmcache-kernel-check init-container injection shape (assertion 14)"
+# Start from a clean namespace: on a rerun against a kept cluster, leftover pods
+# would be UPDATED by `kubectl apply` (the mutating webhook only fires on
+# CREATE), so the assertions could pass/fail on stale injected specs. Delete and
+# recreate so every fixture pod is created fresh and re-admitted.
+kubectl delete namespace "$KERNEL_CHECK_SMOKE_NS" --ignore-not-found=true --wait=true >/dev/null 2>&1 || true
+kubectl create namespace "$KERNEL_CHECK_SMOKE_NS" --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
+
+# Apply the CacheBackend first so status.endpoint is published before the
+# engine pod is admitted (the webhook fail-opens when endpoint is absent).
+KC_INJECT_CB="kc-inject"
+KC_INJECT_POD="kc-inject-probe"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: $KC_INJECT_CB
+  namespace: $KERNEL_CHECK_SMOKE_NS
+spec:
+  type: LMCache
+  engineSelector:
+    matchLabels:
+      app: kc-inject-engine
+  backendConfig:
+    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+EOF
+
+# Wait for the controller to publish status.endpoint before admitting the engine
+# pod. The webhook fail-opens (no injection) when endpoint is absent.
+log "waiting up to 60s for kc-inject status.endpoint before admitting the engine pod"
+kc_inject_deadline=$(($(date +%s) + 60))
+kc_inject_endpoint=""
+while [ "$(date +%s)" -lt "$kc_inject_deadline" ]; do
+  kc_inject_endpoint="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_INJECT_CB" \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+  if [ -n "$kc_inject_endpoint" ]; then break; fi
+  sleep 2
+done
+if [ -z "$kc_inject_endpoint" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_INJECT_CB" -o yaml || true
+  fail "$KC_INJECT_CB status.endpoint not published within 60s; cannot exercise the webhook injection (endpoint must be set before engine pod CREATE)"
+fi
+
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $KC_INJECT_POD
+  namespace: $KERNEL_CHECK_SMOKE_NS
+  labels:
+    app: kc-inject-engine
+spec:
+  restartPolicy: Never
+  # Pin to a non-existent node so the pod stays Pending on ANY cluster (incl. a
+  # GPU-capable one): we only inspect the webhook-mutated spec, and busybox has
+  # no python3, so it must never actually run the kernel-check init container.
+  nodeSelector:
+    inferencecache.io/smoke-never-schedule: "true"
+  containers:
+  - name: vllm
+    image: busybox:1.36
+    command: ["sleep", "3600"]
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+EOF
+
+# The webhook runs synchronously at admission, so the init container is present
+# immediately. Poll briefly as a defensive circuit-breaker against a slow first
+# admission (cert warm-up on a cold cluster).
+log "waiting up to 30s for lmcache-kernel-check init container to be present in the pod spec"
+deadline=$(($(date +%s) + 30))
+kc_injected_name=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  kc_injected_name="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_INJECT_POD" \
+    -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-kernel-check")].name}' 2>/dev/null || true)"
+  if [ "$kc_injected_name" = "lmcache-kernel-check" ]; then break; fi
+  sleep 2
+done
+if [ "$kc_injected_name" != "lmcache-kernel-check" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_INJECT_POD" -o yaml || true
+  fail "lmcache-kernel-check init container not injected into GPU-requesting engine pod after 30s (webhook auto mode did not fire)"
+fi
+
+# Assert the init container's image equals the engine container's image
+# (busybox:1.36). The adapter must copy the engine image so no extra pull occurs.
+kc_init_image="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_INJECT_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-kernel-check")].image}' 2>/dev/null || true)"
+if [ "$kc_init_image" != "busybox:1.36" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_INJECT_POD" -o yaml || true
+  fail "lmcache-kernel-check init container image=$kc_init_image, want busybox:1.36 (adapter must reuse the engine container image)"
+fi
+log "lmcache-kernel-check init container injected; image=$kc_init_image (matches engine container — no extra pull)"
+
+# --- kernel-check report-only FAIL condition path (assertion 15) -----------
+# Block 2: prove the report-only FAIL path is fail-open and surfaces
+# EngineKernelsHealthy=False/KernelLoadFailed. A dedicated managed LMCache
+# CacheBackend (kc-cond) is annotated report-only. The matching engine pod
+# uses python:3.11-slim: the init container runs the kernel-check script, which
+# calls find_spec("lmcache") → None → emits "FAIL: lmcache not importable" to
+# /dev/termination-log and exits 0 (fail-open; STRICT unset). The main container
+# starts normally, so the pod reaches Ready — proving fail-open semantics.
+# The C2 reconciler reads the termination message from
+# status.initContainerStatuses and publishes EngineKernelsHealthy=False /
+# reason=KernelLoadFailed on the CacheBackend.
+#
+# python:3.11-slim was chosen deliberately: it has python3 (so the init container
+# runs successfully, producing our FAIL: message) but does NOT have lmcache
+# installed (find_spec returns None → the FAIL: branch fires). Using a non-python
+# image (e.g. pause) would produce a 127 exit / KernelCheckError, not
+# KernelLoadFailed, which would break the condition assertion.
+log "asserting report-only FAIL path: EngineKernelsHealthy=False/KernelLoadFailed (assertion 15)"
+KC_COND_CB="kc-cond"
+KC_COND_ENGINE_POD="kc-cond-engine"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: $KC_COND_CB
+  namespace: $KERNEL_CHECK_SMOKE_NS
+  annotations:
+    inferencecache.io/lmcache-kernel-check: "report-only"
+spec:
+  type: LMCache
+  engineSelector:
+    matchLabels:
+      app: kc-cond-engine
+  backendConfig:
+    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+EOF
+
+# Wait for status.endpoint before admitting the engine pod. The webhook
+# fail-opens (no init-container injection) when the endpoint is absent; without
+# the init container the FAIL: termination message is never written, and the
+# reconciler cannot publish EngineKernelsHealthy. The endpoint is typically
+# published within a few seconds of CB create.
+log "waiting up to 60s for kc-cond status.endpoint before admitting the engine pod"
+kc_cond_deadline=$(($(date +%s) + 60))
+kc_cond_endpoint=""
+while [ "$(date +%s)" -lt "$kc_cond_deadline" ]; do
+  kc_cond_endpoint="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+  if [ -n "$kc_cond_endpoint" ]; then break; fi
+  sleep 2
+done
+if [ -z "$kc_cond_endpoint" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" -o yaml || true
+  fail "$KC_COND_CB status.endpoint not published within 60s; cannot exercise the report-only condition path"
+fi
+
+# Apply the engine pod. python:3.11-slim is small (~50 MB) and always present on
+# Docker Hub, so this phase does not pay a multi-GB pull. No GPU request: the
+# report-only mode injects regardless of GPU (the annotation overrides auto mode).
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $KC_COND_ENGINE_POD
+  namespace: $KERNEL_CHECK_SMOKE_NS
+  labels:
+    app: kc-cond-engine
+spec:
+  restartPolicy: Never
+  containers:
+  - name: vllm
+    image: python:3.11-slim
+    # The engine container is named "vllm", so the mutating webhook injects the
+    # LMCache engine wiring onto it — including the --kv-transfer-config ARG. A
+    # bare command ["sleep","3600"] would then run as
+    # `sleep 3600 --kv-transfer-config {...}` and exit 1 ("invalid time
+    # interval"). Wrapping in `sh -c` makes the injected args harmless
+    # positional params to the script, so the stand-in stays alive to prove
+    # the init container's report-only fail-open behavior.
+    command: ["/bin/sh", "-c", "sleep 3600"]
+EOF
+
+# Wait for the pod to become Ready. The init container runs the kernel-check
+# script (exits 0 because report-only); then the main container starts and
+# sleep 3600 runs. python:3.11-slim is ~50 MB; the budget covers a cold pull.
+log "waiting up to ${KERNEL_CHECK_POD_TIMEOUT}s for $KC_COND_ENGINE_POD to become Ready (proves report-only fail-open)"
+if ! kubectl -n "$KERNEL_CHECK_SMOKE_NS" wait \
+     --for=condition=Ready pod/"$KC_COND_ENGINE_POD" \
+     --timeout="${KERNEL_CHECK_POD_TIMEOUT}s" >/dev/null 2>&1; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_COND_ENGINE_POD" -o yaml || true
+  fail "$KC_COND_ENGINE_POD did not become Ready within ${KERNEL_CHECK_POD_TIMEOUT}s — report-only did not fail-open (init container may have exited non-zero, or the image pull stalled)"
+fi
+log "$KC_COND_ENGINE_POD is Ready — report-only mode did not block the engine pod"
+
+# Poll for EngineKernelsHealthy=False on the CacheBackend. The reconciler reads
+# the init container's termination message from status.initContainerStatuses on
+# the matched pod; it fires on the next reconcile after the init container
+# completes. The budget absorbs one RequeueAfter cycle + pod-list round-trip.
+log "waiting up to ${KERNEL_CHECK_COND_TIMEOUT}s for EngineKernelsHealthy=False on $KC_COND_CB"
+deadline=$(($(date +%s) + KERNEL_CHECK_COND_TIMEOUT))
+kc_cond_status=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  kc_cond_status="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" \
+    -o jsonpath='{.status.conditions[?(@.type=="EngineKernelsHealthy")].status}' 2>/dev/null || true)"
+  if [ "$kc_cond_status" = "False" ]; then break; fi
+  sleep 3
+done
+if [ "$kc_cond_status" != "False" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" -o yaml || true
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get pod "$KC_COND_ENGINE_POD" -o yaml || true
+  fail "EngineKernelsHealthy condition status=$kc_cond_status on $KC_COND_CB after ${KERNEL_CHECK_COND_TIMEOUT}s; want False (reconciler did not read the FAIL: termination message)"
+fi
+
+kc_cond_reason="$(kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" \
+  -o jsonpath='{.status.conditions[?(@.type=="EngineKernelsHealthy")].reason}' 2>/dev/null || true)"
+if [ "$kc_cond_reason" != "KernelLoadFailed" ]; then
+  kubectl -n "$KERNEL_CHECK_SMOKE_NS" get cb "$KC_COND_CB" -o yaml || true
+  fail "EngineKernelsHealthy reason=$kc_cond_reason on $KC_COND_CB; want KernelLoadFailed (FAIL: termination message must map to this reason)"
+fi
+log "EngineKernelsHealthy=False/KernelLoadFailed on $KC_COND_CB — report-only FAIL path wired end-to-end"
+
+# The validating webhook must reject an invalid lmcache-kernel-check annotation
+# value: a typo (e.g. "strcit") would otherwise silently fall back to report-only
+# and disable the fail-closed strict gate. Proves the rule on the real install.
+log "asserting an invalid lmcache-kernel-check annotation is rejected at admission"
+kc_badannot_yaml="$(cat <<EOF
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: kc-badannot
+  namespace: $KERNEL_CHECK_SMOKE_NS
+  annotations:
+    inferencecache.io/lmcache-kernel-check: "strcit"
+spec:
+  type: LMCache
+  engineSelector:
+    matchLabels:
+      app: kc-badannot
+EOF
+)"
+if kc_badannot_out="$(printf '%s\n' "$kc_badannot_yaml" | kubectl apply -f - 2>&1)"; then
+  echo "$kc_badannot_out"
+  fail "CacheBackend with an invalid lmcache-kernel-check annotation was admitted; the validating webhook should reject it"
+fi
+if ! grep -q "must be one of" <<<"$kc_badannot_out"; then
+  echo "$kc_badannot_out"
+  fail "invalid kernel-check annotation rejected, but not by the expected rule (missing 'must be one of' message)"
+fi
+log "invalid lmcache-kernel-check annotation rejected at admission"
+
+# Cleanup: drop the kernel-check smoke namespace.
+kubectl delete namespace "$KERNEL_CHECK_SMOKE_NS" \
+  --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
+
 # --- sample-manifest apply-clean backstop ----------------------------------
 # Every YAML under config/samples/ must apply cleanly against the running
 # install. Operators copy these as their first-contact recipe; a sample that
@@ -2704,4 +3001,4 @@ if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
 fi
 log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"
