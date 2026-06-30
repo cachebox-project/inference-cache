@@ -1460,17 +1460,24 @@ case "$clbo" in
 esac
 deadline=$(($(date +%s) + 120))
 ec_reason=""
+ec_status=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   kubectl -n "$SAMPLE_NS" annotate cb qwen-demo-cache \
     inferencecache.io/smoke-poke="$(date +%s)" --overwrite >/dev/null 2>&1 || true
   ec_reason=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
     -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].reason}' 2>/dev/null || true)
-  if [ "$ec_reason" = "InjectedEngineCrashLooping" ]; then break; fi
+  ec_status=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].status}' 2>/dev/null || true)
+  # Assert BOTH status and reason: the documented surface is
+  # EngineCompatibility=False/InjectedEngineCrashLooping. Checking the reason
+  # alone would let a regression to status=True (advisory condition inverted)
+  # slip through while the reason string still matched.
+  if [ "$ec_status" = "False" ] && [ "$ec_reason" = "InjectedEngineCrashLooping" ]; then break; fi
   sleep 4
 done
-if [ "$ec_reason" != "InjectedEngineCrashLooping" ]; then
+if [ "$ec_status" != "False" ] || [ "$ec_reason" != "InjectedEngineCrashLooping" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o jsonpath='{.status.conditions}' || true
-  fail "EngineCompatibility reason=$ec_reason, want InjectedEngineCrashLooping after the injected engine crash-looped"
+  fail "EngineCompatibility status=$ec_status reason=$ec_reason, want False/InjectedEngineCrashLooping after the injected engine crash-looped"
 fi
 log "EngineCompatibility=False/InjectedEngineCrashLooping surfaced on the crash-looping injected engine"
 

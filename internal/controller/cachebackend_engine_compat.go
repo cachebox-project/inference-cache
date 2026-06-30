@@ -87,8 +87,9 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 				"A structural engine↔connector incompatibility is a common cause — hybrid-attention models (Qwen3.6/Next "+
 				"gated-DeltaNet, Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …) disable vLLM's hybrid KV-cache manager the moment "+
 				"a KV connector loads (KV-spec unification fails at init) — but a crash-loop can also be a bad image, command, "+
-				"missing dependency/secret, or OOM, so check the engine logs to confirm. If it is the connector, remove it or run "+
-				"the engine events-only via the inferencecache.io/skip-inject annotation.", cs.Name, p.Name), true
+				"missing dependency/secret, or OOM, so check the engine logs to confirm. If it is the connector, remove it — note "+
+				"the inferencecache.io/skip-inject annotation opts the pod out of cache wiring entirely (the "+
+				"kvevent-subscriber included), so on its own it stops routing too and is not a routing-preserving workaround.", cs.Name, p.Name), true
 		}
 	}
 	return "", true
