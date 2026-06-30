@@ -58,13 +58,7 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. PVC-backed storage wire-up (spec.storage.pvc): a single-replica LMCache
-#      CacheBackend with spec.storage.pvc.size set provisions a PVC
-#      owner-referenced to the CacheBackend, mounts it into the cache-server
-#      pod, binds (waiting for the WaitForFirstConsumer pod schedule first),
-#      and populates status.capacity from the bound size. (Server-side
-#      disk-backed KV is a separate follow-up; not asserted here.)
-#   8c. CacheBackend.spec.resources defaults + threading: the CRD-schema
+#   8b. CacheBackend.spec.resources defaults + threading: the CRD-schema
 #      default stamps spec.resources.limits.memory on every admitted
 #      CacheBackend (so the cache-server pod is bounded by the cgroup
 #      rather than node-pressure OOM-killed by the kubelet under T2
@@ -197,7 +191,7 @@
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
 #           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS, STORAGE_SMOKE_NS.
+#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS.
 
 set -euo pipefail
 
@@ -509,7 +503,7 @@ fi
 log "inference-cache-server memory limit = $server_mem_limit ($server_mem_bytes bytes; >= 1Gi → sized for DefaultMaxEntries=1M)"
 
 # --- CacheBackend CRD schema-trim assertion --------------------------------
-# The installed CRD must reflect the inert-field trim: the three removed fields
+# The installed CRD must reflect the inert-field trim: the five removed fields
 # are absent from the served v1alpha1 schema, and the field that replaced the
 # removed status.indexEntries — status.indexParticipation.prefixCount — is
 # present. Probing the live CRD in the cluster (not just the repo manifest)
@@ -542,7 +536,18 @@ fi
 if [ -z "$(crd_field_type 'status.properties.indexParticipation.properties.t2HitRate')" ]; then
   fail "CRD is missing status.indexParticipation.t2HitRate (the tier-2 health surface)"
 fi
-log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries absent; indexParticipation.prefixCount + t2HitRate present)"
+# spec.storage{,.pvc} + status.capacity were removed in the storage-retirement
+# trim — the lm:// server we provision is in-memory, so a local PVC cannot
+# honestly back it; durability is a backend choice. Assert the installed CRD no
+# longer serves them, so an operator cannot set a storage field the controller
+# no longer honors (the operator-facing surface change this smoke must catch).
+if [ -n "$(crd_field_type 'spec.properties.storage')" ]; then
+  fail "CRD still serves removed spec.storage (storage-retirement trim not installed)"
+fi
+if [ -n "$(crd_field_type 'status.properties.capacity')" ]; then
+  fail "CRD still serves removed status.capacity (storage-retirement trim not installed)"
+fi
+log "CacheBackend CRD reflects the schema trim (lookupTimeoutMs/minimumPrefixTokens/indexEntries/storage/capacity absent; indexParticipation.prefixCount + t2HitRate present)"
 
 # --- CacheIndex poller assertion -------------------------------------------
 # The controller's CacheIndex poller is leader-elected and refreshes on a 30s
@@ -1690,103 +1695,6 @@ log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter caden
 # the namespace at the start of this phase, so this leaves the cluster
 # in the state the rest of the smoke produced.
 kubectl delete namespace "$SAMPLE_NS" \
-  --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
-
-# --- PVC-backed storage (spec.storage.pvc) wire-up --------------------------
-# spec.storage.pvc provisions a PVC owner-referenced to the CacheBackend and
-# mounts it into the cache-server pod. This phase asserts the operator-facing
-# surfaces this change delivers — PVC created + owner ref, the data-volume
-# mount on the pod, PVC binds, and status.capacity populates — on a real
-# install. (Switching the lmcache-server to actually spill KV to the volume is
-# a separate follow-up; this phase does NOT assert KV-survives-restart.)
-#
-# kind's default StorageClass (local-path) is WaitForFirstConsumer, so the PVC
-# binds only once a consuming pod schedules — we wait for the cache-server
-# Deployment to reach Available BEFORE asserting bind + capacity.
-STORAGE_SMOKE_NS="${STORAGE_SMOKE_NS:-cb-storage-smoke}"
-log "asserting spec.storage.pvc provisions + mounts a PVC (namespace $STORAGE_SMOKE_NS)"
-kubectl create namespace "$STORAGE_SMOKE_NS" >/dev/null 2>&1 || true
-cat <<EOF | kubectl apply -f - >/dev/null
-apiVersion: inferencecache.io/v1alpha1
-kind: CacheBackend
-metadata:
-  name: persistent-cache
-  namespace: $STORAGE_SMOKE_NS
-spec:
-  type: LMCache
-  replicas: 1
-  integration:
-    engine: vllm
-  engineSelector:
-    matchLabels:
-      app.kubernetes.io/name: vllm
-  backendConfig:
-    model: meta-llama/Meta-Llama-3-8B-Instruct
-    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
-  storage:
-    pvc:
-      size: 1Gi
-EOF
-
-# 1. The PVC is provisioned with a controller owner reference (drives GC on
-#    CacheBackend delete).
-pvc_deadline=$(($(date +%s) + 60))
-pvc_owner=""
-while [ "$(date +%s)" -lt "$pvc_deadline" ]; do
-  pvc_owner="$(kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data \
-    -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].name}' 2>/dev/null || true)"
-  [ -n "$pvc_owner" ] && break
-  sleep 2
-done
-if [ "$pvc_owner" != "persistent-cache" ]; then
-  kubectl -n "$STORAGE_SMOKE_NS" get pvc -o yaml || true
-  fail "PVC persistent-cache-data not created with a controller owner ref to CacheBackend/persistent-cache (owner=$pvc_owner)"
-fi
-log "PVC persistent-cache-data created, owner=CacheBackend/persistent-cache"
-
-# 2. The cache-server pod template mounts the PVC by claim name.
-claim="$(kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache \
-  -o jsonpath='{.spec.template.spec.volumes[?(@.persistentVolumeClaim)].persistentVolumeClaim.claimName}' 2>/dev/null || true)"
-if [ "$claim" != "persistent-cache-data" ]; then
-  kubectl -n "$STORAGE_SMOKE_NS" get deployment persistent-cache -o yaml || true
-  fail "cache-server pod does not mount PVC persistent-cache-data (claim=$claim)"
-fi
-log "cache-server pod mounts PVC claim=$claim"
-
-# 3. Wait for the cache-server Deployment to go Available — this schedules the
-#    pod, which triggers the WaitForFirstConsumer bind.
-log "waiting up to ${SAMPLE_GATE_TIMEOUT}s for the persistent cache-server Deployment to reach Available (triggers PVC bind)"
-if ! kubectl -n "$STORAGE_SMOKE_NS" wait --for=condition=Available --timeout="${SAMPLE_GATE_TIMEOUT}s" \
-     deployment/persistent-cache >/dev/null 2>&1; then
-  kubectl -n "$STORAGE_SMOKE_NS" get deployment/persistent-cache -o yaml || true
-  kubectl -n "$STORAGE_SMOKE_NS" describe pvc persistent-cache-data || true
-  fail "persistent cache-server Deployment did not reach Available within ${SAMPLE_GATE_TIMEOUT}s; the PVC may not have bound"
-fi
-
-# 4. The PVC binds, and status.capacity reflects the bound size.
-pvc_phase="$(kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data \
-  -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-if [ "$pvc_phase" != "Bound" ]; then
-  kubectl -n "$STORAGE_SMOKE_NS" describe pvc persistent-cache-data || true
-  fail "PVC persistent-cache-data phase=$pvc_phase, want Bound (kind's default StorageClass should bind once the pod schedules)"
-fi
-cap_deadline=$(($(date +%s) + 60))
-capacity=""
-while [ "$(date +%s)" -lt "$cap_deadline" ]; do
-  capacity="$(kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache \
-    -o jsonpath='{.status.capacity}' 2>/dev/null || true)"
-  [ -n "$capacity" ] && break
-  sleep 2
-done
-if [ -z "$capacity" ]; then
-  kubectl -n "$STORAGE_SMOKE_NS" get cb persistent-cache -o yaml || true
-  kubectl -n "$STORAGE_SMOKE_NS" get pvc persistent-cache-data -o yaml || true
-  fail "status.capacity not populated after the PVC bound"
-fi
-log "persistent storage wired: PVC Bound, status.capacity=$capacity"
-
-# Sample cleanup: drop the dedicated namespace (best-effort).
-kubectl delete namespace "$STORAGE_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
 # --- External CacheBackend end-to-end ---------------------------------------

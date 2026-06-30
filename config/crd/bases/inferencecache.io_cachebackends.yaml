@@ -64,31 +64,8 @@ spec:
             description: |-
               CacheBackendSpec defines the desired state of a cache backend.
 
-              Persistent storage (spec.storage.pvc) and the autoscaling spec
-              (spec.autoscaling) are both reconciled today. The autoscaling spec drives a
-              HorizontalPodAutoscaler. On a managed Deployment backend
-              (deploymentKind=Deployment, the default), spec.storage.pvc provisions a
-              PersistentVolumeClaim owner-referenced to the CacheBackend (reclaimed only
-              when the CacheBackend is deleted), mounts it into the cache-server pod at the
-              runtime adapter's declared data path, and reports the bound PVC's actual size
-              in status.capacity.
-
-              Two scoping rules apply:
-
-                - Only a managed Deployment backend provisions storage. A StatefulSet
-                  backend is routed to the unmanaged path today (see DeploymentKind), so it
-                  provisions nothing, storage included; per-replica volumeClaimTemplates are
-                  a follow-up. An External backend provisions no workload at all, so
-                  spec.storage.pvc is a no-op there.
-                - A persistent backend must be single-replica. A ReadWriteOnce PVC cannot be
-                  multi-attached, so replicas (or an autoscaling ceiling) > 1 is surfaced
-                  Ready=False/InvalidStorageConfiguration rather than provisioned;
-                  per-replica persistent storage via StatefulSet is a separate follow-up.
-
-              NOTE: provisioning + mounting the PVC does not by itself make the cache server
-              spill KV to it — switching the LMCache server to a disk-backed storage device
-              is a separate follow-up; until then the volume is attached but the server
-              keeps KV in memory.
+              The autoscaling spec (spec.autoscaling) is reconciled into a
+              HorizontalPodAutoscaler for managed backends.
             properties:
               allowCrossNamespace:
                 description: |-
@@ -660,38 +637,6 @@ spec:
                       If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
                       otherwise to an implementation-defined value. Requests cannot exceed Limits.
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                    type: object
-                type: object
-              storage:
-                description: Storage describes persistent storage requested by the
-                  backend.
-                properties:
-                  pvc:
-                    description: PVC describes a persistent volume claim used by the
-                      backend.
-                    properties:
-                      size:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        description: |-
-                          Size is the requested persistent storage size. It can be increased later
-                          (the controller patches the PVC request up, and the StorageClass expands
-                          the volume if it allows expansion); it cannot be decreased — Kubernetes
-                          does not support shrinking a PVC, so a smaller value is ignored.
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                      storageClassName:
-                        description: |-
-                          StorageClassName is the optional StorageClass for the PVC. Omit (leave
-                          null) to use the cluster default StorageClass; set it to the empty string
-                          ("") to explicitly opt out of the default (static / no-provisioner
-                          binding) — the controller preserves the distinction. It is immutable after
-                          the PVC is created — Kubernetes rejects StorageClass changes — so a later
-                          edit is ignored (the controller logs and keeps the existing class).
-                        type: string
-                    required:
-                    - size
                     type: object
                 type: object
               template:
@@ -2130,16 +2075,6 @@ spec:
             description: CacheBackendStatus defines the observed state of a cache
               backend.
             properties:
-              capacity:
-                description: |-
-                  Capacity is a human-readable summary of the backend's provisioned
-                  capacity: the bound PersistentVolumeClaim's actual capacity when
-                  spec.storage.pvc is set and the PVC has bound (the real provisioned size,
-                  which may exceed the request), or empty for an ephemeral backend or while
-                  the PVC is still pending (e.g. a WaitForFirstConsumer StorageClass that
-                  binds only once the pod schedules). It is informational; clients must not
-                  parse it.
-                type: string
               conditions:
                 description: Conditions describe the latest observations of the backend.
                 items:
@@ -2356,10 +2291,7 @@ spec:
                   containerStatuses[].RestartCount summed across cache-server
                   containers (the names from the owned Deployment's pod
                   template; foreign sidecars are excluded). Inert and cleared
-                  for External backends, unsupported-runtime backends, and on
-                  the InvalidStorageConfiguration gate (a persistent
-                  multi-replica spec the controller refuses to provision until
-                  the operator scales to 1 or removes spec.storage.pvc).
+                  for External backends and unsupported-runtime backends.
 
                   Operator-side recovery for the upstream LMCache
                   LMServerConnector EPIPE-on-restart bug. See

@@ -56,18 +56,6 @@ const (
 	defaultFirstEventTimeout = 5 * time.Minute
 )
 
-// memoryOnlyBackends classifies the CacheBackendType values that are
-// architecturally in-memory in Phase 1 and therefore cannot accept a PVC.
-// Kept as a small map (rather than a property on the enum) so we have one
-// place to revise as the substrate adapter set grows — and so the underlying
-// list is unit-test addressable. AIBrix and NIXL are KV-pool / transfer
-// layers with no on-disk tier; hierarchical backends (LMCache,
-// SGLangHiCache, Mooncake) accept PVC-backed tiers and are absent here.
-var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
-	cachev1alpha1.CacheBackendTypeAIBrix: true,
-	cachev1alpha1.CacheBackendTypeNIXL:   true,
-}
-
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
 // defaults (spec.type, deploymentKind, replicas, integration.engine,
@@ -96,11 +84,10 @@ var memoryOnlyBackends = map[cachev1alpha1.CacheBackendType]bool{
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
-// broken — External without an endpoint, persistent storage on a
-// memory-only backend, cross-namespace endpoints without explicit opt-in,
-// runtime/backend pairs no installed adapter supports — before the
-// reconciler ever sees them. It implements [admission.Validator] over
-// CacheBackend.
+// broken — External without an endpoint, cross-namespace endpoints without
+// explicit opt-in, runtime/backend pairs no installed adapter supports —
+// before the reconciler ever sees them. It implements [admission.Validator]
+// over CacheBackend.
 //
 // The structural rule set is ordered and pluggable; the runtime-adapter
 // compatibility check runs separately because it needs to consult the
@@ -150,9 +137,6 @@ var DefaultValidationRules = []ValidationRule{
 	requireEndpointForExternal,
 	rejectEndpointOnNonExternal,
 	rejectInvalidExternalEndpoint,
-	rejectPersistentStorageOnMemoryOnly,
-	rejectNonPositivePVCSize,
-	rejectStorageWithOverlongName,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectResourceLimitsBelowRequests,
@@ -826,78 +810,6 @@ func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 		}
 	}
 	return nil
-}
-
-// rejectPersistentStorageOnMemoryOnly rejects a PVC-backed storage spec on
-// a backend type that is in-memory by design. Letting it through would
-// generate a PVC the workload can never mount.
-func rejectPersistentStorageOnMemoryOnly(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
-		return nil
-	}
-	if !memoryOnlyBackends[cb.Spec.Type] {
-		return nil
-	}
-	return field.ErrorList{
-		field.Forbidden(
-			field.NewPath("spec", "storage", "pvc"),
-			fmt.Sprintf("CacheBackend type %q is memory-only and cannot declare spec.storage.pvc", cb.Spec.Type),
-		),
-	}
-}
-
-// rejectNonPositivePVCSize rejects a spec.storage.pvc.size that is not strictly
-// positive. The schema marks size required, but "required" does not stop a 0 or
-// negative quantity; now that the value drives a real PVC resource request, a
-// non-positive size must be a field-scoped CacheBackend rejection at admission
-// rather than surfacing late as a child-PVC provisioning failure the operator
-// has to dig for.
-func rejectNonPositivePVCSize(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
-		return nil
-	}
-	if cb.Spec.Storage.PVC.Size.Sign() > 0 {
-		return nil
-	}
-	return field.ErrorList{
-		field.Invalid(
-			field.NewPath("spec", "storage", "pvc", "size"),
-			cb.Spec.Storage.PVC.Size.String(),
-			"must be a positive storage quantity",
-		),
-	}
-}
-
-// pvcNameSuffix mirrors the suffix the controller appends when deriving the
-// data PVC name (CacheBackendReconciler.pvcName builds "<name>-data"). It lives
-// here as a literal — the webhook package cannot import the controller package —
-// so keep the two in lockstep if the derivation ever changes.
-const pvcNameSuffix = "-data"
-
-// maxK8sNameLen is the Kubernetes object-name limit (DNS-1123 subdomain).
-const maxK8sNameLen = 253
-
-// rejectStorageWithOverlongName rejects spec.storage.pvc when the PVC name the
-// controller would derive (<name>-data) exceeds the Kubernetes object-name
-// limit. The apiserver already bounds the CacheBackend name at 253 chars, but
-// appending the suffix can push the derived child name over the limit, which
-// would make the PVC uncreatable and the backend silently unreconcilable (the
-// controller's PVC apply would fail every reconcile). Catching it at admission
-// turns that latent failure into a clear, field-scoped rejection.
-func rejectStorageWithOverlongName(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Storage == nil || cb.Spec.Storage.PVC == nil {
-		return nil
-	}
-	if len(cb.Name)+len(pvcNameSuffix) <= maxK8sNameLen {
-		return nil
-	}
-	return field.ErrorList{
-		field.Invalid(
-			field.NewPath("metadata", "name"),
-			cb.Name,
-			fmt.Sprintf("too long for a persistent backend: the derived PVC name %q would exceed the %d-character limit; shorten the CacheBackend name or omit spec.storage.pvc", cb.Name+pvcNameSuffix, maxK8sNameLen),
-		),
-	}
 }
 
 // rejectCrossNamespaceEndpointWithoutOptIn rejects an Endpoint that
