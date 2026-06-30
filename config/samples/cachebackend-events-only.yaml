@@ -56,8 +56,6 @@ spec:
     # keys per-replica entries by model. A hybrid-attention model is the
     # canonical events-only use case.
     model: Qwen/Qwen3-Next-80B-A3B-Instruct
-  # No storage: events-only provisions no server, so there is nothing to back
-  # with a PVC.
   # No autoscaling: there is no server workload to scale (admission rejects it).
   # No endpoint: managed types never set spec.endpoint, and events-only
   # publishes no status.endpoint either.
