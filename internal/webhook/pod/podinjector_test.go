@@ -478,6 +478,55 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	}
 }
 
+func TestHandle_EventsOnly_PrebakedSubscriber_NotClaimedNoStamp(t *testing.T) {
+	// An events-only pod that already carries a hand-authored container named
+	// like the subscriber: the webhook stays idempotent (does NOT append a
+	// second one), but it must NOT claim that pre-existing container as its own
+	// wiring — it neither authored nor verified it (the operator's copy may
+	// carry the wrong image/args and emit no usable events). So it stamps NO
+	// injected-by and routes through the fail-open no-wiring path; the events
+	// controller then never falsely reports the pod as injected, while a correct
+	// hand-baked subscriber is still attributed via the engineSelector path.
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	h := newHandlerWithSubscriber(t, cb) // subscriber image IS configured
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+		Name:  adapterruntime.SubscriberContainerName,
+		Image: "operator/hand-baked-subscriber:wrong",
+	})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// Idempotent: still exactly one subscriber-named container (no duplicate append).
+	count := 0
+	for i := range mutated.Spec.Containers {
+		if mutated.Spec.Containers[i].Name == adapterruntime.SubscriberContainerName {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 subscriber-named container (no duplicate append), got %d: %v",
+			count, containerNames(mutated))
+	}
+	// The hand-baked container is left as-is — the subscriber is NOT webhook-authoritative.
+	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil || sub.Image != "operator/hand-baked-subscriber:wrong" {
+		t.Fatalf("hand-baked subscriber must be left untouched; got %+v", sub)
+	}
+	// NOT claimed: the webhook authored no wiring, so it stamps no injected-by.
+	if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
+		t.Fatalf("a pre-existing (unverified) subscriber must NOT be claimed as wiring; %s = %q", AnnotationInjectedBy, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
+		t.Fatalf("a pre-existing subscriber must NOT stamp %s; got %q", AnnotationInjectedByUID, got)
+	}
+}
+
 func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.T) {
 	// In events-only mode InjectEngineConfig is a no-op, so the engine
 	// container is left otherwise untouched. spec.integration.engineOverrides

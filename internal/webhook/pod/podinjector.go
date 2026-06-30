@@ -344,39 +344,39 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// optimisation, and the next admission will retry. Idempotent: skip
 	// the append if a container by the same name is already on the pod
 	// (re-admission, manual sidecar in the pod template, etc.).
-	// sidecarPresent reports whether the observation sidecar is on the pod
-	// after this admission — either appended just now, or already present from
-	// a prior admission / a pod template that pre-baked it. Events-only wiring
-	// hinges on it (see the `wired` gate below).
-	sidecarPresent := false
+	// sidecarAppended records whether the webhook itself ADDED the subscriber
+	// this admission — NOT merely that a same-named container exists. The
+	// distinction is load-bearing for the events-only `wired` gate below: a
+	// pre-existing kvevent-subscriber is operator-authored and UNVERIFIED (it may
+	// carry the wrong image/args and emit no usable events), so the webhook must
+	// not treat it as proof that IT wired the pod. Unlike the kernel-check init
+	// container, the subscriber is NOT webhook-authoritative — a correct
+	// hand-baked one still gets attributed via the engineSelector path — so we
+	// leave a pre-existing one in place and simply do not claim it.
+	sidecarAppended := false
 	if sidecar, sErr := adapter.ObservationSidecar(cache, mutated); sErr != nil {
 		log.V(1).Info("fail-open: adapter rejected observation sidecar",
 			"runtime", string(runtimeID), "error", sErr.Error())
-	} else if sidecar != nil {
-		if hasContainer(mutated.Spec.Containers, sidecar.Name) {
-			// Already attached (re-admission or hand-baked sidecar) — the
-			// pod is wired even though this pass appends nothing.
-			sidecarPresent = true
-		} else {
-			mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
-			sidecarPresent = true
-			log.V(1).Info("observation sidecar appended",
-				"runtime", string(runtimeID), "container", sidecar.Name)
-		}
+	} else if sidecar != nil && !hasContainer(mutated.Spec.Containers, sidecar.Name) {
+		mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
+		sidecarAppended = true
+		log.V(1).Info("observation sidecar appended",
+			"runtime", string(runtimeID), "container", sidecar.Name)
 	}
 
-	// Only stamp the injection annotations when something was actually wired.
-	// For Offload the connector is always injected by InjectEngineConfig, so
-	// the pod is always wired. For events-only InjectEngineConfig is a no-op,
-	// so the ONLY wiring is the observation sidecar — and it is skipped when
-	// the subscriber image is unconfigured (or backendConfig.model is unset),
-	// in which case nothing was injected at all. Stamping
-	// injected-by/injected-by-uid on a pod the webhook didn't touch would trip
-	// the downstream InjectedByCacheBackend event controller on a non-existent
-	// injection, so route the no-wiring case through the fail-open no-injection
-	// path (which strips any forged injection annotations the inbound pod
-	// carried, matching the fail-open contract).
-	wired := !cache.Spec.IsEventsOnly() || sidecarPresent
+	// Only stamp the injection annotations when the webhook actually wired the
+	// pod. For Offload the connector is always injected by InjectEngineConfig, so
+	// the pod is always wired. For events-only InjectEngineConfig is a no-op, so
+	// the ONLY wiring the webhook performs is APPENDING the observation sidecar —
+	// which is skipped when the subscriber image / backendConfig.model is unset
+	// (nothing injected) OR when a same-named container already exists (operator-
+	// authored, unverified). In those cases the webhook added/verified no wiring,
+	// so stamping injected-by/injected-by-uid would trip the downstream
+	// InjectedByCacheBackend event controller on a non-existent injection and
+	// report "wired" while no usable events may flow. Route that case through the
+	// fail-open no-injection path (which strips any forged injection annotations
+	// the inbound pod carried, matching the fail-open contract).
+	wired := !cache.Spec.IsEventsOnly() || sidecarAppended
 	if !wired {
 		log.V(1).Info("events-only: no subscriber configured; admitting with no wiring",
 			"runtime", string(runtimeID))
