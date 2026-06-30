@@ -206,7 +206,10 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //     autoscaling is opted in and minReplicas is left unset.
 //
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
-// replicas=1, integration.engine=vllm, integration.role=ReadWrite,
+// replicas=1, integration.engine=vllm, integration.mode=Offload,
+//
+//	integration.role=ReadWrite,
+//
 // integration.failOpen=true, resources={requests:{memory:4Gi},
 // limits:{memory:8Gi}}) rides on a `+kubebuilder:default=` marker and
 // is stamped by the apiserver before this handler runs. Note that the nested

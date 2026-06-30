@@ -41,7 +41,7 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	//
 	// Other Phase-1 literal defaults (spec.replicas=1, spec.type=LMCache,
 	// spec.deploymentKind=Deployment, spec.integration.engine=vllm,
-	// spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
+	// spec.integration.mode=Offload, spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
 	// stamped by the apiserver before this handler runs — they are NOT this
 	// defaulter's job, and a unit-level call to Default() on a raw struct
 	// will not see them. The persisted-CR shape is asserted end-to-end in the

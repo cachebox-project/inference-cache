@@ -2023,8 +2023,8 @@ kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/n
 log "exercising Events-only CacheBackend end-to-end in namespace $EVENTSONLY_SMOKE_NS"
 kubectl create namespace "$EVENTSONLY_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply an events-only CacheBackend inline (there is no committed sample for
-# this mode). type=LMCache (the supported managed type whose adapter supplies
+# Apply an events-only CacheBackend inline (mirrors config/samples/cachebackend-events-only.yaml,
+# kept inline so the smoke is self-contained). type=LMCache (the supported managed type whose adapter supplies
 # the kvevent-subscriber), integration.mode=EventsOnly, an engineSelector
 # matching the engine stand-in, and a backendConfig.model the subscriber would
 # use for --model-id. No spec.endpoint (rejected on non-External) and no
