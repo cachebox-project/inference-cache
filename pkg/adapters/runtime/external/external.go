@@ -52,21 +52,18 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}
 }
 
-// ResolveCacheServer returns a nil [runtimeadapter.ResolvedCacheServer]: the
-// cache server is operator-managed and pre-exists, so the controller renders
-// neither a pod nor a Service nor a data volume for it (External backends bring
-// their own persistence; spec.storage.pvc is not wired for External by this
-// adapter — persistence is configured on the pre-existing cache directly). The
-// C2 reconciler already short-circuits on type==External before even consulting
-// an adapter (see CacheBackendReconciler.dispatch), so this method is a safety
-// net for any future code path that goes through Registry.Select for an
-// External CR — it must never accidentally provision a placeholder cache-server
-// or PVC.
-func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*runtimeadapter.ResolvedCacheServer, error) {
+// ResolveCacheServer returns (nil, nil, nil): the cache server is operator-
+// managed and pre-exists, so the controller renders neither a pod nor a
+// Service for it. The C2 reconciler already short-circuits on
+// type==External before even consulting an adapter (see
+// CacheBackendReconciler.dispatch), so this method is a safety net for any
+// future code path that goes through Registry.Select for an External CR —
+// it must never accidentally provision a placeholder cache-server.
+func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
-		return nil, fmt.Errorf("resolve cache server: cache is nil")
+		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 // InjectEngineConfig wires the engine pod to the operator-supplied

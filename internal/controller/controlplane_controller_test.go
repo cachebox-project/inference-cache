@@ -654,3 +654,36 @@ func TestResolveOnePolicyRoutingFloorScoreNilWhenAbsent(t *testing.T) {
 			*rp.RoutingFloorScore)
 	}
 }
+
+func TestResolveOnePolicyAffinityRouting(t *testing.T) {
+	enabled := cachev1alpha1.CachePolicyAffinityRoutingEnabled
+	disabled := cachev1alpha1.CachePolicyAffinityRoutingDisabled
+
+	cases := []struct {
+		name    string
+		spec    cachev1alpha1.CachePolicySpec
+		wantNil bool
+		want    bool
+	}{
+		{name: "omitted", spec: cachev1alpha1.CachePolicySpec{}, wantNil: true},
+		{name: "enabled", spec: cachev1alpha1.CachePolicySpec{AffinityRouting: &enabled}, wantNil: false, want: true},
+		{name: "disabled", spec: cachev1alpha1.CachePolicySpec{AffinityRouting: &disabled}, wantNil: false, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := &cachev1alpha1.CachePolicy{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns-x", Name: "p"},
+				Spec:       tc.spec,
+			}
+			rp := resolveOnePolicy(cp)
+			switch {
+			case tc.wantNil && rp.AffinityRouting != nil:
+				t.Fatalf("expected nil, got &%v", *rp.AffinityRouting)
+			case !tc.wantNil && rp.AffinityRouting == nil:
+				t.Fatalf("expected &%v, got nil", tc.want)
+			case !tc.wantNil && *rp.AffinityRouting != tc.want:
+				t.Fatalf("expected %v, got %v", tc.want, *rp.AffinityRouting)
+			}
+		})
+	}
+}

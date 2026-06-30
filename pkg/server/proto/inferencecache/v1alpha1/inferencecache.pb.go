@@ -482,7 +482,7 @@ func (x *ReplicaScore) GetEstimatedCacheHitProb() float32 {
 type LookupRouteResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ReplicaScores   []*ReplicaScore        `protobuf:"bytes,1,rep,name=replica_scores,json=replicaScores,proto3" json:"replica_scores,omitempty"`
-	ReasonCode      string                 `protobuf:"bytes,2,opt,name=reason_code,json=reasonCode,proto3" json:"reason_code,omitempty"` // PREFIX_MATCH | TENANT_HOT | NO_HINT | POLICY_REQUIRES_CHAIN | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
+	ReasonCode      string                 `protobuf:"bytes,2,opt,name=reason_code,json=reasonCode,proto3" json:"reason_code,omitempty"` // PREFIX_MATCH | TENANT_HOT | AFFINITY_HINT | NO_HINT | POLICY_REQUIRES_CHAIN | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME
 	LookupLatencyUs int64                  `protobuf:"varint,3,opt,name=lookup_latency_us,json=lookupLatencyUs,proto3" json:"lookup_latency_us,omitempty"`
 	// Canonical token IDs the server tokenized for this request, echoed back ONLY
 	// when the server itself tokenized prompt_text. A gateway that sent token_ids

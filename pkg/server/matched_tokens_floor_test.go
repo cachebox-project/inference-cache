@@ -18,11 +18,17 @@ import (
 // chat-template-only matches (1-block, ~16 tokens identical across every
 // replica) used to surface as PREFIX_MATCH and inflated operator-visible
 // routing metrics by ~3× without changing routing quality. The floor
-// downgrades sub-floor matches to NO_HINT so the gateway round-robins
-// honestly. These tests pin the four observable behaviors: the default
-// applies when no CachePolicy is set; the policy value overrides; the
-// explicit 0 opt-out disables; replicas with a real match aren't dragged
-// down by sub-floor siblings.
+// downgrades sub-floor matches off the PREFIX_MATCH path — the final
+// wire code is then affinity-toggle-dependent (AFFINITY_HINT with the
+// kubebuilder default and a usable seed + serving replica; NO_HINT
+// otherwise). The tests below intentionally disable affinity to keep
+// pinning the historic NO_HINT shape that this file was originally
+// written against; the AFFINITY_HINT side of the same downgrade is
+// covered by affinity_routing_test.go. These tests pin the four
+// observable behaviors: the default applies when no CachePolicy is
+// set; the policy value overrides; the explicit 0 opt-out disables;
+// replicas with a real match aren't dragged down by sub-floor
+// siblings.
 
 // TestPolicyStoreMinimumMatchedTokensFallsBackToDefaultWhenNoPolicy pins the
 // resolver's "no policy → server default" rule. An unconfigured tenant must
@@ -77,6 +83,17 @@ func TestPolicyStoreMinimumMatchedTokensClampsNegativeToZero(t *testing.T) {
 // exercises in production for ~70% of its responses.
 func TestLookupRouteAppliesDefaultMatchedTokensFloorWhenNoPolicy(t *testing.T) {
 	svc := newTestService()
+	// Disable affinity so the floor-induced StrategyNone stays NO_HINT
+	// (the historical shape this test pins). Affinity covered in
+	// affinity_routing_test.go. Re-spell the default
+	// MinimumMatchedTokens (64) explicitly because Replace overwrites
+	// the no-policy fallback the resolver would otherwise pick.
+	fal := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace:            "no-policy-tenant",
+		AffinityRouting:      &fal,
+		MinimumMatchedTokens: DefaultMinimumMatchedTokens,
+	}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "no-policy-tenant", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("chat-template"), TokenCount: 16}},
@@ -132,8 +149,11 @@ func TestLookupRouteKeepsPrefixMatchAtDefaultFloorWhenNoPolicy(t *testing.T) {
 // surface, exactly the inert-field anti-pattern §5 forbids.
 func TestLookupRoutePolicyMatchedTokensFloorOverridesDefault(t *testing.T) {
 	svc := newTestService()
+	fal := false
+	// Disable affinity to keep the floor downgrade as NO_HINT (see
+	// the sibling test for rationale).
 	svc.policies.Replace([]ResolvedPolicy{
-		{Namespace: "team-strict", MinimumMatchedTokens: 256},
+		{Namespace: "team-strict", MinimumMatchedTokens: 256, AffinityRouting: &fal},
 	})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "team-strict", HashScheme: "vllm",
@@ -239,6 +259,18 @@ func TestLookupRouteMatchedTokensFloorFiltersBelowFloorReplicasKeepsTheRest(t *t
 // that splits the wire view from the dashboard view.
 func TestLookupRouteSubFloorMatchEmitsNoHintMetric(t *testing.T) {
 	svc := newTestService()
+	// Disable affinity so the floor downgrade emits a NO_HINT metric
+	// (the historical shape this test pins). With affinity enabled the
+	// metric would land in the AFFINITY_HINT bucket — that's covered
+	// in affinity_routing_test.go. Re-spell the default
+	// MinimumMatchedTokens explicitly (Replace overrides the
+	// no-policy fallback the resolver would otherwise pick).
+	fal := false
+	svc.policies.Replace([]ResolvedPolicy{{
+		Namespace:            "no-policy-tenant",
+		AffinityRouting:      &fal,
+		MinimumMatchedTokens: DefaultMinimumMatchedTokens,
+	}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "no-policy-tenant", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("trivial"), TokenCount: 16}},

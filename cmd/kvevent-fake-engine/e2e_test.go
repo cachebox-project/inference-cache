@@ -250,7 +250,10 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 //     pkg/fingerprint, as a gateway would) returns PREFIX_MATCH with the
 //     publishing replica as the hint, with the full two-block chain matched —
 //     including the block delivered in a second, parent-chained event;
-//   - a novel prompt's fingerprint returns NO_HINT with no replica scores.
+//   - a novel prompt's fingerprint does not PREFIX_MATCH; with affinity
+//     routing on by default and a serving replica present it returns
+//     AFFINITY_HINT with one zero-matched-tokens replica pick (no real
+//     prefix overlap).
 func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	const tenant = "e2e-route"
 	tokens := tokenSeq(5_000, 2*e2eBlockTok) // two blocks
@@ -309,34 +312,36 @@ func TestE2EFingerprintRoutingPrefixMatchAndMiss(t *testing.T) {
 	}
 
 	// Miss: a novel prompt — same scheme, same fingerprint construction,
-	// content never published. Must fail open as NO_HINT with no scores
-	// (model/tenant/scheme all exist in the index, so any other reason code
-	// means the miss path regressed).
+	// content never published. It does NOT prefix-match (the fingerprint is
+	// novel). With affinity routing on by default and a serving replica for
+	// this tenant/model/scheme, the server fills the miss with a stable
+	// AFFINITY_HINT pick whose matched_tokens is 0 — proving there is no real
+	// prefix overlap. A PREFIX_MATCH (or any matched_tokens > 0) here would
+	// mean the miss path regressed.
 	novel := fingerprint.PrefixHashes(tokenSeq(50_000_000, 2*e2eBlockTok), e2eBlockTok)
 	resp = lookupChain(t, client, tenant, novel)
-	if resp.GetReasonCode() != "NO_HINT" {
-		t.Errorf("novel prefix: reason = %q, want NO_HINT; scores=%+v",
+	if resp.GetReasonCode() != "AFFINITY_HINT" {
+		t.Errorf("novel prefix: reason = %q, want AFFINITY_HINT (novel fingerprint → affinity fallback, not a prefix match); scores=%+v",
 			resp.GetReasonCode(), resp.GetReplicaScores())
 	}
-	if n := len(resp.GetReplicaScores()); n != 0 {
-		t.Errorf("novel prefix: %d replica scores, want 0", n)
+	if scores := resp.GetReplicaScores(); len(scores) != 1 || scores[0].GetMatchedTokens() != 0 {
+		t.Errorf("novel prefix: want exactly one affinity pick with matched_tokens 0 (no real overlap), got %+v", scores)
 	}
 
 	// The engine's OWN block hashes (what the index was keyed on before the
 	// fingerprint change, normalized to 8-byte big-endian like the decoder
-	// does) must NOT be index keys anymore. If this ever matches, the index
-	// has regressed to engine-hash keying — the exact shape of the original
-	// bug, just with the miss showing up on the gateway side instead. Like
-	// the novel-prefix case, the miss must be exactly the fail-open NO_HINT
-	// with zero scores (tenant/model/scheme all exist in the index, so any
-	// other code means the miss path regressed too).
+	// does) must NOT be index keys anymore. If this ever PREFIX_MATCHes, the
+	// index has regressed to engine-hash keying — the exact shape of the
+	// original bug. Affinity still fires (the hashes are a usable seed), so the
+	// result is AFFINITY_HINT with matched_tokens 0 — the zero matched tokens
+	// is the anti-regression signal that no real prefix match occurred.
 	resp = lookupChain(t, client, tenant, []uint64{uint64(fakeBlockHash(0)), uint64(fakeBlockHash(1))})
-	if resp.GetReasonCode() != "NO_HINT" {
-		t.Errorf("engine block hashes: reason = %q, want NO_HINT — routing must key on the content fingerprint, not the engine's hashes; scores=%+v",
+	if resp.GetReasonCode() != "AFFINITY_HINT" {
+		t.Errorf("engine block hashes: reason = %q, want AFFINITY_HINT with no real match — routing must key on the content fingerprint, not the engine's hashes; scores=%+v",
 			resp.GetReasonCode(), resp.GetReplicaScores())
 	}
-	if n := len(resp.GetReplicaScores()); n != 0 {
-		t.Errorf("engine block hashes: %d replica scores, want 0", n)
+	if scores := resp.GetReplicaScores(); len(scores) != 1 || scores[0].GetMatchedTokens() != 0 {
+		t.Errorf("engine block hashes: want exactly one affinity pick with matched_tokens 0 (engine hashes are not index keys), got %+v", scores)
 	}
 }
 

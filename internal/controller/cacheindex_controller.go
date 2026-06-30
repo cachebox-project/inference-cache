@@ -648,8 +648,13 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
 			ID:           t.TenantID,
 			IndexEntries: t.IndexEntries,
-			MemoryUsed:   t.MemoryUsed,
 			HitRate:      formatRate(t.HitRate),
+			// Deprecated field, hard-zeroed here (NOT copied from the snapshot):
+			// the controller is authoritative for keeping it 0 even when talking
+			// to an older/skewed server that still reports a non-zero (double-
+			// counted) per-tenant memory in its /snapshot. See
+			// TenantCacheStatus.MemoryUsed.
+			MemoryUsed: 0,
 		})
 	}
 	return st

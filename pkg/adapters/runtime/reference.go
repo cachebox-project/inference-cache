@@ -51,13 +51,11 @@ func (referenceAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBa
 	return runtime == RuntimeReference
 }
 
-// ResolveCacheServer renders no cache-server and declares no persistent data:
-// the reference adapter wires engine/router pods directly to whatever endpoint
-// the reconciler discovered, matching backends (such as LMCache) that colocate
-// the cache with the engine. A nil [ResolvedCacheServer] is the canonical
-// "no cache-server" signal the reconciler treats as unmanaged.
-func (referenceAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*ResolvedCacheServer, error) {
-	return nil, nil
+// ResolveCacheServer renders no cache-server: the reference adapter wires
+// engine/router pods directly to whatever endpoint the reconciler discovered,
+// matching backends (such as LMCache) that colocate the cache with the engine.
+func (referenceAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
 }
 
 // InjectEngineConfig sets [EnvCacheEndpoint] on every container in pod,
