@@ -175,6 +175,13 @@ spec:
                   recovery is to recreate the pod (e.g. `kubectl rollout restart`),
                   not to edit the live pod's labels.
 
+                  This describes the default spec.integration.mode=Offload path. For
+                  spec.integration.mode=EventsOnly no KV connector wiring (env vars +
+                  CLI args) is injected and status.endpoint is neither required nor
+                  published — the kvevent-subscriber observation sidecar alone is
+                  injected (see below), so matched pods report cache state for routing
+                  without offloading KV to a backend server.
+
                   The kvevent-subscriber observation sidecar is appended in addition
                   to the engine wiring only when the controller is started with
                   --kvevent-subscriber-image set (empty by default) AND the matched
@@ -2176,21 +2183,26 @@ spec:
                 type: boolean
               firstAvailableAt:
                 description: |-
-                  FirstAvailableAt latches the first time the managed cache-backend
-                  workload was observed Available — the stable anchor for the
-                  firstEventTimeout clock. It is deliberately a latched timestamp rather
-                  than the live Deployment's Available condition LastTransitionTime: that
-                  condition resets on an availability flap, which would restart the
-                  timeout window and let a backend that already breached the timeout
-                  (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
-                  without any KV event — contradicting the "once Degraded, stays Degraded
-                  until an event arrives" contract. Anchoring on this write-once value
-                  keeps the elapsed window monotonic, so Degraded is sticky. Written
-                  write-once when the workload first reports Available and never cleared
-                  (inert while the backend is not managed). A genuinely recreated managed
-                  Deployment keeps the prior anchor; the gate re-evaluates from it, which
-                  is safe because the engine event source is unchanged by a cache-server
-                  restart.
+                  FirstAvailableAt is the stable anchor for the firstEventTimeout clock.
+                  It latches one of two events depending on the integration mode:
+                    - Offload (managed): the first time the managed cache-backend
+                      workload was observed Available — there is a workload to wait on.
+                    - EventsOnly: the first reconcile. A server-less backend has no
+                      workload to become Available, so it is "up" the moment it exists
+                      and the firstEventTimeout clock starts immediately.
+                  In both cases it is a latched timestamp rather than a live condition's
+                  LastTransitionTime: a live condition resets on an availability flap,
+                  which would restart the timeout window and let a backend that already
+                  breached the timeout (Degraded / NoKVEventsObserved) bounce back to
+                  AwaitingFirstKVEvent without any KV event — contradicting the "once
+                  Degraded, stays Degraded until an event arrives" contract. Anchoring on
+                  this write-once value keeps the elapsed window monotonic, so Degraded is
+                  sticky. Written write-once and never cleared. A genuinely recreated
+                  managed Deployment keeps the prior anchor; the gate re-evaluates from
+                  it, which is safe because the engine event source is unchanged by a
+                  cache-server restart. (Inert only on an Offload backend that has not yet
+                  reported Available; on the EventsOnly path it is set on the first
+                  reconcile.)
                 format: date-time
                 type: string
               firstKVEventObservedAt:

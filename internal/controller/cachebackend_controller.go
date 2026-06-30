@@ -1458,11 +1458,22 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	if anchor.IsZero() {
 		anchor = now
 	}
+	// The AwaitingFirstKVEvent / NoKVEventsObserved Ready+Degraded messages are
+	// operator-facing, so they must describe the actual anchor: a managed
+	// (Offload) backend gates on its workload becoming Available; an events-only
+	// backend has no workload, so the clock starts when the backend is wired.
+	// Only the wording differs by mode — the reasons stay identical.
+	awaitingMessage := fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout)
+	noEventsMessage := fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout)
+	if backend.Spec.IsEventsOnly() {
+		awaitingMessage = fmt.Sprintf("events-only backend is wired but no KV events observed yet; waiting up to %s for the engine to report state", timeout)
+		noEventsMessage = fmt.Sprintf("no KV events observed within %s of the events-only backend being wired; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout)
+	}
 	if elapsed := now.Sub(anchor); elapsed < timeout {
 		return kvReadiness{
 			readyStatus:     metav1.ConditionFalse,
 			readyReason:     reasonAwaitingFirstKVEvent,
-			readyMessage:    fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout),
+			readyMessage:    awaitingMessage,
 			degradedStatus:  metav1.ConditionFalse,
 			degradedReason:  reasonNotDegraded,
 			degradedMessage: "backend is not in a degraded state",
@@ -1478,7 +1489,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	return kvReadiness{
 		readyStatus:     metav1.ConditionFalse,
 		readyReason:     reasonNoKVEventsObserved,
-		readyMessage:    fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout),
+		readyMessage:    noEventsMessage,
 		degradedStatus:  metav1.ConditionTrue,
 		degradedReason:  reasonNoKVEventsObserved,
 		degradedMessage: fmt.Sprintf("no KV events observed within %s of the cache-backend workload becoming Available", timeout),

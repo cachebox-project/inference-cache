@@ -140,6 +140,53 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 	})
 
+	t.Run("NoEventBeforeTimeoutIsDegradedNoKVEventsObserved", func(t *testing.T) {
+		// Events-only has no workload to wait on, so the firstEventTimeout clock
+		// starts at the first reconcile (status.firstAvailableAt is latched
+		// immediately). Drive a short window past its deadline with no KV event
+		// and the gate must flip the backend to Ready=False/NoKVEventsObserved,
+		// Degraded=True — exactly like a managed backend, but with no Deployment.
+		ns := freshNS(t, k8s)
+		cb := eventsOnlyBackend("cache", ns)
+		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: time.Second}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		// First reconcile latches status.firstAvailableAt (no workload — the
+		// clock starts now) and parks at AwaitingFirstKVEvent inside the window.
+		reconcile(t, r, "cache", ns)
+		latched := getBackend(t, r, "cache", ns)
+		if latched.Status.FirstAvailableAt == nil {
+			t.Fatalf("firstAvailableAt = nil after first reconcile, want latched immediately (no workload to wait on)")
+		}
+		if ready := findCondition(latched.Status.Conditions, conditionTypeReady); ready == nil ||
+			ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+			t.Fatalf("pre-timeout Ready = %+v, want False/AwaitingFirstKVEvent", ready)
+		}
+
+		// Backdate the latched anchor well before the 1s window so the next
+		// reconcile observes the timeout breached without sleeping.
+		setFirstAvailableAt(t, k8s, "cache", ns, time.Now().Add(-5*time.Second))
+		reconcile(t, r, "cache", ns)
+
+		got := getBackend(t, r, "cache", ns)
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonNoKVEventsObserved {
+			t.Fatalf("post-timeout Ready = %+v, want False/NoKVEventsObserved", ready)
+		}
+		deg := findCondition(got.Status.Conditions, conditionTypeDegraded)
+		if deg == nil || deg.Status != metav1.ConditionTrue || deg.Reason != reasonNoKVEventsObserved {
+			t.Fatalf("post-timeout Degraded = %+v, want True/NoKVEventsObserved", deg)
+		}
+		// Still server-less: no workload provisioned, no endpoint published.
+		if deps, svcs := countOwnedWorkloads(t, k8s, "cache", ns); deps != 0 || svcs != 0 {
+			t.Fatalf("post-timeout owned workloads = %d/%d, want 0/0 (events-only provisions nothing)", deps, svcs)
+		}
+		if got.Status.Endpoint != "" {
+			t.Fatalf("post-timeout status.endpoint = %q, want empty", got.Status.Endpoint)
+		}
+	})
+
 	t.Run("OffloadToEventsOnlyShedsPriorWorkload", func(t *testing.T) {
 		// A backend provisioned in Offload mode (Deployment + Service), then
 		// flipped to EventsOnly, must shed the prior owned workload on the next

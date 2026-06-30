@@ -76,7 +76,7 @@ const (
 // It does NOT stamp spec.integration.failOpen explicitly — once the
 // defaulter materialises spec.integration above, the apiserver applies
 // the `+kubebuilder:default=true` marker on the now-present failOpen
-// field (alongside engine, role, firstEventTimeout) before persisting,
+// field (alongside mode, engine, role, firstEventTimeout) before persisting,
 // so an admitted CR with no integration block ends up with failOpen
 // populated in etcd. The read-time fallback in [IntegrationFailOpen]
 // covers callers that bypass the apiserver (raw-struct test invocation,
