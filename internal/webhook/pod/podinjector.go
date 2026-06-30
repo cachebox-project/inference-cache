@@ -18,6 +18,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // WebhookPath is the URL the kubebuilder marker below registers with the
@@ -205,14 +206,17 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	registry := h.Registry
 	if registry == nil {
 		// Mirror production cmd/controller wiring: DefaultRegistry +
-		// the External adapter (registered explicitly because the
-		// subpackage can't be imported by DefaultRegistry without a
-		// cycle). Keeps the nil-fallback consistent with the running
-		// controller so a bare `EngineInjector{}` doesn't silently
-		// fail-open on External CRs that the production webhook would
-		// have wired.
+		// the External and SGLang+LMCache adapters (registered explicitly
+		// because those subpackages can't be imported by DefaultRegistry
+		// without a cycle). Keeps the nil-fallback consistent with the
+		// running controller so a bare `EngineInjector{}` doesn't silently
+		// fail-open on External / SGLang CRs that the production webhook
+		// would have wired. The no-arg SGLang adapter renders no subscriber
+		// sidecar (no image configured) — engine config injection still
+		// happens; only auto-attach is gated on the controller flag.
 		registry = adapterruntime.DefaultRegistry()
 		registry.Register(externaladapter.NewAdapter())
+		registry.Register(sglangadapter.NewAdapter())
 	}
 	adapter, err := registry.Select(runtimeID, cache)
 	if err != nil {

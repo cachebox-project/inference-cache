@@ -1,0 +1,190 @@
+package sglang
+
+import (
+	corev1 "k8s.io/api/core/v1"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
+)
+
+const (
+	// subscriberHashScheme is the canonical hash-scheme tag the SGLang
+	// subscriber carries. Kept distinct from the runtime id and from vLLM's
+	// "vllm" tag: the cache plane keys the index on (tenant, model,
+	// hash_scheme, prefix_hash), so tagging SGLang prefixes "sglang" keeps
+	// them in a disjoint domain from vLLM's — a request hashed under one
+	// scheme can never false-hit a bytewise-identical entry recorded under the
+	// other (SGLang hashes prefixes with hashlib.sha256 over the token-id
+	// bytes; vLLM uses its own block-hash chain — but the disjointness
+	// guarantee rides on the tag, not on the underlying hash differing).
+	subscriberHashScheme = "sglang"
+
+	// defaultEngineZMQPortStr is the port SGLang's KV-event ZMQ PUB endpoint
+	// binds by default (SGLang's KVEventsConfig defaults to tcp://*:5557, the
+	// same port vLLM uses). The operator enables the publisher with
+	// --kv-events-config on the engine; the subscriber sidecar dials it over
+	// 127.0.0.1 since it shares the engine pod's network namespace.
+	defaultEngineZMQPortStr = "5557"
+)
+
+// adapter wires SGLang engine pods to the managed LMCache backend a
+// CacheBackend{type: LMCache} provisions, for the (sglang, LMCache) pair. It
+// mirrors the vLLM+LMCache adapter (pkg/adapters/runtime): the lmcache-server
+// and kvevent-subscriber sidecar rendering are shared engine-agnostically (the
+// server is the same lm:// server and the subscriber is one binary
+// parameterised per engine), and only the engine-side launch wire differs —
+// SGLang turns LMCache on with --enable-lmcache + LMCACHE_USE_EXPERIMENTAL,
+// not vLLM's --kv-transfer-config (see enginewire.InjectSGLangLMCache).
+type adapter struct {
+	// subscriberImage is the image the kvevent-subscriber sidecar runs.
+	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
+	// returns nil — so an unconfigured controller install doesn't push engine
+	// pods into ImagePullBackOff on a nonexistent default image.
+	subscriberImage string
+	// policyServerGRPCAddress overrides the default in-cluster Service DNS the
+	// sidecar dials to ReportCacheState. Empty falls back to
+	// [runtimeadapter.DefaultPolicyServerGRPCAddress].
+	policyServerGRPCAddress string
+}
+
+// NewAdapter returns the runtime adapter for the (sglang, LMCache) pair. The
+// optional [runtimeadapter.Option] helpers let the controller pin the
+// subscriber sidecar's image + policy-server target — the same options
+// cmd/controller passes to runtime.DefaultRegistry for the vLLM adapter, so
+// the SGLang subscriber sidecar auto-attaches with identical operator wiring.
+//
+// Wire it into the shared [runtimeadapter.Registry] in cmd/controller and both
+// webhook handlers' nil-Registry fallbacks alongside the vLLM+LMCache and
+// External adapters: this package imports its parent pkg/adapters/runtime, so
+// it cannot live inside runtime.DefaultRegistry without an import cycle (same
+// reason as the External adapter).
+func NewAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
+	var cfg runtimeadapter.Options
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return adapter{
+		subscriberImage:         cfg.SubscriberImage,
+		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
+	}
+}
+
+// Supports matches SGLang engines against an LMCache CacheBackend. Every other
+// (runtime, backend) combination is left for another adapter — vLLM+LMCache,
+// the External passthrough, or a future SGLang+Mooncake adapter — and an
+// unsupported pair surfaces as ErrNoAdapter at admission.
+func (adapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
+	if cache == nil {
+		return false
+	}
+	return runtime == runtimeadapter.RuntimeSGLang && cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+}
+
+// SupportedPairs lets the registry surface this adapter's canonical pair in the
+// "no adapter supports the (engine, backend) pair" admission error so an
+// operator who mistypes the engine or backend sees sglang/LMCache as a
+// candidate.
+func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
+	return []runtimeadapter.SupportedPair{
+		{Runtime: runtimeadapter.RuntimeSGLang, Backend: cachev1alpha1.CacheBackendTypeLMCache},
+	}
+}
+
+// ResolveCacheServer renders the standalone LMCache server, delegating to the
+// engine-agnostic [runtimeadapter.ResolveLMCacheServer] shared with the vLLM
+// adapter — the lmcache-server is identical regardless of which engine
+// connects (the engine reaches it at lm://<svc>:<port>).
+func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return runtimeadapter.ResolveLMCacheServer(cache)
+}
+
+// InjectEngineConfig wires the SGLang engine pod to the resolved cache endpoint
+// via SGLang's LMCache launch surface (--enable-lmcache + LMCACHE_* env), merging
+// with the pod template's existing args/env. See enginewire.InjectSGLangLMCache
+// for why the env set differs from vLLM's (no VLLM_USE_V1 / PYTHONHASHSEED).
+func (adapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	return enginewire.InjectSGLangLMCache(pod, endpoint, cache)
+}
+
+// InjectRouterConfig is a no-op for LMCache: the topology has no router
+// component the controller wires. Returning nil keeps the interface contract
+// satisfied so a Registry caller can blindly invoke both Inject* paths without
+// branching on backend type — per
+// [runtimeadapter.KVCacheRuntimeAdapter.InjectRouterConfig]: "backends without
+// a router component should return nil without touching pod."
+func (adapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	_ = pod
+	_ = endpoint
+	_ = cache
+	return nil
+}
+
+// ObservationSidecar returns the kvevent-subscriber container the Pod webhook
+// appends to an SGLang engine pod so its KV-cache events flow to the policy
+// server. It delegates to the shared [runtimeadapter.RenderSubscriberSidecar],
+// pinning the SGLang-specific knobs: --hash-scheme=sglang (so the index keeps
+// SGLang prefixes disjoint from vLLM's), SGLang's ZMQ PUB port, and
+// --ignore-block-removed=true (LMCache is an L2 tier that retains blocks after
+// the engine evicts them from GPU — forwarding the eviction would drop a hint
+// the replica can still cheaply serve). The shipped subscriber binary decodes
+// SGLang's KV-event stream unchanged because SGLang emits the same msgspec
+// BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does.
+func (a adapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
+		Image:              a.subscriberImage,
+		ServerAddr:         a.policyServerGRPCAddress,
+		Cache:              cache,
+		Pod:                pod,
+		HashScheme:         subscriberHashScheme,
+		EngineZMQPortStr:   defaultEngineZMQPortStr,
+		IgnoreBlockRemoved: true,
+	})
+}
+
+// ReservedArgs returns the engine args this adapter injects that the LMCache
+// integration cannot function without. The validating webhook blocks an
+// spec.integration.engineOverrides entry that overrides or suppresses any of
+// these so the operator cannot silently un-wire the connector.
+//
+//   - "--enable-lmcache" is the SGLang flag that turns the LMCache connector on
+//     at startup; suppressing it means no LMCache wiring at all.
+//
+// (Distinct from the vLLM adapter, which reserves --kv-transfer-config — the
+// two engines turn LMCache on through different launch surfaces.)
+func (adapter) ReservedArgs() []string {
+	return []string{enginewire.SGLangEnableLMCacheArg}
+}
+
+// ReservedEnv returns the env var names this adapter injects that the LMCache
+// integration cannot function without:
+//
+//   - LMCACHE_REMOTE_URL is the address of the rendered cache server; an
+//     override re-points the engine at a different cache than the CR resolved
+//     to.
+//   - LMCACHE_USE_EXPERIMENTAL gates SGLang's experimental LMCache path; without
+//     it "True" --enable-lmcache does not engage the connector.
+//   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the pod;
+//     an override would silently desync the pod from the CR contract.
+//
+// Unlike the vLLM adapter, VLLM_USE_V1 and PYTHONHASHSEED are NOT reserved —
+// they are not injected for SGLang at all (no vLLM v1 codepath; SGLang's
+// sha256-based prefix hashing does not depend on PYTHONHASHSEED). The LMCACHE_*
+// perf/mode tunables (chunk size / serde / local-CPU knobs) are likewise NOT
+// reserved.
+func (adapter) ReservedEnv() []string {
+	return []string{
+		enginewire.EnvLMCacheRemoteURL,
+		enginewire.EnvLMCacheUseExperimental,
+		enginewire.EnvInferenceCacheFailOpen,
+	}
+}
+
+// EngineContainerName returns the canonical name of the SGLang engine container
+// the adapter mutates. The pod webhook uses this to scope engineOverrides edits
+// to the same container InjectEngineConfig writes to — overrides land on the
+// engine, not on user-attached sidecars.
+func (adapter) EngineContainerName() string { return enginewire.SGLangEngineContainerName }
+
+// Compile-time assertion: the adapter implements the full C5 interface.
+var _ runtimeadapter.KVCacheRuntimeAdapter = adapter{}

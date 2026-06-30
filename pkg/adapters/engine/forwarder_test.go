@@ -72,7 +72,15 @@ func runReporterWindow(t *testing.T, window time.Duration, batches ...*EventBatc
 
 // runReporterWithOpts is the most general harness; tests that need to set
 // extra ReporterOptions (e.g. WithIgnoreBlockRemoved) pass them through.
+// It uses the default vLLM testConfig(); runReporterCfg lets a test pick a
+// different identity (e.g. a SGLang config with HashScheme="sglang").
 func runReporterWithOpts(t *testing.T, opts []ReporterOption, batches ...*EventBatch) *recordingServer {
+	return runReporterCfg(t, testConfig(), opts, batches...)
+}
+
+// runReporterCfg is runReporterWithOpts with an explicit Config so a test can
+// exercise a non-vLLM engine identity end-to-end through the Reporter.
+func runReporterCfg(t *testing.T, cfg Config, opts []ReporterOption, batches ...*EventBatch) *recordingServer {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
@@ -89,7 +97,7 @@ func runReporterWithOpts(t *testing.T, opts []ReporterOption, batches ...*EventB
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	r := NewReporter(icpb.NewInferenceCacheClient(conn), testConfig(), opts...)
+	r := NewReporter(icpb.NewInferenceCacheClient(conn), cfg, opts...)
 	rec.reporter = r
 	in := make(chan *EventBatch, len(batches))
 	for _, b := range batches {

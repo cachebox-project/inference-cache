@@ -23,6 +23,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
@@ -114,11 +115,12 @@ type CacheBackendValidator struct {
 // defaultShippingRegistry returns a Registry with every adapter the
 // production cmd/controller wiring installs: the in-package vLLM+LMCache
 // adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
-// External adapter. Centralised here so the validator's nil-Registry
-// fallback admits the same set the running controller does.
+// External and SGLang+LMCache adapters. Centralised here so the validator's
+// nil-Registry fallback admits the same set the running controller does.
 func defaultShippingRegistry() *adapterruntime.Registry {
 	r := adapterruntime.DefaultRegistry()
 	r.Register(externaladapter.NewAdapter())
+	r.Register(sglangadapter.NewAdapter())
 	return r
 }
 

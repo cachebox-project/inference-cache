@@ -1452,6 +1452,78 @@ func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
 	}
 }
 
+func TestDefaultShippingRegistryResolvesSGLangLMCache(t *testing.T) {
+	// Registration check: the real shipping registry (the set the running
+	// controller installs) must resolve the (sglang, LMCache) pair to an
+	// adapter, and surface sglang/LMCache in its SupportedPairs so admission
+	// error messages list it as a candidate. Exercises the real
+	// defaultShippingRegistry rather than a stub so a regression that drops the
+	// SGLang registration from any of the three wiring sites is caught here.
+	r := defaultShippingRegistry()
+	cb := newBackend() // type=LMCache
+	if _, err := r.Select(adapterruntime.RuntimeSGLang, cb); err != nil {
+		t.Fatalf("shipping registry does not resolve (sglang, LMCache): %v", err)
+	}
+	found := false
+	for _, p := range r.SupportedPairs() {
+		if p.Runtime == adapterruntime.RuntimeSGLang && p.Backend == cachev1alpha1.CacheBackendTypeLMCache {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("SupportedPairs missing sglang/LMCache; got %v", r.SupportedPairs())
+	}
+}
+
+func TestValidator_RuntimeAdapter_SGLangPlusLMCacheAdmitted(t *testing.T) {
+	// DoD: admission accepts (sglang, LMCache) once the adapter is registered.
+	// Runs through the real shipping registry so the test fails if the SGLang
+	// adapter is not actually wired into the validator's registry.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("sglang+LMCache rejected: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_SGLangPlusExternalRejected(t *testing.T) {
+	// The SGLang adapter supports only (sglang, LMCache) — a (sglang, External)
+	// pair must still be rejected (no adapter claims it), and the message must
+	// list sglang/LMCache among the supported candidates so the operator sees
+	// the actionable alternative.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:65432" // shape-valid External endpoint
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+
+	_, err := v.ValidateCreate(context.Background(), cb)
+	if err == nil {
+		t.Fatalf("expected (sglang, External) to be rejected")
+	}
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok {
+		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
+	}
+	var match *metav1.StatusCause
+	for i := range statusErr.Status().Details.Causes {
+		if statusErr.Status().Details.Causes[i].Field == "spec.integration.engine" {
+			match = &statusErr.Status().Details.Causes[i]
+			break
+		}
+	}
+	if match == nil {
+		t.Fatalf("no cause on spec.integration.engine; got: %+v", statusErr.Status().Details.Causes)
+	}
+	for _, want := range []string{"sglang", "External", "sglang/LMCache"} {
+		if !strings.Contains(match.Message, want) {
+			t.Errorf("rejection message missing %q; got %q", want, match.Message)
+		}
+	}
+}
+
 func TestValidator_RuntimeAdapter_VLLMPlusMooncakeRejected(t *testing.T) {
 	// Rejection path: a (vLLM, Mooncake) pair no installed adapter
 	// supports must be rejected with a message that names BOTH sides of

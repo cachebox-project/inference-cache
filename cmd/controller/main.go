@@ -23,6 +23,7 @@ import (
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -143,6 +144,16 @@ func main() {
 	// lives under pkg/adapters/runtime/external — runtime importing it
 	// would cycle. See pkg/adapters/runtime/external/doc.go.
 	adapterRegistry.Register(externaladapter.NewAdapter())
+	// SGLang+LMCache: the second-engine sibling of the vLLM+LMCache adapter.
+	// Registered here (not inside DefaultRegistry) for the same import-cycle
+	// reason as External. It needs the same subscriber-image + policy-server
+	// options the vLLM adapter got so its auto-attached kvevent-subscriber
+	// sidecar (tagged --hash-scheme=sglang) reaches the policy server with the
+	// operator's deployment wiring. See pkg/adapters/runtime/sglang/doc.go.
+	adapterRegistry.Register(sglangadapter.NewAdapter(
+		adapterruntime.WithSubscriberImage(opts.subscriberImage),
+		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
+	))
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
 	// An empty ProbeURL disables the gate — useful for local-dev runs that
