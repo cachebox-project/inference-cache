@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -119,7 +120,14 @@ func TestReporterTagsSGLangScheme(t *testing.T) {
 	// The reported prefix hashes are the in-pod content fingerprint of the
 	// tokens (same scheme-independent algorithm vLLM uses) — proving the
 	// subscriber derives + forwards routing keys from SGLang's token_ids.
+	// Assert the BYTES, not just the count: a regression that emitted the
+	// right number of wrong hashes would otherwise pass.
 	if len(gotHashes) != len(wantHashes) {
 		t.Fatalf("forwarded %d prefix hashes, want %d", len(gotHashes), len(wantHashes))
+	}
+	for i := range wantHashes {
+		if !bytes.Equal(gotHashes[i], fingerprint.Bytes(wantHashes[i])) {
+			t.Errorf("forwarded hash[%d] = %x, want content fingerprint %x", i, gotHashes[i], fingerprint.Bytes(wantHashes[i]))
+		}
 	}
 }

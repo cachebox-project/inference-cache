@@ -94,7 +94,7 @@ Limits-only shapes admit unchanged for any resource — K8s auto-populates `requ
 
 ### backendConfig keys (managed LMCache)
 
-`spec.backendConfig` is a free-form string map; the managed LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) recognizes overrides for the **standalone lmcache-server** workload it renders, and for the **engine-side env** that the [mutating Pod admission webhook](#mutating-pod-webhook-engine-wiring) injects into vLLM pods. Defaults are overridable until they are promoted to first-class spec fields.
+`spec.backendConfig` is a free-form string map. The shared LMCache rendering (`pkg/adapters/runtime/lmcache_shared.go`) recognizes overrides for the **standalone lmcache-server** workload both LMCache adapters render, and each engine adapter (`pkg/adapters/runtime/vllm_lmcache.go` for vLLM, `pkg/adapters/runtime/sglang` for SGLang) recognizes the **engine-side env** the [mutating Pod admission webhook](#mutating-pod-webhook-engine-wiring) injects into its engine pods. Defaults are overridable until they are promoted to first-class spec fields.
 
 Server-side (consumed by `ResolveCacheServer` when rendering the cache-server pod):
 
@@ -155,7 +155,7 @@ The **same silent store-failure signature can also come from an under-provisione
 
 Because of this:
 
-- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `pkg/adapters/runtime/vllm_lmcache.go`.)
+- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `pkg/adapters/runtime/lmcache_shared.go`.)
 - **Pin both sides.** When an operator overrides `serverImage`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest on `serverImage`.
 - IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus the pinned default; runtime detection / a tier-2 health signal is a separate follow-up.
 

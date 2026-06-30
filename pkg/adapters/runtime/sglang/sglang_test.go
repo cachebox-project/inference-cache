@@ -409,6 +409,12 @@ func TestSGLangObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testing.T)
 	if err := fs.Parse(c.Args); err != nil {
 		t.Fatalf("rendered sidecar args rejected by subscriber FlagSet: %v\nargs = %v", err, c.Args)
 	}
+	// Belt-and-suspenders: parse a control case that should fail, so the
+	// FlagSet isn't silently accepting unknown flags (rules out a tautology
+	// if someone passes the wrong FlagSet mode).
+	if err := fs.Parse(append(c.Args, "--definitely-not-a-real-flag=x")); err == nil {
+		t.Fatalf("control: FlagSet must reject unknown flag --definitely-not-a-real-flag")
+	}
 }
 
 func TestSGLangObservationSidecarHonoursOptions(t *testing.T) {

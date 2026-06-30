@@ -98,9 +98,9 @@ type EngineInjector struct {
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
 	// nil falls back to [adapterruntime.DefaultRegistry] plus the External
-	// adapter (registered explicitly because the External package lives in
-	// a subpackage DefaultRegistry can't import without a cycle). Mirrors
-	// the production cmd/controller wiring so a bare `EngineInjector{}`
+	// and SGLang+LMCache adapters (registered explicitly because those
+	// subpackages can't be imported by DefaultRegistry without a cycle).
+	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
 	// doesn't silently fail-open on External CRs that the running webhook
 	// would have wired.
 	Registry *adapterruntime.Registry

@@ -102,13 +102,13 @@ type CacheBackendValidator struct {
 	// Registry resolves the runtime adapter for a (runtime, backend) pair
 	// at admission time. A nil Registry falls back to
 	// [defaultShippingRegistry], which mirrors the production cmd/controller
-	// wiring: [adapterruntime.DefaultRegistry] plus the External adapter
-	// (registered explicitly because the External package lives in a
-	// subpackage that DefaultRegistry can't import without a cycle). The
+	// wiring: [adapterruntime.DefaultRegistry] plus the External and
+	// SGLang+LMCache adapters (registered explicitly because those
+	// subpackages can't be imported by DefaultRegistry without a cycle). The
 	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
 	// (engine, backend) pair the running controller supports, including
-	// External — so admission doesn't silently reject an otherwise-valid
-	// External CR just because the caller forgot to pass a registry.
+	// External and SGLang+LMCache — so admission doesn't silently reject an
+	// otherwise-valid CR just because the caller forgot to pass a registry.
 	Registry *adapterruntime.Registry
 }
 
@@ -182,8 +182,8 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
-// [defaultShippingRegistry] (DefaultRegistry plus the External adapter),
-// mirroring cmd/controller's production wiring so a zero-value validator
+// [defaultShippingRegistry] (DefaultRegistry plus the External and
+// SGLang+LMCache adapters), mirroring cmd/controller's production wiring so a zero-value validator
 // sees the same adapter set the running controller does. cmd/controller
 // threads the same instance the reconciler + pod webhook receive so all
 // three layers agree on what's supported.
