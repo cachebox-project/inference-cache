@@ -228,11 +228,27 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 			Message:            "seeded prior-Offload kernel verdict",
 			ObservedGeneration: seedManaged.Generation,
 		})
+		// Also seed a stale managed-only EngineCompatibility verdict (as a prior
+		// Offload generation would publish when an injected engine crash-looped
+		// after the connector was wired). Events-only injects no connector, so the
+		// flip must shed this too — otherwise it strands a connector-incompatibility
+		// advisory on a backend that never wires a connector.
+		meta.SetStatusCondition(&seedManaged.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeEngineCompatibility,
+			Status:             metav1.ConditionFalse,
+			Reason:             reasonInjectedEngineCrashLooping,
+			Message:            "seeded prior-Offload incompatibility verdict",
+			ObservedGeneration: seedManaged.Generation,
+		})
 		if err := k8s.Status().Patch(ctx, seedManaged, client.MergeFrom(beforeSeed)); err != nil {
-			t.Fatalf("seed EngineKernelsHealthy: %v", err)
+			t.Fatalf("seed managed-only conditions: %v", err)
 		}
-		if c := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeEngineKernelsHealthy); c == nil {
+		seeded := getBackend(t, r, "cache", ns).Status.Conditions
+		if c := findCondition(seeded, conditionTypeEngineKernelsHealthy); c == nil {
 			t.Fatalf("EngineKernelsHealthy seed did not take; want present before the flip")
+		}
+		if c := findCondition(seeded, conditionTypeEngineCompatibility); c == nil {
+			t.Fatalf("EngineCompatibility seed did not take; want present before the flip")
 		}
 
 		// Flip the live object to EventsOnly. (Validation admits this: type is
@@ -265,6 +281,9 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 		if c := findCondition(got.Status.Conditions, conditionTypeT2Degraded); c != nil {
 			t.Fatalf("post-flip T2Degraded = %+v, want absent", c)
+		}
+		if c := findCondition(got.Status.Conditions, conditionTypeEngineCompatibility); c != nil {
+			t.Fatalf("post-flip EngineCompatibility = %+v, want absent (events-only sheds the managed-only incompatibility advisory)", c)
 		}
 	})
 }

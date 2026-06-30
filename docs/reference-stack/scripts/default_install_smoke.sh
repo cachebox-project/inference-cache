@@ -1480,6 +1480,73 @@ if [ -n "$t2_status" ]; then
 fi
 log "T2Degraded absent until tier-2 is exercised (no-traffic steady state)"
 
+# --- EngineCompatibility (injected-engine crash-loop) assertion -------------
+# ORDERING (do not move earlier): this phase blocks up to ~300s (180s for the
+# injected engine to reach CrashLoopBackOff + 120s for the advisory condition to
+# publish). It MUST run AFTER the KV-event-gate AwaitingFirstKVEvent assertion
+# above, NOT between matchedEnginePods=1 and that gate. The gate's
+# AwaitingFirstKVEvent window is bounded by spec.integration.firstEventTimeout
+# (defaulted to 5m and asserted as 5m above), anchored at the cache-server
+# Deployment becoming Available; the busybox engine never emits KV events, so the
+# backend deterministically flips AwaitingFirstKVEvent -> NoKVEventsObserved once
+# that 5m elapses. Running this ~300s wait before the gate assertion would burn
+# most of that 5m budget and race the gate to NoKVEventsObserved on slow CI
+# (flaky). Placed here, the gate is already banked and EngineCompatibility is
+# independent of the Ready condition, so the long wait is harmless.
+#
+# This asserts the controller surfaces an injected engine's CrashLoopBackOff as
+# the advisory EngineCompatibility condition — it does NOT validate the
+# hybrid-attention incompatibility *cause* (a real hybrid model would need a
+# GPU). The condition reports the generic crash-loop observation; the root cause
+# is verified out-of-band via engine logs. The busybox stand-in
+# (SAMPLE_ENGINE_IMAGE) CANNOT run `vllm serve`, so its injected engine
+# container lands in CrashLoopBackOff — which is all this assertion needs: it
+# exercises the controller's crash-loop heuristic, not the connector-versus-
+# hybrid-attention diagnosis. We must NOT mutate the qwen-engine Deployment
+# here: a later phase cascade-restarts it to assert status.observedServerInstance
+# advances, and a command override would stick and break that check. So we only
+# wait for the natural crash-loop and assert the advisory
+# EngineCompatibility=False/InjectedEngineCrashLooping condition surfaces
+# (instead of a silent crash-loop). The controller does NOT watch engine pods
+# (no informer, by design), so we poke the CacheBackend to drive the reconcile
+# that reads them.
+log "asserting EngineCompatibility surfaces on the crash-looping injected engine"
+deadline=$(($(date +%s) + 180))
+clbo=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  clbo=$(kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo \
+    -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason} {end}{end}' 2>/dev/null || true)
+  case "$clbo" in *CrashLoopBackOff*) break;; esac
+  sleep 4
+done
+case "$clbo" in
+  *CrashLoopBackOff*) : ;;
+  *) kubectl -n "$SAMPLE_NS" get pod -l app=qwen-demo -o wide || true
+     fail "engine pod did not reach CrashLoopBackOff within 180s (waiting reasons: $clbo)" ;;
+esac
+deadline=$(($(date +%s) + 120))
+ec_reason=""
+ec_status=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  kubectl -n "$SAMPLE_NS" annotate cb qwen-demo-cache \
+    inferencecache.io/smoke-poke="$(date +%s)" --overwrite >/dev/null 2>&1 || true
+  ec_reason=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].reason}' 2>/dev/null || true)
+  ec_status=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+    -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].status}' 2>/dev/null || true)
+  # Assert BOTH status and reason: the documented surface is
+  # EngineCompatibility=False/InjectedEngineCrashLooping. Checking the reason
+  # alone would let a regression to status=True (advisory condition inverted)
+  # slip through while the reason string still matched.
+  if [ "$ec_status" = "False" ] && [ "$ec_reason" = "InjectedEngineCrashLooping" ]; then break; fi
+  sleep 4
+done
+if [ "$ec_status" != "False" ] || [ "$ec_reason" != "InjectedEngineCrashLooping" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o jsonpath='{.status.conditions}' || true
+  fail "EngineCompatibility status=$ec_status reason=$ec_reason, want False/InjectedEngineCrashLooping after the injected engine crash-looped"
+fi
+log "EngineCompatibility=False/InjectedEngineCrashLooping surfaced on the crash-looping injected engine"
+
 # Persisted pod identity (UID is server-assigned post-admission; the
 # whole point of the engine-pod-events controller is to record the
 # Event with this UID, not the empty one a webhook-recorded Event
