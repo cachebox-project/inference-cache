@@ -453,8 +453,9 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	// or set by an attacker with pod-create RBAC) must come out of admission
 	// with those annotations STRIPPED when the webhook wired nothing —
 	// otherwise the downstream InjectedByCacheBackend event controller would
-	// fire on a pod the webhook never touched. This is the fail-open
-	// no-injection contract that finding-1's routing through failOpen restores.
+	// fire on a pod the webhook never touched. The events-only no-wiring path
+	// routes through failOpen, which strips those annotations — the same
+	// fail-open no-injection contract every other un-wired path follows.
 	const ns = "engines"
 	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb) // no subscriber image → nothing to wire
