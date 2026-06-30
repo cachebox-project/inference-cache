@@ -269,8 +269,8 @@ The cache plane has two levers — **routing** (driven by kv-events; works on an
 | Model family | Attention | Routing (T1) | Offload (T2) | Integration |
 |---|---|---|---|---|
 | Llama, Qwen3 dense, Mixtral, … | standard | ✅ | ✅ | full (connector + subscriber) |
-| Qwen3.6 / Qwen3-Next (gated-DeltaNet) | hybrid | ✅ | ❌ | events-only (subscriber, no connector) |
-| Mamba / Jamba, Falcon-H, Granite-hybrid, KDA | hybrid | ✅ | ❌ | events-only |
+| Qwen3.6 / Qwen3-Next (gated-DeltaNet) | hybrid | ✅ (manual) | ❌ | events-only — **planned**; today a hand-attached subscriber (see note below) |
+| Mamba / Jamba, Falcon-H, Granite-hybrid, KDA | hybrid | ✅ (manual) | ❌ | events-only — **planned** (as above) |
 
 A hybrid model wired with the full (connector) integration crash-loops at engine init; the controller surfaces the crash-loop as `EngineCompatibility=False/InjectedEngineCrashLooping` (above) instead of leaving it a silent CrashLoopBackOff. The condition reports the observation, not a proven cause — confirm via the engine logs (a crash-loop can also be a bad image/command/secret/OOM). When it is the connector incompatibility, a first-class events-only integration mode is planned; until it ships, run hybrid engines with the `inferencecache.io/skip-inject` annotation (routing still works via a hand-attached subscriber) or without the connector.
 

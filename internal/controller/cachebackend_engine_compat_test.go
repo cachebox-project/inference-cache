@@ -75,6 +75,8 @@ func TestDetectEngineConnectorCrashLoop(t *testing.T) {
 			enginePodWithContainers("e1", ns, matchedSelector, injectedBy, testBackendUID, run("vllm"), clbo("istio-proxy")), false},
 		{"engine crash-looping with a healthy sidecar is flagged",
 			enginePodWithContainers("e1", ns, matchedSelector, injectedBy, testBackendUID, clbo("vllm"), run(sidecar)), true},
+		{"injected engine named other than the adapter default (subscriber appended) is still flagged",
+			enginePodWithContainers("e1", ns, matchedSelector, injectedBy, testBackendUID, clbo("my-engine"), run(sidecar)), true},
 		{"ImagePullBackOff is not the connector-incompatibility signature",
 			enginePodWithContainers("e1", ns, matchedSelector, injectedBy, testBackendUID, ctrState{"vllm", "ImagePullBackOff"}), false},
 	}

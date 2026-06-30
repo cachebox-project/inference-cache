@@ -115,11 +115,17 @@ func (r *CacheBackendReconciler) engineContainerName(backend *cachev1alpha1.Cach
 // engineContainerStatus returns the status of the engine container the connector
 // was injected into, mirroring the webhook's overrideTargetIndex targeting:
 // match by the adapter-declared engine container name, and — only when that name
-// is set but absent from the pod — fall back to the sole container of a
-// single-container pod. Returns nil when the engine container cannot be
+// is set but absent from the pod — fall back to the sole ENGINE container of an
+// otherwise single-container pod. Returns nil when the engine container cannot be
 // identified, so an unrelated crash-looping sidecar (service-mesh proxy, user
-// logging sidecar, kvevent-subscriber) is never misread as the connector
-// incompatibility signature.
+// logging sidecar) is never misread as the connector incompatibility signature.
+//
+// The fallback counts containers EXCLUDING our injected kvevent-subscriber: the
+// webhook injects into a lone arbitrarily-named engine container and THEN appends
+// the subscriber, so the persisted pod has two containers even though it had one
+// engine container at injection time. Counting raw containers would miss it and
+// let a real injected engine (named other than the adapter default) crash-loop
+// without ever surfacing EngineCompatibility.
 func engineContainerStatus(pod *corev1.Pod, engineContainerName string) *corev1.ContainerStatus {
 	if engineContainerName == "" {
 		return nil
@@ -129,8 +135,17 @@ func engineContainerStatus(pod *corev1.Pod, engineContainerName string) *corev1.
 			return &pod.Status.ContainerStatuses[i]
 		}
 	}
-	if len(pod.Spec.Containers) == 1 && len(pod.Status.ContainerStatuses) == 1 {
-		return &pod.Status.ContainerStatuses[0]
+	var engine *corev1.ContainerStatus
+	nonSidecar := 0
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == adapterruntime.SubscriberContainerName {
+			continue
+		}
+		engine = &pod.Status.ContainerStatuses[i]
+		nonSidecar++
+	}
+	if nonSidecar == 1 {
+		return engine
 	}
 	return nil
 }
