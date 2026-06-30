@@ -14,8 +14,9 @@ import (
 // vLLM+Mooncake canonical defaults. These template a standalone Mooncake store
 // "master" pod that vLLM engines connect to via
 // LMCACHE_REMOTE_URL=mooncakestore://<svc>:<rpc-port>. Mooncake is integrated
-// as an LMCache *remote backend* (the durable, network-addressable store that
-// PROJECT_CONTEXT designates the shared/scalable path): the engine runs the
+// as an LMCache *remote backend* (the durable, network-addressable store the
+// project designates the shared/scalable path — see
+// docs/design/lmcache-server-persistence.md): the engine runs the
 // ordinary LMCache connector — see [enginewire.InjectVLLMMooncake] — pointed at
 // the mooncakestore:// scheme, so the only thing that distinguishes this
 // adapter from the vLLM+LMCache adapter on the engine side is the remote-URL
@@ -110,8 +111,9 @@ const (
 // it cannot write a file into a user-owned engine container. Routing the
 // controller-resolved master endpoint through LMCACHE_REMOTE_URL=
 // mooncakestore://… is the only path that lets status.endpoint reach the engine
-// via injection alone, and it matches the locked PROJECT_CONTEXT decision that
-// Mooncake "fits the lm://-style RemoteBackend wire". The native connector
+// via injection alone, and it matches the locked design decision that Mooncake
+// "fits the lm://-style RemoteBackend wire" (docs/design/lmcache-server-persistence.md).
+// The native connector
 // remains available to operators who pre-bake their own config file; this
 // adapter targets the auto-wired path.
 type vllmMooncakeAdapter struct {
