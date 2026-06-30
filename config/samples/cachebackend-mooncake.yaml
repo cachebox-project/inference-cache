@@ -54,7 +54,11 @@ spec:
     model: meta-llama/Meta-Llama-3-8B-Instruct
     # Matches the pinned adapter default (the only version tag published on
     # Docker Hub, version-aligned with mooncake-transfer-engine 0.3.11.post1
-    # on PyPI). Pin to an `@sha256:` digest for non-local runs.
+    # on PyPI). The image's entrypoint/ports are pinned-but-not-yet-cluster-
+    # validated (tracked reference-stack follow-up) — a wrong image surfaces
+    # as the CacheBackend staying Ready=False (the RPC readiness probe never
+    # passes), never a silent miss, and the cache is fail-open regardless.
+    # Pin to an `@sha256:` digest for non-local runs.
     serverImage: kvcacheai/mooncake:0.3.11.post1
     # Override `serverCommand` to change the master's flags (a different
     # metadata backend, HA mode, etc.). The default launches the master with

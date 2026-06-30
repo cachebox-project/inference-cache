@@ -43,8 +43,10 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  vLLM/LMCache returns the `kvevent-subscriber` container spec; the reference adapter and
-  any adapter for `type: External` return `(nil, nil)`.
+  The vLLM/LMCache and vLLM/Mooncake adapters both return the `kvevent-subscriber`
+  container spec (via the shared `buildKVEventSubscriber` — the KV-event stream is
+  vLLM's, independent of the L2 store); the reference adapter and any adapter for
+  `type: External` return `(nil, nil)`.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
@@ -122,9 +124,10 @@ entry until its freshness TTL expires; a stale entry yields a cache miss
 The subscriber binary exposes `--ignore-block-removed` (default off, for
 backward compatibility with single-tier deployments). When set the reporter
 drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
-`BlockStored` still flow normally. The vLLM/LMCache adapter
-(`pkg/adapters/runtime/vllm_lmcache.go`) sets the flag unconditionally in the
-sidecar it renders — that adapter only ever stands up a vLLM + LMCache pair,
+`BlockStored` still flow normally. The shared `buildKVEventSubscriber` helper
+(`pkg/adapters/runtime/kvevent_subscriber.go`) sets the flag unconditionally,
+so both adapters that use it — vLLM/LMCache and vLLM/Mooncake — render it: each
+stands up a vLLM engine in front of an L2 store (LMCache or a Mooncake store),
 so the L2 tier is always present and the flag is always the right choice.
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off.

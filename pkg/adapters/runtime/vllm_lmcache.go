@@ -405,7 +405,8 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 // Package-local aliases to the engine-wire helpers. Kept so the in-place
 // unit tests in vllm_lmcache_test.go continue to assert on the wire format
 // through the canonical adapter API surface. New tests for the shared wire
-// (LMCache + External) belong in pkg/adapters/runtime/internal/enginewire.
+// (LMCache, Mooncake, and External all speak the LMCache connector) belong in
+// pkg/adapters/runtime/internal/enginewire.
 const defaultEngineKVTransferConfigArg = "--kv-transfer-config"
 
 var (
