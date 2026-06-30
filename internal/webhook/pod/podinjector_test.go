@@ -121,6 +121,29 @@ func vllmEnginePod(name string, labels map[string]string) *corev1.Pod {
 	}
 }
 
+// sglangEnginePod builds a pod whose engine container is named "sglang" — the
+// SGLang adapter's EngineContainerName — so the webhook routes it through the
+// SGLang+LMCache injection path. (Literal "sglang" rather than a re-export: the
+// enginewire constant lives in an internal package this test can't import.)
+func sglangEnginePod(name string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "sglang",
+				Image: "lmsysorg/sglang:latest",
+				Env: []corev1.EnvVar{
+					{Name: "USER_FLAG", Value: "preserved"},
+				},
+				Args: []string{"--model-path", "Qwen/Qwen2.5-0.5B-Instruct"},
+			}},
+		},
+	}
+}
+
 // readyCacheBackend returns a CacheBackend with status.endpoint published,
 // a vLLM integration, and an EngineSelector keyed on a single label.
 // The metadata.uid is set to a stable fake so the webhook's
@@ -209,6 +232,54 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	}
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+}
+
+func TestHandle_MatchAndInject_SGLang(t *testing.T) {
+	// Covers the production pod-webhook selection path for (sglang, LMCache):
+	// the nil-registry fallback now includes the SGLang adapter, so a SGLang
+	// engine pod matching a (sglang, LMCache) CacheBackend is injected with
+	// SGLang's LMCache wire (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL +
+	// LMCACHE_REMOTE_URL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
+	// PYTHONHASHSEED. Without the SGLang registration in the fallback, the
+	// webhook would fail-open and the pod would boot unwired.
+	const ns = "engines"
+	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
+	h := newHandler(t, cb)                // nil registry → DefaultRegistry + External + SGLang fallback
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatalf("expected JSON patches (SGLang engine config injection), got none")
+	}
+
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
+	mustHaveArgFlag(t, mutated, "--enable-lmcache")
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, "LMCACHE_USE_EXPERIMENTAL", "True")
+
+	// Proof it went through the SGLang path, not vLLM's: the vLLM-only connector
+	// arg and env must be absent.
+	for _, c := range mutated.Spec.Containers {
+		if c.Name != "sglang" {
+			continue
+		}
+		for _, a := range c.Args {
+			if a == "--kv-transfer-config" {
+				t.Fatalf("SGLang pod got vLLM's --kv-transfer-config: %v", c.Args)
+			}
+		}
+		for _, e := range c.Env {
+			if e.Name == adapterruntime.EnvVLLMUseV1 || e.Name == adapterruntime.EnvPythonHashSeed {
+				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
+			}
+		}
+	}
 }
 
 func TestHandle_AppendsObservationSidecar(t *testing.T) {

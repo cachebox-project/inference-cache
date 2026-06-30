@@ -334,9 +334,11 @@ type CacheBackendIntegrationSpec struct {
 	// dependency, which is loud and visible via a Warning Event on the
 	// owning CacheBackend.
 	//
-	// The flag is plumbed by the engine adapter; per-request fail-open
-	// behavior at the engine level is owned by vLLM+LMCache (the connector
-	// honors this flag).
+	// The flag is plumbed by the engine adapter as INFERENCECACHE_FAIL_OPEN
+	// (both shipping LMCache adapters — vLLM+LMCache and SGLang+LMCache —
+	// inject it). Per-request fail-open enforcement at the engine level is the
+	// engine/connector's responsibility; the cache plane surfaces the bit so
+	// the engine can honor it.
 	// +optional
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`

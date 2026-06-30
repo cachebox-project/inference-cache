@@ -103,7 +103,7 @@ Server-side (consumed by `ResolveCacheServer` when rendering the cache-server po
 | `serverImage` | `lmcache/standalone:v0.4.7` *(pinned, non-floating; see version-alignment note below)* | Container image for the standalone lmcache-server. The default is pinned to a specific version — **not** a floating `:latest` — because the server's wire protocol must match the lmcache *client* compiled into the engine; a drifting `:latest` silently breaks tier-2 offload (see [LMCache server / client version alignment](#lmcache-server--client-version-alignment)). Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
 
-Engine-side (consumed by `InjectEngineConfig` when the webhook wires a vLLM pod to the cache):
+Engine-side (consumed by `InjectEngineConfig` when the webhook wires a managed-LMCache engine pod to the cache). The `LMCACHE_*` tunables below are shared by both LMCache adapters (vLLM and SGLang); the engine-on flag differs per engine (vLLM's `--kv-transfer-config` vs. SGLang's `--enable-lmcache` — see [SGLang engine support](#sglang-engine-support--the-sglang-lmcache-pair)):
 
 | Key | Default | Purpose |
 |---|---|---|
