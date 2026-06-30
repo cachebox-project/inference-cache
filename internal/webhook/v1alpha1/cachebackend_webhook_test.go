@@ -388,6 +388,34 @@ func TestValidator_EndpointOnManagedTypeBlankAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_InvalidKernelCheckAnnotationRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+
+	// A typo for "strict" would silently fall back to "auto" (report-only) and
+	// disable the fail-closed gate — reject it at admission instead.
+	bad := newBackend()
+	bad.Annotations = map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: "strcit"}
+	requireInvalidWithCause(t, v, bad, "metadata.annotations[inferencecache.io/lmcache-kernel-check]", "must be one of")
+
+	// Every known value — and an unset annotation — is accepted.
+	for _, val := range []string{
+		adapterruntime.KernelCheckModeAuto,
+		adapterruntime.KernelCheckModeReportOnly,
+		adapterruntime.KernelCheckModeStrict,
+		adapterruntime.KernelCheckModeOff,
+		"", // explicit empty == unset
+	} {
+		ok := newBackend()
+		ok.Annotations = map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: val}
+		if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
+			t.Fatalf("valid kernel-check annotation %q rejected: %v", val, err)
+		}
+	}
+	if _, err := v.ValidateCreate(context.Background(), newBackend()); err != nil {
+		t.Fatalf("unset kernel-check annotation rejected: %v", err)
+	}
+}
+
 func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
 	// limits.memory < requests.memory makes the operator's intent
 	// impossible to satisfy at scheduling time and is the canonical
