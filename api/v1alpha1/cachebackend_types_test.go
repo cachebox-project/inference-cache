@@ -9,7 +9,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -25,7 +24,6 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"type",
 		"deploymentKind",
 		"replicas",
-		"storage",
 		"autoscaling",
 		"integration",
 		"engineSelector",
@@ -40,8 +38,9 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	}
 
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
-	// health was removed in this PR. Both are guarded by requireNoProperty checks below.
-	for _, field := range []string{"endpoint", "capacity", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
+	// health was removed in an earlier change; capacity is removed in this PR.
+	// All three are guarded by requireNoProperty checks below.
+	for _, field := range []string{"endpoint", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -51,6 +50,17 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	// re-introduction.
 	if hasProperty(statusSchema, "health") {
 		t.Fatalf("status.health is present in CRD schema; it must be removed in favour of status.conditions[Ready]")
+	}
+	// spec.storage.pvc + status.capacity were retired: the lm:// LMCache
+	// server we provision is in-memory, so a local PVC cannot back it —
+	// durability is a backend choice (remote store / Mooncake), not a
+	// generic volume knob (see docs/design/lmcache-server-persistence.md).
+	// Guard against accidental re-introduction.
+	if hasProperty(specSchema, "storage") {
+		t.Fatalf("spec.storage is present in CRD schema; it was retired (durability is a backend choice — see docs/design/lmcache-server-persistence.md)")
+	}
+	if hasProperty(statusSchema, "capacity") {
+		t.Fatalf("status.capacity is present in CRD schema; it was retired alongside spec.storage")
 	}
 
 	requireNoEnum(t, mustProperty(t, specSchema, "type"))
@@ -81,7 +91,6 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireNoProperty(t, templateSchema, "containers")
 
 	requireNotRequired(t, specSchema, "type")
-	requireRequired(t, mustPath[map[string]any](t, specSchema, "properties", "storage", "properties", "pvc"), "size")
 	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
 	firstEventTimeoutSchema := mustPath[map[string]any](t, integrationSchema, "properties", "firstEventTimeout")
 	if got, ok := firstEventTimeoutSchema["default"].(string); !ok || got != "5m" {
@@ -168,7 +177,6 @@ func TestCacheBackendCRDPrintColumns(t *testing.T) {
 
 func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	replicas := int32(2)
-	storageClassName := "fast"
 	hitRate := "0.50"
 	t2HitRate := "0.66"
 	matchedEnginePods := int32(7)
@@ -186,12 +194,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			Type:           CacheBackendTypeLMCache,
 			DeploymentKind: CacheBackendDeploymentKindStatefulSet,
 			Replicas:       &replicas,
-			Storage: &CacheBackendStorageSpec{
-				PVC: &CacheBackendPVCSpec{
-					Size:             resource.MustParse("10Gi"),
-					StorageClassName: &storageClassName,
-				},
-			},
 			Autoscaling: &CacheBackendAutoscalingSpec{
 				MinReplicas:                 &autoscalingMin,
 				MaxReplicas:                 5,
@@ -222,7 +224,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 		},
 		Status: CacheBackendStatus{
 			Endpoint: "cache.default.svc:8080",
-			Capacity: "10Gi",
 			IndexParticipation: &CacheBackendIndexParticipation{
 				PrefixCount: 7,
 				HitRate:     &hitRate,
@@ -244,8 +245,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 
 	copied := backend.DeepCopy()
 	*backend.Spec.Replicas = 3
-	backend.Spec.Storage.PVC.Size.Add(resource.MustParse("1Gi"))
-	*backend.Spec.Storage.PVC.StorageClassName = "slow"
 	*backend.Spec.Autoscaling.MinReplicas = 4
 	backend.Spec.Autoscaling.MaxReplicas = 9
 	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
@@ -268,15 +267,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Spec.Replicas == nil || *copied.Spec.Replicas != 2 {
 		t.Fatalf("replicas was not deep-copied")
 	}
-	if copied.Spec.Storage == nil || copied.Spec.Storage.PVC == nil {
-		t.Fatalf("storage.pvc was not deep-copied")
-	}
-	if copied.Spec.Storage.PVC.Size.Cmp(resource.MustParse("10Gi")) != 0 {
-		t.Fatalf("storage.pvc.size was not deep-copied")
-	}
-	if copied.Spec.Storage.PVC.StorageClassName == nil || *copied.Spec.Storage.PVC.StorageClassName != "fast" {
-		t.Fatalf("storage.pvc.storageClassName was not deep-copied")
-	}
 	if copied.Spec.Autoscaling == nil {
 		t.Fatalf("autoscaling was not deep-copied")
 	}
@@ -288,9 +278,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Spec.Autoscaling.TargetCPUUtilizationPercent == nil || *copied.Spec.Autoscaling.TargetCPUUtilizationPercent != 70 {
 		t.Fatalf("autoscaling.targetCPUUtilizationPercent was not deep-copied")
-	}
-	if copied.Status.Capacity != "10Gi" {
-		t.Fatalf("status.capacity = %q, want 10Gi (independent copy)", copied.Status.Capacity)
 	}
 	if copied.Spec.Integration == nil {
 		t.Fatalf("integration was not deep-copied")

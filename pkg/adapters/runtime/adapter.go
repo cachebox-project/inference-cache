@@ -25,48 +25,6 @@ const (
 	RuntimeSGLang RuntimeID = "sglang"
 )
 
-// ResolvedCacheServer is what an adapter returns from [KVCacheRuntimeAdapter.ResolveCacheServer]:
-// the cache-server pod + service to render, plus an optional declaration of where the
-// server keeps persistent data. The struct return (rather than a widening tuple) lets the
-// contract grow — future fields like a metrics port or a second volume — without touching
-// every implementer and caller again.
-//
-// PodSpec and Service follow the same split the interface documents: the adapter fills the
-// backend-specific container/port details, the reconciler fills the identity-dependent
-// ObjectMeta / Selector / owner refs. A nil PodSpec+Service is valid for engine-colocated
-// backends that need no separate cache-server (the reference and External adapters).
-type ResolvedCacheServer struct {
-	// PodSpec is the cache-server pod the adapter renders, or nil when the backend
-	// needs no separate cache-server.
-	PodSpec *corev1.PodSpec
-	// Service is the cache-server Service the adapter renders, or nil when the backend
-	// needs no separate cache-server.
-	Service *corev1.Service
-	// DataVolume declares where this backend keeps persistent data, or nil when the
-	// backend has no persistent data (the ephemeral default). When non-nil AND the
-	// CacheBackend sets spec.storage.pvc, the reconciler provisions a PVC and mounts it
-	// at the declared path on the rendered cache-server container(s); when nil, no PVC
-	// is provisioned regardless of spec.storage.pvc. The adapter is the only layer that
-	// knows where its data lives, so it — not the reconciler — owns this declaration.
-	// Future backends (SGLang HiCache, Mooncake) just declare a different mount path.
-	DataVolume *AdapterDataVolume
-}
-
-// AdapterDataVolume names the volume + in-container path where a backend's persistent
-// data lives. The reconciler provisions a PVC owner-referenced to the CacheBackend and
-// merges a corev1.Volume (PVC-backed) + corev1.VolumeMount at MountPath into the rendered
-// cache-server container(s). Keeping VolumeName stable across reconciles is the adapter's
-// responsibility — it is the key the reconciler matches on when reconciling the live pod.
-type AdapterDataVolume struct {
-	// VolumeName is the corev1.Volume / VolumeMount Name the reconciler uses for the
-	// PVC-backed volume (e.g. "cache-data"). Must be a stable DNS-1123 label.
-	VolumeName string
-	// MountPath is the in-container directory the PVC is mounted at (e.g.
-	// "/var/lib/lmcache"). For backends that spill KV to disk, this MUST match the
-	// directory the server writes to so the persistent volume actually backs the data.
-	MountPath string
-}
-
 // KVCacheRuntimeAdapter is the controller-side plug-point for wiring an
 // inference engine to a cache backend. The interface mirrors OEP-0010
 // (KVCacheRuntimeAdapter), with parameters adapted to this repo's types: the
@@ -83,25 +41,20 @@ type KVCacheRuntimeAdapter interface {
 	Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 
 	// ResolveCacheServer renders the desired cache-server pod and service for
-	// this backend, when one is required, plus an optional declaration of where
-	// the server keeps persistent data (see [ResolvedCacheServer]). Returning a
-	// [ResolvedCacheServer] with nil PodSpec+Service (or returning nil) is valid
-	// for backends that colocate with the engine (e.g. an in-process connector)
-	// and need no separate cache-server.
+	// this backend, when one is required. Returning (nil, nil, nil) is valid
+	// for backends that colocate with the engine (e.g. an in-process
+	// connector) and need no separate cache-server.
 	//
 	// The split between adapter and reconciler is deliberate:
 	//   - The adapter fills PodSpec.Containers / PodSpec.Volumes and
 	//     Service.Spec.Ports / Service.Spec.Type — the backend-specific
-	//     details that don't depend on the CacheBackend's identity — and
-	//     declares its DataVolume (where its persistent data lives).
+	//     details that don't depend on the CacheBackend's identity.
 	//   - The reconciler fills ObjectMeta (name, namespace, labels, owner
 	//     refs), Service.Spec.Selector, replicas, and the workload kind
-	//     (Deployment vs StatefulSet) — the identity-dependent fields — and
-	//     provisions/mounts the PVC for the declared DataVolume when
-	//     spec.storage.pvc is set.
+	//     (Deployment vs StatefulSet) — the identity-dependent fields.
 	// An adapter rendering the same containers for two CacheBackends in
 	// different namespaces should not have to learn about names.
-	ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*ResolvedCacheServer, error)
+	ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
 
 	// InjectEngineConfig mutates pod so the engine talks to the cache at
 	// endpoint. Implementations MUST merge: preserve existing containers,

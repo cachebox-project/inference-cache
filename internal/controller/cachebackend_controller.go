@@ -127,16 +127,6 @@ const (
 	eventReasonFailClosedEnabled       = "FailClosedEnabled"
 	eventReasonFailOpenRestored        = "FailOpenRestored"
 	eventReasonEngineSelectorUnmatched = "EngineSelectorUnmatched"
-	// eventReasonInvalidStorageConfiguration is the Warning fired when a
-	// persistent (spec.storage.pvc) backend asks for more than one replica —
-	// a single ReadWriteOnce PVC cannot be multi-attached. Mirrors the
-	// Ready=False reason so a transition into the gated state is narrated once.
-	eventReasonInvalidStorageConfiguration = conditionReasonInvalidStorageConfiguration
-	// eventReasonOrphanedPVCRetained is the Warning fired when spec.storage.pvc
-	// is removed but the owner-referenced PVC is retained (adopt-and-keep) so
-	// the operator knows the storage was kept, not silently dropped. Event
-	// aggregation collapses the per-reconcile repeats into one event.
-	eventReasonOrphanedPVCRetained = "OrphanedPVCRetained"
 )
 
 // Condition reasons published on a CacheBackend's Ready condition. Stable
@@ -274,7 +264,6 @@ func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Du
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -377,18 +366,6 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // shed any previously managed workload; LMCache (Phase 1) templates a
 // Deployment + Service.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	// Adopt-and-keep visibility: if spec.storage.pvc is absent but we still own a
-	// data PVC from a prior persistent generation, warn (once). Done here, before
-	// the type/kind routing, so the warning fires regardless of how a now
-	// storage-less backend is dispatched — External, StatefulSet/unmanaged, an
-	// unsupported (runtime, type) pair, or managed-ephemeral all otherwise bypass
-	// the per-path provisioning logic. The PVC itself is retained by its owner
-	// reference (reclaimed only on CR delete); warnRetainedPVC no-ops when no
-	// owned PVC exists, so this is a cheap cached Get on the common path.
-	if backend.Spec.Storage == nil || backend.Spec.Storage.PVC == nil {
-		r.warnRetainedPVC(ctx, backend)
-	}
-
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		// A backend switched from a managed type to External must shed its workload.
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
@@ -486,7 +463,6 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// at the consumer.
 		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
 		backend.Status.Endpoint = endpoint
-		backend.Status.Capacity = ""
 		// Clear the cache-server-instance latch — External backends
 		// have no controller-managed cache-server pods, and
 		// cleanupOwnedWorkload above has just deleted any prior
@@ -580,7 +556,6 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
-		backend.Status.Capacity = ""
 		// Clear the cache-server-instance latch — cleanupOwnedWorkload
 		// above has just deleted any prior managed Deployment and we
 		// no longer provision one, so a retained UID would advertise
@@ -609,11 +584,11 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 // to apply churn. Any apply error is surfaced after the status pass so
 // controller-runtime requeues.
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
-	resolved, err := adapter.ResolveCacheServer(backend)
+	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("resolve cache server for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
-	if resolved == nil || resolved.PodSpec == nil || resolved.Service == nil {
+	if podSpec == nil || svcSpec == nil {
 		// An adapter that genuinely needs no cache-server (e.g. an
 		// engine-colocated backend) is a valid future case. For Phase 1 it
 		// shouldn't happen for managed types — surface as unmanaged.
@@ -621,37 +596,6 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
-	podSpec := resolved.PodSpec
-	svcSpec := resolved.Service
-
-	// Persistent storage: provision a PVC and mount it when the adapter declares
-	// a data volume AND the operator asked for PVC-backed storage. The adapter
-	// owns the volume name + mount path (it knows where its data lives); the
-	// controller owns PVC identity, owner-ref GC, and the mutable-field reconcile.
-	capacity := ""
-	if resolved.DataVolume != nil && backend.Spec.Storage != nil && backend.Spec.Storage.PVC != nil {
-		// Multi-replica gate: a single ReadWriteOnce PVC cannot be multi-attached.
-		// Refuse to provision the workload until the operator scales to 1 or
-		// drops spec.storage.pvc. The pod is not created in this state.
-		if multiReplicaRequested(backend) {
-			return r.reconcileInvalidStorage(ctx, backend)
-		}
-		pvc, pvcErr := r.applyPVC(ctx, logger, backend)
-		if pvcErr != nil {
-			return ctrl.Result{}, pvcErr
-		}
-		// Merge the PVC-backed volume + mount into the rendered cache-server pod
-		// before it is wrapped into the Deployment. The apply path already
-		// propagates podSpec.Volumes + container VolumeMounts to the live
-		// Deployment (see reconcileManagedPodSpec), so no extra apply step is
-		// needed.
-		mountDataVolume(podSpec, resolved.DataVolume, pvc.Name)
-		capacity = boundCapacity(pvc)
-	}
-	// (When spec.storage.pvc is absent the rendered pod carries no PVC volume, so
-	// the workload reverts to ephemeral on the next rollout. The adopt-and-keep
-	// Warning for a removed spec.storage.pvc is emitted in dispatch — it covers
-	// every routing outcome, not just this managed path.)
 
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
@@ -715,11 +659,11 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		endpoint = serviceEndpoint(&liveSvc)
 	}
 
-	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, capacity, &live, applyErr == nil)
+	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil)
 	// Do NOT short-circuit on statusErr — the cascade is independent
 	// recovery for stale engine sockets and must not be skipped just
 	// because the unrelated managed-status patch (matchedEnginePods,
-	// Ready / Progressing / Degraded conditions, capacity, …) hit a
+	// Ready / Progressing / Degraded conditions, …) hit a
 	// transient conflict. The cascade has its own patchStatus path
 	// for the latch field, gated separately. Capture the error and
 	// return it AFTER the cascade has run.
@@ -1000,305 +944,6 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 	return nil
 }
 
-// pvcName is the stable name of the data PVC a persistent backend provisions.
-// Derived from the CacheBackend name so it is deterministic across reconciles
-// and unique within the namespace (one shared PVC per backend on the Deployment
-// path; per-replica PVCs via StatefulSet volumeClaimTemplates are a follow-up).
-func pvcName(backend *cachev1alpha1.CacheBackend) string {
-	return backend.Name + "-data"
-}
-
-// multiReplicaRequested reports whether the backend's effective replica ceiling
-// exceeds one — the multi-attach hazard for a single ReadWriteOnce PVC, which
-// the reconciler gates (see reconcileInvalidStorage). The check mirrors the
-// controller's HPA-ownership model: when spec.autoscaling is set the HPA owns
-// the live replica count and spec.replicas is ignored for scaling (see
-// applyDeployment), so the ceiling is spec.autoscaling.maxReplicas alone — a
-// stale spec.replicas left at 3 under maxReplicas=1 is NOT a multi-attach
-// hazard and must not be gated. When autoscaling is unset, spec.replicas is the
-// ceiling. The ceiling — not the live count — is what matters: the operator's
-// intent to ever run more than one pod against the shared PVC is the hazard, and
-// admission deliberately surfaces this as Ready=False rather than rejecting
-// (per-replica PVCs via StatefulSet are a follow-up).
-func multiReplicaRequested(backend *cachev1alpha1.CacheBackend) bool {
-	if backend.Spec.Autoscaling != nil {
-		return backend.Spec.Autoscaling.MaxReplicas > 1
-	}
-	return backend.Spec.Replicas != nil && *backend.Spec.Replicas > 1
-}
-
-// applyPVC creates or updates the backend's data PVC idempotently, owned by the
-// CR so it is garbage-collected when (and only when) the CacheBackend is
-// deleted. On create it establishes the full spec; on update it reconciles only
-// the mutable field — the requested size, and only upward (k8s rejects shrink;
-// equal is a no-op). storageClassName and accessModes are immutable in k8s, so
-// a drifted class is a no-op + debug log rather than a doomed patch.
-//
-// Wrapped in RetryOnConflict because the binder writes PVC.Status during bind;
-// without retry the Get/Update inside CreateOrUpdate would race those writes.
-func (r *CacheBackendReconciler) applyPVC(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (*corev1.PersistentVolumeClaim, error) {
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: pvcName(backend), Namespace: backend.Namespace}}
-	want := backend.Spec.Storage.PVC.Size
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		_, e := controllerutil.CreateOrUpdate(ctx, r.Client, pvc, func() error {
-			// ResourceVersion is empty only when CreateOrUpdate's Get returned
-			// NotFound (we are about to Create); a Get of an existing PVC always
-			// populates it. This distinguishes create from update more reliably
-			// than CreationTimestamp (which some clients don't stamp on create).
-			if pvc.ResourceVersion == "" {
-				// First create: establish the (mostly immutable) spec.
-				pvc.Labels = podTemplateLabels(backend)
-				pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
-				pvc.Spec.Resources = corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceStorage: want},
-				}
-				// Set StorageClassName whenever the operator specified it,
-				// INCLUDING an explicit empty string: in Kubernetes "" is not
-				// "unset" — it opts out of the default StorageClass (static /
-				// no-provisioner binding). Only a nil pointer means "omit, use
-				// the cluster default".
-				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil {
-					pvc.Spec.StorageClassName = scn
-				}
-			} else {
-				// Never adopt a PVC we do not own. CreateOrUpdate's Get matched an
-				// existing object named <cb>-data; if it is not controller-owned by
-				// THIS CacheBackend it may be an operator-created PVC that merely
-				// shares the derived name. Adding our controller owner reference
-				// here would make that PVC garbage-collected when the CacheBackend
-				// is deleted — irreversible data loss. Refuse by returning an error
-				// so CreateOrUpdate makes no write; the reconcile surfaces it and
-				// requeues until the operator renames the CacheBackend or removes
-				// the conflicting PVC.
-				if !metav1.IsControlledBy(pvc, backend) {
-					return fmt.Errorf("pvc %s/%s already exists and is not owned by this CacheBackend; refusing to adopt it (rename the CacheBackend or remove the conflicting PVC)", pvc.Namespace, pvc.Name)
-				}
-				// Update: size is expandable (if the StorageClass allows it);
-				// patch the request up only — never down (k8s rejects shrink).
-				have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-				if want.Cmp(have) > 0 {
-					if pvc.Spec.Resources.Requests == nil {
-						pvc.Spec.Resources.Requests = corev1.ResourceList{}
-					}
-					pvc.Spec.Resources.Requests[corev1.ResourceStorage] = want
-				}
-				// storageClassName is immutable: a change request can't be
-				// honored by k8s, so log it at debug and leave the live class.
-				// A nil pointer means the operator did not specify a class on
-				// this edit, so there is nothing to compare.
-				if scn := backend.Spec.Storage.PVC.StorageClassName; scn != nil {
-					live := ""
-					if pvc.Spec.StorageClassName != nil {
-						live = *pvc.Spec.StorageClassName
-					}
-					if live != *scn {
-						logger.V(1).Info("ignoring spec.storage.pvc.storageClassName change (immutable in k8s)",
-							"namespace", backend.Namespace, "name", backend.Name,
-							"liveStorageClass", live, "requestedStorageClass", *scn)
-					}
-				}
-			}
-			// Re-adoption: clear the "already warned" marker (if any) left by a
-			// prior adopt-and-keep orphaning, so a future spec.storage.pvc
-			// removal warns again. delete on an absent key is a no-op.
-			delete(pvc.Annotations, annotationStorageRetainedWarned)
-			return controllerutil.SetControllerReference(backend, pvc, r.Scheme)
-		})
-		return e
-	})
-	if err != nil {
-		return nil, fmt.Errorf("apply pvc %s/%s: %w", backend.Namespace, pvcName(backend), err)
-	}
-	return pvc, nil
-}
-
-// mountDataVolume merges the PVC-backed volume + mount the adapter declared into
-// the rendered cache-server pod. The volume source is the controller-named PVC;
-// the mount path is the adapter's (it knows where its data lives). Both upsert
-// by name so re-rendering is idempotent and an out-of-band drift is corrected.
-//
-// The mount is added to every adapter-rendered container: the cache-server pod
-// template comes solely from ResolveCacheServer (sidecars are appended to ENGINE
-// pods by the pod webhook, never to this pod), so "all rendered containers" is
-// exactly the cache-server's own container(s) sharing the one data directory.
-func mountDataVolume(podSpec *corev1.PodSpec, dv *adapterruntime.AdapterDataVolume, claimName string) {
-	vol := corev1.Volume{
-		Name: dv.VolumeName,
-		VolumeSource: corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName},
-		},
-	}
-	replaced := false
-	for i := range podSpec.Volumes {
-		if podSpec.Volumes[i].Name == dv.VolumeName {
-			podSpec.Volumes[i] = vol
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		podSpec.Volumes = append(podSpec.Volumes, vol)
-	}
-
-	mount := corev1.VolumeMount{Name: dv.VolumeName, MountPath: dv.MountPath}
-	for i := range podSpec.Containers {
-		podSpec.Containers[i].VolumeMounts = upsertVolumeMount(podSpec.Containers[i].VolumeMounts, mount)
-	}
-}
-
-// upsertVolumeMount replaces a mount with the same Name (idempotent re-render)
-// or appends it, returning the updated slice.
-func upsertVolumeMount(mounts []corev1.VolumeMount, m corev1.VolumeMount) []corev1.VolumeMount {
-	for i := range mounts {
-		if mounts[i].Name == m.Name {
-			mounts[i] = m
-			return mounts
-		}
-	}
-	return append(mounts, m)
-}
-
-// boundCapacity returns the PVC's actual provisioned capacity once bound, or ""
-// when the PVC has no capacity yet (still Pending — e.g. a WaitForFirstConsumer
-// StorageClass that binds only when the pod schedules). This is the REAL size
-// the storage layer provisioned, which can exceed the request (rounding up to a
-// provisioner's minimum), so it — not spec.storage.pvc.size — is what status
-// reports.
-func boundCapacity(pvc *corev1.PersistentVolumeClaim) string {
-	// Only report capacity for a PVC that is actually Bound. status.capacity can
-	// linger on a claim that has left Bound (e.g. Lost), and a Pending claim has
-	// none yet — reporting either would advertise provisioned capacity the
-	// backend does not have. The documented contract is "the bound PVC's
-	// capacity", so gate on the phase.
-	if pvc == nil || pvc.Status.Phase != corev1.ClaimBound {
-		return ""
-	}
-	if q, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && !q.IsZero() {
-		return q.String()
-	}
-	return ""
-}
-
-// reconcileInvalidStorage publishes the Ready=False/InvalidStorageConfiguration
-// terminal state for a persistent backend that asked for more than one replica,
-// WITHOUT provisioning the PVC or the workload. A single ReadWriteOnce PVC
-// cannot be mounted by multiple pods, so creating a multi-replica Deployment
-// that shares it would wedge all but one replica in ContainerCreating
-// (multi-attach). The operator must scale to 1 or drop spec.storage.pvc; the
-// Warning event is emitted on the state transition (see emitTransitionEvents).
-//
-// The configuration is invalid, so we refuse to RUN it: any workload from a
-// prior valid generation is shed and status.endpoint is cleared, so the
-// pod-mutating webhook stops wiring engine pods to a backend the operator must
-// fix (leaving a live endpoint advertised while reporting Ready=False would be
-// an inconsistent, confusing state). The PVC is NOT deleted —
-// cleanupOwnedWorkload only sheds Deployment/Service/HPA, and the PVC stays
-// owner-referenced (adopt-and-keep), so persistent data survives the gate and a
-// later scale-to-1 re-provisions against it. Fail-open posture means engines
-// fall back to local prefill while the backend is gated.
-func (r *CacheBackendReconciler) reconcileInvalidStorage(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
-		return ctrl.Result{}, err
-	}
-	// Wipe the in-memory cascade shadow + rate-limit timestamp
-	// alongside the on-cluster status clearing below: a retained
-	// shadow would surface a stale pod identifier while no cache-
-	// server Deployment exists, and would drive a false cascade
-	// when the operator fixes the storage/replicas configuration
-	// and the controller flips back to the managed path.
-	r.clearServerInstanceLatchShadow(backend)
-	// Wipe the functional-probe rate-limit entry too. Same reasoning
-	// as in reconcileExternal / reconcileUnmanaged: a managed →
-	// InvalidStorage → managed cycle within the 30s rate-limit window
-	// would otherwise have a stale lastCalled timestamp on re-entry
-	// and the first reconcile under the managed path would skip the
-	// /probe call, leaving any prior FunctionalProbeOK=True (or
-	// absent) unchallenged.
-	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
-	err := r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = ""
-		backend.Status.Capacity = ""
-		// Clear the cache-server-instance latch — cleanupOwnedWorkload
-		// has just deleted the previously-running Deployment (if any)
-		// and we refuse to provision a new one until the operator
-		// fixes the configuration. A retained UID would advertise a
-		// stale identifier and feed a false cascade on the fix-up
-		// transition.
-		backend.Status.ObservedServerInstance = ""
-		backend.Status.ObservedGeneration = backend.Generation
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             conditionReasonInvalidStorageConfiguration,
-			Message:            invalidStorageMessage,
-			ObservedGeneration: backend.Generation,
-		})
-		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeProgressing,
-			Status:             metav1.ConditionFalse,
-			Reason:             conditionReasonInvalidStorageConfiguration,
-			Message:            "controller will not provision a multi-attach workload until storage or replica count is corrected",
-			ObservedGeneration: backend.Generation,
-		})
-		// Not a transient/recoverable workload fault; the Degraded condition
-		// (rollout/replica health) does not apply to an unprovisioned workload.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
-		// The kernel gate runs only in updateManagedStatus, which this
-		// invalid-storage early-return bypasses; clear EngineKernelsHealthy so a
-		// backend that flipped into this gate doesn't keep a stale verdict.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
-		// The workload isn't provisioned, so tier-2 isn't being exercised —
-		// clear any stale T2Degraded advisory from a prior provisioned state.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
-	})
-	return ctrl.Result{}, err
-}
-
-// warnRetainedPVC emits a Warning ONCE when spec.storage.pvc has been removed
-// but the CR still owns a data PVC (adopt-and-keep). The PVC is intentionally
-// NOT deleted — destroying persistent storage on a spec edit is irreversible
-// data loss, so it stays owner-referenced and is reclaimed only when the
-// CacheBackend itself is deleted.
-//
-// Fire-once: this runs on the steady-state reconcile path, which repeats on
-// every resync, so emitting unconditionally would re-fire the Warning forever.
-// We stamp the retained PVC with an annotation the first time we warn and skip
-// when it is already present, so the event fires once per orphaning rather than
-// per reconcile. applyPVC clears the annotation when the backend re-adopts the
-// PVC (spec.storage.pvc re-added), so a later removal warns again.
-//
-// Fail-soft: a NotFound (the common case — no PVC was ever provisioned) or a
-// transient Get/Patch error simply emits nothing (the next reconcile retries).
-// A PVC we do not own is left entirely alone.
-func (r *CacheBackendReconciler) warnRetainedPVC(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
-	if r.Recorder == nil {
-		return
-	}
-	pvc := &corev1.PersistentVolumeClaim{}
-	key := types.NamespacedName{Name: pvcName(backend), Namespace: backend.Namespace}
-	if err := r.Get(ctx, key, pvc); err != nil {
-		return
-	}
-	if !metav1.IsControlledBy(pvc, backend) {
-		return
-	}
-	if pvc.Annotations[annotationStorageRetainedWarned] == "true" {
-		return // already warned for this orphaned PVC — stay quiet on resync.
-	}
-	// Stamp first, then emit: if the stamp write fails we skip the event and
-	// retry on the next reconcile, so a persistent Patch failure can't spam.
-	patch := client.MergeFrom(pvc.DeepCopy())
-	if pvc.Annotations == nil {
-		pvc.Annotations = map[string]string{}
-	}
-	pvc.Annotations[annotationStorageRetainedWarned] = "true"
-	if err := r.Patch(ctx, pvc, patch); err != nil {
-		return
-	}
-	r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning, eventReasonOrphanedPVCRetained, eventReasonOrphanedPVCRetained,
-		"spec.storage.pvc was removed but PVC %q is retained (owner-referenced; reclaimed only when this CacheBackend is deleted). The workload reverts to ephemeral storage; delete the CacheBackend to reclaim the volume, or re-add spec.storage.pvc to mount it again.", pvc.Name)
-}
-
 // reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
 // place: the managed container's image/command/args/env, plus the pod-level
 // override fields. API-server-defaulted fields we don't own (RestartPolicy,
@@ -1449,15 +1094,7 @@ func (r *CacheBackendReconciler) deleteIfOwned(ctx context.Context, key types.Na
 // observedGeneration therefore stays at its prior value until apply succeeds
 // for the current generation; the Ready and Progressing conditions carry the
 // same generation so callers can tell which spec the observation belongs to.
-//
-// status.capacity carries the caller-resolved provisioned capacity: the bound
-// PVC's actual status.capacity[storage] when a persistent backend's PVC has
-// bound, or "" otherwise (ephemeral backend, or PVC not yet bound). It is the
-// REAL provisioned size, not spec.storage.pvc.size (the request) — a pending or
-// over-provisioned bind would otherwise be misreported. The Owns(PVC) watch
-// re-triggers this reconcile when the PVC binds so the empty→size transition is
-// observed promptly.
-func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint, capacity string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
+func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
 	now := time.Now()
 	readyStatus, reason, message := managedReadiness(backend, dep)
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
@@ -1502,7 +1139,6 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	}
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
-		backend.Status.Capacity = capacity
 		backend.Status.ObservedGeneration = publishedGen
 		// Latch the first KV-event observation write-once. The poller can later
 		// clear indexParticipation.lastEventAt on a drain, so this durable
@@ -1817,26 +1453,7 @@ const (
 	conditionReasonScaledToZero        = "ScaledToZero"
 	conditionReasonRolloutInProgress   = "RolloutInProgress"
 	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
-	// conditionReasonInvalidStorageConfiguration is set Ready=False when a
-	// persistent backend (spec.storage.pvc) requests more than one replica
-	// (spec.replicas > 1 or spec.autoscaling.maxReplicas > 1). A single
-	// ReadWriteOnce PVC cannot be mounted by multiple pods, so the controller
-	// refuses to provision the workload until the operator scales to 1 or drops
-	// spec.storage.pvc. Per-replica PVCs via StatefulSet volumeClaimTemplates
-	// are a separate follow-up.
-	conditionReasonInvalidStorageConfiguration = "InvalidStorageConfiguration"
 )
-
-// invalidStorageMessage is the Ready=False/InvalidStorageConfiguration message,
-// shared by the status condition and the Warning event so kubectl describe and
-// the event stream say the same thing.
-const invalidStorageMessage = "spec.storage.pvc requires a single replica: a ReadWriteOnce PVC cannot be multi-attached across replicas. Scale to spec.replicas=1 and spec.autoscaling.maxReplicas<=1, or remove spec.storage.pvc. Per-replica persistent storage via StatefulSet is a separate follow-up."
-
-// annotationStorageRetainedWarned marks a retained (adopt-and-keep) PVC for
-// which the OrphanedPVCRetained Warning has already been emitted, so the
-// steady-state reconcile path warns once per orphaning rather than on every
-// resync. Cleared by applyPVC when the backend re-adopts the PVC.
-const annotationStorageRetainedWarned = "inferencecache.io/storage-retained-warned"
 
 // managedReadiness maps the Deployment's rollout state to the Ready
 // condition (status + reason + message). Ready=True requires the Deployment
@@ -2370,16 +1987,6 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 			"no KV events observed within %s of the workload becoming Available; no engine pods are attached, or the engine's KV-event publisher is mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
 	}
 
-	// Multi-replica-on-RWO-PVC gate (Ready=False/InvalidStorageConfiguration),
-	// keyed on the Ready reason so it fires once on entry. after.degraded is
-	// false in this state (reconcileInvalidStorage removes Degraded), so the
-	// generic BackendDegraded/BackendRecovered events above do not double-fire.
-	if before.readyReason != conditionReasonInvalidStorageConfiguration &&
-		after.readyReason == conditionReasonInvalidStorageConfiguration {
-		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonInvalidStorageConfiguration, eventReasonInvalidStorageConfiguration,
-			invalidStorageMessage)
-	}
-
 	if before.failOpen && !after.failOpen {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonFailClosedEnabled, eventReasonFailClosedEnabled,
 			"fail-closed mode enabled — cache is now a serving dependency; engine requests will fail when the cache is unreachable")
@@ -2431,9 +2038,5 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
-		// Owns(PVC) so a PVC binding (status.capacity goes from empty to the
-		// bound size) or unbinding re-triggers a reconcile and refreshes
-		// status.capacity without waiting for the next periodic resync.
-		Owns(&corev1.PersistentVolumeClaim{}).
 		Complete(r)
 }

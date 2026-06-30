@@ -769,8 +769,8 @@ func (sidecarErrorAdapter) Supports(adapterruntime.RuntimeID, *cachev1alpha1.Cac
 	return true
 }
 
-func (sidecarErrorAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*adapterruntime.ResolvedCacheServer, error) {
-	return nil, nil
+func (sidecarErrorAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
 }
 
 func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *cachev1alpha1.CacheBackend) error {

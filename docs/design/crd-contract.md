@@ -47,7 +47,7 @@ Every **spec-reconciled** CRD that carries a status follows the same three rules
 
 | Status | Field(s) | Writer |
 |---|---|---|
-| `CacheBackend.status` | `matchedEnginePods`, `engineSelectorMessage`, `conditions`, `firstKVEventObservedAt`, `firstAvailableAt`, `observedServerInstance`, `endpoint`, `failOpen`, `capacity`, `observedGeneration` | CacheBackend reconciler |
+| `CacheBackend.status` | `matchedEnginePods`, `engineSelectorMessage`, `conditions`, `firstKVEventObservedAt`, `firstAvailableAt`, `observedServerInstance`, `endpoint`, `failOpen`, `observedGeneration` | CacheBackend reconciler |
 | `CacheBackend.status` | `indexParticipation` | CacheIndex snapshot poller |
 | `CachePolicy.status` | `conditions`, `observedGeneration` (reserved) | — (see note) |
 | `CacheTenant.status` | `indexEntries`, `conditions`, `observedGeneration` | CacheIndex snapshot poller (per-tenant projection of `/snapshot`) |
@@ -81,7 +81,7 @@ Every new `v1alpha1` spec/status field ships in exactly **one of three states**:
 
 1. **Wired at merge.** A runtime consumer in `pkg/server/`, `pkg/index/`, `pkg/adapters/`, or `internal/controller/` changes observable behavior on the field's value — verified by grep in the same PR that adds the field.
 2. **Intentionally declarative.** The field scaffolds a not-yet-built controller; the type godoc must say so explicitly *and* name the tracking work. This requirement binds **new** fields at merge. Three fields predate the invariant and belong in this state but do **not** yet fully satisfy the godoc bar — `CacheTenantCryptoSpec` (godoc'd only "reserved for future cryptographic isolation"), `PromptTemplate.slots`, and `PDTopology`'s prefill/decode pools — each is scaffolded ahead of its render / disaggregation controller but names no tracking effort in godoc. That is a known pre-existing gap, tracked as a follow-up; closing it (making each godoc name the work) brings them into compliance. The doc states the bar; these three are the outstanding exceptions, not compliant examples.
-3. **Tracked for wiring.** A follow-up effort exists, the field's godoc names it, and the field comment says "inert until \<that work\>" (e.g. `CacheBackend.spec.storage.pvc.*` and `status.capacity`, which name the storage wire-up).
+3. **Tracked for wiring.** A follow-up effort exists, the field's godoc names it, and the field comment says "inert until \<that work\>". (Historical example: `CacheBackend.spec.storage.pvc.*` and `status.capacity` named the storage wire-up while they existed; both were later retired when the project decided durability is a backend choice rather than a generic volume knob — see `docs/design/lmcache-server-persistence.md`.)
 
 **Inert with no tracking and no godoc carve-out is not permitted at `v1alpha1`.** A field that nothing reads and that no one is on the hook to wire is exactly the failure mode the inert-field audit closed; reviewers (and the automated review pass) hard-block any new field that fails the three-state test. This invariant **relaxes at the `v1beta1` promotion**, when adding a field becomes the more expensive operation and the review bar shifts from "is this field wired?" to "is this the right field?".
 
