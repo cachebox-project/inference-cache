@@ -156,8 +156,10 @@ const (
 // returns the kvevent-subscriber container the webhook appends so the engine
 // pod auto-attaches to the policy server with no out-of-band steps.
 //
-// Phase 1 only wires vLLM. SGLang HiCache and Mooncake adapters will live in
-// their own files when those backends are picked up.
+// This adapter wires vLLM+LMCache. The sibling vLLM+Mooncake adapter lives in
+// vllm_mooncake.go (it reuses the same LMCache connector wire via a
+// mooncakestore:// remote); a future SGLang HiCache adapter would live in its
+// own file the same way.
 type vllmLMCacheAdapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar

@@ -145,14 +145,18 @@ func TestVLLMMooncakeResolveCacheServerImageOverride(t *testing.T) {
 
 func TestVLLMMooncakeResolveCacheServerCommandOverride(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
-	cb := newMooncakeBackend(map[string]string{cfgKeyServerCommand: "mooncake_master --port 50063"})
+	// Use a non-port flag for the override: the docs/godoc warn operators NOT
+	// to change the pinned RPC/metadata ports via serverCommand (the Service +
+	// status.endpoint are fixed to them), so the test must not normalize that
+	// footgun. A verbosity flag is a harmless, representative override.
+	cb := newMooncakeBackend(map[string]string{cfgKeyServerCommand: "mooncake_master --v=1"})
 	pod := resolvePod(t, a, cb)
 	c := pod.Containers[0]
 	if len(c.Command) != 1 || c.Command[0] != "mooncake_master" {
 		t.Fatalf("command = %v, want [mooncake_master]", c.Command)
 	}
-	if len(c.Args) != 2 || c.Args[0] != "--port" || c.Args[1] != "50063" {
-		t.Fatalf("args = %v, want [--port 50063]", c.Args)
+	if len(c.Args) != 1 || c.Args[0] != "--v=1" {
+		t.Fatalf("args = %v, want [--v=1]", c.Args)
 	}
 }
 

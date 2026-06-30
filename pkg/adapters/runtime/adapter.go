@@ -239,8 +239,10 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 // package default, and empty SubscriberImage disables sidecar auto-attach
 // (see the field doc for why).
 type Options struct {
-	// SubscriberImage is the image reference the vLLM/LMCache adapter
-	// uses for the kvevent-subscriber sidecar. Empty (the zero value)
+	// SubscriberImage is the image reference the vLLM/LMCache and
+	// vLLM/Mooncake adapters use for the kvevent-subscriber sidecar (both
+	// share the same builder — the KV-event stream is engine-side, not
+	// store-specific). Empty (the zero value)
 	// **disables** sidecar auto-attach — the adapter returns no sidecar
 	// at all. Auto-attach is opt-in by design: a nonexistent default
 	// image would put the sidecar container into ImagePullBackOff and

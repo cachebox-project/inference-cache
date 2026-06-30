@@ -49,8 +49,9 @@ Concretely:
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache adapter returns nil unless the controller's
-  `--kvevent-subscriber-image` flag is set.** An unconfigured image would put the sidecar
+* **The vLLM/LMCache and vLLM/Mooncake adapters return nil unless the controller's
+  `--kvevent-subscriber-image` flag is set** (both go through the same shared
+  `buildKVEventSubscriber`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
   exact "cache becomes a serving dependency" failure mode the fail-open posture exists
   to prevent. Defaulting auto-attach off lets the controller install cleanly into any

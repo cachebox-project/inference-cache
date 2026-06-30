@@ -1442,8 +1442,10 @@ func stubRegistryWithExternal() *adapterruntime.Registry {
 func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
 	// Happy path: an explicit (vLLM, LMCache) pair the stub registry
 	// supports must be admitted. Pins the C7 check's positive side so a
-	// regression doesn't silently start rejecting the only currently
-	// shipping combination.
+	// regression doesn't silently start rejecting it. (vLLM+LMCache is one of
+	// the shipping pairs; vLLM+Mooncake is the other — see
+	// TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry,
+	// which checks it against the real DefaultRegistry rather than this stub.)
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend() // type=LMCache
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
