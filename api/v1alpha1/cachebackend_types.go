@@ -266,8 +266,10 @@ type CacheBackendAutoscalingSpec struct {
 // which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
 	// Engine identifies the inference engine integration, such as vllm or
-	// sglang. Defaults to vllm — the only runtime ID with a shipping adapter
-	// today (sglang is wired but no adapter ships in v1alpha1). The CRD-level
+	// sglang. Defaults to vllm. Both vllm and sglang have shipping adapters
+	// (vllm+LMCache and sglang+LMCache); the supported (engine, type) pairs
+	// are whatever the installed runtime adapters accept, and admission lists
+	// them in its rejection message for an unsupported pair. The CRD-level
 	// default only applies when spec.integration is materialised on the
 	// submitted object; when integration is omitted entirely the
 	// [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback

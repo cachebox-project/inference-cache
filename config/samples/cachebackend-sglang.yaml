@@ -11,9 +11,10 @@
 #   - LMCACHE_USE_EXPERIMENTAL=True + LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/
 #     LOCAL_CPU/MAX_LOCAL_CPU_SIZE env.
 # Notably absent (and deliberately so): VLLM_USE_V1 and PYTHONHASHSEED are
-# vLLM-only — SGLang has no v1 codepath and hashes prefixes with sha256 over the
-# token-id bytes, independent of PYTHONHASHSEED. The vLLM `--kv-transfer-config`
-# arg is likewise not used. User-set env/args on the pod template survive
+# vLLM-only — SGLang has no v1 codepath, and its prefix caching does not depend
+# on PYTHONHASHSEED the way vLLM's TP block-hash chain does. The vLLM
+# `--kv-transfer-config` arg is likewise not used. User-set env/args on the pod
+# template survive
 # injection (the adapter merges, never clobbers); a pod can opt out per-instance
 # with the annotation `inferencecache.io/skip-inject`.
 #

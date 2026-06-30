@@ -15,9 +15,11 @@ const (
 	// hash_scheme, prefix_hash), so tagging SGLang prefixes "sglang" keeps
 	// them in a disjoint domain from vLLM's — a request hashed under one
 	// scheme can never false-hit a bytewise-identical entry recorded under the
-	// other (SGLang hashes prefixes with hashlib.sha256 over the token-id
-	// bytes; vLLM uses its own block-hash chain — but the disjointness
-	// guarantee rides on the tag, not on the underlying hash differing).
+	// other. The prefix_hash the index stores is the cache plane's OWN
+	// content fingerprint (derived in-pod from the engine's token_ids by the
+	// subscriber — the same scheme-independent algorithm for both engines, NOT
+	// the engine's native block hash), so the disjointness guarantee rides
+	// entirely on this tag, not on vLLM's and SGLang's native hashes differing.
 	subscriberHashScheme = "sglang"
 
 	// defaultEngineZMQPortStr is the port SGLang's KV-event ZMQ PUB endpoint
