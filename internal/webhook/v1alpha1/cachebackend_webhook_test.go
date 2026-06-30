@@ -1522,8 +1522,9 @@ func TestValidator_RuntimeAdapter_EmptyEngineDefaultsToVLLM(t *testing.T) {
 	// Engine is optional on the CRD; the reconciler and pod webhook
 	// default it to vLLM via adapterruntime.ResolveRuntimeID, so
 	// admission must use the same defaulting or pairs like
-	// "type: Mooncake with no engine" slip past the webhook and only
-	// fail at reconcile (the exact gap C7 closes).
+	// "type: AIBrix with no engine" slip past the webhook and only
+	// fail at reconcile (the exact gap C7 closes). AIBrix has no adapter
+	// in any registry, so it stays a genuinely-unsupported example.
 	//
 	// With LMCache the default vLLM pair is supported → admit.
 	v := &CacheBackendValidator{Registry: stubRegistry()}
@@ -1654,9 +1655,10 @@ func TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry(t 
 	// Mooncake). A zero-value validator (Registry nil) falls back to the real
 	// shipping registry (DefaultRegistry + External), so this exercises the
 	// same adapter set the running controller installs — not a stub. (The
-	// stub-registry rejection tests above keep using Mooncake as their
-	// unsupported example precisely because their stub registry omits the
-	// Mooncake adapter; this test is the real-registry counterpart.)
+	// stub-registry rejection tests above use AIBrix as their unsupported
+	// example — a type no shipping adapter handles — since Mooncake is now
+	// supported; this test is the real-registry counterpart proving Mooncake
+	// admits.)
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
@@ -1995,6 +1997,39 @@ func TestValidator_EngineOverrides_ExternalBackendChecksReservedSet(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "--kv-transfer-config") {
 		t.Fatalf("reserved-arg rejection should name the offending flag; got %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_MooncakeBackendChecksReservedSet(t *testing.T) {
+	// Mooncake is a registered managed pair (vLLM+Mooncake) that reuses the
+	// LMCache connector wire (pointed at a mooncakestore:// remote), so it
+	// declares the SAME reserved args/env. An operator must not be able to
+	// un-wire it via engineOverrides any more than on LMCache/External. Use the
+	// shipping registry (nil → DefaultRegistry + External, which now includes
+	// the real Mooncake adapter) so the adapter's own ReservedArgs/ReservedEnv
+	// drive the admission check — this pins the new registered pair's
+	// reserved-override enforcement on the admission surface, not just the
+	// adapter's returned slice (which the adapter unit test already covers).
+	v := &CacheBackendValidator{}
+
+	// Arg side: suppressing the connector arg must hard-reject, naming the flag.
+	cbArg := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--kv-transfer-config"},
+	})
+	cbArg.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	if _, err := v.ValidateCreate(context.Background(), cbArg); err == nil ||
+		!strings.Contains(err.Error(), "--kv-transfer-config") {
+		t.Fatalf("Mooncake CR suppressing --kv-transfer-config must reject naming the flag; got %v", err)
+	}
+
+	// Env side: overriding the reserved remote-URL env must hard-reject too.
+	cbEnv := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "mooncakestore://evil:50051"}},
+	})
+	cbEnv.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	if _, err := v.ValidateCreate(context.Background(), cbEnv); err == nil ||
+		!strings.Contains(err.Error(), "LMCACHE_REMOTE_URL") {
+		t.Fatalf("Mooncake CR overriding reserved LMCACHE_REMOTE_URL must reject naming the env; got %v", err)
 	}
 }
 

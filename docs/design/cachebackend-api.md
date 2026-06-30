@@ -429,6 +429,8 @@ The vLLM+LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) reserves the a
 
 The External adapter (`pkg/adapters/runtime/external/external.go`) reserves the **same** args/env. The injected wire format is identical to the managed-LMCache path (both call `enginewire.InjectVLLMLMCache`), so an override that would un-wire LMCache on a managed CR would un-wire it on an External CR for the same reason. Admission consults the External adapter's reserved set the same way it consults the managed adapter's — operators see a hard reject at write time regardless of which `spec.type` they're using.
 
+The vLLM+Mooncake adapter (`pkg/adapters/runtime/vllm_mooncake.go`) reserves the **same** args/env too: Mooncake is wired as an LMCache remote backend (the engine runs the same connector, pointed at a `mooncakestore://` remote — see [backendConfig keys (managed Mooncake)](#backendconfig-keys-managed-mooncake)), so `--kv-transfer-config` and `LMCACHE_REMOTE_URL` / `VLLM_USE_V1` / `INFERENCECACHE_FAIL_OPEN` / `PYTHONHASHSEED` are reserved for the identical reasons. Admission consults whichever adapter the `(engine, spec.type)` pair selects, so an override that would un-wire the cache is hard-rejected on a `type: Mooncake` CR exactly as on LMCache and External.
+
 `LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. (`spec.backendConfig` already exposes them; `engineOverrides.env` is the engine-agnostic seam future engines without a per-key map will reach for.)
 
 #### Shape rationale (A vs. B)
