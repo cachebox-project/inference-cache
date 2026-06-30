@@ -188,6 +188,12 @@ spec:
                   CacheBackend has a model id configured. Without those, the engine
                   is wired but no sidecar is added.
 
+                  In spec.integration.mode=EventsOnly the above "engine wiring" is
+                  absent: no KV connector is injected, so the sidecar is the ONLY thing
+                  the webhook adds. With the subscriber image or model id unset nothing
+                  is wired at all and the pod carries no injected-by stamp (the webhook
+                  admits it untouched).
+
                   The match is evaluated once at pod CREATE — pods whose labels change
                   after creation are not re-evaluated; the wiring is sticky to the
                   life of the pod. To opt a specific pod out of injection regardless

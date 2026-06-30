@@ -8,6 +8,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -213,6 +214,27 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 			t.Fatalf("Offload owned workloads = %d deployments / %d services, want 1/1", deps, svcs)
 		}
 
+		// Seed a stale managed-only EngineKernelsHealthy condition (as a prior
+		// Offload generation would publish from the lmcache-kernel-check init
+		// container). The flip to EventsOnly must clear it — events-only loads no
+		// connector and injects no kernel-check, so a lingering kernel verdict
+		// would be a stale, server-less-irrelevant advisory.
+		seedManaged := getBackend(t, r, "cache", ns)
+		beforeSeed := seedManaged.DeepCopy()
+		meta.SetStatusCondition(&seedManaged.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeEngineKernelsHealthy,
+			Status:             metav1.ConditionTrue,
+			Reason:             reasonKernelsHealthy,
+			Message:            "seeded prior-Offload kernel verdict",
+			ObservedGeneration: seedManaged.Generation,
+		})
+		if err := k8s.Status().Patch(ctx, seedManaged, client.MergeFrom(beforeSeed)); err != nil {
+			t.Fatalf("seed EngineKernelsHealthy: %v", err)
+		}
+		if c := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeEngineKernelsHealthy); c == nil {
+			t.Fatalf("EngineKernelsHealthy seed did not take; want present before the flip")
+		}
+
 		// Flip the live object to EventsOnly. (Validation admits this: type is
 		// LMCache, no autoscaling.)
 		live := getBackend(t, r, "cache", ns)
@@ -237,6 +259,9 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 		if c := findCondition(got.Status.Conditions, conditionTypeFunctionalProbeOK); c != nil {
 			t.Fatalf("post-flip FunctionalProbeOK = %+v, want absent", c)
+		}
+		if c := findCondition(got.Status.Conditions, conditionTypeEngineKernelsHealthy); c != nil {
+			t.Fatalf("post-flip EngineKernelsHealthy = %+v, want absent (events-only sheds the managed-only kernel condition)", c)
 		}
 		if c := findCondition(got.Status.Conditions, conditionTypeT2Degraded); c != nil {
 			t.Fatalf("post-flip T2Degraded = %+v, want absent", c)

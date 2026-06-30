@@ -249,10 +249,23 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		}
 	}
 
-	if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
-		log.V(1).Info("fail-open: adapter rejected pod",
-			"runtime", string(runtimeID), "error", err.Error())
-		return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+	// Events-only (tier-1 routing) wires NO KV connector regardless of
+	// spec.type: the engine container is left untouched so a hybrid-attention
+	// model's KV-cache manager is not disabled by a connector it cannot load.
+	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
+	// adapter's own no-op: the connector no-op currently lives ONLY in the
+	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
+	// mode=EventsOnly object would otherwise select the External adapter and
+	// inject the LMCache connector — violating the events-only "no connector"
+	// contract. Gating here makes the no-connector guarantee adapter-independent.
+	// The observation-sidecar append and the wired/injected-by logic below stay
+	// as-is (events-only's only wiring is the subscriber sidecar).
+	if !cache.Spec.IsEventsOnly() {
+		if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
+			log.V(1).Info("fail-open: adapter rejected pod",
+				"runtime", string(runtimeID), "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+		}
 	}
 
 	// Apply spec.integration.engineOverrides scoped to the adapter-owned
@@ -290,7 +303,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// suppress the real check and bypass strict enforcement (the controller
 	// trusts the container by name + termination message). On a normal
 	// re-admission the rendered spec is identical, so the replace is a no-op.
-	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
+	//
+	// Skip the kernel-check entirely for events-only: events-only loads no
+	// LMCache KV connector (InjectEngineConfig is a no-op above), so checking
+	// the LMCache native CUDA kernels is irrelevant — and in strict mode the
+	// init container would exit non-zero, holding the engine pod in Init so it
+	// never serves. An events-only engine must not be blocked by a kernel tier
+	// it does not use.
+	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok && !cache.Spec.IsEventsOnly() {
 		if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
 			log.V(1).Info("fail-open: kernel-check init container rejected",
 				"runtime", string(runtimeID), "error", iErr.Error())

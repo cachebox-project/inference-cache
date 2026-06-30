@@ -24,6 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -760,6 +762,81 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 	}
 	if len(deps.Items) != 0 {
 		t.Fatalf("deployments = %d, want 0 for unmanaged events-only", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
+	// An admission-bypassed / stored object that sets BOTH spec.type=External
+	// AND integration.mode=EventsOnly must reconcile via the events-only path,
+	// NOT the External path. Admission's rejectEventsOnlyMisconfiguration rejects
+	// this pair, so this is defense-in-depth for a stored CR: dispatch checks
+	// IsEventsOnly() before the Type==External branch, so EventsOnly wins. If it
+	// reconciled as External it would mirror spec.endpoint to status and mark
+	// Ready=True/ExternalEndpointAccepted, letting the pod webhook's External
+	// adapter inject the KV connector — violating events-only's "no connector,
+	// no server" contract. The (vllm, External) pair has a registered adapter, so
+	// the events-only adapter-selectability check passes and the events-only
+	// reconcile runs.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "external-cache.ns1.svc:8200",
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+	// Mirror cmd/controller wiring: the External adapter is registered on the
+	// reconciler's registry (DefaultRegistry doesn't include it to avoid an
+	// import cycle). Without it the (vllm, External) pair is unselectable and the
+	// events-only branch falls to reconcileUnmanaged — masking the precedence we
+	// want to assert.
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	r.Registry = reg
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+
+	// status.endpoint stays EMPTY — events-only publishes no endpoint. The
+	// External path would have mirrored spec.endpoint here.
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty (events-only wins over External; no endpoint mirrored)", got.Status.Endpoint)
+	}
+
+	// Ready is published by the events-only gate (AwaitingFirstKVEvent before any
+	// event), NOT by the External path (ExternalEndpointAccepted). The reason is
+	// the discriminator between the two reconcile paths.
+	ready := findCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil {
+		t.Fatalf("events-only must publish Ready; conditions = %v", got.Status.Conditions)
+	}
+	if ready.Reason == conditionReasonExternalEndpointAccepted {
+		t.Fatalf("Ready reason = %q — reconciled as External, but EventsOnly must take precedence", ready.Reason)
+	}
+	if ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (events-only gate before any KV event)", ready)
+	}
+
+	// No workload is provisioned (events-only is server-less).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for events-only", len(deps.Items))
+	}
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 for events-only", len(svcs.Items))
 	}
 }
 

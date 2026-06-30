@@ -1926,6 +1926,169 @@ func TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses(t *testing.T) 
 	}
 }
 
+// TestHandle_KernelCheckInitContainer_SkippedForEventsOnly verifies that an
+// events-only backend does NOT get the lmcache-kernel-check init container even
+// when the kernel-check is forced on (strict mode + a GPU-requesting pod, which
+// would normally inject it). Events-only loads no LMCache KV connector, so the
+// native-kernel check is irrelevant — and in strict mode the init container's
+// non-zero exit would hold the engine pod in Init and block it from serving.
+func TestHandle_KernelCheckInitContainer_SkippedForEventsOnly(t *testing.T) {
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	// Force the kernel-check on the strongest way possible: strict mode. On an
+	// Offload backend this would inject (and, on a strict failure, block the
+	// pod). Events-only must skip it regardless.
+	cb.Annotations = map[string]string{
+		adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict,
+	}
+	h := newHandlerWithSubscriber(t, cb)
+
+	// GPU-requesting engine pod — auto mode would also inject for this, so strict
+	// + GPU is the maximal trigger condition.
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// No kernel-check init container for events-only.
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			t.Fatalf("events-only pod must NOT get the %q init container; init containers = %v",
+				adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+		}
+	}
+
+	// Sanity: the events-only wiring still happened (subscriber sidecar
+	// appended), so this is not a fail-open no-op masquerading as a skip.
+	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil {
+		t.Fatalf("events-only subscriber sidecar missing; containers = %v", containerNames(mutated))
+	}
+}
+
+// TestHandle_KernelCheckInitContainer_AppendedOnOffloadStrict is the regression
+// counterpart to the events-only skip above: an Offload (default-mode) backend
+// with the same strict annotation + GPU pod STILL gets the kernel-check init
+// container. This pins the skip to events-only mode, not a blanket suppression.
+func TestHandle_KernelCheckInitContainer_AppendedOnOffloadStrict(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Annotations = map[string]string{
+		adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict,
+	}
+	h := newHandler(t, cb)
+
+	pod := vllmEnginePod("engine-gpu", map[string]string{"app": "vllm"})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	found := false
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Offload (strict) pod must still get the %q init container; init containers = %v",
+			adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+	}
+}
+
+// TestHandle_EventsOnlyExternal_NoConnectorWiring verifies that an
+// admission-bypassed spec.type=External + mode=EventsOnly object gets NO KV
+// connector wiring. Admission's rejectEventsOnlyMisconfiguration rejects this
+// pair, so it can only reach the webhook via a stored / bypassed object — but if
+// it does, events-only's "no connector" contract must win over spec.type. The
+// External adapter's InjectEngineConfig would otherwise inject the LMCache
+// connector; the webhook skips InjectEngineConfig for events-only regardless of
+// the selected adapter.
+func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
+	const (
+		ns       = "engines"
+		endpoint = "external-cache.example:8200"
+	)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ext-eo",
+			Namespace: ns,
+			UID:       types.UID("cb-ext-eo-uid"),
+		},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: endpoint,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+			BackendConfig: map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
+	}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	// Mirror cmd/controller wiring: DefaultRegistry + the External adapter +
+	// the subscriber image configured (so the events-only sidecar path is live).
+	reg := adapterruntime.DefaultRegistry(
+		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
+	)
+	reg.Register(externaladapter.NewAdapter())
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	if engine == nil {
+		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
+	}
+	// No LMCACHE_* env (the External adapter would have set LMCACHE_REMOTE_URL).
+	for _, e := range engine.Env {
+		if strings.HasPrefix(e.Name, "LMCACHE_") {
+			t.Fatalf("events-only+External engine container must carry NO LMCACHE_* env; found %s=%q", e.Name, e.Value)
+		}
+	}
+	// No --kv-transfer-config connector arg.
+	for _, a := range engine.Args {
+		if a == "--kv-transfer-config" {
+			t.Fatalf("events-only+External engine container must carry NO --kv-transfer-config; args = %v", engine.Args)
+		}
+	}
+	// No kernel-check init container either (External adapter has none, but assert
+	// the contract holds end-to-end).
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			t.Fatalf("events-only+External pod must NOT get the kernel-check init container; init containers = %v",
+				initContainerNames(mutated))
+		}
+	}
+}
+
 // initContainerNames returns init container names for diagnostic messages.
 func initContainerNames(pod *corev1.Pod) []string {
 	out := make([]string, len(pod.Spec.InitContainers))

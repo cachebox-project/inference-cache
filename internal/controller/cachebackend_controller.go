@@ -366,14 +366,6 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // shed any previously managed workload; LMCache (Phase 1) templates a
 // Deployment + Service.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		// A backend switched from a managed type to External must shed its workload.
-		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
-	}
-
 	registry := r.Registry
 	if registry == nil {
 		registry = adapterruntime.DefaultRegistry()
@@ -388,11 +380,20 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// StatefulSet routing because the mode decides provisioning regardless of
 	// deploymentKind (a server-less backend ignores deploymentKind).
 	//
+	// EventsOnly is checked BEFORE the External branch so it takes precedence
+	// over spec.type. Admission's rejectEventsOnlyMisconfiguration rejects a
+	// spec.type=External + mode=EventsOnly pair, but an admission-bypassed /
+	// pre-existing stored object with both set must NOT reconcile as External
+	// (which would publish an endpoint and let the pod webhook inject the KV
+	// connector via the External adapter) — that violates the events-only "no
+	// connector, no server" contract. Letting EventsOnly win here mirrors the
+	// webhook's adapter-independent connector skip, so both layers agree on the
+	// mode's precedence over type.
+	//
 	// First confirm an adapter is selectable for this (runtime, backend) pair.
-	// Admission rejects an unsupported pair at write time, but a stored /
-	// admission-bypassed EventsOnly CR with an unsupported (engine, type) pair
-	// would otherwise be reconciled as ACTIVE events-only even though the pod
-	// webhook can't select an adapter for it (so it can never inject the
+	// A stored / admission-bypassed EventsOnly CR with an unsupported (engine,
+	// type) pair would otherwise be reconciled as ACTIVE events-only even though
+	// the pod webhook can't select an adapter for it (so it can never inject the
 	// subscriber → no events ever flow). Treat the no-adapter case the same as
 	// the Offload no-adapter path below: shed any workload and reconcile as
 	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
@@ -408,6 +409,14 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, err
 		}
 		return r.reconcileEventsOnly(ctx, backend)
+	}
+
+	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		// A backend switched from a managed type to External must shed its workload.
+		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
 	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
@@ -577,7 +586,8 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 //
 // Like reconcileExternal it clears the in-memory cascade shadow and the
 // functional-probe rate-limit entry (there is no server to cascade-restart or
-// probe) and clears the managed-only FunctionalProbeOK / T2Degraded conditions.
+// probe) and clears the managed-only FunctionalProbeOK / EngineKernelsHealthy /
+// T2Degraded conditions.
 // The firstEventTimeout window is anchored on status.firstAvailableAt, latched
 // here on the first reconcile — an events-only backend is "up" the moment it
 // exists (no workload to wait on), so the gate starts its clock immediately and
@@ -643,6 +653,12 @@ func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backen
 		})
 		// Managed-only advisories never apply to a server-less backend.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// EngineKernelsHealthy is a managed-path-only condition (events-only
+		// loads no LMCache connector, so the kernel-check init container is
+		// never injected). Clear any left over from a prior Offload generation
+		// so an Offload→EventsOnly flip doesn't strand a stale kernel verdict —
+		// events-only publishes only Ready/Degraded/Progressing.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 	})
 	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
