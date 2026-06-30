@@ -284,6 +284,13 @@ type CacheBackendIntegrationSpec struct {
 	// matching the [enginewire.IntegrationRole] read-time fallback for an
 	// omitted integration block. ReadOnly / WriteOnly are specialised
 	// producer/consumer roles operators opt into explicitly.
+	//
+	// Engine support is per-adapter: vLLM maps the role onto its LMCache
+	// connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,
+	// ReadWrite→kv_both). The SGLang LMCache integration has no kv_role split
+	// (--enable-lmcache always both stores and retrieves), so a (sglang,
+	// LMCache) backend supports only ReadWrite — admission rejects ReadOnly /
+	// WriteOnly there rather than silently ignoring them.
 	// +optional
 	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`

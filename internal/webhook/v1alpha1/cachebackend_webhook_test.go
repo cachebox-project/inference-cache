@@ -1901,6 +1901,57 @@ func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
 	}
 }
 
+func TestValidator_SGLangRoleRejected(t *testing.T) {
+	// SGLang's LMCache integration has no producer/consumer split, so a
+	// non-ReadWrite role can't be honored — admission rejects it loudly rather
+	// than silently treating it as ReadWrite. Uses the real shipping registry
+	// (the role rule is registry-independent, but this keeps the adapter-pair
+	// check happy for the (sglang, LMCache) CR).
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	for _, role := range []cachev1alpha1.CacheBackendIntegrationRole{
+		cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+		cachev1alpha1.CacheBackendIntegrationRoleWriteOnly,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			cb := newBackend() // type=LMCache
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang", Role: role}
+			requireInvalidWithCause(t, v, cb, "spec.integration.role", "sglang")
+		})
+	}
+}
+
+func TestValidator_SGLangRoleReadWriteAndUnsetAdmitted(t *testing.T) {
+	// ReadWrite (and unset, which defaults to ReadWrite) are the honored
+	// SGLang role; both must admit.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cases := []*cachev1alpha1.CacheBackendIntegrationSpec{
+		{Engine: "sglang"}, // role unset
+		{Engine: "sglang", Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
+	}
+	for _, integ := range cases {
+		cb := newBackend()
+		cb.Spec.Integration = integ
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("sglang role=%q rejected: %v", integ.Role, err)
+		}
+	}
+}
+
+func TestValidator_VLLMRoleReadOnlyStillAdmitted(t *testing.T) {
+	// The SGLang role rule must not bleed onto vLLM: vLLM maps ReadOnly onto
+	// its connector (kv_consumer), so a (vllm, LMCache) backend with ReadOnly
+	// must still admit.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "vllm",
+		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vllm role=ReadOnly rejected by the sglang role rule: %v", err)
+	}
+}
+
 func TestValidator_EngineOverrides_SGLangAdmitsVLLMOnlyNames(t *testing.T) {
 	// VLLM_USE_V1 and PYTHONHASHSEED are reserved for vLLM but NOT for SGLang
 	// (the SGLang adapter never injects them), and the LMCACHE_* tunables are

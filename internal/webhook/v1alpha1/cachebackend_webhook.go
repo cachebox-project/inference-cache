@@ -149,6 +149,41 @@ var DefaultValidationRules = []ValidationRule{
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
 	rejectInvalidKernelCheckAnnotation,
+	rejectUnsupportedSGLangRole,
+}
+
+// rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
+// (sglang, LMCache) backend. SGLang's --enable-lmcache integration has no
+// kv_role split equivalent to vLLM's LMCache connector — it always both stores
+// and retrieves — so a ReadOnly / WriteOnly role cannot be honored by the
+// engine. Rejecting at admission makes that loud rather than silently treating
+// the role as ReadWrite. Scoped to (sglang, LMCache): other engines map all
+// roles onto their connector (vLLM), and the rule must not fire on an
+// already-unsupported pair (e.g. sglang+External, which checkRuntimeAdapter
+// rejects on its own). If SGLang's LMCache integration gains a
+// producer/consumer split, lift this rule.
+func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Integration == nil {
+		return nil
+	}
+	role := cb.Spec.Integration.Role
+	if role == "" || role == cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
+		return nil // unset defaults to ReadWrite; ReadWrite is honored
+	}
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "integration", "role"),
+			role,
+			fmt.Sprintf("the sglang engine's LMCache integration has no producer/consumer split, so only %q (the default) is honored today; %q / %q are not yet wired for SGLang",
+				cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),
+		),
+	}
 }
 
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
