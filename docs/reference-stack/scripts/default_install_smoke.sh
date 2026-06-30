@@ -171,11 +171,19 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
-#  15. The operator `inferencecache doctor` CLI runs end-to-end against the live
+#  17. The operator `inferencecache doctor` CLI runs end-to-end against the live
 #      install: build the binary, apply a CacheBackend, run the config-only
 #      checks, and assert it emits the documented JSON envelope, surfaces a
 #      CacheBackend (CB0xx) finding, and exits with a code matching the reported
 #      summary.exitCode (the CI-gating contract).
+#  18. The managed Mooncake backend reconciles end-to-end: a busybox
+#      `mooncake_master` stand-in (accepts TCP on the RPC port so the rendered
+#      readiness probe passes — the real kvcacheai/mooncake image is NOT pulled)
+#      lets `CacheBackend{type: Mooncake}` reach an Available Deployment, with
+#      `status.endpoint=<svc>:50051` and the Service's first port = the RPC port.
+#      Proves the real installed controller selects the vLLM/Mooncake adapter and
+#      renders the mooncake_master workload via ResolveCacheServer; the real
+#      engine-over-mooncakestore:// path stays for the Mooncake reference stack.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
