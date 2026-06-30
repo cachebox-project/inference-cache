@@ -25,8 +25,8 @@ func (s stubAdapter) Supports(r RuntimeID, c *cachev1alpha1.CacheBackend) bool {
 	return s.supportsFn(r, c)
 }
 
-func (stubAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*ResolvedCacheServer, error) {
-	return nil, nil
+func (stubAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return nil, nil, nil
 }
 
 func (stubAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
@@ -151,12 +151,12 @@ func TestReferenceAdapterResolveCacheServerIsNil(t *testing.T) {
 	a := NewReferenceAdapter()
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
 
-	resolved, err := a.ResolveCacheServer(cb)
+	pod, svc, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if resolved != nil {
-		t.Fatalf("ResolveCacheServer = %+v, want nil — reference adapter renders no cache-server", resolved)
+	if pod != nil || svc != nil {
+		t.Fatalf("ResolveCacheServer = (%v, %v), want (nil, nil) — reference adapter renders no cache-server", pod, svc)
 	}
 }
 

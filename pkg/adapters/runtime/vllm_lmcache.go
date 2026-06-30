@@ -59,26 +59,6 @@ const (
 	// the system can address by name without hard-coding the integer.
 	defaultLMCacheServerPortName = "lmcache"
 
-	// defaultLMCacheDataVolumeName / defaultLMCacheDataMountPath name the
-	// persistent data volume the adapter DECLARES (via
-	// [ResolvedCacheServer.DataVolume]) when the CacheBackend sets
-	// spec.storage.pvc. The reconciler provisions a PVC owner-referenced to the
-	// CacheBackend and mounts it at this path on the lmcache-server container.
-	//
-	// NOTE: declaring the data volume provisions + attaches the PVC, but it does
-	// NOT by itself make KV survive a pod restart. The lmcache-server still runs
-	// with the in-memory storage device (defaultLMCacheServerStorage = "cpu"),
-	// so the mounted volume is not yet written to. Switching the server to a
-	// disk-backed device that spills to this exact directory is a deliberately
-	// separate follow-up (the supported on-server disk mechanism depends on the
-	// pinned LMCache server version and is not a simple positional-arg flip — see
-	// the storage section of docs/design/cachebackend-api.md). Splitting the
-	// version-agnostic provisioning half (here) from the server-side device
-	// switch lets PVC provisioning, owner-ref GC, the multi-replica gate, and
-	// status.capacity land independently.
-	defaultLMCacheDataVolumeName = "cache-data"
-	defaultLMCacheDataMountPath  = "/var/lib/lmcache"
-
 	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
 	// since they round-trip through CacheBackend.Spec.BackendConfig (a
 	// map[string]string).
@@ -279,9 +259,9 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 // Service.Spec.Ports / Service.Spec.Type keeps the seam clean: an adapter
 // rendering identical containers for two CacheBackends in different
 // namespaces never has to learn about names.
-func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*ResolvedCacheServer, error) {
+func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
-		return nil, fmt.Errorf("resolve cache server: cache is nil")
+		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
 	cfg := cache.Spec.BackendConfig
 	image := enginewire.ConfigOr(cfg, cfgKeyServerImage, defaultLMCacheServerImage)
@@ -334,26 +314,7 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 			},
 		},
 	}
-
-	// Declare the persistent data volume when the operator asked for one. The
-	// adapter is the only layer that knows where its data lives, so it names the
-	// volume + mount path; the reconciler provisions the PVC and mounts it. When
-	// spec.storage.pvc is unset, DataVolume stays nil and the server runs
-	// ephemeral exactly as before — status quo preserved.
-	//
-	// The adapter does NOT add the corev1.Volume / VolumeMount itself: it has no
-	// PVC name (the reconciler owns CacheBackend identity), and declaring intent
-	// keeps the controller generic across future backends. See the constant doc
-	// for why the server's storage device is not switched to disk here.
-	var dataVolume *AdapterDataVolume
-	if cache.Spec.Storage != nil && cache.Spec.Storage.PVC != nil {
-		dataVolume = &AdapterDataVolume{
-			VolumeName: defaultLMCacheDataVolumeName,
-			MountPath:  defaultLMCacheDataMountPath,
-		}
-	}
-
-	return &ResolvedCacheServer{PodSpec: pod, Service: svc, DataVolume: dataVolume}, nil
+	return pod, svc, nil
 }
 
 // defaultServerResources resolves the Container.Resources block for the

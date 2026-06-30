@@ -246,7 +246,7 @@ func TestReconcileDeploymentRespectsHPAReplicas(t *testing.T) {
 	}
 }
 
-// ---- Status (Progressing, Capacity, observedGeneration) ---------------------
+// ---- Status (Progressing, observedGeneration) -------------------------------
 
 func TestStatusProgressingTrueWhilePending(t *testing.T) {
 	scheme := newScheme(t)
@@ -345,22 +345,6 @@ func TestStatusProgressingFalseAtScaledToZero(t *testing.T) {
 	prog := findCondition(updated.Status.Conditions, conditionTypeProgressing)
 	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "ScaledToZero" {
 		t.Fatalf("Progressing condition = %+v, want False/ScaledToZero at zero replicas", prog)
-	}
-}
-
-func TestStatusCapacityStaysEmpty(t *testing.T) {
-	// The capacity field is present on the type for forward-compat, but the
-	// controller does not populate it: there is no data volume on the
-	// adapter-rendered pod today to attach a PVC to, so reporting a
-	// requested PVC size as "provisioned capacity" would mislead operators.
-	// Populating it is left to the follow-up that wires storage end-to-end.
-	scheme := newScheme(t)
-	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
-
-	reconcile(t, r, "cache", "ns1")
-
-	if got := getBackend(t, r, "cache", "ns1").Status.Capacity; got != "" {
-		t.Fatalf("status.capacity = %q, want empty (storage wire-up deferred)", got)
 	}
 }
 
