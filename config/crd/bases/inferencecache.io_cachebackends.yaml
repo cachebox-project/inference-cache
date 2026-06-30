@@ -467,11 +467,12 @@ spec:
                   firstEventTimeout:
                     default: 5m
                     description: |-
-                      FirstEventTimeout bounds how long a managed backend may sit
-                      Ready=False with reason AwaitingFirstKVEvent — the managed cache-backend
-                      workload is Available but no KV event has been observed yet — before
-                      the controller flips it to Ready=False/Degraded=True with reason
-                      NoKVEventsObserved.
+                      FirstEventTimeout bounds how long a backend may sit
+                      Ready=False with reason AwaitingFirstKVEvent — the backend is up (a
+                      managed workload is Available, or an events-only backend is wired) but no
+                      KV event has been observed yet — before the controller flips it to
+                      Ready=False/Degraded=True with reason NoKVEventsObserved. It applies to
+                      both Offload-managed and EventsOnly backends.
 
                       The KV-event readiness gate holds Ready until at least one KV event
                       has been observed for this backend's replicas
@@ -484,11 +485,15 @@ spec:
                       plane silently degrades to NO_HINT on every lookup, and this gate makes
                       that loud.
 
-                      The timeout clock starts when the managed cache-backend workload first
-                      reports Available. The gate is on by default and opt-out per CacheBackend
-                      via the annotation inferencecache.io/require-kv-events: "false". Backends
-                      of spec.type External are always exempt (their readiness is determined by
-                      admission accepting the endpoint, and they never enter this gate).
+                      The timeout clock starts when the backend becomes "up": for an
+                      Offload-managed backend, when its workload first reports Available; for an
+                      events-only backend (which provisions no workload), on the first reconcile
+                      it is wired — including a re-anchor to the flip moment when a backend
+                      transitions into events-only from a server-bearing mode. The gate is on by
+                      default and opt-out per CacheBackend via the annotation
+                      inferencecache.io/require-kv-events: "false". Backends of spec.type
+                      External are always exempt (their readiness is determined by admission
+                      accepting the endpoint, and they never enter this gate).
 
                       A zero or negative value is treated as unset and falls back to the 5m
                       default — the field carries no meaningful "wait forever" or "fail
