@@ -183,6 +183,78 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	}
 }
 
+// mooncakeBackend is the managed-Mooncake fixture, mirroring lmcacheBackend:
+// it opts OUT of the KV-event readiness gate so the rollout-driven Ready
+// assertion is orthogonal to the gate.
+func mooncakeBackend(name, namespace string) *cachev1alpha1.CacheBackend {
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Generation:  1,
+			Annotations: map[string]string{"inferencecache.io/require-kv-events": "false"},
+		},
+		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeMooncake},
+	}
+}
+
+// TestReconcileManagedMooncake is the C2-reconciles-Mooncake DoD: a
+// CacheBackend{type: Mooncake} must reconcile into a managed mooncake_master
+// Deployment + Service via the Mooncake adapter's ResolveCacheServer, and
+// status.endpoint must be the master's RPC host:port (the engine-agnostic
+// address the pod webhook later turns into mooncakestore://). The RPC port
+// being first in the rendered Service is what makes serviceEndpoint resolve it.
+func TestReconcileManagedMooncake(t *testing.T) {
+	scheme := newScheme(t)
+	cb := mooncakeBackend("cache", "ns1")
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	dep := getDeployment(t, r, "cache", "ns1")
+	owner := metav1.GetControllerOf(dep)
+	if owner == nil || owner.Kind != "CacheBackend" || owner.Name != "cache" {
+		t.Fatalf("deployment controller owner = %+v, want CacheBackend/cache", owner)
+	}
+	containers := dep.Spec.Template.Spec.Containers
+	if len(containers) != 1 {
+		t.Fatalf("containers = %d, want 1", len(containers))
+	}
+	c := containers[0]
+	if c.Name != "mooncake-master" {
+		t.Fatalf("container name = %q, want mooncake-master", c.Name)
+	}
+	if c.Image == "" {
+		t.Fatalf("container image is empty")
+	}
+	if !containsStr(c.Command, "mooncake_master") {
+		t.Fatalf("container command = %v, want to start with mooncake_master", c.Command)
+	}
+	if len(c.Ports) == 0 || c.Ports[0].ContainerPort != 50051 {
+		t.Fatalf("first container port = %v, want RPC port 50051 first", c.Ports)
+	}
+
+	svc := &corev1.Service{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
+	}
+	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 50051 {
+		t.Fatalf("first service port = %v, want RPC port 50051 first (serviceEndpoint uses Ports[0])", svc.Spec.Ports)
+	}
+
+	updated := getBackend(t, r, "cache", "ns1")
+	wantEndpoint := "cache.ns1.svc.cluster.local:50051"
+	if updated.Status.Endpoint != wantEndpoint {
+		t.Fatalf("status.endpoint = %q, want %q (master RPC host:port; mooncakestore:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
+	}
+	if updated.Status.ObservedGeneration != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
+	}
+}
+
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
@@ -698,9 +770,13 @@ func TestReconcileExternalAdvancesObservedGeneration(t *testing.T) {
 
 func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 	scheme := newScheme(t)
+	// AIBrix has no registered runtime adapter, so it exercises the
+	// "unsupported managed type → reconcileUnmanaged" path. (Mooncake is no
+	// longer a stand-in for an unsupported type — it has an adapter now and
+	// reconciles managed; see TestReconcileManagedMooncake.)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeMooncake},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeAIBrix},
 	}
 	r := newReconciler(scheme, cb)
 

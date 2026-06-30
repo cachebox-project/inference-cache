@@ -1642,6 +1642,24 @@ func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 	}
 }
 
+func TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry(t *testing.T) {
+	// The Mooncake admission contract: with the Mooncake adapter registered in
+	// DefaultRegistry, the registry-driven C7 check must ADMIT (vLLM,
+	// Mooncake). A zero-value validator (Registry nil) falls back to the real
+	// shipping registry (DefaultRegistry + External), so this exercises the
+	// same adapter set the running controller installs — not a stub. (The
+	// stub-registry rejection tests above keep using Mooncake as their
+	// unsupported example precisely because their stub registry omits the
+	// Mooncake adapter; this test is the real-registry counterpart.)
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("shipping registry rejected vLLM+Mooncake (adapter should be registered): %v", err)
+	}
+}
+
 func TestServiceDNSNamespace(t *testing.T) {
 	cases := []struct {
 		name     string

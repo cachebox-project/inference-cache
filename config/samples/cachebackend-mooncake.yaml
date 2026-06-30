@@ -1,0 +1,62 @@
+# A managed Mooncake backend the controller reconciles into a standalone
+# mooncake_master Deployment + Service. Mooncake is the durable, network-
+# addressable / shared cache path (vs. the in-memory lmcache-server in
+# cachebackend-lmcache.yaml) — see docs/design/lmcache-server-persistence.md.
+#
+# How the engine is wired: Mooncake integrates with vLLM as an LMCache *remote
+# backend*. Engine pods (vLLM) are user-owned; spec.engineSelector identifies
+# the pods the controller's mutating Pod admission webhook auto-wires to the
+# resolved cache endpoint published in status.endpoint (an engine-agnostic
+# host:port — the master's RPC address). Matched pods are auto-injected at
+# admission with the SAME LMCache connector the LMCache backend uses
+# (LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
+# VLLM_USE_V1 + the `--kv-transfer-config` arg) — the only difference is the
+# remote-store URL scheme: LMCACHE_REMOTE_URL=mooncakestore://<host:port>
+# instead of lm://. User-set env/args on the pod template survive injection
+# (the adapter merges, never clobbers). A pod can opt out per-instance with the
+# annotation `inferencecache.io/skip-inject`.
+#
+# Phase 1 manages a Deployment + ClusterIP Service exposing the Mooncake master
+# RPC port (50051, the mooncakestore:// endpoint the engine dials) plus the
+# master's embedded HTTP metadata port (8080), plus an optional
+# HorizontalPodAutoscaler from spec.autoscaling.
+#
+# Operator note — transfer-engine config: the Mooncake transfer engine's static
+# tuning (metadata_server, protocol tcp/rdma, device_name, segment sizes) lives
+# in LMCache's extra_config, supplied to the engine via an operator-provided
+# config file (LMCACHE_CONFIG_FILE / MOONCAKE_CONFIG_PATH) — it is not part of
+# the auto-injected env. The defaults (P2P-handshake metadata) cover the
+# simplest deployment; pin the rest for a real RDMA/HTTP-metadata setup. Keep
+# the master image wire-compatible with the engine's mooncake-transfer-engine
+# pip package version (see docs/design/cachebackend-api.md).
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-mooncake
+spec:
+  type: Mooncake
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
+    engine: vllm
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  backendConfig:
+    # Served model identifier the matched engine pods are loaded with.
+    # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
+    # so the index keys per-replica entries by model. Omit (or set empty)
+    # to skip the subscriber sidecar (engine wiring still happens).
+    model: meta-llama/Meta-Llama-3-8B-Instruct
+    # Matches the pinned adapter default (the only version tag published on
+    # Docker Hub, version-aligned with mooncake-transfer-engine 0.3.11.post1
+    # on PyPI). Pin to an `@sha256:` digest for non-local runs.
+    serverImage: kvcacheai/mooncake:0.3.11.post1
+    # Override `serverCommand` to change the master's flags (a different
+    # metadata backend, HA mode, etc.). The default launches the master with
+    # its RPC port, Prometheus metrics port, and the embedded HTTP metadata
+    # server so the simplest deployment needs no external etcd/redis.

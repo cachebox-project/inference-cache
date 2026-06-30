@@ -134,6 +134,109 @@ func TestLMCacheRemoteURL_ShortInputDoesNotPanic(t *testing.T) {
 	}
 }
 
+// TestInjectVLLMMooncake_InjectsEnv asserts the Mooncake wire injects the SAME
+// env set as the LMCache wire (Mooncake is an LMCache remote backend) but with
+// LMCACHE_REMOTE_URL carrying the mooncakestore:// scheme, and the SAME
+// LMCacheConnectorV1 --kv-transfer-config arg. The only on-the-wire difference
+// from InjectVLLMLMCache is the remote-URL scheme.
+func TestInjectVLLMMooncake_InjectsEnv(t *testing.T) {
+	pod := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: EngineContainerName}},
+	}
+	cache := &cachev1alpha1.CacheBackend{}
+
+	if err := InjectVLLMMooncake(pod, "mooncake.example:50051", cache); err != nil {
+		t.Fatalf("InjectVLLMMooncake: %v", err)
+	}
+	env := pod.Containers[0].Env
+
+	wantNames := map[string]bool{
+		EnvLMCacheRemoteURL:       true,
+		EnvLMCacheRemoteSerde:     true,
+		EnvLMCacheChunkSize:       true,
+		EnvLMCacheLocalCPU:        true,
+		EnvLMCacheMaxLocalCPU:     true,
+		EnvVLLMUseV1:              true,
+		EnvInferenceCacheFailOpen: true,
+		EnvPythonHashSeed:         true,
+	}
+	gotNames := make(map[string]bool, len(env))
+	for _, e := range env {
+		gotNames[e.Name] = true
+	}
+	if len(env) != len(wantNames) {
+		t.Errorf("injected env count = %d, want %d; env = %v", len(env), len(wantNames), env)
+	}
+	for name := range wantNames {
+		if !gotNames[name] {
+			t.Errorf("injected env missing %q; got %v", name, gotNames)
+		}
+	}
+
+	// The remote URL carries the mooncakestore:// scheme (the defining
+	// difference from the LMCache wire).
+	if v, ok := lookupInjectedEnv(env, EnvLMCacheRemoteURL); !ok || v != "mooncakestore://mooncake.example:50051" {
+		t.Fatalf("%s = (%q, %v), want mooncakestore://mooncake.example:50051", EnvLMCacheRemoteURL, v, ok)
+	}
+	// PYTHONHASHSEED correctness invariant still pinned to "0".
+	if v, ok := lookupInjectedEnv(env, EnvPythonHashSeed); !ok || v != "0" {
+		t.Fatalf("%s = (%q, %v), want 0", EnvPythonHashSeed, v, ok)
+	}
+	// The connector arg is the shared LMCache connector (Mooncake is wired
+	// as an LMCache remote backend).
+	args := pod.Containers[0].Args
+	if len(args) < 2 || args[0] != "--kv-transfer-config" || !contains(args[1], "LMCacheConnectorV1") {
+		t.Fatalf("kv-transfer-config arg = %v, want LMCacheConnectorV1 connector", args)
+	}
+}
+
+func TestMooncakeStoreRemoteURL_BareHostGetsScheme(t *testing.T) {
+	got := MooncakeStoreRemoteURL("mooncake.example:50051")
+	want := "mooncakestore://mooncake.example:50051"
+	if got != want {
+		t.Fatalf("MooncakeStoreRemoteURL(bare) = %q, want %q", got, want)
+	}
+}
+
+func TestMooncakeStoreRemoteURL_SchemePreserved(t *testing.T) {
+	got := MooncakeStoreRemoteURL("mooncakestore://mooncake.example:50051")
+	want := "mooncakestore://mooncake.example:50051"
+	if got != want {
+		t.Fatalf("MooncakeStoreRemoteURL(prefixed) = %q, want %q (must not double the scheme)", got, want)
+	}
+}
+
+func TestMooncakeStoreRemoteURL_UpperCaseSchemeNormalised(t *testing.T) {
+	for _, in := range []string{
+		"MOONCAKESTORE://mooncake.example:50051",
+		"MooncakeStore://mooncake.example:50051",
+	} {
+		got := MooncakeStoreRemoteURL(in)
+		want := "mooncakestore://mooncake.example:50051"
+		if got != want {
+			t.Fatalf("MooncakeStoreRemoteURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMooncakeStoreRemoteURL_HostCasingPreserved(t *testing.T) {
+	got := MooncakeStoreRemoteURL("mooncakestore://Mooncake.Example.Com:50051")
+	want := "mooncakestore://Mooncake.Example.Com:50051"
+	if got != want {
+		t.Fatalf("MooncakeStoreRemoteURL(mixed host) = %q, want %q", got, want)
+	}
+}
+
+func TestMooncakeStoreRemoteURL_ShortInputDoesNotPanic(t *testing.T) {
+	for _, in := range []string{"", "moon", "mooncakestore:", "mooncakestore:/"} {
+		got := MooncakeStoreRemoteURL(in)
+		want := "mooncakestore://" + in
+		if got != want {
+			t.Fatalf("MooncakeStoreRemoteURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestValidateLMCacheEndpoint(t *testing.T) {
 	cases := []struct {
 		name      string

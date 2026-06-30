@@ -75,9 +75,13 @@ Concretely:
   the engine config injection consumes. One mutation step does both injections.
 * The adapter seam keeps engine-specific decisions where the project already lives them.
   A future SGLang adapter can return a different sidecar (e.g. a different ZMQ port or a
-  completely different observation mechanism); a Mooncake adapter can return `nil` if its
-  backend exposes the same data a different way. **DaemonSet remains an option for any
-  future adapter** that wants it — it just isn't this PR.
+  completely different observation mechanism). The shipped Mooncake adapter, by contrast,
+  returns the *same* vLLM kvevent-subscriber the LMCache adapter does — Mooncake integrates
+  as an LMCache remote backend, so the engine is still vLLM and its KV events still come
+  from vLLM's ZMQ publisher (scheme-tagged `vllm`); only the backend store differs. A
+  future backend that fronts a non-vLLM engine, or exposes observation data some other way,
+  could still return `nil` or a different container here. **DaemonSet remains an option for
+  any future adapter** that wants it — it just isn't this PR.
 * `External` backends explicitly return `nil` — we don't manage that backend's lifecycle,
   per the ticket test plan.
 * Subscriber lifecycle tied to the engine pod is correctness, not a regression: when the
