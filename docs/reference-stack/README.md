@@ -1,4 +1,4 @@
-# vLLM + LMCache reference stack
+# vLLM (+ SGLang) + LMCache reference stack
 
 A reproducible reference deployment of **vLLM** serving a model with **LMCache**
 as its KV-cache backend, with **KV-cache events published over ZMQ**. Use it to
@@ -13,6 +13,10 @@ The manifests here are intentionally minimal and explicit so they can serve as a
 starting template for your own automation (an operator, a Helm release, or plain
 `kubectl apply`).
 
+> **Two engine references live here.** This page walks the **vLLM** path; the
+> **SGLang** sibling (same LMCache backend + ZMQ event wire) is at
+> [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) with its own README.
+
 > **You need an NVIDIA GPU** for the full stack — vLLM loads weights on CUDA and
 > LMCache offloads KV from GPU memory. See [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) for
 > how to size GPU memory and pick a card. If you only want to validate the event
@@ -25,9 +29,10 @@ starting template for your own automation (an operator, a Helm release, or plain
 |---|---|
 | [`VERSIONS.md`](VERSIONS.md) | Pinned images / models / chart. **Read first.** |
 | [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing (VRAM math), shape/card table, multi-card tensor-parallelism. |
-| [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ). |
+| [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ; the ZMQ NodePort is used by the vLLM path — the SGLang manifest deliberately doesn't node-expose ZMQ). |
 | [`manifests/`](manifests/) | GPU reference Deployment + Service. |
 | [`manifests/cpu-local/`](manifests/cpu-local/) | CPU variant (no LMCache): prefix-cache hit + KV events. |
+| [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | **SGLang** + LMCache reference (the second engine) — GPU; the hand-built template the `(sglang, LMCache)` adapter's engine-side injection mirrors. Same KV-event structs as vLLM (the batch envelope adds a trailing `attn_dp_rank` the decoder ignores); the Python `scripts/` tooling covers the shared decode/redaction, the Go `pkg/adapters/engine` SGLang test covers SGLang's exact 3-tuple wire. |
 | [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream vLLM Production-Stack chart path (alternative to the raw manifests). |
 | [`scripts/`](scripts/) | ZMQ event subscriber, prefix-cache-hit test, synthetic publisher, tests. |
 | `captures/` | Where you save your event-stream sample and a cache-hit screenshot. |

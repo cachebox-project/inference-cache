@@ -1,0 +1,205 @@
+# SGLang + LMCache reference deployment — the second-engine sibling of the
+# top-level vLLM + LMCache reference (manifests/deployment.yaml).
+#
+# This is the hand-built reference the (sglang, LMCache) runtime adapter was
+# templated from: a standalone lmcache-server + an SGLang engine wired to it,
+# publishing KV-cache events over ZMQ. The SGLang engine container's LMCache
+# wiring (the --enable-lmcache arg + the LMCACHE_* / INFERENCECACHE_FAIL_OPEN
+# env) mirrors what the adapter's auto-injection produces, so an operator can
+# read one manifest to understand the engine-side contract the controller
+# applies on their behalf. The rest — the image, resources, the lmcache-server,
+# and --kv-events-config — is operator-owned scaffolding the adapter assumes is
+# already present (it wires the cache offload, not the event publisher or the
+# pod shape), so the full manifest is NOT byte-for-byte adapter output.
+#
+# >> You need an NVIDIA GPU. << SGLang loads weights on CUDA, and the LMCache
+# connector offloads KV. Unlike vLLM there is no first-class CPU build to fall
+# back to here, so this manifest is GPU-only. SGLang's exact KV-event wire (the
+# 3-tuple EventBatch envelope) is covered off-GPU by the Go fixture
+# `go test ./pkg/adapters/engine/ -run SGLang`; the Python scripts/ tooling
+# additionally exercises the shared decode + token-redaction logic (it models
+# vLLM's 2-tuple envelope). See this directory's README.
+#
+# IMAGE PINNING: the SGLang image ships as a **non-applyable placeholder digest**
+# (the all-zero `@sha256:` below won't pull — same convention as the vLLM
+# reference manifest, see VERSIONS.md). Substitute a real digest before any run,
+# and ensure the lmcache client is present in the image (the base SGLang image
+# does not bundle it — bake `pip install lmcache` into a derived image or an init
+# step, version-aligned with the lmcache-server tag below).
+#
+# WIRE-TEST CAVEAT: this manifest wires SGLang's experimental LMCache path to a
+# REMOTE lmcache-server via LMCACHE_REMOTE_URL (what the adapter injects). Whether
+# SGLang's experimental path honours LMCACHE_REMOTE_URL from the env vs. requiring
+# the full LMCACHE_CONFIG_FILE has not been wire-tested end-to-end. If a real run
+# shows the engine never connects (lmcache-server logs no stores), mount a config
+# file instead (see the README) and report back so the adapter can follow suit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-server
+  namespace: cache-substrate
+  labels:
+    app: lmcache-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lmcache-server
+  template:
+    metadata:
+      labels:
+        app: lmcache-server
+    spec:
+      containers:
+        - name: lmcache-server
+          # Non-applyable placeholder digest, like the engine image above — pin
+          # both before a run. = lmcache/standalone:v0.4.7 (the adapter's default,
+          # a fixed non-floating version); resolve its real digest per VERSIONS.md
+          # and substitute here. Must be wire-compatible with the lmcache *client*
+          # baked into the SGLang image (VERSIONS.md "version alignment").
+          image: lmcache/standalone@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command: ["lmcache_server"]
+          args: ["0.0.0.0", "65432", "cpu"]
+          ports:
+            - { name: lmcache, containerPort: 65432 }
+          readinessProbe:
+            tcpSocket: { port: lmcache }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          # The lmcache-server keeps KV in memory; bound it by the cgroup so T2
+          # write load can't OOM the node. Mirrors the managed adapter's
+          # spec.resources CRD default (4Gi request / 8Gi limit) — size to your
+          # working set (a large model's KV is tens of GB; see the version-
+          # alignment note in docs/design/cachebackend-api.md).
+          resources:
+            requests: { memory: 4Gi }
+            limits: { memory: 8Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lmcache-server
+  namespace: cache-substrate
+  labels:
+    app: lmcache-server
+spec:
+  type: ClusterIP
+  selector:
+    app: lmcache-server
+  ports:
+    - { name: lmcache, port: 65432, targetPort: lmcache }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-lmcache-llama-8b
+  namespace: cache-substrate
+  labels:
+    app: sglang-lmcache-llama-8b
+    # The cache plane's mutating Pod webhook matches engine pods by label
+    # (CacheBackend.spec.engineSelector). This mirrors config/samples/cachebackend-sglang.yaml.
+    app.kubernetes.io/name: sglang
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-lmcache-llama-8b
+  template:
+    metadata:
+      labels:
+        app: sglang-lmcache-llama-8b
+        app.kubernetes.io/name: sglang
+    spec:
+      containers:
+        # Container name MUST be `sglang` so the adapter's InjectEngineConfig /
+        # engineOverrides target the right container (EngineContainerName()).
+        - name: sglang
+          # Non-applyable placeholder for a DERIVED image: base lmsysorg/sglang
+          # with the lmcache client baked in (the base does NOT bundle it — see
+          # header + VERSIONS.md for the build/pin steps). The repo name is
+          # deliberately not `lmsysorg/sglang` so that substituting only the
+          # digest can't accidentally pull the lmcache-less upstream base.
+          image: YOUR_REGISTRY/sglang-lmcache@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "sglang.launch_server"]
+          args:
+            # Matches config/samples/cachebackend-sglang.yaml's backendConfig.model
+            # and the SGLang row in VERSIONS.md. In the managed path the served
+            # model, the CacheBackend's backendConfig.model, and the request's
+            # `model` must all agree — the index keys per-model, so a mismatch
+            # silently misses on LookupRoute even while events flow.
+            - "--model-path=meta-llama/Meta-Llama-3-8B-Instruct"
+            - "--host=0.0.0.0"
+            - "--port=30000"
+            # SGLang's LMCache connector (store_true flag — no value).
+            - "--enable-lmcache"
+            # KV-cache event publisher — SGLang's ZmqEventPublisher, same event
+            # structs as vLLM (3-tuple batch envelope). The consumer is the Go
+            # kvevent-subscriber (managed path); the Python scripts/kv_events_subscriber.py
+            # demo decodes only vLLM's 2-tuple shape (UNDECODED on SGLang). Reads
+            # tcp://*:5557. NOTE: these raw frames carry token_ids — see the
+            # README privacy note before exposing :5557 beyond the pod.
+            - "--kv-events-config"
+            - '{"publisher":"zmq","endpoint":"tcp://*:5557","buffer_steps":10000,"topic":"kv-events"}'
+          env:
+            # Gates SGLang's experimental LMCache integration — required for
+            # --enable-lmcache to engage the connector.
+            - { name: LMCACHE_USE_EXPERIMENTAL, value: "True" }
+            # The remote lmcache-server, lm:// scheme. (See the wire-test caveat
+            # in the header — this is the path the adapter injects.)
+            - { name: LMCACHE_REMOTE_URL, value: "lm://lmcache-server:65432" }
+            - { name: LMCACHE_REMOTE_SERDE, value: "naive" }
+            - { name: LMCACHE_CHUNK_SIZE, value: "256" }
+            - { name: LMCACHE_LOCAL_CPU, value: "False" }
+            - { name: LMCACHE_MAX_LOCAL_CPU_SIZE, value: "20" }
+            # Mirror of spec.integration.failOpen (defaults true) — the adapter
+            # injects this as a reserved env so the engine layer can honor the
+            # fail-open contract. Part of the adapter-injected set.
+            - { name: INFERENCECACHE_FAIL_OPEN, value: "true" }
+            # Gated model — needs a Hugging Face token (see README step 2).
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token }
+          ports:
+            - { name: http, containerPort: 30000 }
+            - { name: kv-events, containerPort: 5557 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 120 # model load + CUDA graph capture is slow
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { name: cache-home, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache-home
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-lmcache-llama-8b
+  namespace: cache-substrate
+  labels:
+    app: sglang-lmcache-llama-8b
+spec:
+  type: NodePort
+  selector:
+    app: sglang-lmcache-llama-8b
+  # Only the HTTP API is node-exposed (for driving traffic); reuses the kind
+  # cluster's 30080 mapping (../../kind/cluster.yaml), shared with the vLLM
+  # reference — deploy ONE engine reference at a time. The KV-event port (:5557)
+  # is deliberately NOT in this Service: those raw frames carry token_ids, and
+  # the consumer is the in-pod subscriber sidecar reading 127.0.0.1 (managed
+  # path) — there is no need to expose token-bearing frames cluster-wide.
+  ports:
+    - { name: http, port: 30000, targetPort: http, nodePort: 30080 }
