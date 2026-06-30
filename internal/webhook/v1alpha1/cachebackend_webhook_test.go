@@ -1452,19 +1452,21 @@ func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
 	}
 }
 
-func TestValidator_RuntimeAdapter_VLLMPlusMooncakeRejected(t *testing.T) {
-	// Rejection path: a (vLLM, Mooncake) pair no installed adapter
+func TestValidator_RuntimeAdapter_VLLMPlusUnsupportedTypeRejected(t *testing.T) {
+	// Rejection path: a (vLLM, <unsupported type>) pair no installed adapter
 	// supports must be rejected with a message that names BOTH sides of
 	// the offending pair and lists the supported pairs so the user has
-	// an actionable next step.
+	// an actionable next step. AIBrix is the example because no shipping
+	// adapter handles it (unlike Mooncake, which this PR added an adapter
+	// for) — so it stays a genuinely-unsupported pair in any registry.
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 
 	_, err := v.ValidateCreate(context.Background(), cb)
 	if err == nil {
-		t.Fatalf("expected vLLM+Mooncake to be rejected")
+		t.Fatalf("expected vLLM+AIBrix to be rejected")
 	}
 	statusErr, ok := err.(*apierrors.StatusError)
 	if !ok {
@@ -1484,7 +1486,7 @@ func TestValidator_RuntimeAdapter_VLLMPlusMooncakeRejected(t *testing.T) {
 	if match == nil {
 		t.Fatalf("no cause on spec.integration.engine; got: %+v", causes)
 	}
-	for _, want := range []string{"vllm", "Mooncake", "vllm/LMCache"} {
+	for _, want := range []string{"vllm", "AIBrix", "vllm/LMCache"} {
 		if !strings.Contains(match.Message, want) {
 			t.Errorf("rejection message missing %q; got %q", want, match.Message)
 		}
@@ -1531,14 +1533,16 @@ func TestValidator_RuntimeAdapter_EmptyEngineDefaultsToVLLM(t *testing.T) {
 
 func TestValidator_RuntimeAdapter_EmptyEngineWithUnsupportedTypeRejected(t *testing.T) {
 	// Counterpart to the previous test: the default vLLM resolution
-	// must also fire C7 — type: Mooncake with no engine must be
+	// must also fire C7 — type: AIBrix with no engine must be
 	// rejected at admission, since the reconciler would otherwise try
-	// vllm+Mooncake and fall back to unmanaged.
+	// vllm+AIBrix and fall back to unmanaged. (AIBrix, not Mooncake:
+	// this PR added a vllm+Mooncake adapter, so Mooncake is no longer an
+	// unsupported pair.)
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix
 	requireInvalidWithCause(t, v, cb, "spec.integration.engine",
-		"backend=\"Mooncake\"")
+		"backend=\"AIBrix\"")
 }
 
 func TestValidator_RuntimeAdapter_EmptyTypeSkipsCheck(t *testing.T) {
@@ -1591,7 +1595,7 @@ func TestValidator_RuntimeAdapter_UpdateAlsoChecks(t *testing.T) {
 	old := newBackend()
 	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	newCB := old.DeepCopy()
-	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix
 
 	_, err := v.ValidateUpdate(context.Background(), old, newCB)
 	if err == nil || !apierrors.IsInvalid(err) {
@@ -1604,7 +1608,7 @@ func TestValidator_RuntimeAdapter_DeleteSkipsCheck(t *testing.T) {
 	// since admission) must still be allowed so operators can clean up.
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend()
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateDelete(context.Background(), cb); err != nil {
 		t.Fatalf("ValidateDelete rejected unsupported pair: %v", err)

@@ -42,13 +42,25 @@ const (
 	// Overridable via backendConfig.serverImage (production should pin to a
 	// digest there).
 	//
-	// TODO(cachebox): wire-test and digest-pin before production. The tag is
+	// TODO(cachebox): wire-test and digest-pin before production. The tag and
+	// its multi-arch digests are confirmed published on Docker Hub and are
 	// version-aligned with the PyPI release, but the image's entrypoint / that
-	// `mooncake_master` is on PATH / the master/metadata ports were not
-	// independently verified here (the image layers were not inspected). Confirm
-	// against a kind reference stack (the A2-equivalent Mooncake bring-up — see
-	// the CacheBackend API doc) and prefer an @sha256: digest. Do not substitute
-	// an invented digest.
+	// `mooncake_master` is on PATH / the master/metadata ports were NOT
+	// independently verified here (the config blob was not layer-inspected).
+	// Confirm against a kind reference stack (the A2-equivalent Mooncake
+	// bring-up — see the CacheBackend API doc) and prefer an @sha256: digest.
+	// Do not substitute an invented digest.
+	//
+	// This default fails SAFE, not silently: if the image is wrong (no
+	// `mooncake_master` on PATH, different flags/ports) the master pod
+	// CrashLoops / ImagePullBackOffs, the managed Deployment never reports
+	// Available, and the RPC-port readiness probe below keeps the CacheBackend
+	// at Ready=False (RolloutInProgress / ReplicasUnavailable) — the operator
+	// sees the breakage in `kubectl get cachebackend`, not a green-but-dead
+	// backend. And because the cache is fail-open, engines fall back to local
+	// prefill regardless, so a broken master is never a serving outage. An
+	// operator can repoint to a known-good image/digest via backendConfig
+	// .serverImage without a code change.
 	defaultMooncakeMasterImage = "kvcacheai/mooncake:0.3.11.post1"
 
 	// defaultMooncakeMasterRPCPort is the Mooncake master's RPC port — the
@@ -307,6 +319,20 @@ func (a vllmMooncakeAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBacken
 // etc.). The default launches the master with its RPC port, Prometheus metrics
 // port, and the embedded HTTP metadata server so the simplest deployment needs
 // no external etcd/redis.
+//
+// PORT CONSTRAINT: the override MUST keep the RPC port at
+// [defaultMooncakeMasterRPCPort] (50051) and the HTTP metadata port at
+// [defaultMooncakeMetadataPort] (8080). [ResolveCacheServer] pins the Service
+// ports, the container ports, the readiness probe, and (via the reconciler's
+// serviceEndpoint) status.endpoint to those two values — they are NOT derived
+// from this command string, because a free-form command can't be reliably
+// parsed for flag values. So an override that changes `--rpc_port` or
+// `--http_metadata_server_port` desyncs the master from the Service: the
+// readiness probe and engine wire would target dead ports and the backend
+// would stay Ready=False. Change the metadata backend / HA flags here freely;
+// do NOT change the ports. (Synchronized port config — backendConfig keys that
+// drive both the command and the Service — is a deliberate non-goal for
+// v1alpha1; the LMCache adapter's serverCommand carries the same constraint.)
 func mooncakeMasterCommand(cfg map[string]string) (command, args []string) {
 	if raw := enginewire.ConfigOr(cfg, cfgKeyServerCommand, ""); raw != "" {
 		fields := strings.Fields(raw)

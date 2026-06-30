@@ -396,8 +396,8 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 // reconciler and pod-mutating webhook consult — so admission, reconcile,
 // and pod injection agree on which adapter the registry should pick. In
 // particular, an unset engine defaults to vLLM here just as it does at
-// reconcile, so a CR with `type: Mooncake` and no engine no longer slips
-// past admission only to fail downstream.
+// reconcile, so a CR with an unsupported type (e.g. `type: AIBrix`) and no
+// engine no longer slips past admission only to fail downstream.
 //
 // External backends flow through this check the same way managed types
 // do: they have a real runtime adapter (vllm-only today, see

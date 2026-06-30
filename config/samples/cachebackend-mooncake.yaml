@@ -59,4 +59,7 @@ spec:
     # Override `serverCommand` to change the master's flags (a different
     # metadata backend, HA mode, etc.). The default launches the master with
     # its RPC port, Prometheus metrics port, and the embedded HTTP metadata
-    # server so the simplest deployment needs no external etcd/redis.
+    # server so the simplest deployment needs no external etcd/redis. Keep the
+    # RPC port (50051) and HTTP metadata port (8080) as-is: the Service,
+    # readiness probe, and status.endpoint are pinned to them, so changing the
+    # ports here would leave the engine wire pointing at dead ports.
