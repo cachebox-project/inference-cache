@@ -511,6 +511,24 @@ spec:
                       mis-parses). This matches how the API treats every metav1.Duration
                       field; no extra CRD-level format constraint is imposed.
                     type: string
+                  mode:
+                    default: Offload
+                    description: |-
+                      Mode selects which cache tiers the engine is wired for. Defaults to
+                      Offload — cache-aware routing (tier-1) PLUS the KV-offload connector
+                      (tier-2), with a controller-provisioned backend server. EventsOnly wires
+                      routing only: the kvevent-subscriber sidecar is injected, but no KV
+                      connector is loaded into the engine and no backend server is provisioned.
+                      EventsOnly is the supported integration for hybrid-attention models that
+                      cannot take a vLLM KV connector (and a lighter routing-only deployment for
+                      anyone who does not want an offload tier). Because EventsOnly provisions
+                      no server, status.endpoint stays empty and the autoscaling spec is
+                      rejected at admission; Ready is still gated on the first observed KV event.
+                      See the CacheBackendIntegrationMode godoc.
+                    enum:
+                    - Offload
+                    - EventsOnly
+                    type: string
                   role:
                     default: ReadWrite
                     description: |-

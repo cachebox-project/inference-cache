@@ -272,6 +272,133 @@ func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 	}
 }
 
+// eventsOnlyCacheBackend returns an events-only (tier-1 routing) LMCache
+// CacheBackend: type=LMCache, spec.integration.mode=EventsOnly, a served model
+// id (so ObservationSidecar emits a container), an engineSelector, and NO
+// status.endpoint. It provisions no server, so the absent endpoint is the
+// expected steady state — not a not-yet-reconciled race.
+func eventsOnlyCacheBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
+		},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
+			BackendConfig:  map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+		},
+		// No Status.Endpoint — events-only provisions no server, so the
+		// reconciler leaves it empty. The webhook MUST inject anyway.
+	}
+}
+
+func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *testing.T) {
+	// An events-only backend has an EMPTY status.endpoint by design (no
+	// provisioned server), but it must NOT fail-open the way a managed backend
+	// with a not-yet-published endpoint does. The webhook injects: the pod is
+	// patched, the kvevent-subscriber sidecar is appended, the injected-by
+	// annotations are stamped, and the engine container gets NO connector
+	// wiring (InjectEngineConfig is a no-op in events-only mode).
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	h := newHandlerWithSubscriber(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatalf("events-only backend with empty status.endpoint must INJECT, not fail-open; got no patches")
+	}
+
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// The subscriber sidecar IS appended — that is the whole point of
+	// events-only (the routing tier observes KV events via the sidecar).
+	if len(mutated.Spec.Containers) != 2 {
+		t.Fatalf("expected 2 containers (engine + subscriber), got %d: %v",
+			len(mutated.Spec.Containers), containerNames(mutated))
+	}
+	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	if sub == nil {
+		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
+	}
+	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+	}
+
+	// The injected-by + injected-by-uid annotations are stamped — proving the
+	// webhook took the inject path (not fail-open, which strips them).
+	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
+		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
+	}
+	if got, want := mutated.Annotations[AnnotationInjectedByUID], string(cb.UID); got != want {
+		t.Fatalf("annotation %s: got %q, want %q (matched CR UID)", AnnotationInjectedByUID, got, want)
+	}
+
+	// The engine container gets NO KV connector wiring: events-only loads no
+	// connector (a hybrid-attention model's KV-cache manager would be disabled
+	// by one). The user's own env/args survive untouched.
+	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	if engine == nil {
+		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
+	}
+	for _, e := range engine.Env {
+		if strings.HasPrefix(e.Name, "LMCACHE_") {
+			t.Fatalf("events-only engine container must carry NO LMCACHE_* env; found %s=%q", e.Name, e.Value)
+		}
+	}
+	for _, a := range engine.Args {
+		if a == "--kv-transfer-config" {
+			t.Fatalf("events-only engine container must carry NO --kv-transfer-config; args = %v", engine.Args)
+		}
+	}
+	// The user-set env/arg on the engine pod template survive.
+	if !argPresent(engine.Args, "--model") {
+		t.Fatalf("user pod-template arg --model dropped; args = %v", engine.Args)
+	}
+}
+
+func TestHandle_OffloadManagedBackend_EmptyEndpoint_FailsOpen(t *testing.T) {
+	// Contrast with the events-only case above: an Offload (default-mode)
+	// managed backend whose status.endpoint is not yet published MUST fail-open
+	// — admit unmodified, no subscriber sidecar, no injected-by annotation —
+	// because the connector it would wire needs a real dial target. This pins
+	// that the events-only inject path is mode-gated, not a blanket
+	// "inject on empty endpoint".
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+	cb.Status.Endpoint = "" // Offload mode, reconciler hasn't published yet.
+	h := newHandlerWithSubscriber(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed (fail-open), got: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("Offload managed backend with empty status.endpoint must fail-open (no patches), got %d: %+v",
+			len(resp.Patches), resp.Patches)
+	}
+	// Fail-open never stamps injected-by; the inbound pod carried none, so a
+	// re-applied pod is byte-identical (zero patches above already proves it,
+	// but assert the annotation absence explicitly for clarity).
+	if pod.Annotations[AnnotationInjectedBy] != "" {
+		t.Fatalf("fail-open path must not stamp %s", AnnotationInjectedBy)
+	}
+}
+
 func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	// A pod that matches an External CR's engine selector must come out
 	// of admission wired to the operator-supplied endpoint via the

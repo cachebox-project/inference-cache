@@ -160,7 +160,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
 
 	endpoint := effectiveEndpoint(cache)
-	if endpoint == "" {
+	// Events-only (tier-1 routing) backends provision no server, so they publish
+	// no endpoint — and they wire no KV connector, so they need none. The
+	// endpoint gate exists ONLY because the connector requires a dial target
+	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
+	// events-only pod injects only the observation sidecar (InjectEngineConfig
+	// is a no-op in this mode), so bypass the gate and inject without one.
+	if endpoint == "" && !cache.Spec.IsEventsOnly() {
 		// The endpoint source is type-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint

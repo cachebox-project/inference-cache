@@ -1,0 +1,63 @@
+# An events-only (tier-1 routing) CacheBackend. This is the lighter,
+# routing-only integration: cache-aware routing is wired, but NO KV-offload
+# connector is loaded into the engine and NO backend server is provisioned.
+#
+# Set spec.integration.mode: EventsOnly to select it. Compared to the default
+# Offload mode (see cachebackend-lmcache.yaml), the controller here:
+#   - provisions NO standalone lmcache-server Deployment or Service, and leaves
+#     status.endpoint empty (there is no server address to publish), and
+#   - injects NO `--kv-transfer-config` arg / LMCACHE_* env into the engine
+#     container.
+# The mutating Pod webhook still appends the kvevent-subscriber sidecar to
+# matched engine pods, so LookupRoute and status.indexParticipation behave
+# exactly like a managed backend — only the offload tier is absent. (In this
+# mode the subscriber forwards evictions instead of suppressing them: there is
+# no L2 tier holding the block after the engine drops it, so a removed block
+# genuinely means the prefix is gone.)
+#
+# WHY use it: this is the supported integration for hybrid-attention models
+# that cannot take a vLLM KV connector — Qwen3.6/Next gated-DeltaNet,
+# Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, and similar. vLLM disables its
+# hybrid KV-cache manager the moment any KV connector is loaded (KV-spec
+# unification then fails at init), so they cannot take the tier-2 connector;
+# but their KV events coexist fine with the hybrid manager, so routing still
+# works. It is also a lighter deployment for routing-only users who do not want
+# an offload tier at all.
+#
+# Like a managed backend, an events-only backend is gated on the first KV event:
+# it sits Ready=False/AwaitingFirstKVEvent until the auto-attached
+# kvevent-subscriber reports an event (requires the controller to run with
+# --kvevent-subscriber-image set; empty by default), then flips to
+# Ready=True/KVEventsObserved. status.endpoint stays empty throughout.
+#
+# Admission constraints for this mode: spec.type=External is rejected (it
+# provisions an offload server a connector would dial — contradictory with
+# "no connector"), and spec.autoscaling is rejected (there is no server
+# workload to scale). The supported managed type is LMCache.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-events-only
+spec:
+  type: LMCache
+  integration:
+    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
+    engine: vllm
+    # Routing-only: no KV connector, no provisioned server.
+    mode: EventsOnly
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  backendConfig:
+    # Served model identifier the matched engine pods are loaded with. Plumbed
+    # to the auto-attached kvevent-subscriber sidecar's --model-id so the index
+    # keys per-replica entries by model. A hybrid-attention model is the
+    # canonical events-only use case.
+    model: Qwen/Qwen3-Next-80B-A3B-Instruct
+  # No storage: events-only provisions no server, so there is nothing to back
+  # with a PVC.
+  # No autoscaling: there is no server workload to scale (admission rejects it).
+  # No endpoint: managed types never set spec.endpoint, and events-only
+  # publishes no status.endpoint either.

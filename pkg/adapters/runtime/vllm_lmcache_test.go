@@ -924,6 +924,67 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheInjectEngineConfigEventsOnlyIsNoOp(t *testing.T) {
+	// Events-only (tier-1 routing) wires NO KV connector — the engine container
+	// must be left untouched so a hybrid-attention model's KV-cache manager is
+	// not disabled — and it requires no endpoint (nothing dials a cache server),
+	// so an empty endpoint must NOT error the way the managed path does.
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen3.6-27B"})
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+	}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName, Args: []string{"--model", "x"}}}}
+
+	if err := a.InjectEngineConfig(pod, "", cb); err != nil {
+		t.Fatalf("events-only InjectEngineConfig must be a no-op with no endpoint, got error: %v", err)
+	}
+	if got := len(pod.Containers[0].Args); got != 2 {
+		t.Fatalf("events-only must not add engine args; args = %v", pod.Containers[0].Args)
+	}
+	if got := len(pod.Containers[0].Env); got != 0 {
+		t.Fatalf("events-only must not inject connector env; env = %v", pod.Containers[0].Env)
+	}
+	if containsArg(pod.Containers[0].Args, defaultEngineKVTransferConfigArg) {
+		t.Fatalf("events-only must not inject the KV connector arg; args = %v", pod.Containers[0].Args)
+	}
+}
+
+func TestVLLMLMCacheObservationSidecarEventsOnlyForwardsEvictions(t *testing.T) {
+	// Events-only has no L2 tier retaining blocks, so a BlockRemoved genuinely
+	// means the prefix is gone: the subscriber MUST forward evictions, i.e. the
+	// suppression flag must be ABSENT (the binary defaults it to false). Pinning
+	// its absence here keeps a future edit from silently re-suppressing
+	// evictions in events-only and stranding stale routing hints.
+	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
+	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen3.6-27B"})
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"}}
+
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil || c == nil {
+		t.Fatalf("events-only ObservationSidecar: (%v, %v)", c, err)
+	}
+	for _, arg := range c.Args {
+		if strings.HasPrefix(arg, "--ignore-block-removed") {
+			t.Fatalf("events-only must omit --ignore-block-removed (forward evictions); found %q in %v", arg, c.Args)
+		}
+	}
+	// The rest of the subscriber wiring is identical to Offload mode.
+	for _, want := range []string{
+		"--engine-endpoint=tcp://127.0.0.1:5557",
+		"--replica-id=$(POD_NAME)",
+		"--model-id=Qwen/Qwen3.6-27B",
+		"--hash-scheme=vllm",
+	} {
+		if !containsArg(c.Args, want) {
+			t.Fatalf("events-only subscriber missing %q; args = %v", want, c.Args)
+		}
+	}
+}
+
 func TestVLLMLMCacheObservationSidecarHonoursOptions(t *testing.T) {
 	a := NewVLLMLMCacheAdapter(
 		WithSubscriberImage("registry.example.com/subscriber:pinned"),

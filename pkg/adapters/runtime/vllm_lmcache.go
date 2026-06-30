@@ -410,6 +410,15 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 // config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
 // (and unset / unknown) → kv_both.
 func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	// Events-only (tier-1 routing) wires NO KV connector: the engine container
+	// is left unmodified so a hybrid-attention model's KV-cache manager is not
+	// disabled by a connector it cannot load. The engine's own (operator-
+	// configured) kv-events publisher is all the observation sidecar needs, and
+	// nothing dials a cache server, so no endpoint is required either. The
+	// subscriber is still appended by the webhook via ObservationSidecar.
+	if cache != nil && cache.Spec.IsEventsOnly() {
+		return nil
+	}
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
 }
 
@@ -480,6 +489,29 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 	}
 	image := a.subscriberImage
 
+	// Eviction-forwarding policy is mode-dependent. In Offload mode the paired
+	// LMCache L2 tier retains a block after the engine evicts it from GPU, so
+	// vLLM's BlockRemoved does NOT mean the prefix is gone — forwarding it as
+	// PREFIX_EVICTED would drop a routing hint the replica can still cheaply
+	// serve from L2, so suppress it (--ignore-block-removed=true) and let the
+	// hint age out on its freshness TTL. In EventsOnly mode there is NO L2
+	// retaining blocks, so a BlockRemoved genuinely means the prefix is gone and
+	// the hint MUST be pruned — do not suppress (omit the flag; the subscriber
+	// binary defaults it to false). Soft state means a stale hint is a cache
+	// miss at worst, while a missing one routes the request away from its warm
+	// replica — the opposite risk in each mode, hence the opposite default.
+	args := []string{
+		"--engine-endpoint=tcp://127.0.0.1:" + defaultEngineZMQPortStr,
+		"--server=" + serverAddr,
+		"--replica-id=$(POD_NAME)",
+		"--tenant-id=$(POD_NAMESPACE)",
+		"--model-id=" + modelID,
+		"--hash-scheme=" + subscriberHashScheme,
+	}
+	if !cache.Spec.IsEventsOnly() {
+		args = append(args, "--ignore-block-removed=true")
+	}
+
 	nonRoot := true
 	noPrivEsc := false
 	readOnlyRoot := true
@@ -504,24 +536,7 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
 			},
 		},
-		Args: []string{
-			"--engine-endpoint=tcp://127.0.0.1:" + defaultEngineZMQPortStr,
-			"--server=" + serverAddr,
-			"--replica-id=$(POD_NAME)",
-			"--tenant-id=$(POD_NAMESPACE)",
-			"--model-id=" + modelID,
-			"--hash-scheme=" + subscriberHashScheme,
-			// This adapter pairs vLLM with LMCache, a separate L2 cache tier
-			// that retains blocks after the engine evicts them from GPU. vLLM
-			// emits BlockRemoved on every GPU eviction even when the block is
-			// still resident at LMCache; forwarding that as PREFIX_EVICTED
-			// would drop a routing hint the replica can still cheaply serve
-			// from L2 — the gateway then routes elsewhere and wastes the L2
-			// hit. Keep the entry until its freshness TTL expires; soft state
-			// means a stale hint is a cache miss at worst, while a missing one
-			// routes the request away from its warm replica.
-			"--ignore-block-removed=true",
-		},
+		Args: args,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("10m"),

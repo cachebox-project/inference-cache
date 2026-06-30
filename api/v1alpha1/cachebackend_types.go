@@ -40,6 +40,29 @@ const (
 	CacheBackendIntegrationRoleReadWrite CacheBackendIntegrationRole = "ReadWrite"
 )
 
+// +kubebuilder:validation:Enum=Offload;EventsOnly
+
+// CacheBackendIntegrationMode selects which cache tiers an engine is wired for.
+type CacheBackendIntegrationMode string
+
+const (
+	// CacheBackendIntegrationModeOffload is the default: the engine is wired for
+	// cache-aware routing (tier-1) AND the KV-offload connector (tier-2), and
+	// the controller provisions a managed backend server for the offload tier.
+	CacheBackendIntegrationModeOffload CacheBackendIntegrationMode = "Offload"
+	// CacheBackendIntegrationModeEventsOnly wires the engine for cache-aware
+	// routing (tier-1) ONLY: the kvevent-subscriber observation sidecar is
+	// injected, but NO KV connector is loaded into the engine and NO backend
+	// server is provisioned. This is the supported integration for
+	// hybrid-attention models (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, KDA,
+	// Falcon-H, Granite-hybrid, …): vLLM disables its hybrid KV-cache manager
+	// the moment any KV connector is loaded (KV-spec unification then fails at
+	// init), so they cannot take the tier-2 connector — but their KV events
+	// coexist fine with the hybrid manager, so routing still works. Also a
+	// lighter deployment for routing-only users who do not want an offload tier.
+	CacheBackendIntegrationModeEventsOnly CacheBackendIntegrationMode = "EventsOnly"
+)
+
 // CacheBackendSpec defines the desired state of a cache backend.
 //
 // Persistent storage (spec.storage.pvc) and the autoscaling spec
@@ -331,6 +354,21 @@ type CacheBackendIntegrationSpec struct {
 	// +kubebuilder:default=vllm
 	Engine string `json:"engine,omitempty"`
 
+	// Mode selects which cache tiers the engine is wired for. Defaults to
+	// Offload — cache-aware routing (tier-1) PLUS the KV-offload connector
+	// (tier-2), with a controller-provisioned backend server. EventsOnly wires
+	// routing only: the kvevent-subscriber sidecar is injected, but no KV
+	// connector is loaded into the engine and no backend server is provisioned.
+	// EventsOnly is the supported integration for hybrid-attention models that
+	// cannot take a vLLM KV connector (and a lighter routing-only deployment for
+	// anyone who does not want an offload tier). Because EventsOnly provisions
+	// no server, status.endpoint stays empty and the autoscaling spec is
+	// rejected at admission; Ready is still gated on the first observed KV event.
+	// See the CacheBackendIntegrationMode godoc.
+	// +optional
+	// +kubebuilder:default=Offload
+	Mode CacheBackendIntegrationMode `json:"mode,omitempty"`
+
 	// Role controls whether the engine reads from, writes to, or fully
 	// participates in the cache. Defaults to ReadWrite — full participation,
 	// matching the [enginewire.IntegrationRole] read-time fallback for an
@@ -499,6 +537,27 @@ func IntegrationFailOpen(spec *CacheBackendIntegrationSpec) bool {
 		return true
 	}
 	return *spec.FailOpen
+}
+
+// IntegrationMode returns the effective integration mode for a CacheBackend
+// integration spec. Missing spec or empty field defaults to Offload, matching
+// the API default — full routing + offload + a managed backend server. The
+// admission defaulter materialises the field on submitted objects; this helper
+// is the read-time fallback for callers that bypass the apiserver (raw-struct
+// test invocation, partial deserialization).
+func IntegrationMode(spec *CacheBackendIntegrationSpec) CacheBackendIntegrationMode {
+	if spec == nil || spec.Mode == "" {
+		return CacheBackendIntegrationModeOffload
+	}
+	return spec.Mode
+}
+
+// IsEventsOnly reports whether the backend is wired for events-only (tier-1
+// routing) integration — no KV connector, no provisioned server. It is the
+// single predicate the adapter, webhook, controller, and validator share so the
+// mode's three-layer wiring (inject / reconcile / admit) stays in lockstep.
+func (s *CacheBackendSpec) IsEventsOnly() bool {
+	return IntegrationMode(s.Integration) == CacheBackendIntegrationModeEventsOnly
 }
 
 // CacheBackendEngineSelector selects engines by labels.

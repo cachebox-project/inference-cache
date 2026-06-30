@@ -162,6 +162,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
+	rejectEventsOnlyMisconfiguration,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -844,6 +845,43 @@ func rejectPersistentStorageOnMemoryOnly(cb *cachev1alpha1.CacheBackend) field.E
 			fmt.Sprintf("CacheBackend type %q is memory-only and cannot declare spec.storage.pvc", cb.Spec.Type),
 		),
 	}
+}
+
+// rejectEventsOnlyMisconfiguration enforces the constraints of the events-only
+// (tier-1 routing) integration mode. EventsOnly provisions no backend server
+// and wires no KV connector, so server-shaped configuration is structurally
+// meaningless:
+//
+//   - spec.type=External is contradictory: External wires an operator-run
+//     offload server that a KV connector dials, while EventsOnly wires no
+//     connector at all. (The valid managed type is LMCache, whose adapter
+//     supplies the kvevent-subscriber the routing tier needs; other (engine,
+//     type) pairs are already rejected by the runtime-adapter check.)
+//   - spec.autoscaling has no workload to scale — the controller deploys
+//     nothing for an events-only backend.
+//
+// spec.endpoint is already rejected on any non-External backend by
+// rejectEndpointOnNonExternal, so it needs no events-only-specific check.
+func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if !cb.Spec.IsEventsOnly() {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "integration", "mode"),
+			fmt.Sprintf("mode %q is incompatible with spec.type %q: events-only wires no KV connector, while External provisions an operator-run offload server the connector would dial",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeExternal),
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "autoscaling"),
+			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no server workload, so there is nothing to autoscale",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
+		))
+	}
+	return errs
 }
 
 // rejectNonPositivePVCSize rejects a spec.storage.pvc.size that is not strictly

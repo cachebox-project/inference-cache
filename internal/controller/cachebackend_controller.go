@@ -397,6 +397,20 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
+	// Events-only (tier-1 routing) provisions no backend server: the engine is
+	// wired for cache-aware routing via the kvevent-subscriber alone, with no KV
+	// connector and nothing to deploy. Shed any workload a prior Offload
+	// generation owned, then run the server-less status path (the KV-event
+	// readiness gate, no Service/endpoint/cascade). Checked before the
+	// StatefulSet / adapter routing because the mode decides provisioning
+	// regardless of deploymentKind, and the controller needs no adapter here.
+	if backend.Spec.IsEventsOnly() {
+		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.reconcileEventsOnly(ctx, backend)
+	}
+
 	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
 	// module. Phase 1 manages a Deployment only.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
@@ -553,6 +567,89 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// clear any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
 	})
+}
+
+// reconcileEventsOnly drives an events-only (tier-1 routing) backend: it
+// provisions NO cache-server workload and publishes no endpoint, but still runs
+// the KV-event readiness gate so Ready reflects "the engine is reporting state"
+// exactly as a managed backend does. The kvevent-subscriber sidecar is injected
+// engine-side by the (mode-aware) pod webhook, and status.indexParticipation is
+// owned by the CacheIndex poller as usual — so routing, LookupRoute, and the
+// per-backend index slice behave identically to a managed backend; only the
+// offload tier (a server + KV connector) is absent.
+//
+// Like reconcileExternal it clears the in-memory cascade shadow and the
+// functional-probe rate-limit entry (there is no server to cascade-restart or
+// probe) and clears the managed-only FunctionalProbeOK / T2Degraded conditions.
+// The firstEventTimeout window is anchored on status.firstAvailableAt, latched
+// here on the first reconcile — an events-only backend is "up" the moment it
+// exists (no workload to wait on), so the gate starts its clock immediately and
+// its Degraded flip stays sticky exactly as on the managed path.
+func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	now := time.Now()
+	// Base readiness is unconditionally True (no workload to gate on); the
+	// KV-event gate layers AwaitingFirstKVEvent → KVEventsObserved /
+	// NoKVEventsObserved on top, anchored on the firstAvailableAt latch.
+	anchor := now
+	if backend.Status.FirstAvailableAt != nil {
+		anchor = backend.Status.FirstAvailableAt.Time
+	}
+	gate := evaluateKVEventReadiness(backend, metav1.ConditionTrue,
+		conditionReasonEventsOnlyActive,
+		"events-only backend active; routing tier wired with no offload server",
+		anchor, now)
+	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
+
+	// No server to cascade-restart or functionally probe — drop both in-memory
+	// trackers so a later Offload re-entry inside their windows starts clean
+	// (mirrors reconcileExternal).
+	r.clearServerInstanceLatchShadow(backend)
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
+
+	err := r.patchStatus(ctx, backend, func() {
+		// No provisioned server: no endpoint, no capacity, no server-instance
+		// latch. status.indexParticipation stays poller-owned.
+		backend.Status.Endpoint = ""
+		backend.Status.Capacity = ""
+		backend.Status.ObservedServerInstance = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		// Latch the first KV-event observation + first-Available time write-once,
+		// the same contract as updateManagedStatus (the gate reads both).
+		if backend.Status.FirstKVEventObservedAt == nil {
+			if at := currentLastEventAt(backend); at != nil {
+				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
+			}
+		}
+		if backend.Status.FirstAvailableAt == nil {
+			t := metav1.NewTime(now)
+			backend.Status.FirstAvailableAt = &t
+		}
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             gate.readyStatus,
+			Reason:             gate.readyReason,
+			Message:            gate.readyMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeDegraded,
+			Status:             gate.degradedStatus,
+			Reason:             gate.degradedReason,
+			Message:            gate.degradedMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             progressingStatus,
+			Reason:             progressingReason,
+			Message:            progressingMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		// Managed-only advisories never apply to a server-less backend.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
+	})
+	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
 }
 
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
@@ -1781,9 +1878,16 @@ func firstEventTimeout(backend *cachev1alpha1.CacheBackend) time.Duration {
 // derivation, dashboards) can switch on reason instead of regexing the
 // message.
 const (
-	conditionReasonBackendReady        = "BackendReady"
-	conditionReasonScaledToZero        = "ScaledToZero"
-	conditionReasonRolloutInProgress   = "RolloutInProgress"
+	conditionReasonBackendReady      = "BackendReady"
+	conditionReasonScaledToZero      = "ScaledToZero"
+	conditionReasonRolloutInProgress = "RolloutInProgress"
+	// conditionReasonEventsOnlyActive is the base Ready reason for an
+	// events-only (tier-1 routing) backend, which provisions no server and so
+	// has no workload to gate Ready on. The KV-event readiness gate normally
+	// overrides it (AwaitingFirstKVEvent → KVEventsObserved / NoKVEventsObserved
+	// as events arrive or time out); it surfaces verbatim only when the gate is
+	// opted out via inferencecache.io/require-kv-events: "false".
+	conditionReasonEventsOnlyActive    = "EventsOnlyActive"
 	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
 	// conditionReasonInvalidStorageConfiguration is set Ready=False when a
 	// persistent backend (spec.storage.pvc) requests more than one replica
