@@ -27,6 +27,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Status condition types published on a managed CacheBackend.
@@ -197,8 +198,10 @@ type CacheBackendReconciler struct {
 	// client.Client so existing fake-client tests still work).
 	APIReader client.Reader
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
-	// uses [adapterruntime.DefaultRegistry] — set explicitly only in tests
-	// that need a custom adapter set.
+	// falls back to [adapterruntime.DefaultRegistry] plus the SGLang+LMCache
+	// adapter (the managed adapters the shipping controller wires; External is
+	// short-circuited before Select, so it is not in the fallback). Set
+	// explicitly only in tests that need a custom adapter set.
 	Registry *adapterruntime.Registry
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
@@ -404,7 +407,16 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 
 	registry := r.Registry
 	if registry == nil {
+		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
+		// nil-fallback manages the same backends the validator + pod webhook
+		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
+		// plus the SGLang+LMCache adapter (a subpackage DefaultRegistry can't
+		// import without a cycle). External is intentionally absent — a
+		// type==External backend short-circuits to the unmanaged External path
+		// in dispatch before ever reaching Select, so registering it here would
+		// be dead code.
 		registry = adapterruntime.DefaultRegistry()
+		registry.Register(sglangadapter.NewAdapter())
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	adapter, err := registry.Select(runtimeID, backend)

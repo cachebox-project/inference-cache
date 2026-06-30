@@ -1452,6 +1452,78 @@ func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
 	}
 }
 
+func TestDefaultShippingRegistryResolvesSGLangLMCache(t *testing.T) {
+	// Registration check: the real shipping registry (the set the running
+	// controller installs) must resolve the (sglang, LMCache) pair to an
+	// adapter, and surface sglang/LMCache in its SupportedPairs so admission
+	// error messages list it as a candidate. Exercises the real
+	// defaultShippingRegistry rather than a stub so a regression that drops the
+	// SGLang registration from any of the three wiring sites is caught here.
+	r := defaultShippingRegistry()
+	cb := newBackend() // type=LMCache
+	if _, err := r.Select(adapterruntime.RuntimeSGLang, cb); err != nil {
+		t.Fatalf("shipping registry does not resolve (sglang, LMCache): %v", err)
+	}
+	found := false
+	for _, p := range r.SupportedPairs() {
+		if p.Runtime == adapterruntime.RuntimeSGLang && p.Backend == cachev1alpha1.CacheBackendTypeLMCache {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("SupportedPairs missing sglang/LMCache; got %v", r.SupportedPairs())
+	}
+}
+
+func TestValidator_RuntimeAdapter_SGLangPlusLMCacheAdmitted(t *testing.T) {
+	// DoD: admission accepts (sglang, LMCache) once the adapter is registered.
+	// Runs through the real shipping registry so the test fails if the SGLang
+	// adapter is not actually wired into the validator's registry.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("sglang+LMCache rejected: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_SGLangPlusExternalRejected(t *testing.T) {
+	// The SGLang adapter supports only (sglang, LMCache) — a (sglang, External)
+	// pair must still be rejected (no adapter claims it), and the message must
+	// list sglang/LMCache among the supported candidates so the operator sees
+	// the actionable alternative.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "cache.example.com:65432" // shape-valid External endpoint
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+
+	_, err := v.ValidateCreate(context.Background(), cb)
+	if err == nil {
+		t.Fatalf("expected (sglang, External) to be rejected")
+	}
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok {
+		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
+	}
+	var match *metav1.StatusCause
+	for i := range statusErr.Status().Details.Causes {
+		if statusErr.Status().Details.Causes[i].Field == "spec.integration.engine" {
+			match = &statusErr.Status().Details.Causes[i]
+			break
+		}
+	}
+	if match == nil {
+		t.Fatalf("no cause on spec.integration.engine; got: %+v", statusErr.Status().Details.Causes)
+	}
+	for _, want := range []string{"sglang", "External", "sglang/LMCache"} {
+		if !strings.Contains(match.Message, want) {
+			t.Errorf("rejection message missing %q; got %q", want, match.Message)
+		}
+	}
+}
+
 func TestValidator_RuntimeAdapter_VLLMPlusMooncakeRejected(t *testing.T) {
 	// Rejection path: a (vLLM, Mooncake) pair no installed adapter
 	// supports must be rejected with a message that names BOTH sides of
@@ -1782,6 +1854,121 @@ func TestValidator_EngineOverrides_SuppressPythonHashSeedRejected(t *testing.T) 
 	requireInvalidWithCause(t, v, cb,
 		"spec.integration.engineOverrides.suppressEnv[0]",
 		"PYTHONHASHSEED")
+}
+
+// withSGLangOverrides builds a (sglang, LMCache) CacheBackend carrying the
+// given engineOverrides. The SGLang override tests use the real
+// defaultShippingRegistry (not stubRegistry) so the SGLang adapter is the one
+// the reserved-args/env check consults — proving the check is keyed on the
+// SELECTED adapter, not a hardcoded vLLM list.
+func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine:          "sglang",
+		EngineOverrides: &o,
+	}
+	return cb
+}
+
+func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
+	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache
+	// (args) and LMCACHE_REMOTE_URL / LMCACHE_USE_EXPERIMENTAL /
+	// INFERENCECACHE_FAIL_OPEN (env). Admission must reject an engineOverrides
+	// entry that overrides OR suppresses any of them, and name the sglang
+	// adapter in the rejection. Exercises the real shipping registry so the
+	// sglang adapter's reserved lists are the ones enforced.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cases := []struct {
+		name     string
+		o        cachev1alpha1.EngineInjectionOverrides
+		field    string
+		contains string
+	}{
+		{"suppress --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--enable-lmcache"},
+		{"override --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{Args: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.args[0]", "--enable-lmcache"},
+		{"override LMCACHE_REMOTE_URL", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "lm://elsewhere:1"}}}, "spec.integration.engineOverrides.env[0].name", "LMCACHE_REMOTE_URL"},
+		{"suppress LMCACHE_USE_EXPERIMENTAL", cachev1alpha1.EngineInjectionOverrides{SuppressEnv: []string{"LMCACHE_USE_EXPERIMENTAL"}}, "spec.integration.engineOverrides.suppressEnv[0]", "LMCACHE_USE_EXPERIMENTAL"},
+		{"override INFERENCECACHE_FAIL_OPEN", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}}}, "spec.integration.engineOverrides.env[0].name", "INFERENCECACHE_FAIL_OPEN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := withSGLangOverrides(tc.o)
+			requireInvalidWithCause(t, v, cb, tc.field, tc.contains)
+			// The rejection names the offending (sglang) adapter so the
+			// operator can trace the contract back.
+			requireInvalidWithCause(t, v, cb, tc.field, "sglang")
+		})
+	}
+}
+
+func TestValidator_SGLangRoleRejected(t *testing.T) {
+	// SGLang's LMCache integration has no producer/consumer split, so a
+	// non-ReadWrite role can't be honored — admission rejects it loudly rather
+	// than silently treating it as ReadWrite. Uses the real shipping registry
+	// (the role rule is registry-independent, but this keeps the adapter-pair
+	// check happy for the (sglang, LMCache) CR).
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	for _, role := range []cachev1alpha1.CacheBackendIntegrationRole{
+		cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+		cachev1alpha1.CacheBackendIntegrationRoleWriteOnly,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			cb := newBackend() // type=LMCache
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang", Role: role}
+			requireInvalidWithCause(t, v, cb, "spec.integration.role", "sglang")
+		})
+	}
+}
+
+func TestValidator_SGLangRoleReadWriteAndUnsetAdmitted(t *testing.T) {
+	// ReadWrite (and unset, which defaults to ReadWrite) are the honored
+	// SGLang role; both must admit.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cases := []*cachev1alpha1.CacheBackendIntegrationSpec{
+		{Engine: "sglang"}, // role unset
+		{Engine: "sglang", Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
+	}
+	for _, integ := range cases {
+		cb := newBackend()
+		cb.Spec.Integration = integ
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("sglang role=%q rejected: %v", integ.Role, err)
+		}
+	}
+}
+
+func TestValidator_VLLMRoleReadOnlyStillAdmitted(t *testing.T) {
+	// The SGLang role rule must not bleed onto vLLM: vLLM maps ReadOnly onto
+	// its connector (kv_consumer), so a (vllm, LMCache) backend with ReadOnly
+	// must still admit.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend()
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "vllm",
+		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vllm role=ReadOnly rejected by the sglang role rule: %v", err)
+	}
+}
+
+func TestValidator_EngineOverrides_SGLangAdmitsVLLMOnlyNames(t *testing.T) {
+	// VLLM_USE_V1 and PYTHONHASHSEED are reserved for vLLM but NOT for SGLang
+	// (the SGLang adapter never injects them), and the LMCACHE_* tunables are
+	// not reserved for either. Overriding them on a sglang backend must be
+	// ADMITTED — proving the reserved set is per-selected-adapter, so the
+	// vLLM-only reservations don't bleed onto SGLang.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := withSGLangOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{
+			{Name: "VLLM_USE_V1", Value: "0"},
+			{Name: "PYTHONHASHSEED", Value: "1"},
+			{Name: "LMCACHE_CHUNK_SIZE", Value: "512"},
+		},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vLLM-only env names (not reserved for sglang) rejected: %v", err)
+	}
 }
 
 func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {

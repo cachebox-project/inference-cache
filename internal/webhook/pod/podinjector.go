@@ -18,6 +18,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // WebhookPath is the URL the kubebuilder marker below registers with the
@@ -97,9 +98,9 @@ type EngineInjector struct {
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
 	// nil falls back to [adapterruntime.DefaultRegistry] plus the External
-	// adapter (registered explicitly because the External package lives in
-	// a subpackage DefaultRegistry can't import without a cycle). Mirrors
-	// the production cmd/controller wiring so a bare `EngineInjector{}`
+	// and SGLang+LMCache adapters (registered explicitly because those
+	// subpackages can't be imported by DefaultRegistry without a cycle).
+	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
 	// doesn't silently fail-open on External CRs that the running webhook
 	// would have wired.
 	Registry *adapterruntime.Registry
@@ -194,25 +195,30 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	// No env-presence short-circuit here: the adapter is the source of truth
-	// for the full injected contract (env + arg), and lenient short-circuits
-	// risk admitting a pod that carries only a subset of the wiring (e.g. a
-	// pre-set LMCACHE_REMOTE_URL but no --kv-transfer-config / VLLM_USE_V1)
-	// permanently un-converged. Call the adapter unconditionally; it merges
-	// idempotently (upsertEnv / upsertArgPair) and a no-op merge produces an
+	// for the full injected contract (env + the adapter-required args/flags),
+	// and lenient short-circuits risk admitting a pod that carries only a
+	// subset of the wiring (e.g. a pre-set LMCACHE_REMOTE_URL but missing the
+	// engine's connector flag — vLLM's --kv-transfer-config or SGLang's
+	// --enable-lmcache) permanently un-converged. Call the adapter
+	// unconditionally; it merges idempotently (upsertEnv / upsertArgPair /
+	// upsertFlag) and a no-op merge produces an
 	// empty patch set, so re-admissions on an already-injected pod are
 	// free at the apiserver.
 	runtimeID := adapterruntime.ResolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
 		// Mirror production cmd/controller wiring: DefaultRegistry +
-		// the External adapter (registered explicitly because the
-		// subpackage can't be imported by DefaultRegistry without a
-		// cycle). Keeps the nil-fallback consistent with the running
-		// controller so a bare `EngineInjector{}` doesn't silently
-		// fail-open on External CRs that the production webhook would
-		// have wired.
+		// the External and SGLang+LMCache adapters (registered explicitly
+		// because those subpackages can't be imported by DefaultRegistry
+		// without a cycle). Keeps the nil-fallback consistent with the
+		// running controller so a bare `EngineInjector{}` doesn't silently
+		// fail-open on External / SGLang CRs that the production webhook
+		// would have wired. The no-arg SGLang adapter renders no subscriber
+		// sidecar (no image configured) — engine config injection still
+		// happens; only auto-attach is gated on the controller flag.
 		registry = adapterruntime.DefaultRegistry()
 		registry.Register(externaladapter.NewAdapter())
+		registry.Register(sglangadapter.NewAdapter())
 	}
 	adapter, err := registry.Select(runtimeID, cache)
 	if err != nil {

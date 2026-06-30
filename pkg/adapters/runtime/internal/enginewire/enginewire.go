@@ -118,6 +118,100 @@ func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha
 	return nil
 }
 
+// SGLang engine-side wire. SGLang fronts LMCache through its own launch
+// surface, distinct from vLLM's --kv-transfer-config JSON:
+//
+//   - the connector is turned on by the bare boolean flag --enable-lmcache
+//     (SGLang's `server_args.py`; an `action="store_true"` arg, so it carries
+//     no value), and
+//   - SGLang's experimental LMCache integration is gated on the
+//     LMCACHE_USE_EXPERIMENTAL=True env (SGLang's
+//     mem_cache/storage/lmcache README + unit_test set exactly this).
+//
+// The LMCache *client* it loads is the same library vLLM uses, so the
+// LMCACHE_* connection/tunable env is identical (remote URL + serde + chunk
+// size + local-CPU knobs) and points at the same lm:// server. Two vLLM-only
+// env vars are deliberately NOT injected for SGLang:
+//
+//   - VLLM_USE_V1 selects a vLLM-internal codepath that has no SGLang analogue;
+//   - PYTHONHASHSEED pins vLLM's builtin-hash()-seeded NONE_HASH so its
+//     block-hash chain matches across TP workers — SGLang derives its prefix
+//     hash with hashlib.sha256 over the token-id bytes, which is independent of
+//     PYTHONHASHSEED, so pinning it would be cargo-culted, not load-bearing.
+const (
+	// EnvLMCacheUseExperimental gates SGLang's experimental LMCache path; it
+	// MUST be "True" for --enable-lmcache to engage the connector.
+	EnvLMCacheUseExperimental = "LMCACHE_USE_EXPERIMENTAL"
+	// SGLangEngineContainerName is the conventional name of the SGLang engine
+	// container in a pod the adapter mutates (parallel to [EngineContainerName]
+	// for vLLM). A single-container pod is also treated as the engine.
+	SGLangEngineContainerName = "sglang"
+	// SGLangEnableLMCacheArg is SGLang's boolean flag that turns on the LMCache
+	// connector. It takes no value (store_true), so it is upserted as a bare
+	// flag rather than a --flag value pair. Exported so the SGLang adapter can
+	// name it in ReservedArgs (the admission validator blocks an
+	// engineOverrides entry that would suppress it).
+	SGLangEnableLMCacheArg    = "--enable-lmcache"
+	lmcacheUseExperimentalVal = "True"
+)
+
+// InjectSGLangLMCache adds the SGLang LMCache connector flag and the LMCACHE_*
+// env to the SGLang container in pod, given endpoint as the cache server's
+// address. endpoint accepts a bare host:port or an already-prefixed
+// lm://host:port (see [LMCacheRemoteURL]); the helper renders both into
+// LMCACHE_REMOTE_URL=lm://host:port. It merges (existing args/env preserved,
+// repeat injections idempotent, sidecars untouched) exactly like
+// [InjectVLLMLMCache]; only the engine-side wire differs (see the SGLang
+// constants above). The engine container is [SGLangEngineContainerName]; a
+// single-container pod is accepted; a multi-container pod with no `sglang`
+// container is rejected.
+//
+// TODO(wire-test before production): the LMCACHE_* env path is how vLLM's
+// LMCache client is configured and is the same library SGLang loads, but
+// whether SGLang's experimental path honours LMCACHE_REMOTE_URL from the env
+// versus requiring LMCACHE_CONFIG_FILE has not been wire-tested end-to-end
+// here. Confirm against a real SGLang+LMCache build before pinning a
+// production image; the SGLang+LMCache-on-kind reference stack (a follow-up)
+// is the place to validate it.
+func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	if err := ValidateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
+		return err
+	}
+	cfg := cache.Spec.BackendConfig
+	env := []corev1.EnvVar{
+		{Name: EnvLMCacheRemoteURL, Value: LMCacheRemoteURL(endpoint)},
+		{Name: EnvLMCacheUseExperimental, Value: lmcacheUseExperimentalVal},
+		{Name: EnvLMCacheRemoteSerde, Value: ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)},
+		{Name: EnvLMCacheChunkSize, Value: ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)},
+		{Name: EnvLMCacheLocalCPU, Value: ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)},
+		{Name: EnvLMCacheMaxLocalCPU, Value: ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)},
+		{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)},
+	}
+
+	i, err := EngineContainerIndexNamed(pod, SGLangEngineContainerName)
+	if err != nil {
+		return err
+	}
+	for _, e := range env {
+		pod.Containers[i].Env = UpsertEnv(pod.Containers[i].Env, e)
+	}
+	pod.Containers[i].Args = UpsertFlag(pod.Containers[i].Args, SGLangEnableLMCacheArg)
+	return nil
+}
+
+// UpsertFlag appends the bare boolean flag flag (e.g. "--enable-lmcache") when
+// it is absent, preserving every existing arg; a second call is a no-op. Used
+// for store_true flags that carry no value — distinct from [UpsertArgPair],
+// which manages a `--flag value` pair.
+func UpsertFlag(args []string, flag string) []string {
+	for _, a := range args {
+		if a == flag {
+			return args
+		}
+	}
+	return append(args, flag)
+}
+
 // ValidateInjectInputs centralises the bad-input checks Inject* paths share.
 // The role tag flows into the error message so callers can tell which path
 // rejected the input ("engine", "router", ...).
@@ -137,11 +231,22 @@ func ValidateInjectInputs(pod *corev1.PodSpec, endpoint string, cache *cachev1al
 	return nil
 }
 
-// EngineContainerIndex returns the index of the engine container the adapter
-// should mutate. See [InjectVLLMLMCache] for the selection rules.
+// EngineContainerIndex returns the index of the vLLM engine container the
+// adapter should mutate. See [InjectVLLMLMCache] for the selection rules.
 func EngineContainerIndex(pod *corev1.PodSpec) (int, error) {
+	return EngineContainerIndexNamed(pod, EngineContainerName)
+}
+
+// EngineContainerIndexNamed returns the index of the engine container named
+// name, falling back to the lone container in a single-container pod (there is
+// no sidecar to crash). A multi-container pod with no container named name is
+// rejected — blindly mutating every container would inject engine-only flags
+// onto unrelated sidecars and crash them. Adapters for engines whose canonical
+// container name differs from vLLM's (e.g. SGLang) call this with their own
+// name; [EngineContainerIndex] is the vLLM-named convenience wrapper.
+func EngineContainerIndexNamed(pod *corev1.PodSpec, name string) (int, error) {
 	for i := range pod.Containers {
-		if pod.Containers[i].Name == EngineContainerName {
+		if pod.Containers[i].Name == name {
 			return i, nil
 		}
 	}
@@ -152,8 +257,8 @@ func EngineContainerIndex(pod *corev1.PodSpec) (int, error) {
 	for i := range pod.Containers {
 		names[i] = pod.Containers[i].Name
 	}
-	return -1, fmt.Errorf("inject engine config: pod has %d containers %v but none is named %q; injecting vLLM flags into unrelated sidecars would crash them — name the engine container %q",
-		len(pod.Containers), names, EngineContainerName, EngineContainerName)
+	return -1, fmt.Errorf("inject engine config: pod has %d containers %v but none is named %q; injecting engine flags into unrelated sidecars would crash them — name the engine container %q",
+		len(pod.Containers), names, name, name)
 }
 
 // LMCacheRemoteURL prefixes an engine-agnostic host:port endpoint with the
