@@ -13,10 +13,13 @@
 # Notably absent (and deliberately so): VLLM_USE_V1 and PYTHONHASHSEED are
 # vLLM-only — SGLang has no v1 codepath, and its prefix caching does not depend
 # on PYTHONHASHSEED the way vLLM's TP block-hash chain does. The vLLM
-# `--kv-transfer-config` arg is likewise not used. User-set env/args on the pod
-# template survive
-# injection (the adapter merges, never clobbers); a pod can opt out per-instance
-# with the annotation `inferencecache.io/skip-inject`.
+# `--kv-transfer-config` arg is likewise not used. Unrelated user-set env/args
+# on the pod template survive injection — the adapter merges, upserting the
+# values it owns (the LMCACHE_* / connector wiring) and leaving everything else
+# untouched; a colliding user value for an adapter-owned key is replaced (and a
+# reserved one is hard-rejected at admission, not silently overridden). A pod
+# can opt out entirely per-instance with the annotation
+# `inferencecache.io/skip-inject`.
 #
 # The auto-attached kvevent-subscriber sidecar tags every report
 # `--hash-scheme=sglang`, keeping SGLang prefixes in a disjoint index domain
