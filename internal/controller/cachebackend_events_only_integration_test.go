@@ -286,4 +286,53 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 			t.Fatalf("post-flip EngineCompatibility = %+v, want absent (events-only sheds the managed-only incompatibility advisory)", c)
 		}
 	})
+
+	t.Run("OffloadToEventsOnlyReanchorsFirstEventWindow", func(t *testing.T) {
+		// A backend that ran in Offload long enough to latch firstAvailableAt but
+		// never observed a KV event, then flips to EventsOnly, must get a FRESH
+		// firstEventTimeout window measured from the flip — NOT inherit the stale
+		// Offload availability anchor. Reusing the old anchor (hours in the past)
+		// would breach the window instantly and strand the backend at
+		// Ready=False/NoKVEventsObserved the moment it became events-only, denying
+		// the routing-preserving remediation events-only exists to provide.
+		ns := freshNS(t, k8s)
+		cb := eventsOnlyBackend("cache", ns)
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		// Seed the status a prior Offload generation would leave behind: a server
+		// endpoint (which events-only clears, and which the reconcile reads as the
+		// "transitioned from a server-bearing mode" signal) plus a firstAvailableAt
+		// latched an hour ago, with no KV event ever observed.
+		live := getBackend(t, r, "cache", ns)
+		beforeSeed := live.DeepCopy()
+		stale := metav1.NewTime(time.Now().Add(-time.Hour))
+		live.Status.Endpoint = "cache." + ns + ".svc.cluster.local:8080"
+		live.Status.FirstAvailableAt = &stale
+		if err := k8s.Status().Patch(ctx, live, client.MergeFrom(beforeSeed)); err != nil {
+			t.Fatalf("seed prior-Offload status: %v", err)
+		}
+
+		reconcile(t, r, "cache", ns)
+		got := getBackend(t, r, "cache", ns)
+
+		// The flip re-anchored the window to now, so the default 5m timeout has
+		// NOT elapsed: the backend parks at AwaitingFirstKVEvent, not the
+		// stale-anchor NoKVEventsObserved.
+		ready := findCondition(got.Status.Conditions, conditionTypeReady)
+		if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+			t.Fatalf("post-flip Ready = %+v, want False/AwaitingFirstKVEvent (re-anchored window, not stale NoKVEventsObserved)", ready)
+		}
+		if deg := findCondition(got.Status.Conditions, conditionTypeDegraded); deg == nil || deg.Status != metav1.ConditionFalse {
+			t.Fatalf("post-flip Degraded = %+v, want False (fresh window not yet breached)", deg)
+		}
+		// firstAvailableAt was overwritten with the flip moment, and the server
+		// endpoint cleared.
+		if got.Status.FirstAvailableAt == nil || got.Status.FirstAvailableAt.Time.Before(time.Now().Add(-time.Minute)) {
+			t.Fatalf("post-flip firstAvailableAt = %v, want re-anchored to ~now (stale Offload anchor reused)", got.Status.FirstAvailableAt)
+		}
+		if got.Status.Endpoint != "" {
+			t.Fatalf("post-flip status.endpoint = %q, want empty", got.Status.Endpoint)
+		}
+	})
 }
