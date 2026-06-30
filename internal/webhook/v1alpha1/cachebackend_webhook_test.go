@@ -1856,6 +1856,70 @@ func TestValidator_EngineOverrides_SuppressPythonHashSeedRejected(t *testing.T) 
 		"PYTHONHASHSEED")
 }
 
+// withSGLangOverrides builds a (sglang, LMCache) CacheBackend carrying the
+// given engineOverrides. The SGLang override tests use the real
+// defaultShippingRegistry (not stubRegistry) so the SGLang adapter is the one
+// the reserved-args/env check consults — proving the check is keyed on the
+// SELECTED adapter, not a hardcoded vLLM list.
+func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine:          "sglang",
+		EngineOverrides: &o,
+	}
+	return cb
+}
+
+func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
+	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache
+	// (args) and LMCACHE_REMOTE_URL / LMCACHE_USE_EXPERIMENTAL /
+	// INFERENCECACHE_FAIL_OPEN (env). Admission must reject an engineOverrides
+	// entry that overrides OR suppresses any of them, and name the sglang
+	// adapter in the rejection. Exercises the real shipping registry so the
+	// sglang adapter's reserved lists are the ones enforced.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cases := []struct {
+		name     string
+		o        cachev1alpha1.EngineInjectionOverrides
+		field    string
+		contains string
+	}{
+		{"suppress --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--enable-lmcache"},
+		{"override --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{Args: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.args[0]", "--enable-lmcache"},
+		{"override LMCACHE_REMOTE_URL", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "lm://elsewhere:1"}}}, "spec.integration.engineOverrides.env[0].name", "LMCACHE_REMOTE_URL"},
+		{"suppress LMCACHE_USE_EXPERIMENTAL", cachev1alpha1.EngineInjectionOverrides{SuppressEnv: []string{"LMCACHE_USE_EXPERIMENTAL"}}, "spec.integration.engineOverrides.suppressEnv[0]", "LMCACHE_USE_EXPERIMENTAL"},
+		{"override INFERENCECACHE_FAIL_OPEN", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}}}, "spec.integration.engineOverrides.env[0].name", "INFERENCECACHE_FAIL_OPEN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := withSGLangOverrides(tc.o)
+			requireInvalidWithCause(t, v, cb, tc.field, tc.contains)
+			// The rejection names the offending (sglang) adapter so the
+			// operator can trace the contract back.
+			requireInvalidWithCause(t, v, cb, tc.field, "sglang")
+		})
+	}
+}
+
+func TestValidator_EngineOverrides_SGLangAdmitsVLLMOnlyNames(t *testing.T) {
+	// VLLM_USE_V1 and PYTHONHASHSEED are reserved for vLLM but NOT for SGLang
+	// (the SGLang adapter never injects them), and the LMCACHE_* tunables are
+	// not reserved for either. Overriding them on a sglang backend must be
+	// ADMITTED — proving the reserved set is per-selected-adapter, so the
+	// vLLM-only reservations don't bleed onto SGLang.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := withSGLangOverrides(cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{
+			{Name: "VLLM_USE_V1", Value: "0"},
+			{Name: "PYTHONHASHSEED", Value: "1"},
+			{Name: "LMCACHE_CHUNK_SIZE", Value: "512"},
+		},
+	})
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("vLLM-only env names (not reserved for sglang) rejected: %v", err)
+	}
+}
+
 func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {
 	// Positive case: a non-reserved arg + env + suppression combination
 	// must pass admission. This is the CPU-vLLM use case — the operator

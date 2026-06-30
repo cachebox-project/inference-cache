@@ -195,11 +195,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	// No env-presence short-circuit here: the adapter is the source of truth
-	// for the full injected contract (env + arg), and lenient short-circuits
-	// risk admitting a pod that carries only a subset of the wiring (e.g. a
-	// pre-set LMCACHE_REMOTE_URL but no --kv-transfer-config / VLLM_USE_V1)
-	// permanently un-converged. Call the adapter unconditionally; it merges
-	// idempotently (upsertEnv / upsertArgPair) and a no-op merge produces an
+	// for the full injected contract (env + the adapter-required args/flags),
+	// and lenient short-circuits risk admitting a pod that carries only a
+	// subset of the wiring (e.g. a pre-set LMCACHE_REMOTE_URL but missing the
+	// engine's connector flag — vLLM's --kv-transfer-config or SGLang's
+	// --enable-lmcache) permanently un-converged. Call the adapter
+	// unconditionally; it merges idempotently (upsertEnv / upsertArgPair /
+	// upsertFlag) and a no-op merge produces an
 	// empty patch set, so re-admissions on an already-injected pod are
 	// free at the apiserver.
 	runtimeID := adapterruntime.ResolveRuntimeID(cache)
