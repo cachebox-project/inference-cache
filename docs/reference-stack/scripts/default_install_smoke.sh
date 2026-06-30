@@ -1275,21 +1275,23 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
-# --- EngineCompatibility (hybrid-attention crash-loop) assertion ------------
-# A hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, …)
-# crash-loops at engine init when a KV connector is injected — vLLM disables
-# its hybrid KV-cache manager and fails KV-spec unification. We cannot run a
-# real hybrid model on the CPU kind node, but we don't have to: the binding
-# phase's engine is the busybox stand-in (SAMPLE_ENGINE_IMAGE), which CANNOT
-# run `vllm serve`, so its injected engine container is already in
-# CrashLoopBackOff — the exact signature the controller keys on. We must NOT
-# mutate the qwen-engine Deployment here: a later phase cascade-restarts it to
-# assert status.observedServerInstance advances, and a command override would
-# stick and break that check. So we only wait for the natural crash-loop and
-# assert the advisory EngineCompatibility=False/EngineConnectorIncompatible
-# condition surfaces (instead of a silent crash-loop). The controller does NOT
-# watch engine pods (no informer, by design), so we poke the CacheBackend to
-# drive the reconcile that reads them.
+# --- EngineCompatibility (injected-engine crash-loop) assertion -------------
+# This asserts the controller surfaces an injected engine's CrashLoopBackOff as
+# the advisory EngineCompatibility condition — it does NOT validate the
+# hybrid-attention incompatibility *cause* (a real hybrid model would need a
+# GPU). The condition reports the generic crash-loop observation; the root cause
+# is verified out-of-band via engine logs. The busybox stand-in
+# (SAMPLE_ENGINE_IMAGE) CANNOT run `vllm serve`, so its injected engine
+# container lands in CrashLoopBackOff — which is all this assertion needs: it
+# exercises the controller's crash-loop heuristic, not the connector-versus-
+# hybrid-attention diagnosis. We must NOT mutate the qwen-engine Deployment
+# here: a later phase cascade-restarts it to assert status.observedServerInstance
+# advances, and a command override would stick and break that check. So we only
+# wait for the natural crash-loop and assert the advisory
+# EngineCompatibility=False/InjectedEngineCrashLooping condition surfaces
+# (instead of a silent crash-loop). The controller does NOT watch engine pods
+# (no informer, by design), so we poke the CacheBackend to drive the reconcile
+# that reads them.
 log "asserting EngineCompatibility surfaces on the crash-looping injected engine"
 deadline=$(($(date +%s) + 180))
 clbo=""
@@ -1311,14 +1313,14 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     inferencecache.io/smoke-poke="$(date +%s)" --overwrite >/dev/null 2>&1 || true
   ec_reason=$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
     -o jsonpath='{.status.conditions[?(@.type=="EngineCompatibility")].reason}' 2>/dev/null || true)
-  if [ "$ec_reason" = "EngineConnectorIncompatible" ]; then break; fi
+  if [ "$ec_reason" = "InjectedEngineCrashLooping" ]; then break; fi
   sleep 4
 done
-if [ "$ec_reason" != "EngineConnectorIncompatible" ]; then
+if [ "$ec_reason" != "InjectedEngineCrashLooping" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o jsonpath='{.status.conditions}' || true
-  fail "EngineCompatibility reason=$ec_reason, want EngineConnectorIncompatible after the injected engine crash-looped"
+  fail "EngineCompatibility reason=$ec_reason, want InjectedEngineCrashLooping after the injected engine crash-looped"
 fi
-log "EngineCompatibility=False/EngineConnectorIncompatible surfaced on the crash-looping injected engine"
+log "EngineCompatibility=False/InjectedEngineCrashLooping surfaced on the crash-looping injected engine"
 
 # --- spec.resources defaults + thread-through ------------------------------
 # The minimal paired-sample CacheBackend declares no spec.resources, so the

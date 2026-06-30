@@ -90,17 +90,22 @@ const (
 
 // EngineCompatibility — advisory engine↔connector compatibility, derived from
 // the live container state of the engine pods THIS backend injected cache
-// config into. Published False/EngineConnectorIncompatible only when an
-// injected engine container is in CrashLoopBackOff — the signature of a
-// hybrid-attention model that cannot run a KV connector. Like T2Degraded it is
-// advisory: it NEVER gates Ready (the engine is operator-owned and the
-// KV-event gate already drives Ready); it just names the otherwise-silent root
-// cause. The reason doubles as the Event reason on the transition into it.
+// config into. Published False/InjectedEngineCrashLooping only when an injected
+// engine container is in CrashLoopBackOff after the cache plane wired a KV
+// connector — the live observation, NOT a confirmed root cause. A structural
+// engine↔connector incompatibility (canonically a hybrid-attention model that
+// cannot run a KV connector) is a common cause, but a crash-loop can equally be
+// a bad image, command, missing dependency/secret, or OOM. Like T2Degraded it
+// is advisory: it NEVER gates Ready (the engine is operator-owned and the
+// KV-event gate already drives Ready); it just names an otherwise-silent
+// crash-loop and points at the likely cause. The reason doubles as the Event
+// reason on the transition into it.
 const (
 	conditionTypeEngineCompatibility = "EngineCompatibility"
-	// reasonEngineConnectorIncompatible: an injected engine pod is crash-looping
-	// after connector injection (canonically a hybrid-attention model).
-	reasonEngineConnectorIncompatible = "EngineConnectorIncompatible"
+	// reasonInjectedEngineCrashLooping: an injected engine pod is crash-looping
+	// after connector injection (a likely-but-unconfirmed connector
+	// incompatibility, canonically a hybrid-attention model).
+	reasonInjectedEngineCrashLooping = "InjectedEngineCrashLooping"
 )
 
 // Default HPA tuning when the autoscaling spec leaves them unset.
@@ -1233,7 +1238,7 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 				meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 					Type:               conditionTypeEngineCompatibility,
 					Status:             metav1.ConditionFalse,
-					Reason:             reasonEngineConnectorIncompatible,
+					Reason:             reasonInjectedEngineCrashLooping,
 					Message:            engineCompatMsg,
 					ObservedGeneration: publishedGen,
 				})
@@ -1253,7 +1258,7 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// Narrate the engine-incompatibility transition once (absent/True → False).
 	if err == nil && engineCompatObserved && engineCompatMsg != "" && !prevEngineIncompatible && r.Recorder != nil {
 		r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning,
-			reasonEngineConnectorIncompatible, reasonEngineConnectorIncompatible, "%s", engineCompatMsg)
+			reasonInjectedEngineCrashLooping, reasonInjectedEngineCrashLooping, "%s", engineCompatMsg)
 	}
 	// Take the tighter of the KV-gate requeue and the probe-gate requeue
 	// so a stuck-failing backend re-probes when its rate-limit window

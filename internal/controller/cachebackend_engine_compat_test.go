@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -104,5 +107,36 @@ func TestDetectEngineConnectorCrashLoopNoInjectedPods(t *testing.T) {
 	r := newReconciler(scheme, cb) // no pods at all
 	if msg, observed := r.detectEngineConnectorCrashLoop(context.Background(), cb); !observed || msg != "" {
 		t.Fatalf("want observed=true, msg empty; got observed=%v msg=%q", observed, msg)
+	}
+}
+
+// A pod-list failure must report observed=false (live state unknown) with an
+// empty diagnostic, so the caller PRESERVES any existing EngineCompatibility
+// condition rather than clearing it. (Preservation itself is asserted at the
+// controller level in TestUpdateManagedStatusPreservesEngineCompatibilityOnListError.)
+func TestDetectEngineConnectorCrashLoopListErrorIsUnobserved(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackendWithSelector("cache", "ns1", matchedSelector)
+	cb.UID = testBackendUID
+	listErr := errors.New("synthetic pod-list failure")
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+	// Seed the crash-looping pod so the ONLY reason the detector returns
+	// nothing is the injected list error (not an empty cluster).
+	pod := enginePodWithContainers("e1", "ns1", matchedSelector, "ns1/cache", testBackendUID,
+		ctrState{"vllm", crashLoopBackOffReason})
+	r := newReconcilerWithInterceptor(scheme, funcs, cb, pod)
+	msg, observed := r.detectEngineConnectorCrashLoop(context.Background(), cb)
+	if observed {
+		t.Fatalf("observed=true on a pod-list failure; want observed=false (live state unknown)")
+	}
+	if msg != "" {
+		t.Fatalf("diagnostic = %q on a pod-list failure; want empty", msg)
 	}
 }

@@ -658,14 +658,14 @@ func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
 			r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
 			reconcile(t, r, "cache", "ns1")
 
-			// Plant a False/EngineConnectorIncompatible condition as if a prior
+			// Plant a False/InjectedEngineCrashLooping condition as if a prior
 			// managed reconcile had observed an injected engine crash-looping,
 			// so the clearing assertion below is not vacuous.
 			live := getBackend(t, r, "cache", "ns1")
 			live.Status.Conditions = append(live.Status.Conditions, metav1.Condition{
 				Type:               conditionTypeEngineCompatibility,
 				Status:             metav1.ConditionFalse,
-				Reason:             reasonEngineConnectorIncompatible,
+				Reason:             reasonInjectedEngineCrashLooping,
 				Message:            "planted",
 				LastTransitionTime: metav1.Now(),
 				ObservedGeneration: live.Generation,
@@ -689,6 +689,67 @@ func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
 				t.Fatalf("EngineCompatibility = %+v after %s; want cleared (a stale managed-only advisory would linger on a CR no managed path re-evaluates)", c, tc.name)
 			}
 		})
+	}
+}
+
+// TestUpdateManagedStatusPreservesEngineCompatibilityOnListError pins the
+// preserve-on-list-error contract: when detectEngineConnectorCrashLoop cannot
+// observe the engine pods (pod List fails → observed=false), updateManagedStatus
+// must LEAVE any existing EngineCompatibility condition in place rather than
+// clear it. Clearing on a transient list failure and re-asserting on the next
+// success would flap the Warning event and briefly hide an active
+// incompatibility. The managed reconcile still completes (the list error is
+// soft on every path that reads pods), so the condition's survival is the whole
+// assertion.
+func TestUpdateManagedStatusPreservesEngineCompatibilityOnListError(t *testing.T) {
+	scheme := newScheme(t)
+	// No engineSelector → the matchedEnginePods refresh does not list pods;
+	// the detector's namespace-wide PodList is the one the interceptor below
+	// fails, and the server-instance cascade soft-fails on the same error.
+	listErr := errors.New("synthetic pod-list failure")
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, lmcacheBackend("cache", "ns1"))
+
+	// First reconcile creates the managed Deployment/Service and publishes the
+	// baseline status; the interceptor only fails pod Lists, which are soft.
+	reconcile(t, r, "cache", "ns1")
+
+	// Plant a False/InjectedEngineCrashLooping condition as if a prior reconcile
+	// (with the pods observable) had surfaced an injected engine crash-loop.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.Conditions = append(live.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeEngineCompatibility,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonInjectedEngineCrashLooping,
+		Message:            "planted",
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: live.Generation,
+	})
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant EngineCompatibility precondition: %v", err)
+	}
+	if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c == nil {
+		t.Fatalf("planted EngineCompatibility precondition failed (test would be vacuous)")
+	}
+
+	// Reconcile again with the pod List still failing: detectEngineConnectorCrashLoop
+	// returns ("", false), so updateManagedStatus must skip both the set and the
+	// clear and leave the planted condition untouched.
+	reconcile(t, r, "cache", "ns1")
+
+	c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility)
+	if c == nil {
+		t.Fatalf("EngineCompatibility was cleared on a transient pod-list failure; want preserved (observed=false must not clear)")
+	}
+	if c.Status != metav1.ConditionFalse || c.Reason != reasonInjectedEngineCrashLooping {
+		t.Fatalf("EngineCompatibility = %s/%s after list error; want False/InjectedEngineCrashLooping (preserved unchanged)", c.Status, c.Reason)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 // TestIntegrationEngineCompatibilityCondition exercises the advisory
 // EngineCompatibility condition end-to-end through a real reconcile: an engine
 // pod the backend injected a connector into that is stuck in CrashLoopBackOff
-// (the hybrid-attention signature) surfaces False/EngineConnectorIncompatible
+// (the hybrid-attention signature) surfaces False/InjectedEngineCrashLooping
 // plus a Warning event; the condition is absent when the engine is healthy or
 // the injected-by-uid does not match; and it never drives Ready.
 func TestIntegrationEngineCompatibilityCondition(t *testing.T) {
@@ -89,15 +89,46 @@ func TestIntegrationEngineCompatibilityCondition(t *testing.T) {
 
 		cb := getBackend(t, r, "cache", ns)
 		ec := findCondition(cb.Status.Conditions, conditionTypeEngineCompatibility)
-		if ec == nil || ec.Status != metav1.ConditionFalse || ec.Reason != reasonEngineConnectorIncompatible {
-			t.Fatalf("EngineCompatibility = %+v, want False/EngineConnectorIncompatible", ec)
+		if ec == nil || ec.Status != metav1.ConditionFalse || ec.Reason != reasonInjectedEngineCrashLooping {
+			t.Fatalf("EngineCompatibility = %+v, want False/InjectedEngineCrashLooping", ec)
 		}
 		// Advisory: it must not become the Ready reason. Ready is driven by the
 		// managed Deployment + KV-event gate, not engine-pod compatibility.
-		if ready := findCondition(cb.Status.Conditions, conditionTypeReady); ready != nil && ready.Reason == reasonEngineConnectorIncompatible {
+		if ready := findCondition(cb.Status.Conditions, conditionTypeReady); ready != nil && ready.Reason == reasonInjectedEngineCrashLooping {
 			t.Fatalf("EngineCompatibility must not drive Ready, got Ready reason %s", ready.Reason)
 		}
-		expectEvent(t, drainEvents(rec), reasonEngineConnectorIncompatible)
+		expectEvent(t, drainEvents(rec), reasonInjectedEngineCrashLooping)
+	})
+
+	t.Run("recoveredInjectedEngineClearsCondition", func(t *testing.T) {
+		ns, uid := mkBackend(t)
+		createEnginePod(t, ns, uid, "engine-0", crashLoopBackOffReason)
+		reconcile(t, r, "cache", ns)
+		if ec := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeEngineCompatibility); ec == nil ||
+			ec.Status != metav1.ConditionFalse || ec.Reason != reasonInjectedEngineCrashLooping {
+			t.Fatalf("EngineCompatibility = %+v, want False/InjectedEngineCrashLooping before recovery", ec)
+		}
+
+		// The engine container recovers (CrashLoopBackOff → Running). Patch the
+		// pod's container status via the status subresource (envtest has no
+		// kubelet) and reconcile: the managed path must REMOVE the condition.
+		var p corev1.Pod
+		if err := k8s.Get(ctx, types.NamespacedName{Name: "engine-0", Namespace: ns}, &p); err != nil {
+			t.Fatalf("get engine pod: %v", err)
+		}
+		before := p.DeepCopy()
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "vllm",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}}
+		if err := k8s.Status().Patch(ctx, &p, client.MergeFrom(before)); err != nil {
+			t.Fatalf("patch engine pod status to Running: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		if ec := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeEngineCompatibility); ec != nil {
+			t.Fatalf("EngineCompatibility = %+v after the engine recovered; want absent (False→removed on observed-healthy)", ec)
+		}
 	})
 
 	t.Run("healthyInjectedEngineHasNoCondition", func(t *testing.T) {

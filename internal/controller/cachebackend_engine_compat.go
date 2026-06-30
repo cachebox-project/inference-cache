@@ -20,18 +20,19 @@ const crashLoopBackOffReason = "CrashLoopBackOff"
 
 // detectEngineConnectorCrashLoop reports whether the ENGINE container of a pod
 // THIS backend injected a KV connector into is stuck in CrashLoopBackOff — the
-// live signature of a structural engine↔connector incompatibility — and whether
-// the engine pods could be observed at all.
+// live OBSERVATION the EngineCompatibility condition surfaces, not a confirmed
+// root cause — and whether the engine pods could be observed at all.
 //
-// The canonical cause is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet,
+// A common cause is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet,
 // Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …): vLLM disables its hybrid
 // KV-cache manager the moment ANY KV connector (LMCache, Mooncake, NIXL) is
-// wired, then fails KV-spec unification at engine init. The engine crash-loops
-// with zero operator-facing signal — the operator has to read engine logs to
-// learn the CacheBackend config is structurally incompatible. Surfacing it as a
-// condition turns that silent failure loud (the KV-event readiness gate only
-// reports a generic "no KV events observed" once firstEventTimeout expires,
-// which does not name the cause).
+// wired, then fails KV-spec unification at engine init. But a crash-loop is a
+// generic kubelet state — a bad image, command, missing dependency/secret, or
+// OOM produces the same signature — so the diagnostic hedges the cause and tells
+// the operator to confirm via engine logs. Surfacing it as a condition turns an
+// otherwise-silent crash-loop loud (the KV-event readiness gate only reports a
+// generic "no KV events observed" once firstEventTimeout expires, which does not
+// name a likely cause or point at the fix).
 //
 // Returns (diagnostic, observed):
 //   - observed == false — the pod list failed, so the live state is unknown;
@@ -82,11 +83,12 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 			continue
 		}
 		if cs.State.Waiting != nil && cs.State.Waiting.Reason == crashLoopBackOffReason {
-			return fmt.Sprintf("container %q in engine pod %q is in CrashLoopBackOff after the cache plane injected a KV connector — "+
-				"if this is a hybrid-attention model (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …), "+
-				"vLLM cannot run a KV connector alongside its hybrid KV-cache manager (KV-spec unification fails at init); remove "+
-				"the connector or run the engine events-only via the inferencecache.io/skip-inject annotation until an events-only "+
-				"integration mode ships.", cs.Name, p.Name), true
+			return fmt.Sprintf("container %q in engine pod %q is in CrashLoopBackOff after the cache plane injected a KV connector. "+
+				"A structural engine↔connector incompatibility is a common cause — hybrid-attention models (Qwen3.6/Next "+
+				"gated-DeltaNet, Mamba/Jamba, KDA, Falcon-H, Granite-hybrid, …) disable vLLM's hybrid KV-cache manager the moment "+
+				"a KV connector loads (KV-spec unification fails at init) — but a crash-loop can also be a bad image, command, "+
+				"missing dependency/secret, or OOM, so check the engine logs to confirm. If it is the connector, remove it or run "+
+				"the engine events-only via the inferencecache.io/skip-inject annotation.", cs.Name, p.Name), true
 		}
 	}
 	return "", true
