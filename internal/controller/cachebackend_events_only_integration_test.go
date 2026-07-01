@@ -66,9 +66,11 @@ func countOwnedWorkloads(t *testing.T, cl client.Client, cbName, ns string) (dep
 // TestIntegrationEventsOnlyMode exercises the events-only reconcile path against
 // a real apiserver: no provisioned workload, empty status.endpoint, the same
 // KV-event readiness gate as a managed backend, and the managed-only advisory
-// conditions (FunctionalProbeOK / T2Degraded) absent. The transition subtest
-// proves a backend that previously provisioned a Deployment+Service in Offload
-// mode sheds them on the flip to EventsOnly (cleanupOwnedWorkload).
+// conditions (FunctionalProbeOK / EngineKernelsHealthy / T2Degraded /
+// EngineCompatibility) absent. The transition subtests prove a backend that
+// previously provisioned a Deployment+Service in Offload mode sheds them on the
+// flip to EventsOnly (cleanupOwnedWorkload) and re-anchors its first-event
+// window rather than inheriting the stale Offload availability time.
 func TestIntegrationEventsOnlyMode(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)

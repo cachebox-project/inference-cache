@@ -613,7 +613,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 // Like reconcileExternal it clears the in-memory cascade shadow and the
 // functional-probe rate-limit entry (there is no server to cascade-restart or
 // probe) and clears the managed-only FunctionalProbeOK / EngineKernelsHealthy /
-// T2Degraded conditions.
+// T2Degraded / EngineCompatibility conditions.
 // The firstEventTimeout window is anchored on status.firstAvailableAt, latched
 // here on the first reconcile — an events-only backend is "up" the moment it
 // exists (no workload to wait on), so the gate starts its clock immediately and

@@ -2083,8 +2083,9 @@ kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/n
 # inside the firstEventTimeout window — exactly the managed sample's
 # no-KV-event-source assertion above, but with no Deployment to wait on. The
 # managed-only advisory conditions (FunctionalProbeOK / EngineKernelsHealthy /
-# T2Degraded) must be ABSENT — events-only has no server to probe, loads no
-# LMCache connector whose native kernels need checking, and has no tier-2.
+# T2Degraded / EngineCompatibility) must be ABSENT — events-only has no server
+# to probe, loads no LMCache connector whose native kernels need checking, has
+# no tier-2, and injects no connector that could be incompatible.
 # We assert the server-less + empty-endpoint + KV-gate contract rather than a
 # positive KV event, since the smoke's engine stand-in emits none.
 log "exercising Events-only CacheBackend end-to-end in namespace $EVENTSONLY_SMOKE_NS"
@@ -2165,8 +2166,11 @@ if [ -n "$eo_latch" ]; then
 fi
 
 # The managed-only advisory conditions must be ABSENT on an events-only backend:
-# events-only publishes only Ready/Degraded/Progressing.
-for eo_cond in FunctionalProbeOK EngineKernelsHealthy T2Degraded; do
+# events-only publishes only Ready/Degraded/Progressing. EngineCompatibility is
+# included because events-only injects no connector (nothing to be incompatible
+# with) and an Offload->EventsOnly flip clears any prior verdict — this asserts
+# that clear holds at install level, not just in envtest.
+for eo_cond in FunctionalProbeOK EngineKernelsHealthy T2Degraded EngineCompatibility; do
   eo_present="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
     -o jsonpath="{.status.conditions[?(@.type=='$eo_cond')].type}" 2>/dev/null || true)"
   if [ -n "$eo_present" ]; then
@@ -2174,7 +2178,7 @@ for eo_cond in FunctionalProbeOK EngineKernelsHealthy T2Degraded; do
     fail "events-only CR published managed-only condition $eo_cond, want absent"
   fi
 done
-log "events-only CR publishes only Ready/Degraded/Progressing (FunctionalProbeOK/EngineKernelsHealthy/T2Degraded absent)"
+log "events-only CR publishes only Ready/Degraded/Progressing (FunctionalProbeOK/EngineKernelsHealthy/T2Degraded/EngineCompatibility absent)"
 
 # Negative-path admission: the misconfiguration the events-only validator
 # guards. An EventsOnly + spec.type=External pair must be rejected at admission
