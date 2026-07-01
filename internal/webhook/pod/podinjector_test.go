@@ -1871,6 +1871,42 @@ func TestHandle_KernelCheckInitContainer_Idempotent(t *testing.T) {
 	}
 }
 
+// TestHandle_EventsOnly_StripsPreexistingKernelCheckInitContainer verifies that
+// an events-only engine pod carrying a stale/hand-authored lmcache-kernel-check
+// init container has it REMOVED on admission. Events-only loads no LMCache
+// connector, so the kernel check is irrelevant — and the webhook is
+// authoritative for that container, so a leftover strict check must not survive
+// to block the pod in Init or be trusted by the controller.
+func TestHandle_EventsOnly_StripsPreexistingKernelCheckInitContainer(t *testing.T) {
+	const ns = "engines"
+	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
+	h := newHandlerWithSubscriber(t, cb) // subscriber image set → the pod is wired (patches returned)
+
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
+		Name:  adapterruntime.LMCacheKernelCheckContainerName,
+		Image: "stale-hand-baked-kernel-check:latest",
+	})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+			t.Fatalf("stale kernel-check init container survived events-only admission; init containers = %v",
+				initContainerNames(mutated))
+		}
+	}
+	// The subscriber sidecar is still wired (this is a normal events-only inject).
+	if findContainer(mutated, adapterruntime.SubscriberContainerName) == nil {
+		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
+	}
+}
+
 func TestHandle_KernelCheckInitContainer_ReplacesForged(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})

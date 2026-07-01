@@ -268,7 +268,7 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 		// The named Deployment/Service are gone (the controller owns the name).
 		if _, err := getOptionalDeployment(t, r, "cache", ns); err == nil {
-			t.Fatalf("Deployment cache/%s still exists after flip to EventsOnly", ns)
+			t.Fatalf("Deployment %s/cache still exists after flip to EventsOnly", ns)
 		}
 
 		got := getBackend(t, r, "cache", ns)

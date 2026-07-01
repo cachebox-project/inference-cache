@@ -304,14 +304,23 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// trusts the container by name + termination message). On a normal
 	// re-admission the rendered spec is identical, so the replace is a no-op.
 	//
-	// Skip the kernel-check entirely for events-only: events-only loads no
+	// For events-only, never INJECT the kernel-check: events-only loads no
 	// LMCache KV connector (InjectEngineConfig is a no-op above), so checking
 	// the LMCache native CUDA kernels is irrelevant — and in strict mode the
 	// init container would exit non-zero, holding the engine pod in Init so it
-	// never serves. An events-only engine must not be blocked by a kernel tier
-	// it does not use.
-	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok && !cache.Spec.IsEventsOnly() {
-		if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
+	// never serves. But the webhook is authoritative for this container, so
+	// still STRIP any pre-existing same-name init container rather than leaving
+	// it: a stale (prior-mode) or hand-authored lmcache-kernel-check would
+	// otherwise block an events-only engine in strict mode, or be trusted by
+	// the controller (which keys off the container name), both of which
+	// contradict the mode's "no connector, no kernel tier" contract.
+	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
+		if cache.Spec.IsEventsOnly() {
+			if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+				log.V(1).Info("kernel-check init container removed (events-only: no connector, no kernel tier)",
+					"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
+			}
+		} else if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
 			log.V(1).Info("fail-open: kernel-check init container rejected",
 				"runtime", string(runtimeID), "error", iErr.Error())
 		} else if initC != nil {
