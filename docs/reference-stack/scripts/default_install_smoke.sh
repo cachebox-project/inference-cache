@@ -86,8 +86,8 @@
 #      firstKVEventObservedAt (no subscriber image wired → no KV events), and
 #      parks the CR at Ready=False/AwaitingFirstKVEvent via the same KV-event
 #      gate as a managed backend. The managed-only conditions (FunctionalProbeOK
-#      / EngineKernelsHealthy / T2Degraded) are absent. Also exercises the
-#      validating webhook's EventsOnly+External rejection.
+#      / EngineKernelsHealthy / T2Degraded / EngineCompatibility) are absent.
+#      Also exercises the validating webhook's EventsOnly+External rejection.
 #  10. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).

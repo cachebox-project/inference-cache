@@ -716,7 +716,10 @@ func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backen
 // for a backend this module no longer provisions (unsupported runtime/backend or
 // deferred kind). The managed conditions are removed; firstKVEventObservedAt and
 // status.indexParticipation are left as-is (see reconcileExternal's comment — the
-// latch is a monotonic marker and indexParticipation is poller-owned).
+// latch is a monotonic marker and indexParticipation is poller-owned). The
+// firstAvailableAt gate anchor IS reset, so a later managed/events-only re-entry
+// starts a fresh first-event window instead of reusing a pre-unmanaged
+// availability time.
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -751,6 +754,17 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// is no longer evaluated for injected engine-pod crash-loops, so clear
 		// any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		// Reset the KV-event-gate timeout ANCHOR. Unlike firstKVEventObservedAt
+		// (a monotonic observation marker, deliberately kept — see godoc),
+		// firstAvailableAt records when the backend became "up" for the gate's
+		// firstEventTimeout window. An unmanaged backend is not up in any sense,
+		// so a stale anchor from a prior managed generation must not survive:
+		// otherwise a later re-entry — in particular Offload→Unmanaged→EventsOnly,
+		// which clears endpoint/observedServerInstance so the events-only
+		// re-anchor heuristic can't see the transition — would reuse a
+		// long-past availability time and breach the window on the first
+		// events-only reconcile.
+		backend.Status.FirstAvailableAt = nil
 	})
 }
 

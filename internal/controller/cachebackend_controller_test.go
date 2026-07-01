@@ -541,6 +541,11 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	reconcile(t, r, "cache", "ns1")
 	live := getBackend(t, r, "cache", "ns1")
 	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	// Plant a stale KV-event-gate anchor too: the unmanaged transition must
+	// reset it so a later re-entry (managed or events-only) starts a fresh
+	// firstEventTimeout window rather than reusing this pre-unmanaged time.
+	staleAnchor := metav1.NewTime(time.Now().Add(-time.Hour))
+	live.Status.FirstAvailableAt = &staleAnchor
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
 	}
@@ -564,6 +569,13 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	// In-memory shadow must also be cleared on the unmanaged path.
 	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
 		t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
+	}
+	// The stale KV-event-gate anchor must be reset — otherwise an Offload→
+	// Unmanaged→EventsOnly path (which clears endpoint/observedServerInstance,
+	// so the events-only re-anchor heuristic can't detect the transition) would
+	// reuse this pre-unmanaged time and breach the first-event window instantly.
+	if got.Status.FirstAvailableAt != nil {
+		t.Fatalf("status.firstAvailableAt = %v, want cleared on managed→unmanaged transition", got.Status.FirstAvailableAt)
 	}
 }
 
