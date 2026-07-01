@@ -29,11 +29,12 @@ import (
 // tests pin the same constants the handler uses.
 //
 // Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
-// spec.replicas=1, spec.integration.engine=vllm, spec.integration.role=
-// ReadWrite, spec.integration.failOpen=true, spec.resources={requests:
-// {memory:4Gi}, limits:{memory:8Gi}}) are expressed via `+kubebuilder:default=`
-// markers on the API types and stamped by the apiserver before this webhook
-// runs. The webhook only handles defaults the schema cannot express:
+// spec.replicas=1, spec.integration.engine=vllm, spec.integration.mode=Offload,
+// spec.integration.role=ReadWrite, spec.integration.failOpen=true,
+// spec.resources={requests:{memory:4Gi}, limits:{memory:8Gi}}) are expressed
+// via `+kubebuilder:default=` markers on the API types and stamped by the
+// apiserver before this webhook runs. The webhook only handles defaults the
+// schema cannot express:
 //
 //   - spec.integration.firstEventTimeout: the CRD-schema default only fires
 //     when spec.integration is present in the submitted object; when the
@@ -59,8 +60,8 @@ const (
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
 // defaults (spec.type, deploymentKind, replicas, integration.engine,
-// integration.role, integration.failOpen, resources) ride on schema
-// markers and are stamped by the apiserver before this handler runs;
+// integration.mode, integration.role, integration.failOpen, resources) ride on
+// schema markers and are stamped by the apiserver before this handler runs;
 // the webhook only handles the schema-inexpressible ones:
 //
 //   - Materialises spec.integration solely to persist
@@ -75,7 +76,7 @@ const (
 // It does NOT stamp spec.integration.failOpen explicitly — once the
 // defaulter materialises spec.integration above, the apiserver applies
 // the `+kubebuilder:default=true` marker on the now-present failOpen
-// field (alongside engine, role, firstEventTimeout) before persisting,
+// field (alongside mode, engine, role, firstEventTimeout) before persisting,
 // so an admitted CR with no integration block ends up with failOpen
 // populated in etcd. The read-time fallback in [IntegrationFailOpen]
 // covers callers that bypass the apiserver (raw-struct test invocation,
@@ -146,6 +147,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
+	rejectEventsOnlyMisconfiguration,
 	rejectInvalidKernelCheckAnnotation,
 }
 
@@ -204,7 +206,10 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //     autoscaling is opted in and minReplicas is left unset.
 //
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
-// replicas=1, integration.engine=vllm, integration.role=ReadWrite,
+// replicas=1, integration.engine=vllm, integration.mode=Offload,
+//
+//	integration.role=ReadWrite,
+//
 // integration.failOpen=true, resources={requests:{memory:4Gi},
 // limits:{memory:8Gi}}) rides on a `+kubebuilder:default=` marker and
 // is stamped by the apiserver before this handler runs. Note that the nested
@@ -834,6 +839,43 @@ func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 		}
 	}
 	return nil
+}
+
+// rejectEventsOnlyMisconfiguration enforces the constraints of the events-only
+// (tier-1 routing) integration mode. EventsOnly provisions no backend server
+// and wires no KV connector, so server-shaped configuration is structurally
+// meaningless:
+//
+//   - spec.type=External is contradictory: External wires an operator-run
+//     offload server that a KV connector dials, while EventsOnly wires no
+//     connector at all. (The valid managed type is LMCache, whose adapter
+//     supplies the kvevent-subscriber the routing tier needs; other (engine,
+//     type) pairs are already rejected by the runtime-adapter check.)
+//   - spec.autoscaling has no workload to scale — the controller deploys
+//     nothing for an events-only backend.
+//
+// spec.endpoint is already rejected on any non-External backend by
+// rejectEndpointOnNonExternal, so it needs no events-only-specific check.
+func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if !cb.Spec.IsEventsOnly() {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "integration", "mode"),
+			fmt.Sprintf("mode %q is incompatible with spec.type %q: events-only wires no KV connector, while External provisions an operator-run offload server the connector would dial",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeExternal),
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "autoscaling"),
+			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no server workload, so there is nothing to autoscale",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
+		))
+	}
+	return errs
 }
 
 // rejectCrossNamespaceEndpointWithoutOptIn rejects an Endpoint that

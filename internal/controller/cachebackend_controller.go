@@ -386,6 +386,51 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // shed any previously managed workload; LMCache (Phase 1) templates a
 // Deployment + Service.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	registry := r.Registry
+	if registry == nil {
+		registry = adapterruntime.DefaultRegistry()
+	}
+	runtimeID := adapterruntime.ResolveRuntimeID(backend)
+
+	// Events-only (tier-1 routing) provisions no backend server: the engine is
+	// wired for cache-aware routing via the kvevent-subscriber alone, with no KV
+	// connector and nothing to deploy. Shed any workload a prior Offload
+	// generation owned, then run the server-less status path (the KV-event
+	// readiness gate, no Service/endpoint/cascade). Checked before the
+	// StatefulSet routing because the mode decides provisioning regardless of
+	// deploymentKind (a server-less backend ignores deploymentKind).
+	//
+	// EventsOnly is checked BEFORE the External branch so it takes precedence
+	// over spec.type. Admission's rejectEventsOnlyMisconfiguration rejects a
+	// spec.type=External + mode=EventsOnly pair, but an admission-bypassed /
+	// pre-existing stored object with both set must NOT reconcile as External
+	// (which would publish an endpoint and let the pod webhook inject the KV
+	// connector via the External adapter) — that violates the events-only "no
+	// connector, no server" contract. Letting EventsOnly win here mirrors the
+	// webhook's adapter-independent connector skip, so both layers agree on the
+	// mode's precedence over type.
+	//
+	// First confirm an adapter is selectable for this (runtime, backend) pair.
+	// A stored / admission-bypassed EventsOnly CR with an unsupported (engine,
+	// type) pair would otherwise be reconciled as ACTIVE events-only even though
+	// the pod webhook can't select an adapter for it (so it can never inject the
+	// subscriber → no events ever flow). Treat the no-adapter case the same as
+	// the Offload no-adapter path below: shed any workload and reconcile as
+	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
+	// a working routing tier the substrate can never feed.
+	if backend.Spec.IsEventsOnly() {
+		if _, err := registry.Select(runtimeID, backend); err != nil {
+			logger.V(1).Info("no runtime adapter for events-only backend; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.Type,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.reconcileEventsOnly(ctx, backend)
+	}
+
 	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
 		// A backend switched from a managed type to External must shed its workload.
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
@@ -402,11 +447,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	registry := r.Registry
-	if registry == nil {
-		registry = adapterruntime.DefaultRegistry()
-	}
-	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	adapter, err := registry.Select(runtimeID, backend)
 	if err != nil {
 		// No adapter knows how to wire this (runtime, backend) pair. The
@@ -561,11 +601,129 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 	})
 }
 
+// reconcileEventsOnly drives an events-only (tier-1 routing) backend: it
+// provisions NO cache-server workload and publishes no endpoint, but still runs
+// the KV-event readiness gate so Ready reflects "the engine is reporting state"
+// exactly as a managed backend does. The kvevent-subscriber sidecar is injected
+// engine-side by the (mode-aware) pod webhook, and status.indexParticipation is
+// owned by the CacheIndex poller as usual — so routing, LookupRoute, and the
+// per-backend index slice behave identically to a managed backend; only the
+// offload tier (a server + KV connector) is absent.
+//
+// Like reconcileExternal it clears the in-memory cascade shadow and the
+// functional-probe rate-limit entry (there is no server to cascade-restart or
+// probe) and clears the managed-only FunctionalProbeOK / EngineKernelsHealthy /
+// T2Degraded / EngineCompatibility conditions.
+// The firstEventTimeout window is anchored on status.firstAvailableAt, latched
+// here on the first reconcile — an events-only backend is "up" the moment it
+// exists (no workload to wait on), so the gate starts its clock immediately and
+// its Degraded flip stays sticky exactly as on the managed path. A backend
+// flipping in from a server-bearing mode re-anchors the latch to the flip moment
+// rather than inheriting that mode's (workload-)availability time.
+func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	now := time.Now()
+	// A backend flipping INTO events-only from a server-bearing mode (Offload or
+	// External) still carries that mode's status.endpoint / observedServerInstance
+	// at the top of this reconcile — events-only clears both below, so a non-empty
+	// value here uniquely marks the FIRST events-only reconcile after the flip.
+	// On that transition any latched firstAvailableAt reflects the OLD mode's
+	// availability (e.g. an Offload workload that went Available long ago), not the
+	// events-only "up" moment, so reusing it as the firstEventTimeout anchor could
+	// breach the window the instant we flip and strand the backend at
+	// NoKVEventsObserved/Degraded. Re-anchor to now so events-only gets a fresh
+	// first-event window from when it took effect (the documented contract).
+	transitionedFromServerMode := backend.Status.Endpoint != "" || backend.Status.ObservedServerInstance != ""
+	// Base readiness is unconditionally True (no workload to gate on); the
+	// KV-event gate layers AwaitingFirstKVEvent → KVEventsObserved /
+	// NoKVEventsObserved on top, anchored on the firstAvailableAt latch.
+	anchor := now
+	if backend.Status.FirstAvailableAt != nil && !transitionedFromServerMode {
+		anchor = backend.Status.FirstAvailableAt.Time
+	}
+	// On a server-mode→events-only transition the clock is re-anchored to now,
+	// so also bypass any sticky NoKVEventsObserved carried over from the prior
+	// mode — otherwise the flip would inherit that timed-out verdict and stay
+	// Degraded despite the fresh window.
+	gate := evaluateKVEventReadiness(backend, metav1.ConditionTrue,
+		conditionReasonEventsOnlyActive,
+		"events-only backend active; routing tier wired with no offload server",
+		anchor, now, transitionedFromServerMode)
+	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
+
+	// No server to cascade-restart or functionally probe — drop both in-memory
+	// trackers so a later Offload re-entry inside their windows starts clean
+	// (mirrors reconcileExternal).
+	r.clearServerInstanceLatchShadow(backend)
+	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
+
+	err := r.patchStatus(ctx, backend, func() {
+		// No provisioned server: no endpoint, no server-instance latch.
+		// status.indexParticipation stays poller-owned.
+		backend.Status.Endpoint = ""
+		backend.Status.ObservedServerInstance = ""
+		backend.Status.ObservedGeneration = backend.Generation
+		// Latch the first KV-event observation + first-Available time write-once,
+		// the same contract as updateManagedStatus (the gate reads both).
+		if backend.Status.FirstKVEventObservedAt == nil {
+			if at := currentLastEventAt(backend); at != nil {
+				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
+			}
+		}
+		// Latch the first-Available time write-once, OR re-anchor it on the
+		// server-mode→events-only transition (where the prior value is the old
+		// mode's availability, not the events-only start — see above).
+		if backend.Status.FirstAvailableAt == nil || transitionedFromServerMode {
+			t := metav1.NewTime(now)
+			backend.Status.FirstAvailableAt = &t
+		}
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             gate.readyStatus,
+			Reason:             gate.readyReason,
+			Message:            gate.readyMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeDegraded,
+			Status:             gate.degradedStatus,
+			Reason:             gate.degradedReason,
+			Message:            gate.degradedMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeProgressing,
+			Status:             progressingStatus,
+			Reason:             progressingReason,
+			Message:            progressingMessage,
+			ObservedGeneration: backend.Generation,
+		})
+		// Managed-only advisories never apply to a server-less backend.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
+		// EngineKernelsHealthy is a managed-path-only condition (events-only
+		// loads no LMCache connector, so the kernel-check init container is
+		// never injected). Clear any left over from a prior Offload generation
+		// so an Offload→EventsOnly flip doesn't strand a stale kernel verdict —
+		// events-only publishes only Ready/Degraded/Progressing.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
+		// EngineCompatibility is likewise managed-path-only: it flags an injected
+		// engine crash-looping after the cache plane wired a KV connector, but
+		// events-only injects no connector, so the advisory can never apply.
+		// Clear any verdict left over from a prior Offload generation so an
+		// Offload→EventsOnly flip doesn't strand a stale incompatibility.
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+	})
+	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
+}
+
 // reconcileUnmanaged sheds any previously owned workload and clears managed status
 // for a backend this module no longer provisions (unsupported runtime/backend or
 // deferred kind). The managed conditions are removed; firstKVEventObservedAt and
 // status.indexParticipation are left as-is (see reconcileExternal's comment — the
-// latch is a monotonic marker and indexParticipation is poller-owned).
+// latch is a monotonic marker and indexParticipation is poller-owned). The
+// firstAvailableAt gate anchor IS reset, so a later managed/events-only re-entry
+// starts a fresh first-event window instead of reusing a pre-unmanaged
+// availability time.
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
@@ -600,6 +758,17 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// is no longer evaluated for injected engine-pod crash-loops, so clear
 		// any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		// Reset the KV-event-gate timeout ANCHOR. Unlike firstKVEventObservedAt
+		// (a monotonic observation marker, deliberately kept — see godoc),
+		// firstAvailableAt records when the backend became "up" for the gate's
+		// firstEventTimeout window. An unmanaged backend is not up in any sense,
+		// so a stale anchor from a prior managed generation must not survive:
+		// otherwise a later re-entry — in particular Offload→Unmanaged→EventsOnly,
+		// which clears endpoint/observedServerInstance so the events-only
+		// re-anchor heuristic can't see the transition — would reuse a
+		// long-past availability time and breach the window on the first
+		// events-only reconcile.
+		backend.Status.FirstAvailableAt = nil
 	})
 }
 
@@ -1140,7 +1309,9 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// Layer the KV-event readiness gate on top of the Deployment-level readiness.
 	// Only the workload-Available state is gated; every other Deployment state
 	// passes through unchanged.
-	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now)
+	// Managed path never bypasses stickiness: the sticky NoKVEventsObserved
+	// contract (a raised firstEventTimeout after a breach can't un-Degrade) holds.
+	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now, false)
 	// Layer the functional-probe gate on top of the
 	// KV-event verdict. It only fires when the upstream gate would
 	// otherwise say Ready=True — a backend that's already Ready=False for
@@ -1367,7 +1538,16 @@ type kvReadiness struct {
 // it back to AwaitingFirstKVEvent — it stays Degraded until an event arrives.
 // (Once firstKVEventObservedAt is latched the gate is satisfied regardless of
 // the anchor, since lastKVEventSeen short-circuits.)
-func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time) kvReadiness {
+// freshWindow forces the gate to ignore a persisted sticky NoKVEventsObserved
+// reason and re-evaluate from the caller-resolved anchor. It is set only on a
+// mode transition that legitimately restarts the first-event clock (a
+// server-bearing → events-only flip, where reconcileEventsOnly re-anchors to
+// the flip moment). Without it a backend that timed out under Offload would
+// carry Ready=False/NoKVEventsObserved into events-only and stay stuck Degraded
+// despite the fresh anchor — defeating the routing-preserving remediation the
+// flip exists for. Steady-state reconciles pass false, so the sticky contract
+// (an operator raising firstEventTimeout after a breach can't un-Degrade) holds.
+func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time, freshWindow bool) kvReadiness {
 	// Base verdict mirrors the Deployment-level readiness; the Degraded
 	// condition tracks the deployment-level Ready=False/ReplicasUnavailable
 	// shape so it is consistent on every path (including the opt-out and
@@ -1413,8 +1593,11 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	// contradicting the documented "once Degraded, stays Degraded until an
 	// event" contract. (Availability flaps are handled separately by the stable
 	// firstAvailableAt anchor; this persisted-reason check survives a no-flap
-	// timeout change, where the condition is not overwritten.)
-	if readyConditionReason(backend) == reasonNoKVEventsObserved {
+	// timeout change, where the condition is not overwritten.) A freshWindow
+	// caller (a mode transition that re-anchors the clock) bypasses stickiness
+	// so the flip gets a genuinely fresh window rather than inheriting the old
+	// mode's timed-out verdict.
+	if !freshWindow && readyConditionReason(backend) == reasonNoKVEventsObserved {
 		return kvReadiness{
 			readyStatus:     metav1.ConditionFalse,
 			readyReason:     reasonNoKVEventsObserved,
@@ -1433,11 +1616,24 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	if anchor.IsZero() {
 		anchor = now
 	}
+	// The AwaitingFirstKVEvent / NoKVEventsObserved Ready+Degraded messages are
+	// operator-facing, so they must describe the actual anchor: a managed
+	// (Offload) backend gates on its workload becoming Available; an events-only
+	// backend has no workload, so the clock starts when the backend is wired.
+	// Only the wording differs by mode — the reasons stay identical.
+	awaitingMessage := fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout)
+	noEventsMessage := fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout)
+	noEventsDegradedMessage := fmt.Sprintf("no KV events observed within %s of the cache-backend workload becoming Available", timeout)
+	if backend.Spec.IsEventsOnly() {
+		awaitingMessage = fmt.Sprintf("events-only backend is wired but no KV events observed yet; waiting up to %s for the engine to report state", timeout)
+		noEventsMessage = fmt.Sprintf("no KV events observed within %s of the events-only backend being wired; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout)
+		noEventsDegradedMessage = fmt.Sprintf("no KV events observed within %s of the events-only backend being wired", timeout)
+	}
 	if elapsed := now.Sub(anchor); elapsed < timeout {
 		return kvReadiness{
 			readyStatus:     metav1.ConditionFalse,
 			readyReason:     reasonAwaitingFirstKVEvent,
-			readyMessage:    fmt.Sprintf("cache-backend workload is Available but no KV events observed yet; waiting up to %s for the engine to report state", timeout),
+			readyMessage:    awaitingMessage,
 			degradedStatus:  metav1.ConditionFalse,
 			degradedReason:  reasonNotDegraded,
 			degradedMessage: "backend is not in a degraded state",
@@ -1453,10 +1649,10 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	return kvReadiness{
 		readyStatus:     metav1.ConditionFalse,
 		readyReason:     reasonNoKVEventsObserved,
-		readyMessage:    fmt.Sprintf("no KV events observed within %s of the workload becoming Available; check that engine pods are attached and their --kv-events-config / ZMQ publisher is healthy", timeout),
+		readyMessage:    noEventsMessage,
 		degradedStatus:  metav1.ConditionTrue,
 		degradedReason:  reasonNoKVEventsObserved,
-		degradedMessage: fmt.Sprintf("no KV events observed within %s of the cache-backend workload becoming Available", timeout),
+		degradedMessage: noEventsDegradedMessage,
 	}
 }
 
@@ -1509,9 +1705,16 @@ func firstEventTimeout(backend *cachev1alpha1.CacheBackend) time.Duration {
 // derivation, dashboards) can switch on reason instead of regexing the
 // message.
 const (
-	conditionReasonBackendReady        = "BackendReady"
-	conditionReasonScaledToZero        = "ScaledToZero"
-	conditionReasonRolloutInProgress   = "RolloutInProgress"
+	conditionReasonBackendReady      = "BackendReady"
+	conditionReasonScaledToZero      = "ScaledToZero"
+	conditionReasonRolloutInProgress = "RolloutInProgress"
+	// conditionReasonEventsOnlyActive is the base Ready reason for an
+	// events-only (tier-1 routing) backend, which provisions no server and so
+	// has no workload to gate Ready on. The KV-event readiness gate normally
+	// overrides it (AwaitingFirstKVEvent → KVEventsObserved / NoKVEventsObserved
+	// as events arrive or time out); it surfaces verbatim only when the gate is
+	// opted out via inferencecache.io/require-kv-events: "false".
+	conditionReasonEventsOnlyActive    = "EventsOnlyActive"
 	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
 )
 
@@ -2028,8 +2231,14 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 	// KV-event readiness gate transitions, keyed on the Ready condition reason
 	// so they fire once on entry into each gate state.
 	if before.readyReason != reasonAwaitingFirstKVEvent && after.readyReason == reasonAwaitingFirstKVEvent {
+		// Mode-aware lead-in: an events-only backend has no workload, so it
+		// describes the wired backend rather than a non-existent Deployment.
+		awaitingLead := "cache-backend workload is Available but no KV events observed yet"
+		if cb.Spec.IsEventsOnly() {
+			awaitingLead = "events-only backend is wired but no KV events observed yet"
+		}
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, reasonAwaitingFirstKVEvent, reasonAwaitingFirstKVEvent,
-			"cache-backend workload is Available but no KV events observed yet; backend stays Ready=False/AwaitingFirstKVEvent until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)")
+			"%s; backend stays Ready=False/AwaitingFirstKVEvent until the first event (check that engine pods are attached and their --kv-events-config is healthy if none arrive)", awaitingLead)
 	}
 	// KVEventsObserved fires exactly once — on the nil→set transition of the
 	// firstKVEventObservedAt latch, i.e. the TRUE first event. Keying on the
@@ -2043,8 +2252,14 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 			"first KV event observed; backend is Ready")
 	}
 	if before.readyReason != reasonNoKVEventsObserved && after.readyReason == reasonNoKVEventsObserved {
+		// Mode-aware anchor phrase: events-only has no workload — its window
+		// starts when the backend is wired, not when a Deployment goes Available.
+		anchorPhrase := "the workload becoming Available"
+		if cb.Spec.IsEventsOnly() {
+			anchorPhrase = "the events-only backend being wired"
+		}
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, reasonNoKVEventsObserved, reasonNoKVEventsObserved,
-			"no KV events observed within %s of the workload becoming Available; no engine pods are attached, or the engine's KV-event publisher is mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb))
+			"no KV events observed within %s of %s; no engine pods are attached, or the engine's KV-event publisher is mis-configured (--kv-events-config / ZMQ bind)", firstEventTimeout(cb), anchorPhrase)
 	}
 
 	if before.failOpen && !after.failOpen {

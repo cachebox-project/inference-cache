@@ -160,7 +160,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
 
 	endpoint := effectiveEndpoint(cache)
-	if endpoint == "" {
+	// Events-only (tier-1 routing) backends provision no server, so they publish
+	// no endpoint — and they wire no KV connector, so they need none. The
+	// endpoint gate exists ONLY because the connector requires a dial target
+	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
+	// events-only pod injects only the observation sidecar (InjectEngineConfig
+	// is a no-op in this mode), so bypass the gate and inject without one.
+	if endpoint == "" && !cache.Spec.IsEventsOnly() {
 		// The endpoint source is type-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
@@ -243,10 +249,23 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		}
 	}
 
-	if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
-		log.V(1).Info("fail-open: adapter rejected pod",
-			"runtime", string(runtimeID), "error", err.Error())
-		return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+	// Events-only (tier-1 routing) wires NO KV connector regardless of
+	// spec.type: the engine container is left untouched so a hybrid-attention
+	// model's KV-cache manager is not disabled by a connector it cannot load.
+	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
+	// adapter's own no-op: the connector no-op currently lives ONLY in the
+	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
+	// mode=EventsOnly object would otherwise select the External adapter and
+	// inject the LMCache connector — violating the events-only "no connector"
+	// contract. Gating here makes the no-connector guarantee adapter-independent.
+	// The observation-sidecar append and the wired/injected-by logic below stay
+	// as-is (events-only's only wiring is the subscriber sidecar).
+	if !cache.Spec.IsEventsOnly() {
+		if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
+			log.V(1).Info("fail-open: adapter rejected pod",
+				"runtime", string(runtimeID), "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
+		}
 	}
 
 	// Apply spec.integration.engineOverrides scoped to the adapter-owned
@@ -257,7 +276,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// adapter) return EngineContainerName() == "" and overrideIdx stays
 	// -1, so the merge is skipped — the override surface is for production
 	// adapters that target a specific engine container.
-	if overrides != nil && overrideIdx >= 0 {
+	//
+	// Skip the merge entirely for events-only: InjectEngineConfig injected
+	// nothing in this mode (it is a no-op), so the engine container is left
+	// untouched by contract. Running the override merge here would let the
+	// override surface append non-adapter-owned args/env to the engine
+	// container even though the canonical injection contributed none —
+	// contradicting "the engine container is left otherwise untouched".
+	if overrides != nil && overrideIdx >= 0 && !cache.Spec.IsEventsOnly() {
 		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
 			preArgs, mutated.Spec.Containers[overrideIdx].Args,
 			preEnv, mutated.Spec.Containers[overrideIdx].Env,
@@ -277,8 +303,24 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// suppress the real check and bypass strict enforcement (the controller
 	// trusts the container by name + termination message). On a normal
 	// re-admission the rendered spec is identical, so the replace is a no-op.
+	//
+	// For events-only, never INJECT the kernel-check: events-only loads no
+	// LMCache KV connector (InjectEngineConfig is a no-op above), so checking
+	// the LMCache native CUDA kernels is irrelevant — and in strict mode the
+	// init container would exit non-zero, holding the engine pod in Init so it
+	// never serves. But the webhook is authoritative for this container, so
+	// still STRIP any pre-existing same-name init container rather than leaving
+	// it: a stale (prior-mode) or hand-authored lmcache-kernel-check would
+	// otherwise block an events-only engine in strict mode, or be trusted by
+	// the controller (which keys off the container name), both of which
+	// contradict the mode's "no connector, no kernel tier" contract.
 	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
-		if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
+		if cache.Spec.IsEventsOnly() {
+			if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+				log.V(1).Info("kernel-check init container removed (events-only: no connector, no kernel tier)",
+					"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
+			}
+		} else if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
 			log.V(1).Info("fail-open: kernel-check init container rejected",
 				"runtime", string(runtimeID), "error", iErr.Error())
 		} else if initC != nil {
@@ -311,13 +353,43 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// optimisation, and the next admission will retry. Idempotent: skip
 	// the append if a container by the same name is already on the pod
 	// (re-admission, manual sidecar in the pod template, etc.).
+	// sidecarAppended records whether the webhook itself ADDED the subscriber
+	// this admission — NOT merely that a same-named container exists. The
+	// distinction is load-bearing for the events-only `wired` gate below: a
+	// pre-existing kvevent-subscriber is operator-authored and UNVERIFIED (it may
+	// carry the wrong image/args and emit no usable events), so the webhook must
+	// not treat it as proof that IT wired the pod. Unlike the kernel-check init
+	// container, the subscriber is NOT webhook-authoritative — a correct
+	// hand-baked one still gets attributed via the engineSelector path — so we
+	// leave a pre-existing one in place and simply do not claim it.
+	sidecarAppended := false
 	if sidecar, sErr := adapter.ObservationSidecar(cache, mutated); sErr != nil {
 		log.V(1).Info("fail-open: adapter rejected observation sidecar",
 			"runtime", string(runtimeID), "error", sErr.Error())
 	} else if sidecar != nil && !hasContainer(mutated.Spec.Containers, sidecar.Name) {
 		mutated.Spec.Containers = append(mutated.Spec.Containers, *sidecar)
+		sidecarAppended = true
 		log.V(1).Info("observation sidecar appended",
 			"runtime", string(runtimeID), "container", sidecar.Name)
+	}
+
+	// Only stamp the injection annotations when the webhook actually wired the
+	// pod. For Offload the connector is always injected by InjectEngineConfig, so
+	// the pod is always wired. For events-only InjectEngineConfig is a no-op, so
+	// the ONLY wiring the webhook performs is APPENDING the observation sidecar —
+	// which is skipped when the subscriber image / backendConfig.model is unset
+	// (nothing injected) OR when a same-named container already exists (operator-
+	// authored, unverified). In those cases the webhook added/verified no wiring,
+	// so stamping injected-by/injected-by-uid would trip the downstream
+	// InjectedByCacheBackend event controller on a non-existent injection and
+	// report "wired" while no usable events may flow. Route that case through the
+	// fail-open no-injection path (which strips any forged injection annotations
+	// the inbound pod carried, matching the fail-open contract).
+	wired := !cache.Spec.IsEventsOnly() || sidecarAppended
+	if !wired {
+		log.V(1).Info("events-only: no subscriber configured; admitting with no wiring",
+			"runtime", string(runtimeID))
+		return failOpen(req, &pod, "events-only: no subscriber configured (fail-open, no wiring)")
 	}
 
 	if mutated.Annotations == nil {

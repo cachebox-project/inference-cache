@@ -24,6 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -539,6 +541,11 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	reconcile(t, r, "cache", "ns1")
 	live := getBackend(t, r, "cache", "ns1")
 	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	// Plant a stale KV-event-gate anchor too: the unmanaged transition must
+	// reset it so a later re-entry (managed or events-only) starts a fresh
+	// firstEventTimeout window rather than reusing this pre-unmanaged time.
+	staleAnchor := metav1.NewTime(time.Now().Add(-time.Hour))
+	live.Status.FirstAvailableAt = &staleAnchor
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
 	}
@@ -562,6 +569,13 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	// In-memory shadow must also be cleared on the unmanaged path.
 	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
 		t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
+	}
+	// The stale KV-event-gate anchor must be reset — otherwise an Offload→
+	// Unmanaged→EventsOnly path (which clears endpoint/observedServerInstance,
+	// so the events-only re-anchor heuristic can't detect the transition) would
+	// reuse this pre-unmanaged time and breach the first-event window instantly.
+	if got.Status.FirstAvailableAt != nil {
+		t.Fatalf("status.firstAvailableAt = %v, want cleared on managed→unmanaged transition", got.Status.FirstAvailableAt)
 	}
 }
 
@@ -838,6 +852,129 @@ func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 	}
 	if len(deps.Items) != 0 {
 		t.Fatalf("deployments = %d, want 0 for unmanaged type", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
+	// An EventsOnly backend whose (engine, type) pair has no registered
+	// adapter must reconcile as UNMANAGED, NOT as active events-only.
+	// Admission rejects an unsupported pair at write time, but a
+	// stored/admission-bypassed CR reaching the controller must not be
+	// advertised as a working routing tier: the pod webhook can't select an
+	// adapter for an unsupported pair, so it could never inject the
+	// kvevent-subscriber and no KV event would ever flow. dispatch confirms an
+	// adapter is selectable before routing to reconcileEventsOnly; on failure it
+	// falls to reconcileUnmanaged. Mooncake has no shipping adapter (the default
+	// registry only supports (vllm, LMCache) + External), so it is the
+	// unsupported-type fixture here.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	// reconcileUnmanaged removes the Ready / Progressing conditions; the
+	// events-only path (reconcileEventsOnly) would have PUBLISHED them. Their
+	// absence is the discriminator between "reconciled as unmanaged" and
+	// "reconciled as active events-only".
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Ready (unmanaged path); got %+v", ready)
+	}
+	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Progressing (unmanaged path); got %+v", prog)
+	}
+	// And no workload is provisioned (unmanaged sheds everything).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for unmanaged events-only", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
+	// An admission-bypassed / stored object that sets BOTH spec.type=External
+	// AND integration.mode=EventsOnly must reconcile via the events-only path,
+	// NOT the External path. Admission's rejectEventsOnlyMisconfiguration rejects
+	// this pair, so this is defense-in-depth for a stored CR: dispatch checks
+	// IsEventsOnly() before the Type==External branch, so EventsOnly wins. If it
+	// reconciled as External it would mirror spec.endpoint to status and mark
+	// Ready=True/ExternalEndpointAccepted, letting the pod webhook's External
+	// adapter inject the KV connector — violating events-only's "no connector,
+	// no server" contract. The (vllm, External) pair has a registered adapter, so
+	// the events-only adapter-selectability check passes and the events-only
+	// reconcile runs.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "external-cache.ns1.svc:8200",
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+	// Mirror cmd/controller wiring: the External adapter is registered on the
+	// reconciler's registry (DefaultRegistry doesn't include it to avoid an
+	// import cycle). Without it the (vllm, External) pair is unselectable and the
+	// events-only branch falls to reconcileUnmanaged — masking the precedence we
+	// want to assert.
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	r.Registry = reg
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+
+	// status.endpoint stays EMPTY — events-only publishes no endpoint. The
+	// External path would have mirrored spec.endpoint here.
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty (events-only wins over External; no endpoint mirrored)", got.Status.Endpoint)
+	}
+
+	// Ready is published by the events-only gate (AwaitingFirstKVEvent before any
+	// event), NOT by the External path (ExternalEndpointAccepted). The reason is
+	// the discriminator between the two reconcile paths.
+	ready := findCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil {
+		t.Fatalf("events-only must publish Ready; conditions = %v", got.Status.Conditions)
+	}
+	if ready.Reason == conditionReasonExternalEndpointAccepted {
+		t.Fatalf("Ready reason = %q — reconciled as External, but EventsOnly must take precedence", ready.Reason)
+	}
+	if ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (events-only gate before any KV event)", ready)
+	}
+
+	// No workload is provisioned (events-only is server-less).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for events-only", len(deps.Items))
+	}
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 for events-only", len(svcs.Items))
 	}
 }
 

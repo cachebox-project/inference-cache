@@ -80,6 +80,14 @@
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time).
+#   9b. The Events-only CacheBackend mode (spec.integration.mode=EventsOnly)
+#      end-to-end: applying an events-only LMCache CacheBackend renders NO owned
+#      Deployment/Service, keeps status.endpoint empty, latches no
+#      firstKVEventObservedAt (no subscriber image wired → no KV events), and
+#      parks the CR at Ready=False/AwaitingFirstKVEvent via the same KV-event
+#      gate as a managed backend. The managed-only conditions (FunctionalProbeOK
+#      / EngineKernelsHealthy / T2Degraded / EngineCompatibility) are absent.
+#      Also exercises the validating webhook's EventsOnly+External rejection.
 #  10. The /snapshot endpoint rejects unauthenticated callers: a side curl
 #      pod outside the controller's SA identity gets either an HTTP 401 (L7
 #      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
@@ -209,8 +217,10 @@
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
 #           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
-#           EXTERNAL_INJECT_TIMEOUT, SAMPLE_APPLY_NS, KERNEL_CHECK_SMOKE_NS,
-#           KERNEL_CHECK_POD_TIMEOUT, KERNEL_CHECK_COND_TIMEOUT.
+#           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
+#           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
+#           KERNEL_CHECK_SMOKE_NS, KERNEL_CHECK_POD_TIMEOUT,
+#           KERNEL_CHECK_COND_TIMEOUT.
 
 set -euo pipefail
 
@@ -231,6 +241,12 @@ LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 # lease the External-reconcile path inherits from the C2 reconciler loop.
 EXTERNAL_BACKEND_TIMEOUT="${EXTERNAL_BACKEND_TIMEOUT:-30}" # seconds
 EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
+
+# Events-only smoke tunable. An events-only backend provisions no workload, so
+# the only wait is the reconciler latching status.firstAvailableAt and the
+# KV-event gate publishing Ready=False/AwaitingFirstKVEvent — a sub-second
+# server-less reconcile; the budget covers APIReader warm-up + leader-election.
+EVENTSONLY_BACKEND_TIMEOUT="${EVENTSONLY_BACKEND_TIMEOUT:-30}" # seconds
 
 # Kernel-check smoke tunables (assertions 14 + 15).
 # KERNEL_CHECK_SMOKE_NS is a dedicated namespace created + deleted by those
@@ -304,6 +320,12 @@ EXT_SMOKE_NS="${EXT_SMOKE_NS:-ic-smoke-external}"
 EXT_SMOKE_CB_NAME="cachebackend-external"
 EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 
+# Events-only-backend smoke fixture identifiers. Declared up front so the
+# diagnostics helper can reference them even if the smoke aborts before the
+# events-only section creates the objects.
+EVENTSONLY_SMOKE_NS="${EVENTSONLY_SMOKE_NS:-ic-smoke-events-only}"
+EVENTSONLY_SMOKE_CB_NAME="${EVENTSONLY_SMOKE_CB_NAME:-cachebackend-events-only}"
+
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
 http_pf_pid=""
@@ -360,6 +382,12 @@ collect_diagnostics() {
     >"$LOG_DIR/external-engine-pod.yaml" 2>&1 || true
   kubectl get deploy,svc -n "$EXT_SMOKE_NS" \
     >"$LOG_DIR/external-ns-workloads.txt" 2>&1 || true
+  # Events-only-backend smoke artefacts. Best-effort — the CR may not exist if
+  # the smoke aborted before that section.
+  kubectl get cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" -o yaml \
+    >"$LOG_DIR/events-only-cb.yaml" 2>&1 || true
+  kubectl get deploy,svc -n "$EVENTSONLY_SMOKE_NS" \
+    >"$LOG_DIR/events-only-ns-workloads.txt" 2>&1 || true
   # Kernel-check smoke artefacts. Best-effort — the objects may not
   # exist if the smoke aborted before that section.
   kubectl get cb -n "$KERNEL_CHECK_SMOKE_NS" -o yaml \
@@ -2040,6 +2068,143 @@ log "admission rejected External+missing-endpoint, External+https, External+empt
 kubectl delete pod -n "$EXT_SMOKE_NS" "$EXT_SMOKE_POD_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete cb -n "$EXT_SMOKE_NS" "$EXT_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
+
+# --- Events-only CacheBackend end-to-end -----------------------------------
+# Exercises spec.integration.mode=EventsOnly (the routing-only integration) on
+# the running cluster. The operator-facing contract for an events-only backend
+# is the inverse of a managed one: the reconciler provisions NO owned Deployment
+# and NO owned Service, status.endpoint stays EMPTY (no server address to
+# publish), and readiness runs the same KV-event gate as a managed backend.
+#
+# The default install wires no --kvevent-subscriber-image, so no subscriber
+# sidecar is injected and no KV events ever flow. The events-only backend is
+# server-less, so it is "up" the moment it exists (status.firstAvailableAt
+# latches immediately) and the gate parks it at Ready=False/AwaitingFirstKVEvent
+# inside the firstEventTimeout window — exactly the managed sample's
+# no-KV-event-source assertion above, but with no Deployment to wait on. The
+# managed-only advisory conditions (FunctionalProbeOK / EngineKernelsHealthy /
+# T2Degraded / EngineCompatibility) must be ABSENT — events-only has no server
+# to probe, loads no LMCache connector whose native kernels need checking, has
+# no tier-2, and injects no connector that could be incompatible.
+# We assert the server-less + empty-endpoint + KV-gate contract rather than a
+# positive KV event, since the smoke's engine stand-in emits none.
+log "exercising Events-only CacheBackend end-to-end in namespace $EVENTSONLY_SMOKE_NS"
+kubectl create namespace "$EVENTSONLY_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Apply the COMMITTED events-only sample so it is exercised end-to-end and
+# cannot silently drift — every other backend type's smoke phase applies its
+# config/samples/ manifest (with-engine, external, cachepolicy, cachetenant),
+# so this one must too rather than hand-typing a private inline copy. The
+# sample's metadata.name is cachebackend-events-only == the default
+# $EVENTSONLY_SMOKE_CB_NAME; pin the name via a tmp copy so an overridden
+# tunable still resolves, and set the namespace with -n (the sample is
+# namespace-less, like the other samples). type=LMCache, integration.mode=
+# EventsOnly, backendConfig.model set, no spec.endpoint (rejected on
+# non-External) and no spec.autoscaling (rejected for events-only). The
+# sample's engineSelector is irrelevant here: events-only provisions no
+# workload and the assertions below are all about the CR's own reconcile, so
+# no matched engine pod is required.
+eo_sample_tmp="$(mktemp "$tmpdir/sample-events-only.XXXXXX")"
+sed "s|^  name: cachebackend-events-only\$|  name: $EVENTSONLY_SMOKE_CB_NAME|" \
+  config/samples/cachebackend-events-only.yaml > "$eo_sample_tmp"
+kubectl -n "$EVENTSONLY_SMOKE_NS" apply -f "$eo_sample_tmp" >/dev/null \
+  || fail "kubectl apply events-only sample (config/samples/cachebackend-events-only.yaml) failed"
+
+# Wait for the reconciler to take the events-only path: Ready published by the
+# KV-event gate (False/AwaitingFirstKVEvent before any event), status.endpoint
+# empty, observedGeneration advanced.
+log "waiting up to ${EVENTSONLY_BACKEND_TIMEOUT}s for events-only CR to reach Ready=False/AwaitingFirstKVEvent"
+deadline=$(($(date +%s) + EVENTSONLY_BACKEND_TIMEOUT))
+eo_ready_status=""
+eo_ready_reason=""
+eo_observed_generation=""
+until [ "$eo_ready_status" = "False" ] && \
+      [ "$eo_ready_reason" = "AwaitingFirstKVEvent" ] && \
+      [ -n "$eo_observed_generation" ]; do
+  eo_ready_status="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  eo_ready_reason="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  eo_observed_generation="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" -o yaml || true
+    fail "events-only CR didn't converge: Ready=$eo_ready_status/$eo_ready_reason observedGeneration=$eo_observed_generation (want False/AwaitingFirstKVEvent + advanced generation)"
+  fi
+  sleep 1
+done
+log "events-only CR Ready=$eo_ready_status/$eo_ready_reason observedGeneration=$eo_observed_generation"
+
+# status.endpoint must stay EMPTY — events-only provisions no server, so there
+# is no address to publish. (A managed/External backend mirrors one here.)
+eo_endpoint="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+if [ -n "$eo_endpoint" ]; then
+  kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" -o yaml || true
+  fail "events-only status.endpoint=$eo_endpoint, want empty (no provisioned server)"
+fi
+
+# No owned Deployment, no owned Service. The namespace is dedicated to this
+# phase and otherwise empty, so a flat count of zero is the right assertion
+# (matches the External phase's reasoning).
+eo_dep_count="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
+eo_svc_count="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get svc -o name 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$eo_dep_count" != "0" ] || [ "$eo_svc_count" != "0" ]; then
+  kubectl -n "$EVENTSONLY_SMOKE_NS" get deploy,svc
+  fail "events-only CR rendered controller-owned workload (deploy=$eo_dep_count svc=$eo_svc_count, want 0/0)"
+fi
+log "no Deployment or Service in $EVENTSONLY_SMOKE_NS (events-only backend skipped provisioning)"
+
+# The KV-event gate latch must be unset: no KV event source exists (no
+# subscriber image wired), so the controller must never write
+# status.firstKVEventObservedAt — same invariant as the managed gate phase.
+eo_latch="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.firstKVEventObservedAt}' 2>/dev/null || true)"
+if [ -n "$eo_latch" ]; then
+  kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" -o yaml || true
+  fail "events-only status.firstKVEventObservedAt=$eo_latch, want unset (no KV event source exists)"
+fi
+
+# The managed-only advisory conditions must be ABSENT on an events-only backend:
+# events-only publishes only Ready/Degraded/Progressing. EngineCompatibility is
+# included because events-only injects no connector (nothing to be incompatible
+# with) and an Offload->EventsOnly flip clears any prior verdict — this asserts
+# that clear holds at install level, not just in envtest.
+for eo_cond in FunctionalProbeOK EngineKernelsHealthy T2Degraded EngineCompatibility; do
+  eo_present="$(kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" \
+    -o jsonpath="{.status.conditions[?(@.type=='$eo_cond')].type}" 2>/dev/null || true)"
+  if [ -n "$eo_present" ]; then
+    kubectl -n "$EVENTSONLY_SMOKE_NS" get cb "$EVENTSONLY_SMOKE_CB_NAME" -o yaml || true
+    fail "events-only CR published managed-only condition $eo_cond, want absent"
+  fi
+done
+log "events-only CR publishes only Ready/Degraded/Progressing (FunctionalProbeOK/EngineKernelsHealthy/T2Degraded/EngineCompatibility absent)"
+
+# Negative-path admission: the misconfiguration the events-only validator
+# guards. An EventsOnly + spec.type=External pair must be rejected at admission
+# (events-only wires no connector; External provisions a server one would dial).
+eo_reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: smoke-reject-events-only-external
+  namespace: $EVENTSONLY_SMOKE_NS
+spec:
+  type: External
+  endpoint: external-cache.example:8200
+  integration:
+    engine: vllm
+    mode: EventsOnly
+EOF
+)"
+if ! grep -q "is incompatible with spec.type" <<<"$eo_reject_output"; then
+  fail "admission did not reject EventsOnly+External as expected; got: $eo_reject_output"
+fi
+log "admission rejected EventsOnly+External misconfiguration"
+
+# Clean up — keeps the cluster reusable for KEEP_CLUSTER=1 reruns.
+kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
+kubectl delete namespace "$EVENTSONLY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
 
 # --- /snapshot auth assertion ---------------------------------------------
 # The CacheIndex CR being populated above already proves the controller can
