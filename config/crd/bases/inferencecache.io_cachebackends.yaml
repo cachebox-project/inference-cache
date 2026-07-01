@@ -2207,13 +2207,18 @@ spec:
                   breached the timeout (Degraded / NoKVEventsObserved) bounce back to
                   AwaitingFirstKVEvent without any KV event — contradicting the "once
                   Degraded, stays Degraded until an event arrives" contract. Anchoring on
-                  this write-once value keeps the elapsed window monotonic, so Degraded is
-                  sticky. Written write-once and never cleared. A genuinely recreated
-                  managed Deployment keeps the prior anchor; the gate re-evaluates from
-                  it, which is safe because the engine event source is unchanged by a
-                  cache-server restart. (Inert only on an Offload backend that has not yet
-                  reported Available; on the EventsOnly path it is set on the first
-                  reconcile.)
+                  this latched value keeps the elapsed window monotonic WITHIN a serving
+                  mode, so Degraded is sticky. It survives availability flaps and a
+                  recreated managed Deployment (the gate re-evaluates from the prior
+                  anchor, safe because a cache-server restart does not change the engine
+                  event source). It is NOT immortal across a mode change, though: a
+                  server-bearing→EventsOnly flip re-anchors it to the flip moment (and also
+                  bypasses the sticky NoKVEventsObserved reason) so the flip gets a fresh
+                  first-event window instead of inheriting the old mode's availability time
+                  or timed-out verdict; and an unmanaged transition clears it so a later
+                  managed/events-only re-entry starts fresh. (Inert only on an Offload
+                  backend that has not yet reported Available; on the EventsOnly path it is
+                  set on the first reconcile.)
                 format: date-time
                 type: string
               firstKVEventObservedAt:

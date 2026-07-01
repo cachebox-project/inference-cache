@@ -640,10 +640,14 @@ func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backen
 	if backend.Status.FirstAvailableAt != nil && !transitionedFromServerMode {
 		anchor = backend.Status.FirstAvailableAt.Time
 	}
+	// On a server-mode→events-only transition the clock is re-anchored to now,
+	// so also bypass any sticky NoKVEventsObserved carried over from the prior
+	// mode — otherwise the flip would inherit that timed-out verdict and stay
+	// Degraded despite the fresh window.
 	gate := evaluateKVEventReadiness(backend, metav1.ConditionTrue,
 		conditionReasonEventsOnlyActive,
 		"events-only backend active; routing tier wired with no offload server",
-		anchor, now)
+		anchor, now, transitionedFromServerMode)
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 
 	// No server to cascade-restart or functionally probe — drop both in-memory
@@ -1305,7 +1309,9 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	// Layer the KV-event readiness gate on top of the Deployment-level readiness.
 	// Only the workload-Available state is gated; every other Deployment state
 	// passes through unchanged.
-	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now)
+	// Managed path never bypasses stickiness: the sticky NoKVEventsObserved
+	// contract (a raised firstEventTimeout after a breach can't un-Degrade) holds.
+	gate := evaluateKVEventReadiness(backend, readyStatus, reason, message, anchor, now, false)
 	// Layer the functional-probe gate on top of the
 	// KV-event verdict. It only fires when the upstream gate would
 	// otherwise say Ready=True — a backend that's already Ready=False for
@@ -1532,7 +1538,16 @@ type kvReadiness struct {
 // it back to AwaitingFirstKVEvent — it stays Degraded until an event arrives.
 // (Once firstKVEventObservedAt is latched the gate is satisfied regardless of
 // the anchor, since lastKVEventSeen short-circuits.)
-func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time) kvReadiness {
+// freshWindow forces the gate to ignore a persisted sticky NoKVEventsObserved
+// reason and re-evaluate from the caller-resolved anchor. It is set only on a
+// mode transition that legitimately restarts the first-event clock (a
+// server-bearing → events-only flip, where reconcileEventsOnly re-anchors to
+// the flip moment). Without it a backend that timed out under Offload would
+// carry Ready=False/NoKVEventsObserved into events-only and stay stuck Degraded
+// despite the fresh anchor — defeating the routing-preserving remediation the
+// flip exists for. Steady-state reconciles pass false, so the sticky contract
+// (an operator raising firstEventTimeout after a breach can't un-Degrade) holds.
+func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus metav1.ConditionStatus, reason, message string, anchor, now time.Time, freshWindow bool) kvReadiness {
 	// Base verdict mirrors the Deployment-level readiness; the Degraded
 	// condition tracks the deployment-level Ready=False/ReplicasUnavailable
 	// shape so it is consistent on every path (including the opt-out and
@@ -1578,8 +1593,11 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	// contradicting the documented "once Degraded, stays Degraded until an
 	// event" contract. (Availability flaps are handled separately by the stable
 	// firstAvailableAt anchor; this persisted-reason check survives a no-flap
-	// timeout change, where the condition is not overwritten.)
-	if readyConditionReason(backend) == reasonNoKVEventsObserved {
+	// timeout change, where the condition is not overwritten.) A freshWindow
+	// caller (a mode transition that re-anchors the clock) bypasses stickiness
+	// so the flip gets a genuinely fresh window rather than inheriting the old
+	// mode's timed-out verdict.
+	if !freshWindow && readyConditionReason(backend) == reasonNoKVEventsObserved {
 		return kvReadiness{
 			readyStatus:     metav1.ConditionFalse,
 			readyReason:     reasonNoKVEventsObserved,

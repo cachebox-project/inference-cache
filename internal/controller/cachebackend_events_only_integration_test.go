@@ -290,29 +290,47 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 	})
 
 	t.Run("OffloadToEventsOnlyReanchorsFirstEventWindow", func(t *testing.T) {
-		// A backend that ran in Offload long enough to latch firstAvailableAt but
-		// never observed a KV event, then flips to EventsOnly, must get a FRESH
-		// firstEventTimeout window measured from the flip — NOT inherit the stale
-		// Offload availability anchor. Reusing the old anchor (hours in the past)
-		// would breach the window instantly and strand the backend at
-		// Ready=False/NoKVEventsObserved the moment it became events-only, denying
-		// the routing-preserving remediation events-only exists to provide.
+		// A backend that ran in Offload long enough to TIME OUT (Ready=False/
+		// NoKVEventsObserved, Degraded=True) and never observed a KV event, then
+		// flips to EventsOnly, must get a FRESH firstEventTimeout window measured
+		// from the flip. Two things would otherwise strand it Degraded the instant
+		// it becomes events-only: (a) reusing the hour-old firstAvailableAt anchor,
+		// and (b) the gate's sticky-NoKVEventsObserved short-circuit inheriting the
+		// prior mode's timed-out Ready reason before the fresh anchor is consulted.
+		// This is the primary remediation events-only exists for — an Offload
+		// backend that never got events, flipped to routing-only — so both must be
+		// bypassed on the transition.
 		ns := freshNS(t, k8s)
 		cb := eventsOnlyBackend("cache", ns)
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
-		// Seed the status a prior Offload generation would leave behind: a server
-		// endpoint (which events-only clears, and which the reconcile reads as the
-		// "transitioned from a server-bearing mode" signal) plus a firstAvailableAt
-		// latched an hour ago, with no KV event ever observed.
+		// Seed the status a timed-out prior Offload generation would leave behind:
+		// a server endpoint (which events-only clears, and which the reconcile
+		// reads as the "transitioned from a server-bearing mode" signal), a
+		// firstAvailableAt latched an hour ago, no KV event ever observed, AND the
+		// sticky Ready=False/NoKVEventsObserved + Degraded=True verdict.
 		live := getBackend(t, r, "cache", ns)
 		beforeSeed := live.DeepCopy()
 		stale := metav1.NewTime(time.Now().Add(-time.Hour))
 		live.Status.Endpoint = "cache." + ns + ".svc.cluster.local:8080"
 		live.Status.FirstAvailableAt = &stale
+		meta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
+			Type: conditionTypeReady, Status: metav1.ConditionFalse,
+			Reason: reasonNoKVEventsObserved, Message: "seeded prior-Offload timeout",
+			ObservedGeneration: live.Generation,
+		})
+		meta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
+			Type: conditionTypeDegraded, Status: metav1.ConditionTrue,
+			Reason: reasonNoKVEventsObserved, Message: "seeded prior-Offload timeout",
+			ObservedGeneration: live.Generation,
+		})
 		if err := k8s.Status().Patch(ctx, live, client.MergeFrom(beforeSeed)); err != nil {
 			t.Fatalf("seed prior-Offload status: %v", err)
+		}
+		// Precondition: the sticky timed-out verdict is really present before the flip.
+		if c := findCondition(getBackend(t, r, "cache", ns).Status.Conditions, conditionTypeReady); c == nil || c.Reason != reasonNoKVEventsObserved {
+			t.Fatalf("seed precondition: Ready = %+v, want False/NoKVEventsObserved before the flip", c)
 		}
 
 		reconcile(t, r, "cache", ns)
