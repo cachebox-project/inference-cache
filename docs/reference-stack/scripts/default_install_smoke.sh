@@ -2090,29 +2090,24 @@ kubectl delete namespace "$EXT_SMOKE_NS" --ignore-not-found --wait=false >/dev/n
 log "exercising Events-only CacheBackend end-to-end in namespace $EVENTSONLY_SMOKE_NS"
 kubectl create namespace "$EVENTSONLY_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply an events-only CacheBackend inline (mirrors config/samples/cachebackend-events-only.yaml,
-# kept inline so the smoke is self-contained). type=LMCache (the supported managed type whose adapter supplies
-# the kvevent-subscriber), integration.mode=EventsOnly, an engineSelector
-# matching the engine stand-in, and a backendConfig.model the subscriber would
-# use for --model-id. No spec.endpoint (rejected on non-External) and no
-# spec.autoscaling (rejected for events-only).
-kubectl apply -f - <<EOF >/dev/null || fail "kubectl apply events-only CacheBackend failed"
-apiVersion: inferencecache.io/v1alpha1
-kind: CacheBackend
-metadata:
-  name: $EVENTSONLY_SMOKE_CB_NAME
-  namespace: $EVENTSONLY_SMOKE_NS
-spec:
-  type: LMCache
-  integration:
-    engine: vllm
-    mode: EventsOnly
-  engineSelector:
-    matchLabels:
-      app: events-only-engine
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
-EOF
+# Apply the COMMITTED events-only sample so it is exercised end-to-end and
+# cannot silently drift — every other backend type's smoke phase applies its
+# config/samples/ manifest (with-engine, external, cachepolicy, cachetenant),
+# so this one must too rather than hand-typing a private inline copy. The
+# sample's metadata.name is cachebackend-events-only == the default
+# $EVENTSONLY_SMOKE_CB_NAME; pin the name via a tmp copy so an overridden
+# tunable still resolves, and set the namespace with -n (the sample is
+# namespace-less, like the other samples). type=LMCache, integration.mode=
+# EventsOnly, backendConfig.model set, no spec.endpoint (rejected on
+# non-External) and no spec.autoscaling (rejected for events-only). The
+# sample's engineSelector is irrelevant here: events-only provisions no
+# workload and the assertions below are all about the CR's own reconcile, so
+# no matched engine pod is required.
+eo_sample_tmp="$(mktemp "$tmpdir/sample-events-only.XXXXXX")"
+sed "s|^  name: cachebackend-events-only\$|  name: $EVENTSONLY_SMOKE_CB_NAME|" \
+  config/samples/cachebackend-events-only.yaml > "$eo_sample_tmp"
+kubectl -n "$EVENTSONLY_SMOKE_NS" apply -f "$eo_sample_tmp" >/dev/null \
+  || fail "kubectl apply events-only sample (config/samples/cachebackend-events-only.yaml) failed"
 
 # Wait for the reconciler to take the events-only path: Ready published by the
 # KV-event gate (False/AwaitingFirstKVEvent before any event), status.endpoint

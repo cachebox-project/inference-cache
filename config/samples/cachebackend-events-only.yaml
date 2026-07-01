@@ -8,12 +8,14 @@
 #     status.endpoint empty (there is no server address to publish), and
 #   - injects NO `--kv-transfer-config` arg / LMCACHE_* env into the engine
 #     container.
-# The mutating Pod webhook still appends the kvevent-subscriber sidecar to
-# matched engine pods, so LookupRoute and status.indexParticipation behave
-# exactly like a managed backend — only the offload tier is absent. (In this
-# mode the subscriber forwards evictions instead of suppressing them: there is
-# no L2 tier holding the block after the engine drops it, so a removed block
-# genuinely means the prefix is gone.)
+# The mutating Pod webhook appends the kvevent-subscriber sidecar to matched
+# engine pods — but only when the controller runs with --kvevent-subscriber-image
+# set (empty by default; see the readiness note below) and this backendConfig.model
+# is present; otherwise it skips the append fail-open. Once appended, LookupRoute
+# and status.indexParticipation behave exactly like a managed backend — only the
+# offload tier is absent. (In this mode the subscriber forwards evictions instead
+# of suppressing them: there is no L2 tier holding the block after the engine
+# drops it, so a removed block genuinely means the prefix is gone.)
 #
 # WHY use it: this is the supported integration for hybrid-attention models
 # that cannot take a vLLM KV connector — Qwen3.6/Next gated-DeltaNet,
