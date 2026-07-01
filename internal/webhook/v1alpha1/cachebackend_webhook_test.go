@@ -2143,6 +2143,24 @@ func TestValidator_EventsOnly_LMCacheAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_EventsOnly_MooncakeRejected(t *testing.T) {
+	// EventsOnly is LMCache-only. A managed Mooncake backend in events-only mode
+	// would stand up a mooncake_master store but wire no KV connector to use it
+	// — a contradiction. This must be rejected EXPLICITLY now that the
+	// (vLLM, Mooncake) adapter is registered: the runtime-adapter check ADMITS
+	// the pair (Mooncake is supported), so without the events-only rule's
+	// type check the CR would slip through and reconcile as active events-only.
+	// Use the shipping registry (nil → DefaultRegistry + External, which
+	// includes the Mooncake adapter) so the runtime-adapter check passes and
+	// the events-only rule is the one that fires, on spec.integration.mode.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Integration = eventsOnlyIntegration()
+	requireInvalidWithCause(t, v, cb, "spec.integration.mode",
+		"only supported with spec.type")
+}
+
 func TestValidator_EventsOnly_OffloadDefaultLMCacheAdmitted(t *testing.T) {
 	// Regression: the default integration mode (Offload) on an LMCache backend
 	// — set explicitly here, but it is also the +kubebuilder default — must be

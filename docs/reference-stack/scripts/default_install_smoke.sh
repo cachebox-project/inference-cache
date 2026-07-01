@@ -3219,6 +3219,10 @@ rm -f "${mc_cb_tmp}.bak"
 log "applying Mooncake CacheBackend"
 kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" >/dev/null
 
+# Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
+# latency is a per-managed-backend property (the reconciler publishes it from
+# the live Service), identical for the LMCache and Mooncake managed paths — no
+# Mooncake-specific tunable is warranted.
 log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for Mooncake status.endpoint"
 mc_deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
 mc_endpoint=""

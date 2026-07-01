@@ -137,8 +137,10 @@ the L2 tier is present only in one of them:
 - **`EventsOnly`:** no KV connector is injected, so there is **no** L2 tier
   holding the block. `BlockRemoved` genuinely means the prefix is gone and the
   hint MUST be pruned, so the helper **omits** the flag (subscriber default off,
-  forwarding the eviction as `PREFIX_EVICTED`). EventsOnly is an LMCache-only
-  mode; Mooncake is always an L2 store, so it always takes the Offload branch.
+  forwarding the eviction as `PREFIX_EVICTED`). EventsOnly is restricted to
+  `spec.type=LMCache` at admission (a managed Mooncake backend always provisions
+  its store, so `Mooncake` + `EventsOnly` is rejected), so a Mooncake backend
+  always takes the Offload branch and sets the flag.
 
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off for the same reason as `EventsOnly`.
