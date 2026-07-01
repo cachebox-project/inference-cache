@@ -41,7 +41,7 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	//
 	// Other Phase-1 literal defaults (spec.replicas=1, spec.type=LMCache,
 	// spec.deploymentKind=Deployment, spec.integration.engine=vllm,
-	// spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
+	// spec.integration.mode=Offload, spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
 	// stamped by the apiserver before this handler runs — they are NOT this
 	// defaulter's job, and a unit-level call to Default() on a raw struct
 	// will not see them. The persisted-CR shape is asserted end-to-end in the
@@ -2088,6 +2088,75 @@ func TestValidator_EngineOverrides_ExternalRejectsPythonHashSeedOverride(t *test
 	requireInvalidWithCause(t, v, cb,
 		"spec.integration.engineOverrides.env[0].name",
 		"PYTHONHASHSEED")
+}
+
+// eventsOnlyIntegration returns an integration spec wired for the events-only
+// (tier-1 routing) mode. Centralised so the events-only tests set the mode the
+// one way the implementation reads it (via spec.integration.mode).
+func eventsOnlyIntegration() *cachev1alpha1.CacheBackendIntegrationSpec {
+	return &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "vllm",
+		Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+	}
+}
+
+func TestValidator_EventsOnly_ExternalTypeRejected(t *testing.T) {
+	// events-only wires no KV connector, while External provisions an
+	// operator-run offload server a connector would dial — the two are
+	// contradictory. The rejection must point at spec.integration.mode (the
+	// knob the operator flipped), not at spec.type. Use the registry that
+	// includes the External adapter so admission of the External CR runs the
+	// same path production does and the only firing rule is the events-only
+	// one.
+	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+	cb.Spec.Endpoint = "team-a-cache.team-a.svc.cluster.local:9000"
+	cb.Spec.Integration = eventsOnlyIntegration()
+	requireInvalidWithCause(t, v, cb, "spec.integration.mode",
+		"incompatible with spec.type")
+}
+
+func TestValidator_EventsOnly_AutoscalingRejected(t *testing.T) {
+	// An events-only backend provisions no server workload, so an autoscaling
+	// spec has nothing to scale; admission rejects it against spec.autoscaling.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = eventsOnlyIntegration()
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
+		MaxReplicas: 3,
+	}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling",
+		"nothing to autoscale")
+}
+
+func TestValidator_EventsOnly_LMCacheAdmitted(t *testing.T) {
+	// The supported events-only shape: type=LMCache (whose adapter supplies
+	// the kvevent-subscriber the routing tier needs), no autoscaling, no
+	// endpoint. The events-only rule must accept it cleanly — events-only is
+	// the lighter routing-only deployment, not a misconfiguration.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = eventsOnlyIntegration()
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("events-only LMCache (no autoscaling, no endpoint) rejected: %v", err)
+	}
+}
+
+func TestValidator_EventsOnly_OffloadDefaultLMCacheAdmitted(t *testing.T) {
+	// Regression: the default integration mode (Offload) on an LMCache backend
+	// — set explicitly here, but it is also the +kubebuilder default — must be
+	// untouched by the events-only rule. Guards against the rule firing on the
+	// Offload path.
+	v := &CacheBackendValidator{Registry: stubRegistry()}
+	cb := newBackend() // type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "vllm",
+		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
+	}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("Offload (default) LMCache rejected: %v", err)
+	}
 }
 
 // Sanity check on the package-level wiring: SetupCacheBackendWebhookWithManager

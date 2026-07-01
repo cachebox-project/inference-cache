@@ -39,6 +39,29 @@ const (
 	CacheBackendIntegrationRoleReadWrite CacheBackendIntegrationRole = "ReadWrite"
 )
 
+// +kubebuilder:validation:Enum=Offload;EventsOnly
+
+// CacheBackendIntegrationMode selects which cache tiers an engine is wired for.
+type CacheBackendIntegrationMode string
+
+const (
+	// CacheBackendIntegrationModeOffload is the default: the engine is wired for
+	// cache-aware routing (tier-1) AND the KV-offload connector (tier-2), and
+	// the controller provisions a managed backend server for the offload tier.
+	CacheBackendIntegrationModeOffload CacheBackendIntegrationMode = "Offload"
+	// CacheBackendIntegrationModeEventsOnly wires the engine for cache-aware
+	// routing (tier-1) ONLY: the kvevent-subscriber observation sidecar is
+	// injected, but NO KV connector is loaded into the engine and NO backend
+	// server is provisioned. This is the supported integration for
+	// hybrid-attention models (Qwen3.6/Next gated-DeltaNet, Mamba/Jamba, KDA,
+	// Falcon-H, Granite-hybrid, …): vLLM disables its hybrid KV-cache manager
+	// the moment any KV connector is loaded (KV-spec unification then fails at
+	// init), so they cannot take the tier-2 connector — but their KV events
+	// coexist fine with the hybrid manager, so routing still works. Also a
+	// lighter deployment for routing-only users who do not want an offload tier.
+	CacheBackendIntegrationModeEventsOnly CacheBackendIntegrationMode = "EventsOnly"
+)
+
 // CacheBackendSpec defines the desired state of a cache backend.
 //
 // The autoscaling spec (spec.autoscaling) is reconciled into a
@@ -106,11 +129,24 @@ type CacheBackendSpec struct {
 	// recovery is to recreate the pod (e.g. `kubectl rollout restart`),
 	// not to edit the live pod's labels.
 	//
+	// This describes the default spec.integration.mode=Offload path. For
+	// spec.integration.mode=EventsOnly no KV connector wiring (env vars +
+	// CLI args) is injected and status.endpoint is neither required nor
+	// published — the kvevent-subscriber observation sidecar alone is
+	// injected (see below), so matched pods report cache state for routing
+	// without offloading KV to a backend server.
+	//
 	// The kvevent-subscriber observation sidecar is appended in addition
 	// to the engine wiring only when the controller is started with
 	// --kvevent-subscriber-image set (empty by default) AND the matched
 	// CacheBackend has a model id configured. Without those, the engine
 	// is wired but no sidecar is added.
+	//
+	// In spec.integration.mode=EventsOnly the above "engine wiring" is
+	// absent: no KV connector is injected, so the sidecar is the ONLY thing
+	// the webhook adds. With the subscriber image or model id unset nothing
+	// is wired at all and the pod carries no injected-by stamp (the webhook
+	// admits it untouched).
 	//
 	// The match is evaluated once at pod CREATE — pods whose labels change
 	// after creation are not re-evaluated; the wiring is sticky to the
@@ -277,6 +313,21 @@ type CacheBackendIntegrationSpec struct {
 	// +kubebuilder:default=vllm
 	Engine string `json:"engine,omitempty"`
 
+	// Mode selects which cache tiers the engine is wired for. Defaults to
+	// Offload — cache-aware routing (tier-1) PLUS the KV-offload connector
+	// (tier-2), with a controller-provisioned backend server. EventsOnly wires
+	// routing only: the kvevent-subscriber sidecar is injected, but no KV
+	// connector is loaded into the engine and no backend server is provisioned.
+	// EventsOnly is the supported integration for hybrid-attention models that
+	// cannot take a vLLM KV connector (and a lighter routing-only deployment for
+	// anyone who does not want an offload tier). Because EventsOnly provisions
+	// no server, status.endpoint stays empty and the autoscaling spec is
+	// rejected at admission; Ready is still gated on the first observed KV event.
+	// See the CacheBackendIntegrationMode godoc.
+	// +optional
+	// +kubebuilder:default=Offload
+	Mode CacheBackendIntegrationMode `json:"mode,omitempty"`
+
 	// Role controls whether the engine reads from, writes to, or fully
 	// participates in the cache. Defaults to ReadWrite — full participation,
 	// matching the [enginewire.IntegrationRole] read-time fallback for an
@@ -286,11 +337,12 @@ type CacheBackendIntegrationSpec struct {
 	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
 
-	// FirstEventTimeout bounds how long a managed backend may sit
-	// Ready=False with reason AwaitingFirstKVEvent — the managed cache-backend
-	// workload is Available but no KV event has been observed yet — before
-	// the controller flips it to Ready=False/Degraded=True with reason
-	// NoKVEventsObserved.
+	// FirstEventTimeout bounds how long a backend may sit
+	// Ready=False with reason AwaitingFirstKVEvent — the backend is up (a
+	// managed workload is Available, or an events-only backend is wired) but no
+	// KV event has been observed yet — before the controller flips it to
+	// Ready=False/Degraded=True with reason NoKVEventsObserved. It applies to
+	// both Offload-managed and EventsOnly backends.
 	//
 	// The KV-event readiness gate holds Ready until at least one KV event
 	// has been observed for this backend's replicas
@@ -303,11 +355,15 @@ type CacheBackendIntegrationSpec struct {
 	// plane silently degrades to NO_HINT on every lookup, and this gate makes
 	// that loud.
 	//
-	// The timeout clock starts when the managed cache-backend workload first
-	// reports Available. The gate is on by default and opt-out per CacheBackend
-	// via the annotation inferencecache.io/require-kv-events: "false". Backends
-	// of spec.type External are always exempt (their readiness is determined by
-	// admission accepting the endpoint, and they never enter this gate).
+	// The timeout clock starts when the backend becomes "up": for an
+	// Offload-managed backend, when its workload first reports Available; for an
+	// events-only backend (which provisions no workload), on the first reconcile
+	// it is wired — including a re-anchor to the flip moment when a backend
+	// transitions into events-only from a server-bearing mode. The gate is on by
+	// default and opt-out per CacheBackend via the annotation
+	// inferencecache.io/require-kv-events: "false". Backends of spec.type
+	// External are always exempt (their readiness is determined by admission
+	// accepting the endpoint, and they never enter this gate).
 	//
 	// A zero or negative value is treated as unset and falls back to the 5m
 	// default — the field carries no meaningful "wait forever" or "fail
@@ -447,6 +503,27 @@ func IntegrationFailOpen(spec *CacheBackendIntegrationSpec) bool {
 	return *spec.FailOpen
 }
 
+// IntegrationMode returns the effective integration mode for a CacheBackend
+// integration spec. Missing spec or empty field defaults to Offload, matching
+// the API default — full routing + offload + a managed backend server. The
+// admission defaulter materialises the field on submitted objects; this helper
+// is the read-time fallback for callers that bypass the apiserver (raw-struct
+// test invocation, partial deserialization).
+func IntegrationMode(spec *CacheBackendIntegrationSpec) CacheBackendIntegrationMode {
+	if spec == nil || spec.Mode == "" {
+		return CacheBackendIntegrationModeOffload
+	}
+	return spec.Mode
+}
+
+// IsEventsOnly reports whether the backend is wired for events-only (tier-1
+// routing) integration — no KV connector, no provisioned server. It is the
+// single predicate the adapter, webhook, controller, and validator share so the
+// mode's three-layer wiring (inject / reconcile / admit) stays in lockstep.
+func (s *CacheBackendSpec) IsEventsOnly() bool {
+	return IntegrationMode(s.Integration) == CacheBackendIntegrationModeEventsOnly
+}
+
 // CacheBackendEngineSelector selects engines by labels.
 type CacheBackendEngineSelector struct {
 	// MatchLabels is a map of labels that selected engines must match.
@@ -568,21 +645,31 @@ type CacheBackendStatus struct {
 	// +optional
 	FirstKVEventObservedAt *metav1.Time `json:"firstKVEventObservedAt,omitempty"`
 
-	// FirstAvailableAt latches the first time the managed cache-backend
-	// workload was observed Available — the stable anchor for the
-	// firstEventTimeout clock. It is deliberately a latched timestamp rather
-	// than the live Deployment's Available condition LastTransitionTime: that
-	// condition resets on an availability flap, which would restart the
-	// timeout window and let a backend that already breached the timeout
-	// (Degraded / NoKVEventsObserved) bounce back to AwaitingFirstKVEvent
-	// without any KV event — contradicting the "once Degraded, stays Degraded
-	// until an event arrives" contract. Anchoring on this write-once value
-	// keeps the elapsed window monotonic, so Degraded is sticky. Written
-	// write-once when the workload first reports Available and never cleared
-	// (inert while the backend is not managed). A genuinely recreated managed
-	// Deployment keeps the prior anchor; the gate re-evaluates from it, which
-	// is safe because the engine event source is unchanged by a cache-server
-	// restart.
+	// FirstAvailableAt is the stable anchor for the firstEventTimeout clock.
+	// It latches one of two events depending on the integration mode:
+	//   - Offload (managed): the first time the managed cache-backend
+	//     workload was observed Available — there is a workload to wait on.
+	//   - EventsOnly: the first reconcile. A server-less backend has no
+	//     workload to become Available, so it is "up" the moment it exists
+	//     and the firstEventTimeout clock starts immediately.
+	// In both cases it is a latched timestamp rather than a live condition's
+	// LastTransitionTime: a live condition resets on an availability flap,
+	// which would restart the timeout window and let a backend that already
+	// breached the timeout (Degraded / NoKVEventsObserved) bounce back to
+	// AwaitingFirstKVEvent without any KV event — contradicting the "once
+	// Degraded, stays Degraded until an event arrives" contract. Anchoring on
+	// this latched value keeps the elapsed window monotonic WITHIN a serving
+	// mode, so Degraded is sticky. It survives availability flaps and a
+	// recreated managed Deployment (the gate re-evaluates from the prior
+	// anchor, safe because a cache-server restart does not change the engine
+	// event source). It is NOT immortal across a mode change, though: a
+	// server-bearing→EventsOnly flip re-anchors it to the flip moment (and also
+	// bypasses the sticky NoKVEventsObserved reason) so the flip gets a fresh
+	// first-event window instead of inheriting the old mode's availability time
+	// or timed-out verdict; and an unmanaged transition clears it so a later
+	// managed/events-only re-entry starts fresh. (Inert only on an Offload
+	// backend that has not yet reported Available; on the EventsOnly path it is
+	// set on the first reconcile.)
 	// +optional
 	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
 

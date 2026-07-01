@@ -16,9 +16,10 @@ import (
 // a vLLM-engine L2 cache tier — the vLLM+LMCache adapter and the vLLM+Mooncake
 // adapter today — because the KV-event stream is produced by vLLM itself (its
 // ZMQ publisher), independent of which L2 store the engine offloads to. The
-// scheme tag is therefore "vllm" for both, and both want --ignore-block-removed
-// for the same reason (see below), so the rendered container is byte-identical
-// across those adapters and lives here as the single source of truth.
+// scheme tag is therefore "vllm" for both, and the --ignore-block-removed
+// eviction-forwarding policy is derived from the CR's integration mode (see
+// below), so the rendered container is identical across those adapters for a
+// given mode and lives here as the single source of truth.
 //
 // The container shares the engine pod's network namespace, so the subscriber
 // dials the engine over 127.0.0.1 (the vLLM ZMQ PUB endpoint defaults to
@@ -61,6 +62,32 @@ func buildKVEventSubscriber(subscriberImage, policyServerGRPCAddress string, cac
 		serverAddr = DefaultPolicyServerGRPCAddress
 	}
 
+	// Eviction-forwarding policy is mode-dependent. In Offload mode the paired
+	// L2 tier (LMCache, or a Mooncake store) retains a block after the engine
+	// evicts it from GPU, so vLLM's BlockRemoved does NOT mean the prefix is
+	// gone — forwarding it as PREFIX_EVICTED would drop a routing hint the
+	// replica can still cheaply serve from L2, so suppress it
+	// (--ignore-block-removed=true) and let the hint age out on its freshness
+	// TTL. In EventsOnly mode there is NO L2 retaining blocks, so a BlockRemoved
+	// genuinely means the prefix is gone and the hint MUST be pruned — omit the
+	// flag (the subscriber binary defaults it to false). Soft state means a
+	// stale hint is a cache miss at worst, while a missing one routes the
+	// request away from its warm replica — the opposite risk in each mode,
+	// hence the opposite default. (Mooncake is always an L2 store, so it takes
+	// the Offload branch unless an operator sets EventsOnly, which is a
+	// contradiction the admission validator already rejects.)
+	args := []string{
+		"--engine-endpoint=tcp://127.0.0.1:" + defaultEngineZMQPortStr,
+		"--server=" + serverAddr,
+		"--replica-id=$(POD_NAME)",
+		"--tenant-id=$(POD_NAMESPACE)",
+		"--model-id=" + modelID,
+		"--hash-scheme=" + subscriberHashScheme,
+	}
+	if !cache.Spec.IsEventsOnly() {
+		args = append(args, "--ignore-block-removed=true")
+	}
+
 	nonRoot := true
 	noPrivEsc := false
 	readOnlyRoot := true
@@ -85,24 +112,7 @@ func buildKVEventSubscriber(subscriberImage, policyServerGRPCAddress string, cac
 				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
 			},
 		},
-		Args: []string{
-			"--engine-endpoint=tcp://127.0.0.1:" + defaultEngineZMQPortStr,
-			"--server=" + serverAddr,
-			"--replica-id=$(POD_NAME)",
-			"--tenant-id=$(POD_NAMESPACE)",
-			"--model-id=" + modelID,
-			"--hash-scheme=" + subscriberHashScheme,
-			// The vLLM+LMCache and vLLM+Mooncake backends are both L2 cache
-			// tiers that retain blocks after the engine evicts them from GPU.
-			// vLLM emits BlockRemoved on every GPU eviction even when the block
-			// is still resident in the L2 store; forwarding that as
-			// PREFIX_EVICTED would drop a routing hint the replica can still
-			// cheaply serve from L2 — the gateway then routes elsewhere and
-			// wastes the L2 hit. Keep the entry until its freshness TTL
-			// expires; soft state means a stale hint is a cache miss at worst,
-			// while a missing one routes the request away from its warm replica.
-			"--ignore-block-removed=true",
-		},
+		Args: args,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("10m"),

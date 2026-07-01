@@ -373,6 +373,15 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 // config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
 // (and unset / unknown) → kv_both.
 func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	// Events-only (tier-1 routing) wires NO KV connector: the engine container
+	// is left unmodified so a hybrid-attention model's KV-cache manager is not
+	// disabled by a connector it cannot load. The engine's own (operator-
+	// configured) kv-events publisher is all the observation sidecar needs, and
+	// nothing dials a cache server, so no endpoint is required either. The
+	// subscriber is still appended by the webhook via ObservationSidecar.
+	if cache != nil && cache.Spec.IsEventsOnly() {
+		return nil
+	}
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
 }
 

@@ -24,6 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -611,6 +613,11 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	reconcile(t, r, "cache", "ns1")
 	live := getBackend(t, r, "cache", "ns1")
 	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	// Plant a stale KV-event-gate anchor too: the unmanaged transition must
+	// reset it so a later re-entry (managed or events-only) starts a fresh
+	// firstEventTimeout window rather than reusing this pre-unmanaged time.
+	staleAnchor := metav1.NewTime(time.Now().Add(-time.Hour))
+	live.Status.FirstAvailableAt = &staleAnchor
 	if err := r.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("plant baseline observedServerInstance: %v", err)
 	}
@@ -634,6 +641,13 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	// In-memory shadow must also be cleared on the unmanaged path.
 	if shadow := r.serverInstanceCascade.lastAttempt(plantedKey); shadow != "" {
 		t.Fatalf("cascade shadow = %q after managed→unmanaged transition; want cleared", shadow)
+	}
+	// The stale KV-event-gate anchor must be reset — otherwise an Offload→
+	// Unmanaged→EventsOnly path (which clears endpoint/observedServerInstance,
+	// so the events-only re-anchor heuristic can't detect the transition) would
+	// reuse this pre-unmanaged time and breach the first-event window instantly.
+	if got.Status.FirstAvailableAt != nil {
+		t.Fatalf("status.firstAvailableAt = %v, want cleared on managed→unmanaged transition", got.Status.FirstAvailableAt)
 	}
 }
 
@@ -696,6 +710,132 @@ func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
 				t.Fatalf("probeLimiter.lastCalled(%q) = %v after lifecycle exit; want zero (forget) — re-entry inside the 30s window would skip the first probe call", key, got)
 			}
 		})
+	}
+}
+
+// TestReconcileLifecycleExitsClearEngineCompatibility pins that every managed →
+// non-managed lifecycle exit clears the managed-only EngineCompatibility
+// advisory. Without it, a backend that surfaced an injected-engine crash-loop
+// warning and is then flipped to External or an unmanaged kind would keep
+// advertising a stale incompatibility no path re-evaluates — the same staleness
+// the sibling T2Degraded clear guards against.
+func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+	}{
+		{
+			name: "managed → External",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
+				cb.Spec.Endpoint = "external.ns1.svc:8080"
+			},
+		},
+		{
+			name: "managed → Unmanaged (StatefulSet kind)",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
+			reconcile(t, r, "cache", "ns1")
+
+			// Plant a False/InjectedEngineCrashLooping condition as if a prior
+			// managed reconcile had observed an injected engine crash-looping,
+			// so the clearing assertion below is not vacuous.
+			live := getBackend(t, r, "cache", "ns1")
+			live.Status.Conditions = append(live.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeEngineCompatibility,
+				Status:             metav1.ConditionFalse,
+				Reason:             reasonInjectedEngineCrashLooping,
+				Message:            "planted",
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: live.Generation,
+			})
+			if err := r.Status().Update(context.Background(), live); err != nil {
+				t.Fatalf("plant EngineCompatibility precondition: %v", err)
+			}
+			if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c == nil {
+				t.Fatalf("planted EngineCompatibility precondition failed (test would be vacuous)")
+			}
+
+			// Trigger the lifecycle exit.
+			switching := getBackend(t, r, "cache", "ns1")
+			tc.mutate(switching)
+			if err := r.Update(context.Background(), switching); err != nil {
+				t.Fatalf("apply lifecycle-exit spec change: %v", err)
+			}
+			reconcile(t, r, "cache", "ns1")
+
+			if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c != nil {
+				t.Fatalf("EngineCompatibility = %+v after %s; want cleared (a stale managed-only advisory would linger on a CR no managed path re-evaluates)", c, tc.name)
+			}
+		})
+	}
+}
+
+// TestUpdateManagedStatusPreservesEngineCompatibilityOnListError pins the
+// preserve-on-list-error contract: when detectEngineConnectorCrashLoop cannot
+// observe the engine pods (pod List fails → observed=false), updateManagedStatus
+// must LEAVE any existing EngineCompatibility condition in place rather than
+// clear it. Clearing on a transient list failure and re-asserting on the next
+// success would flap the Warning event and briefly hide an active
+// incompatibility. The managed reconcile still completes (the list error is
+// soft on every path that reads pods), so the condition's survival is the whole
+// assertion.
+func TestUpdateManagedStatusPreservesEngineCompatibilityOnListError(t *testing.T) {
+	scheme := newScheme(t)
+	// No engineSelector → the matchedEnginePods refresh does not list pods;
+	// the detector's namespace-wide PodList is the one the interceptor below
+	// fails, and the server-instance cascade soft-fails on the same error.
+	listErr := errors.New("synthetic pod-list failure")
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(scheme, funcs, lmcacheBackend("cache", "ns1"))
+
+	// First reconcile creates the managed Deployment/Service and publishes the
+	// baseline status; the interceptor only fails pod Lists, which are soft.
+	reconcile(t, r, "cache", "ns1")
+
+	// Plant a False/InjectedEngineCrashLooping condition as if a prior reconcile
+	// (with the pods observable) had surfaced an injected engine crash-loop.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Status.Conditions = append(live.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeEngineCompatibility,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonInjectedEngineCrashLooping,
+		Message:            "planted",
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: live.Generation,
+	})
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant EngineCompatibility precondition: %v", err)
+	}
+	if c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility); c == nil {
+		t.Fatalf("planted EngineCompatibility precondition failed (test would be vacuous)")
+	}
+
+	// Reconcile again with the pod List still failing: detectEngineConnectorCrashLoop
+	// returns ("", false), so updateManagedStatus must skip both the set and the
+	// clear and leave the planted condition untouched.
+	reconcile(t, r, "cache", "ns1")
+
+	c := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeEngineCompatibility)
+	if c == nil {
+		t.Fatalf("EngineCompatibility was cleared on a transient pod-list failure; want preserved (observed=false must not clear)")
+	}
+	if c.Status != metav1.ConditionFalse || c.Reason != reasonInjectedEngineCrashLooping {
+		t.Fatalf("EngineCompatibility = %s/%s after list error; want False/InjectedEngineCrashLooping (preserved unchanged)", c.Status, c.Reason)
 	}
 }
 
@@ -788,6 +928,129 @@ func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 	}
 	if len(deps.Items) != 0 {
 		t.Fatalf("deployments = %d, want 0 for unmanaged type", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
+	// An EventsOnly backend whose (engine, type) pair has no registered
+	// adapter must reconcile as UNMANAGED, NOT as active events-only.
+	// Admission rejects an unsupported pair at write time, but a
+	// stored/admission-bypassed CR reaching the controller must not be
+	// advertised as a working routing tier: the pod webhook can't select an
+	// adapter for an unsupported pair, so it could never inject the
+	// kvevent-subscriber and no KV event would ever flow. dispatch confirms an
+	// adapter is selectable before routing to reconcileEventsOnly; on failure it
+	// falls to reconcileUnmanaged. AIBrix has no shipping adapter (the default
+	// registry supports (vllm, LMCache) + (vllm, Mooncake) + External), so it
+	// is the unsupported-type fixture here — Mooncake is no longer unsupported.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeAIBrix,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	// reconcileUnmanaged removes the Ready / Progressing conditions; the
+	// events-only path (reconcileEventsOnly) would have PUBLISHED them. Their
+	// absence is the discriminator between "reconciled as unmanaged" and
+	// "reconciled as active events-only".
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Ready (unmanaged path); got %+v", ready)
+	}
+	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog != nil {
+		t.Fatalf("unsupported-pair events-only must NOT publish Progressing (unmanaged path); got %+v", prog)
+	}
+	// And no workload is provisioned (unmanaged sheds everything).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for unmanaged events-only", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
+	// An admission-bypassed / stored object that sets BOTH spec.type=External
+	// AND integration.mode=EventsOnly must reconcile via the events-only path,
+	// NOT the External path. Admission's rejectEventsOnlyMisconfiguration rejects
+	// this pair, so this is defense-in-depth for a stored CR: dispatch checks
+	// IsEventsOnly() before the Type==External branch, so EventsOnly wins. If it
+	// reconciled as External it would mirror spec.endpoint to status and mark
+	// Ready=True/ExternalEndpointAccepted, letting the pod webhook's External
+	// adapter inject the KV connector — violating events-only's "no connector,
+	// no server" contract. The (vllm, External) pair has a registered adapter, so
+	// the events-only adapter-selectability check passes and the events-only
+	// reconcile runs.
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Endpoint: "external-cache.ns1.svc:8200",
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+	// Mirror cmd/controller wiring: the External adapter is registered on the
+	// reconciler's registry (DefaultRegistry doesn't include it to avoid an
+	// import cycle). Without it the (vllm, External) pair is unselectable and the
+	// events-only branch falls to reconcileUnmanaged — masking the precedence we
+	// want to assert.
+	reg := adapterruntime.DefaultRegistry()
+	reg.Register(externaladapter.NewAdapter())
+	r.Registry = reg
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+
+	// status.endpoint stays EMPTY — events-only publishes no endpoint. The
+	// External path would have mirrored spec.endpoint here.
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty (events-only wins over External; no endpoint mirrored)", got.Status.Endpoint)
+	}
+
+	// Ready is published by the events-only gate (AwaitingFirstKVEvent before any
+	// event), NOT by the External path (ExternalEndpointAccepted). The reason is
+	// the discriminator between the two reconcile paths.
+	ready := findCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil {
+		t.Fatalf("events-only must publish Ready; conditions = %v", got.Status.Conditions)
+	}
+	if ready.Reason == conditionReasonExternalEndpointAccepted {
+		t.Fatalf("Ready reason = %q — reconciled as External, but EventsOnly must take precedence", ready.Reason)
+	}
+	if ready.Status != metav1.ConditionFalse || ready.Reason != reasonAwaitingFirstKVEvent {
+		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (events-only gate before any KV event)", ready)
+	}
+
+	// No workload is provisioned (events-only is server-less).
+	var deps appsv1.DeploymentList
+	if err := r.List(context.Background(), &deps, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(deps.Items) != 0 {
+		t.Fatalf("deployments = %d, want 0 for events-only", len(deps.Items))
+	}
+	var svcs corev1.ServiceList
+	if err := r.List(context.Background(), &svcs, client.InNamespace("ns1")); err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs.Items) != 0 {
+		t.Fatalf("services = %d, want 0 for events-only", len(svcs.Items))
 	}
 }
 
