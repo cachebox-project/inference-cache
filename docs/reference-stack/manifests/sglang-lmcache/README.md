@@ -1,0 +1,241 @@
+# SGLang + LMCache reference stack
+
+The second-engine sibling of the top-level [vLLM + LMCache reference](../../README.md):
+a reproducible **SGLang** deployment serving a model with **LMCache** as its
+KV-cache backend, publishing **KV-cache events over ZMQ**. It is the hand-built
+reference the `(sglang, LMCache)` runtime adapter
+(`pkg/adapters/runtime/sglang`) was templated from: in [`deployment.yaml`](deployment.yaml)
+the SGLang container's **LMCache wiring** (`--enable-lmcache` + the `LMCACHE_*` /
+`INFERENCECACHE_FAIL_OPEN` env) mirrors what the adapter auto-injects. The rest
+of the manifest — image, resources, the lmcache-server, `--kv-events-config` —
+is operator-owned scaffolding the adapter assumes is already present, so the
+file as a whole is **not** byte-for-byte adapter output.
+
+## Why this exists (and what's already validated)
+
+SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
+`ZmqEventPublisher` emitting the **same** msgspec `BlockStored` / `BlockRemoved`
+/ `AllBlocksCleared` event structs vLLM does (the batch envelope adds a trailing
+`attn_dp_rank` the decoder ignores). Two consequences:
+
+1. **The event-decode path is engine-agnostic and already covered by tests.** The
+   shipped `kvevent-subscriber` decodes SGLang's stream unchanged; the only
+   difference is the `--hash-scheme=sglang` tag. The Go decoder is exercised
+   against a synthetic SGLang-shaped frame in
+   `pkg/adapters/engine/sglang_wire_test.go`, and the cross-engine isolation
+   (`hash_scheme` keeps SGLang and vLLM prefixes disjoint) in
+   `pkg/index` (`TestNoCrossEngineFalseHitVLLMvsSGLang`).
+2. **You can validate off-GPU** (below): the Go test covers SGLang's exact wire
+   shape; the Python synthetic tooling covers the shared decode/redaction logic.
+
+What this reference stack adds on top of those tests is the **real engine →
+ZMQ events** path on a GPU — a live SGLang+LMCache pod publishing real
+`BlockStored`/`BlockRemoved` frames a subscriber can read. Extending that all
+the way to **index + `LookupRoute`** additionally requires the cache plane
+installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
+`engineSelector` matches these pods and whose `backendConfig.model` is set, so
+the controller auto-attaches the `kvevent-subscriber` sidecar (see
+`config/samples/cachebackend-sglang.yaml` and the install docs). The raw
+`kubectl apply` below stands up only the engine + lmcache-server, so from these
+steps alone the reproducible outcome is the **event stream**, not the populated
+index; the index/`LookupRoute` criterion below assumes the controller + that
+`CacheBackend` are also present.
+
+## Engine-side differences from the vLLM reference
+
+| | vLLM | SGLang |
+|---|---|---|
+| LMCache on | `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1",…}'` | `--enable-lmcache` (bare flag) + `LMCACHE_USE_EXPERIMENTAL=True` |
+| vLLM-only env | `VLLM_USE_V1=1`, `PYTHONHASHSEED=0` | *(neither — no v1 codepath; SGLang sha256-hashes, independent of `PYTHONHASHSEED`)* |
+| Default HTTP port | 8000 | 30000 |
+| KV-event wire | ZMQ `BlockStored`/`BlockRemoved`/`AllBlocksCleared` | same event structs; batch envelope adds a trailing `attn_dp_rank` the decoder ignores |
+| LMCACHE_* tunables | same | same |
+
+## Deploy and test on a GPU
+
+> Needs an NVIDIA GPU host (or a managed GPU cluster advertising `nvidia.com/gpu`)
+> and a Hugging Face token for the gated reference model. Size the GPU the same
+> way as the vLLM path — see [`../../GPU-RUNBOOK.md`](../../GPU-RUNBOOK.md); the
+> 8B reference model fits on a single 24 GB card.
+
+This manifest is a **standalone** reference: the SGLang engine is wired to the
+**bundled `lmcache-server`** by the manifest itself (the `LMCACHE_REMOTE_URL` env
+points at the in-namespace Service), with **no controller or `CacheBackend` in
+the loop**. It stands up the real engine and emits real ZMQ KV events — the
+hand-built shape the adapter was templated from.
+
+Run the commands below from this directory
+(`docs/reference-stack/manifests/sglang-lmcache/`) — the relative paths
+(`../../kind/cluster.yaml`, `deployment.yaml`) assume it.
+
+```bash
+# 1. Cluster + GPU device plugin (identical to the vLLM path).
+kind create cluster --name inference-cache-substrate --config ../../kind/cluster.yaml
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+helm install nvdp nvdp/nvidia-device-plugin -n kube-system
+
+# 2. Fix BOTH placeholder images in deployment.yaml: replace the ENTIRE SGLang
+#    engine image reference `YOUR_REGISTRY/sglang-lmcache@sha256:0000...` with
+#    your real derived image (repo AND digest), and swap the lmcache-server's
+#    all-zero digest for its real one — see the deployment.yaml header +
+#    VERSIONS.md. Then create the namespace + HF token secret (idempotent so the
+#    runbook re-runs cleanly).
+kubectl create namespace cache-substrate --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 3. Deploy the lmcache-server + SGLang engine (the manifest wires them together).
+kubectl apply -f deployment.yaml
+kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeout=20m
+
+# 4. Drive the SAME long-prefix prompt twice (first warms, second reuses). This
+#    exercises the engine and triggers its KV-event publisher on :5557;
+#    CONSUMING/verifying the frames is the managed path below — there is no
+#    standalone printer for SGLang's 3-tuple stream in this repo. Swap the
+#    `prefix = ...` line below for a REAL prompt long enough to span several KV
+#    blocks (>> the engine's --page-size in tokens); a short literal won't
+#    reliably produce BlockStored / prefix reuse.
+# Build the request body with python3 (no jq dependency); the long shared
+# prefix is what triggers block storage + reuse.
+BODY="$(python3 - <<'PY'
+import json
+prefix = "You are a helpful assistant. " * 200   # ~1k+ tokens of shared prefix
+print(json.dumps({"model": "meta-llama/Meta-Llama-3-8B-Instruct",
+                  "messages": [{"role": "user", "content": prefix}]}))
+PY
+)"
+kubectl -n cache-substrate port-forward svc/sglang-lmcache-llama-8b 30000:30000 &
+pf=$!; trap 'kill "$pf" 2>/dev/null' EXIT   # clean up the port-forward (frees :30000)
+until curl -sf localhost:30000/health >/dev/null 2>&1; do sleep 1; done   # wait for the port-forward
+for i in 1 2; do
+  # -sfS: fail (non-zero) on HTTP 4xx/5xx so a rejected request doesn't look served.
+  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null
+done
+kill "$pf" 2>/dev/null; trap - EXIT
+```
+
+### What success looks like (standalone)
+
+- **The verifiable standalone outcome is: the engine serves both requests AND
+  its KV-event publisher started.** Assert the publisher concretely from the
+  engine logs (so a mis-configured `--kv-events-config` fails the check rather
+  than silently passing):
+
+  ```bash
+  kubectl -n cache-substrate logs deploy/sglang-lmcache-llama-8b -c sglang \
+    | grep -iE 'zmq.*publish|publisher thread|kv.?events' \
+    || { echo "FAIL: KV-event publisher did not start (check --kv-events-config)"; exit 1; }
+  ```
+
+  Full stream verification stops there standalone: this flow does **not** consume
+  or assert the `BlockStored` frames themselves, **nor does it prove LMCache
+  offload works** — a passing standalone run says nothing about whether SGLang
+  actually stores KV into `lmcache-server` over `LMCACHE_REMOTE_URL` (that is the
+  open wire-test caveat below; confirm it by checking `lmcache-server` for
+  incoming stores on a real run). Observing the actual event stream needs a
+  consumer (the managed Go sidecar below; this repo ships no standalone 3-tuple
+  printer), and the decoder's correctness against SGLang's exact wire is covered
+  offline by the Go test. End-to-end frame→index→`LookupRoute`
+  verification requires the **managed controller/sidecar path** (see below), not
+  this standalone deployment — even on a GPU, the standalone manifest has no
+  consumer, so it never populates the index. This is an inherent limit of the
+  consumer-less standalone manifest, not a gap to paper over.
+- **Privacy boundary — the RAW ZMQ frames carry `token_ids`.** Both vLLM's and
+  SGLang's `BlockStored` wire includes the block's token ids; the
+  "metadata-only, never token content" guarantee is about what the IC
+  `kvevent-subscriber` *reports to the policy server* — it hashes the token_ids
+  in-pod into the content fingerprint and forwards only hashes + counts. This is
+  why the Service here deliberately exposes **only** the HTTP API and **not**
+  `:5557`: the in-pod subscriber reaches the publisher over `127.0.0.1`, so the
+  token-bearing frames never need a cluster-reachable port. If you must inspect
+  the raw stream during dev, `kubectl port-forward` `:5557` to localhost
+  yourself — don't add it to the Service.
+- **Why the two `scripts/` helpers don't verify SGLang here:**
+  `scripts/kv_events_subscriber.py` decodes only vLLM's 2-tuple synthetic frames
+  (it would print `UNDECODED` on SGLang's 3-tuple), and
+  `scripts/prefix_cache_hit_test.sh` reads vLLM's `vllm:prefix_cache_hits`
+  counter SGLang doesn't emit (use it only as a request driver). The shipped
+  live SGLang consumer is the managed Go sidecar below.
+
+### The managed path (what the adapter automates)
+
+In a real install you do **not** hand-write this manifest. You create a
+`CacheBackend` (`engine: sglang`, `type: LMCache`; see
+[`config/samples/cachebackend-sglang.yaml`](../../../../config/samples/cachebackend-sglang.yaml))
+whose `engineSelector` matches your SGLang pods, and the controller renders its
+own lmcache-server, injects the engine's LMCache env (overwriting the manual
+`LMCACHE_REMOTE_URL` with the managed endpoint), and — with
+`--kvevent-subscriber-image` set — auto-attaches the Go `kvevent-subscriber`
+sidecar (tagged `--hash-scheme=sglang`) that reports to the index, enabling
+`LookupRoute` to return SGLang replicas (never a vLLM replica on the same prefix
+bytes — the `hash_scheme` tag keeps them disjoint). Two caveats the manual
+manifest sidesteps but the managed path must honor: the CacheBackend must live
+in the **engine pods' namespace** (the Pod webhook matches per-namespace), and
+because injection is **create-time only**, the CacheBackend's
+`status.endpoint` must be **published** before the engine pod is created, or the
+pod admits unwired and must be recreated. (The precondition is specifically
+`status.endpoint`, **not** `Ready` — managed `Ready` is gated on the first KV
+event observed *from these very pods*, so waiting for `Ready` first would be
+circular.) The served model, the CacheBackend's
+`backendConfig.model`, and the request's `model` must all agree, or the index
+keys per-model and `LookupRoute` silently misses. **Block-size caveat:** for
+raw-`token_ids`/`prompt_text` lookups the server fingerprints at its single
+global `--engine-block-size` (default 16, vLLM's); SGLang's page size (e.g. 64)
+must match it, or gateways must send pre-computed `prefix_hash`/`block_hashes` —
+otherwise `LookupRoute` silently misses even with events flowing (see the
+"Block-size alignment" note in [`docs/design/cachebackend-api.md`](../../../design/cachebackend-api.md)).
+This managed wiring is
+exercised by the **controller/webhook envtests** — the SGLang pod-injection,
+reserved-override, and admission tests — not reproduced step-by-step here. (The
+install-smoke gate's all-samples backstop additionally admits the
+`config/samples/cachebackend-sglang.yaml` shape against a real-cluster webhook,
+but it does not drive the full inject→index→`LookupRoute` flow.)
+
+## Validate the event wire WITHOUT a GPU
+
+Two complementary off-GPU checks, with an important scope distinction:
+
+1. **The shared decode + token-redaction path** (Python, no image/cluster). The
+   `kv_events_synthetic_publisher.py` emits the **2-field** `[ts, events]`
+   EventBatch envelope (vLLM's shape), so it exercises the decode +
+   token-redaction logic common to both engines — not SGLang's exact envelope:
+
+   ```bash
+   pip install -r ../../scripts/requirements.txt
+   python ../../scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
+   pub=$!   # background publisher — kill it when done so :5557 is freed
+   python ../../scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
+   python ../../scripts/test_kv_events.py   # asserts token_ids never surfaces; token_count kept
+   kill "$pub"
+   ```
+
+2. **SGLang's exact wire shape** (Go, run from the repo root). SGLang's real
+   envelope is the **3-tuple** `[ts, events, attn_dp_rank]` with a 6-field
+   `BlockStored`; that shape — and that the subscriber's decoder tolerates the
+   trailing `attn_dp_rank` and tags reports `hash_scheme=sglang` — is asserted
+   by the Go fixture the shipped subscriber actually uses (from the repo root):
+   `go test ./pkg/adapters/engine/ -run SGLang`
+   (`TestDecodeSGLangEventBatch` + `TestReporterTagsSGLangScheme`). The Python
+   synthetic path above does **not** cover the 3-tuple; rely on the Go test for
+   the SGLang-specific envelope.
+
+## Wire-test caveat (open item)
+
+This manifest wires SGLang's experimental LMCache path to a **remote**
+lmcache-server via `LMCACHE_REMOTE_URL` — the topology the adapter injects.
+Whether SGLang's experimental path honours `LMCACHE_REMOTE_URL` from the env vs.
+requiring a full `LMCACHE_CONFIG_FILE` has **not** been wire-tested end-to-end
+(no GPU available at authoring time). On a real run:
+
+- If the lmcache-server logs show stores arriving, the env path works — done.
+- If not, mount an `LMCACHE_CONFIG_FILE` ConfigMap (with `remote_url:
+  lm://lmcache-server:65432`, `remote_serde: naive`, `chunk_size: 256`) into the
+  SGLang container and set `LMCACHE_CONFIG_FILE` to it; then update the adapter
+  (`enginewire.InjectSGLangLMCache`) to render the config-file path instead, and
+  drop the matching `TODO` there.
+
+## Teardown
+
+```bash
+kind delete cluster --name inference-cache-substrate
+```
