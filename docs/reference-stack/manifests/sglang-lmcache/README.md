@@ -97,7 +97,11 @@ kubectl -n cache-substrate create secret generic hf-token --from-literal=token="
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Deploy the lmcache-server + SGLang engine (the manifest wires them together).
+#    Wait for BOTH rollouts: fail-open means the engine can serve traffic even if
+#    lmcache-server is unready or its image is bad, so a green engine rollout
+#    alone would hide a broken cache server (offload silently never happens).
 kubectl apply -f deployment.yaml
+kubectl -n cache-substrate rollout status deploy/lmcache-server --timeout=5m
 kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeout=20m
 
 # 4. Drive the SAME long-prefix prompt twice (first warms, second reuses). This
@@ -112,8 +116,11 @@ kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeo
 BODY="$(python3 - <<'PY'
 import json
 prefix = "You are a helpful assistant. " * 200   # ~1k+ tokens of shared prefix
+# Tiny, greedy generation — the point is prefix reuse (block storage), not the
+# output; a short deterministic decode keeps the smoke fast and reproducible.
 print(json.dumps({"model": "meta-llama/Meta-Llama-3-8B-Instruct",
-                  "messages": [{"role": "user", "content": prefix}]}))
+                  "messages": [{"role": "user", "content": prefix}],
+                  "max_tokens": 16, "temperature": 0}))
 PY
 )"
 kubectl -n cache-substrate port-forward svc/sglang-lmcache-llama-8b 30000:30000 &
@@ -139,7 +146,7 @@ kill "$pf" 2>/dev/null; trap - EXIT
 [ "$rc" -eq 0 ] || exit 1
 ```
 
-### What success looks like (standalone)
+### What success looks like (standalone) — publisher-start smoke only
 
 - **The verifiable standalone outcome is: the engine serves both requests AND
   its KV-event publisher started.** Assert the publisher concretely from the

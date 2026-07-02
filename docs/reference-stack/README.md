@@ -32,7 +32,7 @@ starting template for your own automation (an operator, a Helm release, or plain
 | [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ; the ZMQ NodePort is used by the vLLM path — the SGLang manifest deliberately doesn't node-expose ZMQ). |
 | [`manifests/`](manifests/) | GPU reference Deployment + Service. |
 | [`manifests/cpu-local/`](manifests/cpu-local/) | CPU variant (no LMCache): prefix-cache hit + KV events. |
-| [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | **SGLang** + LMCache reference (the second engine) — GPU; the hand-built template the `(sglang, LMCache)` adapter's engine-side injection mirrors. Same KV-event structs as vLLM (the batch envelope adds a trailing `attn_dp_rank` the decoder ignores); the Python `scripts/` tooling covers the shared decode/redaction, the Go `pkg/adapters/engine` SGLang test covers SGLang's exact 3-tuple wire. |
+| [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | **SGLang** + LMCache reference (the second engine) — GPU; the hand-built template the `(sglang, LMCache)` adapter mirrors. See its [README](manifests/sglang-lmcache/README.md) for the event-wire scope, validation split, and caveats. |
 | [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream vLLM Production-Stack chart path (alternative to the raw manifests). |
 | [`scripts/`](scripts/) | ZMQ event subscriber, prefix-cache-hit test, synthetic publisher, tests. |
 | `captures/` | Where you save your event-stream sample and a cache-hit screenshot. |
