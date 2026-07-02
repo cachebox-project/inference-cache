@@ -475,7 +475,7 @@ The diff-only update semantics also apply: an existing CR with a now-invalid `re
 
 ### Engine-injection overrides (`spec.integration.engineOverrides`)
 
-`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and other adapters (the vLLM+Mooncake adapter today, a future SGLang adapter) reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
+`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and other adapters (the vLLM+Mooncake and SGLang+LMCache adapters today) reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
 
 Shape, in `corev1` vocabulary:
 
@@ -521,7 +521,7 @@ Two shapes were on the table:
 - **A — typed K8s vocabulary** (`[]string` args, `[]corev1.EnvVar` env, plus suppression). Chosen.
 - **B — backendConfig magic keys** (`cpuMode: "true"`, `gpuLimit: "0"`, `extraArgs: "..."`). Rejected.
 
-A is more general: the Mooncake adapter, a future SGLang adapter, and further engine/backend pairs plug in with no per-adapter `backendConfig` schema churn. It keeps the CRD disciplined (no permanent v1alpha1 legacy keys). B is faster to ship but bakes engine-specific knobs into the CRD, which is the trap an "engine-agnostic backend" surface is meant to avoid.
+A is more general: the Mooncake adapter, the SGLang adapter, and further engine/backend pairs plug in with no per-adapter `backendConfig` schema churn. It keeps the CRD disciplined (no permanent v1alpha1 legacy keys). B is faster to ship but bakes engine-specific knobs into the CRD, which is the trap an "engine-agnostic backend" surface is meant to avoid.
 
 #### Residual risk
 

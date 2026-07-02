@@ -78,7 +78,9 @@ Concretely:
   matching `CacheBackend`, the registry returns the right adapter, the same `cache.Spec`
   the engine config injection consumes. One mutation step does both injections.
 * The adapter seam keeps engine-specific decisions where the project already lives them.
-  A future SGLang adapter can return a different sidecar (e.g. a different ZMQ port or a
+  The SGLang adapter reuses the same shared subscriber, only its `--hash-scheme` tag
+  differs (SGLang adopted vLLM's ZMQ KV-event wire); the seam is what would let a genuinely
+  different future engine return a different sidecar (e.g. a different ZMQ port or a
   completely different observation mechanism). The shipped Mooncake adapter, by contrast,
   returns the *same* vLLM kvevent-subscriber the LMCache adapter does — Mooncake integrates
   as an LMCache remote backend, so the engine is still vLLM and its KV events still come
