@@ -37,9 +37,11 @@ installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
 the controller auto-attaches the `kvevent-subscriber` sidecar (see
 `config/samples/cachebackend-sglang.yaml` and the install docs). The raw
 `kubectl apply` below stands up only the engine + lmcache-server, so from these
-steps alone the reproducible outcome is the **event stream**, not the populated
-index; the index/`LookupRoute` criterion below assumes the controller + that
-`CacheBackend` are also present.
+steps alone the verifiable outcome is the engine serving traffic with its
+**KV-event publisher started** (asserted from the engine logs below) — not the
+consumed event stream (the standalone manifest ships no consumer) and not the
+populated index; the index/`LookupRoute` criterion below assumes the controller
++ that `CacheBackend` are also present.
 
 ## Engine-side differences from the vLLM reference
 
@@ -106,12 +108,25 @@ PY
 )"
 kubectl -n cache-substrate port-forward svc/sglang-lmcache-llama-8b 30000:30000 &
 pf=$!; trap 'kill "$pf" 2>/dev/null' EXIT   # clean up the port-forward (frees :30000)
-until curl -sf localhost:30000/health >/dev/null 2>&1; do sleep 1; done   # wait for the port-forward
+# Wait for the port-forward to serve /health, but don't spin forever if it dies
+# (e.g. the pod never became ready) — bound the wait and bail if $pf has exited.
+ready=""
+for _ in $(seq 60); do
+  kill -0 "$pf" 2>/dev/null || { echo "FAIL: port-forward exited early (is the pod running?)"; exit 1; }
+  curl -sf localhost:30000/health >/dev/null 2>&1 && { ready=1; break; }
+  sleep 2
+done
+[ -n "$ready" ] || { echo "FAIL: engine /health not ready after ~120s"; exit 1; }
+rc=0
 for i in 1 2; do
   # -sfS: fail (non-zero) on HTTP 4xx/5xx so a rejected request doesn't look served.
-  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null
+  # Capture that failure — otherwise the trailing (exit-0) kill masks a rejected
+  # request and the whole block still "passes".
+  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null \
+    || { echo "FAIL: request $i was not served (HTTP error)"; rc=1; break; }
 done
 kill "$pf" 2>/dev/null; trap - EXIT
+[ "$rc" -eq 0 ] || exit 1
 ```
 
 ### What success looks like (standalone)
@@ -203,10 +218,10 @@ Two complementary off-GPU checks, with an important scope distinction:
    ```bash
    pip install -r ../../scripts/requirements.txt
    python ../../scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
-   pub=$!   # background publisher — kill it when done so :5557 is freed
+   pub=$!; trap 'kill "$pub" 2>/dev/null' EXIT   # background publisher; freed on exit even if a step below fails
    python ../../scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
    python ../../scripts/test_kv_events.py   # asserts token_ids never surfaces; token_count kept
-   kill "$pub"
+   kill "$pub" 2>/dev/null; trap - EXIT
    ```
 
 2. **SGLang's exact wire shape** (Go, run from the repo root). SGLang's real
