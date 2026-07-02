@@ -126,21 +126,20 @@ func (adapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *c
 // appends to an SGLang engine pod so its KV-cache events flow to the policy
 // server. It delegates to the shared [runtimeadapter.RenderSubscriberSidecar],
 // pinning the SGLang-specific knobs: --hash-scheme=sglang (so the index keeps
-// SGLang prefixes disjoint from vLLM's), SGLang's ZMQ PUB port, and
-// --ignore-block-removed=true (LMCache is an L2 tier that retains blocks after
-// the engine evicts them from GPU — forwarding the eviction would drop a hint
-// the replica can still cheaply serve). The shipped subscriber binary decodes
-// SGLang's KV-event stream unchanged because SGLang emits the same msgspec
-// BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does.
+// SGLang prefixes disjoint from vLLM's) and SGLang's ZMQ PUB port. The
+// eviction-forwarding policy (--ignore-block-removed) is mode-dependent and
+// computed by the shared builder — suppressed in Offload (LMCache L2 retains
+// evicted blocks) and forwarded in EventsOnly (no L2). The shipped subscriber
+// binary decodes SGLang's KV-event stream unchanged because SGLang emits the
+// same msgspec BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does.
 func (a adapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
-		Image:              a.subscriberImage,
-		ServerAddr:         a.policyServerGRPCAddress,
-		Cache:              cache,
-		Pod:                pod,
-		HashScheme:         subscriberHashScheme,
-		EngineZMQPortStr:   defaultEngineZMQPortStr,
-		IgnoreBlockRemoved: true,
+		Image:            a.subscriberImage,
+		ServerAddr:       a.policyServerGRPCAddress,
+		Cache:            cache,
+		Pod:              pod,
+		HashScheme:       subscriberHashScheme,
+		EngineZMQPortStr: defaultEngineZMQPortStr,
 	})
 }
 

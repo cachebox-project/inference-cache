@@ -255,9 +255,9 @@ func serverCommand(cfg map[string]string) (command, args []string) {
 
 // SubscriberSidecarParams carries the per-adapter inputs to
 // [RenderSubscriberSidecar]. Image and ServerAddr come from the controller
-// flags (operator-supplied); Cache + Pod are the admission inputs; HashScheme,
-// EngineZMQPortStr, and IgnoreBlockRemoved are the engine-specific wiring each
-// adapter pins so the one subscriber binary speaks the right engine's dialect.
+// flags (operator-supplied); Cache + Pod are the admission inputs; HashScheme
+// and EngineZMQPortStr are the engine-specific wiring each adapter pins so the
+// one subscriber binary speaks the right engine's dialect.
 type SubscriberSidecarParams struct {
 	// Image is the kvevent-subscriber sidecar image. Empty disables
 	// auto-attach (the builder returns (nil, nil)) — see [DefaultSubscriberImage].
@@ -277,11 +277,6 @@ type SubscriberSidecarParams struct {
 	// (both vLLM and SGLang default to 5557; parameterised so a future engine
 	// can differ without touching this builder).
 	EngineZMQPortStr string
-	// IgnoreBlockRemoved drops BlockRemoved instead of forwarding it as
-	// PREFIX_EVICTED. True for engines paired with an L2 tier (LMCache) that
-	// retains a block after the engine evicts it from GPU — forwarding the
-	// eviction would drop a hint the replica can still cheaply serve from L2.
-	IgnoreBlockRemoved bool
 }
 
 // RenderSubscriberSidecar builds the kvevent-subscriber container the Pod
@@ -339,16 +334,19 @@ func RenderSubscriberSidecar(p SubscriberSidecarParams) (*corev1.Container, erro
 		"--model-id=" + modelID,
 		"--hash-scheme=" + p.HashScheme,
 	}
-	if p.IgnoreBlockRemoved {
-		// The engine has an L2 cache tier behind it (e.g. LMCache) that retains
-		// blocks after the engine evicts them from GPU; the engine emits
-		// BlockRemoved on every GPU eviction even when the block is still
-		// resident at L2. Forwarding that as PREFIX_EVICTED would drop a routing
-		// hint the replica can still cheaply serve from L2 — the gateway then
-		// routes elsewhere and wastes the L2 hit. Keep the entry until its
-		// freshness TTL expires; soft state means a stale hint is a cache miss
-		// at worst, while a missing one routes the request away from its warm
-		// replica.
+	// Eviction-forwarding policy is mode-dependent (engine-agnostic — the same
+	// for vLLM and SGLang). In Offload mode the paired LMCache L2 tier retains a
+	// block after the engine evicts it from GPU, so the engine's BlockRemoved
+	// does NOT mean the prefix is gone — forwarding it as PREFIX_EVICTED would
+	// drop a routing hint the replica can still cheaply serve from L2, so
+	// suppress it (--ignore-block-removed=true) and let the hint age out on its
+	// freshness TTL. In EventsOnly mode there is NO L2 retaining blocks, so a
+	// BlockRemoved genuinely means the prefix is gone and the hint MUST be pruned
+	// — do not suppress (omit the flag; the subscriber defaults it to false).
+	// Soft state means a stale hint is a cache miss at worst, while a missing one
+	// routes the request away from its warm replica — the opposite risk in each
+	// mode, hence the opposite default. (p.Cache is non-nil here — checked above.)
+	if !p.Cache.Spec.IsEventsOnly() {
 		args = append(args, "--ignore-block-removed=true")
 	}
 

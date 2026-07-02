@@ -118,11 +118,20 @@ The subscriber binary exposes `--ignore-block-removed` (default off, for
 backward compatibility with single-tier deployments). When set the reporter
 drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
 `BlockStored` still flow normally. The vLLM/LMCache adapter
-(`pkg/adapters/runtime/vllm_lmcache.go`) sets the flag unconditionally in the
-sidecar it renders — that adapter only ever stands up a vLLM + LMCache pair,
-so the L2 tier is always present and the flag is always the right choice.
+(`pkg/adapters/runtime/vllm_lmcache.go`) sets the flag **per integration mode**,
+because the L2 tier is present only in one of them:
+
+- **`Offload` (default):** the adapter wires the LMCache KV connector, so an L2
+  tier retains the block after the engine offloads it — `BlockRemoved` means
+  "moved tiers," not "gone." The adapter sets `--ignore-block-removed=true` so
+  the hint ages out on its freshness TTL instead of being dropped.
+- **`EventsOnly`:** no KV connector is injected, so there is **no** L2 tier
+  holding the block. `BlockRemoved` genuinely means the prefix is gone and the
+  hint MUST be pruned, so the adapter **omits** the flag (subscriber default off,
+  forwarding the eviction as `PREFIX_EVICTED`).
+
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
-the flag off.
+the flag off for the same reason as `EventsOnly`.
 
 ## What this unblocks
 

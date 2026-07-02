@@ -170,6 +170,15 @@ func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) 
 // config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
 // (and unset / unknown) → kv_both.
 func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	// Events-only (tier-1 routing) wires NO KV connector: the engine container
+	// is left unmodified so a hybrid-attention model's KV-cache manager is not
+	// disabled by a connector it cannot load. The engine's own (operator-
+	// configured) kv-events publisher is all the observation sidecar needs, and
+	// nothing dials a cache server, so no endpoint is required either. The
+	// subscriber is still appended by the webhook via ObservationSidecar.
+	if cache != nil && cache.Spec.IsEventsOnly() {
+		return nil
+	}
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
 }
 
@@ -191,18 +200,18 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint strin
 // ObservationSidecar returns the kvevent-subscriber container the Pod webhook
 // appends to a vLLM engine pod so its KV-cache events flow to the policy
 // server. It delegates to the shared [RenderSubscriberSidecar], pinning the
-// vLLM-specific knobs: --hash-scheme=vllm, the vLLM ZMQ PUB port, and
-// --ignore-block-removed=true (LMCache is an L2 tier that retains blocks after
-// the engine evicts them from GPU — see [SubscriberSidecarParams.IgnoreBlockRemoved]).
+// vLLM-specific knobs: --hash-scheme=vllm and the vLLM ZMQ PUB port. The
+// eviction-forwarding policy (--ignore-block-removed) is mode-dependent and
+// computed by the shared builder (suppressed in Offload where LMCache L2
+// retains evicted blocks; forwarded in EventsOnly where there is no L2).
 func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return RenderSubscriberSidecar(SubscriberSidecarParams{
-		Image:              a.subscriberImage,
-		ServerAddr:         a.policyServerGRPCAddress,
-		Cache:              cache,
-		Pod:                pod,
-		HashScheme:         subscriberHashScheme,
-		EngineZMQPortStr:   defaultEngineZMQPortStr,
-		IgnoreBlockRemoved: true,
+		Image:            a.subscriberImage,
+		ServerAddr:       a.policyServerGRPCAddress,
+		Cache:            cache,
+		Pod:              pod,
+		HashScheme:       subscriberHashScheme,
+		EngineZMQPortStr: defaultEngineZMQPortStr,
 	})
 }
 

@@ -25,7 +25,7 @@ import (
 // guess (engineSelector, backendConfig.model, and a name) must produce a
 // fully-defaulted CR with every Phase-1 default stamped — Type=LMCache,
 // DeploymentKind=Deployment, Replicas=1, Integration.Engine=vllm,
-// Integration.Role=ReadWrite, Integration.FailOpen=true,
+// Integration.Role=ReadWrite, Integration.Mode=Offload, Integration.FailOpen=true,
 // Integration.FirstEventTimeout=5m. The apiserver in the loop applies
 // `+kubebuilder:default=` markers; the webhook materialises
 // spec.integration solely to persist firstEventTimeout.
@@ -169,6 +169,9 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	}
 	if want := cachev1alpha1.CacheBackendIntegrationRoleReadWrite; got.Spec.Integration.Role != want {
 		t.Errorf("spec.integration.role = %q, want %q (kubebuilder default)", got.Spec.Integration.Role, want)
+	}
+	if want := cachev1alpha1.CacheBackendIntegrationModeOffload; got.Spec.Integration.Mode != want {
+		t.Errorf("spec.integration.mode = %q, want %q (kubebuilder default)", got.Spec.Integration.Mode, want)
 	}
 	if got.Spec.Integration.FailOpen == nil || !*got.Spec.Integration.FailOpen {
 		t.Errorf("spec.integration.failOpen = %v, want true (kubebuilder default)", got.Spec.Integration.FailOpen)
