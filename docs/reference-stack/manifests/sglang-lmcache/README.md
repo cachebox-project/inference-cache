@@ -11,6 +11,14 @@ of the manifest — image, resources, the lmcache-server, `--kv-events-config` �
 is operator-owned scaffolding the adapter assumes is already present, so the
 file as a whole is **not** byte-for-byte adapter output.
 
+> **Status — event-path reference, offload leg GPU-unvalidated.** What this stack
+> reproduces and what the shipped tests exercise is the real SGLang → ZMQ
+> **KV-event** path (publisher startup, asserted from engine logs). The **LMCache
+> offload** leg (`LMCACHE_REMOTE_URL`) is **not** wire-tested — no GPU was
+> available at authoring time. Treat the offload path as **experimental until
+> validated on a GPU** (see [Wire-test caveat](#wire-test-caveat-open-item)); the
+> event path is the validated surface.
+
 ## Why this exists (and what's already validated)
 
 SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
@@ -159,12 +167,16 @@ kill "$pf" 2>/dev/null; trap - EXIT
   SGLang's `BlockStored` wire includes the block's token ids; the
   "metadata-only, never token content" guarantee is about what the IC
   `kvevent-subscriber` *reports to the policy server* — it hashes the token_ids
-  in-pod into the content fingerprint and forwards only hashes + counts. This is
-  why the Service here deliberately exposes **only** the HTTP API and **not**
-  `:5557`: the in-pod subscriber reaches the publisher over `127.0.0.1`, so the
-  token-bearing frames never need a cluster-reachable port. If you must inspect
-  the raw stream during dev, `kubectl port-forward` `:5557` to localhost
-  yourself — don't add it to the Service.
+  in-pod into the content fingerprint and forwards only hashes + counts. Two
+  layers keep the raw frames off the cluster network, so the guarantee holds at
+  the transport level too: (1) the publisher **binds loopback**
+  (`endpoint: tcp://127.0.0.1:5557` in `deployment.yaml`), **not** `tcp://*`, so
+  the port is unreachable on the pod's routable IP — only a same-netns consumer
+  (the in-pod subscriber sidecar in the managed path) can read it; and (2) the
+  Service deliberately exposes **only** the HTTP API, never `:5557`. If you must
+  inspect the raw stream during dev, `kubectl port-forward` `:5557` (it dials
+  pod-`localhost`, so it still reaches the loopback-bound publisher) — don't
+  rebind to `tcp://*` or add `:5557` to the Service.
 - **Why the two `scripts/` helpers don't verify SGLang here:**
   `scripts/kv_events_subscriber.py` decodes only vLLM's 2-tuple synthetic frames
   (it would print `UNDECODED` on SGLang's 3-tuple), and

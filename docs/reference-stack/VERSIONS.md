@@ -51,7 +51,11 @@ base `lmsysorg/sglang` does not bundle it):
 # lmcache-kernel-check init container to catch it (see "LMCache client kernels ↔
 # engine-image CUDA / vLLM alignment" in docs/design/cachebackend-api.md).
 cat > Dockerfile.sglang-lmcache <<'EOF'
-FROM lmsysorg/sglang:<pinned-tag>
+# Digest-pin the base too — this file is the pinning authority, and a moving tag
+# would silently change the derived image's inputs on rebuild. Resolve the digest
+# with: docker pull lmsysorg/sglang:<tag> &&
+#   docker inspect --format='{{index .RepoDigests 0}}' lmsysorg/sglang:<tag>
+FROM lmsysorg/sglang@sha256:<pinned-base-digest>
 RUN pip install --no-cache-dir lmcache==<wire- and CUDA-aligned version>
 EOF
 docker build -f Dockerfile.sglang-lmcache -t myrepo/sglang-lmcache:pinned .

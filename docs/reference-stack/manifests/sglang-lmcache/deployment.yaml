@@ -68,8 +68,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 6
-          # The lmcache-server keeps KV in memory; bound it by the cgroup so T2
-          # write load can't OOM the node. Mirrors the managed adapter's
+          # The lmcache-server keeps KV in memory; bound it by the cgroup so
+          # tier-2 (offload) write load can't OOM the node. Mirrors the managed adapter's
           # spec.resources CRD default (4Gi request / 8Gi limit) — size to your
           # working set (a large model's KV is tens of GB; see the version-
           # alignment note in docs/design/cachebackend-api.md).
@@ -138,11 +138,16 @@ spec:
             # KV-cache event publisher — SGLang's ZmqEventPublisher, same event
             # structs as vLLM (3-tuple batch envelope). The consumer is the Go
             # kvevent-subscriber (managed path); the Python scripts/kv_events_subscriber.py
-            # demo decodes only vLLM's 2-tuple shape (UNDECODED on SGLang). Reads
-            # tcp://*:5557. NOTE: these raw frames carry token_ids — see the
-            # README privacy note before exposing :5557 beyond the pod.
+            # demo decodes only vLLM's 2-tuple shape (UNDECODED on SGLang).
+            # Bound to LOOPBACK (tcp://127.0.0.1:5557), NOT tcp://*: these raw
+            # frames carry token_ids, and the in-pod subscriber shares the pod
+            # netns so it reaches the publisher over 127.0.0.1 — binding loopback
+            # keeps the token-bearing port off the pod's routable IP (defense in
+            # depth alongside leaving :5557 out of the Service). For dev inspection
+            # use `kubectl port-forward` (it dials pod-localhost); do NOT rebind to
+            # tcp://* just to reach it. See the README privacy note.
             - "--kv-events-config"
-            - '{"publisher":"zmq","endpoint":"tcp://*:5557","buffer_steps":10000,"topic":"kv-events"}'
+            - '{"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","buffer_steps":10000,"topic":"kv-events"}'
           env:
             # Gates SGLang's experimental LMCache integration — required for
             # --enable-lmcache to engage the connector.
