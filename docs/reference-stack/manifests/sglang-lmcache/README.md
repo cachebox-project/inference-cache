@@ -11,14 +11,17 @@ of the manifest — image, resources, the lmcache-server, `--kv-events-config` �
 is operator-owned scaffolding the adapter assumes is already present, so the
 file as a whole is **not** byte-for-byte adapter output.
 
-> **Status — event-path reference, offload leg GPU-unvalidated.** This stack
-> stands up the real SGLang → ZMQ **KV-event** path; the standalone flow verifies
-> only that the publisher **starts** (asserted from engine logs) — it does
-> **not** consume or assert `BlockStored` frames (there is no standalone
-> consumer). SGLang's exact wire *shape* is covered separately, off-GPU, by the Go
-> test (`go test ./pkg/adapters/engine/ -run SGLang`). The **LMCache offload** leg
-> (`LMCACHE_REMOTE_URL`) is **not** wire-tested at all — no GPU was available at
-> authoring time; treat it as **experimental until validated on a GPU** (see
+> **Status — unvalidated template (no end-to-end GPU run).** No GPU was available
+> at authoring time, so nothing in the GPU flow below has been executed
+> end-to-end — treat this as a **template**, not a known-good run. Applied, it is
+> *designed to* stand up the real SGLang → ZMQ **KV-event** path, and the
+> standalone flow's intended check is only that the publisher **starts** (from
+> engine logs) — it does **not** consume or assert `BlockStored` frames (there is
+> no standalone consumer). The one thing that **is** actually executed (off-GPU)
+> is SGLang's exact wire *shape*, via the Go test
+> (`go test ./pkg/adapters/engine/ -run SGLang`). The **LMCache offload** leg
+> (`LMCACHE_REMOTE_URL`) is **not** wire-tested at all; treat it as
+> **experimental until validated on a GPU** (see
 > [Wire-test caveat](#wire-test-caveat-open-item)).
 
 ## Why this exists (and what's already validated)
