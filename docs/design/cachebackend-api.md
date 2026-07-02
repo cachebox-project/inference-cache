@@ -133,6 +133,8 @@ The auto-attach itself is opt-in: the controller's `--kvevent-subscriber-image` 
 
 SGLang is the second engine the cache plane supports (`spec.integration.engine: sglang`, `spec.type: LMCache`; adapter at `pkg/adapters/runtime/sglang`). It reuses the engine-agnostic standalone lmcache-server `ResolveCacheServer` renders for vLLM (the lmcache-server is engine-independent — both engines' lmcache clients connect at `lm://<svc>:65432`) and the same auto-attached `kvevent-subscriber` sidecar. Only the **engine-side launch wire** differs, because SGLang turns LMCache on through a different surface than vLLM:
 
+> **Two caveats up front on the SGLang support surface** (details below): (1) server-derived `LookupRoute` with raw `token_ids`/`prompt_text` only hits when the server's single global `--engine-block-size` matches SGLang's page size (see the "Block-size alignment" note later in this section); gateways that send pre-computed `prefix_hash`/`block_hashes` are unaffected. (2) The `lmcache-kernel-check` init container is vLLM-only today (the SGLang adapter does not implement `InitContainerProvider`), so `EngineKernelsHealthy` is not published for SGLang pods.
+
 The webhook injects, on the SGLang engine container (name `sglang`):
 
 - `--enable-lmcache` — SGLang's boolean flag (an argparse `store_true`, so a bare flag with no value) that activates its `LMCRadixCache` connector. This replaces vLLM's `--kv-transfer-config` JSON; the two engines are not wire-compatible on this flag.
@@ -220,6 +222,16 @@ enforcement back to report-only. Changing the annotation affects only
 strict `Ready` downgrade reflect each pod's *actual admitted mode* (read from
 the pod, not the CacheBackend's current annotation), so flipping the annotation
 on a live backend takes effect as its pods roll.
+
+**Engine scope — vLLM only today.** The kernel-check init container is provided
+by the runtime adapter via the optional `InitContainerProvider` interface, which
+only the vLLM+LMCache adapter implements. The SGLang+LMCache adapter does **not**
+implement it yet, so `inferencecache.io/lmcache-kernel-check` has no effect on
+SGLang engine pods and `EngineKernelsHealthy` is not published for them — even
+though SGLang loads the same lmcache client and would benefit from the same
+check. The annotation is still shape-validated for any CacheBackend (the value
+rule is engine-agnostic); it simply injects nothing on the SGLang path.
+Extending the check to SGLang is a follow-up.
 
 **Boundaries (what the check does and does not prove):**
 
