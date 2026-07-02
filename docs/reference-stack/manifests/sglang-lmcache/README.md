@@ -11,13 +11,15 @@ of the manifest — image, resources, the lmcache-server, `--kv-events-config` �
 is operator-owned scaffolding the adapter assumes is already present, so the
 file as a whole is **not** byte-for-byte adapter output.
 
-> **Status — event-path reference, offload leg GPU-unvalidated.** What this stack
-> reproduces and what the shipped tests exercise is the real SGLang → ZMQ
-> **KV-event** path (publisher startup, asserted from engine logs). The **LMCache
-> offload** leg (`LMCACHE_REMOTE_URL`) is **not** wire-tested — no GPU was
-> available at authoring time. Treat the offload path as **experimental until
-> validated on a GPU** (see [Wire-test caveat](#wire-test-caveat-open-item)); the
-> event path is the validated surface.
+> **Status — event-path reference, offload leg GPU-unvalidated.** This stack
+> stands up the real SGLang → ZMQ **KV-event** path; the standalone flow verifies
+> only that the publisher **starts** (asserted from engine logs) — it does
+> **not** consume or assert `BlockStored` frames (there is no standalone
+> consumer). SGLang's exact wire *shape* is covered separately, off-GPU, by the Go
+> test (`go test ./pkg/adapters/engine/ -run SGLang`). The **LMCache offload** leg
+> (`LMCACHE_REMOTE_URL`) is **not** wire-tested at all — no GPU was available at
+> authoring time; treat it as **experimental until validated on a GPU** (see
+> [Wire-test caveat](#wire-test-caveat-open-item)).
 
 ## Why this exists (and what's already validated)
 
@@ -85,7 +87,7 @@ helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
 helm install nvdp nvdp/nvidia-device-plugin -n kube-system
 
 # 2. Fix BOTH placeholder images in deployment.yaml: replace the ENTIRE SGLang
-#    engine image reference `YOUR_REGISTRY/sglang-lmcache@sha256:0000...` with
+#    engine image reference `example.invalid/sglang-lmcache@sha256:0000...` with
 #    your real derived image (repo AND digest), and swap the lmcache-server's
 #    all-zero digest for its real one — see the deployment.yaml header +
 #    VERSIONS.md. Then create the namespace + HF token secret (idempotent so the
@@ -145,8 +147,13 @@ kill "$pf" 2>/dev/null; trap - EXIT
   than silently passing):
 
   ```bash
+  # Match a publisher-STARTUP line, not a config/arg echo: SGLang echoes
+  # "--kv-events-config"/"kv-events" at boot, so grepping for "kv-events" would
+  # false-pass on the echo alone. If your SGLang build's startup log phrases the
+  # publisher differently, adjust the pattern below (confirm it against a real
+  # run's logs the first time).
   kubectl -n cache-substrate logs deploy/sglang-lmcache-llama-8b -c sglang \
-    | grep -iE 'zmq.*publish|publisher thread|kv.?events' \
+    | grep -iE 'zmq.*publish|publisher thread|start(ing|ed).*publisher' \
     || { echo "FAIL: KV-event publisher did not start (check --kv-events-config)"; exit 1; }
   ```
 
@@ -167,16 +174,19 @@ kill "$pf" 2>/dev/null; trap - EXIT
   SGLang's `BlockStored` wire includes the block's token ids; the
   "metadata-only, never token content" guarantee is about what the IC
   `kvevent-subscriber` *reports to the policy server* — it hashes the token_ids
-  in-pod into the content fingerprint and forwards only hashes + counts. Two
-  layers keep the raw frames off the cluster network, so the guarantee holds at
-  the transport level too: (1) the publisher **binds loopback**
-  (`endpoint: tcp://127.0.0.1:5557` in `deployment.yaml`), **not** `tcp://*`, so
-  the port is unreachable on the pod's routable IP — only a same-netns consumer
-  (the in-pod subscriber sidecar in the managed path) can read it; and (2) the
-  Service deliberately exposes **only** the HTTP API, never `:5557`. If you must
-  inspect the raw stream during dev, `kubectl port-forward` `:5557` (it dials
-  pod-`localhost`, so it still reaches the loopback-bound publisher) — don't
-  rebind to `tcp://*` or add `:5557` to the Service.
+  in-pod into the content fingerprint and forwards only hashes + counts (over
+  `127.0.0.1`). That report-level guarantee holds regardless of how the publisher
+  binds. The **raw ZMQ frames** are a separate matter: the manifest binds
+  `tcp://*:5557` (the operator contract in
+  [`docs/design/cachebackend-api.md`](../../../design/cachebackend-api.md), kept
+  identical to the vLLM reference), so the raw, token-bearing frames **are**
+  reachable by any in-cluster pod that knows this pod's IP. Two things bound that
+  exposure: the Service deliberately exposes **only** the HTTP API (never
+  `:5557`), and — if in-cluster raw-frame access is a concern — you can add a
+  **NetworkPolicy** restricting `:5557` to this pod (the in-pod subscriber reaches
+  the publisher over `127.0.0.1`, so it is unaffected). If you must inspect the
+  raw stream during dev, `kubectl port-forward` `:5557` yourself rather than
+  adding it to the Service.
 - **Why the two `scripts/` helpers don't verify SGLang here:**
   `scripts/kv_events_subscriber.py` decodes only vLLM's 2-tuple synthetic frames
   (it would print `UNDECODED` on SGLang's 3-tuple), and

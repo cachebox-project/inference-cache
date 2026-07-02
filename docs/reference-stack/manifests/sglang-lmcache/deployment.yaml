@@ -121,7 +121,7 @@ spec:
           # header + VERSIONS.md for the build/pin steps). The repo name is
           # deliberately not `lmsysorg/sglang` so that substituting only the
           # digest can't accidentally pull the lmcache-less upstream base.
-          image: YOUR_REGISTRY/sglang-lmcache@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          image: example.invalid/sglang-lmcache@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           command: ["python", "-m", "sglang.launch_server"]
           args:
@@ -139,15 +139,17 @@ spec:
             # structs as vLLM (3-tuple batch envelope). The consumer is the Go
             # kvevent-subscriber (managed path); the Python scripts/kv_events_subscriber.py
             # demo decodes only vLLM's 2-tuple shape (UNDECODED on SGLang).
-            # Bound to LOOPBACK (tcp://127.0.0.1:5557), NOT tcp://*: these raw
-            # frames carry token_ids, and the in-pod subscriber shares the pod
-            # netns so it reaches the publisher over 127.0.0.1 — binding loopback
-            # keeps the token-bearing port off the pod's routable IP (defense in
-            # depth alongside leaving :5557 out of the Service). For dev inspection
-            # use `kubectl port-forward` (it dials pod-localhost); do NOT rebind to
-            # tcp://* just to reach it. See the README privacy note.
+            # Binds tcp://*:5557 — the operator contract in
+            # docs/design/cachebackend-api.md (kept identical to the vLLM
+            # reference). NOTE: these raw frames carry token_ids, and tcp://* means
+            # the port is reachable by any pod that knows this pod's IP. The
+            # metadata-only guarantee is REPORT-level (the in-pod subscriber
+            # forwards only hashes + counts over 127.0.0.1); to also keep the RAW
+            # frames off the cluster network, this Service omits :5557 and you can
+            # add a NetworkPolicy restricting :5557 to this pod. See the README
+            # privacy note.
             - "--kv-events-config"
-            - '{"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","buffer_steps":10000,"topic":"kv-events"}'
+            - '{"publisher":"zmq","endpoint":"tcp://*:5557","buffer_steps":10000,"topic":"kv-events"}'
           env:
             # Gates SGLang's experimental LMCache integration — required for
             # --enable-lmcache to engage the connector.
