@@ -52,8 +52,8 @@ Concretely:
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache and vLLM/Mooncake adapters return nil unless the controller's
-  `--kvevent-subscriber-image` flag is set** (both go through the same shared
+* **The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return nil unless the
+  controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
   `RenderSubscriberSidecar`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
   exact "cache becomes a serving dependency" failure mode the fail-open posture exists
@@ -64,7 +64,7 @@ Concretely:
   (downward API likewise), `--model-id` ← `spec.backendConfig.model` (single source;
   when unset, the adapter returns no sidecar — the binary requires the flag, the next
   admission picks it up once the operator sets the key), `--hash-scheme` ← the
-  adapter's runtime convention (`"vllm"` here), `--server` ← the policy-server
+  adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),
   `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags
   (`--engine-metrics-url`, `--stats-interval`, etc.) are added by the adapter when the
