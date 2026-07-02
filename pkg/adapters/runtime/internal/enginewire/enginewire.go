@@ -241,7 +241,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	return nil
 }
 
-// UpsertFlag appends the bare boolean flag flag (e.g. "--enable-lmcache") when
+// UpsertFlag appends the bare boolean flag (e.g. "--enable-lmcache") when
 // it is absent, preserving every existing arg; a second call is a no-op. Used
 // for store_true flags that carry no value — distinct from [UpsertArgPair],
 // which manages a `--flag value` pair.

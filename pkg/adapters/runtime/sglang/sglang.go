@@ -163,8 +163,8 @@ func (adapter) ReservedArgs() []string {
 //   - LMCACHE_REMOTE_URL is the address of the rendered cache server; an
 //     override re-points the engine at a different cache than the CR resolved
 //     to.
-//   - LMCACHE_USE_EXPERIMENTAL gates SGLang's experimental LMCache path; without
-//     it "True" --enable-lmcache does not engage the connector.
+//   - LMCACHE_USE_EXPERIMENTAL (set to "True") gates SGLang's experimental
+//     LMCache path; without it, --enable-lmcache does not engage the connector.
 //   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the pod;
 //     an override would silently desync the pod from the CR contract.
 //

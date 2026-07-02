@@ -126,8 +126,10 @@ func main() {
 	// and the CacheBackend validating webhook. Building it here keeps the
 	// three call sites in agreement: whatever pair the validator admits,
 	// the reconciler will be able to render and the pod webhook will be
-	// able to inject. Adding a new adapter is a one-line registry
-	// change, not three.
+	// able to inject. Adding a new adapter is a registry change in this
+	// one place, not three separate registrations across the call sites
+	// (import-cycle-bound adapters like External and SGLang below still
+	// take their own Register call here rather than living in DefaultRegistry).
 	//
 	// The kvevent-subscriber sidecar image + policy-server gRPC
 	// address are operator-supplied: pinning the image to a digest in

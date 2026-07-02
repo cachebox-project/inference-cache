@@ -128,8 +128,8 @@ The subscriber binary exposes `--ignore-block-removed` (default off, for
 backward compatibility with single-tier deployments). When set the reporter
 drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
 `BlockStored` still flow normally. The shared `RenderSubscriberSidecar` helper
-(`pkg/adapters/runtime/kvevent_subscriber.go`) — which both the vLLM/LMCache and
-vLLM/Mooncake adapters call — sets the flag **per integration mode**, because
+(`pkg/adapters/runtime/kvevent_subscriber.go`) — which the vLLM/LMCache,
+vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per integration mode**, because
 the L2 tier is present only in one of them:
 
 - **`Offload` (default):** the adapter wires the LMCache KV connector (pointed at
