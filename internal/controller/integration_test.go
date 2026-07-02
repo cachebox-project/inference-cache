@@ -224,6 +224,53 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
+	t.Run("MooncakeMasterWorkloadShape", func(t *testing.T) {
+		// Mooncake reconcile contract against a real apiserver: type=Mooncake
+		// reconciles into a mooncake_master Deployment + Service via the
+		// Mooncake adapter, and status.endpoint resolves the master's RPC port.
+		ns := freshNS(t, k8s)
+		cb := mooncakeBackend("cache", ns)
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		dep := getDeployment(t, r, "cache", ns)
+		if len(dep.Spec.Template.Spec.Containers) != 1 {
+			t.Fatalf("containers = %d, want 1", len(dep.Spec.Template.Spec.Containers))
+		}
+		c := dep.Spec.Template.Spec.Containers[0]
+		if c.Name != "mooncake-master" {
+			t.Fatalf("container name = %q, want mooncake-master", c.Name)
+		}
+		if !strings.Contains(c.Image, "mooncake") {
+			t.Fatalf("default image = %q, want the Mooncake reference image", c.Image)
+		}
+		if !containsStr(c.Command, "mooncake_master") {
+			t.Fatalf("command = %v, want mooncake_master", c.Command)
+		}
+		if !containsStr(c.Args, "--rpc_port=50051") {
+			t.Fatalf("args = %v, want --rpc_port=50051", c.Args)
+		}
+		if len(c.Ports) == 0 || c.Ports[0].ContainerPort != 50051 || c.Ports[0].Protocol != corev1.ProtocolTCP {
+			t.Fatalf("first port = %v, want the RPC port 50051 first", c.Ports)
+		}
+		if c.ReadinessProbe == nil || c.ReadinessProbe.TCPSocket == nil {
+			t.Fatalf("readiness probe = %+v, want a TCP-socket probe on the RPC port", c.ReadinessProbe)
+		}
+
+		svc := getService(t, r, "cache", ns)
+		if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 50051 {
+			t.Fatalf("service first port = %v, want RPC port 50051 first", svc.Spec.Ports)
+		}
+
+		got := getBackend(t, r, "cache", ns)
+		wantEndpoint := "cache." + ns + ".svc.cluster.local:50051"
+		if got.Status.Endpoint != wantEndpoint {
+			t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, wantEndpoint)
+		}
+	})
+
 	t.Run("StatusEndpointAndObservedGeneration", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		if err := k8s.Create(ctx, lmcacheBackend("cache", ns)); err != nil {
@@ -631,9 +678,12 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 
 	t.Run("UnmanagedTypeNoWorkload", func(t *testing.T) {
 		ns := freshNS(t, k8s)
+		// AIBrix has no registered adapter → unmanaged path. (Mooncake now
+		// has an adapter and reconciles managed — see the Managed Mooncake
+		// integration subtest.)
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns},
-			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeMooncake},
+			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeAIBrix},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
