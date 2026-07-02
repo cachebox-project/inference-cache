@@ -284,6 +284,73 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	}
 }
 
+func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
+	// End-to-end pod-webhook path for a managed Mooncake backend: the handler
+	// lists the CacheBackend, the shipping DefaultRegistry selects the
+	// vLLM+Mooncake adapter, and the engine container comes out wired to the
+	// Mooncake master via the LMCache connector with the mooncakestore://
+	// scheme (the lm:// analog) — plus the kvevent-subscriber sidecar. This is
+	// the advertised integration path; the adapter-level tests don't exercise
+	// the webhook's registry selection + injection together.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mc",
+			Namespace: ns,
+			UID:       types.UID("cb-mc-uid"),
+		},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+			BackendConfig: map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+		},
+		// Mooncake status.endpoint is the master's RPC host:port (the
+		// reconciler publishes the Service's first port, 50051).
+		Status: cachev1alpha1.CacheBackendStatus{
+			Endpoint: "mc.engines.svc.cluster.local:50051",
+		},
+	}
+	h := newHandlerWithSubscriber(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("expected Allowed with patches; Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	// The defining difference from the LMCache path: the remote URL carries
+	// the mooncakestore:// scheme, pointed at the master RPC endpoint.
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+	// User-set engine arg survives the merge (merge, not clobber).
+	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
+	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
+		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
+	}
+
+	// The kvevent-subscriber sidecar is appended on the Mooncake path too
+	// (same shared builder; vLLM's KV-event stream is store-independent).
+	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	if sub == nil {
+		t.Fatalf("subscriber sidecar missing on Mooncake path; containers = %v", containerNames(mutated))
+	}
+	if !argPresent(sub.Args, "--hash-scheme=vllm") {
+		t.Fatalf("subscriber must tag events hash-scheme=vllm; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("subscriber --model-id derived from backendConfig.model missing; args = %v", sub.Args)
+	}
+}
+
 func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	// The vLLM/LMCache adapter returns a kvevent-subscriber sidecar
 	// the webhook MUST append after InjectEngineConfig, with identity flags

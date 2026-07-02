@@ -438,8 +438,8 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 // reconciler and pod-mutating webhook consult — so admission, reconcile,
 // and pod injection agree on which adapter the registry should pick. In
 // particular, an unset engine defaults to vLLM here just as it does at
-// reconcile, so a CR with `type: Mooncake` and no engine no longer slips
-// past admission only to fail downstream.
+// reconcile, so a CR with an unsupported type (e.g. `type: AIBrix`) and no
+// engine no longer slips past admission only to fail downstream.
 //
 // External backends flow through this check the same way managed types
 // do: they have a real runtime adapter (vllm-only today, see
@@ -883,11 +883,16 @@ func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 // and wires no KV connector, so server-shaped configuration is structurally
 // meaningless:
 //
-//   - spec.type=External is contradictory: External wires an operator-run
-//     offload server that a KV connector dials, while EventsOnly wires no
-//     connector at all. (The valid managed type is LMCache, whose adapter
-//     supplies the kvevent-subscriber the routing tier needs; other (engine,
-//     type) pairs are already rejected by the runtime-adapter check.)
+//   - spec.type must be LMCache (the default): LMCache's adapter supplies the
+//     kvevent-subscriber the routing tier needs, and its in-memory server is a
+//     no-op when no connector is wired. Every other type is contradictory —
+//     External wires an operator-run offload server the (absent) connector
+//     would dial, and a managed Mooncake backend stands up a mooncake_master
+//     store nothing would use. So LMCache is the ONLY supported events-only
+//     managed type. This must be checked explicitly now that a second managed
+//     adapter (vLLM, Mooncake) is registered: before it shipped, non-LMCache
+//     managed types were caught by the runtime-adapter check, but Mooncake now
+//     passes that check and would otherwise be admitted in events-only mode.
 //   - spec.autoscaling has no workload to scale — the controller deploys
 //     nothing for an events-only backend.
 //
@@ -898,11 +903,25 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 		return nil
 	}
 	var errs field.ErrorList
-	if cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+	switch cb.Spec.Type {
+	case "", cachev1alpha1.CacheBackendTypeLMCache:
+		// LMCache is the supported events-only managed type; an empty type
+		// defaults to LMCache via the CRD marker, so both are allowed.
+	case cachev1alpha1.CacheBackendTypeExternal:
 		errs = append(errs, field.Forbidden(
 			field.NewPath("spec", "integration", "mode"),
 			fmt.Sprintf("mode %q is incompatible with spec.type %q: events-only wires no KV connector, while External provisions an operator-run offload server the connector would dial",
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeExternal),
+		))
+	default:
+		// Any other managed type (Mooncake today, and any future adapter):
+		// events-only wires no KV connector, so a backend that provisions an
+		// offload store has nothing the mode would use. LMCache is the only
+		// supported events-only managed type.
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "integration", "mode"),
+			fmt.Sprintf("mode %q is only supported with spec.type %q; got spec.type %q. Events-only wires no KV connector, so a managed backend that provisions an offload store (e.g. a Mooncake master) has nothing the mode would use",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeLMCache, cb.Spec.Type),
 		))
 	}
 	if cb.Spec.Autoscaling != nil {

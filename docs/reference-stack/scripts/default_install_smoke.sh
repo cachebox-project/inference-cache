@@ -179,11 +179,19 @@
 #      lockstep. Admission-level only — does NOT create CRs, write status, or
 #      hit /policy+/snapshot (no NetworkPolicy/RBAC coverage; the per-CRD
 #      phases above cover those). No engine pods, no traffic.
-#  15. The operator `inferencecache doctor` CLI runs end-to-end against the live
+#  17. The operator `inferencecache doctor` CLI runs end-to-end against the live
 #      install: build the binary, apply a CacheBackend, run the config-only
 #      checks, and assert it emits the documented JSON envelope, surfaces a
 #      CacheBackend (CB0xx) finding, and exits with a code matching the reported
 #      summary.exitCode (the CI-gating contract).
+#  18. The managed Mooncake backend reconciles end-to-end: a busybox
+#      `mooncake_master` stand-in (accepts TCP on the RPC port so the rendered
+#      readiness probe passes — the real kvcacheai/mooncake image is NOT pulled)
+#      lets `CacheBackend{type: Mooncake}` reach an Available Deployment, with
+#      `status.endpoint=<svc>:50051` and the Service's first port = the RPC port.
+#      Proves the real installed controller selects the vLLM/Mooncake adapter and
+#      renders the mooncake_master workload via ResolveCacheServer; the real
+#      engine-over-mooncakestore:// path stays for the Mooncake reference stack.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
 # cache reuse (multi-GB image, ~10+ GiB RAM, schedule-only). This smoke stops
@@ -220,7 +228,7 @@
 #           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
 #           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
 #           KERNEL_CHECK_SMOKE_NS, KERNEL_CHECK_POD_TIMEOUT,
-#           KERNEL_CHECK_COND_TIMEOUT.
+#           KERNEL_CHECK_COND_TIMEOUT, MOONCAKE_SMOKE_NS, MOONCAKE_MASTER_IMAGE.
 
 set -euo pipefail
 
@@ -3166,4 +3174,95 @@ if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
 fi
 log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, and every config/samples/ manifest applies cleanly — all work"
+# --- managed Mooncake backend smoke ----------------------------------------
+# CacheBackend{type: Mooncake} is a new operator-facing surface, so it needs a
+# real-install assertion, not just unit/envtest. The kvcacheai/mooncake image
+# is intentionally NOT pulled here (heavy, and its entrypoint/ports are pending
+# reference-stack validation); instead a busybox stand-in named `mooncake_master`
+# accepts TCP on the RPC port so the controller-rendered readiness probe passes
+# and the managed Deployment reaches Available. That proves the REAL installed
+# controller reconciles type:Mooncake through ResolveCacheServer into a healthy
+# workload + the mooncakestore:// RPC endpoint in status — the operator-visible
+# contract envtest can't fully exercise (real install bundle + real controller
+# image). The real engine-over-mooncakestore:// path stays for the reference stack.
+MOONCAKE_SMOKE_NS="${MOONCAKE_SMOKE_NS:-mooncake-smoke}"
+MOONCAKE_MASTER_IMAGE="${MOONCAKE_MASTER_IMAGE:-install-smoke-mooncake-master:$TAG}"
+MOONCAKE_CB_NAME="cachebackend-mooncake"
+
+log "building lightweight mooncake_master stand-in image=$MOONCAKE_MASTER_IMAGE"
+mc_ctx="$(mktemp -d "$tmpdir/mooncake-master-context.XXXXXX")"
+cat >"$mc_ctx/mooncake_master" <<'EOF'
+#!/bin/sh
+# Stand-in: ignore all flags (--rpc_port=..., metadata/metrics ports) and just
+# accept TCP on the RPC port so the TCP-socket readiness probe passes.
+while true; do
+  nc -l -p 50051 >/dev/null 2>&1 || sleep 1
+done
+EOF
+cat >"$mc_ctx/Dockerfile" <<'EOF'
+FROM busybox:1.36
+COPY mooncake_master /usr/local/bin/mooncake_master
+RUN chmod +x /usr/local/bin/mooncake_master
+EOF
+docker build -t "$MOONCAKE_MASTER_IMAGE" "$mc_ctx" >/dev/null
+"$KIND" load docker-image "$MOONCAKE_MASTER_IMAGE" --name "$KIND_CLUSTER" >/dev/null
+
+log "creating namespace $MOONCAKE_SMOKE_NS"
+kubectl create namespace "$MOONCAKE_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+mc_cb_tmp="$(mktemp "$tmpdir/mooncake-cb.XXXXXX")"
+cp config/samples/cachebackend-mooncake.yaml "$mc_cb_tmp"
+mc_escaped_image="$(printf '%s' "$MOONCAKE_MASTER_IMAGE" | sed 's/[&|\\]/\\&/g')"
+sed -i.bak "s|serverImage: kvcacheai/mooncake:0.3.11.post1|serverImage: $mc_escaped_image|g" "$mc_cb_tmp"
+rm -f "${mc_cb_tmp}.bak"
+
+log "applying Mooncake CacheBackend"
+kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" >/dev/null
+
+# Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
+# latency is a per-managed-backend property (the reconciler publishes it from
+# the live Service), identical for the LMCache and Mooncake managed paths — no
+# Mooncake-specific tunable is warranted.
+log "waiting up to ${SAMPLE_ENDPOINT_TIMEOUT}s for Mooncake status.endpoint"
+mc_deadline=$(($(date +%s) + SAMPLE_ENDPOINT_TIMEOUT))
+mc_endpoint=""
+while [ "$(date +%s)" -lt "$mc_deadline" ]; do
+  mc_endpoint=$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)
+  if [ -n "$mc_endpoint" ]; then break; fi
+  sleep 2
+done
+mc_want_endpoint="$MOONCAKE_CB_NAME.$MOONCAKE_SMOKE_NS.svc.cluster.local:50051"
+if [ "$mc_endpoint" != "$mc_want_endpoint" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake status.endpoint=$mc_endpoint, want $mc_want_endpoint (master RPC host:port via ResolveCacheServer)"
+fi
+log "Mooncake status.endpoint=$mc_endpoint"
+
+# The rendered Service must expose the RPC port (50051) FIRST — serviceEndpoint
+# publishes Ports[0], and the engine wire dials it via mooncakestore://.
+mc_svc_port="$(kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+if [ "$mc_svc_port" != "50051" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake Service first port=$mc_svc_port, want 50051"
+fi
+
+# The managed Deployment must reach Available: the stand-in master accepts TCP
+# on 50051 so the controller-rendered readiness probe passes — proving
+# ResolveCacheServer rendered a workload that actually comes up under a real
+# install. (CacheBackend Ready is deliberately NOT asserted: no engine is wired
+# here, so the KV-event readiness gate legitimately holds it at
+# AwaitingFirstKVEvent — orthogonal to the managed-reconcile contract.)
+log "waiting up to ${READY_TIMEOUT} for the Mooncake master Deployment to be Available"
+if ! kubectl -n "$MOONCAKE_SMOKE_NS" wait --for=condition=Available --timeout="$READY_TIMEOUT" \
+  deployment/"$MOONCAKE_CB_NAME" >/dev/null 2>&1; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" -o yaml || true
+  kubectl -n "$MOONCAKE_SMOKE_NS" get pods -o wide || true
+  fail "Mooncake master Deployment did not reach Available within ${READY_TIMEOUT}"
+fi
+log "Mooncake master Deployment Available; managed type:Mooncake reconcile verified end-to-end"
+
+kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend end-to-end (stand-in master reaches Available + mooncakestore:// RPC endpoint in status), and every config/samples/ manifest applies cleanly — all work"

@@ -43,14 +43,18 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  vLLM/LMCache returns the `kvevent-subscriber` container spec; the reference adapter and
-  any adapter for `type: External` return `(nil, nil)`.
+  The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
+  container spec (via the shared `RenderSubscriberSidecar` — the KV-event stream is the
+  engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
+  `--hash-scheme` tag + ZMQ port); the reference adapter and any adapter for
+  `type: External` return `(nil, nil)`.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache adapter returns nil unless the controller's
-  `--kvevent-subscriber-image` flag is set.** An unconfigured image would put the sidecar
+* **The vLLM/LMCache and vLLM/Mooncake adapters return nil unless the controller's
+  `--kvevent-subscriber-image` flag is set** (both go through the same shared
+  `RenderSubscriberSidecar`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
   exact "cache becomes a serving dependency" failure mode the fail-open posture exists
   to prevent. Defaulting auto-attach off lets the controller install cleanly into any
@@ -75,9 +79,13 @@ Concretely:
   the engine config injection consumes. One mutation step does both injections.
 * The adapter seam keeps engine-specific decisions where the project already lives them.
   A future SGLang adapter can return a different sidecar (e.g. a different ZMQ port or a
-  completely different observation mechanism); a Mooncake adapter can return `nil` if its
-  backend exposes the same data a different way. **DaemonSet remains an option for any
-  future adapter** that wants it — it just isn't this PR.
+  completely different observation mechanism). The shipped Mooncake adapter, by contrast,
+  returns the *same* vLLM kvevent-subscriber the LMCache adapter does — Mooncake integrates
+  as an LMCache remote backend, so the engine is still vLLM and its KV events still come
+  from vLLM's ZMQ publisher (scheme-tagged `vllm`); only the backend store differs. A
+  future backend that fronts a non-vLLM engine, or exposes observation data some other way,
+  could still return `nil` or a different container here. **DaemonSet remains an option for
+  any future adapter** that wants it — it just isn't this PR.
 * `External` backends explicitly return `nil` — we don't manage that backend's lifecycle,
   per the ticket test plan.
 * Subscriber lifecycle tied to the engine pod is correctness, not a regression: when the
@@ -117,18 +125,23 @@ entry until its freshness TTL expires; a stale entry yields a cache miss
 The subscriber binary exposes `--ignore-block-removed` (default off, for
 backward compatibility with single-tier deployments). When set the reporter
 drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
-`BlockStored` still flow normally. The vLLM/LMCache adapter
-(`pkg/adapters/runtime/vllm_lmcache.go`) sets the flag **per integration mode**,
-because the L2 tier is present only in one of them:
+`BlockStored` still flow normally. The shared `RenderSubscriberSidecar` helper
+(`pkg/adapters/runtime/kvevent_subscriber.go`) — which both the vLLM/LMCache and
+vLLM/Mooncake adapters call — sets the flag **per integration mode**, because
+the L2 tier is present only in one of them:
 
-- **`Offload` (default):** the adapter wires the LMCache KV connector, so an L2
+- **`Offload` (default):** the adapter wires the LMCache KV connector (pointed at
+  an `lm://` LMCache server or a `mooncakestore://` Mooncake store), so an L2
   tier retains the block after the engine offloads it — `BlockRemoved` means
-  "moved tiers," not "gone." The adapter sets `--ignore-block-removed=true` so
+  "moved tiers," not "gone." The helper sets `--ignore-block-removed=true` so
   the hint ages out on its freshness TTL instead of being dropped.
 - **`EventsOnly`:** no KV connector is injected, so there is **no** L2 tier
   holding the block. `BlockRemoved` genuinely means the prefix is gone and the
-  hint MUST be pruned, so the adapter **omits** the flag (subscriber default off,
-  forwarding the eviction as `PREFIX_EVICTED`).
+  hint MUST be pruned, so the helper **omits** the flag (subscriber default off,
+  forwarding the eviction as `PREFIX_EVICTED`). EventsOnly is restricted to
+  `spec.type=LMCache` at admission (a managed Mooncake backend always provisions
+  its store, so `Mooncake` + `EventsOnly` is rejected), so a Mooncake backend
+  always takes the Offload branch and sets the flag.
 
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off for the same reason as `EventsOnly`.

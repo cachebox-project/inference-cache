@@ -1,16 +1,19 @@
 // Package enginewire holds the engine-side wire format shared by every
 // runtime adapter that fronts an LMCache-compatible cache (the in-tree
-// vLLM+LMCache adapter and the External passthrough adapter today; future
-// adapters that also speak the LMCache connector protocol can import it
-// the same way).
+// vLLM+LMCache adapter, the vLLM+Mooncake adapter, and the External
+// passthrough adapter today; future adapters that also speak the LMCache
+// connector protocol can import it the same way).
 //
 // Centralising the wire keeps the adapters from drifting: an external cache
 // the operator manages themselves still presents the same lm:// endpoint
 // and the engine still parses the same --kv-transfer-config / LMCACHE_*
 // env, so the injection logic is identical and only the endpoint source
-// differs. The package lives under internal/ so it stays import-scoped to
-// adapter authors and is never confused with a public API the engine team
-// can rely on.
+// differs. The Mooncake adapter reuses the same connector wire — vLLM runs
+// the LMCache connector pointed at a mooncakestore:// remote store instead
+// of an lm:// one — so it differs from the LMCache path in nothing but the
+// remote-URL scheme (see [InjectVLLMMooncake]). The package lives under
+// internal/ so it stays import-scoped to adapter authors and is never
+// confused with a public API the engine team can rely on.
 package enginewire
 
 import (
@@ -91,12 +94,51 @@ const (
 // the source of endpoint (controller-resolved Service DNS vs operator-
 // supplied address in spec.endpoint).
 func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	return injectLMCacheConnector(pod, endpoint, LMCacheRemoteURL(endpoint), cache)
+}
+
+// InjectVLLMMooncake wires a vLLM engine to a Mooncake store. Mooncake
+// integrates with vLLM as an LMCache *remote backend*: the engine runs the
+// exact same LMCache connector (kv_connector=LMCacheConnectorV1) and reads the
+// same LMCACHE_* env, the only difference being the remote-store URL scheme —
+// mooncakestore://host:port instead of lm://host:port. LMCache parses that
+// scheme (its MooncakestoreConnectorAdapter registers "mooncakestore://") and
+// connects the engine to the Mooncake master at host:port, so the injected
+// wire is byte-identical to [InjectVLLMLMCache] save for the scheme. endpoint
+// accepts a bare host:port (canonical — the Mooncake master Service DNS the
+// reconciler published into status.endpoint) or an already-prefixed
+// mooncakestore://host:port; both render to LMCACHE_REMOTE_URL=
+// mooncakestore://host:port.
+//
+// Static Mooncake transfer-engine tuning (metadata_server, protocol,
+// device_name, segment sizes) lives in LMCache's extra_config, which is
+// supplied via an engine-side config file (LMCACHE_CONFIG_FILE /
+// MOONCAKE_CONFIG_PATH) the operator owns — it is not env-injectable, so this
+// helper wires only the controller-resolved master address + the connector,
+// and the transfer-engine defaults (P2P-handshake metadata) cover the simplest
+// deployment. See docs/design/cachebackend-api.md for the operator-side config.
+func InjectVLLMMooncake(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	return injectLMCacheConnector(pod, endpoint, MooncakeStoreRemoteURL(endpoint), cache)
+}
+
+// injectLMCacheConnector is the shared body behind [InjectVLLMLMCache] and
+// [InjectVLLMMooncake]: it merges the LMCache connector arg and LMCACHE_* env
+// onto the vLLM container in pod, with remoteURL as the already-scheme-prefixed
+// LMCACHE_REMOTE_URL value (lm:// for LMCache, mooncakestore:// for Mooncake).
+// endpoint is the pre-scheme address, passed only so the input validation
+// reports the same "endpoint is empty" error regardless of scheme. It merges:
+// existing args/env on the vLLM container are preserved, repeat injections are
+// idempotent, sidecars are left alone. The engine container is identified by
+// [EngineContainerName]; a single-container pod is also accepted (the lone
+// container is treated as the engine); a multi-container pod with no `vllm`
+// container is rejected.
+func injectLMCacheConnector(pod *corev1.PodSpec, endpoint, remoteURL string, cache *cachev1alpha1.CacheBackend) error {
 	if err := ValidateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
 		return err
 	}
 	cfg := cache.Spec.BackendConfig
 	env := []corev1.EnvVar{
-		{Name: EnvLMCacheRemoteURL, Value: LMCacheRemoteURL(endpoint)},
+		{Name: EnvLMCacheRemoteURL, Value: remoteURL},
 		{Name: EnvLMCacheRemoteSerde, Value: ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)},
 		{Name: EnvLMCacheChunkSize, Value: ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)},
 		{Name: EnvLMCacheLocalCPU, Value: ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)},
@@ -271,7 +313,31 @@ func EngineContainerIndexNamed(pod *corev1.PodSpec, name string) (int, error) {
 // only; the host portion is preserved verbatim (DNS is case-insensitive
 // but rewriting operator-typed casing is not the helper's job).
 func LMCacheRemoteURL(endpoint string) string {
-	const scheme = "lm://"
+	return prefixScheme(endpoint, "lm://")
+}
+
+// MooncakeStoreRemoteURL prefixes an engine-agnostic host:port endpoint with
+// the LMCache mooncakestore:// remote-store scheme — the Mooncake analog of
+// lm://. host:port is the Mooncake master's address (the controller-resolved
+// Service DNS the reconciler publishes into status.endpoint); LMCache's
+// MooncakestoreConnectorAdapter parses this scheme and connects the engine's
+// LMCache connector to the master there. Like [LMCacheRemoteURL] it is
+// idempotent — an endpoint already carrying the scheme is normalised to a
+// single lower-case `mooncakestore://` prefix rather than doubled — so a
+// re-injection produces the same value and the merge stays a no-op. The host
+// portion is preserved verbatim (DNS is case-insensitive; rewriting
+// operator-typed casing is not this helper's job).
+func MooncakeStoreRemoteURL(endpoint string) string {
+	return prefixScheme(endpoint, "mooncakestore://")
+}
+
+// prefixScheme returns endpoint with scheme guaranteed as a single, lower-case
+// prefix: an endpoint that already starts with the scheme (case-insensitively)
+// is normalised to the lower-case form rather than double-prefixed; otherwise
+// scheme is prepended. Shared by [LMCacheRemoteURL] and
+// [MooncakeStoreRemoteURL] so both LMCache-compatible schemes apply the exact
+// same idempotent rule.
+func prefixScheme(endpoint, scheme string) string {
 	if len(endpoint) >= len(scheme) && strings.EqualFold(endpoint[:len(scheme)], scheme) {
 		return scheme + endpoint[len(scheme):]
 	}

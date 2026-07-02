@@ -577,7 +577,7 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 //     CREATE-only so that bad wiring is permanent. Preferring
 //     trimmed spec.endpoint over status here avoids that race and is
 //     consistent with admission's view of the truth.
-//   - Managed types (LMCache today): status.endpoint is the only
+//   - Managed types (LMCache, Mooncake): status.endpoint is the only
 //     source — the reconciler builds it from the live Service it
 //     provisions, and spec.endpoint is admission-rejected for these
 //     types (see rejectEndpointOnNonExternal), so there's nothing

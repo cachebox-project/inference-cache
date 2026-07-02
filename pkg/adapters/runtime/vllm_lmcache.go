@@ -56,9 +56,12 @@ const (
 // returns the kvevent-subscriber container the webhook appends so the engine
 // pod auto-attaches to the policy server with no out-of-band steps.
 //
-// The SGLang+LMCache adapter (pkg/adapters/runtime/sglang) is the sibling for
-// the SGLang engine; it shares the lmcache-server + subscriber rendering here
-// (see lmcache_shared.go) and differs only in the engine-side wire.
+// This adapter wires vLLM+LMCache. It has two siblings that reuse the shared
+// helpers here: the vLLM+Mooncake adapter (vllm_mooncake.go) reuses the same
+// LMCache connector wire via a mooncakestore:// remote, and the SGLang+LMCache
+// adapter (pkg/adapters/runtime/sglang) reuses the lmcache-server rendering
+// (ResolveLMCacheServer) + the subscriber sidecar (RenderSubscriberSidecar) and
+// differs only in the engine-side wire.
 type vllmLMCacheAdapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
@@ -202,8 +205,10 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint strin
 // server. It delegates to the shared [RenderSubscriberSidecar], pinning the
 // vLLM-specific knobs: --hash-scheme=vllm and the vLLM ZMQ PUB port. The
 // eviction-forwarding policy (--ignore-block-removed) is mode-dependent and
-// computed by the shared builder (suppressed in Offload where LMCache L2
-// retains evicted blocks; forwarded in EventsOnly where there is no L2).
+// computed by the shared builder (suppressed in Offload where the L2 tier
+// retains evicted blocks; forwarded in EventsOnly where there is no L2). The
+// subscriber shape is identical for every vLLM-engine L2 backend (LMCache,
+// Mooncake) because the KV-event stream comes from vLLM itself, not the L2 store.
 func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return RenderSubscriberSidecar(SubscriberSidecarParams{
 		Image:            a.subscriberImage,
@@ -218,7 +223,8 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 // Package-local aliases to the engine-wire helpers. Kept so the in-place
 // unit tests in vllm_lmcache_test.go continue to assert on the wire format
 // through the canonical adapter API surface. New tests for the shared wire
-// (LMCache + External) belong in pkg/adapters/runtime/internal/enginewire.
+// (LMCache, Mooncake, and External all speak the LMCache connector) belong in
+// pkg/adapters/runtime/internal/enginewire.
 const defaultEngineKVTransferConfigArg = "--kv-transfer-config"
 
 var (
