@@ -302,8 +302,10 @@ type CacheBackendAutoscalingSpec struct {
 // which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
 	// Engine identifies the inference engine integration, such as vllm or
-	// sglang. Defaults to vllm — the only runtime ID with a shipping adapter
-	// today (sglang is wired but no adapter ships in v1alpha1). The CRD-level
+	// sglang. Defaults to vllm. Both vllm and sglang have shipping adapters
+	// (vllm+LMCache and sglang+LMCache); the supported (engine, type) pairs
+	// are whatever the installed runtime adapters accept, and admission lists
+	// them in its rejection message for an unsupported pair. The CRD-level
 	// default only applies when spec.integration is materialised on the
 	// submitted object; when integration is omitted entirely the
 	// [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback
@@ -333,6 +335,13 @@ type CacheBackendIntegrationSpec struct {
 	// matching the [enginewire.IntegrationRole] read-time fallback for an
 	// omitted integration block. ReadOnly / WriteOnly are specialised
 	// producer/consumer roles operators opt into explicitly.
+	//
+	// Engine support is per-adapter: vLLM maps the role onto its LMCache
+	// connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,
+	// ReadWrite→kv_both). The SGLang LMCache integration has no kv_role split
+	// (--enable-lmcache always both stores and retrieves), so a (sglang,
+	// LMCache) backend supports only ReadWrite — admission rejects ReadOnly /
+	// WriteOnly there rather than silently ignoring them.
 	// +optional
 	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
@@ -388,9 +397,11 @@ type CacheBackendIntegrationSpec struct {
 	// dependency, which is loud and visible via a Warning Event on the
 	// owning CacheBackend.
 	//
-	// The flag is plumbed by the engine adapter; per-request fail-open
-	// behavior at the engine level is owned by vLLM+LMCache (the connector
-	// honors this flag).
+	// The flag is plumbed by the engine adapter as INFERENCECACHE_FAIL_OPEN
+	// (both shipping LMCache adapters — vLLM+LMCache and SGLang+LMCache —
+	// inject it). Per-request fail-open enforcement at the engine level is the
+	// engine/connector's responsibility; the cache plane surfaces the bit so
+	// the engine can honor it.
 	// +optional
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`

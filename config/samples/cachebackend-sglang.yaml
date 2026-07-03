@@ -1,0 +1,63 @@
+# A managed LMCache backend fronting SGLang engine pods — the (sglang, LMCache)
+# pair, the second engine the cache plane supports alongside vLLM. The
+# controller reconciles this into the same standalone lmcache-server Deployment
+# + ClusterIP Service the vLLM+LMCache backend uses (the lmcache-server is
+# engine-agnostic; engines reach it at lm://<svc>:65432).
+#
+# spec.engineSelector identifies the user-owned SGLang pods the mutating Pod
+# webhook auto-wires. SGLang turns LMCache on through a different launch surface
+# than vLLM, so matched pods are injected with:
+#   - the bare `--enable-lmcache` arg (SGLang's store_true flag), and
+#   - LMCACHE_USE_EXPERIMENTAL=True + LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/
+#     LOCAL_CPU/MAX_LOCAL_CPU_SIZE env.
+# Notably absent (and deliberately so): VLLM_USE_V1 and PYTHONHASHSEED are
+# vLLM-only — SGLang has no v1 codepath, and its prefix caching does not depend
+# on PYTHONHASHSEED the way vLLM's TP block-hash chain does. The vLLM
+# `--kv-transfer-config` arg is likewise not used. Unrelated user-set env/args
+# on the pod template survive injection — the adapter merges, upserting the
+# values it owns (the LMCACHE_* / connector wiring) and leaving everything else
+# untouched; a colliding user value for an adapter-owned key is replaced (and a
+# reserved one is hard-rejected at admission, not silently overridden). A pod
+# can opt out entirely per-instance with the annotation
+# `inferencecache.io/skip-inject`.
+#
+# The auto-attached kvevent-subscriber sidecar tags every report
+# `--hash-scheme=sglang`, keeping SGLang prefixes in a disjoint index domain
+# from vLLM's (no cross-engine false hits on identical prefix bytes). SGLang
+# emits the same ZMQ BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does,
+# so the shipped subscriber decodes it unchanged — but the engine must be
+# launched with `--kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557",
+# "topic":"kv-events"}'` for the publisher to be active (the adapter wires the
+# cache offload, not the event publisher — same division as the vLLM path).
+#
+# Override the lmcache-server image (defaults to a pinned lmcache/standalone
+# version; keep it wire-compatible with the engine's lmcache client) or the
+# server command via backendConfig until first-class spec fields land.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  labels:
+    app.kubernetes.io/name: inference-cache
+  name: cachebackend-sglang
+spec:
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    # The runtime id, not the adapter name. Case-insensitive; "SGLang" / "sglang"
+    # both route to the SGLang+LMCache adapter via ResolveRuntimeID.
+    engine: sglang
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: sglang
+  backendConfig:
+    # Served model identifier the matched SGLang pods are loaded with. Plumbed
+    # to the auto-attached kvevent-subscriber sidecar's --model-id so the index
+    # keys per-replica entries by model. Omit (or set empty) to skip the
+    # subscriber sidecar (engine wiring still happens).
+    model: meta-llama/Meta-Llama-3-8B-Instruct
+    # Matches the pinned adapter default; pin to an `@sha256:` digest for
+    # non-local runs, and keep the lmcache version wire-compatible with the
+    # engine's lmcache client (see docs/design/cachebackend-api.md).
+    serverImage: lmcache/standalone:v0.4.7

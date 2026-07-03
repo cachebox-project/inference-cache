@@ -151,6 +151,41 @@ func TestHashSchemeIsolatesMatches(t *testing.T) {
 	}
 }
 
+// TestNoCrossEngineFalseHitVLLMvsSGLang is the second-engine no-cross-engine-
+// false-hit guarantee: with a
+// vLLM replica and a SGLang replica BOTH holding a bytewise-identical prefix
+// (same tenant, model, and prefix_hash bytes — exactly the collision the
+// hash_scheme tag exists to keep disjoint), a lookup under one scheme must
+// return ONLY that engine's replica and never the other's. This is the
+// stronger form of TestHashSchemeIsolatesMatches (which only checks the
+// empty-other-scheme miss): here both schemes are populated, so it proves the
+// tag — not the absence of the other entry — is what isolates them.
+func TestNoCrossEngineFalseHitVLLMvsSGLang(t *testing.T) {
+	idx := New()
+	const (
+		tenant = "t"
+		model  = "shared-model"
+	)
+	// Identical prefix bytes recorded by each engine under its own scheme.
+	prefix := hash("the quick brown fox")
+	idx.Ingest(Update{ReplicaID: "vllm-replica-0", Model: model, Tenant: tenant, HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: prefix, TokenCount: 32}}})
+	idx.Ingest(Update{ReplicaID: "sglang-replica-0", Model: model, Tenant: tenant, HashScheme: "sglang",
+		Prefixes: []PrefixRef{{PrefixHash: prefix, TokenCount: 32}}})
+
+	// A request hashed under the SGLang scheme matches ONLY the SGLang replica.
+	sglangScores := idx.Lookup(LookupRequest{Model: model, Tenant: tenant, HashScheme: "sglang", PrefixHash: prefix})
+	if len(sglangScores) != 1 || sglangScores[0].ReplicaID != "sglang-replica-0" {
+		t.Fatalf("sglang lookup = %+v, want exactly [sglang-replica-0] (no cross-engine false hit on the vLLM entry)", sglangScores)
+	}
+
+	// And the symmetric direction: a vLLM-scheme request matches ONLY the vLLM replica.
+	vllmScores := idx.Lookup(LookupRequest{Model: model, Tenant: tenant, HashScheme: "vllm", PrefixHash: prefix})
+	if len(vllmScores) != 1 || vllmScores[0].ReplicaID != "vllm-replica-0" {
+		t.Fatalf("vllm lookup = %+v, want exactly [vllm-replica-0] (no cross-engine false hit on the SGLang entry)", vllmScores)
+	}
+}
+
 func TestEmptyHashSchemeFailsOpen(t *testing.T) {
 	idx := New()
 

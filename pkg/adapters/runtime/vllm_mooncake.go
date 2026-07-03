@@ -308,11 +308,19 @@ func (vllmMooncakeAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint stri
 // appends to a vLLM engine pod. The subscriber observes vLLM's own ZMQ
 // KV-event stream, which is independent of the L2 store, so the container is
 // byte-identical to the vLLM+LMCache adapter's — both delegate to the shared
-// [buildKVEventSubscriber]. See that helper for the full contract (opt-in image
+// [RenderSubscriberSidecar] with the vLLM engine dialect (--hash-scheme=vllm,
+// the vLLM ZMQ PUB port). See that helper for the full contract (opt-in image
 // gate, required model id, downward-API identity, --ignore-block-removed
 // rationale for L2 tiers).
 func (a vllmMooncakeAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
-	return buildKVEventSubscriber(a.subscriberImage, a.policyServerGRPCAddress, cache, pod)
+	return RenderSubscriberSidecar(SubscriberSidecarParams{
+		Image:            a.subscriberImage,
+		ServerAddr:       a.policyServerGRPCAddress,
+		Cache:            cache,
+		Pod:              pod,
+		HashScheme:       subscriberHashScheme,
+		EngineZMQPortStr: defaultEngineZMQPortStr,
+	})
 }
 
 // mooncakeMasterCommand returns the Mooncake master command + args, with a

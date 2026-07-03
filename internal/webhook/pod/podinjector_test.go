@@ -28,6 +28,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // newScheme returns a scheme with corev1 + the CRD types registered so a
@@ -122,6 +123,29 @@ func vllmEnginePod(name string, labels map[string]string) *corev1.Pod {
 	}
 }
 
+// sglangEnginePod builds a pod whose engine container is named "sglang" — the
+// SGLang adapter's EngineContainerName — so the webhook routes it through the
+// SGLang+LMCache injection path. (Literal "sglang" rather than a re-export: the
+// enginewire constant lives in an internal package this test can't import.)
+func sglangEnginePod(name string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "sglang",
+				Image: "lmsysorg/sglang:latest",
+				Env: []corev1.EnvVar{
+					{Name: "USER_FLAG", Value: "preserved"},
+				},
+				Args: []string{"--model-path", "Qwen/Qwen2.5-0.5B-Instruct"},
+			}},
+		},
+	}
+}
+
 // readyCacheBackend returns a CacheBackend with status.endpoint published,
 // a vLLM integration, and an EngineSelector keyed on a single label.
 // The metadata.uid is set to a stable fake so the webhook's
@@ -210,6 +234,54 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	}
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+}
+
+func TestHandle_MatchAndInject_SGLang(t *testing.T) {
+	// Covers the production pod-webhook selection path for (sglang, LMCache):
+	// the nil-registry fallback now includes the SGLang adapter, so a SGLang
+	// engine pod matching a (sglang, LMCache) CacheBackend is injected with
+	// SGLang's LMCache wire (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL +
+	// LMCACHE_REMOTE_URL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
+	// PYTHONHASHSEED. Without the SGLang registration in the fallback, the
+	// webhook would fail-open and the pod would boot unwired.
+	const ns = "engines"
+	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
+	h := newHandler(t, cb)                // nil registry → DefaultRegistry + External + SGLang fallback
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatalf("expected JSON patches (SGLang engine config injection), got none")
+	}
+
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
+	mustHaveArgFlag(t, mutated, "--enable-lmcache")
+	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, "LMCACHE_USE_EXPERIMENTAL", "True")
+
+	// Proof it went through the SGLang path, not vLLM's: the vLLM-only connector
+	// arg and env must be absent.
+	for _, c := range mutated.Spec.Containers {
+		if c.Name != "sglang" {
+			continue
+		}
+		for _, a := range c.Args {
+			if a == "--kv-transfer-config" {
+				t.Fatalf("SGLang pod got vLLM's --kv-transfer-config: %v", c.Args)
+			}
+		}
+		for _, e := range c.Env {
+			if e.Name == adapterruntime.EnvVLLMUseV1 || e.Name == adapterruntime.EnvPythonHashSeed {
+				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
+			}
+		}
+	}
 }
 
 func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
@@ -317,6 +389,53 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	// The engine container is still wired with LMCache env — appending the
 	// sidecar must not regress the engine-side injection.
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+}
+
+func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
+	// SGLang counterpart of TestHandle_AppendsObservationSidecar: a matched
+	// SGLang engine pod must get the kvevent-subscriber sidecar tagged
+	// --hash-scheme=sglang (the load-bearing scheme tag) + --ignore-block-removed
+	// (LMCache is an L2 tier). Builds the registry the way cmd/controller does —
+	// DefaultRegistry + External + SGLang, all carrying the subscriber image —
+	// because the no-arg nil-fallback renders no sidecar (auto-attach opt-in).
+	const ns = "engines"
+	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Integration.Engine = "sglang"
+	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	reg := adapterruntime.DefaultRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
+	reg.Register(externaladapter.NewAdapter())
+	reg.Register(sglangadapter.NewAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
+	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
+
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("expected Allowed with patches; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if len(mutated.Spec.Containers) != 2 {
+		t.Fatalf("expected 2 containers (sglang engine + subscriber), got %d: %v", len(mutated.Spec.Containers), containerNames(mutated))
+	}
+	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	if sub == nil {
+		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
+	}
+	if !argPresent(sub.Args, "--hash-scheme=sglang") {
+		t.Fatalf("SGLang subscriber MUST tag --hash-scheme=sglang; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
+		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--ignore-block-removed=true") {
+		t.Fatalf("SGLang+LMCache subscriber MUST set --ignore-block-removed=true (L2 tier); args = %v", sub.Args)
+	}
+	// Appending the sidecar must not regress the SGLang engine-side injection.
+	mustHaveArgFlag(t, mutated, "--enable-lmcache")
 }
 
 func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {

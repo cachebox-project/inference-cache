@@ -23,6 +23,7 @@ import (
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -85,7 +86,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.serverProbeURL, "server-probe-url", opts.serverProbeURL, "URL of the cache server's /probe endpoint, the controller POSTs per CacheBackend to drive the functional self-test. Empty disables the gate (FunctionalProbeOK condition is not written and the Ready gate is unchanged).")
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
-	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to vLLM engine pods. Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
+	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to managed-LMCache engine pods (vLLM and SGLang). Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
 	flag.StringVar(&opts.policyServerGRPCAddress, "policy-server-grpc-address", opts.policyServerGRPCAddress, "host:port the kvevent-subscriber sidecar dials to ReportCacheState. Defaults to the in-cluster Service DNS in the inference-cache-system namespace.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -125,8 +126,10 @@ func main() {
 	// and the CacheBackend validating webhook. Building it here keeps the
 	// three call sites in agreement: whatever pair the validator admits,
 	// the reconciler will be able to render and the pod webhook will be
-	// able to inject. Adding a new adapter is a one-line registry
-	// change, not three.
+	// able to inject. Adding a new adapter is a registry change in this
+	// one place, not three separate registrations across the call sites
+	// (import-cycle-bound adapters like External and SGLang below still
+	// take their own Register call here rather than living in DefaultRegistry).
 	//
 	// The kvevent-subscriber sidecar image + policy-server gRPC
 	// address are operator-supplied: pinning the image to a digest in
@@ -143,6 +146,16 @@ func main() {
 	// lives under pkg/adapters/runtime/external — runtime importing it
 	// would cycle. See pkg/adapters/runtime/external/doc.go.
 	adapterRegistry.Register(externaladapter.NewAdapter())
+	// SGLang+LMCache: the second-engine sibling of the vLLM+LMCache adapter.
+	// Registered here (not inside DefaultRegistry) for the same import-cycle
+	// reason as External. It needs the same subscriber-image + policy-server
+	// options the vLLM adapter got so its auto-attached kvevent-subscriber
+	// sidecar (tagged --hash-scheme=sglang) reaches the policy server with the
+	// operator's deployment wiring. See pkg/adapters/runtime/sglang/doc.go.
+	adapterRegistry.Register(sglangadapter.NewAdapter(
+		adapterruntime.WithSubscriberImage(opts.subscriberImage),
+		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
+	))
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
 	// An empty ProbeURL disables the gate — useful for local-dev runs that

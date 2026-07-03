@@ -23,6 +23,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
+	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
@@ -102,24 +103,25 @@ type CacheBackendValidator struct {
 	// Registry resolves the runtime adapter for a (runtime, backend) pair
 	// at admission time. A nil Registry falls back to
 	// [defaultShippingRegistry], which mirrors the production cmd/controller
-	// wiring: [adapterruntime.DefaultRegistry] plus the External adapter
-	// (registered explicitly because the External package lives in a
-	// subpackage that DefaultRegistry can't import without a cycle). The
+	// wiring: [adapterruntime.DefaultRegistry] plus the External and
+	// SGLang+LMCache adapters (registered explicitly because those
+	// subpackages can't be imported by DefaultRegistry without a cycle). The
 	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
 	// (engine, backend) pair the running controller supports, including
-	// External — so admission doesn't silently reject an otherwise-valid
-	// External CR just because the caller forgot to pass a registry.
+	// External and SGLang+LMCache — so admission doesn't silently reject an
+	// otherwise-valid CR just because the caller forgot to pass a registry.
 	Registry *adapterruntime.Registry
 }
 
 // defaultShippingRegistry returns a Registry with every adapter the
 // production cmd/controller wiring installs: the in-package vLLM+LMCache
 // adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
-// External adapter. Centralised here so the validator's nil-Registry
-// fallback admits the same set the running controller does.
+// External and SGLang+LMCache adapters. Centralised here so the validator's
+// nil-Registry fallback admits the same set the running controller does.
 func defaultShippingRegistry() *adapterruntime.Registry {
 	r := adapterruntime.DefaultRegistry()
 	r.Register(externaladapter.NewAdapter())
+	r.Register(sglangadapter.NewAdapter())
 	return r
 }
 
@@ -149,6 +151,41 @@ var DefaultValidationRules = []ValidationRule{
 	rejectMisalignedHugepageQuantities,
 	rejectEventsOnlyMisconfiguration,
 	rejectInvalidKernelCheckAnnotation,
+	rejectUnsupportedSGLangRole,
+}
+
+// rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
+// (sglang, LMCache) backend. SGLang's --enable-lmcache integration has no
+// kv_role split equivalent to vLLM's LMCache connector — it always both stores
+// and retrieves — so a ReadOnly / WriteOnly role cannot be honored by the
+// engine. Rejecting at admission makes that loud rather than silently treating
+// the role as ReadWrite. Scoped to (sglang, LMCache): other engines map all
+// roles onto their connector (vLLM), and the rule must not fire on an
+// already-unsupported pair (e.g. sglang+External, which checkRuntimeAdapter
+// rejects on its own). If SGLang's LMCache integration gains a
+// producer/consumer split, lift this rule.
+func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Integration == nil {
+		return nil
+	}
+	role := cb.Spec.Integration.Role
+	if role == "" || role == cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
+		return nil // unset defaults to ReadWrite; ReadWrite is honored
+	}
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "integration", "role"),
+			role,
+			fmt.Sprintf("the sglang engine's LMCache integration has no producer/consumer split, so only %q (the default) is honored today; %q / %q are not yet wired for SGLang",
+				cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),
+		),
+	}
 }
 
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
@@ -182,8 +219,8 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
-// [defaultShippingRegistry] (DefaultRegistry plus the External adapter),
-// mirroring cmd/controller's production wiring so a zero-value validator
+// [defaultShippingRegistry] (DefaultRegistry plus the External and
+// SGLang+LMCache adapters), mirroring cmd/controller's production wiring so a zero-value validator
 // sees the same adapter set the running controller does. cmd/controller
 // threads the same instance the reconciler + pod webhook receive so all
 // three layers agree on what's supported.

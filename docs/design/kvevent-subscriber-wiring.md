@@ -43,17 +43,18 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  The vLLM/LMCache and vLLM/Mooncake adapters both return the `kvevent-subscriber`
-  container spec (via the shared `buildKVEventSubscriber` — the KV-event stream is
-  vLLM's, independent of the L2 store); the reference adapter and any adapter for
+  The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
+  container spec (via the shared `RenderSubscriberSidecar` — the KV-event stream is the
+  engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
+  `--hash-scheme` tag + ZMQ port); the reference adapter and any adapter for
   `type: External` return `(nil, nil)`.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache and vLLM/Mooncake adapters return nil unless the controller's
-  `--kvevent-subscriber-image` flag is set** (both go through the same shared
-  `buildKVEventSubscriber`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
+* **The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return nil unless the
+  controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
+  `RenderSubscriberSidecar`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
   exact "cache becomes a serving dependency" failure mode the fail-open posture exists
   to prevent. Defaulting auto-attach off lets the controller install cleanly into any
@@ -63,7 +64,7 @@ Concretely:
   (downward API likewise), `--model-id` ← `spec.backendConfig.model` (single source;
   when unset, the adapter returns no sidecar — the binary requires the flag, the next
   admission picks it up once the operator sets the key), `--hash-scheme` ← the
-  adapter's runtime convention (`"vllm"` here), `--server` ← the policy-server
+  adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),
   `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags
   (`--engine-metrics-url`, `--stats-interval`, etc.) are added by the adapter when the
@@ -77,7 +78,9 @@ Concretely:
   matching `CacheBackend`, the registry returns the right adapter, the same `cache.Spec`
   the engine config injection consumes. One mutation step does both injections.
 * The adapter seam keeps engine-specific decisions where the project already lives them.
-  A future SGLang adapter can return a different sidecar (e.g. a different ZMQ port or a
+  The SGLang adapter reuses the same shared subscriber, only its `--hash-scheme` tag
+  differs (SGLang adopted vLLM's ZMQ KV-event wire); the seam is what would let a genuinely
+  different future engine return a different sidecar (e.g. a different ZMQ port or a
   completely different observation mechanism). The shipped Mooncake adapter, by contrast,
   returns the *same* vLLM kvevent-subscriber the LMCache adapter does — Mooncake integrates
   as an LMCache remote backend, so the engine is still vLLM and its KV events still come
@@ -124,9 +127,9 @@ entry until its freshness TTL expires; a stale entry yields a cache miss
 The subscriber binary exposes `--ignore-block-removed` (default off, for
 backward compatibility with single-tier deployments). When set the reporter
 drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
-`BlockStored` still flow normally. The shared `buildKVEventSubscriber` helper
-(`pkg/adapters/runtime/kvevent_subscriber.go`) — which both the vLLM/LMCache and
-vLLM/Mooncake adapters call — sets the flag **per integration mode**, because
+`BlockStored` still flow normally. The shared `RenderSubscriberSidecar` helper
+(`pkg/adapters/runtime/kvevent_subscriber.go`) — which the vLLM/LMCache,
+vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per integration mode**, because
 the L2 tier is present only in one of them:
 
 - **`Offload` (default):** the adapter wires the LMCache KV connector (pointed at

@@ -762,15 +762,29 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			t.Fatalf("VLLM (uppercase) should match the vllm adapter and produce a Deployment: %v", err)
 		}
 
-		// An engine with no registered Phase-1 adapter falls into the unmanaged path.
+		// sglang now has a shipping adapter (the SGLang+LMCache adapter is in
+		// the reconciler's nil-registry fallback), so a (sglang, LMCache)
+		// backend is managed the same way vLLM is — it renders the standalone
+		// lmcache-server Deployment.
 		sg := lmcacheBackend("sg", ns)
 		sg.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
 		if err := k8s.Create(ctx, sg); err != nil {
 			t.Fatalf("create sglang: %v", err)
 		}
 		reconcile(t, r, "sg", ns)
-		if _, err := getOptionalDeployment(t, r, "sg", ns); err == nil {
-			t.Fatalf("sglang has no Phase-1 adapter; expected no Deployment (unmanaged path)")
+		if _, err := getOptionalDeployment(t, r, "sg", ns); err != nil {
+			t.Fatalf("sglang now has a shipping adapter; expected a managed Deployment: %v", err)
+		}
+
+		// An engine with no registered adapter still falls into the unmanaged path.
+		unk := lmcacheBackend("unk", ns)
+		unk.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "no-such-engine"}
+		if err := k8s.Create(ctx, unk); err != nil {
+			t.Fatalf("create unknown-engine: %v", err)
+		}
+		reconcile(t, r, "unk", ns)
+		if _, err := getOptionalDeployment(t, r, "unk", ns); err == nil {
+			t.Fatalf("unknown engine has no adapter; expected no Deployment (unmanaged path)")
 		}
 	})
 
