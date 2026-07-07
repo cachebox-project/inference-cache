@@ -3,14 +3,20 @@
 package tokenize
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
 const testModel = "test-model"
+const goldenTokenizerModel = "Qwen/Qwen2.5-0.5B-Instruct"
 
 // newTestTokenizer builds a tokenizer with a single model loaded directly from
 // IC_TEST_TOKENIZER (a local tokenizer dir/tokenizer.json or an HF model id,
@@ -66,6 +72,36 @@ func TestCgoTokenizerEncodeTextWorks(t *testing.T) {
 	}
 }
 
+func TestCgoTokenizerGoldenTextMatchesFingerprintVector(t *testing.T) {
+	if ref := os.Getenv("IC_TEST_TOKENIZER"); ref != "" && ref != goldenTokenizerModel {
+		t.Skipf("golden token vector is pinned to %s; got IC_TEST_TOKENIZER=%s", goldenTokenizerModel, ref)
+	}
+	tk := newTestTokenizer(t)
+
+	ids, err := tk.EncodeText(context.Background(), testModel, "hello world", EncodeOptions{})
+	if err != nil {
+		t.Fatalf("EncodeText: %v", err)
+	}
+	v := loadGoldenVector(t, "qwen_hello_world_encode_text")
+	if !equalU32(ids, v.Tokens) {
+		t.Fatalf("EncodeText tokens = %v, want golden vector tokens %v", ids, v.Tokens)
+	}
+
+	hashes, counts := fingerprint.Chain(ids, v.BlockSize)
+	if len(hashes) != len(v.PrefixHashes) {
+		t.Fatalf("fingerprint.Chain produced %d hashes, want %d", len(hashes), len(v.PrefixHashes))
+	}
+	for i, got := range hashes {
+		want := decodeGoldenHash(t, v.PrefixHashes[i].B64BE)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("prefix_hash[%d] = %x, want %x", i, got, want)
+		}
+		if counts[i] != int32(v.BlockSize) {
+			t.Fatalf("block_token_counts[%d] = %d, want %d", i, counts[i], v.BlockSize)
+		}
+	}
+}
+
 // Hermetic (no network): without a vetted models directory the cgo build loads
 // no tokenizer (the prompt_text path then fails open to NO_HINT downstream).
 func TestCgoNewEmptyDirIsUnavailable(t *testing.T) {
@@ -83,6 +119,34 @@ func TestCgoUnknownModelFailsOpen(t *testing.T) {
 	_, err := tk.Encode(context.Background(), "not-loaded", []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Errorf("Encode err = %v, want ErrUnavailable (model not in vetted dir)", err)
+	}
+}
+
+func TestCgoUnsafeModelIDsFailOpenWithoutCacheMutation(t *testing.T) {
+	tk, ok := New(Config{ModelsDir: t.TempDir()}).(*smgTokenizer)
+	if !ok {
+		t.Fatal("New(Config{ModelsDir}) did not return *smgTokenizer under smgcgo")
+	}
+	before := len(tk.handles)
+	for _, model := range []string{
+		"../secret",
+		"models/../../secret",
+		"/var/tmp/tokenizer",
+		"Qwen//Qwen2.5-0.5B-Instruct",
+		"Qwen/./Qwen2.5-0.5B-Instruct",
+		`Qwen\Qwen2.5-0.5B-Instruct`,
+		"C:/models/Qwen",
+		`C:\models\Qwen`,
+	} {
+		t.Run(model, func(t *testing.T) {
+			_, err := tk.Encode(context.Background(), model, []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("Encode err = %v, want ErrUnavailable", err)
+			}
+		})
+	}
+	if got := len(tk.handles); got != before {
+		t.Fatalf("tokenizer cache grew from %d to %d after unsafe request model_ids", before, got)
 	}
 }
 
@@ -121,6 +185,35 @@ func TestDiscoverModelsKeysByRelativePath(t *testing.T) {
 	}
 }
 
+func TestSafeModelID(t *testing.T) {
+	for _, model := range []string{
+		"gpt2",
+		"Qwen/Qwen2.5-0.5B-Instruct",
+		"meta-llama/Llama-3.1-8B-Instruct",
+	} {
+		if !safeModelID(model) {
+			t.Errorf("safeModelID(%q) = false, want true", model)
+		}
+	}
+	for _, model := range []string{
+		"",
+		".",
+		"..",
+		"../secret",
+		"models/../../secret",
+		"/absolute/model",
+		"Qwen//model",
+		"Qwen/./model",
+		`Qwen\model`,
+		"C:/models/qwen",
+		`C:\models\qwen`,
+	} {
+		if safeModelID(model) {
+			t.Errorf("safeModelID(%q) = true, want false", model)
+		}
+	}
+}
+
 func equalU32(a, b []uint32) bool {
 	if len(a) != len(b) {
 		return false
@@ -131,4 +224,50 @@ func equalU32(a, b []uint32) bool {
 		}
 	}
 	return true
+}
+
+type goldenHash struct {
+	B64BE string `json:"b64be"`
+}
+
+type goldenVector struct {
+	Name         string       `json:"name"`
+	Tokens       []uint32     `json:"tokens"`
+	BlockSize    int          `json:"block_size"`
+	PrefixHashes []goldenHash `json:"prefix_hashes"`
+}
+
+type goldenFile struct {
+	Vectors []goldenVector `json:"vectors"`
+}
+
+func loadGoldenVector(t *testing.T, name string) goldenVector {
+	t.Helper()
+	raw, err := os.ReadFile("../fingerprint/testdata/golden_vectors.json")
+	if err != nil {
+		t.Fatalf("read fingerprint golden vectors: %v", err)
+	}
+	var f goldenFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse fingerprint golden vectors: %v", err)
+	}
+	for _, v := range f.Vectors {
+		if v.Name == name {
+			return v
+		}
+	}
+	t.Fatalf("fingerprint golden vector %q not found", name)
+	return goldenVector{}
+}
+
+func decodeGoldenHash(t *testing.T, b64 string) []byte {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("decode golden hash %q: %v", b64, err)
+	}
+	if len(b) != 8 {
+		t.Fatalf("decode golden hash %q: got %d bytes, want 8", b64, len(b))
+	}
+	return b
 }

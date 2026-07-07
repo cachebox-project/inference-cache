@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -114,7 +115,12 @@ func discoverModels(modelsDir string) []discoveredModel {
 		if relErr != nil {
 			return filepath.SkipDir
 		}
-		out = append(out, discoveredModel{id: filepath.ToSlash(rel), path: path})
+		id := filepath.ToSlash(rel)
+		if !safeModelID(id) {
+			slog.Warn("tokenize: skipping tokenizer with unsafe relative model id", "model", id)
+			return filepath.SkipDir
+		}
+		out = append(out, discoveredModel{id: id, path: path})
 		return filepath.SkipDir // a model directory is a leaf; don't descend into it
 	})
 	return out
@@ -166,6 +172,9 @@ func (t *smgTokenizer) Encode(ctx context.Context, model string, msgs []Message,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if !safeModelID(model) {
+		return nil, fmt.Errorf("%w: unsafe model_id %q", ErrUnavailable, model)
+	}
 	wire := make([]wireMessage, len(msgs))
 	for i, m := range msgs {
 		wire[i] = wireMessage{Role: m.Role, Content: m.Content}
@@ -199,6 +208,9 @@ func (t *smgTokenizer) Encode(ctx context.Context, model string, msgs []Message,
 func (t *smgTokenizer) EncodeText(ctx context.Context, model, text string, opts EncodeOptions) ([]uint32, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !safeModelID(model) {
+		return nil, fmt.Errorf("%w: unsafe model_id %q", ErrUnavailable, model)
 	}
 	// C.CString builds a NUL-terminated string, so an embedded NUL would silently
 	// truncate the text on the Rust side — reject it rather than tokenize a
@@ -266,4 +278,27 @@ func cBool(b bool) C.int {
 		return 1
 	}
 	return 0
+}
+
+func safeModelID(model string) bool {
+	if model == "" || path.IsAbs(model) || strings.Contains(model, `\`) || isWindowsAbsModelID(model) {
+		return false
+	}
+	if path.Clean(model) != model {
+		return false
+	}
+	for _, part := range strings.Split(model, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func isWindowsAbsModelID(model string) bool {
+	if len(model) < 3 || model[1] != ':' || model[2] != '/' {
+		return false
+	}
+	c := model[0]
+	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }

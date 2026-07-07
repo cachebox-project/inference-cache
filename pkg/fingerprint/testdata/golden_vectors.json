@@ -318,6 +318,28 @@
       ]
     },
     {
+      "name": "qwen_hello_world_encode_text",
+      "description": "Qwen/Qwen2.5-0.5B-Instruct cgo tokenizer EncodeText(\"hello world\") golden token output, used to lock tokenizer output to the shared content-fingerprint chain fixture.",
+      "tokens": [
+        14990,
+        1879
+      ],
+      "block_size": 2,
+      "parent_prefix": null,
+      "content_hashes": [
+        {
+          "dec": "2562323614806148766",
+          "b64be": "I48zwHwdhp4="
+        }
+      ],
+      "prefix_hashes": [
+        {
+          "dec": "2562323614806148766",
+          "b64be": "I48zwHwdhp4="
+        }
+      ]
+    },
+    {
       "name": "partial_only_no_blocks",
       "description": "Fewer tokens than one block: no hashes at all.",
       "tokens": [

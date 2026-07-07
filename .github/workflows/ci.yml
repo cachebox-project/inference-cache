@@ -226,6 +226,39 @@ jobs:
     - name: Build binaries
       run: make build
 
+  tokenize-cgo:
+    name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build-tag:
+        - smgcgo
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Setup Rust
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+        rustc --version
+        cargo --version
+
+    - name: Build and test smgcgo tokenizer path
+      env:
+        CARGO_NET_RETRY: 3
+        TOKENIZE_CGO_BUILD_TAG: ${{ matrix.build-tag }}
+      run: make tokenize-cgo-test
+
   lint-test-proto:
     name: Lint, Test, Proto
     runs-on: ubuntu-latest
@@ -235,6 +268,7 @@ jobs:
     - fingerprint-e2e
     - vulnerability-scan
     - build
+    - tokenize-cgo
     if: always()
     permissions:
       contents: read
@@ -246,6 +280,7 @@ jobs:
         FINGERPRINT_E2E_RESULT: ${{ needs.fingerprint-e2e.result }}
         VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
         BUILD_RESULT: ${{ needs.build.result }}
+        TOKENIZE_CGO_RESULT: ${{ needs.tokenize-cgo.result }}
       run: |
         failed=0
         for item in \
@@ -253,7 +288,8 @@ jobs:
           "test:$TEST_RESULT" \
           "fingerprint-e2e:$FINGERPRINT_E2E_RESULT" \
           "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
-          "build:$BUILD_RESULT"; do
+          "build:$BUILD_RESULT" \
+          "tokenize-cgo:$TOKENIZE_CGO_RESULT"; do
           name="${item%%:*}"
           result="${item#*:}"
           if [ "$result" != "success" ]; then

@@ -359,6 +359,27 @@ func TestLookupRouteOversizedTokenIDsFailsOpen(t *testing.T) {
 	}
 }
 
+// A tokenizer that returns too many IDs is treated the same as an oversized
+// caller-supplied token_ids request: fail open and do not echo an unbounded
+// response payload back to the gateway.
+func TestLookupRouteOversizedTokenizerOutputFailsOpen(t *testing.T) {
+	svc := newTestService()
+	svc.tokenizer = fakeTokenizer{tokens: make([]uint32, MaxLookupTokens+1)}
+	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+		ModelId: "m", TenantId: "tenant-x", HashScheme: "vllm",
+		PromptText: "hello",
+	})
+	if err != nil {
+		t.Fatalf("LookupRoute: %v", err)
+	}
+	if resp.GetReasonCode() != "NO_HINT" {
+		t.Errorf("reason = %q, want NO_HINT (oversized tokenizer output must fail open)", resp.GetReasonCode())
+	}
+	if len(resp.GetTokenIds()) != 0 {
+		t.Errorf("oversized tokenizer output echoed %d token_ids, want 0", len(resp.GetTokenIds()))
+	}
+}
+
 // An explicit block-hash chain (a gateway that already fingerprinted) takes
 // precedence over token_ids. We supply a matching chain AND a novel token_ids;
 // if precedence holds the chain wins and we PREFIX_MATCH. If token_ids wrongly
