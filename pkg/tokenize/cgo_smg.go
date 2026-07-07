@@ -14,7 +14,7 @@ package tokenize
 
 /*
 #cgo darwin LDFLAGS: -lictokenizer -lc++ -framework SystemConfiguration -framework CoreFoundation -liconv -lSystem -lm
-#cgo linux  LDFLAGS: -lictokenizer -ldl -lm -lpthread
+#cgo linux  LDFLAGS: -lictokenizer -lstdc++ -ldl -lm -lpthread
 #include <stdint.h>
 #include <stdlib.h>
 
