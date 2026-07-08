@@ -29,6 +29,8 @@ Two top-level fields round out the object: `status.observedServer` (the full sna
 
 `hitRate` and `pressure` are decimal strings in `[0,1]` (e.g. `"0.78"`) — CRDs avoid floats for cross-language portability, so they render as quoted strings.
 
+`hitRate` (on both `status.replicas[]` and `status.tenants[]`) and `tenants[].indexEntries` are **optional and absent until reported**: the key is omitted while the stats reporter has not emitted yet, and present once it has. That "absent = not yet reported" is deliberately distinct from a present `"0"` (a real 0% hit rate) or `0` (a genuinely empty tenant) — the same nil-means-unreported convention used by `CacheBackend.status.indexParticipation.hitRate` and `CacheTenant.status.indexEntries`, so the two surfaces read consistently. Fields that are always defined (e.g. `prefixes.summary.total`, per-replica `cacheMemoryBytes`) are rendered unconditionally.
+
 ### Printer columns
 
 ```text

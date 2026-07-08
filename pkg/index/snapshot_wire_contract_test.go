@@ -52,13 +52,19 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 			LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
 			PrefixCount:      3,
 			LastEventAt:      time.Unix(1_700_000_500, 0).UTC(),
-			T2HitTokens:      600,
-			T2QueryTokens:    1000,
+			// StatsReported carries omitempty (bool), so it must be true here to
+			// emit the key for the frozen-shape check.
+			StatsReported: true,
+			T2HitTokens:   600,
+			T2QueryTokens: 1000,
 		}},
 		Tenants: []TenantSnapshot{{
 			TenantID:     "team-a",
 			IndexEntries: 3,
 			HitRate:      0.5,
+			// HitRateReported carries omitempty (bool), so it must be true here
+			// to emit the key for the frozen-shape check.
+			HitRateReported: true,
 			// Deprecated, always 0 in production; pinned here because the JSON
 			// tag carries no omitempty, so the key stays on the wire (skew-safe
 			// for an older controller still decoding it).
@@ -90,7 +96,8 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	}
 	wantReplica := []string{
 		"replicaId", "tenant", "cacheMemoryBytes", "hitRate", "pressure",
-		"lastUpdate", "prefixCount", "lastEventAt", "t2HitTokens", "t2QueryTokens",
+		"lastUpdate", "prefixCount", "lastEventAt", "statsReported",
+		"t2HitTokens", "t2QueryTokens",
 	}
 	assertExactKeys(t, "ReplicaSnapshot", replicas[0], wantReplica)
 
@@ -102,7 +109,7 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 	if len(tenants) != 1 {
 		t.Fatalf("expected one tenant row; got %d", len(tenants))
 	}
-	wantTenant := []string{"tenantId", "indexEntries", "hitRate", "memoryUsed"}
+	wantTenant := []string{"tenantId", "indexEntries", "hitRate", "hitRateReported", "memoryUsed"}
 	assertExactKeys(t, "TenantSnapshot", tenants[0], wantTenant)
 }
 

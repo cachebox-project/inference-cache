@@ -373,6 +373,12 @@ func TestSnapshotAggregates(t *testing.T) {
 	if snap.Replicas[0].CacheMemoryBytes != 100 || snap.Replicas[0].HitRate != 0.8 {
 		t.Fatalf("replica-a stats = %+v", snap.Replicas[0])
 	}
+	// Both replicas reported stats, so StatsReported is the "hit rate is real,
+	// not a fabricated 0" presence bit for the CacheIndex status projection.
+	if !snap.Replicas[0].StatsReported || !snap.Replicas[1].StatsReported {
+		t.Fatalf("StatsReported should be true for stats-bearing replicas: a=%v b=%v",
+			snap.Replicas[0].StatsReported, snap.Replicas[1].StatsReported)
+	}
 	// Per-replica prefix counts are aggregated cluster-wide across models /
 	// hash_schemes: replica-a holds two distinct prefixes (one per model),
 	// replica-b holds one.
@@ -410,11 +416,67 @@ func TestSnapshotAggregates(t *testing.T) {
 	if snap.Tenants[1].TenantID != "tenant-b" || snap.Tenants[1].IndexEntries != 1 || snap.Tenants[1].HitRate != 0.6 {
 		t.Fatalf("tenant-b = %+v, want indexEntries 1 hitRate 0.6", snap.Tenants[1])
 	}
+	// Both tenants have at least one stats-reporting replica, so HitRateReported
+	// is the "mean hit rate is real, not a fabricated 0" presence bit.
+	if !snap.Tenants[0].HitRateReported || !snap.Tenants[1].HitRateReported {
+		t.Fatalf("HitRateReported should be true for tenants with reported stats: a=%v b=%v",
+			snap.Tenants[0].HitRateReported, snap.Tenants[1].HitRateReported)
+	}
 	// MemoryUsed is deprecated and never accumulated: it stays 0 even though
 	// both tenants' replicas reported non-zero CacheMemoryBytes.
 	if snap.Tenants[0].MemoryUsed != 0 || snap.Tenants[1].MemoryUsed != 0 {
 		t.Fatalf("tenant MemoryUsed must be 0 (deprecated, not accumulated): a=%d b=%d",
 			snap.Tenants[0].MemoryUsed, snap.Tenants[1].MemoryUsed)
+	}
+}
+
+// TestSnapshotPresenceBitsDistinguishAbsentFromZero pins the absent-vs-zero
+// signal the CacheIndex status projection relies on to keep the aggregate
+// HitRate nil (not a fabricated "0") for a replica/tenant whose stats reporter
+// has not emitted yet. A prefix-only Ingest (no Stats) records index entries
+// but no stats row: the replica must report StatsReported=false and the tenant
+// HitRateReported=false, while IndexEntries still reflects the real count.
+func TestSnapshotPresenceBitsDistinguishAbsentFromZero(t *testing.T) {
+	idx := New()
+	// Prefix-only report: two distinct prefixes, no Stats payload.
+	idx.Ingest(Update{
+		ReplicaID: "vllm-0", Model: "m", Tenant: "tenant-a", HashScheme: "vllm",
+		Prefixes: []PrefixRef{
+			{PrefixHash: hash("p1"), TokenCount: 1},
+			{PrefixHash: hash("p2"), TokenCount: 1},
+		},
+	})
+
+	snap := idx.Snapshot()
+
+	if len(snap.Replicas) != 1 {
+		t.Fatalf("replicas = %+v, want one prefix-only row", snap.Replicas)
+	}
+	r := snap.Replicas[0]
+	if r.StatsReported {
+		t.Fatalf("StatsReported = true for a prefix-only replica, want false (no stats reported yet)")
+	}
+	// A prefix-only replica has zero-valued stats — the exact "observed 0 vs
+	// not reported" ambiguity the presence bit resolves.
+	if r.HitRate != 0 || r.CacheMemoryBytes != 0 || !r.LastUpdate.IsZero() {
+		t.Fatalf("prefix-only replica should carry zero-valued stats: %+v", r)
+	}
+	if r.PrefixCount != 2 {
+		t.Fatalf("prefixCount = %d, want 2 (entries are still counted)", r.PrefixCount)
+	}
+
+	if len(snap.Tenants) != 1 {
+		t.Fatalf("tenants = %+v, want one row", snap.Tenants)
+	}
+	tn := snap.Tenants[0]
+	if tn.HitRateReported {
+		t.Fatalf("HitRateReported = true for a tenant with no reported stats, want false")
+	}
+	if tn.HitRate != 0 {
+		t.Fatalf("tenant HitRate = %v, want 0 (no stats), distinguishable via HitRateReported=false", tn.HitRate)
+	}
+	if tn.IndexEntries != 2 {
+		t.Fatalf("tenant IndexEntries = %d, want 2 (a real observed count, always present)", tn.IndexEntries)
 	}
 }
 

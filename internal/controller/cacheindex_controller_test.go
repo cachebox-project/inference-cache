@@ -34,14 +34,14 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 		TotalPrefixes: 5,
 		HotPrefixes:   0,
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now},
+			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now, StatsReported: true},
 		},
 		Tenants: []index.TenantSnapshot{
 			// MemoryUsed is non-zero here on purpose: it simulates an older /
 			// skewed server still reporting the deprecated, double-counted
 			// per-tenant memory. The controller must DISCARD it (hard-zero),
 			// asserted below.
-			{TenantID: "t1", IndexEntries: 5, HitRate: 0.8, MemoryUsed: 777},
+			{TenantID: "t1", IndexEntries: 5, HitRate: 0.8, HitRateReported: true, MemoryUsed: 777},
 		},
 	}
 
@@ -53,11 +53,14 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	if st.ObservedServer != "http://server/snapshot" {
 		t.Fatalf("observedServer = %q", st.ObservedServer)
 	}
-	if len(st.Replicas) != 1 || st.Replicas[0].ID != "r1" || st.Replicas[0].Tenant != "ns-a" || st.Replicas[0].HitRate != "0.8" || st.Replicas[0].Pressure != "0.5" {
-		t.Fatalf("replica = %+v, want id r1 tenant ns-a hitRate 0.8 pressure 0.5", st.Replicas[0])
+	if len(st.Replicas) != 1 || st.Replicas[0].ID != "r1" || st.Replicas[0].Tenant != "ns-a" ||
+		st.Replicas[0].HitRate == nil || *st.Replicas[0].HitRate != "0.8" || st.Replicas[0].Pressure != "0.5" {
+		t.Fatalf("replica = %+v (hitRate=%v), want id r1 tenant ns-a hitRate 0.8 pressure 0.5", st.Replicas[0], derefStr(st.Replicas[0].HitRate))
 	}
-	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" || st.Tenants[0].IndexEntries != 5 || st.Tenants[0].HitRate != "0.8" {
-		t.Fatalf("tenant = %+v, want id t1 indexEntries 5 hitRate 0.8", st.Tenants[0])
+	if len(st.Tenants) != 1 || st.Tenants[0].ID != "t1" ||
+		st.Tenants[0].IndexEntries == nil || *st.Tenants[0].IndexEntries != 5 ||
+		st.Tenants[0].HitRate == nil || *st.Tenants[0].HitRate != "0.8" {
+		t.Fatalf("tenant = %+v (indexEntries=%v hitRate=%v), want id t1 indexEntries 5 hitRate 0.8", st.Tenants[0], st.Tenants[0].IndexEntries, derefStr(st.Tenants[0].HitRate))
 	}
 	// Deprecated memoryUsed must be hard-zeroed regardless of what the snapshot
 	// carried (skew-compat: an older server may still report a non-zero,
@@ -68,11 +71,22 @@ func TestBuildCacheIndexStatus(t *testing.T) {
 	// The per-tenant indexEntries sum to prefixes.summary.total (single tenant here).
 	var sum int64
 	for _, tn := range st.Tenants {
-		sum += tn.IndexEntries
+		if tn.IndexEntries != nil {
+			sum += *tn.IndexEntries
+		}
 	}
 	if sum != int64(st.Prefixes.Summary.Total) {
 		t.Fatalf("Σ tenants[].indexEntries = %d, want == prefixes.summary.total %d", sum, st.Prefixes.Summary.Total)
 	}
+}
+
+// derefStr is a test helper that renders a *string for failure messages,
+// showing "<nil>" for the unreported sentinel.
+func derefStr(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
 }
 
 // TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner asserts the two
@@ -85,8 +99,8 @@ func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	snap := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "vllm-0", Tenant: "ns-a", CacheMemoryBytes: 100, LastUpdate: now},
-			{ReplicaID: "vllm-0", Tenant: "ns-b", CacheMemoryBytes: 200, LastUpdate: now},
+			{ReplicaID: "vllm-0", Tenant: "ns-a", CacheMemoryBytes: 100, LastUpdate: now, StatsReported: true},
+			{ReplicaID: "vllm-0", Tenant: "ns-b", CacheMemoryBytes: 200, LastUpdate: now, StatsReported: true},
 			{ReplicaID: "prefix-only", Tenant: "ns-a", PrefixCount: 5},
 		},
 	}
@@ -97,6 +111,68 @@ func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
 	got := st.Replicas[0]
 	if got.ID != "vllm-0" || got.Tenant != "ns-b" || got.CacheMemoryBytes != 200 {
 		t.Fatalf("collision winner = %+v, want id vllm-0 tenant ns-b memory 200 (lex-later tenant wins)", got)
+	}
+}
+
+// TestBuildCacheIndexStatusHitRateNilWhenUnreported pins the harmonized
+// pointer-ness: the cluster-aggregate HitRate (*string) stays nil when the
+// stats reporter has not emitted yet, so a not-yet-reported replica / tenant is
+// distinguishable from an observed 0% hit rate — matching the per-backend
+// CacheBackend.status.indexParticipation.hitRate and per-tenant
+// CacheTenant.status.indexEntries surfaces. IndexEntries (*int64) is always
+// present on an emitted tenant row (a real observed count), never a fabricated
+// nil.
+func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	snap := index.Snapshot{
+		TotalPrefixes: 4,
+		Replicas: []index.ReplicaSnapshot{
+			// Emitted row (non-zero LastUpdate) but the stats reporter has not
+			// pinged: HitRate must stay nil, not "0".
+			{ReplicaID: "r-unreported", Tenant: "ns-a", LastUpdate: now, StatsReported: false},
+			// Stats-bearing replica: HitRate present.
+			{ReplicaID: "r-reported", Tenant: "ns-a", HitRate: 0, LastUpdate: now, StatsReported: true},
+		},
+		Tenants: []index.TenantSnapshot{
+			// Tenant with index entries but no reported stats: HitRate nil,
+			// IndexEntries present (a real observed 0-vs-N count).
+			{TenantID: "t-unreported", IndexEntries: 4, HitRate: 0, HitRateReported: false},
+			// Tenant whose replicas reported a real 0% mean: HitRate present as
+			// "0", distinct from the nil above.
+			{TenantID: "t-reported", IndexEntries: 0, HitRate: 0, HitRateReported: true},
+		},
+	}
+
+	st := buildCacheIndexStatus(snap, "http://server/snapshot", now)
+
+	byReplica := map[string]cachev1alpha1.ReplicaCacheStatus{}
+	for _, r := range st.Replicas {
+		byReplica[r.ID] = r
+	}
+	if r := byReplica["r-unreported"]; r.HitRate != nil {
+		t.Fatalf("r-unreported HitRate = %q, want nil (stats reporter has not pinged)", *r.HitRate)
+	}
+	if r := byReplica["r-reported"]; r.HitRate == nil || *r.HitRate != "0" {
+		t.Fatalf("r-reported HitRate = %v, want a real \"0\" (observed 0%%, distinct from unreported nil)", derefStr(r.HitRate))
+	}
+
+	byTenant := map[string]cachev1alpha1.TenantCacheStatus{}
+	for _, tn := range st.Tenants {
+		byTenant[tn.ID] = tn
+	}
+	tu := byTenant["t-unreported"]
+	if tu.HitRate != nil {
+		t.Fatalf("t-unreported HitRate = %q, want nil (no replica reported stats)", *tu.HitRate)
+	}
+	if tu.IndexEntries == nil || *tu.IndexEntries != 4 {
+		t.Fatalf("t-unreported IndexEntries = %v, want a present 4 (observed count, never fabricated nil)", tu.IndexEntries)
+	}
+	tr := byTenant["t-reported"]
+	if tr.HitRate == nil || *tr.HitRate != "0" {
+		t.Fatalf("t-reported HitRate = %v, want a real \"0\" (observed 0%% mean)", derefStr(tr.HitRate))
+	}
+	if tr.IndexEntries == nil || *tr.IndexEntries != 0 {
+		t.Fatalf("t-reported IndexEntries = %v, want a present 0 (observed zero, not nil)", tr.IndexEntries)
 	}
 }
 
@@ -117,7 +193,7 @@ func TestEmptyIndexStatusRendersZeroSummary(t *testing.T) {
 func TestStatusEqualIgnoresTimestamps(t *testing.T) {
 	base := cachev1alpha1.CacheIndexStatus{
 		Prefixes: cachev1alpha1.PrefixStatus{Summary: cachev1alpha1.PrefixSummary{Total: 3}},
-		Replicas: []cachev1alpha1.ReplicaCacheStatus{{ID: "r1", CacheMemoryBytes: 100, HitRate: "0.8"}},
+		Replicas: []cachev1alpha1.ReplicaCacheStatus{{ID: "r1", CacheMemoryBytes: 100, HitRate: ptrTo("0.8")}},
 	}
 	// Same meaningful data, different timestamps → equal.
 	a := *base.DeepCopy()

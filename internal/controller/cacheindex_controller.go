@@ -634,31 +634,55 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		byID[r.ReplicaID] = r
 	}
 	for _, r := range byID {
-		st.Replicas = append(st.Replicas, cachev1alpha1.ReplicaCacheStatus{
+		row := cachev1alpha1.ReplicaCacheStatus{
 			ID:               r.ReplicaID,
 			Tenant:           r.Tenant,
 			CacheMemoryBytes: r.CacheMemoryBytes,
-			HitRate:          formatRate(r.HitRate),
 			Pressure:         formatRate(r.Pressure),
 			LastUpdate:       metav1.NewTime(r.LastUpdate),
-		})
+		}
+		// HitRate is a *string that must stay nil when the replica's stats
+		// reporter hasn't emitted yet — a fabricated "0" reads as a real 0%
+		// hit rate. The rows here already come from stats-bearing replicas
+		// (StatsReported), since prefix-only replicas were dropped above by the
+		// LastUpdate.IsZero() filter; branch on the presence bit for clarity and
+		// so the shape stays honest if that filter ever changes.
+		if r.StatsReported {
+			row.HitRate = ptrTo(formatRate(r.HitRate))
+		}
+		st.Replicas = append(st.Replicas, row)
 	}
 	sort.Slice(st.Replicas, func(a, b int) bool { return st.Replicas[a].ID < st.Replicas[b].ID })
 	for _, t := range snap.Tenants {
-		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
-			ID:           t.TenantID,
-			IndexEntries: t.IndexEntries,
-			HitRate:      formatRate(t.HitRate),
+		row := cachev1alpha1.TenantCacheStatus{
+			ID: t.TenantID,
+			// IndexEntries is a *int64. The cluster aggregate always carries a
+			// real count when it emits a tenant row (this projection only runs
+			// after a successful scrape), so it is always present here; nil is
+			// reserved for "not yet computed" to match
+			// CacheTenant.status.indexEntries.
+			IndexEntries: ptrTo(t.IndexEntries),
 			// Deprecated field, hard-zeroed here (NOT copied from the snapshot):
 			// the controller is authoritative for keeping it 0 even when talking
 			// to an older/skewed server that still reports a non-zero (double-
 			// counted) per-tenant memory in its /snapshot. See
 			// TenantCacheStatus.MemoryUsed.
 			MemoryUsed: 0,
-		})
+		}
+		// HitRate stays nil until a replica of this tenant has reported stats
+		// (HitRateReported), so an observed mean of 0 is distinguishable from
+		// "no stats reported yet".
+		if t.HitRateReported {
+			row.HitRate = ptrTo(formatRate(t.HitRate))
+		}
+		st.Tenants = append(st.Tenants, row)
 	}
 	return st
 }
+
+// ptrTo returns a pointer to v. Used for the presence-aware CacheIndex status
+// fields (HitRate, IndexEntries) that stay nil when unreported.
+func ptrTo[T any](v T) *T { return &v }
 
 // formatRate renders a [0,1] rate as a short decimal string (float32 precision).
 func formatRate(f float32) string {
