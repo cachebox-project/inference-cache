@@ -152,13 +152,6 @@ def main():
                 list(range(50, 82)), 16, parent=0xDEADBEEF,
             ),
             vector(
-                "qwen_hello_world_encode_text",
-                "Qwen/Qwen2.5-0.5B-Instruct cgo tokenizer EncodeText(\"hello world\") "
-                "golden token output, used to lock tokenizer output to the shared "
-                "content-fingerprint chain fixture.",
-                [14990, 1879], 2,
-            ),
-            vector(
                 "partial_only_no_blocks",
                 "Fewer tokens than one block: no hashes at all.",
                 list(range(10)), 16,

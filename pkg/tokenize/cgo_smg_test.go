@@ -72,32 +72,35 @@ func TestCgoTokenizerEncodeTextWorks(t *testing.T) {
 	}
 }
 
-func TestCgoTokenizerGoldenTextMatchesFingerprintVector(t *testing.T) {
+func TestCgoTokenizerGoldenTextMatchesFingerprintChain(t *testing.T) {
 	if ref := os.Getenv("IC_TEST_TOKENIZER"); ref != "" && ref != goldenTokenizerModel {
 		t.Skipf("golden token vector is pinned to %s; got IC_TEST_TOKENIZER=%s", goldenTokenizerModel, ref)
 	}
+	g := loadTokenizerGolden(t)
+	if g.Model != goldenTokenizerModel {
+		t.Fatalf("tokenizer golden model = %q, want %q", g.Model, goldenTokenizerModel)
+	}
 	tk := newTestTokenizer(t)
 
-	ids, err := tk.EncodeText(context.Background(), testModel, "hello world", EncodeOptions{})
+	ids, err := tk.EncodeText(context.Background(), testModel, g.Text, EncodeOptions{})
 	if err != nil {
 		t.Fatalf("EncodeText: %v", err)
 	}
-	v := loadGoldenVector(t, "qwen_hello_world_encode_text")
-	if !equalU32(ids, v.Tokens) {
-		t.Fatalf("EncodeText tokens = %v, want golden vector tokens %v", ids, v.Tokens)
+	if !equalU32(ids, g.Tokens) {
+		t.Fatalf("EncodeText tokens = %v, want golden vector tokens %v", ids, g.Tokens)
 	}
 
-	hashes, counts := fingerprint.Chain(ids, v.BlockSize)
-	if len(hashes) != len(v.PrefixHashes) {
-		t.Fatalf("fingerprint.Chain produced %d hashes, want %d", len(hashes), len(v.PrefixHashes))
+	hashes, counts := fingerprint.Chain(ids, g.BlockSize)
+	if len(hashes) != len(g.PrefixHashes) {
+		t.Fatalf("fingerprint.Chain produced %d hashes, want %d", len(hashes), len(g.PrefixHashes))
 	}
 	for i, got := range hashes {
-		want := decodeGoldenHash(t, v.PrefixHashes[i].B64BE)
+		want := decodeGoldenHash(t, g.PrefixHashes[i].B64BE)
 		if !bytes.Equal(got, want) {
 			t.Fatalf("prefix_hash[%d] = %x, want %x", i, got, want)
 		}
-		if counts[i] != int32(v.BlockSize) {
-			t.Fatalf("block_token_counts[%d] = %d, want %d", i, counts[i], v.BlockSize)
+		if counts[i] != int32(g.BlockSize) {
+			t.Fatalf("block_token_counts[%d] = %d, want %d", i, counts[i], g.BlockSize)
 		}
 	}
 }
@@ -230,34 +233,25 @@ type goldenHash struct {
 	B64BE string `json:"b64be"`
 }
 
-type goldenVector struct {
-	Name         string       `json:"name"`
+type tokenizerGolden struct {
+	Model        string       `json:"model"`
+	Text         string       `json:"text"`
 	Tokens       []uint32     `json:"tokens"`
 	BlockSize    int          `json:"block_size"`
 	PrefixHashes []goldenHash `json:"prefix_hashes"`
 }
 
-type goldenFile struct {
-	Vectors []goldenVector `json:"vectors"`
-}
-
-func loadGoldenVector(t *testing.T, name string) goldenVector {
+func loadTokenizerGolden(t *testing.T) tokenizerGolden {
 	t.Helper()
-	raw, err := os.ReadFile("../fingerprint/testdata/golden_vectors.json")
+	raw, err := os.ReadFile("testdata/qwen_hello_world_golden.json")
 	if err != nil {
-		t.Fatalf("read fingerprint golden vectors: %v", err)
+		t.Fatalf("read tokenizer golden vector: %v", err)
 	}
-	var f goldenFile
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse fingerprint golden vectors: %v", err)
+	var g tokenizerGolden
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatalf("parse tokenizer golden vector: %v", err)
 	}
-	for _, v := range f.Vectors {
-		if v.Name == name {
-			return v
-		}
-	}
-	t.Fatalf("fingerprint golden vector %q not found", name)
-	return goldenVector{}
+	return g
 }
 
 func decodeGoldenHash(t *testing.T, b64 string) []byte {
