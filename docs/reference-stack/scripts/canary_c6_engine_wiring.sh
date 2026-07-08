@@ -193,6 +193,19 @@ spec:
     ports:
     - containerPort: 8000
       name: http
+    # Gate pod-Ready on vLLM actually serving /health. Without this a
+    # probe-less pod reports Ready the instant the container starts, so the
+    # downstream "wait for Ready" returns in ~1s and the short port-forward
+    # health loop then expires long before the CPU model finishes loading
+    # (~3-4 min). Tying Ready to /health makes READY_TIMEOUT the real budget.
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 180
 EOF
 }
 

@@ -82,6 +82,22 @@ kubectl "${KUBECONFIG_ARGS[@]}" apply -f config/crd/bases/inferencecache.io_cach
 
 log "building + starting the controller"
 go build -o bin/controller ./cmd/controller
+
+# The controller registers its admission webhooks unconditionally, so the
+# manager starts an in-process webhook server that reads its TLS serving
+# cert from this directory at startup — mgr.Start() returns an error and the
+# whole manager exits if tls.crt/tls.key are absent, before the reconciler
+# ever runs. This canary installs no WebhookConfiguration (only the CRD), so
+# the apiserver never calls the webhook; the cert only has to exist for the
+# server to bind. Mint a throwaway self-signed pair — nothing verifies it.
+# The cert dir must match controller-runtime's default webhook CertDir,
+# which is os.TempDir()/k8s-webhook-server/serving-certs — i.e. honour
+# TMPDIR (unset on the CI runner, so this resolves to /tmp there).
+webhook_cert_dir="${TMPDIR:-/tmp}/k8s-webhook-server/serving-certs"
+mkdir -p "$webhook_cert_dir"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=c2-canary-webhook" \
+  -keyout "$webhook_cert_dir/tls.key" -out "$webhook_cert_dir/tls.crt" >/dev/null 2>&1
+
 ./bin/controller --leader-elect=false >/tmp/c2-canary-controller.log 2>&1 &
 controller_pid=$!
 

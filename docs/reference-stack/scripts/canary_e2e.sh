@@ -88,8 +88,14 @@ done
 log "engine healthy"
 
 # --- start the policy server + subscriber ----------------------------------
+# The server refuses to start unless controller-facing auth is configured:
+# either --allowed-controller-sa (production, needs an apiserver to run
+# TokenReview against) or the named --insecure-disable-auth escape hatch.
+# This canary runs the server as a bare host process with no apiserver, and
+# only drives the gRPC ingest + index path, so it uses the escape hatch.
 log "starting policy server"
 ./bin/server --grpc-bind-address=":$SERVER_GRPC_PORT" --http-bind-address=":$SERVER_HTTP_PORT" \
+  --insecure-disable-auth \
   >/tmp/canary-server.log 2>&1 &
 server_pid=$!
 for _ in $(seq 1 30); do
