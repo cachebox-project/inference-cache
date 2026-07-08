@@ -694,23 +694,24 @@ log "CacheIndex CRD serves deprecated status.tenants[].memoryUsed (retained, alw
 
 # --- CacheIndex harmonized-pointer status fields ---------------------------
 # hitRate (status.replicas[] and status.tenants[]) and status.tenants[].indexEntries
-# use the "nil = not yet reported" pointer convention, aligned with the
-# per-instance CacheBackend/CacheTenant surfaces. Pointer-ness is not visible in
-# the OpenAPI schema (a *string still serves as type: string), but the fields
-# must be served with the expected leaf types by the installed CRD — this proves
-# the harmonized codegen shipped in the bundle, not just the repo. On the empty
-# cluster the poller writes no tenant/replica rows, so the value-level nil
-# behavior is exercised by the envtest suite; here we assert the served schema.
+# use the "nil = not yet reported / computed" pointer convention, aligned with
+# the per-instance CacheBackend/CacheTenant surfaces. Pointer-ness itself is NOT
+# visible in the OpenAPI schema (a *string still serves as type: string, a
+# *int64 as type: integer), so this check only proves the fields still exist
+# with their expected scalar leaf types in the installed bundle — the guard is
+# against an accidental field drop/rename or a codegen change that alters the
+# served type. The value-level nil-vs-observed-0 behavior is exercised by the
+# envtest suite (persisted-shape assertions), not here.
 if [ "$(ci_field_type 'status.properties.replicas.items.properties.hitRate')" != "string" ]; then
-  fail "CacheIndex CRD status.replicas[].hitRate is not served as type string (pointer-harmonize codegen not installed)"
+  fail "CacheIndex CRD status.replicas[].hitRate is not served as type string"
 fi
 if [ "$(ci_field_type 'status.properties.tenants.items.properties.hitRate')" != "string" ]; then
-  fail "CacheIndex CRD status.tenants[].hitRate is not served as type string (pointer-harmonize codegen not installed)"
+  fail "CacheIndex CRD status.tenants[].hitRate is not served as type string"
 fi
 if [ "$(ci_field_type 'status.properties.tenants.items.properties.indexEntries')" != "integer" ]; then
-  fail "CacheIndex CRD status.tenants[].indexEntries is not served as type integer (pointer-harmonize codegen not installed)"
+  fail "CacheIndex CRD status.tenants[].indexEntries is not served as type integer"
 fi
-log "CacheIndex CRD serves harmonized status.{replicas,tenants}[].hitRate + status.tenants[].indexEntries (nil = not yet reported)"
+log "CacheIndex CRD serves status.{replicas,tenants}[].hitRate (string) + status.tenants[].indexEntries (integer)"
 
 # --- CachePolicy push + printer-column setup --------------------------------
 # Apply a CachePolicy in a dedicated namespace and verify its operator-facing
