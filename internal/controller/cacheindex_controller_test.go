@@ -738,11 +738,14 @@ func TestRefreshNoChurnOnIdenticalSnapshot(t *testing.T) {
 	}
 }
 
-// TestRefreshHitRateStaysNil: HitRate aggregation is intentionally deferred
-// because the snapshot's per-replica HitRate has no presence bit — a real 0%
-// hit rate is indistinguishable from "not reported". Until the stats-reporter
-// follow-up adds a presence signal to the snapshot, status.indexParticipation
-// .hitRate stays nil regardless of replica values.
+// TestRefreshHitRateStaysNil: per-backend indexParticipation.hitRate stays nil
+// even when the snapshot's replicas carry a hit rate AND the StatsReported
+// presence bit. The cluster-aggregate CacheIndex projection consumes that bit,
+// but the per-backend path aggregates many replicas onto one backend with no
+// defined backend-level hit-rate reduction, so backend hit-rate aggregation is
+// deliberately deferred to a follow-up; a fabricated value would mislead
+// operators. This pins that deferral so a future change to emit it is a
+// deliberate, tested one.
 func TestRefreshHitRateStaysNil(t *testing.T) {
 	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
 	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
@@ -750,8 +753,8 @@ func TestRefreshHitRateStaysNil(t *testing.T) {
 	var mu sync.Mutex
 	served := index.Snapshot{
 		Replicas: []index.ReplicaSnapshot{
-			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, HitRate: 0.75, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, HitRate: 0.85, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, HitRate: 0.75, StatsReported: true, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
+			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, HitRate: 0.85, StatsReported: true, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
 	p, cl, srv := buildPollerWithFixtures(t,

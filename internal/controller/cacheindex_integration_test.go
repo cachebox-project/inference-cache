@@ -279,6 +279,33 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		if ci.Status.Prefixes.Summary.Total != 1 {
 			t.Fatalf("controller status update did not persist through status subresource; total = %d, want 1", ci.Status.Prefixes.Summary.Total)
 		}
+		// Pointer/omitempty is the core CRD-facing change, so assert the
+		// PERSISTED shape (post structural-pruning + codegen), not just the
+		// typed decode: the tenant row here reported no stats (HitRateReported
+		// false), so status.tenants[0].hitRate must be OMITTED (nil sentinel),
+		// while indexEntries — always set on an emitted row — must be present.
+		if ci.Status.Tenants[0].HitRate != nil {
+			t.Fatalf("typed tenant hitRate = %q, want nil (no stats reported)", *ci.Status.Tenants[0].HitRate)
+		}
+		raw := getCacheIndexUnstructured(ctx, t, k8s, "cacheindex-status-only-it")
+		tenantsRaw, found, err := unstructured.NestedSlice(raw.Object, "status", "tenants")
+		if err != nil || !found || len(tenantsRaw) != 1 {
+			t.Fatalf("persisted status.tenants = (found=%v err=%v len=%d), want exactly one row", found, err, len(tenantsRaw))
+		}
+		row, ok := tenantsRaw[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("persisted tenant row is not a map: %#v", tenantsRaw[0])
+		}
+		if _, hasHitRate := row["hitRate"]; hasHitRate {
+			t.Fatalf("persisted status.tenants[0].hitRate present = %#v, want the key omitted (nil = not reported)", row["hitRate"])
+		}
+		entries, hasEntries := row["indexEntries"]
+		if !hasEntries {
+			t.Fatal("persisted status.tenants[0].indexEntries is missing, want present (always set on an emitted row)")
+		}
+		if got, _ := entries.(int64); got != 1 {
+			t.Fatalf("persisted status.tenants[0].indexEntries = %v, want 1", entries)
+		}
 	})
 }
 

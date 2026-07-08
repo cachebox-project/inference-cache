@@ -269,9 +269,15 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 //     claim any replica and is skipped; otherwise EngineSelector would
 //     match every pod by vacuous truth and steal everyone else's stats.
 //
-// Per-replica HitRate stays nil until the snapshot carries an explicit
-// presence bit for it (planned with the stats-reporter follow-up).
-// Surfacing a fabricated 0 here would mislead operators.
+// Per-backend indexParticipation.HitRate stays nil here. The snapshot now
+// carries a per-replica presence bit (ReplicaSnapshot.StatsReported) that the
+// cluster-aggregate CacheIndex projection uses, but this per-backend path
+// aggregates MANY replicas onto one backend and has no defined
+// backend-level hit-rate reduction (mean? token-weighted? across which
+// replicas — stats-bearing only?). Emitting one without that decision would be
+// arbitrary, and a fabricated 0 would mislead operators, so backend hit-rate
+// aggregation is deliberately left to a follow-up; the presence bit added by
+// the pointer-harmonize change is consumed only by CacheIndex.status.
 func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap index.Snapshot) error {
 	var backends cachev1alpha1.CacheBackendList
 	if err := p.Client.List(ctx, &backends); err != nil {

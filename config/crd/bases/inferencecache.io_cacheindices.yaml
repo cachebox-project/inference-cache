@@ -63,7 +63,7 @@ spec:
               reflects from the server's in-memory index. Metadata only — never KV tensors
               or prompt text.
 
-              Pointer- status-field convention: a status field that must distinguish "not
+              Pointer status-field convention: a status field that must distinguish "not
               yet observed" from a real zero/empty value uses a pointer type, and the same
               shape is used on both the per-instance surface (CacheBackend/CacheTenant
               status) and this cluster-aggregate surface, so operators reading kubectl
@@ -139,7 +139,7 @@ spec:
                         A nil pointer means "not yet reported" (the replica's stats reporter has
                         not emitted a hit rate yet), distinct from an observed "0" (a real 0%
                         hit rate). This mirrors CacheBackend.status.indexParticipation.hitRate;
-                        see the pointer- status-field convention on CacheIndexStatus.
+                        see the pointer status-field convention on CacheIndexStatus.
                       type: string
                     id:
                       description: ID is the replica identifier (the engine/pod that
@@ -187,7 +187,7 @@ spec:
                         string (e.g. "0.82").
 
                         A nil pointer means "not yet reported" (no replica of this tenant has
-                        emitted stats yet), distinct from an observed "0". See the pointer-
+                        emitted stats yet), distinct from an observed "0". See the pointer
                         status-field convention on CacheIndexStatus.
                       type: string
                     id:
@@ -203,7 +203,7 @@ spec:
 
                         A nil pointer means "not yet computed" (no snapshot observed), distinct
                         from an observed 0 (the tenant holds zero prefixes). This mirrors
-                        CacheTenant.status.indexEntries; see the pointer- status-field
+                        CacheTenant.status.indexEntries; see the pointer status-field
                         convention on CacheIndexStatus.
                       format: int64
                       type: integer

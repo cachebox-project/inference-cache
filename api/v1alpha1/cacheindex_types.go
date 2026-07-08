@@ -32,7 +32,7 @@ type ReplicaCacheStatus struct {
 	// A nil pointer means "not yet reported" (the replica's stats reporter has
 	// not emitted a hit rate yet), distinct from an observed "0" (a real 0%
 	// hit rate). This mirrors CacheBackend.status.indexParticipation.hitRate;
-	// see the pointer- status-field convention on CacheIndexStatus.
+	// see the pointer status-field convention on CacheIndexStatus.
 	// +optional
 	HitRate *string `json:"hitRate,omitempty"`
 	// Pressure is the replica's memory-pressure heuristic in [0,1], as a decimal
@@ -59,7 +59,7 @@ type TenantCacheStatus struct {
 	//
 	// A nil pointer means "not yet computed" (no snapshot observed), distinct
 	// from an observed 0 (the tenant holds zero prefixes). This mirrors
-	// CacheTenant.status.indexEntries; see the pointer- status-field
+	// CacheTenant.status.indexEntries; see the pointer status-field
 	// convention on CacheIndexStatus.
 	// +optional
 	IndexEntries *int64 `json:"indexEntries,omitempty"`
@@ -67,7 +67,7 @@ type TenantCacheStatus struct {
 	// string (e.g. "0.82").
 	//
 	// A nil pointer means "not yet reported" (no replica of this tenant has
-	// emitted stats yet), distinct from an observed "0". See the pointer-
+	// emitted stats yet), distinct from an observed "0". See the pointer
 	// status-field convention on CacheIndexStatus.
 	// +optional
 	HitRate *string `json:"hitRate,omitempty"`
@@ -114,7 +114,7 @@ type PrefixStatus struct {
 // reflects from the server's in-memory index. Metadata only — never KV tensors
 // or prompt text.
 //
-// Pointer- status-field convention: a status field that must distinguish "not
+// Pointer status-field convention: a status field that must distinguish "not
 // yet observed" from a real zero/empty value uses a pointer type, and the same
 // shape is used on both the per-instance surface (CacheBackend/CacheTenant
 // status) and this cluster-aggregate surface, so operators reading kubectl
