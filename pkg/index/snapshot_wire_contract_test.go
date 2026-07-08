@@ -114,7 +114,9 @@ func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
 }
 
 // TestSnapshotJSONOptionalTagWireShape pins the actual wire-emission
-// behaviour for the two ReplicaSnapshot fields tagged ",omitempty":
+// behaviour for two ReplicaSnapshot fields whose omitempty semantics are
+// subtle (other fields also carry ",omitempty" — e.g. statsReported and the
+// T2 counters — but their behaviour is the ordinary basic-type one):
 //
 //   - `Tenant string` — omitempty works on strings, so an empty Tenant
 //     omits the key entirely. Older controllers built against the

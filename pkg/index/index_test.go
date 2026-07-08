@@ -431,11 +431,14 @@ func TestSnapshotAggregates(t *testing.T) {
 }
 
 // TestSnapshotPresenceBitsDistinguishAbsentFromZero pins the absent-vs-zero
-// signal the CacheIndex status projection relies on to keep the aggregate
-// HitRate nil (not a fabricated "0") for a replica/tenant whose stats reporter
-// has not emitted yet. A prefix-only Ingest (no Stats) records index entries
-// but no stats row: the replica must report StatsReported=false and the tenant
-// HitRateReported=false, while IndexEntries still reflects the real count.
+// presence bits the CacheIndex status projection relies on. A prefix-only
+// Ingest (no Stats) records index entries but no stats row: the replica reports
+// StatsReported=false and the tenant HitRateReported=false, while IndexEntries
+// still reflects the real count. Downstream, the controller keeps the
+// cluster-aggregate tenant hitRate nil for such a tenant; note a stats-less
+// replica is dropped from CacheIndex.status.replicas[] entirely (the
+// LastUpdate.IsZero() filter), so the nil-hitRate case is only observable on
+// the tenant surface — this test asserts the snapshot-level bits that feed it.
 func TestSnapshotPresenceBitsDistinguishAbsentFromZero(t *testing.T) {
 	idx := New()
 	// Prefix-only report: two distinct prefixes, no Stats payload.
