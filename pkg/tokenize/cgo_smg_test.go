@@ -146,6 +146,10 @@ func TestCgoUnsafeModelIDsFailOpenWithoutCacheMutation(t *testing.T) {
 			if !errors.Is(err, ErrUnavailable) {
 				t.Fatalf("Encode err = %v, want ErrUnavailable", err)
 			}
+			_, err = tk.EncodeText(context.Background(), model, "hi", EncodeOptions{})
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("EncodeText err = %v, want ErrUnavailable", err)
+			}
 		})
 	}
 	if got := len(tk.handles); got != before {
