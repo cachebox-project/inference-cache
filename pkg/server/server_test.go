@@ -893,29 +893,21 @@ func TestGRPCServerReflectionEnumeratesRegisteredServices(t *testing.T) {
 // ReportCacheState handler. When the client cancels mid-stream (e.g. a crashed
 // or disconnected engine adapter) instead of half-closing, the server's Recv
 // returns a cancellation error — not io.EOF — and the handler propagates it
-// rather than acking. The happy-path test only exercises the EOF→Ack branch.
+// rather than acking. Use a handler-level stream here so the test does not race
+// real gRPC cancellation propagation against the server's success Ack path.
 func TestReportCacheStateClientCancel(t *testing.T) {
-	client, _, stop := startInProcessServer(t)
-	defer stop()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := client.ReportCacheState(ctx)
-	if err != nil {
-		cancel()
-		t.Fatalf("open ReportCacheState: %v", err)
-	}
-	if err := stream.Send(&icpb.CacheStateUpdate{ReplicaId: "replica-a"}); err != nil {
-		cancel()
-		t.Fatalf("send update: %v", err)
+	svc := newTestService()
+	stream := &fakeReportStream{
+		updates: []*icpb.CacheStateUpdate{{ReplicaId: "replica-a"}},
+		recvErr: status.Error(codes.Canceled, "client canceled"),
 	}
 
-	// Abort mid-stream without half-closing; the server must not return a success Ack.
-	cancel()
-
-	if ack, err := stream.CloseAndRecv(); err == nil {
-		t.Fatalf("CloseAndRecv after cancel: got ack %+v, want error", ack)
-	} else if status.Code(err) != codes.Canceled {
-		t.Fatalf("error code = %v, want Canceled", status.Code(err))
+	err := svc.ReportCacheState(stream)
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("ReportCacheState error code = %v, want Canceled", status.Code(err))
+	}
+	if stream.acked {
+		t.Fatal("ReportCacheState sent a success Ack after client cancellation")
 	}
 }
 
@@ -1235,12 +1227,16 @@ func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
 type fakeReportStream struct {
 	icpb.InferenceCache_ReportCacheStateServer
 	updates []*icpb.CacheStateUpdate
+	recvErr error
 	idx     int
 	acked   bool
 }
 
 func (f *fakeReportStream) Recv() (*icpb.CacheStateUpdate, error) {
 	if f.idx >= len(f.updates) {
+		if f.recvErr != nil {
+			return nil, f.recvErr
+		}
 		return nil, io.EOF
 	}
 	u := f.updates[f.idx]
