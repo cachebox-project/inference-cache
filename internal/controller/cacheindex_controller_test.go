@@ -116,21 +116,26 @@ func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
 
 // TestBuildCacheIndexStatusHitRateNilWhenUnreported pins the harmonized
 // pointer-ness: the cluster-aggregate HitRate (*string) stays nil when the
-// stats reporter has not emitted yet, so a not-yet-reported replica / tenant is
-// distinguishable from an observed 0% hit rate — matching the per-backend
+// stats reporter has not emitted yet, so "not reported" is distinguishable from
+// an observed 0% hit rate — matching the per-backend
 // CacheBackend.status.indexParticipation.hitRate and per-tenant
 // CacheTenant.status.indexEntries surfaces. IndexEntries (*int64) is always
 // present on an emitted tenant row (a real observed count), never a fabricated
 // nil.
+//
+// Note the replica surface only ever emits rows that passed the
+// LastUpdate.IsZero() filter (prefix-only replicas are dropped upstream), and
+// the skew fallback treats a non-zero LastUpdate as "reported", so an emitted
+// replica row always carries a HitRate. The genuinely-nil case therefore lives
+// on the tenant surface (index entries observed, no replica stats reported yet)
+// — that is what this test pins.
 func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	snap := index.Snapshot{
 		TotalPrefixes: 4,
 		Replicas: []index.ReplicaSnapshot{
-			// Emitted row (non-zero LastUpdate) but the stats reporter has not
-			// pinged: HitRate must stay nil, not "0".
-			{ReplicaID: "r-unreported", Tenant: "ns-a", LastUpdate: now, StatsReported: false},
-			// Stats-bearing replica: HitRate present.
+			// Stats-bearing replica reporting a real 0% hit rate: HitRate is
+			// present as "0", NOT nil — an observed zero, not an absence.
 			{ReplicaID: "r-reported", Tenant: "ns-a", HitRate: 0, LastUpdate: now, StatsReported: true},
 		},
 		Tenants: []index.TenantSnapshot{
@@ -148,9 +153,6 @@ func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
 	byReplica := map[string]cachev1alpha1.ReplicaCacheStatus{}
 	for _, r := range st.Replicas {
 		byReplica[r.ID] = r
-	}
-	if r := byReplica["r-unreported"]; r.HitRate != nil {
-		t.Fatalf("r-unreported HitRate = %q, want nil (stats reporter has not pinged)", *r.HitRate)
 	}
 	if r := byReplica["r-reported"]; r.HitRate == nil || *r.HitRate != "0" {
 		t.Fatalf("r-reported HitRate = %v, want a real \"0\" (observed 0%%, distinct from unreported nil)", derefStr(r.HitRate))
@@ -173,6 +175,35 @@ func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
 	}
 	if tr.IndexEntries == nil || *tr.IndexEntries != 0 {
 		t.Fatalf("t-reported IndexEntries = %v, want a present 0 (observed zero, not nil)", tr.IndexEntries)
+	}
+}
+
+// TestBuildCacheIndexStatusSkewFallbackPreservesOldServerHitRate pins the
+// new-controller/old-server skew fallback: an older /snapshot producer does not
+// send the statsReported / hitRateReported presence bits (they decode false),
+// but a non-zero LastUpdate (replica) / non-zero HitRate (tenant) proves it DID
+// report stats. The controller must still emit those hit rates on a
+// controller-first rollout rather than dropping a real value.
+func TestBuildCacheIndexStatusSkewFallbackPreservesOldServerHitRate(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	// Simulate an old server: presence bits unset, but real reported values.
+	snap := index.Snapshot{
+		TotalPrefixes: 3,
+		Replicas: []index.ReplicaSnapshot{
+			{ReplicaID: "r-old", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.66, LastUpdate: now, StatsReported: false},
+		},
+		Tenants: []index.TenantSnapshot{
+			{TenantID: "t-old", IndexEntries: 3, HitRate: 0.66, HitRateReported: false},
+		},
+	}
+
+	st := buildCacheIndexStatus(snap, "http://server/snapshot", now)
+
+	if len(st.Replicas) != 1 || st.Replicas[0].HitRate == nil || *st.Replicas[0].HitRate != "0.66" {
+		t.Fatalf("old-server replica hitRate = %v, want \"0.66\" via lastUpdate skew fallback", derefStr(st.Replicas[0].HitRate))
+	}
+	if len(st.Tenants) != 1 || st.Tenants[0].HitRate == nil || *st.Tenants[0].HitRate != "0.66" {
+		t.Fatalf("old-server tenant hitRate = %v, want \"0.66\" via non-zero-HitRate skew fallback", derefStr(st.Tenants[0].HitRate))
 	}
 }
 

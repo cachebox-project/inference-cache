@@ -649,11 +649,15 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		}
 		// HitRate is a *string that must stay nil when the replica's stats
 		// reporter hasn't emitted yet — a fabricated "0" reads as a real 0%
-		// hit rate. The rows here already come from stats-bearing replicas
-		// (StatsReported), since prefix-only replicas were dropped above by the
-		// LastUpdate.IsZero() filter; branch on the presence bit for clarity and
-		// so the shape stays honest if that filter ever changes.
-		if r.StatsReported {
+		// hit rate. Emit it when the presence bit is set OR (skew fallback) the
+		// row has a non-zero LastUpdate: an OLDER /snapshot producer does not
+		// send statsReported (decodes false), but a non-zero lastUpdate means it
+		// DID report stats, so we must not drop its real hitRate on a
+		// controller-first rollout. Every row here already passed the
+		// LastUpdate.IsZero() filter above, so a new server (which sets
+		// StatsReported whenever it has a stats entry, i.e. a lastUpdate) and an
+		// old server agree via this fallback.
+		if r.StatsReported || !r.LastUpdate.IsZero() {
 			row.HitRate = ptrTo(formatRate(r.HitRate))
 		}
 		st.Replicas = append(st.Replicas, row)
@@ -677,8 +681,15 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		}
 		// HitRate stays nil until a replica of this tenant has reported stats
 		// (HitRateReported), so an observed mean of 0 is distinguishable from
-		// "no stats reported yet".
-		if t.HitRateReported {
+		// "no stats reported yet". Skew fallback: an OLDER /snapshot producer
+		// does not send hitRateReported (decodes false) but does send a non-zero
+		// mean HitRate when it had samples, so a non-zero HitRate means it
+		// reported — don't drop it on a controller-first rollout. The only
+		// residual old-server ambiguity is a genuine 0% mean, which has no
+		// signal on the old wire and reads as nil (the same "0"-vs-unreported
+		// ambiguity this change removes for new servers); acceptable degradation
+		// until the server side ships the presence bit.
+		if t.HitRateReported || t.HitRate != 0 {
 			row.HitRate = ptrTo(formatRate(t.HitRate))
 		}
 		st.Tenants = append(st.Tenants, row)
