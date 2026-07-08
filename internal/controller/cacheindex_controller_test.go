@@ -802,7 +802,7 @@ func TestRefreshHitRateStaysNil(t *testing.T) {
 		t.Fatal("backend-a participation should be populated (prefixCount + lastEventAt)")
 	}
 	if a.Status.IndexParticipation.HitRate != nil {
-		t.Fatalf("HitRate should be nil while the snapshot lacks a presence bit, got %q", *a.Status.IndexParticipation.HitRate)
+		t.Fatalf("backend indexParticipation.HitRate should be nil (backend hit-rate aggregation is deliberately deferred even though the snapshot's StatsReported bit is set), got %q", *a.Status.IndexParticipation.HitRate)
 	}
 }
 
