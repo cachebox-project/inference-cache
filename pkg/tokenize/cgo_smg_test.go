@@ -3,14 +3,20 @@
 package tokenize
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
 const testModel = "test-model"
+const goldenTokenizerModel = "Qwen/Qwen2.5-0.5B-Instruct"
 
 // newTestTokenizer builds a tokenizer with a single model loaded directly from
 // IC_TEST_TOKENIZER (a local tokenizer dir/tokenizer.json or an HF model id,
@@ -66,6 +72,39 @@ func TestCgoTokenizerEncodeTextWorks(t *testing.T) {
 	}
 }
 
+func TestCgoTokenizerGoldenTextMatchesFingerprintChain(t *testing.T) {
+	if ref := os.Getenv("IC_TEST_TOKENIZER"); ref != "" && ref != goldenTokenizerModel {
+		t.Skipf("golden token vector is pinned to %s; got IC_TEST_TOKENIZER=%s", goldenTokenizerModel, ref)
+	}
+	g := loadTokenizerGolden(t)
+	if g.Model != goldenTokenizerModel {
+		t.Fatalf("tokenizer golden model = %q, want %q", g.Model, goldenTokenizerModel)
+	}
+	tk := newTestTokenizer(t)
+
+	ids, err := tk.EncodeText(context.Background(), testModel, g.Text, EncodeOptions{})
+	if err != nil {
+		t.Fatalf("EncodeText: %v", err)
+	}
+	if !equalU32(ids, g.Tokens) {
+		t.Fatalf("EncodeText tokens = %v, want golden vector tokens %v", ids, g.Tokens)
+	}
+
+	hashes, counts := fingerprint.Chain(ids, g.BlockSize)
+	if len(hashes) != len(g.PrefixHashes) {
+		t.Fatalf("fingerprint.Chain produced %d hashes, want %d", len(hashes), len(g.PrefixHashes))
+	}
+	for i, got := range hashes {
+		want := decodeGoldenHash(t, g.PrefixHashes[i].B64BE)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("prefix_hash[%d] = %x, want %x", i, got, want)
+		}
+		if counts[i] != int32(g.BlockSize) {
+			t.Fatalf("block_token_counts[%d] = %d, want %d", i, counts[i], g.BlockSize)
+		}
+	}
+}
+
 // Hermetic (no network): without a vetted models directory the cgo build loads
 // no tokenizer (the prompt_text path then fails open to NO_HINT downstream).
 func TestCgoNewEmptyDirIsUnavailable(t *testing.T) {
@@ -83,6 +122,38 @@ func TestCgoUnknownModelFailsOpen(t *testing.T) {
 	_, err := tk.Encode(context.Background(), "not-loaded", []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Errorf("Encode err = %v, want ErrUnavailable (model not in vetted dir)", err)
+	}
+}
+
+func TestCgoUnsafeModelIDsFailOpenWithoutCacheMutation(t *testing.T) {
+	tk, ok := New(Config{ModelsDir: t.TempDir()}).(*smgTokenizer)
+	if !ok {
+		t.Fatal("New(Config{ModelsDir}) did not return *smgTokenizer under smgcgo")
+	}
+	before := len(tk.handles)
+	for _, model := range []string{
+		"../secret",
+		"models/../../secret",
+		"/var/tmp/tokenizer",
+		"Qwen//Qwen2.5-0.5B-Instruct",
+		"Qwen/./Qwen2.5-0.5B-Instruct",
+		`Qwen\Qwen2.5-0.5B-Instruct`,
+		"C:/models/Qwen",
+		`C:\models\Qwen`,
+	} {
+		t.Run(model, func(t *testing.T) {
+			_, err := tk.Encode(context.Background(), model, []Message{{Role: "user", Content: "hi"}}, EncodeOptions{})
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("Encode err = %v, want ErrUnavailable", err)
+			}
+			_, err = tk.EncodeText(context.Background(), model, "hi", EncodeOptions{})
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("EncodeText err = %v, want ErrUnavailable", err)
+			}
+		})
+	}
+	if got := len(tk.handles); got != before {
+		t.Fatalf("tokenizer cache grew from %d to %d after unsafe request model_ids", before, got)
 	}
 }
 
@@ -121,6 +192,35 @@ func TestDiscoverModelsKeysByRelativePath(t *testing.T) {
 	}
 }
 
+func TestSafeModelID(t *testing.T) {
+	for _, model := range []string{
+		"gpt2",
+		"Qwen/Qwen2.5-0.5B-Instruct",
+		"meta-llama/Llama-3.1-8B-Instruct",
+	} {
+		if !safeModelID(model) {
+			t.Errorf("safeModelID(%q) = false, want true", model)
+		}
+	}
+	for _, model := range []string{
+		"",
+		".",
+		"..",
+		"../secret",
+		"models/../../secret",
+		"/absolute/model",
+		"Qwen//model",
+		"Qwen/./model",
+		`Qwen\model`,
+		"C:/models/qwen",
+		`C:\models\qwen`,
+	} {
+		if safeModelID(model) {
+			t.Errorf("safeModelID(%q) = true, want false", model)
+		}
+	}
+}
+
 func equalU32(a, b []uint32) bool {
 	if len(a) != len(b) {
 		return false
@@ -131,4 +231,41 @@ func equalU32(a, b []uint32) bool {
 		}
 	}
 	return true
+}
+
+type goldenHash struct {
+	B64BE string `json:"b64be"`
+}
+
+type tokenizerGolden struct {
+	Model        string       `json:"model"`
+	Text         string       `json:"text"`
+	Tokens       []uint32     `json:"tokens"`
+	BlockSize    int          `json:"block_size"`
+	PrefixHashes []goldenHash `json:"prefix_hashes"`
+}
+
+func loadTokenizerGolden(t *testing.T) tokenizerGolden {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/qwen_hello_world_golden.json")
+	if err != nil {
+		t.Fatalf("read tokenizer golden vector: %v", err)
+	}
+	var g tokenizerGolden
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatalf("parse tokenizer golden vector: %v", err)
+	}
+	return g
+}
+
+func decodeGoldenHash(t *testing.T, b64 string) []byte {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("decode golden hash %q: %v", b64, err)
+	}
+	if len(b) != 8 {
+		t.Fatalf("decode golden hash %q: got %d bytes, want 8", b64, len(b))
+	}
+	return b
 }

@@ -130,7 +130,7 @@ The check (Makefile + `.githooks/pre-commit` + CI) scans every tracked file exce
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + golangci-lint + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. The same set of checks runs in CI.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + golangci-lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then `make verify-samples` (server-side dry-run of every YAML under `config/samples/` against an envtest apiserver + the CacheBackend admission webhook), then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged).
