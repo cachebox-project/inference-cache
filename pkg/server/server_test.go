@@ -1223,7 +1223,7 @@ func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
 	}
 }
 
-// fakeReportStream replays a fixed slice of updates and signals EOF.
+// fakeReportStream replays a fixed slice of updates, then signals EOF or recvErr.
 type fakeReportStream struct {
 	icpb.InferenceCache_ReportCacheStateServer
 	updates []*icpb.CacheStateUpdate
