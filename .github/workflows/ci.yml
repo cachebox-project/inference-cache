@@ -229,6 +229,8 @@ jobs:
   tokenize-cgo:
     name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
     runs-on: ubuntu-latest
+    env:
+      RUST_TOOLCHAIN: 1.92.0
     strategy:
       fail-fast: false
       matrix:
@@ -248,8 +250,8 @@ jobs:
 
     - name: Setup Rust
       run: |
-        rustup toolchain install stable --profile minimal
-        rustup default stable
+        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+        rustup default "$RUST_TOOLCHAIN"
         rustc --version
         cargo --version
 
