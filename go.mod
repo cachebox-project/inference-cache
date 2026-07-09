@@ -1,6 +1,6 @@
 module github.com/cachebox-project/inference-cache
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/evanphx/json-patch/v5 v5.9.11
