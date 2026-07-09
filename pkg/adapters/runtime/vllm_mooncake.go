@@ -43,11 +43,13 @@ const (
 	// Overridable via backendConfig.serverImage (production should pin to a
 	// digest there).
 	//
-	// The reference is FULLY QUALIFIED (docker.io/...) on purpose: CRI-O nodes
-	// reject a bare short name ("short-name … did not resolve to an alias, and
-	// no containers-registries.conf was found"), so an unqualified default
-	// ImagePullBackOffs on any CRI-O-based cluster. containerd accepts either
-	// form, so the explicit registry is strictly safer.
+	// The reference is FULLY QUALIFIED (docker.io/...) on purpose: a CRI-O node
+	// without short-name resolution configured (registry aliases or an
+	// unqualified-search-registries list — the common default) rejects a bare
+	// short name ("short-name … did not resolve to an alias, and no
+	// containers-registries.conf was found"), so an unqualified default
+	// ImagePullBackOffs there. containerd resolves short names against
+	// docker.io by default, but the explicit registry is safe on both.
 	//
 	// TODO(cachebox): digest-pin before production. That `mooncake_master` is on
 	// PATH and the RPC / metadata / metrics ports (50051 / 8080 / 9003) match

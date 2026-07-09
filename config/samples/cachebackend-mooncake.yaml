@@ -53,14 +53,15 @@ spec:
     # so the index keys per-replica entries by model. Omit (or set empty)
     # to skip the subscriber sidecar (engine wiring still happens).
     model: meta-llama/Meta-Llama-3-8B-Instruct
-    # Matches the pinned adapter default (the only version tag published on
-    # Docker Hub, version-aligned with mooncake-transfer-engine 0.3.11.post1
-    # on PyPI). The image's entrypoint/ports are pinned-but-not-yet-cluster-
-    # validated (tracked reference-stack follow-up) — a wrong image surfaces
-    # as the CacheBackend staying Ready=False (the RPC readiness probe never
-    # passes), never a silent miss, and the cache is fail-open regardless.
-    # Pin to an `@sha256:` digest for non-local runs.
-    serverImage: kvcacheai/mooncake:0.3.11.post1
+    # Matches the pinned adapter default. Fully qualified (docker.io/...) so
+    # CRI-O nodes without short-name resolution configured don't reject it;
+    # version-aligned with mooncake-transfer-engine 0.3.11.post1 on PyPI. The
+    # master entrypoint + RPC/metadata/metrics ports are confirmed against the
+    # real image on a live cluster; digest-pinning is the remaining hardening.
+    # A wrong image surfaces as the CacheBackend staying Ready=False (the RPC
+    # readiness probe never passes), never a silent miss, and the cache is
+    # fail-open regardless. Pin to an `@sha256:` digest for non-local runs.
+    serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1
     # Override `serverCommand` to change the master's flags (a different
     # metadata backend, HA mode, etc.). The default launches the master with
     # its RPC port, Prometheus metrics port, and the embedded HTTP metadata

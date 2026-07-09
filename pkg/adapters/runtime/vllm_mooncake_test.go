@@ -145,10 +145,11 @@ func TestVLLMMooncakeResolveCacheServerImageOverride(t *testing.T) {
 }
 
 // TestVLLMMooncakeDefaultImageFullyQualified guards against a regression to a
-// bare short name in defaultMooncakeMasterImage. CRI-O nodes reject short names
-// ("short-name … did not resolve to an alias"), so the default MUST carry an
-// explicit registry host (e.g. docker.io/...). containerd accepts either form,
-// so a fully-qualified reference is strictly safer.
+// bare short name in defaultMooncakeMasterImage. A CRI-O node without short-name
+// resolution configured rejects short names ("short-name … did not resolve to an
+// alias"), so the default MUST carry an explicit registry host (e.g.
+// docker.io/...). containerd resolves short names by default, but a
+// fully-qualified reference is safe on both.
 func TestVLLMMooncakeDefaultImageFullyQualified(t *testing.T) {
 	registry, rest, ok := strings.Cut(defaultMooncakeMasterImage, "/")
 	if !ok {
@@ -158,7 +159,7 @@ func TestVLLMMooncakeDefaultImageFullyQualified(t *testing.T) {
 	// registry host: it contains a '.' or ':' (host[:port]) or is "localhost".
 	if !strings.ContainsAny(registry, ".:") && registry != "localhost" {
 		t.Fatalf("default image %q is a short name (registry segment %q is not a host, path %q); "+
-			"CRI-O nodes reject short names — fully-qualify it (e.g. docker.io/...)",
+			"CRI-O without short-name resolution configured rejects it — fully-qualify it (e.g. docker.io/...)",
 			defaultMooncakeMasterImage, registry, rest)
 	}
 }
