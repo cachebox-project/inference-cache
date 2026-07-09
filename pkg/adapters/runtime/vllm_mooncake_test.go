@@ -3,6 +3,7 @@ package runtime
 import (
 	"flag"
 	"io"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -140,6 +141,25 @@ func TestVLLMMooncakeResolveCacheServerImageOverride(t *testing.T) {
 	pod := resolvePod(t, a, cb)
 	if got := pod.Containers[0].Image; got != "registry.example.com/mooncake@sha256:abc" {
 		t.Fatalf("image override ignored: got %q", got)
+	}
+}
+
+// TestVLLMMooncakeDefaultImageFullyQualified guards against a regression to a
+// bare short name in defaultMooncakeMasterImage. CRI-O nodes reject short names
+// ("short-name … did not resolve to an alias"), so the default MUST carry an
+// explicit registry host (e.g. docker.io/...). containerd accepts either form,
+// so a fully-qualified reference is strictly safer.
+func TestVLLMMooncakeDefaultImageFullyQualified(t *testing.T) {
+	registry, rest, ok := strings.Cut(defaultMooncakeMasterImage, "/")
+	if !ok {
+		t.Fatalf("default image %q has no registry host (no %q separator)", defaultMooncakeMasterImage, "/")
+	}
+	// A reference is fully qualified when the segment before the first slash is a
+	// registry host: it contains a '.' or ':' (host[:port]) or is "localhost".
+	if !strings.ContainsAny(registry, ".:") && registry != "localhost" {
+		t.Fatalf("default image %q is a short name (registry segment %q is not a host, path %q); "+
+			"CRI-O nodes reject short names — fully-qualify it (e.g. docker.io/...)",
+			defaultMooncakeMasterImage, registry, rest)
 	}
 }
 
