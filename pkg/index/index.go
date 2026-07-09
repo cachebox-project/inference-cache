@@ -1632,6 +1632,15 @@ type ReplicaSnapshot struct {
 	LastUpdate       time.Time `json:"lastUpdate"`
 	PrefixCount      int       `json:"prefixCount"`
 	LastEventAt      time.Time `json:"lastEventAt,omitempty"`
+	// StatsReported is true once the replica's stats reporter has emitted at
+	// least one stats payload (the replica appears in the stats map). It is the
+	// presence bit that lets a consumer distinguish an observed 0 hit rate /
+	// pressure / memory from "not yet reported": a replica known only through
+	// reported prefixes (Ingest) but no stats payload has StatsReported=false and
+	// zero-valued HitRate/Pressure/CacheMemoryBytes/LastUpdate. The CacheIndex
+	// status projection uses it to leave the cluster-aggregate replica hitRate
+	// nil rather than fabricating "0" (see internal/controller).
+	StatsReported bool `json:"statsReported,omitempty"`
 	// T2HitTokens / T2QueryTokens carry the replica's cumulative tier-2
 	// (external offload) reload token counters across the /snapshot wire.
 	T2HitTokens   int64 `json:"t2HitTokens,omitempty"`
@@ -1656,6 +1665,15 @@ type TenantSnapshot struct {
 	TenantID     string  `json:"tenantId"`
 	IndexEntries int64   `json:"indexEntries"`
 	HitRate      float32 `json:"hitRate"`
+	// HitRateReported is true once at least one replica of this tenant has
+	// reported stats (the hit-rate average had n > 0 samples). It is the
+	// presence bit that distinguishes an observed mean hit rate of 0 from "no
+	// replica has reported stats yet": a tenant known only through reported
+	// prefixes (index entries) but no replica stats has HitRateReported=false
+	// and a zero-valued HitRate. The CacheIndex status projection uses it to
+	// leave the cluster-aggregate tenant hitRate nil rather than fabricating
+	// "0" (see internal/controller).
+	HitRateReported bool `json:"hitRateReported,omitempty"`
 	// Deprecated: always 0; read ReplicaSnapshot.CacheMemoryBytes instead.
 	MemoryUsed int64 `json:"memoryUsed"`
 }
@@ -1748,6 +1766,11 @@ func (i *Index) Snapshot() Snapshot {
 			r.T2HitTokens = s.stats.T2HitTokens
 			r.T2QueryTokens = s.stats.T2QueryTokens
 			r.LastUpdate = s.lastSeen
+			// Presence of a stats entry is the "stats reporter emitted" signal;
+			// a prefix-only replica (in prefixByReplica but not here) stays
+			// StatsReported=false so consumers can tell an observed 0 from
+			// "not yet reported".
+			r.StatsReported = true
 		}
 		if a, ok := prefixByReplica[tr]; ok {
 			r.PrefixCount = a.count
@@ -1786,15 +1809,22 @@ func (i *Index) Snapshot() Snapshot {
 		}
 		tenantSeen[t] = struct{}{}
 		var hit float32
+		var hitReported bool
 		if a := byTenant[t]; a != nil {
 			if a.n > 0 {
 				hit = float32(a.sumHit / float64(a.n))
+				// n > 0 means at least one replica reported stats for the
+				// tenant — the "stats reporter emitted" signal for the tenant's
+				// mean hit rate. A tenant with index entries but no stats stays
+				// HitRateReported=false so an observed 0 is distinguishable.
+				hitReported = true
 			}
 		}
 		snap.Tenants = append(snap.Tenants, TenantSnapshot{
-			TenantID:     t,
-			IndexEntries: agg.PerTenant[t],
-			HitRate:      hit,
+			TenantID:        t,
+			IndexEntries:    agg.PerTenant[t],
+			HitRate:         hit,
+			HitRateReported: hitReported,
 		})
 	}
 	for t := range byTenant {

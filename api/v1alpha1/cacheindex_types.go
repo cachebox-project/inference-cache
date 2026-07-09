@@ -28,8 +28,13 @@ type ReplicaCacheStatus struct {
 	// HitRate is the replica's rolling cache hit rate in [0,1], as a decimal
 	// string (e.g. "0.78"). A string is used because CRDs avoid floats for
 	// cross-language portability.
+	//
+	// A nil pointer means "not yet reported" (the replica's stats reporter has
+	// not emitted a hit rate yet), distinct from an observed "0" (a real 0%
+	// hit rate). This mirrors CacheBackend.status.indexParticipation.hitRate;
+	// see the pointer status-field convention on CacheIndexStatus.
 	// +optional
-	HitRate string `json:"hitRate,omitempty"`
+	HitRate *string `json:"hitRate,omitempty"`
 	// Pressure is the replica's memory-pressure heuristic in [0,1], as a decimal
 	// string (e.g. "0.65").
 	// +optional
@@ -51,12 +56,21 @@ type TenantCacheStatus struct {
 	// IndexEntries is the number of distinct prefixes the tenant holds in the
 	// index. Across all tenant rows these sum to prefixes.summary.total by
 	// construction — the per-tenant breakdown of the cluster prefix count.
+	//
+	// A nil pointer means "not yet computed" (no snapshot observed), distinct
+	// from an observed 0 (the tenant holds zero prefixes). This mirrors
+	// CacheTenant.status.indexEntries; see the pointer status-field
+	// convention on CacheIndexStatus.
 	// +optional
-	IndexEntries int64 `json:"indexEntries,omitempty"`
+	IndexEntries *int64 `json:"indexEntries,omitempty"`
 	// HitRate is the tenant's mean replica hit rate in [0,1], as a decimal
 	// string (e.g. "0.82").
+	//
+	// A nil pointer means "not yet reported" (no replica of this tenant has
+	// emitted stats yet), distinct from an observed "0". See the pointer
+	// status-field convention on CacheIndexStatus.
 	// +optional
-	HitRate string `json:"hitRate,omitempty"`
+	HitRate *string `json:"hitRate,omitempty"`
 	// MemoryUsed is deprecated and always 0. Per-tenant memory is not honestly
 	// attributable on a shared engine: ReplicaStats.cache_memory_bytes is the
 	// engine total across ALL tenants on a replica, so summing it per tenant
@@ -99,6 +113,16 @@ type PrefixStatus struct {
 // CacheIndexStatus is the observed, cluster-wide cache aggregate the controller
 // reflects from the server's in-memory index. Metadata only — never KV tensors
 // or prompt text.
+//
+// Pointer status-field convention: a status field that must distinguish "not
+// yet observed" from a real zero/empty value uses a pointer type, and the same
+// shape is used on both the per-instance surface (CacheBackend/CacheTenant
+// status) and this cluster-aggregate surface, so operators reading kubectl
+// output across the two see the same "nil = unreported" sentinel. HitRate
+// (*string) and IndexEntries (*int64) below follow it, matching
+// CacheBackend.status.indexParticipation.hitRate and
+// CacheTenant.status.indexEntries respectively. Fields that are always defined
+// (e.g. prefixes.summary.total) stay non-pointer.
 type CacheIndexStatus struct {
 	// Replicas is the per-replica cache health. Map-list keyed on `id`
 	// (the v1alpha1 surface; unchanged for backward compatibility). The

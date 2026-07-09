@@ -43,11 +43,13 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				HitRate:          0.75,
 				Pressure:         0.25,
 				LastUpdate:       lastUpdate,
+				StatsReported:    true,
 			}},
 			Tenants: []index.TenantSnapshot{{
-				TenantID:     "tenant-a",
-				IndexEntries: 7,
-				HitRate:      0.75,
+				TenantID:        "tenant-a",
+				IndexEntries:    7,
+				HitRate:         0.75,
+				HitRateReported: true,
 			}},
 		}
 		srv := newSnapshotServer(t, &snap, nil)
@@ -92,17 +94,17 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		}
 		replica := ci.Status.Replicas[0]
 		if replica.ID != "vllm-0" || replica.Tenant != "tenant-a" ||
-			replica.CacheMemoryBytes != 2048 || replica.HitRate != "0.75" ||
+			replica.CacheMemoryBytes != 2048 || replica.HitRate == nil || *replica.HitRate != "0.75" ||
 			replica.Pressure != "0.25" || !replica.LastUpdate.Time.Equal(lastUpdate) {
-			t.Fatalf("replica status = %+v, want vllm-0 tenant-a memory/hit/pressure/lastUpdate from snapshot", replica)
+			t.Fatalf("replica status = %+v (hitRate=%v), want vllm-0 tenant-a memory/hit/pressure/lastUpdate from snapshot", replica, derefStr(replica.HitRate))
 		}
 		if len(ci.Status.Tenants) != 1 {
 			t.Fatalf("tenants = %+v, want exactly one row", ci.Status.Tenants)
 		}
 		tenant := ci.Status.Tenants[0]
-		if tenant.ID != "tenant-a" || tenant.IndexEntries != 7 ||
-			tenant.HitRate != "0.75" {
-			t.Fatalf("tenant status = %+v, want tenant-a aggregate from snapshot", tenant)
+		if tenant.ID != "tenant-a" || tenant.IndexEntries == nil || *tenant.IndexEntries != 7 ||
+			tenant.HitRate == nil || *tenant.HitRate != "0.75" {
+			t.Fatalf("tenant status = %+v (indexEntries=%v hitRate=%v), want tenant-a aggregate from snapshot", tenant, tenant.IndexEntries, derefStr(tenant.HitRate))
 		}
 		// Persisted-status guard for the deprecated tenants[].memoryUsed: it must
 		// serialize as an explicit 0, NOT be dropped by omitempty, so the
@@ -145,8 +147,9 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				CacheMemoryBytes: 100,
 				HitRate:          0.8,
 				LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
+				StatsReported:    true,
 			}},
-			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8}},
+			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8, HitRateReported: true}},
 		}
 		var requests int
 		srv := newSnapshotServer(t, &served, &snapshotServerHooks{
@@ -195,8 +198,9 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 					CacheMemoryBytes: 500,
 					HitRate:          0.9,
 					LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
+					StatsReported:    true,
 				}},
-				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9}},
+				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9, HitRateReported: true}},
 			}
 		}()
 
@@ -211,7 +215,8 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			len(ci.Status.Replicas) != 1 ||
 			ci.Status.Replicas[0].CacheMemoryBytes != 500 ||
 			len(ci.Status.Tenants) != 1 ||
-			ci.Status.Tenants[0].IndexEntries != 9 {
+			ci.Status.Tenants[0].IndexEntries == nil ||
+			*ci.Status.Tenants[0].IndexEntries != 9 {
 			t.Fatalf("changed status = %+v, want updated total/replica/tenant from second snapshot", ci.Status)
 		}
 	})
@@ -273,6 +278,33 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 		ci := getCacheIndex(ctx, t, k8s, "cacheindex-status-only-it")
 		if ci.Status.Prefixes.Summary.Total != 1 {
 			t.Fatalf("controller status update did not persist through status subresource; total = %d, want 1", ci.Status.Prefixes.Summary.Total)
+		}
+		// Pointer/omitempty is the core CRD-facing change, so assert the
+		// PERSISTED shape (post structural-pruning + codegen), not just the
+		// typed decode: the tenant row here reported no stats (HitRateReported
+		// false), so status.tenants[0].hitRate must be OMITTED (nil sentinel),
+		// while indexEntries — always set on an emitted row — must be present.
+		if ci.Status.Tenants[0].HitRate != nil {
+			t.Fatalf("typed tenant hitRate = %q, want nil (no stats reported)", *ci.Status.Tenants[0].HitRate)
+		}
+		raw := getCacheIndexUnstructured(ctx, t, k8s, "cacheindex-status-only-it")
+		tenantsRaw, found, err := unstructured.NestedSlice(raw.Object, "status", "tenants")
+		if err != nil || !found || len(tenantsRaw) != 1 {
+			t.Fatalf("persisted status.tenants = (found=%v err=%v len=%d), want exactly one row", found, err, len(tenantsRaw))
+		}
+		row, ok := tenantsRaw[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("persisted tenant row is not a map: %#v", tenantsRaw[0])
+		}
+		if _, hasHitRate := row["hitRate"]; hasHitRate {
+			t.Fatalf("persisted status.tenants[0].hitRate present = %#v, want the key omitted (nil = not reported)", row["hitRate"])
+		}
+		entries, hasEntries := row["indexEntries"]
+		if !hasEntries {
+			t.Fatal("persisted status.tenants[0].indexEntries is missing, want present (always set on an emitted row)")
+		}
+		if got, _ := entries.(int64); got != 1 {
+			t.Fatalf("persisted status.tenants[0].indexEntries = %v, want 1", entries)
 		}
 	})
 }

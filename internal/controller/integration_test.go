@@ -1551,7 +1551,9 @@ func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
 	var sawUntenanted, sawTeam bool
 	var sum int64
 	for _, tn := range ci.Status.Tenants {
-		sum += tn.IndexEntries
+		if tn.IndexEntries != nil {
+			sum += *tn.IndexEntries
+		}
 		switch tn.ID {
 		case "":
 			sawUntenanted = true

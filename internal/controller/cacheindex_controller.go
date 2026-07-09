@@ -269,9 +269,15 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 //     claim any replica and is skipped; otherwise EngineSelector would
 //     match every pod by vacuous truth and steal everyone else's stats.
 //
-// Per-replica HitRate stays nil until the snapshot carries an explicit
-// presence bit for it (planned with the stats-reporter follow-up).
-// Surfacing a fabricated 0 here would mislead operators.
+// Per-backend indexParticipation.HitRate stays nil here. The snapshot now
+// carries a per-replica presence bit (ReplicaSnapshot.StatsReported) that the
+// cluster-aggregate CacheIndex projection uses, but this per-backend path
+// aggregates MANY replicas onto one backend and has no defined
+// backend-level hit-rate reduction (mean? token-weighted? across which
+// replicas — stats-bearing only?). Emitting one without that decision would be
+// arbitrary, and a fabricated 0 would mislead operators, so backend hit-rate
+// aggregation is deliberately left to a follow-up; the presence bit added by
+// the pointer-harmonize change is consumed only by CacheIndex.status.
 func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap index.Snapshot) error {
 	var backends cachev1alpha1.CacheBackendList
 	if err := p.Client.List(ctx, &backends); err != nil {
@@ -634,31 +640,66 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 		byID[r.ReplicaID] = r
 	}
 	for _, r := range byID {
-		st.Replicas = append(st.Replicas, cachev1alpha1.ReplicaCacheStatus{
+		row := cachev1alpha1.ReplicaCacheStatus{
 			ID:               r.ReplicaID,
 			Tenant:           r.Tenant,
 			CacheMemoryBytes: r.CacheMemoryBytes,
-			HitRate:          formatRate(r.HitRate),
 			Pressure:         formatRate(r.Pressure),
 			LastUpdate:       metav1.NewTime(r.LastUpdate),
-		})
+		}
+		// HitRate is a *string that must stay nil when the replica's stats
+		// reporter hasn't emitted yet — a fabricated "0" reads as a real 0%
+		// hit rate. Emit it when the presence bit is set OR (skew fallback) the
+		// row has a non-zero LastUpdate: an OLDER /snapshot producer does not
+		// send statsReported (decodes false), but a non-zero lastUpdate means it
+		// DID report stats, so we must not drop its real hitRate on a
+		// controller-first rollout. Every row here already passed the
+		// LastUpdate.IsZero() filter above, so a new server (which sets
+		// StatsReported whenever it has a stats entry, i.e. a lastUpdate) and an
+		// old server agree via this fallback.
+		if r.StatsReported || !r.LastUpdate.IsZero() {
+			row.HitRate = ptrTo(formatRate(r.HitRate))
+		}
+		st.Replicas = append(st.Replicas, row)
 	}
 	sort.Slice(st.Replicas, func(a, b int) bool { return st.Replicas[a].ID < st.Replicas[b].ID })
 	for _, t := range snap.Tenants {
-		st.Tenants = append(st.Tenants, cachev1alpha1.TenantCacheStatus{
-			ID:           t.TenantID,
-			IndexEntries: t.IndexEntries,
-			HitRate:      formatRate(t.HitRate),
+		row := cachev1alpha1.TenantCacheStatus{
+			ID: t.TenantID,
+			// IndexEntries is a *int64. The cluster aggregate always carries a
+			// real count when it emits a tenant row (this projection only runs
+			// after a successful scrape), so it is always present here; nil is
+			// reserved for "not yet computed" to match
+			// CacheTenant.status.indexEntries.
+			IndexEntries: ptrTo(t.IndexEntries),
 			// Deprecated field, hard-zeroed here (NOT copied from the snapshot):
 			// the controller is authoritative for keeping it 0 even when talking
 			// to an older/skewed server that still reports a non-zero (double-
 			// counted) per-tenant memory in its /snapshot. See
 			// TenantCacheStatus.MemoryUsed.
 			MemoryUsed: 0,
-		})
+		}
+		// HitRate stays nil until a replica of this tenant has reported stats
+		// (HitRateReported), so an observed mean of 0 is distinguishable from
+		// "no stats reported yet". Skew fallback: an OLDER /snapshot producer
+		// does not send hitRateReported (decodes false) but does send a non-zero
+		// mean HitRate when it had samples, so a non-zero HitRate means it
+		// reported — don't drop it on a controller-first rollout. The only
+		// residual old-server ambiguity is a genuine 0% mean, which has no
+		// signal on the old wire and reads as nil (the same "0"-vs-unreported
+		// ambiguity this change removes for new servers); acceptable degradation
+		// until the server side ships the presence bit.
+		if t.HitRateReported || t.HitRate != 0 {
+			row.HitRate = ptrTo(formatRate(t.HitRate))
+		}
+		st.Tenants = append(st.Tenants, row)
 	}
 	return st
 }
+
+// ptrTo returns a pointer to v. Used for the presence-aware CacheIndex status
+// fields (HitRate, IndexEntries) that stay nil when unreported.
+func ptrTo[T any](v T) *T { return &v }
 
 // formatRate renders a [0,1] rate as a short decimal string (float32 precision).
 func formatRate(f float32) string {
