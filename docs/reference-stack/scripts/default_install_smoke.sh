@@ -3286,7 +3286,7 @@ kubectl create namespace "$MOONCAKE_SMOKE_NS" --dry-run=client -o yaml | kubectl
 mc_cb_tmp="$(mktemp "$tmpdir/mooncake-cb.XXXXXX")"
 cp config/samples/cachebackend-mooncake.yaml "$mc_cb_tmp"
 mc_escaped_image="$(printf '%s' "$MOONCAKE_MASTER_IMAGE" | sed 's/[&|\\]/\\&/g')"
-sed -i.bak "s|serverImage: kvcacheai/mooncake:0.3.11.post1|serverImage: $mc_escaped_image|g" "$mc_cb_tmp"
+sed -i.bak "s|serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1|serverImage: $mc_escaped_image|g" "$mc_cb_tmp"
 rm -f "${mc_cb_tmp}.bak"
 
 log "applying Mooncake CacheBackend"

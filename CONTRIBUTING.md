@@ -6,7 +6,7 @@ Thanks for helping build inference-cache. This repository follows kubebuilder-st
 
 Requirements:
 
-- Go 1.26.4 or newer
+- Go 1.26.5 or newer
 - Make
 - Docker
 - kind

@@ -43,14 +43,19 @@ const (
 	// Overridable via backendConfig.serverImage (production should pin to a
 	// digest there).
 	//
-	// TODO(cachebox): wire-test and digest-pin before production. The tag and
-	// its multi-arch digests are confirmed published on Docker Hub and are
-	// version-aligned with the PyPI release, but the image's entrypoint / that
-	// `mooncake_master` is on PATH / the master/metadata ports were NOT
-	// independently verified here (the config blob was not layer-inspected).
-	// Confirm against a kind reference stack (the A2-equivalent Mooncake
-	// bring-up — see the CacheBackend API doc) and prefer an @sha256: digest.
-	// Do not substitute an invented digest.
+	// The reference is FULLY QUALIFIED (docker.io/...) on purpose: a CRI-O node
+	// without short-name resolution configured (registry aliases or an
+	// unqualified-search-registries list — the common default) rejects a bare
+	// short name ("short-name … did not resolve to an alias, and no
+	// containers-registries.conf was found"), so an unqualified default
+	// ImagePullBackOffs there. containerd resolves short names against
+	// docker.io by default, but the explicit registry is safe on both.
+	//
+	// TODO(cachebox): digest-pin before production. That `mooncake_master` is on
+	// PATH and the RPC / metadata / metrics ports (50051 / 8080 / 9003) match
+	// what this adapter renders are confirmed against the real image on a live
+	// cluster (the master boots and reaches serving); the remaining hardening is
+	// an @sha256: digest here. Do not substitute an invented digest.
 	//
 	// This default fails SAFE, not silently: if the image is wrong (no
 	// `mooncake_master` on PATH, different flags/ports) the master pod
@@ -62,7 +67,7 @@ const (
 	// prefill regardless, so a broken master is never a serving outage. An
 	// operator can repoint to a known-good image/digest via backendConfig
 	// .serverImage without a code change.
-	defaultMooncakeMasterImage = "kvcacheai/mooncake:0.3.11.post1"
+	defaultMooncakeMasterImage = "docker.io/kvcacheai/mooncake:0.3.11.post1"
 
 	// defaultMooncakeMasterRPCPort is the Mooncake master's RPC port — the
 	// address vLLM's LMCache connector dials via the mooncakestore:// URL.
