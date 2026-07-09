@@ -1,0 +1,26 @@
+# verify-samples: skip
+#
+# INTENTIONALLY INVALID fixture — NOT a shippable sample.
+#
+# This CacheBackend pairs spec.replicas=0 with an enabled spec.autoscaling that
+# leaves spec.autoscaling.minReplicas unset. The CacheBackend validating
+# admission webhook MUST reject this shape: with replicas=0 the defaulter
+# declines to stamp minReplicas (a 0 value would violate the schema's
+# Minimum=1), the apiserver would otherwise accept the CR with minReplicas
+# unset, and the reconciler's HPA fallback silently picks minReplicas=1 — so an
+# operator who wrote "scale to zero" gets "scale 1-N" with no notification.
+#
+# The default-install smoke gate applies this file and asserts the live
+# admission webhook rejects it with the locked wording AND that the CR is not
+# persisted. It is deliberately parked under config/samples/_test/ with the
+# `# verify-samples: skip` opt-out above so neither `make verify-samples` nor
+# the install-smoke apply-clean backstop treats it as a shippable sample.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: cachebackend-invalid-scale-to-zero-no-min
+spec:
+  type: LMCache
+  replicas: 0
+  autoscaling:
+    maxReplicas: 5

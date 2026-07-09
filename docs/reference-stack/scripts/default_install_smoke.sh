@@ -79,7 +79,12 @@
 #      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
-#      endpoint shape, and non-External + endpoint are rejected at write time).
+#      endpoint shape, and non-External + endpoint are rejected at write time),
+#      plus the scale-to-zero guard: a CacheBackend with spec.replicas=0 +
+#      spec.autoscaling enabled + nil spec.autoscaling.minReplicas is rejected
+#      at admission and NOT persisted (the operator-facing surface added by the
+#      defaulter-sweep; without the rule a "scale to zero" intent would silently
+#      become "scale 1-N" via the reconciler's HPA fallback).
 #   9b. The Events-only CacheBackend mode (spec.integration.mode=EventsOnly)
 #      end-to-end: applying an events-only LMCache CacheBackend renders NO owned
 #      Deployment/Service, keeps status.endpoint empty, latches no
@@ -2092,6 +2097,53 @@ if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_o
   fail "admission did not reject non-External + endpoint as expected; got: $reject_output"
 fi
 log "admission rejected External+missing-endpoint, External+https, External+empty-host, and non-External+endpoint"
+
+# --- CacheBackend admission: scale-to-zero + autoscaling + nil minReplicas ---
+# The installed validating webhook must reject the combination
+# spec.replicas=0 + spec.autoscaling enabled + nil spec.autoscaling.minReplicas.
+# With replicas=0 the defaulter declines to stamp minReplicas (a 0 value would
+# violate the schema's Minimum=1), so without this rule the apiserver would
+# accept the CR with minReplicas unset and the reconciler's HPA fallback would
+# silently pick minReplicas=1 — turning an operator's "scale to zero" into
+# "scale 1-N" with no notification. This is an operator-facing surface (an
+# operator hits it on `kubectl apply` of a misconfigured CR), so it needs a
+# real-install smoke assertion, not just the envtest/unit coverage.
+#
+# Uses a dedicated INTENTIONALLY-INVALID fixture parked under
+# config/samples/_test/ with a `# verify-samples: skip` opt-out so neither
+# `make verify-samples` nor the apply-clean backstop (final phase) treats it as
+# a shippable sample. The fixture omits a namespace, so it is applied into
+# $EXT_SMOKE_NS (still present here).
+scale_to_zero_fixture="config/samples/_test/cachebackend-invalid-scale-to-zero-no-min.yaml"
+scale_to_zero_name="cachebackend-invalid-scale-to-zero-no-min"
+log "asserting a replicas=0 + autoscaling + nil-minReplicas CacheBackend is rejected at admission"
+if scale_to_zero_out="$(kubectl apply -n "$EXT_SMOKE_NS" -f "$scale_to_zero_fixture" 2>&1)"; then
+  echo "$scale_to_zero_out"
+  fail "replicas=0 + autoscaling + nil minReplicas CacheBackend was admitted; the scale-to-zero-requires-explicit-minReplicas rule did not fire on the real install"
+fi
+# Match wording-stable substrings so a minor rewording of the message doesn't
+# break the gate, while still proving the rejection came from THIS rule and not
+# some unrelated admission failure (which would false-pass a bare exit-code
+# check). All three tokens are load-bearing phrases of the locked message.
+for token in "spec.replicas=0" "minReplicas" "scale to zero"; do
+  if ! grep -qF "$token" <<<"$scale_to_zero_out"; then
+    echo "$scale_to_zero_out"
+    fail "scale-to-zero CacheBackend was rejected, but not by the expected scale-to-zero-requires-explicit-minReplicas rule (missing substring '$token' in the admission message)"
+  fi
+done
+# The rejection must have prevented persistence — a rejected CREATE writes
+# nothing, so the object must be absent. `kubectl get` on a missing object exits
+# non-zero with "NotFound"; anything else (the CR present, or a different error)
+# means the reject-then-not-persisted contract broke.
+if get_out="$(kubectl get cachebackend -n "$EXT_SMOKE_NS" "$scale_to_zero_name" 2>&1)"; then
+  echo "$get_out"
+  fail "rejected scale-to-zero CacheBackend '$scale_to_zero_name' was persisted in $EXT_SMOKE_NS; admission reject must not create the object"
+fi
+if ! grep -q "NotFound\|not found" <<<"$get_out"; then
+  echo "$get_out"
+  fail "could not confirm scale-to-zero CacheBackend '$scale_to_zero_name' is absent (expected a NotFound, got an unexpected kubectl error): $get_out"
+fi
+log "replicas=0 + autoscaling + nil-minReplicas CacheBackend rejected at admission and not persisted"
 
 # Clean up — keeps the cluster reusable for KEEP_CLUSTER=1 reruns.
 kubectl delete pod -n "$EXT_SMOKE_NS" "$EXT_SMOKE_POD_NAME" --ignore-not-found --wait=false >/dev/null || true
