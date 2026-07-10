@@ -157,6 +157,25 @@ func TestIntegrationMooncakeHostNetworkAndHeadlessService(t *testing.T) {
 			t.Fatalf("strategy = %q, want %q (Deployment stranded on Recreate)",
 				got.Spec.Strategy.Type, appsv1.RollingUpdateDeploymentStrategyType)
 		}
+
+		// The Service must migrate too — headless -> virtual ClusterIP is the same
+		// immutable-field problem in reverse, and only a real apiserver both rejects
+		// the in-place update and allocates the replacement VIP. The reconcile above
+		// deletes the divergent Service; the next one recreates it.
+		var gone corev1.Service
+		switch err := k8s.Get(ctx, types.NamespacedName{Name: "cache", Namespace: ns}, &gone); {
+		case err == nil:
+			t.Fatalf("headless Service survived the switch (clusterIP %q); it must be recreated with a virtual IP",
+				gone.Spec.ClusterIP)
+		case !apierrors.IsNotFound(err):
+			t.Fatalf("get service: %v", err)
+		}
+
+		reconcile(t, r, "cache", ns)
+		svc := getService(t, r, "cache", ns)
+		if svc.Spec.ClusterIP == corev1.ClusterIPNone || svc.Spec.ClusterIP == "" {
+			t.Fatalf("recreated svc.Spec.ClusterIP = %q, want an apiserver-allocated virtual IP", svc.Spec.ClusterIP)
+		}
 	})
 
 	t.Run("RecreatesServiceStuckOnAnImmutableVirtualClusterIP", func(t *testing.T) {

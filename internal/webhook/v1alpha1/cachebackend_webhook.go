@@ -328,11 +328,18 @@ func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 // and moves zero KV — a silent failure. Say so out loud at apply time rather than
 // letting an operator discover it from a flat cache-hit graph.
 //
+// The text stays within [maxWarningLen]: the API conventions ask for concise
+// warnings so clients render them reliably, and a truncated warning is exactly the
+// silent failure this exists to prevent. The requirement and its consequence live
+// here; the full rationale (the mesh, node ports, Pod Security) lives in
+// docs/design/cachebackend-api.md.
+//
 // Remove this warning when engine-side hostNetwork injection lands.
-const mooncakeEngineHostNetworkWarning = "spec.type=Mooncake: the master is provisioned on the host network, but engine pods must ALSO run with " +
-	"hostNetwork for Mooncake's peer-to-peer transfer engine to reach it — the pod webhook does not inject that yet. Until you set hostNetwork on " +
-	"your engine workload, this backend will report Ready while transferring zero KV. The namespace must also permit hostNetwork (Pod Security " +
-	"'restricted' rejects it)."
+const mooncakeEngineHostNetworkWarning = "Mooncake: engine pods must also set hostNetwork (not auto-injected); without it the backend is Ready but moves no KV"
+
+// maxWarningLen is the concise-warning budget from the Kubernetes API conventions.
+// Longer text risks truncation or being dropped by clients.
+const maxWarningLen = 120
 
 func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {

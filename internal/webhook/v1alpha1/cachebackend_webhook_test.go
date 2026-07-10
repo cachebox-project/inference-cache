@@ -317,7 +317,7 @@ func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "engine pods must ALSO run with hostNetwork") {
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "engine pods must also set hostNetwork") {
 		t.Fatalf("create warnings = %v, want one warning naming the engine hostNetwork requirement", warnings)
 	}
 
@@ -329,6 +329,17 @@ func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
 	}
 	if len(warnings) != 1 {
 		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+	}
+}
+
+func TestValidator_WarningTextStaysConcise(t *testing.T) {
+	// The Kubernetes API conventions ask for warnings within a concise budget so
+	// clients render them reliably. A warning that gets truncated — or dropped — is
+	// exactly the silent failure this warning exists to prevent, so guard the budget
+	// here rather than trusting review to catch a future edit that pads it out.
+	if got := len(mooncakeEngineHostNetworkWarning); got > maxWarningLen {
+		t.Fatalf("warning is %d chars, want <= %d — put the detail in the docs, not the warning:\n%q",
+			got, maxWarningLen, mooncakeEngineHostNetworkWarning)
 	}
 }
 

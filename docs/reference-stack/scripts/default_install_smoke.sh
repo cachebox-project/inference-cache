@@ -3297,7 +3297,7 @@ log "applying Mooncake CacheBackend"
 # operators go back to receiving a backend that reports Ready and transfers zero KV.
 mc_apply_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" 2>&1)"
 case "$mc_apply_out" in
-  *"engine pods must ALSO run with hostNetwork"*)
+  *"engine pods must also set hostNetwork"*)
     log "Mooncake apply emitted the engine-hostNetwork admission warning" ;;
   *)
     printf '%s\n' "$mc_apply_out"
