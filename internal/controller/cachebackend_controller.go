@@ -966,7 +966,7 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 	pod := podSpec.DeepCopy()
 	applyPodOverrides(pod, backend.Spec.Template)
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      backend.Name,
 			Namespace: backend.Namespace,
@@ -981,6 +981,18 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 			},
 		},
 	}
+
+	// A hostNetwork cache-server binds its ports directly on the node, so the
+	// default RollingUpdate would surge a second pod onto the same host ports:
+	// it either fails the scheduler's NodePorts predicate (the API server
+	// defaults hostPort=containerPort for hostNetwork pods) or CrashLoops on
+	// bind until the old pod exits. Recreate tears the old pod down first.
+	// Only a backend whose data plane requires the host network renders one
+	// (Mooncake today); every other adapter keeps the default RollingUpdate.
+	if pod.HostNetwork {
+		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+	}
+	return dep
 }
 
 // buildService wraps the adapter-rendered Service spec into a Service the
@@ -1097,6 +1109,17 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 			} else {
 				dep.Spec.Replicas = desired.Spec.Replicas
 				reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
+				// The rollout strategy is part of the desired shape: a hostNetwork
+				// server must use Recreate or a rolling surge collides on the node's
+				// ports. Assign the whole struct (not just .Type) so the stale
+				// rollingUpdate block is cleared — the API server rejects Recreate
+				// while it is still populated. Only write when the adapter asks for
+				// an explicit strategy, so a pod-network backend keeps the
+				// API-server-defaulted RollingUpdate instead of churning it to zero.
+				if desired.Spec.Strategy.Type != "" &&
+					dep.Spec.Strategy.Type != desired.Spec.Strategy.Type {
+					dep.Spec.Strategy = desired.Spec.Strategy
+				}
 			}
 			if backend.Spec.Autoscaling != nil && liveReplicas != nil {
 				// Preserve the HPA's writes — but clamp to the configured floor so
@@ -1134,9 +1157,43 @@ func autoscalingFloor(spec *cachev1alpha1.CacheBackendAutoscalingSpec) int32 {
 // applyService creates or updates the backend Service idempotently, owned by the CR.
 // Type, selector, and ports are reconciled (so out-of-band drift is corrected); the
 // rendered ports carry Protocol=TCP so they match the API-server-defaulted object,
-// and the allocated fields (clusterIP, nodePort) live in separate fields we never
-// touch — so reconciling ports does not churn through the Owns(Service) watch.
+// and nodePort stays an allocated field we never touch — so reconciling ports does
+// not churn through the Owns(Service) watch.
+//
+// clusterIP is the exception. It is IMMUTABLE after creation and it is the field
+// that decides whether the Service is headless. A backend whose data plane is a
+// peer-to-peer mesh (Mooncake) must be headless, so the Service DNS name resolves
+// to the pod's (hostNetwork: node) IP with every dynamically negotiated port
+// reachable; a virtual ClusterIP forwards only the declared ports and strands the
+// mesh. Therefore:
+//   - on create we propagate the adapter's clusterIP (e.g. "None"),
+//   - on update we never touch it (immutable),
+//   - and when a live Service's headless-ness diverges from what the adapter now
+//     renders, we delete it so the next reconcile recreates it correctly. Without
+//     that, the in-place update would fail forever and the backend would stay
+//     silently broken — Ready, but transferring nothing.
 func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cachev1alpha1.CacheBackend, desired *corev1.Service) error {
+	var live corev1.Service
+	switch err := r.Get(ctx, client.ObjectKeyFromObject(desired), &live); {
+	case err == nil:
+		// Only ever delete a Service this CacheBackend controls.
+		if metav1.IsControlledBy(&live, backend) &&
+			headlessnessDiverges(live.Spec.ClusterIP, desired.Spec.ClusterIP) {
+			if delErr := r.Delete(ctx, &live); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("recreate service %s/%s for immutable clusterIP change: %w",
+					desired.Namespace, desired.Name, delErr)
+			}
+			log.FromContext(ctx).Info("deleted service to change immutable clusterIP; recreating",
+				"namespace", desired.Namespace, "name", desired.Name,
+				"liveClusterIP", live.Spec.ClusterIP, "desiredClusterIP", desired.Spec.ClusterIP)
+			// The Owns(Service) watch requeues on this delete; recreate on the next
+			// pass rather than racing a stale cache read inside CreateOrUpdate below.
+			return nil
+		}
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("get service %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
@@ -1144,6 +1201,11 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 			svc.Spec.Type = desired.Spec.Type
 			svc.Spec.Selector = desired.Spec.Selector
 			svc.Spec.Ports = desired.Spec.Ports
+			// Settable only at creation. On an existing Service this is already
+			// "None" or an allocated VIP, and a divergent one was deleted above.
+			if svc.Spec.ClusterIP == "" {
+				svc.Spec.ClusterIP = desired.Spec.ClusterIP
+			}
 			return controllerutil.SetControllerReference(backend, svc, r.Scheme)
 		})
 		return err
@@ -1152,6 +1214,20 @@ func (r *CacheBackendReconciler) applyService(ctx context.Context, backend *cach
 		return fmt.Errorf("apply service %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
 	return nil
+}
+
+// headlessnessDiverges reports whether a live Service's clusterIP allocation is
+// incompatible with what the adapter now renders. spec.clusterIP is immutable, so
+// a Service cannot be migrated in place between headless ("None") and a virtual
+// ClusterIP in either direction — it must be recreated.
+//
+// An empty live value means the API server has not assigned one yet; treat that as
+// "no divergence" so a transient read never triggers a delete.
+func headlessnessDiverges(live, desired string) bool {
+	if live == "" {
+		return false
+	}
+	return (live == corev1.ClusterIPNone) != (desired == corev1.ClusterIPNone)
 }
 
 // reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
@@ -1190,6 +1266,19 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	live.SchedulerName = desired.SchedulerName
 	live.RuntimeClassName = desired.RuntimeClassName
 	live.TerminationGracePeriodSeconds = desired.TerminationGracePeriodSeconds
+
+	// Host networking is part of the adapter's desired shape, not an
+	// API-server-defaulted field: a backend whose data plane is a peer-to-peer
+	// mesh (Mooncake) is unreachable on overlay pod IPs. Reconcile it on UPDATE
+	// too, or an already-provisioned backend would never migrate onto the host
+	// network and would keep transferring nothing.
+	live.HostNetwork = desired.HostNetwork
+	// dnsPolicy IS API-server-defaulted (ClusterFirst). Only write an explicit
+	// value, so a pod-network backend does not churn the template on every
+	// reconcile by resetting the field to "".
+	if desired.DNSPolicy != "" {
+		live.DNSPolicy = desired.DNSPolicy
+	}
 }
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend

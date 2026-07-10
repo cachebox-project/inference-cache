@@ -3321,6 +3321,38 @@ if [ "$mc_svc_port" != "50051" ]; then
   fail "Mooncake Service first port=$mc_svc_port, want 50051"
 fi
 
+# Mooncake's transfer engine is a peer-to-peer mesh: the master hands back a
+# directory pointer and the engine then dials a real node IP on a dynamically
+# negotiated port. Two provisioning properties make that reachable, and BOTH are
+# asserted here against the real install because losing either is silent — the
+# backend still reconciles and reports an endpoint while transferring zero KV.
+#
+#  - headless Service (clusterIP: None): a virtual ClusterIP forwards only the
+#    ports declared above and strands the dynamic ones.
+#  - hostNetwork master pod: CNI overlay pod IPs are not reachable for the mesh.
+mc_svc_clusterip="$(kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+if [ "$mc_svc_clusterip" != "None" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake Service clusterIP=$mc_svc_clusterip, want None (headless; a virtual IP strands the mesh's dynamic ports)"
+fi
+
+mc_host_network="$(kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null || true)"
+if [ "$mc_host_network" != "true" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake master hostNetwork=$mc_host_network, want true (overlay pod IPs are unreachable for the transfer-engine mesh)"
+fi
+
+# A hostNetwork pod binds the node's ports, so a rolling surge would collide.
+mc_strategy="$(kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.strategy.type}' 2>/dev/null || true)"
+if [ "$mc_strategy" != "Recreate" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake master rollout strategy=$mc_strategy, want Recreate (hostNetwork pods collide on the node's ports)"
+fi
+log "Mooncake master: hostNetwork=true, Recreate strategy, headless Service"
+
 # The managed Deployment must reach Available: the stand-in master accepts TCP
 # on 50051 so the controller-rendered readiness probe passes — proving
 # ResolveCacheServer rendered a workload that actually comes up under a real

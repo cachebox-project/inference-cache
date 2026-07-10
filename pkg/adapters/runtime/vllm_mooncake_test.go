@@ -126,6 +126,40 @@ func TestVLLMMooncakeResolveCacheServer(t *testing.T) {
 	}
 }
 
+// TestVLLMMooncakeResolveCacheServerHostNetworkAndHeadless pins the two properties
+// Mooncake's peer-to-peer transfer engine depends on. Without BOTH, the backend
+// reconciles Ready and transfers zero KV — validated on a real cluster, where the
+// master's key count never left 0.
+//
+//   - hostNetwork: the master on :50051 only returns a directory pointer; the
+//     engine then dials a real node IP on a dynamically negotiated port. CNI
+//     overlay pod IPs are not reachable for that mesh.
+//   - headless Service: a virtual ClusterIP forwards only the ports declared on
+//     it, stranding those dynamic ports. clusterIP=None makes the Service DNS name
+//     (which serviceEndpoint publishes into status.endpoint) resolve straight to
+//     the master's node IP with every port reachable.
+func TestVLLMMooncakeResolveCacheServerHostNetworkAndHeadless(t *testing.T) {
+	a := NewVLLMMooncakeAdapter()
+	pod, svc, err := a.ResolveCacheServer(newMooncakeBackend(nil))
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if !pod.HostNetwork {
+		t.Fatal("pod.HostNetwork = false; mooncake's transfer engine cannot run on overlay pod IPs")
+	}
+	if pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Fatalf("pod.DNSPolicy = %q, want %q (a hostNetwork pod must keep cluster DNS)",
+			pod.DNSPolicy, corev1.DNSClusterFirstWithHostNet)
+	}
+	if svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Fatalf("svc.Spec.ClusterIP = %q, want %q (headless)", svc.Spec.ClusterIP, corev1.ClusterIPNone)
+	}
+	// Headless is still Type=ClusterIP; the type must not have drifted.
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Fatalf("svc.Spec.Type = %q, want %q", svc.Spec.Type, corev1.ServiceTypeClusterIP)
+	}
+}
+
 func hasContainerPort(ports []corev1.ContainerPort, name string, port int32) bool {
 	for _, p := range ports {
 		if p.Name == name && p.ContainerPort == port {

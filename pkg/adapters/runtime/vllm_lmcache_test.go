@@ -113,6 +113,25 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	}
 }
 
+// TestVLLMLMCacheResolveCacheServerStaysPodNetworkAndVirtualIP bounds the blast
+// radius of the Mooncake hostNetwork/headless change. LMCache's lm:// server is a
+// single endpoint on one port, so it keeps the portable, non-privileged default:
+// an overlay pod behind a virtual ClusterIP. hostNetwork is reserved for backends
+// whose data plane genuinely cannot work without it.
+func TestVLLMLMCacheResolveCacheServerStaysPodNetworkAndVirtualIP(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	pod, svc, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if pod.HostNetwork {
+		t.Fatal("pod.HostNetwork = true; lmcache must stay on the pod network (portable, Pod-Security friendly)")
+	}
+	if svc.Spec.ClusterIP == corev1.ClusterIPNone {
+		t.Fatal("svc.Spec.ClusterIP = None; lmcache must keep a virtual ClusterIP")
+	}
+}
+
 func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	// Without a readiness probe on the lm:// port, AvailableReplicas (and
 	// therefore the CacheBackend's Ready condition) can flip True before

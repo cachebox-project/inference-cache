@@ -257,13 +257,39 @@ func (vllmMooncakeAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend)
 		Resources: defaultServerResources(cache),
 	}
 
+	// Mooncake's transfer engine is a peer-to-peer MESH, not a single-endpoint
+	// server like LMCache's lm://. The master on :50051 returns only a directory
+	// pointer ("block X lives on node B:<dynamic port>"); the engine then dials
+	// that node's real IP on a dynamically negotiated port to move the KV bytes.
+	// A ClusterIP Service forwards only the ports declared on it, and CNI overlay
+	// pod IPs are not reachable for the mesh — so an overlay+ClusterIP master
+	// transfers ZERO KV while the CacheBackend still reports Ready (the master's
+	// key count never leaves 0). The master therefore runs on the host network,
+	// and the Service below is headless so its DNS name resolves straight to the
+	// node IP with every mooncake port reachable.
+	//
+	// The cost is inherent to Mooncake, not a choice this adapter can avoid:
+	// hostNetwork needs a namespace that permits it (Pod Security "restricted"
+	// forbids it) and reserves the master's ports on its node.
 	pod := &corev1.PodSpec{
-		Containers: []corev1.Container{container},
+		Containers:  []corev1.Container{container},
+		HostNetwork: true,
+		// hostNetwork pods otherwise inherit the node's resolver; keep cluster DNS
+		// so in-cluster names still resolve from the master.
+		DNSPolicy: corev1.DNSClusterFirstWithHostNet,
 	}
 
 	svc := &corev1.Service{
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeClusterIP,
+			// HEADLESS (clusterIP: None). A ClusterIP virtual IP forwards only the
+			// ports declared below, stranding mooncake's dynamically negotiated data
+			// ports. Headless makes this Service's DNS name resolve directly to the
+			// (hostNetwork) master pod's IP — i.e. the node IP — with all ports
+			// reachable. serviceEndpoint() already publishes that DNS name into
+			// status.endpoint, so the engine's mooncakestore:// URL needs no
+			// special-casing, and the endpoint survives a master reschedule.
+			ClusterIP: corev1.ClusterIPNone,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       mooncakeRPCPortName,
