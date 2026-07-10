@@ -397,6 +397,24 @@ func TestValidator_DroppingEngineHostNetworkWithTheTypeFlipIsAccepted(t *testing
 	}
 }
 
+func TestValidator_EngineHostNetworkCannotGoInertViaEventsOnly(t *testing.T) {
+	// The other way engineHostNetwork could end up inert: an events-only backend
+	// wires no KV connector, so the Pod webhook never calls InjectEngineConfig and
+	// the flag would do nothing. Today that combination is already unreachable —
+	// rejectEventsOnlyMisconfiguration forbids EventsOnly on any managed type but
+	// LMCache, and engineHostNetwork is rejected on any type but Mooncake, so the
+	// two rules cross.
+	//
+	// Pinned because that safety is emergent, not stated: it comes from two
+	// independent rules meeting. Loosening either one — allowing events-only
+	// Mooncake, say — would silently open the inert-flag hole this asserts shut.
+	v := &CacheBackendValidator{}
+	cb := mooncakeBackendWithEngineHostNetwork(true)
+	cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+	requireInvalidWithCause(t, v, cb, "spec.integration.mode",
+		"is only supported with spec.type")
+}
+
 func TestValidator_WarningTextStaysConcise(t *testing.T) {
 	// The Kubernetes API conventions ask for warnings within a concise budget so
 	// clients render them reliably. A warning that gets truncated — or dropped — is
