@@ -318,8 +318,36 @@ func (vllmMooncakeAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend)
 // spec.integration.role maps onto LMCache's kv_role exactly as for the LMCache
 // adapter: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite (and
 // unset / unknown) → kv_both.
+//
+// When spec.integration.engineHostNetwork is set, the engine pod is also moved
+// onto the host network. Mooncake's transfer engine is a peer-to-peer mesh: the
+// master returns a directory pointer and the engine then dials a real node IP on
+// a dynamically negotiated port, which a CNI overlay pod IP cannot reach. That
+// move is gated on the operator's explicit opt-in rather than applied by default:
+// hostNetwork is a privilege, and because mutating webhooks run BEFORE Pod
+// Security validation, injecting it unasked would turn a working engine pod into
+// one a "restricted" namespace rejects — with an error naming Pod Security rather
+// than this controller. Until the operator opts in, admission warns that the
+// backend will report Ready while transferring nothing.
 func (vllmMooncakeAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	return enginewire.InjectVLLMMooncake(pod, endpoint, cache)
+	if err := enginewire.InjectVLLMMooncake(pod, endpoint, cache); err != nil {
+		return err
+	}
+	if EngineHostNetworkRequested(cache) {
+		pod.HostNetwork = true
+		// A hostNetwork pod otherwise inherits the node's resolver; keep cluster DNS
+		// so the master's Service name still resolves from the engine.
+		pod.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	}
+	return nil
+}
+
+// EngineHostNetworkRequested reports whether the operator opted engine pods bound
+// to this backend into host networking. Nil-safe: spec.integration is optional.
+// Exported so admission can enforce that the opt-in only appears on a backend
+// whose data plane actually needs it, rather than sitting inert.
+func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
+	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
 }
 
 // InjectRouterConfig is a no-op for Mooncake: the topology has no router

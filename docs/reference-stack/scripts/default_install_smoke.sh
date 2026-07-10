@@ -3290,18 +3290,35 @@ sed -i.bak "s|serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1|serverImage
 rm -f "${mc_cb_tmp}.bak"
 
 log "applying Mooncake CacheBackend"
-# Admission emits a warning on every Mooncake apply: the master is provisioned on
-# the host network, but Mooncake's transfer engine is a peer-to-peer mesh and the
-# ENGINE pods must run with hostNetwork too — which the pod webhook does not inject
-# yet. Assert the warning against the real install: if it ever silently disappears,
-# operators go back to receiving a backend that reports Ready and transfers zero KV.
+# Mooncake's transfer engine is a peer-to-peer mesh, so ENGINE pods must run with
+# hostNetwork too. That rewrites a pod the operator owns, so it is opt-in via
+# spec.integration.engineHostNetwork rather than injected. Both halves of that
+# contract are asserted against the real install, because both fail silently:
+#
+#   1. WITHOUT the opt-in, admission must WARN — otherwise the operator receives a
+#      backend that reports Ready and transfers zero KV, visible only as a flat
+#      cache-hit graph.
+#   2. WITH the opt-in (what the sample ships), the warning must be SILENT — a
+#      warning that keeps firing after the gap is closed trains operators to
+#      ignore warnings.
+mc_nooptin_tmp="$(mktemp "$tmpdir/mooncake-cb-nooptin.XXXXXX")"
+sed 's/^    engineHostNetwork: true$//' "$mc_cb_tmp" >"$mc_nooptin_tmp"
+mc_warn_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply --dry-run=server -f "$mc_nooptin_tmp" 2>&1)"
+case "$mc_warn_out" in
+  *"spec.integration.engineHostNetwork=true"*)
+    log "Mooncake without the opt-in emits the engine-hostNetwork admission warning" ;;
+  *)
+    printf '%s\n' "$mc_warn_out"
+    fail "Mooncake without spec.integration.engineHostNetwork did not warn (the incomplete data plane must stay loud)" ;;
+esac
+
 mc_apply_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" 2>&1)"
 case "$mc_apply_out" in
-  *"engine pods must also set hostNetwork"*)
-    log "Mooncake apply emitted the engine-hostNetwork admission warning" ;;
-  *)
+  *"engineHostNetwork"*)
     printf '%s\n' "$mc_apply_out"
-    fail "Mooncake apply did not emit the engine-hostNetwork admission warning (the incomplete managed path must stay loud)" ;;
+    fail "Mooncake WITH the opt-in still warned about engineHostNetwork; the warning must go quiet once the gap is closed" ;;
+  *)
+    log "Mooncake with the opt-in applies without the engine-hostNetwork warning" ;;
 esac
 
 # Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint

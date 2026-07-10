@@ -426,6 +426,30 @@ type CacheBackendIntegrationSpec struct {
 	// crashed engine. See the package doc for the rationale.
 	// +optional
 	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
+
+	// EngineHostNetwork opts engine pods bound to this backend into host
+	// networking. It exists for exactly one backend today: Mooncake, whose
+	// transfer engine is a peer-to-peer mesh — the engine dials a real node IP
+	// on a dynamically negotiated port, which a CNI overlay pod IP cannot do.
+	// Without this the backend reconciles Ready and transfers zero KV, and
+	// admission warns as much on every apply.
+	//
+	// This is opt-in, and deliberately not a default, because it rewrites the
+	// networking of a pod the operator owns:
+	//   - hostNetwork is a privilege. A Pod Security "restricted" namespace
+	//     rejects such a pod, and because mutating webhooks run BEFORE Pod
+	//     Security validation, silently injecting it would turn a working engine
+	//     pod into a rejected one — with an error that names Pod Security, not
+	//     this controller.
+	//   - The pod's ports move onto the node's interfaces, outside the pod
+	//     network. NetworkPolicy selects pods by pod IP and therefore stops
+	//     constraining them (see docs/design/cachebackend-api.md).
+	//
+	// Admission rejects this on any backend type that does not need it, so it
+	// can never sit inert on a CacheBackend.
+	//
+	// +optional
+	EngineHostNetwork bool `json:"engineHostNetwork,omitempty"`
 }
 
 // EngineInjectionOverrides is the in-between knob between "take the

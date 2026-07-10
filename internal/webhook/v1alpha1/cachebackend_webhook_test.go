@@ -303,22 +303,31 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 		"spec.type=External requires spec.endpoint")
 }
 
-func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
-	// The Phase-1 gap, made loud. The adapter provisions the master on hostNetwork,
-	// but Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run
-	// with hostNetwork too, and the pod webhook does not inject that yet. Without
-	// this warning the operator gets a backend that reports Ready and moves zero KV,
-	// discoverable only from a flat cache-hit graph.
-	v := &CacheBackendValidator{}
+func mooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBackend {
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	if cb.Spec.Integration == nil {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+	}
+	cb.Spec.Integration.EngineHostNetwork = optIn
+	return cb
+}
+
+func TestValidator_MooncakeWarnsUntilEngineHostNetworkOptIn(t *testing.T) {
+	// Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run with
+	// hostNetwork or the backend reports Ready and moves zero KV. That move rewrites
+	// a pod the operator owns, so it is opt-in rather than injected. Until they opt
+	// in, say so at apply time and name the exact field — otherwise the failure is
+	// discoverable only from a flat cache-hit graph.
+	v := &CacheBackendValidator{}
+	cb := mooncakeBackendWithEngineHostNetwork(false)
 
 	warnings, err := v.ValidateCreate(context.Background(), cb)
 	if err != nil {
 		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "engine pods must also set hostNetwork") {
-		t.Fatalf("create warnings = %v, want one warning naming the engine hostNetwork requirement", warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.engineHostNetwork=true") {
+		t.Fatalf("create warnings = %v, want one warning naming the opt-in field", warnings)
 	}
 
 	// It must persist across updates, not only on first apply — an operator who
@@ -329,6 +338,62 @@ func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
 	}
 	if len(warnings) != 1 {
 		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+	}
+}
+
+func TestValidator_MooncakeOptInSilencesTheWarning(t *testing.T) {
+	// Once the operator opts in, the pod webhook completes the data plane. A warning
+	// that keeps firing after the gap is closed trains operators to ignore warnings.
+	v := &CacheBackendValidator{}
+	cb := mooncakeBackendWithEngineHostNetwork(true)
+
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none once engineHostNetwork is set", warnings)
+	}
+}
+
+func TestValidator_EngineHostNetworkRejectedOnBackendThatDoesNotNeedIt(t *testing.T) {
+	// The flag would silently do nothing on a pod-network backend while leaving the
+	// operator convinced they had granted their engine host networking. hostNetwork
+	// is a privilege — a no-op that looks like it granted one is worse than an error.
+	v := &CacheBackendValidator{}
+	cb := mooncakeBackendWithEngineHostNetwork(true)
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	requireInvalidWithCause(t, v, cb, "spec.integration.engineHostNetwork",
+		"only meaningful for spec.type=Mooncake")
+}
+
+func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *testing.T) {
+	// The realistic way the flag rots: a Mooncake backend legitimately carrying
+	// engineHostNetwork=true is retyped to LMCache, and the flag rides along as a
+	// no-op that reads like a granted privilege.
+	//
+	// Worth pinning explicitly because ValidateUpdate only rejects errors the new
+	// object *introduces* — errors already present on the old object are filtered
+	// out. The old object here (Mooncake + flag) is valid, so the error IS newly
+	// introduced and must be caught. Nothing about that is obvious from the rule.
+	v := &CacheBackendValidator{}
+	old := mooncakeBackendWithEngineHostNetwork(true)
+	newCB := mooncakeBackendWithEngineHostNetwork(true)
+	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	requireUpdateInvalidWithCause(t, v, old, newCB, "spec.integration.engineHostNetwork",
+		"only meaningful for spec.type=Mooncake")
+}
+
+func TestValidator_DroppingEngineHostNetworkWithTheTypeFlipIsAccepted(t *testing.T) {
+	// The escape hatch the rejection above implies: retyping away from Mooncake is
+	// fine as long as the flag goes with it. If this failed, the rule would have
+	// wedged the object — rejecting both keeping and dropping the flag.
+	v := &CacheBackendValidator{}
+	old := mooncakeBackendWithEngineHostNetwork(true)
+	newCB := mooncakeBackendWithEngineHostNetwork(false)
+	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	if _, err := v.ValidateUpdate(context.Background(), old, newCB); err != nil {
+		t.Fatalf("retyping away from Mooncake while dropping engineHostNetwork must be accepted, got: %v", err)
 	}
 }
 

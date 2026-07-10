@@ -1,8 +1,20 @@
 # A managed Mooncake backend the controller reconciles into a standalone
-# mooncake_master Deployment + Service. Mooncake is the durable, network-
-# addressable / shared cache path (vs. the in-memory lmcache-server in
-# cachebackend-lmcache.yaml) — durability is a backend choice, not a volume
-# knob; see docs/design/lmcache-server-persistence.md.
+# mooncake_master Deployment + Service. Mooncake is the durable / shared cache
+# path (vs. the in-memory lmcache-server in cachebackend-lmcache.yaml) —
+# durability is a backend choice, not a volume knob; see
+# docs/design/lmcache-server-persistence.md.
+#
+# HOST NETWORKING IS REQUIRED, on both sides. Mooncake is not a single-endpoint
+# server like lm://: it is a peer-to-peer transfer-engine mesh. The master on
+# :50051 returns only a directory pointer ("this block lives on node B"), and
+# the engine then dials that node's real IP on a dynamically negotiated port. A
+# ClusterIP Service forwards only its declared ports, and CNI overlay pod IPs
+# are not reachable for the mesh — so the controller renders the master with
+# hostNetwork behind a HEADLESS Service, and engine pods must opt in via
+# spec.integration.engineHostNetwork below. Consequences: the namespace must
+# permit hostNetwork (Pod Security "restricted" rejects it), the master reserves
+# its ports on its node, and NetworkPolicy stops constraining those listeners
+# (it selects pod IPs). See docs/design/cachebackend-api.md.
 #
 # How the engine is wired: Mooncake integrates with vLLM as an LMCache *remote
 # backend*. Engine pods (vLLM) are user-owned; spec.engineSelector identifies
@@ -17,10 +29,15 @@
 # (the adapter merges, never clobbers). A pod can opt out per-instance with the
 # annotation `inferencecache.io/skip-inject`.
 #
-# Phase 1 manages a Deployment + ClusterIP Service exposing the Mooncake master
-# RPC port (50051, the mooncakestore:// endpoint the engine dials) plus the
-# master's embedded HTTP metadata port (8080), plus an optional
-# HorizontalPodAutoscaler from spec.autoscaling.
+# The controller manages a hostNetwork Deployment (Recreate strategy) + a
+# HEADLESS Service exposing the Mooncake master RPC port (50051, the
+# mooncakestore:// endpoint the engine dials) plus the master's embedded HTTP
+# metadata port (8080). The Service DNS name published in status.endpoint
+# therefore resolves straight to the master's node IP, with every port reachable.
+#
+# The master is a SINGLETON: spec.replicas > 1 and spec.autoscaling are rejected
+# at admission, because a second master either cannot bind the first's node ports
+# or comes up independently and silently splits the store.
 #
 # Operator note — transfer-engine config: the Mooncake transfer engine's static
 # tuning (metadata_server, protocol tcp/rdma, device_name, segment sizes) lives
@@ -44,6 +61,18 @@ spec:
     # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
     engine: vllm
     role: ReadWrite
+    # REQUIRED for a working Mooncake data plane. Moves matched engine pods onto
+    # the host network so they can dial the mesh's real node IPs; an overlay pod
+    # IP cannot, and the backend would report Ready while transferring zero KV
+    # (admission warns when this is unset).
+    #
+    # Opt-in, never injected by default: hostNetwork is a privilege, and mutating
+    # webhooks run BEFORE Pod Security validation — so silently adding it would
+    # turn a working engine pod into one a "restricted" namespace rejects, with
+    # an error naming Pod Security rather than this controller. Setting it here
+    # is the operator's explicit acknowledgement. Rejected on backend types that
+    # do not need it, so it can never sit inert.
+    engineHostNetwork: true
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
