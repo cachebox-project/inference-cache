@@ -143,6 +143,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectMooncakeMasterScaleOut,
+	rejectEngineHostNetworkOnBackendThatDoesNotNeedIt,
 	rejectResourceLimitsBelowRequests,
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
@@ -323,19 +324,19 @@ func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 // mooncakeEngineHostNetworkWarning names the one thing that still stands between a
 // Mooncake CacheBackend and working KV transfer. The adapter provisions the master
 // correctly (hostNetwork behind a headless Service), but Mooncake's transfer engine
-// is a peer-to-peer mesh: the ENGINE pods must run with host networking too, and
-// the pod webhook does not inject that yet. Without it the backend reconciles Ready
-// and moves zero KV — a silent failure. Say so out loud at apply time rather than
-// letting an operator discover it from a flat cache-hit graph.
+// is a peer-to-peer mesh: the ENGINE pods must run with host networking too. That
+// move rewrites a pod the operator owns and hostNetwork is a privilege, so it is
+// opt-in via spec.integration.engineHostNetwork rather than injected by default.
+// Until the operator opts in, the backend reconciles Ready and moves zero KV — a
+// silent failure. Say so out loud at apply time, pointing at the exact field,
+// rather than letting them discover it from a flat cache-hit graph.
 //
 // The text stays within [maxWarningLen]: the API conventions ask for concise
 // warnings so clients render them reliably, and a truncated warning is exactly the
-// silent failure this exists to prevent. The requirement and its consequence live
-// here; the full rationale (the mesh, node ports, Pod Security) lives in
+// silent failure this exists to prevent. The field and its consequence live here;
+// the full rationale (the mesh, node ports, Pod Security ordering) lives in
 // docs/design/cachebackend-api.md.
-//
-// Remove this warning when engine-side hostNetwork injection lands.
-const mooncakeEngineHostNetworkWarning = "Mooncake: engine pods must also set hostNetwork (not auto-injected); without it the backend is Ready but moves no KV"
+const mooncakeEngineHostNetworkWarning = "Mooncake: set spec.integration.engineHostNetwork=true or engine pods cannot reach the master (Ready, no KV)"
 
 // maxWarningLen is the concise-warning budget from the Kubernetes API conventions.
 // Longer text risks truncation or being dropped by clients.
@@ -345,7 +346,30 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
 		return nil
 	}
+	if adapterruntime.EngineHostNetworkRequested(cb) {
+		// Opted in: the pod webhook moves engine pods onto the host network, so the
+		// data plane is complete and there is nothing left to warn about.
+		return nil
+	}
 	return admission.Warnings{mooncakeEngineHostNetworkWarning}
+}
+
+// rejectEngineHostNetworkOnBackendThatDoesNotNeedIt keeps
+// spec.integration.engineHostNetwork from sitting inert. Only Mooncake's
+// peer-to-peer transfer engine needs engine pods on the host network; on any other
+// backend the flag silently does nothing while leaving the operator convinced they
+// changed the pod's networking. hostNetwork is a privilege — a no-op that *looks*
+// like it granted one is worse than a rejection, so reject at the door.
+func rejectEngineHostNetworkOnBackendThatDoesNotNeedIt(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if !adapterruntime.EngineHostNetworkRequested(cb) ||
+		cb.Spec.Type == cachev1alpha1.CacheBackendTypeMooncake {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(
+		field.NewPath("spec", "integration", "engineHostNetwork"), true,
+		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful for spec.type=Mooncake, whose transfer engine dials engine pods "+
+			"on real node IPs; spec.type=%s does not need it and the flag would do nothing. Remove it.", cb.Spec.Type),
+	)}
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject
