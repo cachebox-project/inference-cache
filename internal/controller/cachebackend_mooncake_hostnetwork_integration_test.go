@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -175,6 +176,56 @@ func TestIntegrationMooncakeHostNetworkAndHeadlessService(t *testing.T) {
 		svc := getService(t, r, "cache", ns)
 		if svc.Spec.ClusterIP == corev1.ClusterIPNone || svc.Spec.ClusterIP == "" {
 			t.Fatalf("recreated svc.Spec.ClusterIP = %q, want an apiserver-allocated virtual IP", svc.Spec.ClusterIP)
+		}
+	})
+
+	t.Run("GrandfatheredScaleOutIsClampedAndItsHPARemoved", func(t *testing.T) {
+		// Admission rejects spec.replicas>1 and spec.autoscaling for Mooncake, but
+		// ValidateUpdate only rejects violations an edit *introduces*: an object
+		// written before that rule existed (or before its backend moved onto host
+		// networking) sits in etcd carrying both and is never re-validated. Rendering
+		// it faithfully would schedule several masters — contending for the same node
+		// ports, or splitting the store as independent masters. The reconciler is the
+		// last line of defense. The apiserver would refuse to persist such a CR now,
+		// so the grandfathered object is simulated in memory.
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(ctx, mooncakeBackend("cache", ns)); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		ghost := getBackend(t, r, "cache", ns).DeepCopy()
+		three := int32(3)
+		ghost.Spec.Replicas = &three
+		ghost.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 5}
+
+		// An HPA had already scaled the live Deployment out before the upgrade.
+		live := getDeployment(t, r, "cache", ns)
+		live.Spec.Replicas = &three
+		if err := k8s.Update(ctx, live); err != nil {
+			t.Fatalf("simulate HPA-scaled Deployment: %v", err)
+		}
+
+		desired := r.buildDeployment(ghost, live.Spec.Template.Spec.DeepCopy())
+		if err := r.applyDeployment(ctx, ghost, desired); err != nil {
+			t.Fatalf("applyDeployment: %v", err)
+		}
+		got := getDeployment(t, r, "cache", ns)
+		if got.Spec.Replicas == nil || *got.Spec.Replicas != 1 {
+			t.Fatalf("replicas = %v, want 1 — the clamp must override both spec.replicas and the HPA-preserved live value",
+				got.Spec.Replicas)
+		}
+
+		// ...and no HPA may survive to undo the clamp on the next scaling decision.
+		if err := r.reconcileHPA(ctx, ghost, desired); err != nil {
+			t.Fatalf("reconcileHPA: %v", err)
+		}
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		switch err := k8s.Get(ctx, types.NamespacedName{Name: "cache", Namespace: ns}, &hpa); {
+		case err == nil:
+			t.Fatal("an HPA exists for a hostNetwork master; it would fight the singleton clamp and could split the store")
+		case !apierrors.IsNotFound(err):
+			t.Fatalf("get hpa: %v", err)
 		}
 	})
 

@@ -996,7 +996,28 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 	if pod.HostNetwork {
 		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 	}
+	clampHostNetworkToSingleton(&dep.Spec)
 	return dep
+}
+
+// clampHostNetworkToSingleton caps a host-network cache-server at one replica.
+//
+// Admission rejects spec.replicas>1 and spec.autoscaling for such a backend, but
+// that is not sufficient: ValidateUpdate only rejects violations an edit
+// *introduces*, so an object written before the rule existed — or before its
+// backend moved onto host networking — stays in etcd with replicas=3 and an HPA,
+// and is never re-validated. Rendering that faithfully would schedule several
+// masters: they contend for the same node ports, or land on different nodes and
+// come up as independent masters that silently split the store.
+//
+// The reconciler is therefore the last line of defense, and it clamps rather than
+// obeys. 0 is preserved: that is "disabled", not "scaled out".
+func clampHostNetworkToSingleton(spec *appsv1.DeploymentSpec) {
+	if !spec.Template.Spec.HostNetwork || spec.Replicas == nil || *spec.Replicas <= 1 {
+		return
+	}
+	one := int32(1)
+	spec.Replicas = &one
 }
 
 // buildService wraps the adapter-rendered Service spec into a Service the
@@ -1084,15 +1105,20 @@ func serviceEndpoint(svc *corev1.Service) string {
 // applyDeployment creates or updates the backend Deployment idempotently, owned by the CR.
 //
 // On create we establish the full templated spec. On update we touch only the
-// fields this module owns (replicas + the managed container's image/command/
-// args/env) and leave everything else intact — overwriting the whole PodTemplate
-// would strip API-server-defaulted fields (port Protocol, RestartPolicy, probe
-// thresholds, ...), and since those are re-defaulted on every write it would spin
-// a perpetual update loop via the Owns(Deployment) watch.
+// fields this module owns — replicas, the rollout strategy, and everything
+// reconcileManagedPodSpec covers (the managed container's image/command/args/env,
+// pod-level overrides and volumes, HostNetwork/DNSPolicy) — and leave everything
+// else intact. Overwriting the whole PodTemplate would strip API-server-defaulted
+// fields (port Protocol, RestartPolicy, probe thresholds, ...), and since those are
+// re-defaulted on every write it would spin a perpetual update loop via the
+// Owns(Deployment) watch.
 //
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
 // HPA's replica count rather than overwriting it — re-asserting replicas on
-// every reconcile would fight the HPA and churn the rollout.
+// every reconcile would fight the HPA and churn the rollout. The one exception is
+// a host-network server, which is a singleton: clampHostNetworkToSingleton runs
+// last and overrides both the spec and the HPA (see its godoc for why admission
+// alone cannot protect a grandfathered object).
 //
 // Wrapped in RetryOnConflict because the kube Deployment controller writes
 // Deployment.Status often during rollout; without retry, the Get/Update inside
@@ -1141,6 +1167,10 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 				}
 				dep.Spec.Replicas = &preserved
 			}
+			// LAST, after every other writer (desired spec, HPA preservation): a
+			// host-network server is a singleton and must never be scaled out, no
+			// matter what the spec or a stale HPA asks for.
+			clampHostNetworkToSingleton(&dep.Spec)
 			return controllerutil.SetControllerReference(backend, dep, r.Scheme)
 		})
 		return err
@@ -1241,12 +1271,14 @@ func headlessnessDiverges(live, desired string) bool {
 }
 
 // reconcileManagedPodSpec updates the spec-driven fields of the live pod spec in
-// place: the managed container's image/command/args/env, plus the pod-level
-// override fields. API-server-defaulted fields we don't own (RestartPolicy,
-// DNSPolicy, probe thresholds, port Protocol, ...) are left untouched so the
-// update does not churn. The desired pod spec already carries the canonical
-// defaults for the server-defaulted override fields (schedulerName,
-// terminationGracePeriodSeconds), so copying them is idempotent.
+// place: the managed container's image/command/args/env, the pod-level override
+// fields, and the networking the adapter owns (HostNetwork, and DNSPolicy
+// normalized to its API-server default when the adapter leaves it unset).
+// API-server-defaulted fields we don't own (RestartPolicy, probe thresholds, port
+// Protocol, ...) are left untouched so the update does not churn. The desired pod
+// spec already carries the canonical defaults for the server-defaulted override
+// fields (schedulerName, terminationGracePeriodSeconds), so copying them is
+// idempotent.
 //
 // Volumes are adapter-owned (per [adapterruntime.KVCacheRuntimeAdapter] — the
 // adapter fills PodSpec.Containers + PodSpec.Volumes) and are not
@@ -1931,8 +1963,13 @@ func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
 // drives the backend Deployment's replica count. The HPA exists iff
 // spec.autoscaling is set; otherwise any controller-owned HPA is removed.
 func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) error {
-	if backend.Spec.Autoscaling == nil {
-		// Autoscaling disabled — clean up any HPA we previously owned.
+	// A host-network cache-server is a singleton (see clampHostNetworkToSingleton):
+	// an HPA would fight that clamp on every reconcile and, whenever it won, put a
+	// second master on the cluster. Admission rejects spec.autoscaling for these
+	// backends, but a grandfathered object still carries one — so tear the HPA down
+	// from the observed pod shape rather than trusting the spec.
+	if backend.Spec.Autoscaling == nil || deployment.Spec.Template.Spec.HostNetwork {
+		// Autoscaling disabled (or impossible) — clean up any HPA we previously owned.
 		return r.deleteOwnedHPA(ctx, backend, deployment.Name)
 	}
 
