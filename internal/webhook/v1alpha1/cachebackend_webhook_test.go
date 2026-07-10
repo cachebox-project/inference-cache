@@ -304,10 +304,10 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 }
 
 func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
-	// The Mooncake master is a singleton on the host network: a second replica
-	// either cannot schedule (its node ports are already bound) or comes up as an
-	// independent master and silently splits the store. Both failures surface long
-	// after the object looks healthy, so admission rejects them at write time.
+	// The Mooncake master is a singleton on the host network: a second replica cannot
+	// bind the node ports the first already holds, and on a different node it comes up
+	// as an independent master and silently splits the store. Both failures surface
+	// long after the object looks healthy, so admission rejects them at write time.
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake

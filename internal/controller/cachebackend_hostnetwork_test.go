@@ -8,12 +8,12 @@ import (
 )
 
 // TestBuildDeploymentRecreateStrategyForHostNetwork covers the rollout strategy a
-// hostNetwork cache-server needs. Such a pod binds its ports directly on the node
-// (the apiserver defaults hostPort=containerPort when hostNetwork is set), so the
-// default RollingUpdate would surge a second pod onto the same host ports: it
-// either fails the scheduler's NodePorts predicate or CrashLoops on bind until the
-// old pod exits. Recreate tears the old pod down first. Backends that stay on the
-// pod network must keep the default strategy.
+// hostNetwork cache-server needs. Such a pod binds its ports directly on the node,
+// so the default RollingUpdate would surge a second pod onto the same host ports:
+// it CrashLoops failing to bind while the old pod still holds them (in practice the
+// scheduler rejects it earlier still, since the apiserver defaults
+// hostPort=containerPort for hostNetwork pods). Recreate tears the old pod down
+// first. Backends that stay on the pod network must keep the default strategy.
 func TestBuildDeploymentRecreateStrategyForHostNetwork(t *testing.T) {
 	r := &CacheBackendReconciler{}
 	const ns = "default"

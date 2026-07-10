@@ -983,10 +983,14 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 	}
 
 	// A hostNetwork cache-server binds its ports directly on the node, so the
-	// default RollingUpdate would surge a second pod onto the same host ports:
-	// it either fails the scheduler's NodePorts predicate (the API server
-	// defaults hostPort=containerPort for hostNetwork pods) or CrashLoops on
-	// bind until the old pod exits. Recreate tears the old pod down first.
+	// default RollingUpdate would surge a second pod onto the same host ports.
+	// That surge pod cannot serve: it CrashLoops failing to bind while the old pod
+	// still holds the port. In practice the scheduler rejects it even earlier,
+	// because the API server defaults hostPort=containerPort for hostNetwork pods
+	// (core/v1 defaultHostNetworkPorts — confirmed against a live apiserver: a
+	// hostNetwork pod declaring only containerPort=50051 comes back with
+	// hostPort=50051), which trips the NodePorts predicate. Recreate tears the old
+	// pod down first, so neither failure mode is reachable.
 	// Only a backend whose data plane requires the host network renders one
 	// (Mooncake today); every other adapter keeps the default RollingUpdate.
 	if pod.HostNetwork {
