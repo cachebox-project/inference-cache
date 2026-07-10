@@ -309,7 +309,36 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend create",
 		"namespace", cb.Namespace, "name", cb.Name, "type", cb.Spec.Type)
-	return nil, v.validate(cb)
+	return collectWarnings(cb), v.validate(cb)
+}
+
+// collectWarnings returns non-blocking advisories surfaced to the operator at
+// admission time (kubectl prints them on apply). A warning is for a gap the object
+// itself cannot express and the controller cannot close on the operator's behalf —
+// never for something a validation rule could simply reject.
+func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
+	return warnMooncakeEngineHostNetwork(cb)
+}
+
+// mooncakeEngineHostNetworkWarning names the one thing that still stands between a
+// Mooncake CacheBackend and working KV transfer. The adapter provisions the master
+// correctly (hostNetwork behind a headless Service), but Mooncake's transfer engine
+// is a peer-to-peer mesh: the ENGINE pods must run with host networking too, and
+// the pod webhook does not inject that yet. Without it the backend reconciles Ready
+// and moves zero KV — a silent failure. Say so out loud at apply time rather than
+// letting an operator discover it from a flat cache-hit graph.
+//
+// Remove this warning when engine-side hostNetwork injection lands.
+const mooncakeEngineHostNetworkWarning = "spec.type=Mooncake: the master is provisioned on the host network, but engine pods must ALSO run with " +
+	"hostNetwork for Mooncake's peer-to-peer transfer engine to reach it — the pod webhook does not inject that yet. Until you set hostNetwork on " +
+	"your engine workload, this backend will report Ready while transferring zero KV. The namespace must also permit hostNetwork (Pod Security " +
+	"'restricted' rejects it)."
+
+func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.Warnings {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+		return nil
+	}
+	return admission.Warnings{mooncakeEngineHostNetworkWarning}
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject
@@ -329,16 +358,17 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
 		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
+	warnings := collectWarnings(newCB)
 	newErrs := v.collectErrors(newCB)
 	if len(newErrs) == 0 {
-		return nil, nil
+		return warnings, nil
 	}
 	oldErrs := v.collectErrors(oldCB)
 	introduced := filterIntroducedErrors(oldErrs, newErrs)
 	if len(introduced) == 0 {
-		return nil, nil
+		return warnings, nil
 	}
-	return nil, apierrors.NewInvalid(
+	return warnings, apierrors.NewInvalid(
 		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
 		newCB.Name,
 		introduced,

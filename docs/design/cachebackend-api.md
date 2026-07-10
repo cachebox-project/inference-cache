@@ -281,7 +281,7 @@ that the round-trip probe cannot see.
 > * The namespace must **permit `hostNetwork`** — a Pod Security `restricted` namespace will reject the master pod.
 > * The master **reserves its ports (50051 / 8080 / 9003) on its node** (the API server defaults `hostPort=containerPort` for hostNetwork pods), and its Deployment uses the `Recreate` rollout strategy — a rolling surge would collide on those ports.
 > * The master is a **singleton**. `spec.replicas > 1` and `spec.autoscaling` are **rejected at admission** for `type: Mooncake`: a second replica either fails to schedule (its node ports are already bound) or comes up as an independent master and silently splits the store. `spec.replicas: 0` (disabled) and `1` remain valid.
-> * Engine pods wired to a Mooncake backend need host networking for the same reason; that side is not yet injected by the webhook.
+> * **Engine pods need host networking too, and the pod webhook does not inject it yet.** Mooncake's mesh reaches the master from the engine, so an overlay engine pod cannot participate. Admission therefore emits a **warning on every `type: Mooncake` apply**: until you set `hostNetwork: true` on your engine workload, the backend reports `Ready` while transferring **zero KV**. This is the one gap the managed path does not yet close for you.
 >
 > This is inherent to Mooncake, not a choice the adapter can avoid. `type: LMCache` is unaffected and stays on the pod network behind a normal ClusterIP.
 

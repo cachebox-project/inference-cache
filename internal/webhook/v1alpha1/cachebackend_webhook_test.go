@@ -303,6 +303,49 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 		"spec.type=External requires spec.endpoint")
 }
 
+func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
+	// The Phase-1 gap, made loud. The adapter provisions the master on hostNetwork,
+	// but Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run
+	// with hostNetwork too, and the pod webhook does not inject that yet. Without
+	// this warning the operator gets a backend that reports Ready and moves zero KV,
+	// discoverable only from a flat cache-hit graph.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "engine pods must ALSO run with hostNetwork") {
+		t.Fatalf("create warnings = %v, want one warning naming the engine hostNetwork requirement", warnings)
+	}
+
+	// It must persist across updates, not only on first apply — an operator who
+	// edits the CR later should still be told.
+	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
+	if err != nil {
+		t.Fatalf("a Mooncake update must still be admitted: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+	}
+}
+
+func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
+	// Blast radius: LMCache operators must not be nagged about a mesh they do not run.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("LMCache backend must be admitted: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("LMCache warnings = %v, want none", warnings)
+	}
+}
+
 func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
 	// The Mooncake master is a singleton on the host network: a second replica cannot
 	// bind the node ports the first already holds, and on a different node it comes up

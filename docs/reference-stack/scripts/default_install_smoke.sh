@@ -3290,7 +3290,19 @@ sed -i.bak "s|serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1|serverImage
 rm -f "${mc_cb_tmp}.bak"
 
 log "applying Mooncake CacheBackend"
-kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" >/dev/null
+# Admission emits a warning on every Mooncake apply: the master is provisioned on
+# the host network, but Mooncake's transfer engine is a peer-to-peer mesh and the
+# ENGINE pods must run with hostNetwork too — which the pod webhook does not inject
+# yet. Assert the warning against the real install: if it ever silently disappears,
+# operators go back to receiving a backend that reports Ready and transfers zero KV.
+mc_apply_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" 2>&1)"
+case "$mc_apply_out" in
+  *"engine pods must ALSO run with hostNetwork"*)
+    log "Mooncake apply emitted the engine-hostNetwork admission warning" ;;
+  *)
+    printf '%s\n' "$mc_apply_out"
+    fail "Mooncake apply did not emit the engine-hostNetwork admission warning (the incomplete managed path must stay loud)" ;;
+esac
 
 # Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
 # latency is a per-managed-backend property (the reconciler publishes it from
