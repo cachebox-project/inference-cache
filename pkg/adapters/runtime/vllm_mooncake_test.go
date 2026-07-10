@@ -236,6 +236,75 @@ func TestVLLMMooncakeResolveCacheServerHonorsSpecResources(t *testing.T) {
 	}
 }
 
+// TestVLLMMooncakeInjectEngineConfigHostNetworkIsOptIn pins the opt-in contract for
+// the one mutation that changes a customer pod's security posture.
+//
+// Mooncake's transfer engine is a peer-to-peer mesh, so an engine on an overlay pod
+// IP cannot reach the master and the backend moves zero KV. But hostNetwork is a
+// privilege, and mutating webhooks run BEFORE Pod Security validation: injecting it
+// unasked would turn a working engine pod into one a "restricted" namespace rejects,
+// with an error naming Pod Security rather than this controller. So the engine only
+// moves when the operator asks, via spec.integration.engineHostNetwork.
+func TestVLLMMooncakeInjectEngineConfigHostNetworkIsOptIn(t *testing.T) {
+	a := NewVLLMMooncakeAdapter()
+	enginePod := func() *corev1.PodSpec {
+		return &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+	}
+
+	t.Run("NotInjectedByDefault", func(t *testing.T) {
+		pod := enginePod()
+		if err := a.InjectEngineConfig(pod, "cache.ns.svc.cluster.local:50051", newMooncakeBackend(nil)); err != nil {
+			t.Fatalf("InjectEngineConfig: %v", err)
+		}
+		if pod.HostNetwork {
+			t.Fatal("engine pod moved onto hostNetwork with no opt-in; a restricted namespace would then reject it")
+		}
+		if pod.DNSPolicy != "" {
+			t.Fatalf("dnsPolicy = %q, want unset when hostNetwork was not requested", pod.DNSPolicy)
+		}
+	})
+
+	t.Run("InjectedWhenOperatorOptsIn", func(t *testing.T) {
+		cb := newMooncakeBackend(nil)
+		if cb.Spec.Integration == nil {
+			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+		}
+		cb.Spec.Integration.EngineHostNetwork = true
+
+		pod := enginePod()
+		if err := a.InjectEngineConfig(pod, "cache.ns.svc.cluster.local:50051", cb); err != nil {
+			t.Fatalf("InjectEngineConfig: %v", err)
+		}
+		if !pod.HostNetwork {
+			t.Fatal("engine pod not moved onto hostNetwork despite the opt-in; it cannot reach the mesh from an overlay IP")
+		}
+		if pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+			t.Fatalf("dnsPolicy = %q, want %q (the master's Service name must still resolve)",
+				pod.DNSPolicy, corev1.DNSClusterFirstWithHostNet)
+		}
+	})
+}
+
+// TestVLLMLMCacheInjectEngineConfigNeverTouchesHostNetwork bounds the blast radius:
+// the opt-in field is Mooncake-only (admission rejects it elsewhere), and the
+// LMCache wire must never move a customer's engine onto the host network.
+func TestVLLMLMCacheInjectEngineConfigNeverTouchesHostNetwork(t *testing.T) {
+	a := NewVLLMLMCacheAdapter()
+	cb := newLMCacheBackend(nil)
+	if cb.Spec.Integration == nil {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+	}
+	cb.Spec.Integration.EngineHostNetwork = true // rejected at admission; belt-and-braces here
+
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+	if err := a.InjectEngineConfig(pod, "cache.ns.svc.cluster.local:65432", cb); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	if pod.HostNetwork {
+		t.Fatal("the LMCache adapter moved an engine pod onto hostNetwork; only Mooncake's mesh needs that")
+	}
+}
+
 func TestVLLMMooncakeInjectEngineConfig(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
 	cb := newMooncakeBackend(nil)
