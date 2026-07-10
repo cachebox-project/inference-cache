@@ -336,7 +336,7 @@ func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 // silent failure this exists to prevent. The field and its consequence live here;
 // the full rationale (the mesh, node ports, Pod Security ordering) lives in
 // docs/design/cachebackend-api.md.
-const mooncakeEngineHostNetworkWarning = "Mooncake: set spec.integration.engineHostNetwork=true or engine pods cannot reach the master (Ready, no KV)"
+const mooncakeEngineHostNetworkWarning = "Mooncake: set spec.integration.engineHostNetwork=true or engine pods can't join the transfer mesh (Ready, no KV)"
 
 // maxWarningLen is the concise-warning budget from the Kubernetes API conventions.
 // Longer text risks truncation or being dropped by clients.
