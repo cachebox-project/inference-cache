@@ -2021,6 +2021,20 @@ if [ "$injected" != "$expected_url" ]; then
 fi
 log "pod webhook injected LMCACHE_REMOTE_URL=$injected"
 
+# Host networking is Mooncake's carve-out and must not leak past it. This pod is
+# a genuinely admitted, genuinely injected NON-Mooncake engine pod (the assertion
+# above proves the webhook ran on it), so an empty hostNetwork here means the
+# webhook left it alone — not that the check silently skipped. A regression that
+# moved this onto the host network would break every Pod Security "restricted"
+# namespace running the shipping default.
+ext_pod_hostnet="$(kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" \
+  -o jsonpath='{.spec.hostNetwork}' 2>/dev/null || true)"
+if [ -n "$ext_pod_hostnet" ] && [ "$ext_pod_hostnet" != "false" ]; then
+  kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" -o yaml || true
+  fail "non-Mooncake engine pod hostNetwork=$ext_pod_hostnet, want unset/false (the host-network carve-out must stay Mooncake-scoped)"
+fi
+log "non-Mooncake engine pod stays on the pod network (hostNetwork carve-out is Mooncake-scoped)"
+
 # Verify the --kv-transfer-config arg is also present — pins the full
 # engine wire contract the External adapter shares with the LMCache adapter.
 kv_arg="$(kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" \
@@ -3403,6 +3417,58 @@ if ! kubectl -n "$MOONCAKE_SMOKE_NS" wait --for=condition=Available --timeout="$
 fi
 log "Mooncake master Deployment Available; managed type:Mooncake reconcile verified end-to-end"
 
+# The operator-facing half of the Mooncake data plane: spec.integration.engineHostNetwork
+# moves matched ENGINE pods onto the host network. Assert it against the real
+# installed webhook, not just the adapter unit test — this is the surface the
+# operator's own pod crosses, and getting it wrong is silent (Ready, zero KV).
+#
+# `pause` with the conventional `vllm` container name, mirroring the External
+# engine-pod fixture above: we inspect the admitted .spec, so the pod need not
+# run. No containerPort is declared — under hostNetwork the API server defaults
+# hostPort=containerPort, and a bound node port would make this pod unschedulable
+# for reasons unrelated to what is being asserted.
+MOONCAKE_ENGINE_POD="mooncake-engine"
+cat <<EOF | kubectl apply -f - >/dev/null || fail "kubectl apply Mooncake engine pod failed"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $MOONCAKE_ENGINE_POD
+  namespace: $MOONCAKE_SMOKE_NS
+  labels:
+    app.kubernetes.io/name: vllm
+spec:
+  containers:
+  - name: vllm
+    image: registry.k8s.io/pause:3.10
+EOF
+
+mc_pod_hostnet="$(kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" \
+  -o jsonpath='{.spec.hostNetwork}' 2>/dev/null || true)"
+if [ "$mc_pod_hostnet" != "true" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" -o yaml || true
+  fail "Mooncake engine pod hostNetwork=$mc_pod_hostnet, want true (spec.integration.engineHostNetwork opt-in was not applied; the engine cannot reach the mesh)"
+fi
+
+# Without ClusterFirstWithHostNet a hostNetwork pod inherits the node's resolver
+# and cannot resolve status.endpoint, which is a Service DNS name.
+mc_pod_dns="$(kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" \
+  -o jsonpath='{.spec.dnsPolicy}' 2>/dev/null || true)"
+if [ "$mc_pod_dns" != "ClusterFirstWithHostNet" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" -o yaml || true
+  fail "Mooncake engine pod dnsPolicy=$mc_pod_dns, want ClusterFirstWithHostNet (the master endpoint is a Service DNS name)"
+fi
+
+# hostNetwork travels WITH the connector, never alone: assert the pod is actually
+# wired to the master, so a regression that grants the privilege while dropping
+# the wiring (or vice versa) fails here.
+mc_pod_url="$(kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].env[?(@.name=="LMCACHE_REMOTE_URL")].value}' 2>/dev/null || true)"
+if [ "$mc_pod_url" != "mooncakestore://$mc_want_endpoint" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get pod "$MOONCAKE_ENGINE_POD" -o yaml || true
+  fail "Mooncake engine pod LMCACHE_REMOTE_URL=$mc_pod_url, want mooncakestore://$mc_want_endpoint"
+fi
+log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, wired to mooncakestore://$mc_want_endpoint"
+
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
