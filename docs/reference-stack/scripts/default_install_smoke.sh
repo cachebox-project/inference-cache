@@ -3301,6 +3301,12 @@ log "applying Mooncake CacheBackend"
 #   2. WITH the opt-in (what the sample ships), the warning must be SILENT — a
 #      warning that keeps firing after the gap is closed trains operators to
 #      ignore warnings.
+# Guard the fixture, not just the behaviour: if the field is renamed or
+# re-indented, the sed below silently no-ops and the first assertion then fails
+# with "did not warn" — blaming the webhook for a broken test fixture.
+if ! grep -q '^    engineHostNetwork: true$' "$mc_cb_tmp"; then
+  fail "fixture: cachebackend-mooncake.yaml no longer carries 'engineHostNetwork: true' at the expected indent; the no-opt-in copy would be a no-op"
+fi
 mc_nooptin_tmp="$(mktemp "$tmpdir/mooncake-cb-nooptin.XXXXXX")"
 sed 's/^    engineHostNetwork: true$//' "$mc_cb_tmp" >"$mc_nooptin_tmp"
 mc_warn_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply --dry-run=server -f "$mc_nooptin_tmp" 2>&1)"
