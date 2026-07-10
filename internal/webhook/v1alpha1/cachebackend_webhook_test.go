@@ -303,6 +303,55 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 		"spec.type=External requires spec.endpoint")
 }
 
+func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
+	// The Mooncake master is a singleton on the host network: a second replica
+	// either cannot schedule (its node ports are already bound) or comes up as an
+	// independent master and silently splits the store. Both failures surface long
+	// after the object looks healthy, so admission rejects them at write time.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	two := int32(2)
+	cb.Spec.Replicas = &two
+	requireInvalidWithCause(t, v, cb, "spec.replicas", "singleton on the host network")
+}
+
+func TestValidator_MooncakeAutoscalingRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling", "not supported for type=Mooncake")
+}
+
+func TestValidator_MooncakeSingletonAndDisabledReplicasAccepted(t *testing.T) {
+	// 1 is the singleton; 0 is the "disabled" case. Neither can split the store.
+	v := &CacheBackendValidator{}
+	for _, replicas := range []int32{0, 1} {
+		cb := newBackend()
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+		r := replicas
+		cb.Spec.Replicas = &r
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("Mooncake with spec.replicas=%d must be admitted: %v", replicas, err)
+		}
+	}
+}
+
+func TestValidator_LMCacheScaleOutUnaffectedByMooncakeRule(t *testing.T) {
+	// Blast radius: the lm:// server is an ordinary pod-network workload and must
+	// keep scaling out (and autoscaling) normally.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	three := int32(3)
+	cb.Spec.Replicas = &three
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("multi-replica autoscaled LMCache must be admitted: %v", err)
+	}
+}
+
 func TestValidator_EndpointOnManagedTypeRejected(t *testing.T) {
 	// spec.endpoint is the External-passthrough field; setting it on a
 	// managed type silently does nothing today (the reconciler overwrites

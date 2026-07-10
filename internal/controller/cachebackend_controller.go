@@ -1111,14 +1111,20 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 				reconcileManagedPodSpec(&dep.Spec.Template.Spec, &desired.Spec.Template.Spec)
 				// The rollout strategy is part of the desired shape: a hostNetwork
 				// server must use Recreate or a rolling surge collides on the node's
-				// ports. Assign the whole struct (not just .Type) so the stale
-				// rollingUpdate block is cleared — the API server rejects Recreate
-				// while it is still populated. Only write when the adapter asks for
-				// an explicit strategy, so a pod-network backend keeps the
-				// API-server-defaulted RollingUpdate instead of churning it to zero.
-				if desired.Spec.Strategy.Type != "" &&
-					dep.Spec.Strategy.Type != desired.Spec.Strategy.Type {
-					dep.Spec.Strategy = desired.Spec.Strategy
+				// ports. Reconcile it in BOTH directions — switching a backend back
+				// to a pod-network type must restore RollingUpdate rather than strand
+				// the Deployment on Recreate. Compare against the *effective* desired
+				// type (an adapter that leaves it unset means "the API-server
+				// default"), and assign the whole struct so a stale rollingUpdate
+				// block is cleared: the API server rejects it alongside Recreate.
+				// An already-correct type is left untouched, so a pod-network backend
+				// never churns the API-server-defaulted rollingUpdate block.
+				wantStrategy := desired.Spec.Strategy.Type
+				if wantStrategy == "" {
+					wantStrategy = appsv1.RollingUpdateDeploymentStrategyType
+				}
+				if dep.Spec.Strategy.Type != wantStrategy {
+					dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: wantStrategy}
 				}
 			}
 			if backend.Spec.Autoscaling != nil && liveReplicas != nil {
@@ -1273,12 +1279,17 @@ func reconcileManagedPodSpec(live *corev1.PodSpec, desired *corev1.PodSpec) {
 	// too, or an already-provisioned backend would never migrate onto the host
 	// network and would keep transferring nothing.
 	live.HostNetwork = desired.HostNetwork
-	// dnsPolicy IS API-server-defaulted (ClusterFirst). Only write an explicit
-	// value, so a pod-network backend does not churn the template on every
-	// reconcile by resetting the field to "".
-	if desired.DNSPolicy != "" {
-		live.DNSPolicy = desired.DNSPolicy
+	// dnsPolicy IS API-server-defaulted (ClusterFirst), but it must still be
+	// reconciled in BOTH directions: a hostNetwork backend needs
+	// ClusterFirstWithHostNet, and switching back to a pod-network backend must
+	// restore the default rather than leave the stale host-net policy behind.
+	// Normalize an unset desired value to the API-server default so the write is
+	// idempotent and the template never churns.
+	wantDNS := desired.DNSPolicy
+	if wantDNS == "" {
+		wantDNS = corev1.DNSClusterFirst
 	}
+	live.DNSPolicy = wantDNS
 }
 
 // reconcileManagedContainer updates the spec-driven fields of the managed backend

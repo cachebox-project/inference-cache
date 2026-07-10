@@ -11,6 +11,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
 // TestIntegrationMooncakeHostNetworkAndHeadlessService exercises the Mooncake data
@@ -119,6 +121,41 @@ func TestIntegrationMooncakeHostNetworkAndHeadlessService(t *testing.T) {
 		}
 		if got.Spec.Strategy.RollingUpdate != nil {
 			t.Fatal("stale rollingUpdate block not cleared; the apiserver rejects it alongside Recreate")
+		}
+	})
+
+	t.Run("RevertsToPodNetworkAndRollingUpdateWhenTypeChangesAwayFromMooncake", func(t *testing.T) {
+		// The migration must be symmetric. Reconciling only "unset -> explicit"
+		// would strand a backend that switches away from Mooncake on Recreate and
+		// ClusterFirstWithHostNet forever, because those fields would never be
+		// written back to their defaults.
+		ns := freshNS(t, k8s)
+		if err := k8s.Create(ctx, mooncakeBackend("cache", ns)); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+		if dep := getDeployment(t, r, "cache", ns); !dep.Spec.Template.Spec.HostNetwork {
+			t.Fatal("precondition: Mooncake master should start on hostNetwork")
+		}
+
+		cb := getBackend(t, r, "cache", ns)
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		if err := k8s.Update(ctx, cb); err != nil {
+			t.Fatalf("switch backend type to LMCache: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		got := getDeployment(t, r, "cache", ns)
+		if got.Spec.Template.Spec.HostNetwork {
+			t.Fatal("hostNetwork not cleared after switching away from Mooncake")
+		}
+		if want := corev1.DNSClusterFirst; got.Spec.Template.Spec.DNSPolicy != want {
+			t.Fatalf("dnsPolicy = %q, want %q (stale host-net policy left behind)",
+				got.Spec.Template.Spec.DNSPolicy, want)
+		}
+		if got.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+			t.Fatalf("strategy = %q, want %q (Deployment stranded on Recreate)",
+				got.Spec.Strategy.Type, appsv1.RollingUpdateDeploymentStrategyType)
 		}
 	})
 

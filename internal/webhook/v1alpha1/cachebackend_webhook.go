@@ -142,6 +142,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidExternalEndpoint,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
+	rejectMooncakeMasterScaleOut,
 	rejectResourceLimitsBelowRequests,
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
@@ -992,6 +993,40 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
 		),
 	}
+}
+
+// rejectMooncakeMasterScaleOut hard-rejects a multi-replica or autoscaled Mooncake
+// backend. The Mooncake master is a SINGLETON coordinator that the adapter runs on
+// the host network, so a second replica has no good outcome: co-scheduled, it
+// cannot start (the API server defaults hostPort=containerPort for hostNetwork
+// pods, so the scheduler's NodePorts predicate blocks a same-node peer); scheduled
+// elsewhere, it comes up as an INDEPENDENT master and silently splits the store in
+// two. Both failures land long after admission and look like a healthy backend, so
+// reject at the door rather than warn — the same posture as the other cross-field
+// invariants here.
+//
+// spec.replicas 0 (disabled) and 1 (the singleton) remain valid. type=LMCache is
+// unaffected: its lm:// server is an ordinary pod-network workload that scales.
+func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
+			"the Mooncake master is a singleton on the host network: a second replica either fails to schedule (its node ports are already bound) "+
+				"or becomes an independent master that silently splits the store. Set spec.replicas to 0 or 1.",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
+			"spec.autoscaling is not supported for type=Mooncake: the master is a singleton on the host network, so scaling it out either fails to schedule "+
+				"or splits the store. Remove spec.autoscaling.",
+		))
+	}
+	return errs
 }
 
 // rejectResourceLimitsBelowRequests rejects spec.resources where the
