@@ -3290,7 +3290,19 @@ sed -i.bak "s|serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1|serverImage
 rm -f "${mc_cb_tmp}.bak"
 
 log "applying Mooncake CacheBackend"
-kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" >/dev/null
+# Admission emits a warning on every Mooncake apply: the master is provisioned on
+# the host network, but Mooncake's transfer engine is a peer-to-peer mesh and the
+# ENGINE pods must run with hostNetwork too — which the pod webhook does not inject
+# yet. Assert the warning against the real install: if it ever silently disappears,
+# operators go back to receiving a backend that reports Ready and transfers zero KV.
+mc_apply_out="$(kubectl -n "$MOONCAKE_SMOKE_NS" apply -f "$mc_cb_tmp" 2>&1)"
+case "$mc_apply_out" in
+  *"engine pods must also set hostNetwork"*)
+    log "Mooncake apply emitted the engine-hostNetwork admission warning" ;;
+  *)
+    printf '%s\n' "$mc_apply_out"
+    fail "Mooncake apply did not emit the engine-hostNetwork admission warning (the incomplete managed path must stay loud)" ;;
+esac
 
 # Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
 # latency is a per-managed-backend property (the reconciler publishes it from
@@ -3321,6 +3333,38 @@ if [ "$mc_svc_port" != "50051" ]; then
   fail "Mooncake Service first port=$mc_svc_port, want 50051"
 fi
 
+# Mooncake's transfer engine is a peer-to-peer mesh: the master hands back a
+# directory pointer and the engine then dials a real node IP on a dynamically
+# negotiated port. Two provisioning properties make that reachable, and BOTH are
+# asserted here against the real install because losing either is silent — the
+# backend still reconciles and reports an endpoint while transferring zero KV.
+#
+#  - headless Service (clusterIP: None): a virtual ClusterIP forwards only the
+#    ports declared above and strands the dynamic ones.
+#  - hostNetwork master pod: CNI overlay pod IPs are not reachable for the mesh.
+mc_svc_clusterip="$(kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+if [ "$mc_svc_clusterip" != "None" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get svc "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake Service clusterIP=$mc_svc_clusterip, want None (headless; a virtual IP strands the mesh's dynamic ports)"
+fi
+
+mc_host_network="$(kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null || true)"
+if [ "$mc_host_network" != "true" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake master hostNetwork=$mc_host_network, want true (overlay pod IPs are unreachable for the transfer-engine mesh)"
+fi
+
+# A hostNetwork pod binds the node's ports, so a rolling surge would collide.
+mc_strategy="$(kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" \
+  -o jsonpath='{.spec.strategy.type}' 2>/dev/null || true)"
+if [ "$mc_strategy" != "Recreate" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get deploy "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake master rollout strategy=$mc_strategy, want Recreate (hostNetwork pods collide on the node's ports)"
+fi
+log "Mooncake master: hostNetwork=true, Recreate strategy, headless Service"
+
 # The managed Deployment must reach Available: the stand-in master accepts TCP
 # on 50051 so the controller-rendered readiness probe passes — proving
 # ResolveCacheServer rendered a workload that actually comes up under a real
@@ -3338,4 +3382,4 @@ log "Mooncake master Deployment Available; managed type:Mooncake reconcile verif
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend end-to-end (stand-in master reaches Available + mooncakestore:// RPC endpoint in status), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"

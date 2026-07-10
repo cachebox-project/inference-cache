@@ -142,6 +142,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidExternalEndpoint,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
+	rejectMooncakeMasterScaleOut,
 	rejectResourceLimitsBelowRequests,
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
@@ -308,7 +309,43 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend create",
 		"namespace", cb.Namespace, "name", cb.Name, "type", cb.Spec.Type)
-	return nil, v.validate(cb)
+	return collectWarnings(cb), v.validate(cb)
+}
+
+// collectWarnings returns non-blocking advisories surfaced to the operator at
+// admission time (kubectl prints them on apply). A warning is for a gap the object
+// itself cannot express and the controller cannot close on the operator's behalf —
+// never for something a validation rule could simply reject.
+func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
+	return warnMooncakeEngineHostNetwork(cb)
+}
+
+// mooncakeEngineHostNetworkWarning names the one thing that still stands between a
+// Mooncake CacheBackend and working KV transfer. The adapter provisions the master
+// correctly (hostNetwork behind a headless Service), but Mooncake's transfer engine
+// is a peer-to-peer mesh: the ENGINE pods must run with host networking too, and
+// the pod webhook does not inject that yet. Without it the backend reconciles Ready
+// and moves zero KV — a silent failure. Say so out loud at apply time rather than
+// letting an operator discover it from a flat cache-hit graph.
+//
+// The text stays within [maxWarningLen]: the API conventions ask for concise
+// warnings so clients render them reliably, and a truncated warning is exactly the
+// silent failure this exists to prevent. The requirement and its consequence live
+// here; the full rationale (the mesh, node ports, Pod Security) lives in
+// docs/design/cachebackend-api.md.
+//
+// Remove this warning when engine-side hostNetwork injection lands.
+const mooncakeEngineHostNetworkWarning = "Mooncake: engine pods must also set hostNetwork (not auto-injected); without it the backend is Ready but moves no KV"
+
+// maxWarningLen is the concise-warning budget from the Kubernetes API conventions.
+// Longer text risks truncation or being dropped by clients.
+const maxWarningLen = 120
+
+func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.Warnings {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+		return nil
+	}
+	return admission.Warnings{mooncakeEngineHostNetworkWarning}
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject
@@ -328,16 +365,17 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
 		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
+	warnings := collectWarnings(newCB)
 	newErrs := v.collectErrors(newCB)
 	if len(newErrs) == 0 {
-		return nil, nil
+		return warnings, nil
 	}
 	oldErrs := v.collectErrors(oldCB)
 	introduced := filterIntroducedErrors(oldErrs, newErrs)
 	if len(introduced) == 0 {
-		return nil, nil
+		return warnings, nil
 	}
-	return nil, apierrors.NewInvalid(
+	return warnings, apierrors.NewInvalid(
 		schema.GroupKind{Group: cachev1alpha1.GroupVersion.Group, Kind: "CacheBackend"},
 		newCB.Name,
 		introduced,
@@ -992,6 +1030,41 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
 		),
 	}
+}
+
+// rejectMooncakeMasterScaleOut hard-rejects a multi-replica or autoscaled Mooncake
+// backend. The Mooncake master is a SINGLETON coordinator that the adapter runs on
+// the host network, so a second replica has no good outcome. Co-scheduled, it
+// cannot serve: it fails to bind ports the first master already holds on that node
+// (in practice the scheduler rejects it earlier still, because the API server
+// defaults hostPort=containerPort for hostNetwork pods and the NodePorts predicate
+// then trips). Scheduled elsewhere, it comes up as an INDEPENDENT master and
+// silently splits the store in two. Both failures land long after admission and
+// look like a healthy backend, so reject at the door rather than warn — the same
+// posture as the other cross-field invariants here.
+//
+// spec.replicas 0 (disabled) and 1 (the singleton) remain valid. type=LMCache is
+// unaffected: its lm:// server is an ordinary pod-network workload that scales.
+func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
+			"the Mooncake master is a singleton on the host network: a second replica cannot bind the node ports the first already holds, "+
+				"and on a different node it becomes an independent master that silently splits the store. Set spec.replicas to 0 or 1.",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
+			"spec.autoscaling is not supported for type=Mooncake: the master is a singleton on the host network, so scaling it out either cannot bind "+
+				"the node's ports or splits the store across independent masters. Remove spec.autoscaling.",
+		))
+	}
+	return errs
 }
 
 // rejectResourceLimitsBelowRequests rejects spec.resources where the

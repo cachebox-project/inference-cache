@@ -303,6 +303,109 @@ func TestValidator_External_BlankEndpointRejected(t *testing.T) {
 		"spec.type=External requires spec.endpoint")
 }
 
+func TestValidator_MooncakeWarnsEngineHostNetworkNotInjected(t *testing.T) {
+	// The Phase-1 gap, made loud. The adapter provisions the master on hostNetwork,
+	// but Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run
+	// with hostNetwork too, and the pod webhook does not inject that yet. Without
+	// this warning the operator gets a backend that reports Ready and moves zero KV,
+	// discoverable only from a flat cache-hit graph.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "engine pods must also set hostNetwork") {
+		t.Fatalf("create warnings = %v, want one warning naming the engine hostNetwork requirement", warnings)
+	}
+
+	// It must persist across updates, not only on first apply — an operator who
+	// edits the CR later should still be told.
+	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
+	if err != nil {
+		t.Fatalf("a Mooncake update must still be admitted: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+	}
+}
+
+func TestValidator_WarningTextStaysConcise(t *testing.T) {
+	// The Kubernetes API conventions ask for warnings within a concise budget so
+	// clients render them reliably. A warning that gets truncated — or dropped — is
+	// exactly the silent failure this warning exists to prevent, so guard the budget
+	// here rather than trusting review to catch a future edit that pads it out.
+	if got := len(mooncakeEngineHostNetworkWarning); got > maxWarningLen {
+		t.Fatalf("warning is %d chars, want <= %d — put the detail in the docs, not the warning:\n%q",
+			got, maxWarningLen, mooncakeEngineHostNetworkWarning)
+	}
+}
+
+func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
+	// Blast radius: LMCache operators must not be nagged about a mesh they do not run.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("LMCache backend must be admitted: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("LMCache warnings = %v, want none", warnings)
+	}
+}
+
+func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
+	// The Mooncake master is a singleton on the host network: a second replica cannot
+	// bind the node ports the first already holds, and on a different node it comes up
+	// as an independent master and silently splits the store. Both failures surface
+	// long after the object looks healthy, so admission rejects them at write time.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	two := int32(2)
+	cb.Spec.Replicas = &two
+	requireInvalidWithCause(t, v, cb, "spec.replicas", "singleton on the host network")
+}
+
+func TestValidator_MooncakeAutoscalingRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling", "not supported for type=Mooncake")
+}
+
+func TestValidator_MooncakeSingletonAndDisabledReplicasAccepted(t *testing.T) {
+	// 1 is the singleton; 0 is the "disabled" case. Neither can split the store.
+	v := &CacheBackendValidator{}
+	for _, replicas := range []int32{0, 1} {
+		cb := newBackend()
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeMooncake
+		r := replicas
+		cb.Spec.Replicas = &r
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("Mooncake with spec.replicas=%d must be admitted: %v", replicas, err)
+		}
+	}
+}
+
+func TestValidator_LMCacheScaleOutUnaffectedByMooncakeRule(t *testing.T) {
+	// Blast radius: the lm:// server is an ordinary pod-network workload and must
+	// keep scaling out (and autoscaling) normally.
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	three := int32(3)
+	cb.Spec.Replicas = &three
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("multi-replica autoscaled LMCache must be admitted: %v", err)
+	}
+}
+
 func TestValidator_EndpointOnManagedTypeRejected(t *testing.T) {
 	// spec.endpoint is the External-passthrough field; setting it on a
 	// managed type silently does nothing today (the reconciler overwrites
