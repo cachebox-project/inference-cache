@@ -351,6 +351,167 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
+	// Mooncake's mesh is dialed FROM the engine at a node IP on a negotiated
+	// port, so an overlay engine pod transfers zero KV while the backend reports
+	// Ready. spec.integration.engineHostNetwork moves matched engine pods onto
+	// the host network — but only when the operator asks for it: hostNetwork is
+	// a privilege, and mutating webhooks run BEFORE Pod Security validation, so
+	// injecting it unasked would turn a working pod into one a "restricted"
+	// namespace rejects, blaming Pod Security rather than this controller.
+	//
+	// The adapter unit test pins InjectEngineConfig; this pins the whole
+	// admission path, which is the surface the operator's pod actually crosses.
+	const ns = "engines"
+	backend := func(optIn bool) *cachev1alpha1.CacheBackend {
+		return &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Type: cachev1alpha1.CacheBackendTypeMooncake,
+				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+					Engine:            "vllm",
+					Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+					EngineHostNetwork: optIn,
+				},
+				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+					MatchLabels: map[string]string{"app": "vllm"},
+				},
+			},
+			Status: cachev1alpha1.CacheBackendStatus{Endpoint: "mc.engines.svc.cluster.local:50051"},
+		}
+	}
+
+	t.Run("NotInjectedByDefault", func(t *testing.T) {
+		h := newHandlerWithSubscriber(t, backend(false))
+		req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
+
+		resp := h.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("expected Allowed; result=%+v", resp.Result)
+		}
+		mutated := applyPatches(t, req.Object.Raw, resp)
+
+		if mutated.Spec.HostNetwork {
+			t.Fatal("webhook moved an engine pod onto the host network without spec.integration.engineHostNetwork; " +
+				"that silently escalates the pod's privileges and Pod Security would reject it downstream")
+		}
+		if mutated.Spec.DNSPolicy != "" {
+			t.Fatalf("dnsPolicy rewritten to %q without the opt-in; want it left to the cluster default", mutated.Spec.DNSPolicy)
+		}
+		// The rest of the Mooncake wiring still lands — the opt-in gates the
+		// networking rewrite only, never the connector env.
+		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
+	})
+
+	t.Run("InjectedWhenOperatorOptsIn", func(t *testing.T) {
+		h := newHandlerWithSubscriber(t, backend(true))
+		req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
+
+		resp := h.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("expected Allowed; result=%+v", resp.Result)
+		}
+		mutated := applyPatches(t, req.Object.Raw, resp)
+
+		if !mutated.Spec.HostNetwork {
+			t.Fatal("engineHostNetwork=true but the pod stayed on the overlay; the engine cannot reach the Mooncake mesh")
+		}
+		// Without this the pod loses cluster DNS, and status.endpoint is a
+		// Service DNS name — the engine would fail to resolve the master.
+		if got, want := mutated.Spec.DNSPolicy, corev1.DNSClusterFirstWithHostNet; got != want {
+			t.Fatalf("dnsPolicy: got %q, want %q (hostNetwork pods lose cluster DNS without it, and status.endpoint is a DNS name)", got, want)
+		}
+		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
+	})
+}
+
+func TestHandle_MooncakeBackend_HostNetworkNeverGrantedToAnUnwiredPod(t *testing.T) {
+	// The host-network mutation lives INSIDE InjectEngineConfig, behind the same
+	// endpoint gate as the KV connector. So when the reconciler has not yet
+	// published status.endpoint, the pod admits fail-open with neither the
+	// connector nor hostNetwork — the two always travel together.
+	//
+	// That coupling is deliberate, and this test exists to keep it. Hoisting the
+	// hostNetwork mutation above the endpoint gate would grant a pod a privilege
+	// (host networking, which Pod Security gates) while giving it nothing to use
+	// the privilege for: without LMCACHE_REMOTE_URL the engine never dials the
+	// Mooncake mesh. The pod must be rolled once the backend reports Ready
+	// regardless — pods are immutable, and it needs the connector env either way.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine:            "vllm",
+				Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				EngineHostNetwork: true,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		// The reconciler has not published the master's RPC address yet.
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: ""},
+	}
+	h := newHandlerWithSubscriber(t, cb)
+	req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("endpoint-not-ready must fail open, not reject the pod; result=%+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	if mutated.Spec.HostNetwork {
+		t.Fatal("pod was granted hostNetwork while the backend had no endpoint — a Pod-Security-gated privilege " +
+			"handed to a pod with no KV connector to use it")
+	}
+	for _, c := range mutated.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+				t.Fatalf("connector env %s injected without an endpoint", e.Name)
+			}
+		}
+	}
+}
+
+func TestHandle_LMCacheBackend_NeverMovesEnginePodOntoHostNetwork(t *testing.T) {
+	// The default path must stay on the overlay. hostNetwork is Mooncake's
+	// carve-out; a regression that leaked it into the LMCache adapter would
+	// break every "restricted"-PSA namespace running the shipping default.
+	const ns = "engines"
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "lm", Namespace: ns, UID: types.UID("cb-lm-uid")},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "vllm",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "vllm"},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "lm.engines.svc.cluster.local:8000"},
+	}
+	h := newHandlerWithSubscriber(t, cb)
+	req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed; result=%+v", resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+
+	if mutated.Spec.HostNetwork {
+		t.Fatal("LMCache engine pod was moved onto the host network; the default path must stay on the overlay")
+	}
+	if mutated.Spec.DNSPolicy != "" {
+		t.Fatalf("LMCache engine pod dnsPolicy rewritten to %q; want the cluster default", mutated.Spec.DNSPolicy)
+	}
+}
+
 func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	// The vLLM/LMCache adapter returns a kvevent-subscriber sidecar
 	// the webhook MUST append after InjectEngineConfig, with identity flags
