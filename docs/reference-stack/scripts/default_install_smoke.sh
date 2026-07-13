@@ -93,26 +93,31 @@
 #      gate as a managed backend. The managed-only conditions (FunctionalProbeOK
 #      / EngineKernelsHealthy / T2Degraded / EngineCompatibility) are absent.
 #      Also exercises the validating webhook's EventsOnly+External rejection.
-#  10. The /snapshot endpoint rejects unauthenticated callers: a side curl
-#      pod outside the controller's SA identity gets either an HTTP 401 (L7
-#      auth middleware) or a curl timeout (L3/L4 NetworkPolicy drop).
-#  11. The /policy endpoint rejects unauthenticated callers: same side-pod
-#      shape against the write-side endpoint. This is the more dangerous of
-#      the two — /policy is replace-on-write, so a successful unauthenticated
-#      POST would override every namespace's CachePolicy state cluster-wide.
-#      The probe POSTs a valid snapshot body so the rejection cannot be
-#      misattributed to a 400; the only valid outcome is 401 (auth
-#      middleware) or a curl timeout (NetworkPolicy drop).
-#  11b. The /probe endpoint rejects unauthenticated callers: same side-pod
-#      shape against the functional-self-test endpoint. /probe shares the
-#      controller ServiceAccount identity with /snapshot and /policy, so a regression
-#      that wired /probe outside that profile would let any pod that can
-#      reach :8081 drive a synthetic round-trip AND, since the CacheBackend
-#      reconciler now consumes the result to publish FunctionalProbeOK and
-#      downgrade Ready, observe or trigger forged Ready transitions on
-#      every managed backend. Sends a valid ProbeRequest body so the
-#      rejection cannot be misattributed to a 400; valid outcomes are
-#      401 / NetworkPolicy drop.
+#  10. The /snapshot endpoint rejects unauthenticated callers AT THE NETWORK
+#      LAYER: a side curl pod outside the controller's SA identity (and outside
+#      the NetworkPolicy allowlist) has its connection to :8081 DROPPED by the
+#      server NetworkPolicy, so curl times out (curl_failed:28). The cluster
+#      runs a NetworkPolicy-enforcing CNI (Calico), so a bare HTTP 401 — the L7
+#      auth-middleware fallback — now FAILS the assertion: it would mean the
+#      NetworkPolicy was deleted/broken and only the auth middleware is left
+#      standing, the exact regression this gate exists to catch.
+#  11. The /policy endpoint rejects unauthenticated callers at the network
+#      layer: same side-pod shape against the write-side endpoint. This is the
+#      more dangerous of the two — /policy is replace-on-write, so a successful
+#      unauthenticated POST would override every namespace's CachePolicy state
+#      cluster-wide. The probe POSTs a valid snapshot body so the rejection
+#      cannot be misattributed to a 400; the only valid outcome is the
+#      NetworkPolicy drop (curl_failed:28) — a bare 401 now FAILS.
+#  11b. The /probe endpoint rejects unauthenticated callers at the network
+#      layer: same side-pod shape against the functional-self-test endpoint.
+#      /probe shares the controller ServiceAccount identity with /snapshot and
+#      /policy, so a regression that wired /probe outside that profile would let
+#      any pod that can reach :8081 drive a synthetic round-trip AND, since the
+#      CacheBackend reconciler now consumes the result to publish
+#      FunctionalProbeOK and downgrade Ready, observe or trigger forged Ready
+#      transitions on every managed backend. Sends a valid ProbeRequest body so
+#      the rejection cannot be misattributed to a 400; the only valid outcome is
+#      the NetworkPolicy drop (curl_failed:28) — a bare 401 now FAILS.
 #  12. The audience binding holds on /snapshot, /policy, AND /probe: a probe
 #      pod with the controller's SA + labels reads three tokens
 #      (controller-audience projected, policy-audience projected, and the
@@ -223,8 +228,8 @@
 #   - kustomize       (optional; sed fallback handles the image rewrite if absent)
 #
 # Usage:    docs/reference-stack/scripts/default_install_smoke.sh
-# Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, READY_TIMEOUT,
-#           CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
+# Tunables: TAG, KIND_CLUSTER, NAMESPACE, CERT_MANAGER_VERSION, CALICO_VERSION,
+#           READY_TIMEOUT, CACHEINDEX_TIMEOUT, POLICY_PUSH_TIMEOUT, HTTP_LOCAL_PORT,
 #           GRPC_LOCAL_PORT, LOG_DIR, POLICY_SMOKE_NS, SAMPLE_NS,
 #           PROMPT_TOPOLOGY_SMOKE_NS, SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
@@ -241,6 +246,12 @@ TAG="${TAG:-${GITHUB_SHA:-$(git rev-parse HEAD)}}"
 KIND_CLUSTER="${KIND_CLUSTER:-ic-install-smoke}"
 NAMESPACE="${NAMESPACE:-inference-cache-system}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.1}"
+# NetworkPolicy-enforcing CNI installed in place of kind's default kindnet (which
+# does NOT enforce NetworkPolicy). Required so the server NetworkPolicy actually
+# drops unauthenticated traffic to :8081 and the /snapshot + /policy + /probe
+# assertions below can require the L3/L4 drop. Calico's default IPv4
+# pool is 192.168.0.0/16 — the kind podSubnet is set to match (see cluster block).
+CALICO_VERSION="${CALICO_VERSION:-v3.28.2}"
 READY_TIMEOUT="${READY_TIMEOUT:-120s}"
 CACHEINDEX_TIMEOUT="${CACHEINDEX_TIMEOUT:-90}" # seconds; ~3x the 30s refresh, absorbs leader-election + first-tick jitter
 POLICY_PUSH_TIMEOUT="${POLICY_PUSH_TIMEOUT:-90}" # seconds; watch-triggered push + one 30s periodic repair tick
@@ -343,6 +354,7 @@ KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
 http_pf_pid=""
 tmpdir=""
+kind_config_file=""
 
 log() { echo "[install-smoke] $*"; }
 fail() {
@@ -415,6 +427,7 @@ cleanup() {
   [ -n "$pf_pid" ] && kill "$pf_pid" 2>/dev/null || true
   [ -n "$http_pf_pid" ] && kill "$http_pf_pid" 2>/dev/null || true
   [ -n "$tmpdir" ] && rm -rf "$tmpdir"
+  [ -n "$kind_config_file" ] && rm -f "$kind_config_file"
   # Only tear the cluster down if we created it (lets local devs pre-create a
   # cluster and re-run the smoke without paying the create cost each time).
   if [ "${KEEP_CLUSTER:-0}" != "1" ] && [ "${CREATED_CLUSTER:-0}" = "1" ]; then
@@ -466,14 +479,67 @@ EOF
   "$KIND" load docker-image "$SAMPLE_CACHE_SERVER_IMAGE" --name "$KIND_CLUSTER"
 }
 
+# Install Calico as a NetworkPolicy-enforcing CNI, then block until it — and the
+# node + CoreDNS it unblocks — are fully Ready. kind's built-in kindnet CNI does
+# NOT enforce NetworkPolicy, so with kindnet the server NetworkPolicy is inert
+# and the /snapshot + /policy + /probe drop assertions can only ever pass on the
+# L7 401 fallback. A half-initialised CNI is the main flakiness risk of
+# this swap, so every component is waited on explicitly with generous timeouts.
+install_calico() {
+  log "installing Calico $CALICO_VERSION (NetworkPolicy-enforcing CNI)"
+  kubectl apply -f \
+    "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/calico.yaml"
+  log "waiting for Calico components to become Ready"
+  # calico-node is the per-node DaemonSet that programs the dataplane and
+  # enforces NetworkPolicy; calico-kube-controllers is the policy/IPAM
+  # controller. rollout status blocks until desired == ready for each.
+  kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+  kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=300s
+  # The node stays NotReady until the CNI is actually programming the dataplane,
+  # so node-Ready is the authoritative "Calico works" gate (it also backstops the
+  # DaemonSet rollout racing to a premature 0-desired success). CoreDNS only gets
+  # a pod IP once the CNI is up, and the probes below resolve the server Service
+  # through it, so gate on CoreDNS too.
+  kubectl wait --for=condition=Ready nodes --all --timeout=120s
+  kubectl -n kube-system rollout status deployment/coredns --timeout=180s
+  log "Calico is Ready; NetworkPolicy enforcement is active"
+}
+
 # --- cluster ----------------------------------------------------------------
+# The default-install smoke requires a NetworkPolicy-ENFORCING CNI so the server
+# NetworkPolicy actually drops unauthenticated traffic to the server's :8081
+# controller-facing listener (/snapshot, /policy, /probe) — see install_calico
+# above and the tightened assertions later in this script. This CNI
+# swap is scoped to CI: the human-facing operator reference cluster
+# (docs/reference-stack/kind/cluster.yaml) is intentionally left on kindnet — it
+# demos the substrate and does not need NetworkPolicy enforcement.
 if "$KIND" get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
-  log "reusing existing kind cluster $KIND_CLUSTER"
+  # Reuse path is local-dev only (KEEP_CLUSTER=1); the cluster it reuses was
+  # created by this same script, so Calico is already installed and Ready.
+  log "reusing existing kind cluster $KIND_CLUSTER (assumes Calico already installed)"
   CREATED_CLUSTER=0
 else
-  log "creating kind cluster $KIND_CLUSTER"
-  "$KIND" create cluster --name "$KIND_CLUSTER" --wait 120s
+  log "creating kind cluster $KIND_CLUSTER with the default CNI disabled (Calico installed below)"
+  # disableDefaultCNI drops kindnet; podSubnet matches Calico's default IPv4 pool
+  # (192.168.0.0/16) so calico-node hands out addresses from the same range
+  # kube-controller-manager allocates node podCIDRs from — the canonical
+  # kind+Calico pairing, no IP-pool patching needed. No `--wait` here: with the
+  # default CNI disabled the node stays NotReady until Calico is up, so readiness
+  # is waited on inside install_calico instead.
+  kind_config_file="$(mktemp)"
+  cat >"$kind_config_file" <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: "192.168.0.0/16"
+EOF
+  "$KIND" create cluster --name "$KIND_CLUSTER" --config "$kind_config_file"
+  rm -f "$kind_config_file"
+  kind_config_file=""
   CREATED_CLUSTER=1
+  kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
+  install_calico
 fi
 kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
 
@@ -2301,17 +2367,22 @@ log "admission rejected EventsOnly+External misconfiguration"
 kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$EVENTSONLY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
 
-# --- /snapshot auth assertion ---------------------------------------------
+# --- /snapshot NetworkPolicy-drop assertion -------------------------------
 # The CacheIndex CR being populated above already proves the controller can
 # scrape /snapshot with its SA token (the bearer path). The complementary
-# half — that an UNAUTHENTICATED caller is rejected — is what this section
-# checks, since it's the failure mode the new auth middleware is meant to
-# prevent. A short-lived curl pod outside the controller's identity tries to
-# GET /snapshot; the server must respond 401, OR the NetworkPolicy must drop
-# the connection at L3/L4 (curl exits non-zero on timeout). Either outcome
-# proves the gate works; under kind's default kindnet CNI, NetworkPolicy is
-# not enforced so the 401 path is the one actually exercised.
-log "asserting unauthenticated /snapshot scrape from a side pod is rejected"
+# half — that an UNAUTHENTICATED caller is dropped BY THE NETWORKPOLICY — is
+# what this section checks. A short-lived curl pod outside the controller's
+# identity (and outside the NetworkPolicy allowlist: it carries none of the
+# component=controller labels) tries to GET /snapshot. Because the cluster runs
+# a NetworkPolicy-enforcing CNI (Calico — see install_calico), the server
+# NetworkPolicy drops the SYN at L3/L4, so curl times out (`-m 5`) and exits 28
+# WITHOUT ever reaching the L7 auth middleware. That drop is the required
+# outcome. A bare HTTP 401 is NOT accepted here: a 401 means the probe
+# reached the listener, i.e. the NetworkPolicy was deleted/broken and only the
+# auth middleware is still standing — exactly the regression this gate must
+# catch. (The auth-middleware path is still exercised, positively, by the
+# audience-binding assertion further below, whose probe pod IS in the allowlist.)
+log "asserting unauthenticated /snapshot scrape from a side pod is dropped by the NetworkPolicy"
 SIDE_POD="ic-snapshot-probe"
 # Clean any leftover probe from an interrupted prior run before creating a
 # fresh one — otherwise `kubectl run` fails with AlreadyExists and the script
@@ -2351,43 +2422,48 @@ if [ -z "$probe_out" ]; then
 fi
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD" --grace-period=0 --force >/dev/null 2>&1 || true
 
-# Acceptable outcomes (either gate sufficient):
-#   - HTTP 401: the L7 auth middleware rejected the request (kindnet path
-#     today; the only branch actually exercised under the default CNI).
+# Required outcome (the NetworkPolicy must do the work):
 #   - "curl_failed:28": curl timed out (`-m 5`), i.e. the L3/L4 NetworkPolicy
 #     dropped the SYN and the kernel never saw a RST. Exit code 28 is the
-#     SHAPE of a real CNI-enforced policy drop.
-# Other curl exit codes are NOT accepted — they would mask a regression:
-#   - 6  (couldn't resolve host) → Service rename or DNS bug
-#   - 7  (failed to connect, e.g. ECONNREFUSED) → server not listening; this
-#        is NOT what an enforcing CNI does (it drops packets silently, it
-#        does not RST), so accepting 7 would let "listener crashed" pass
-#   - 3  (malformed URL) → script regression
-# Restricting the catch-all to 28 keeps the smoke a real regression detector.
-# 200 (unauthenticated) is always a regression.
-# A future ticket will swap kindnet for an enforcing CNI and tighten the
-# accept set to require curl_failed:28 alone (i.e. reject 401), proving
-# the NetworkPolicy is actually doing the work in CI.
+#     SHAPE of a real CNI-enforced policy drop, and under the enforcing CNI it
+#     is the ONLY outcome an out-of-allowlist pod can get.
+# Rejected outcomes:
+#   - 401 (auth middleware) → the probe REACHED the listener, so the L3/L4
+#     NetworkPolicy did not drop it. That means the server NetworkPolicy is
+#     missing/broken or the CNI stopped enforcing — the regression this gate
+#     exists to catch. Previously accepted as a kindnet fallback; no longer.
+#   - 200 (unauthenticated read) → always a regression (both gates down).
+#   - 6  (couldn't resolve host) → Service rename or DNS bug.
+#   - 7  (failed to connect, e.g. ECONNREFUSED) → server not listening; an
+#        enforcing CNI drops packets silently, it does not RST, so 7 would
+#        mask a "listener crashed" bug.
+#   - 3  (malformed URL) → script regression.
 case "$probe_out" in
-  "401"|*"curl_failed:28"*)
-    log "unauthenticated /snapshot probe rejected (probe output: $probe_out)"
+  *"curl_failed:28"*)
+    log "unauthenticated /snapshot probe dropped by the NetworkPolicy (curl timed out; probe output: $probe_out)"
+    ;;
+  "401")
+    fail "unauthenticated /snapshot probe reached the listener and got HTTP 401 — the L7 auth middleware answered, but the server NetworkPolicy did NOT drop the connection at L3/L4 (expected curl_failed:28). The NetworkPolicy is missing/broken or the CNI is not enforcing it. Got: $probe_out"
     ;;
   *)
-    fail "unauthenticated /snapshot probe was not rejected (or curl failed for an unexpected reason); got: $probe_out"
+    fail "unauthenticated /snapshot probe was not dropped by the NetworkPolicy (expected curl_failed:28); got: $probe_out"
     ;;
 esac
 
-# --- /policy auth assertion -------------------------------------------------
+# --- /policy NetworkPolicy-drop assertion -----------------------------------
 # The CachePolicy side-effect assertion above proves the authenticated write
 # path works: the controller pushed the CR through /policy and the server
-# enforced it on LookupRoute. The complementary half — that an
-# UNAUTHENTICATED POST is rejected — is what this section checks, since
+# enforced it on LookupRoute. The complementary half — that an UNAUTHENTICATED
+# POST is DROPPED BY THE NETWORKPOLICY — is what this section checks, since
 # /policy is replace-on-write and a successful rogue POST would override
 # cluster-wide policy state with no audit trail. Mirror of the /snapshot probe
-# above. Sends a valid PolicySnapshot body so a 400 (bad request) cannot be
-# confused with a 401; the only valid outcomes are 401 (auth) or
-# curl_failed:28 (NetworkPolicy drop under an enforcing CNI).
-log "asserting unauthenticated /policy POST from a side pod is rejected"
+# above: the side pod carries none of the controller labels, so under the
+# enforcing CNI its connection to :8081 is dropped and curl exits 28 before the
+# body is ever sent. The body is still a valid PolicySnapshot so that if the
+# NetworkPolicy IS broken the probe gets a clean 401 (auth) rather than a 400
+# (bad request) — making the failure diagnosable. Required outcome is
+# curl_failed:28; a bare 401 now FAILS.
+log "asserting unauthenticated /policy POST from a side pod is dropped by the NetworkPolicy"
 SIDE_POD_POLICY="ic-policy-probe"
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_POLICY" --image=curlimages/curl:8.10.1 --restart=Never \
@@ -2424,33 +2500,39 @@ if [ -z "$policy_probe_out" ]; then
 fi
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_POLICY" --grace-period=0 --force >/dev/null 2>&1 || true
 
-# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
-# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
-# CNI drops, it does not RST; accepting 7 would let "listener crashed"
-# pass). 204 (write succeeded unauthenticated) is the regression this
+# Required outcome curl_failed:28 (NetworkPolicy drop) — see /snapshot probe
+# above for the full rationale, incl. why 7 (ECONNREFUSED) is NOT accepted (an
+# enforcing CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass) and why a bare 401 now FAILS (it means the NetworkPolicy did not drop
+# the connection). 204 (write succeeded unauthenticated) is the regression this
 # whole ticket exists to prevent.
 case "$policy_probe_out" in
-  "401"|*"curl_failed:28"*)
-    log "unauthenticated /policy probe rejected (probe output: $policy_probe_out)"
+  *"curl_failed:28"*)
+    log "unauthenticated /policy probe dropped by the NetworkPolicy (curl timed out; probe output: $policy_probe_out)"
+    ;;
+  "401")
+    fail "unauthenticated /policy probe reached the listener and got HTTP 401 — the L7 auth middleware answered, but the server NetworkPolicy did NOT drop the connection at L3/L4 (expected curl_failed:28). The NetworkPolicy is missing/broken or the CNI is not enforcing it. Got: $policy_probe_out"
     ;;
   *)
-    fail "unauthenticated /policy probe was not rejected (or curl failed for an unexpected reason); got: $policy_probe_out"
+    fail "unauthenticated /policy probe was not dropped by the NetworkPolicy (expected curl_failed:28); got: $policy_probe_out"
     ;;
 esac
 
-# --- /probe auth assertion ------------------------------------------------
+# --- /probe NetworkPolicy-drop assertion ----------------------------------
 # /probe is the controller-driven functional self-test endpoint; same
 # controller ServiceAccount identity as /snapshot and /policy. The complementary
-# UNAUTHENTICATED-rejection half is what this section checks — a regression
-# that wired /probe outside the shared auth profile would let any pod that
-# can reach :8081 drive a synthetic round-trip AND, since the CacheBackend
-# reconciler now consumes the result to publish FunctionalProbeOK and
-# downgrade Ready, observe (or trigger forged) Ready transitions on every
-# managed backend. Sends a valid ProbeRequest body so the rejection cannot
-# be misattributed to a 400; the only valid outcomes are 401 (auth) or
-# curl_failed:28 (NetworkPolicy drop under an enforcing CNI). Mirror of the
+# half — that an UNAUTHENTICATED caller is DROPPED BY THE NETWORKPOLICY — is what
+# this section checks: a regression that both wired /probe outside the shared
+# auth profile AND broke the NetworkPolicy would let any pod that can reach :8081
+# drive a synthetic round-trip AND, since the CacheBackend reconciler now
+# consumes the result to publish FunctionalProbeOK and downgrade Ready, observe
+# (or trigger forged) Ready transitions on every managed backend. The side pod
+# carries none of the controller labels, so under the enforcing CNI its
+# connection to :8081 is dropped and curl exits 28. The body is still a valid
+# ProbeRequest so a broken NetworkPolicy surfaces as a clean 401, not a 400.
+# Required outcome curl_failed:28; a bare 401 now FAILS. Mirror of the
 # /policy probe above.
-log "asserting unauthenticated /probe POST from a side pod is rejected"
+log "asserting unauthenticated /probe POST from a side pod is dropped by the NetworkPolicy"
 SIDE_POD_PROBE="ic-probe-probe"
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 if ! kubectl -n "$NAMESPACE" run "$SIDE_POD_PROBE" --image=curlimages/curl:8.10.1 --restart=Never \
@@ -2482,17 +2564,20 @@ if [ -z "$probe_probe_out" ]; then
 fi
 kubectl -n "$NAMESPACE" delete pod "$SIDE_POD_PROBE" --grace-period=0 --force >/dev/null 2>&1 || true
 
-# Acceptable outcomes (either gate sufficient) — see /snapshot probe above
-# for the rationale on why 7 (ECONNREFUSED) is NOT accepted (an enforcing
-# CNI drops, it does not RST; accepting 7 would let "listener crashed"
-# pass). 200 (synthesis ran unauthenticated) is the regression this whole
-# section exists to prevent.
+# Required outcome curl_failed:28 (NetworkPolicy drop) — see /snapshot probe
+# above for the full rationale, incl. why 7 (ECONNREFUSED) is NOT accepted (an
+# enforcing CNI drops, it does not RST; accepting 7 would let "listener crashed"
+# pass) and why a bare 401 now FAILS. 200 (synthesis ran unauthenticated) is the
+# regression this whole section exists to prevent.
 case "$probe_probe_out" in
-  "401"|*"curl_failed:28"*)
-    log "unauthenticated /probe POST rejected (probe output: $probe_probe_out)"
+  *"curl_failed:28"*)
+    log "unauthenticated /probe POST dropped by the NetworkPolicy (curl timed out; probe output: $probe_probe_out)"
+    ;;
+  "401")
+    fail "unauthenticated /probe POST reached the listener and got HTTP 401 — the L7 auth middleware answered, but the server NetworkPolicy did NOT drop the connection at L3/L4 (expected curl_failed:28). The NetworkPolicy is missing/broken or the CNI is not enforcing it. Got: $probe_probe_out"
     ;;
   *)
-    fail "unauthenticated /probe POST was not rejected (or curl failed for an unexpected reason); got: $probe_probe_out"
+    fail "unauthenticated /probe POST was not dropped by the NetworkPolicy (expected curl_failed:28); got: $probe_probe_out"
     ;;
 esac
 
