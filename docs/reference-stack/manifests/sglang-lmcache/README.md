@@ -106,9 +106,17 @@ kubectl -n cache-substrate create secret generic hf-token --from-literal=token="
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Deploy the lmcache-server + SGLang engine (the manifest wires them together).
-#    Wait for BOTH rollouts: fail-open means the engine can serve traffic even if
-#    lmcache-server is unready or its image is bad, so a green engine rollout
-#    alone would hide a broken cache server (offload silently never happens).
+#
+#    !! WILL NOT COMPLETE AS-IS (GPU-validated 2026-07) !! With the shipped lm://
+#    config the SGLang engine HANGS at startup (see "Wire-test caveat (resolved)"),
+#    so the sglang rollout below never goes green and steps 4+ (serving) cannot
+#    pass. These commands are kept as the intended SHAPE; they become runnable only
+#    after the MP-mode adapter fix (--lmcache-config-file + a per-node worker). Do
+#    NOT run this expecting a working LMCache offload today.
+#
+#    (Once fixed: wait for BOTH rollouts — fail-open means the engine can serve even
+#    if lmcache-server is unready, so a green engine rollout alone would hide a
+#    broken cache server, i.e. offload silently never happening.)
 kubectl apply -f deployment.yaml
 kubectl -n cache-substrate rollout status deploy/lmcache-server --timeout=5m
 kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeout=20m

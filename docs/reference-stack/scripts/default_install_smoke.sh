@@ -3217,7 +3217,11 @@ kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/de
 # applies cleanly; this asserts the warning actually fires through a real apply.
 sglang_sample="config/samples/cachebackend-sglang.yaml"
 if [ -f "$sglang_sample" ]; then
-  sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$NAMESPACE" -f "$sglang_sample" 2>&1)"
+  # `|| true`: under `set -e`, a rejected apply (non-zero) inside the assignment
+  # would abort the script before the diagnostic branch below runs. Capture the
+  # output regardless so a real admission failure still hits the `*)` fail path
+  # with its context, rather than dying silently.
+  sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$NAMESPACE" -f "$sglang_sample" 2>&1)" || true
   case "$sglang_warn_out" in
     *"MP mode"*)
       log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
