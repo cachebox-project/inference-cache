@@ -483,8 +483,17 @@ EOF
 # node + CoreDNS it unblocks — are fully Ready. kind's built-in kindnet CNI does
 # NOT enforce NetworkPolicy, so with kindnet the server NetworkPolicy is inert
 # and the /snapshot + /policy + /probe drop assertions can only ever pass on the
-# L7 401 fallback. A half-initialised CNI is the main flakiness risk of
-# this swap, so every component is waited on explicitly with generous timeouts.
+# L7 401 fallback. A half-initialised CNI is the main flakiness risk of this
+# swap, so every component is waited on explicitly.
+#
+# Idempotent: `kubectl apply` and every rollout/wait below is a no-op on a
+# cluster that already has Calico Ready, so this is safe to call on the reuse
+# path as well as after a fresh create.
+#
+# Timeout budget: the waits sum to 180+120+90+120 = 510s worst case, kept well
+# under the workflow's timeout-minutes so that even a wedged CNI fails with time
+# to spare for the exit trap to collect diagnostics before GitHub Actions SIGKILLs
+# the job. In practice Calico is Ready in well under a minute; these are ceilings.
 install_calico() {
   log "installing Calico $CALICO_VERSION (NetworkPolicy-enforcing CNI)"
   kubectl apply -f \
@@ -493,15 +502,15 @@ install_calico() {
   # calico-node is the per-node DaemonSet that programs the dataplane and
   # enforces NetworkPolicy; calico-kube-controllers is the policy/IPAM
   # controller. rollout status blocks until desired == ready for each.
-  kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-  kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=300s
+  kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
+  kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=120s
   # The node stays NotReady until the CNI is actually programming the dataplane,
   # so node-Ready is the authoritative "Calico works" gate (it also backstops the
   # DaemonSet rollout racing to a premature 0-desired success). CoreDNS only gets
   # a pod IP once the CNI is up, and the probes below resolve the server Service
   # through it, so gate on CoreDNS too.
-  kubectl wait --for=condition=Ready nodes --all --timeout=120s
-  kubectl -n kube-system rollout status deployment/coredns --timeout=180s
+  kubectl wait --for=condition=Ready nodes --all --timeout=90s
+  kubectl -n kube-system rollout status deployment/coredns --timeout=120s
   log "Calico is Ready; NetworkPolicy enforcement is active"
 }
 
@@ -514,9 +523,7 @@ install_calico() {
 # (docs/reference-stack/kind/cluster.yaml) is intentionally left on kindnet — it
 # demos the substrate and does not need NetworkPolicy enforcement.
 if "$KIND" get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
-  # Reuse path is local-dev only (KEEP_CLUSTER=1); the cluster it reuses was
-  # created by this same script, so Calico is already installed and Ready.
-  log "reusing existing kind cluster $KIND_CLUSTER (assumes Calico already installed)"
+  log "reusing existing kind cluster $KIND_CLUSTER"
   CREATED_CLUSTER=0
 else
   log "creating kind cluster $KIND_CLUSTER with the default CNI disabled (Calico installed below)"
@@ -525,7 +532,7 @@ else
   # kube-controller-manager allocates node podCIDRs from — the canonical
   # kind+Calico pairing, no IP-pool patching needed. No `--wait` here: with the
   # default CNI disabled the node stays NotReady until Calico is up, so readiness
-  # is waited on inside install_calico instead.
+  # is waited on inside install_calico below.
   kind_config_file="$(mktemp)"
   cat >"$kind_config_file" <<'EOF'
 kind: Cluster
@@ -538,10 +545,16 @@ EOF
   rm -f "$kind_config_file"
   kind_config_file=""
   CREATED_CLUSTER=1
-  kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
-  install_calico
 fi
 kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
+
+# Install (or verify) Calico on BOTH the create and reuse paths. install_calico
+# is idempotent, so on a reused cluster that already enforces NetworkPolicy the
+# apply is a no-op and the readiness waits return immediately — but on a reused
+# cluster that is NOT yet on an enforcing CNI it installs one, rather than
+# silently running the tightened /snapshot + /policy + /probe drop probes against
+# a non-enforcing CNI (which would fail late with a misleading 401).
+install_calico
 
 # --- build + load images ----------------------------------------------------
 log "building controller + server images at TAG=$TAG"

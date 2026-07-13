@@ -45,9 +45,12 @@ concurrency:
 jobs:
   install-smoke:
     runs-on: ubuntu-latest
-    # Script targets ~5 min end-to-end; the timeout is a circuit breaker for a
-    # wedged kind cluster / image pull, not the expected runtime.
-    timeout-minutes: 15
+    # Script targets ~6 min end-to-end (incl. the Calico CNI install the smoke
+    # needs to enforce NetworkPolicy). The timeout is a circuit breaker for a
+    # wedged kind cluster / image pull, not the expected runtime; it sits above
+    # the worst-case Calico readiness budget (~510s) plus the smoke so a wedged
+    # CNI still leaves room for the exit trap to collect diagnostics.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
