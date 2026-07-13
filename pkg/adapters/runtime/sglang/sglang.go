@@ -107,8 +107,11 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 
 // ResolveCacheServer renders the standalone LMCache server, delegating to the
 // engine-agnostic [runtimeadapter.ResolveLMCacheServer] shared with the vLLM
-// adapter — the lmcache-server is identical regardless of which engine
-// connects (the engine reaches it at lm://<svc>:<port>).
+// adapter. NOTE: this is the CURRENTLY RENDERED, known-broken topology — see the
+// package KNOWN LIMITATION. For vLLM the engine reaches this server at
+// lm://<svc>:<port>; SGLang does NOT (it drives LMCache in MP mode and never
+// dials this server), so for (sglang, LMCache) this workload is provisioned but
+// unused until the MP-mode fix lands.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	return runtimeadapter.ResolveLMCacheServer(cache)
 }

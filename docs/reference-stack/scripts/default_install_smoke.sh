@@ -3209,6 +3209,26 @@ while IFS= read -r f; do
 done <<< "$sample_list"
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
+# Operator-facing admission signal: applying the (sglang, LMCache) sample MUST
+# warn that its LMCache offload is misconfigured — SGLang drives LMCache in MP
+# mode, so the shipped lm:// wiring caches nothing and must not be mistaken for a
+# working backend. --dry-run=server reaches admission (where the warning is
+# emitted on stderr) and persists nothing. The loop above only asserts the sample
+# applies cleanly; this asserts the warning actually fires through a real apply.
+sglang_sample="config/samples/cachebackend-sglang.yaml"
+if [ -f "$sglang_sample" ]; then
+  sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$NAMESPACE" -f "$sglang_sample" 2>&1)"
+  case "$sglang_warn_out" in
+    *"MP mode"*)
+      log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
+    *)
+      printf '%s\n' "$sglang_warn_out"
+      fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
+  esac
+else
+  log "WARN: $sglang_sample missing — skipped the SGLang MP-mode warning assertion"
+fi
+
 # Guard against the backstop silently becoming a no-op if config/samples ends
 # up empty or unreadable. The recursive find above tracks `make verify-samples`,
 # so layout changes (subdirs, .yml) stay covered; this only catches the

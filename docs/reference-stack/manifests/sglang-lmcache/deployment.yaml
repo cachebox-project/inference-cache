@@ -36,12 +36,11 @@
 # does not bundle it — bake `pip install lmcache` into a derived image or an init
 # step, version-aligned with the lmcache-server tag below).
 #
-# WIRE-TEST CAVEAT: this manifest wires SGLang's experimental LMCache path to a
-# REMOTE lmcache-server via LMCACHE_REMOTE_URL (what the adapter injects). Whether
-# SGLang's experimental path honours LMCACHE_REMOTE_URL from the env vs. requiring
-# the full LMCACHE_CONFIG_FILE has not been wire-tested end-to-end. If a real run
-# shows the engine never connects (lmcache-server logs no stores), mount a config
-# file instead (see the README) and report back so the adapter can follow suit.
+# WIRE-TEST CAVEAT — RESOLVED (GPU-validated 2026-07): the LMCACHE_REMOTE_URL
+# wiring below is WRONG for SGLang (it hangs the engine — see the KNOWN LIMITATION
+# above). SGLang reads config only from --lmcache-config-file and uses LMCache MP
+# mode, not this remote lm:// server. Do not treat the env wiring as a working
+# offload. Correct MP-mode wiring is the tracked follow-up; see the README.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -163,8 +162,9 @@ spec:
             # Gates SGLang's experimental LMCache integration — required for
             # --enable-lmcache to engage the connector.
             - { name: LMCACHE_USE_EXPERIMENTAL, value: "True" }
-            # The remote lmcache-server, lm:// scheme. (See the wire-test caveat
-            # in the header — this is the path the adapter injects.)
+            # The remote lmcache-server, lm:// scheme — what the adapter injects.
+            # KNOWN-BROKEN for SGLang (ignored env; SGLang needs MP mode — see the
+            # KNOWN LIMITATION header). Kept to document the shipped wiring.
             - { name: LMCACHE_REMOTE_URL, value: "lm://lmcache-server:65432" }
             - { name: LMCACHE_REMOTE_SERDE, value: "naive" }
             - { name: LMCACHE_CHUNK_SIZE, value: "256" }

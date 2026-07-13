@@ -373,7 +373,7 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 // time so the lm:// wiring isn't mistaken for a working cache. Text stays within
 // [maxWarningLen]; the full rationale lives in docs/design/cachebackend-api.md
 // (the SGLang engine support section's KNOWN LIMITATION note).
-const sglangLMCacheDataPlaneWarning = "SGLang+LMCache data plane unverified: SGLang uses LMCache MP mode, not this lm:// server (Ready, may not cache)"
+const sglangLMCacheDataPlaneWarning = "SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server (may hang or not cache)"
 
 // warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend —
 // unlike the Mooncake warning there is no per-field opt-in that closes the gap
