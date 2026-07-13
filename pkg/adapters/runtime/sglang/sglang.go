@@ -116,10 +116,17 @@ func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.Po
 	return runtimeadapter.ResolveLMCacheServer(cache)
 }
 
-// InjectEngineConfig wires the SGLang engine pod to the resolved cache endpoint
-// via SGLang's LMCache launch surface (--enable-lmcache + LMCACHE_* env), merging
-// with the pod template's existing args/env. See enginewire.InjectSGLangLMCache
-// for why the env set differs from vLLM's (no VLLM_USE_V1 / PYTHONHASHSEED).
+// InjectEngineConfig injects SGLang's LMCache launch surface (--enable-lmcache +
+// LMCACHE_* env), merging with the pod template's existing args/env. See
+// enginewire.InjectSGLangLMCache for why the env set differs from vLLM's (no
+// VLLM_USE_V1 / PYTHONHASHSEED).
+//
+// KNOWN LIMITATION (see the package doc): this does NOT produce a working cache
+// today. SGLang ignores the injected `LMCACHE_*` env — it reads config only from
+// the `--lmcache-config-file` flag and uses LMCache MP mode — so the injected
+// `LMCACHE_REMOTE_URL` is inert. The MP-mode wire (a config file + a per-node
+// worker) is the tracked follow-up; this method still injects the shipped
+// (non-functional) wiring.
 func (adapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	return enginewire.InjectSGLangLMCache(pod, endpoint, cache)
 }
@@ -172,14 +179,20 @@ func (adapter) ReservedArgs() []string {
 	return []string{enginewire.SGLangEnableLMCacheArg}
 }
 
-// ReservedEnv returns the env var names this adapter injects that the LMCache
-// integration cannot function without:
+// ReservedEnv returns the env var names this adapter injects and blocks
+// engineOverrides from touching. NOTE (see the package KNOWN LIMITATION): not all
+// of these are load-bearing for SGLang today — the adapter injects the vLLM-style
+// wire, but SGLang uses LMCache MP mode, so some of it is inert. They are still
+// reserved (the operator must not silently mutate adapter-owned state), but the
+// rationale differs per var:
 //
-//   - LMCACHE_REMOTE_URL is the address of the rendered cache server; an
-//     override re-points the engine at a different cache than the CR resolved
-//     to.
-//   - LMCACHE_USE_EXPERIMENTAL (set to "True") gates SGLang's experimental
-//     LMCache path; without it, --enable-lmcache does not engage the connector.
+//   - LMCACHE_REMOTE_URL is the rendered cache-server address for the vLLM path;
+//     SGLang IGNORES it (MP mode reads mp_host/mp_port from --lmcache-config-file),
+//     so it is currently inert — reserved to keep the shipped wire consistent, not
+//     because SGLang honors it. The MP-mode fix replaces it.
+//   - LMCACHE_USE_EXPERIMENTAL (set to "True") DOES matter — it gates SGLang's
+//     experimental LMCache path; without it, --enable-lmcache does not engage the
+//     connector at all.
 //   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the pod;
 //     an override would silently desync the pod from the CR contract.
 //

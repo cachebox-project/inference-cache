@@ -487,10 +487,10 @@ func TestValidator_VLLMLMCacheEmitsNoSGLangWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("(vllm, LMCache) must be admitted: %v", err)
 	}
-	for _, w := range warnings {
-		if strings.Contains(w, "MP mode") {
-			t.Fatalf("(vllm, LMCache) got the sglang MP-mode warning: %q", w)
-		}
+	// The contract is warning-FREE, not merely "no MP-mode warning" — assert the
+	// full list is empty so a reworded warning or an accidental new one is caught.
+	if len(warnings) != 0 {
+		t.Fatalf("(vllm, LMCache) must be warning-free, got: %v", warnings)
 	}
 }
 
