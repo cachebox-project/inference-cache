@@ -375,10 +375,12 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 // (the SGLang engine support section's KNOWN LIMITATION note).
 const sglangLMCacheDataPlaneWarning = "SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server (may hang or not cache)"
 
-// warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend —
-// unlike the Mooncake warning there is no per-field opt-in that closes the gap
-// today; the whole pairing is wired to the wrong LMCache mode. Scoped by the same
-// (runtime, type) test as [rejectUnsupportedSGLangRole].
+// warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend
+// that actually wires an offload — i.e. all of them EXCEPT events-only, which
+// injects no LMCache connector at all (so there is no lm://-vs-MP mismatch to warn
+// about). Unlike the Mooncake warning there is no per-field opt-in that closes the
+// gap for an offload backend; the whole pairing is wired to the wrong LMCache mode.
+// Scoped by the same (runtime, type) test as [rejectUnsupportedSGLangRole].
 func warnSGLangLMCacheDataPlaneUnverified(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
 		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {

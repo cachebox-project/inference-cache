@@ -58,10 +58,13 @@ installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
 `engineSelector` matches these pods and whose `backendConfig.model` is set, so
 the controller auto-attaches the `kvevent-subscriber` sidecar (see
 `config/samples/cachebackend-sglang.yaml` and the install docs). The raw
-`kubectl apply` below stands up only the engine + lmcache-server, so from these
-steps alone the verifiable outcome is the engine serving traffic with its
-**KV-event publisher started** (asserted from the engine logs below) — not the
-consumed event stream (the standalone manifest ships no consumer) and not the
+`kubectl apply` below is *intended* to stand up the engine + lmcache-server, so
+that the verifiable outcome would be the engine serving traffic with its
+**KV-event publisher started** (asserted from the engine logs below). **As shipped
+with `--enable-lmcache` the engine hangs at startup (KNOWN LIMITATION), so none of
+that is reached** — drop `--enable-lmcache` to observe the engine + publisher. Even
+when it runs, this flow shows neither the consumed event stream (the standalone
+manifest ships no consumer) nor the
 populated index; the index/`LookupRoute` criterion below assumes the controller
 + that `CacheBackend` are also present.
 
