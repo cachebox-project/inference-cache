@@ -17,7 +17,9 @@
 # WRONG for SGLang. SGLang drives LMCache in multiprocess (MP) mode — config via
 # the --lmcache-config-file flag (the LMCACHE_* env is ignored), a node-local
 # worker over mp_host/mp_port, not a cluster-reachable lm:// server. Applied as
-# written the engine hangs at startup. This manifest shows the KV-event path and
+# written (env only, no --lmcache-config-file) the engine REFUSES TO START
+# (MP mode requires --lmcache-config-file); a config file carrying remote_url
+# instead would hang. Either way this manifest shows the KV-event path and
 # injection surface, not a working LMCache offload. See the README's KNOWN
 # LIMITATION note and docs/design/cachebackend-api.md (SGLang engine support).
 #
@@ -37,8 +39,9 @@
 # step, version-aligned with the lmcache-server tag below).
 #
 # WIRE-TEST CAVEAT — RESOLVED (GPU-validated 2026-07): the LMCACHE_REMOTE_URL
-# wiring below is WRONG for SGLang (it hangs the engine — see the KNOWN LIMITATION
-# above). SGLang reads config only from --lmcache-config-file and uses LMCache MP
+# wiring below is WRONG for SGLang (env only + no --lmcache-config-file makes the
+# engine refuse to start — see the KNOWN LIMITATION above). SGLang reads config
+# only from --lmcache-config-file and uses LMCache MP
 # mode, not this remote lm:// server. Do not treat the env wiring as a working
 # offload. Correct MP-mode wiring is the tracked follow-up; see the README.
 apiVersion: apps/v1
