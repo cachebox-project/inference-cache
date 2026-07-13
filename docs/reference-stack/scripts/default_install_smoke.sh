@@ -564,14 +564,31 @@ EOF
 fi
 kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
 
-# Guard the reuse path (CREATED_CLUSTER=0). A reused cluster must ALREADY be on
-# Calico — one created by this script is, because the create path above disables
-# the default CNI and configures the 192.168.0.0/16 pool. Installing Calico onto
-# an ordinary kindnet cluster instead (default pod CIDR 10.244.0.0/16, kindnet
-# still present) yields a dual-CNI cluster with unreliable NetworkPolicy
-# enforcement, so refuse rather than silently degrade the gate.
-if [ "$CREATED_CLUSTER" = "0" ] && ! kubectl -n kube-system get daemonset calico-node >/dev/null 2>&1; then
-  fail "reused kind cluster $KIND_CLUSTER is not running Calico (no calico-node DaemonSet in kube-system). This smoke needs a NetworkPolicy-enforcing CNI, and installing Calico onto an existing kindnet cluster is unsafe (CNI/pod-CIDR mismatch). Delete it ('$KIND delete cluster --name $KIND_CLUSTER') and re-run so the script recreates it with the default CNI disabled, or unset KEEP_CLUSTER."
+# Guard the reuse path (CREATED_CLUSTER=0). A reused cluster (KEEP_CLUSTER=1) must
+# ALREADY be on Calico ALONE, configured the way the create path above sets it up
+# — one created by this script is (default CNI disabled + 192.168.0.0/16 pool).
+# Anything else enforces NetworkPolicy unreliably and would give the tightened
+# drop probes false results, so verify the actual CNI and pod CIDR and bail with
+# recreate guidance rather than layering Calico on top / silently degrading:
+#   1. kindnet gone — a pure-kindnet cluster OR the dual-CNI state of kindnet with
+#      Calico added on top both enforce unreliably (checking calico-node presence
+#      alone would wave the dual-CNI case through);
+#   2. calico-node present — an enforcing CNI actually exists;
+#   3. node pod CIDR is 192.168.0.0/16 — a stale cluster on kindnet's default
+#      10.244.0.0/16 would mismatch Calico's pool.
+if [ "$CREATED_CLUSTER" = "0" ]; then
+  reuse_fix="Delete it ('$KIND delete cluster --name $KIND_CLUSTER') and re-run so the script recreates it with the default CNI disabled + the 192.168.0.0/16 pod CIDR, or unset KEEP_CLUSTER."
+  if kubectl -n kube-system get daemonset kindnet >/dev/null 2>&1; then
+    fail "reused kind cluster $KIND_CLUSTER still has the kindnet CNI (kindnet DaemonSet present in kube-system) — this smoke needs Calico as the SOLE NetworkPolicy-enforcing CNI; a kindnet-only or kindnet+Calico cluster enforces unreliably. $reuse_fix"
+  fi
+  if ! kubectl -n kube-system get daemonset calico-node >/dev/null 2>&1; then
+    fail "reused kind cluster $KIND_CLUSTER has no calico-node DaemonSet in kube-system — no NetworkPolicy-enforcing CNI is installed. $reuse_fix"
+  fi
+  reuse_pod_cidr="$(kubectl get nodes -o jsonpath='{.items[0].spec.podCIDR}' 2>/dev/null || true)"
+  case "$reuse_pod_cidr" in
+    192.168.*) ;;
+    *) fail "reused kind cluster $KIND_CLUSTER has pod CIDR '$reuse_pod_cidr', not the 192.168.0.0/16 Calico pool this smoke configures. $reuse_fix" ;;
+  esac
 fi
 
 # Install (or verify) Calico. install_calico is idempotent, so on a reused
