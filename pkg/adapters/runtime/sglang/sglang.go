@@ -38,6 +38,17 @@ const (
 // parameterised per engine), and only the engine-side launch wire differs —
 // SGLang turns LMCache on with --enable-lmcache + LMCACHE_USE_EXPERIMENTAL,
 // not vLLM's --kv-transfer-config (see enginewire.InjectSGLangLMCache).
+//
+// KNOWN LIMITATION (surfaced by GPU validation, not yet fixed): this "mirror the
+// vLLM+LMCache adapter" model is WRONG for SGLang. SGLang drives LMCache through
+// its LMCacheLayerwiseConnector in MULTIPROCESS (MP) mode — config read from the
+// --lmcache-config-file flag (the LMCACHE_* env injected here is IGNORED),
+// node-local transfer via mp_host/mp_port + shared memory. It does not consume a
+// standalone lm:// server the way vLLM does; pointing SGLang at a bare remote
+// lm:// URL hangs the engine at startup. So a (sglang, LMCache) backend can
+// reconcile Ready while caching nothing — admission emits an advisory warning
+// (see the validator's sglangLMCacheDataPlaneWarning). Correcting this to the
+// MP-mode wire + a per-node worker is a GPU-validated follow-up.
 type adapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
