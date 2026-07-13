@@ -371,7 +371,8 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 // per-node worker — is a follow-up that must be built and GPU-validated, and a hard
 // reject would strand operators who set up MP mode by hand. Say it out loud at apply
 // time so the lm:// wiring isn't mistaken for a working cache. Text stays within
-// [maxWarningLen]; the full rationale lives in the sglang adapter docs.
+// [maxWarningLen]; the full rationale lives in docs/design/cachebackend-api.md
+// (the SGLang engine support section's KNOWN LIMITATION note).
 const sglangLMCacheDataPlaneWarning = "SGLang+LMCache data plane unverified: SGLang uses LMCache MP mode, not this lm:// server (Ready, may not cache)"
 
 // warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend —
@@ -381,6 +382,11 @@ const sglangLMCacheDataPlaneWarning = "SGLang+LMCache data plane unverified: SGL
 func warnSGLangLMCacheDataPlaneUnverified(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
 		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	if cb.Spec.IsEventsOnly() {
+		// Events-only (tier-1 routing) injects NO LMCache connector — it only wires
+		// the observation sidecar — so the lm://-vs-MP mismatch simply isn't present.
 		return nil
 	}
 	return admission.Warnings{sglangLMCacheDataPlaneWarning}

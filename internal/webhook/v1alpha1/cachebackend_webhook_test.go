@@ -462,13 +462,14 @@ func TestValidator_SGLangLMCacheWarnsDataPlaneUnverified(t *testing.T) {
 		t.Fatalf("create warnings = %v, want one naming the MP-mode mismatch", warnings)
 	}
 
-	// Persists on update, not only first apply.
+	// Persists on update, not only first apply — and it's the SGLang MP-mode
+	// warning specifically, not just any warning.
 	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
 	if err != nil {
 		t.Fatalf("(sglang, LMCache) update must still be admitted: %v", err)
 	}
-	if len(warnings) != 1 {
-		t.Fatalf("update warnings = %v, want the sglang data-plane warning", warnings)
+	if len(warnings) != 1 || warnings[0] != sglangLMCacheDataPlaneWarning {
+		t.Fatalf("update warnings = %v, want exactly the sglang MP-mode warning", warnings)
 	}
 }
 
@@ -486,6 +487,28 @@ func TestValidator_VLLMLMCacheEmitsNoSGLangWarning(t *testing.T) {
 	for _, w := range warnings {
 		if strings.Contains(w, "MP mode") {
 			t.Fatalf("(vllm, LMCache) got the sglang MP-mode warning: %q", w)
+		}
+	}
+}
+
+func TestValidator_SGLangEventsOnlyEmitsNoDataPlaneWarning(t *testing.T) {
+	// EventsOnly (tier-1 routing) provisions no server and injects no LMCache
+	// connector — only the observation sidecar — so the lm://-vs-MP mismatch is
+	// absent and the warning must not fire.
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := newBackend()
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "sglang",
+		Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+	}
+	warnings, err := v.ValidateCreate(context.Background(), cb)
+	if err != nil {
+		t.Fatalf("(sglang, LMCache, EventsOnly) must be admitted: %v", err)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "MP mode") {
+			t.Fatalf("events-only backend got the sglang MP-mode warning: %q", w)
 		}
 	}
 }

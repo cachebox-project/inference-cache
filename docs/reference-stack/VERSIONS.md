@@ -3,6 +3,16 @@
 Everything the reference stack depends on, pinned. Bump here first, re-validate
 on a GPU host, then propagate to any automation that templates these manifests.
 
+> **KNOWN LIMITATION (GPU-validated 2026-07):** the SGLang rows describe an `lm://`
+> lmcache-server the SGLang engine "offloads to." GPU validation showed SGLang does
+> **not** use LMCache that way — it uses **multiprocess (MP) mode** (config via the
+> `--lmcache-config-file` flag, a node-local worker over `mp_host`/`mp_port`, not a
+> cluster-reachable `lm://` server), and the `lm://` wiring hangs the engine at
+> startup. The SGLang `lmcache-server` / `LMCACHE_REMOTE_URL` pins below are the
+> shipped (incorrect) wiring, pending the MP-mode fix. See the SGLang README's KNOWN
+> LIMITATION note and `docs/design/cachebackend-api.md` (SGLang engine support). The
+> vLLM rows are unaffected.
+
 | Component | Pin | Where | Notes |
 |---|---|---|---|
 | vLLM + LMCache image | `lmcache/vllm-openai@sha256:<pin>` | `manifests/deployment.yaml`, `helm/values-reference.yaml` | Upstream ships LMCache pre-installed. Requires the vLLM **v1** engine (`VLLM_USE_V1=1`). The manifests ship a **non-applyable placeholder digest** — substitute a real one (below) before the GPU run. |

@@ -48,7 +48,8 @@ const (
 // lm:// URL hangs the engine at startup. So a (sglang, LMCache) backend can
 // reconcile Ready while caching nothing — admission emits an advisory warning
 // (see the validator's sglangLMCacheDataPlaneWarning). Correcting this to the
-// MP-mode wire + a per-node worker is a GPU-validated follow-up.
+// MP-mode wire + a per-node worker is a GPU-validated follow-up. Full rationale:
+// docs/design/cachebackend-api.md, the SGLang engine support KNOWN LIMITATION note.
 type adapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar

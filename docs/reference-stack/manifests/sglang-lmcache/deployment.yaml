@@ -12,6 +12,15 @@
 # already present (it wires the cache offload, not the event publisher or the
 # pod shape), so the full manifest is NOT byte-for-byte adapter output.
 #
+# KNOWN LIMITATION (GPU-validated 2026-07, fix pending): the lm:// LMCache
+# offload wiring here (LMCACHE_REMOTE_URL + the standalone lmcache-server) is
+# WRONG for SGLang. SGLang drives LMCache in multiprocess (MP) mode — config via
+# the --lmcache-config-file flag (the LMCACHE_* env is ignored), a node-local
+# worker over mp_host/mp_port, not a cluster-reachable lm:// server. Applied as
+# written the engine hangs at startup. This manifest shows the KV-event path and
+# injection surface, not a working LMCache offload. See the README's KNOWN
+# LIMITATION note and docs/design/cachebackend-api.md (SGLang engine support).
+#
 # >> You need an NVIDIA GPU. << SGLang loads weights on CUDA, and the LMCache
 # connector offloads KV. Unlike vLLM there is no first-class CPU build to fall
 # back to here, so this manifest is GPU-only. SGLang's exact KV-event wire (the

@@ -11,6 +11,8 @@ of the manifest — image, resources, the lmcache-server, `--kv-events-config` �
 is operator-owned scaffolding the adapter assumes is already present, so the
 file as a whole is **not** byte-for-byte adapter output.
 
+> **KNOWN LIMITATION — the `lm://` LMCache offload wiring here is wrong for SGLang (GPU-validated 2026-07).** The `LMCACHE_REMOTE_URL` / standalone `lmcache-server` wiring below mirrors vLLM+LMCache, but SGLang drives LMCache in **multiprocess (MP) mode**: config from the **`--lmcache-config-file` flag** (the `LMCACHE_*` env is ignored) and a **node-local** worker addressed by `mp_host`/`mp_port` over shared memory — not a cluster-reachable `lm://` server. Applied as written, the SGLang engine **hangs at startup** (a `remote_url: lm://…` config never finishes init) or refuses to start without `--lmcache-config-file`. Use this manifest to understand the KV-event path and the injection surface, **not** as a working LMCache offload. The correct MP-mode wiring (`--lmcache-config-file` + a per-node worker) is a pending fix; see `docs/design/cachebackend-api.md` (SGLang engine support). The "Status" note below predates this validation.
+
 > **Status — unvalidated template (no end-to-end GPU run).** No GPU was available
 > at authoring time, so nothing in the GPU flow below has been executed
 > end-to-end — treat this as a **template**, not a known-good run. Applied, it is
