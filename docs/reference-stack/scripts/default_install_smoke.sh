@@ -3236,7 +3236,7 @@ if [ -f "$sglang_sample" ]; then
     fail "(sglang, LMCache) sample did not apply cleanly under --dry-run=server (admission rejected it)"
   fi
 else
-  log "WARN: $sglang_sample missing — skipped the SGLang MP-mode warning assertion"
+  fail "$sglang_sample missing — the SGLang MP-mode admission-warning assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
 fi
 
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
