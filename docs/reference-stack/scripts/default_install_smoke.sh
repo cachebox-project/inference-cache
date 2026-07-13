@@ -3217,18 +3217,23 @@ kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/de
 # applies cleanly; this asserts the warning actually fires through a real apply.
 sglang_sample="config/samples/cachebackend-sglang.yaml"
 if [ -f "$sglang_sample" ]; then
-  # `|| true`: under `set -e`, a rejected apply (non-zero) inside the assignment
-  # would abort the script before the diagnostic branch below runs. Capture the
-  # output regardless so a real admission failure still hits the `*)` fail path
-  # with its context, rather than dying silently.
-  sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$NAMESPACE" -f "$sglang_sample" 2>&1)" || true
-  case "$sglang_warn_out" in
-    *"MP mode"*)
-      log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
-    *)
-      printf '%s\n' "$sglang_warn_out"
-      fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
-  esac
+  # The `if cmd; then` form both keeps `set -e` from aborting on a rejected apply
+  # AND distinguishes the two failure modes: a NON-zero exit means the sample was
+  # rejected (fail with its output — the warning text alone must not mask that,
+  # since a rejection can print the warning before the error), a zero exit means it
+  # admitted and we then require the warning to be present.
+  if sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$NAMESPACE" -f "$sglang_sample" 2>&1)"; then
+    case "$sglang_warn_out" in
+      *"MP mode"*)
+        log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
+      *)
+        printf '%s\n' "$sglang_warn_out"
+        fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
+    esac
+  else
+    printf '%s\n' "$sglang_warn_out"
+    fail "(sglang, LMCache) sample did not apply cleanly under --dry-run=server (admission rejected it)"
+  fi
 else
   log "WARN: $sglang_sample missing — skipped the SGLang MP-mode warning assertion"
 fi

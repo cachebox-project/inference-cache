@@ -47,10 +47,13 @@ SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
 2. **You can validate off-GPU** (below): the Go test covers SGLang's exact wire
    shape; the Python synthetic tooling covers the shared decode/redaction logic.
 
-What this reference stack adds on top of those tests is the **real engine →
-ZMQ events** path on a GPU — a live SGLang+LMCache pod publishing real
-`BlockStored`/`BlockRemoved` frames a subscriber can read. Extending that all
-the way to **index + `LookupRoute`** additionally requires the cache plane
+What this reference stack is *intended* to add on top of those tests is the
+**real engine → ZMQ events** path on a GPU — a live SGLang pod publishing real
+`BlockStored`/`BlockRemoved` frames a subscriber can read. **As shipped this is
+blocked:** with `--enable-lmcache` the engine hangs at startup on the LMCache
+MP-mode mismatch (see the KNOWN LIMITATION) and never reaches serving/event
+publishing — drop `--enable-lmcache` to exercise the event path today. Extending
+that all the way to **index + `LookupRoute`** additionally requires the cache plane
 installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
 `engineSelector` matches these pods and whose `backendConfig.model` is set, so
 the controller auto-attaches the `kvevent-subscriber` sidecar (see
@@ -70,7 +73,7 @@ populated index; the index/`LookupRoute` criterion below assumes the controller
 | vLLM-only env | `VLLM_USE_V1=1`, `PYTHONHASHSEED=0` | *(neither — no v1 codepath; SGLang sha256-hashes, independent of `PYTHONHASHSEED`)* |
 | Default HTTP port | 8000 | 30000 |
 | KV-event wire | ZMQ `BlockStored`/`BlockRemoved`/`AllBlocksCleared` | same event structs; batch envelope adds a trailing `attn_dp_rank` the decoder ignores |
-| LMCACHE_* tunables | same | same |
+| LMCACHE_* tunables | read from env (`LMCACHE_REMOTE_URL` etc.) | **ignored** — SGLang reads config only from `--lmcache-config-file` (KNOWN LIMITATION) |
 
 ## Deploy and test on a GPU
 
@@ -79,11 +82,14 @@ populated index; the index/`LookupRoute` criterion below assumes the controller
 > way as the vLLM path — see [`../../GPU-RUNBOOK.md`](../../GPU-RUNBOOK.md); the
 > 8B reference model fits on a single 24 GB card.
 
-This manifest is a **standalone** reference: the SGLang engine is wired to the
-**bundled `lmcache-server`** by the manifest itself (the `LMCACHE_REMOTE_URL` env
-points at the in-namespace Service), with **no controller or `CacheBackend` in
-the loop**. It stands up the real engine and emits real ZMQ KV events — the
-hand-built shape the adapter was templated from.
+This manifest is a **standalone** reference showing the hand-built shape the
+adapter was templated from, with **no controller or `CacheBackend` in the loop**
+(the `LMCACHE_REMOTE_URL` env points at the bundled in-namespace `lmcache-server`).
+**As shipped it does NOT come up:** with `--enable-lmcache` the SGLang engine hangs
+at startup on the LMCache MP-mode mismatch (see the KNOWN LIMITATION), so it
+neither serves nor emits ZMQ events. The commands below are the intended shape,
+not a runnable flow — drop `--enable-lmcache` to bring up the engine + event path,
+and await the MP-mode fix for a working LMCache offload.
 
 Run the commands below from this directory
 (`docs/reference-stack/manifests/sglang-lmcache/`) — the relative paths
