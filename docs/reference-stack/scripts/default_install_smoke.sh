@@ -387,6 +387,22 @@ collect_diagnostics() {
     >"$LOG_DIR/pdtopologies.yaml" 2>&1 || true
   kubectl -n cert-manager get pods -o wide \
     >"$LOG_DIR/cert-manager-pods.txt" 2>&1 || true
+  # Calico CNI state — the smoke swaps kindnet for Calico so NetworkPolicy is
+  # enforced, so a stuck pod sandbox or an inert policy usually traces back to
+  # the CNI. Capture node readiness + calico-node/kube-controllers describe+logs.
+  # Best-effort (|| true): absent on a pre-Calico abort.
+  kubectl get nodes -o wide \
+    >"$LOG_DIR/nodes.txt" 2>&1 || true
+  kubectl -n kube-system get pods -l k8s-app=calico-node -o wide \
+    >"$LOG_DIR/calico-node-pods.txt" 2>&1 || true
+  kubectl -n kube-system describe daemonset calico-node \
+    >"$LOG_DIR/calico-node-describe.txt" 2>&1 || true
+  kubectl -n kube-system logs -l k8s-app=calico-node --all-containers --tail=-1 \
+    >"$LOG_DIR/calico-node-logs.txt" 2>&1 || true
+  kubectl -n kube-system describe deployment calico-kube-controllers \
+    >"$LOG_DIR/calico-kube-controllers-describe.txt" 2>&1 || true
+  kubectl -n kube-system logs deployment/calico-kube-controllers --tail=-1 \
+    >"$LOG_DIR/calico-kube-controllers-logs.txt" 2>&1 || true
   # Paired-sample state — only populated if the sample-smoke phase ran;
   # safe (|| true) if it didn't.
   kubectl -n "$SAMPLE_NS" get cb -o yaml \
@@ -548,12 +564,21 @@ EOF
 fi
 kubectl config use-context "kind-$KIND_CLUSTER" >/dev/null
 
-# Install (or verify) Calico on BOTH the create and reuse paths. install_calico
-# is idempotent, so on a reused cluster that already enforces NetworkPolicy the
-# apply is a no-op and the readiness waits return immediately — but on a reused
-# cluster that is NOT yet on an enforcing CNI it installs one, rather than
-# silently running the tightened /snapshot + /policy + /probe drop probes against
-# a non-enforcing CNI (which would fail late with a misleading 401).
+# Guard the reuse path (CREATED_CLUSTER=0). A reused cluster must ALREADY be on
+# Calico — one created by this script is, because the create path above disables
+# the default CNI and configures the 192.168.0.0/16 pool. Installing Calico onto
+# an ordinary kindnet cluster instead (default pod CIDR 10.244.0.0/16, kindnet
+# still present) yields a dual-CNI cluster with unreliable NetworkPolicy
+# enforcement, so refuse rather than silently degrade the gate.
+if [ "$CREATED_CLUSTER" = "0" ] && ! kubectl -n kube-system get daemonset calico-node >/dev/null 2>&1; then
+  fail "reused kind cluster $KIND_CLUSTER is not running Calico (no calico-node DaemonSet in kube-system). This smoke needs a NetworkPolicy-enforcing CNI, and installing Calico onto an existing kindnet cluster is unsafe (CNI/pod-CIDR mismatch). Delete it ('$KIND delete cluster --name $KIND_CLUSTER') and re-run so the script recreates it with the default CNI disabled, or unset KEEP_CLUSTER."
+fi
+
+# Install (or verify) Calico. install_calico is idempotent, so on a reused
+# Calico cluster the apply is a no-op and the readiness waits return
+# immediately; on a freshly-created cluster it brings the CNI up. Running it on
+# both paths keeps the tightened /snapshot + /policy + /probe drop probes from
+# ever executing against a non-enforcing CNI.
 install_calico
 
 # --- build + load images ----------------------------------------------------
