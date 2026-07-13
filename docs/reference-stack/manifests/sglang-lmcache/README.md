@@ -1,8 +1,9 @@
 # SGLang + LMCache reference stack
 
 The second-engine sibling of the top-level [vLLM + LMCache reference](../../README.md):
-a **SGLang** deployment publishing **KV-cache events over ZMQ** (the working
-reference leg). Its **LMCache offload** leg is a **non-working historical
+a **SGLang** deployment publishing **KV-cache events over ZMQ** (the intended
+reference leg — usable on its own once `--enable-lmcache` is dropped; see the
+status caveat below). Its **LMCache offload** leg is a **non-working historical
 template** — GPU validation (2026-07) found it wired to the wrong LMCache mode
 (see the KNOWN LIMITATION below); treat it as a record of the shipped topology,
 not a serving cache. It is the hand-built
@@ -118,8 +119,9 @@ kubectl -n cache-substrate create secret generic hf-token --from-literal=token="
 
 # 3. Deploy the lmcache-server + SGLang engine (the manifest wires them together).
 #
-#    !! WILL NOT COMPLETE AS-IS (GPU-validated 2026-07) !! With the shipped lm://
-#    config the SGLang engine HANGS at startup (see "Wire-test caveat (resolved)"),
+#    !! WILL NOT COMPLETE AS-IS (GPU-validated 2026-07) !! As shipped (--enable-lmcache
+#    + env, no --lmcache-config-file) the SGLang engine REFUSES TO START
+#    (`MP mode requires --lmcache-config-file`; see "Wire-test caveat (resolved)"),
 #    so the sglang rollout below never goes green and steps 4+ (serving) cannot
 #    pass. These commands are kept as the intended SHAPE; they become runnable only
 #    after the MP-mode adapter fix (--lmcache-config-file + a per-node worker). Do

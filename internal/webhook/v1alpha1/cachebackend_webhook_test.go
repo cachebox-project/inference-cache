@@ -429,7 +429,10 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 }
 
 func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
-	// Blast radius: LMCache operators must not be nagged about a mesh they do not run.
+	// Blast radius: the DEFAULT (vLLM) LMCache pairing — engine unset defaults to
+	// vLLM — must stay warning-free: neither the Mooncake mesh warning nor the
+	// SGLang MP-mode warning applies to it. (SGLang+LMCache operators DO get a
+	// warning — see TestValidator_SGLangLMCacheWarnsDataPlaneUnverified.)
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache

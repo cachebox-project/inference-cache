@@ -7,8 +7,10 @@ on a GPU host, then propagate to any automation that templates these manifests.
 > lmcache-server the SGLang engine "offloads to." GPU validation showed SGLang does
 > **not** use LMCache that way — it uses **multiprocess (MP) mode** (config via the
 > `--lmcache-config-file` flag, a node-local worker over `mp_host`/`mp_port`, not a
-> cluster-reachable `lm://` server), and the `lm://` wiring hangs the engine at
-> startup. The SGLang `lmcache-server` / `LMCACHE_REMOTE_URL` pins below are the
+> cluster-reachable `lm://` server). As shipped (env only, no `--lmcache-config-file`)
+> the engine **refuses to start** (`MP mode requires --lmcache-config-file`); a
+> `--lmcache-config-file` carrying `remote_url: lm://…` instead hangs. The SGLang
+> `lmcache-server` / `LMCACHE_REMOTE_URL` pins below are the
 > shipped (incorrect) wiring, pending the MP-mode fix. See the SGLang README's KNOWN
 > LIMITATION note and `docs/design/cachebackend-api.md` (SGLang engine support). The
 > vLLM rows are unaffected.
