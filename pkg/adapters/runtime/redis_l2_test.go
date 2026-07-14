@@ -90,6 +90,16 @@ func TestResolveRedisL2Server(t *testing.T) {
 	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != defaultRedisPort {
 		t.Errorf("service ports = %v, want one :%d", svc.Spec.Ports, defaultRedisPort)
 	}
+	// Remaining intentional fields: pull policy, service target/protocol, probe timing.
+	if c.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("imagePullPolicy = %q, want IfNotPresent", c.ImagePullPolicy)
+	}
+	if p := svc.Spec.Ports[0]; p.TargetPort.StrVal != defaultRedisPortName || p.Protocol != corev1.ProtocolTCP {
+		t.Errorf("service port target/proto = %v/%v, want %s/TCP", p.TargetPort, p.Protocol, defaultRedisPortName)
+	}
+	if rp := c.ReadinessProbe; rp.InitialDelaySeconds != 3 || rp.PeriodSeconds != 10 || rp.FailureThreshold != 6 {
+		t.Errorf("readiness timing = %d/%d/%d, want 3/10/6", rp.InitialDelaySeconds, rp.PeriodSeconds, rp.FailureThreshold)
+	}
 }
 
 func TestResolveRedisL2ServerImageOverride(t *testing.T) {
@@ -135,7 +145,10 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 // TestResolveRedisL2ServerMaxmemoryFitsLimit asserts the rendered --maxmemory
 // stays strictly below the container's memory limit (headroom for Redis overhead),
 // so LRU eviction — not the OOM killer — reclaims space. Regression guard for the
-// old 256Mi floor that could exceed a small limit.
+// removed floor that could exceed a small limit. Covers realistic limits (>= a few
+// MiB); the degenerate sub-5-byte range — where integer 80% cannot be both
+// positive AND strictly below the limit, and a Redis pod cannot run anyway — is
+// asserted (as equal-to-base, still positive) in the maxmemory table, not here.
 func TestResolveRedisL2ServerMaxmemoryFitsLimit(t *testing.T) {
 	for _, limit := range []string{"100Mi", "512Mi", "8Gi"} {
 		t.Run(limit, func(t *testing.T) {
