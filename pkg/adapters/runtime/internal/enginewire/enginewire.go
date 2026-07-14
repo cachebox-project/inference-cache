@@ -208,13 +208,17 @@ const (
 // single-container pod is accepted; a multi-container pod with no `sglang`
 // container is rejected.
 //
-// TODO(wire-test before production): the LMCACHE_* env path is how vLLM's
-// LMCache client is configured and is the same library SGLang loads, but
-// whether SGLang's experimental path honours LMCACHE_REMOTE_URL from the env
-// versus requiring LMCACHE_CONFIG_FILE has not been wire-tested end-to-end
-// here. Confirm against a real SGLang+LMCache build before pinning a
-// production image; the SGLang+LMCache-on-kind reference stack (a follow-up)
-// is the place to validate it.
+// KNOWN LIMITATION (the old wire-test TODO here, now resolved by live GPU
+// validation): SGLang does NOT read this LMCACHE_* env. It drives LMCache in
+// multiprocess (MP) mode — configured by a --lmcache-config-file carrying
+// mp_host/mp_port and served by a node-local MP worker — so the injected
+// LMCACHE_REMOTE_URL is inert, and pointing SGLang at a bare lm:// URL does not
+// offload anywhere useful (lm:// is not even a valid MP --l2-adapter type). Only
+// LMCACHE_USE_EXPERIMENTAL=True still matters (it gates the connector). This
+// function keeps injecting the shipped (non-functional) env for now; the working
+// MP-mode wire — a config-file init container, an MP-worker sidecar, and a shared
+// L2 store — is the tracked follow-up. Full design + evidence:
+// docs/design/sglang-lmcache-mp-mode.md.
 func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	if err := ValidateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
 		return err
