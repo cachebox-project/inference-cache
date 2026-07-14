@@ -105,19 +105,19 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 }
 
 func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
-	// 80% via base/10*8 (overflow-safe), 1Mi positivity floor. Precomputed:
-	// 8Gi->6871947672, 4Gi->3435973832, 100Mi->83886080, 1 byte->1Mi floor.
+	// 80% via base - base/5 (overflow-safe, inherently positive, no floor).
+	// Precomputed: 8Gi->6871947674, 4Gi->3435973837, 100Mi->83886080, 1 byte->1.
 	cases := []struct {
 		name           string
 		limit, request string
 		wantMaxmemory  int64
 	}{
-		{"limit 8Gi -> 80%", "8Gi", "", 6871947672},
-		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973832},
-		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973832},
-		{"no sizing -> 80% of 8Gi default", "", "", 6871947672},
-		{"tiny limit 100Mi -> 80%, in-bounds (no over-limit floor)", "100Mi", "", 83886080},
-		{"sub-byte limit -> 1Mi positivity floor, never 0/unlimited", "1", "", 1048576},
+		{"limit 8Gi -> 80%", "8Gi", "", 6871947674},
+		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973837},
+		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973837},
+		{"no sizing -> 80% of 8Gi default", "", "", 6871947674},
+		{"limit 100Mi -> 80%, in-bounds", "100Mi", "", 83886080},
+		{"sub-byte limit -> stays positive (never 0/unlimited), never exceeds base", "1", "", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
