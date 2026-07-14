@@ -204,6 +204,29 @@ parts are named for what they are:
   `Degraded` condition, exactly as a broken engine connector would be — the same
   way vLLM does not "fail open" around a connector it failed to load.
 
+> **ACCEPTED CONTRACT DECISION (endorsed by the project owner) — worker failure is a
+> documented fail-open boundary of the `(sglang, LMCache)` pair, not a contract
+> violation.** Because SGLang's MP worker is a *separate process* (unlike vLLM's
+> compiled-in connector), it is a failure mode the vLLM pair does not have: a
+> persistently-dead worker takes down engine serving even though the model is
+> healthy. This is a **deliberate, bounded trade-off**, acceptable because (a) it is
+> *inherent* to MP mode — SGLang has no cacheless fallback while `--enable-lmcache`
+> is on, so a strict "serve without the worker" guarantee would need upstream SGLang
+> support; (b) the *common* cache failure — the shared/remote L2 (Redis) — still
+> fails open, matching the documented "the LMCache connector is fail-open at
+> runtime"; and (c) it does not violate an *enforced* invariant (hard `failOpen`
+> enforcement at the engine layer is future work per the CRD contract). **Known
+> cost:** `(sglang, LMCache)` has a strictly worse worst-case availability than
+> `(vllm, LMCache)` — the worker is a new in-pod single point of failure, and L1
+> mis-sizing (`/dev/shm` OOM) now has an availability consequence, not only a
+> perf one. **Containment (all in Phase 2):** native sidecar + `restartPolicy:
+> Always` self-heals transient worker crashes; an engine **liveness probe** turns a
+> persistently-wedged engine into a whole-pod restart (self-healing) rather than a
+> silent hang; the `CacheBackend` `Degraded` condition surfaces worker unhealth; and
+> operator docs state plainly that for this pair the cache worker is a serving
+> component. Not a one-way door — if upstream SGLang adds a cacheless fallback, the
+> guarantee upgrades with no redesign.
+
 Net: engine-local prefill proceeds whenever the *shared* cache is unavailable —
 which is what the contract requires. This is a deliberate **contract
 interpretation** ("cache unavailable" = the remote/shared tier, not the local
