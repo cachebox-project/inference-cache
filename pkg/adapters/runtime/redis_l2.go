@@ -86,10 +86,16 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 		// database — disable RDB/AOF persistence so a restart starts cold (the KV
 		// is soft state; loss is a cache miss, never a wrong answer) and no PVC is
 		// implied. --maxmemory + allkeys-lru bound the cache to the derived budget
-		// so the cgroup does not OOM-kill it under write load.
+		// so the cgroup does not OOM-kill it under write load. --protected-mode no:
+		// the worker reaches Redis over the ClusterIP — a non-loopback client — so
+		// protected mode (which would accept the TCP connection, passing the
+		// readiness probe, but reject actual commands) must be off. This is rendered
+		// explicitly rather than relying on the image's default, and is consistent
+		// with the documented in-cluster-trust security posture.
 		Args: []string{
 			"--save", "",
 			"--appendonly", "no",
+			"--protected-mode", "no",
 			"--maxmemory", fmt.Sprintf("%d", redisMaxmemoryBytes(cache)),
 			"--maxmemory-policy", "allkeys-lru",
 		},

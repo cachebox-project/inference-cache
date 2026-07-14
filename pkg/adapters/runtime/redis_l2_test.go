@@ -65,6 +65,9 @@ func TestResolveRedisL2Server(t *testing.T) {
 	if v, ok := argVal(c.Args, "--appendonly"); !ok || v != "no" {
 		t.Errorf("--appendonly = %q, want no", v)
 	}
+	if v, ok := argVal(c.Args, "--protected-mode"); !ok || v != "no" {
+		t.Errorf("--protected-mode = %q, want no (Redis is reached over a non-loopback ClusterIP)", v)
+	}
 	if v, ok := argVal(c.Args, "--maxmemory-policy"); !ok || v != "allkeys-lru" {
 		t.Errorf("--maxmemory-policy = %q, want allkeys-lru", v)
 	}
@@ -150,25 +153,41 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 // positive AND strictly below the limit, and a Redis pod cannot run anyway — is
 // asserted (as equal-to-base, still positive) in the maxmemory table, not here.
 func TestResolveRedisL2ServerMaxmemoryFitsLimit(t *testing.T) {
-	for _, limit := range []string{"100Mi", "512Mi", "8Gi"} {
-		t.Run(limit, func(t *testing.T) {
-			cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), limit, "")
+	cases := []struct{ name, limit, request string }{
+		{"limit 100Mi", "100Mi", ""},
+		{"limit 8Gi", "8Gi", ""},
+		{"limit+request", "8Gi", "4Gi"},
+		{"request-only (no limit)", "", "4Gi"},
+		{"no resources", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+			if tc.limit != "" || tc.request != "" {
+				withMemory(cb, tc.limit, tc.request)
+			}
 			pod, _, err := ResolveRedisL2Server(cb)
 			if err != nil {
 				t.Fatalf("ResolveRedisL2Server: %v", err)
 			}
-			v, ok := argVal(pod.Containers[0].Args, "--maxmemory")
+			c := pod.Containers[0]
+			v, ok := argVal(c.Args, "--maxmemory")
 			if !ok {
 				t.Fatalf("--maxmemory not set")
 			}
-			mm, err := strconv.ParseInt(v, 10, 64)
-			if err != nil {
-				t.Fatalf("--maxmemory = %q, not an integer: %v", v, err)
+			mm, perr := strconv.ParseInt(v, 10, 64)
+			if perr != nil || mm <= 0 {
+				t.Fatalf("--maxmemory = %q, want a positive integer", v)
 			}
-			lq := resource.MustParse(limit)
-			limitBytes := lq.Value()
-			if mm >= limitBytes {
-				t.Errorf("--maxmemory %d >= container memory limit %d (%s) — Redis OOMs before evicting", mm, limitBytes, limit)
+			// When the RENDERED container carries a memory limit, --maxmemory must
+			// stay strictly below it. Compare against the rendered limit (not the
+			// test input) so this also catches drift between redisMaxmemoryBytes and
+			// defaultServerResources. request-only / no-resources shapes carry no
+			// limit — there is nothing to exceed, so only positivity is asserted.
+			if lim, has := c.Resources.Limits[corev1.ResourceMemory]; has {
+				if limBytes := lim.Value(); mm >= limBytes {
+					t.Errorf("--maxmemory %d >= rendered memory limit %d — Redis OOMs before evicting", mm, limBytes)
+				}
 			}
 		})
 	}
