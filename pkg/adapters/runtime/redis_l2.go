@@ -28,10 +28,11 @@ import (
 // (sglang, LMCache) adapter's engine path. It is factored out and unit-tested on
 // its own so the store render is reviewed independently of the engine wire.
 const (
-	// defaultRedisImage is the upstream Redis image for the managed L2 store,
-	// pinned to a version rather than a floating :7 / :latest. A minor tag still
-	// drifts within its patch line; production should pin a @sha256 digest via
-	// backendConfig.redisImage. redis:7-alpine is the tag validated end-to-end
+	// defaultRedisImage is the upstream Redis image for the managed L2 store. A
+	// major.minor-alpine tag is more stable than :7 / :latest but still mutable
+	// within its patch line, so it is a sane default, NOT a reproducible pin:
+	// production MUST pin an exact release or @sha256 digest via
+	// backendConfig.redisImage. This redis:7 line is what validation exercised
 	// against the pinned lmcache MP worker.
 	defaultRedisImage = "docker.io/library/redis:7.4-alpine"
 	// defaultRedisPort is the canonical Redis port the `resp` L2 adapter dials.
@@ -40,20 +41,9 @@ const (
 	// it by name without hard-coding the integer.
 	defaultRedisPortName = "redis"
 
-	// redisMaxmemoryFraction is the share of the pod's memory limit Redis is told
-	// to use as its LRU budget (`--maxmemory`), leaving headroom for Redis
-	// overhead + fragmentation inside the same cgroup. Without a positive
-	// --maxmemory, `--maxmemory-policy allkeys-lru` never evicts and Redis grows
-	// until the container is OOM-killed — so a bounded value is load-bearing.
-	redisMaxmemoryFraction = 0.8
-	// redisMaxmemoryMinBytes is the floor for the derived --maxmemory so
-	// allkeys-lru always has a non-trivial budget to evict within, even under a
-	// small (or defaulted-away) memory limit.
-	redisMaxmemoryMinBytes = int64(256) * 1024 * 1024 // 256Mi
-	// redisMaxmemoryDefaultBytes is the budget used when spec.resources carries no
-	// memory sizing (pre-defaulting paths). Matches 80% of the CRD's 8Gi memory
-	// default so a defaulted CacheBackend and an explicit 8Gi one derive the same
-	// value.
+	// redisMaxmemoryDefaultBytes is the memory sizing assumed when spec.resources
+	// carries none (pre-defaulting paths); the derived --maxmemory is a fraction
+	// of it. Matches the CRD's 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
 
 	// cfgKeyRedisImage overrides the Redis image (production should pin a digest).
@@ -69,10 +59,17 @@ const (
 //
 // The Redis backend is a **singleton** cache: it holds no replicated state, so
 // running more than one pod behind the Service would shard requests across
-// independent key spaces and silently partition the L2. The single-replica
-// invariant is enforced by the reconciler/admission (a multi-replica
-// (sglang, LMCache) CacheBackend is rejected), not by this render — the render
-// only describes the pod + service shape.
+// independent key spaces and silently partition the L2. This render only
+// describes the pod + service shape; the single-replica invariant MUST be
+// enforced by the reconciler/admission (reject a multi-replica (sglang, LMCache)
+// CacheBackend), added alongside the wiring that consumes this render — before it
+// provisions anything.
+//
+// Security posture matches the lm:// lmcache-server this replaces: an
+// unauthenticated, non-TLS ClusterIP holding KV blocks, trusted to the in-cluster
+// network — any pod that can reach the Service can read, overwrite, or flush
+// cached KV. Hardening (a NetworkPolicy scoping access to engine pods, Redis AUTH,
+// or TLS) is a follow-up carried at the same posture as the existing server.
 func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve redis L2: cache is nil")
@@ -137,12 +134,12 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	return pod, svc, nil
 }
 
-// redisMaxmemoryBytes derives Redis's `--maxmemory` LRU budget from the pod's
-// memory sizing: redisMaxmemoryFraction of the memory limit (falling back to the
-// request, then to redisMaxmemoryDefaultBytes when neither is set), floored at
-// redisMaxmemoryMinBytes so allkeys-lru always has room to evict. Deriving it from
-// the same spec.resources the container carries keeps the budget inside the cgroup
-// so the OOM killer never races LRU eviction.
+// redisMaxmemoryBytes derives Redis's `--maxmemory` LRU budget as 80% of the pod's
+// memory sizing: the memory limit, falling back to the request, then to
+// redisMaxmemoryDefaultBytes when neither is set. Deriving it from the same
+// spec.resources the container carries — and staying strictly below it (80%) —
+// keeps the budget inside the cgroup with headroom, so LRU eviction reclaims space
+// before the OOM killer ever fires.
 func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	base := redisMaxmemoryDefaultBytes
 	if cache != nil && cache.Spec.Resources != nil {
@@ -153,9 +150,10 @@ func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 			base = q.Value()
 		}
 	}
-	mm := int64(float64(base) * redisMaxmemoryFraction)
-	if mm < redisMaxmemoryMinBytes {
-		mm = redisMaxmemoryMinBytes
-	}
-	return mm
+	// 80% of the memory sizing, integer arithmetic (exact). No floor: this is
+	// always < base, so a small explicit limit yields a small but in-bounds budget
+	// rather than one that exceeds the container — Redis's LRU eviction, not the
+	// OOM killer, reclaims space. (A 256Mi floor would exceed, e.g., a 100Mi limit
+	// and OOM-kill Redis before it ever evicted.)
+	return base * 8 / 10
 }

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"strconv"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -102,9 +103,8 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 }
 
 func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
-	// 0.8 * (limit, else request, else 8Gi default), floored at 256Mi. Expected
-	// values precomputed: 0.8*8Gi=6871947673 (int trunc of 6871947673.6),
-	// 0.8*4Gi=3435973836, 256Mi=268435456.
+	// 80% of (limit, else request, else 8Gi default), integer arithmetic, no floor.
+	// Precomputed: 0.8*8Gi=6871947673, 0.8*4Gi=3435973836, 0.8*100Mi=83886080.
 	cases := []struct {
 		name           string
 		limit, request string
@@ -114,7 +114,7 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973836},
 		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973836},
 		{"no sizing -> 80% of 8Gi default", "", "", 6871947673},
-		{"tiny limit -> floor 256Mi", "100Mi", "", 268435456},
+		{"tiny limit 100Mi -> 80%, never floored above the limit", "100Mi", "", 83886080},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,6 +124,35 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 			}
 			if got := redisMaxmemoryBytes(cb); got != tc.wantMaxmemory {
 				t.Errorf("redisMaxmemoryBytes = %d, want %d", got, tc.wantMaxmemory)
+			}
+		})
+	}
+}
+
+// TestResolveRedisL2ServerMaxmemoryFitsLimit asserts the rendered --maxmemory
+// stays strictly below the container's memory limit (headroom for Redis overhead),
+// so LRU eviction — not the OOM killer — reclaims space. Regression guard for the
+// old 256Mi floor that could exceed a small limit.
+func TestResolveRedisL2ServerMaxmemoryFitsLimit(t *testing.T) {
+	for _, limit := range []string{"100Mi", "512Mi", "8Gi"} {
+		t.Run(limit, func(t *testing.T) {
+			cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), limit, "")
+			pod, _, err := ResolveRedisL2Server(cb)
+			if err != nil {
+				t.Fatalf("ResolveRedisL2Server: %v", err)
+			}
+			v, ok := argVal(pod.Containers[0].Args, "--maxmemory")
+			if !ok {
+				t.Fatalf("--maxmemory not set")
+			}
+			mm, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("--maxmemory = %q, not an integer: %v", v, err)
+			}
+			lq := resource.MustParse(limit)
+			limitBytes := lq.Value()
+			if mm >= limitBytes {
+				t.Errorf("--maxmemory %d >= container memory limit %d (%s) — Redis OOMs before evicting", mm, limitBytes, limit)
 			}
 		})
 	}
