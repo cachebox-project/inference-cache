@@ -68,8 +68,10 @@ func TestResolveRedisL2Server(t *testing.T) {
 	if v, ok := argVal(c.Args, "--maxmemory-policy"); !ok || v != "allkeys-lru" {
 		t.Errorf("--maxmemory-policy = %q, want allkeys-lru", v)
 	}
-	if v, ok := argVal(c.Args, "--maxmemory"); !ok || v == "" || v == "0" {
-		t.Errorf("--maxmemory = %q, want a positive bound (else allkeys-lru is a no-op → OOM)", v)
+	if v, ok := argVal(c.Args, "--maxmemory"); !ok {
+		t.Errorf("--maxmemory not set")
+	} else if n, perr := strconv.ParseInt(v, 10, 64); perr != nil || n <= 0 {
+		t.Errorf("--maxmemory = %q, want a positive integer (0 = unlimited in Redis; else allkeys-lru is a no-op → OOM)", v)
 	}
 	// Port + readiness.
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != defaultRedisPort {
@@ -103,18 +105,19 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 }
 
 func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
-	// 80% of (limit, else request, else 8Gi default), integer arithmetic, no floor.
-	// Precomputed: 0.8*8Gi=6871947673, 0.8*4Gi=3435973836, 0.8*100Mi=83886080.
+	// 80% via base/10*8 (overflow-safe), 1Mi positivity floor. Precomputed:
+	// 8Gi->6871947672, 4Gi->3435973832, 100Mi->83886080, 1 byte->1Mi floor.
 	cases := []struct {
 		name           string
 		limit, request string
 		wantMaxmemory  int64
 	}{
-		{"limit 8Gi -> 80%", "8Gi", "", 6871947673},
-		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973836},
-		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973836},
-		{"no sizing -> 80% of 8Gi default", "", "", 6871947673},
-		{"tiny limit 100Mi -> 80%, never floored above the limit", "100Mi", "", 83886080},
+		{"limit 8Gi -> 80%", "8Gi", "", 6871947672},
+		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973832},
+		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973832},
+		{"no sizing -> 80% of 8Gi default", "", "", 6871947672},
+		{"tiny limit 100Mi -> 80%, in-bounds (no over-limit floor)", "100Mi", "", 83886080},
+		{"sub-byte limit -> 1Mi positivity floor, never 0/unlimited", "1", "", 1048576},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

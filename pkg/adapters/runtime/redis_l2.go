@@ -45,6 +45,13 @@ const (
 	// carries none (pre-defaulting paths); the derived --maxmemory is a fraction
 	// of it. Matches the CRD's 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
+	// redisMaxmemoryMinBytes is a positivity floor for the derived --maxmemory. Its
+	// only job is to guarantee a POSITIVE value: Redis reads --maxmemory 0 as
+	// UNLIMITED, so an absurdly small limit rounding to 0 would silently disable
+	// eviction. At 1Mi it sits far below any limit a Redis pod could actually run
+	// under, so — unlike the old 256Mi floor — it never exceeds a realistic limit
+	// and cannot cause the OOM it guards against.
+	redisMaxmemoryMinBytes = int64(1) * 1024 * 1024 // 1Mi
 
 	// cfgKeyRedisImage overrides the Redis image (production should pin a digest).
 	cfgKeyRedisImage = "redisImage"
@@ -150,10 +157,15 @@ func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 			base = q.Value()
 		}
 	}
-	// 80% of the memory sizing, integer arithmetic (exact). No floor: this is
-	// always < base, so a small explicit limit yields a small but in-bounds budget
-	// rather than one that exceeds the container — Redis's LRU eviction, not the
-	// OOM killer, reclaims space. (A 256Mi floor would exceed, e.g., a 100Mi limit
-	// and OOM-kill Redis before it ever evicted.)
-	return base * 8 / 10
+	// 80%, computed base/10*8 (not base*8/10) so it is overflow-safe for any int64
+	// quantity, then floored at a 1Mi positivity guard. 80% is always < base, so a
+	// small explicit limit yields a small but in-bounds budget — LRU eviction, not
+	// the OOM killer, reclaims space (a 256Mi floor would instead exceed, e.g., a
+	// 100Mi limit and OOM-kill Redis). The floor only stops an absurd sub-2-byte
+	// limit from rounding to --maxmemory 0 (= unlimited in Redis).
+	mm := base / 10 * 8
+	if mm < redisMaxmemoryMinBytes {
+		mm = redisMaxmemoryMinBytes
+	}
+	return mm
 }
