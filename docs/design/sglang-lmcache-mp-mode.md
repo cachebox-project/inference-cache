@@ -1,6 +1,6 @@
 # Design: SGLang + LMCache (MP mode)
 
-Status: proposed · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapter: `pkg/adapters/runtime/sglang`
+Status: design accepted; implementation pending (Phase 2–3). Validated live facts vs. open Phase-2 spikes are marked inline. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapter: `pkg/adapters/runtime/sglang`
 
 The shipped `(sglang, LMCache)` adapter was built by analogy to `(vllm, LMCache)`:
 render a standalone `lm://` LMCache server, then inject `LMCACHE_REMOTE_URL` +
@@ -10,8 +10,9 @@ Mooncake hostNetwork work surfaced for a different backend. This doc records how
 SGLang+LMCache actually works, the design that fits it, and the phased path there.
 
 An advisory admission warning already ships for this pair (the validator's
-`sglangLMCacheDataPlaneWarning`) so operators are told the wiring is unverified;
-this design is what replaces the warning with a working data plane.
+`sglangLMCacheDataPlaneWarning`) so operators are told the shipped data plane is
+non-functional (verified — it caches nothing); this design is what replaces the
+warning with a working data plane.
 
 ## TL;DR
 
@@ -25,9 +26,12 @@ this design is what replaces the warning with a working data plane.
   `lm://` server, which is not even a valid MP `--l2-adapter` type.
 - The design fits the existing `KVCacheRuntimeAdapter` interface with **no new
   methods**: `ResolveCacheServer` renders the **shared L2 (Redis)**;
-  `InjectEngineConfig` adds a **config-file init container + an MP-worker sidecar
-  + the engine wire** to the engine pod. `mp_host=127.0.0.1` (same-pod sidecar),
-  so — unlike Mooncake — the engine needs **no `hostNetwork`**.
+  `InjectEngineConfig` adds a **config-file init container + a node-local MP worker
+  + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
+  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. One
+  packaging detail is still open (a **GPU-less sidecar** vs. the proven
+  **single-container** form) pending a Phase-2 spike; the interface mapping and the
+  L2/config-file decisions hold either way.
 
 ## Background: how SGLang+LMCache actually works
 
@@ -200,14 +204,31 @@ parts are named for what they are:
   `Degraded` condition, exactly as a broken engine connector would be — the same
   way vLLM does not "fail open" around a connector it failed to load.
 
-Net: engine-local prefill proceeds whenever the *shared* cache is unavailable,
-satisfying the contract. The load-bearing assumption — that the lmcache MP server
-tolerates an unreachable `--l2-adapter` at startup (starts L1-only, attaches L2 on
-a background retry) rather than aborting — is the **first thing Phase 2 verifies**;
-if it does not already behave that way, the worker entrypoint wraps it to start
-L1-only and attach the L2 tier on a retry loop. `INFERENCECACHE_FAIL_OPEN` is
-injected as today, but it is the routing-layer signal — the engine-serving
-guarantee comes from the worker's L1-only degradation, above.
+Net: engine-local prefill proceeds whenever the *shared* cache is unavailable —
+which is what the contract requires. This is a deliberate **contract
+interpretation** ("cache unavailable" = the remote/shared tier, not the local
+serving component), and Phase 2 must *validate* rather than assume it:
+
+- **Load-bearing L2 assumption.** That the lmcache MP server starts and serves
+  L1-only when its `--l2-adapter` target is unreachable (retrying L2), rather than
+  aborting. If it does **not** support that — nor reconfiguring/attaching L2 later
+  — the worker entrypoint supervises it (a restart/backoff loop re-attempting L2);
+  and if even that cannot preserve L1-only serving, "L2 required at startup"
+  becomes a **documented limitation of the pair**, not a silent breakage. The
+  viable mechanism is a Phase-2 finding, not claimed here.
+- **Worker crash / restart.** Whether the engine survives a mid-flight worker
+  restart (`restartPolicy: Always`) — recomputing during the gap, resuming cache
+  use after — is a Phase-2 acceptance test. If SGLang cannot tolerate worker loss
+  at all, that is the pair's documented fail-open boundary (the worker is a
+  required serving component; not every engine/backend pair offers identical
+  guarantees), surfaced via the `CacheBackend` `Degraded` condition.
+- **`failOpen: false`.** The operator has promoted the cache to a serving
+  dependency, so the conservative behavior is intended: the startup gate is not
+  relaxed, and an L2 outage may be treated as a hard error rather than a silent
+  degrade — trading availability for the guarantee that served requests used the
+  cache.
+
+`INFERENCECACHE_FAIL_OPEN` is injected as today; it is the routing-layer signal.
 
 ### Why not a per-node DaemonSet worker?
 

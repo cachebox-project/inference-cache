@@ -212,10 +212,10 @@ const (
 // does not read the LMCACHE_* remote-connection/tuning env — it drives LMCache in
 // multiprocess (MP) mode, configured by a --lmcache-config-file (carrying
 // mp_host/mp_port) and served by a node-local MP worker. So the injected
-// LMCACHE_REMOTE_URL is inert, and a bare
-// lm:// URL does not offload anywhere useful (lm:// is not even a valid MP
-// --l2-adapter type); only LMCACHE_USE_EXPERIMENTAL=True still matters (it gates
-// the connector). This function keeps injecting the shipped (non-functional) env
+// LMCACHE_REMOTE_URL is inert, and a bare lm:// URL does not offload anywhere
+// useful (lm:// is not even a valid MP --l2-adapter type); only
+// LMCACHE_USE_EXPERIMENTAL=True still matters (it gates the connector). This
+// function keeps injecting the shipped (non-functional) env
 // for now; the working MP-mode wire — a config-file init container, an MP-worker
 // sidecar, and a shared L2 store — is the tracked follow-up. Full design +
 // evidence: docs/design/sglang-lmcache-mp-mode.md.
