@@ -209,7 +209,8 @@ const (
 //
 // KNOWN LIMITATION (the old wire-test TODO here, now resolved by live GPU
 // validation): this wire does NOT produce a working cache. Unlike vLLM, SGLang
-// does not read the LMCACHE_* env — it drives LMCache in multiprocess (MP) mode,
+// does not read the LMCACHE_* remote-connection/tuning env — it drives LMCache in
+// multiprocess (MP) mode,
 // configured by a --lmcache-config-file (carrying mp_host/mp_port) and served by a
 // node-local MP worker. So the injected LMCACHE_REMOTE_URL is inert, and a bare
 // lm:// URL does not offload anywhere useful (lm:// is not even a valid MP
