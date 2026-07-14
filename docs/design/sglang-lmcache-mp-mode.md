@@ -154,11 +154,14 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   ordering matters** — the engine dials the worker at launch, and K8s does not
   order ordinary containers within a pod. So this is a **native sidecar** (a
   `restartPolicy: Always` entry in `initContainers` — beta and on-by-default since
-  K8s 1.29, stable since 1.33) with a `startupProbe` on the ZMQ port: native
-  sidecars start and gate ready **before** the main engine container, so the
-  worker is listening when the engine connects. (An ordinary sidecar would race
-  the engine.) The adapter's minimum is K8s ≥ 1.29; the fail-open interaction is a
-  constraint of its own (see Risks).
+  K8s 1.29, stable since 1.33) with an **`exec` `startupProbe`** that checks the
+  loopback socket from inside the sidecar. (A `tcpSocket`/`httpGet` probe targets
+  the pod IP, which cannot reach the worker's `127.0.0.1`-only listener, so it
+  would never pass and the engine would never start — an `exec` probe runs inside
+  the container and reaches loopback.) Native sidecars start and gate ready
+  **before** the main engine container, so the worker is listening when the engine
+  connects. (An ordinary sidecar would race the engine.) The adapter's minimum is
+  K8s ≥ 1.29. Fail-open interaction is resolved below.
 - **engine container** — add `--enable-lmcache`, `--lmcache-config-file
   /config/lmcache.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
   `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/config`. **Drop** the
@@ -171,6 +174,40 @@ the engine's network namespace, so ZMQ over loopback reaches it and the shared
 Mooncake: Mooncake needs `hostNetwork` on the engine (its mesh dials real host
 IPs on dynamic ports); SGLang's MP worker is in-pod, so the engine stays on the
 pod network.
+
+### Fail-open semantics (resolving the startup-gate tension)
+
+`spec.integration.failOpen: true` (the default) requires that a cache outage never
+takes down serving — engine-local prefill must proceed when the cache is
+unavailable. The native-sidecar gate seems to conflict with this (it makes the
+worker a prerequisite for engine startup), but the tension resolves once the two
+parts are named for what they are:
+
+- **The shared L2 (Redis) is the "cache" fail-open protects — a remote
+  dependency.** So the worker MUST start and keep serving **L1-only when Redis is
+  unreachable**, retrying L2 in the background — it must never abort on an
+  unreachable `--l2-adapter`, and its `startupProbe` gates on **local readiness
+  only** (listening on `mp_port`), never on L2 connectivity. A Redis outage then
+  degrades the cache (cross-node reuse pauses; L1 + local prefill continue) but
+  never blocks engine startup or serving. This is exactly the fail-open contract,
+  honored at the tier that can actually be "unavailable" — and it is the direct
+  analog of vLLM+LMCache serving through an unreachable `lm://` server.
+- **The MP worker itself is a required, co-scheduled component of the serving
+  stack**, not a remote dependency — the out-of-process analog of vLLM's
+  *in-process* LMCache connector. It is co-located, auto-restarted
+  (`restartPolicy: Always`), and its liveness is part of the engine pod's own
+  health. A worker that cannot start at all is a pod-health / `CacheBackend`
+  `Degraded` condition, exactly as a broken engine connector would be — the same
+  way vLLM does not "fail open" around a connector it failed to load.
+
+Net: engine-local prefill proceeds whenever the *shared* cache is unavailable,
+satisfying the contract. The load-bearing assumption — that the lmcache MP server
+tolerates an unreachable `--l2-adapter` at startup (starts L1-only, attaches L2 on
+a background retry) rather than aborting — is the **first thing Phase 2 verifies**;
+if it does not already behave that way, the worker entrypoint wraps it to start
+L1-only and attach the L2 tier on a retry loop. `INFERENCECACHE_FAIL_OPEN` is
+injected as today, but it is the routing-layer signal — the engine-serving
+guarantee comes from the worker's L1-only degradation, above.
 
 ### Why not a per-node DaemonSet worker?
 
@@ -235,31 +272,21 @@ data plane), different resolution because the data planes differ:
 - **Phase 2.** The working data plane: `ResolveCacheServer` → Redis L2;
   `InjectSGLangLMCache` rewritten → config-file init container + MP-worker native
   sidecar + engine config-file wire + shared volumes, **dropping the inert
-  `LMCACHE_*` env**; resolve the GPU-less-sidecar spike first. Flip the advisory
-  warning off once validated end-to-end.
+  `LMCACHE_*` env**; resolve the GPU-less-sidecar spike first. The pinned,
+  version-aligned worker/engine/Redis image tuple lands in **`VERSIONS.md` in this
+  phase** (it is a Phase-2 correctness requirement, not a Phase-3 doc polish). Flip
+  the advisory warning off once validated end-to-end.
 - **Phase 3.** Operator surface: `config/samples/cachebackend-sglang.yaml`, the
-  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, `VERSIONS.md`,
-  the default-install smoke assertions, and correcting the
+  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, the
+  default-install smoke assertions, and fully rewriting the
   [cachebackend-api.md](cachebackend-api.md) SGLang section from the `lm://` model
-  to the MP-mode design.
+  to the MP-mode design (Phase 1 only flags it superseded — see below).
 
 ## Risks / notes
 
-- **Fail-open vs. the startup gate (open question — validate in Phase 2).** The
-  native-sidecar gate makes the worker a prerequisite for engine startup, which is
-  in tension with `failOpen: true` ("serve local prefill even when the cache is
-  unavailable"). The unresolved question is how SGLang behaves when the worker is
-  absent or dies: node-local validation showed the engine *requires* the worker at
-  startup (a config-file pointing at a dead `mp_port` hangs/aborts, it does not
-  fall back to cacheless serving), and mid-flight worker loss is untested. If
-  SGLang genuinely hard-depends on the worker, then fail-open for this pair is
-  limited to the **routing** layer (the gateway still gets `NO_HINT` and
-  round-robins) and does **not** extend to engine-local prefill — a limitation to
-  verify and document, not assume away. `INFERENCECACHE_FAIL_OPEN` is injected as
-  today, but it does not by itself make a worker-less engine serve; whether an
-  additional guard (e.g. the engine tolerating a restarting worker via
-  `restartPolicy: Always`, or degrading to no-LMCache) is achievable is a Phase-2
-  finding.
+- **Fail-open** is resolved in [Fail-open semantics](#fail-open-semantics-resolving-the-startup-gate-tension)
+  above; the one load-bearing check (the MP worker tolerates an unreachable L2 at
+  startup) is the first Phase-2 validation.
 - **`chunk_size` must match** between the engine config-file and the MP worker, and
   the same-scheme (`sglang`) hash tag keeps the index disjoint from vLLM (unchanged
   from today).
