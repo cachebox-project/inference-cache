@@ -105,15 +105,17 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}
 }
 
-// ResolveCacheServer renders the standalone LMCache server, delegating to the
-// engine-agnostic [runtimeadapter.ResolveLMCacheServer] shared with the vLLM
-// adapter. NOTE: this is the CURRENTLY RENDERED, known-broken topology — see the
-// package KNOWN LIMITATION. For vLLM the engine reaches this server at
-// lm://<svc>:<port>; SGLang does NOT (it drives LMCache in MP mode and never
-// dials this server), so for (sglang, LMCache) this workload is provisioned but
-// unused until the MP-mode fix lands.
+// ResolveCacheServer renders the shared Redis L2 store the SGLang MP worker
+// offloads to via its resp --l2-adapter, delegating to
+// [runtimeadapter.ResolveRedisL2Server]. This replaces the standalone lm://
+// lmcache-server the adapter previously (mis)rendered for SGLang: lm:// is not a
+// valid MP --l2-adapter type, so SGLang cannot reuse it. The reconciler wraps the
+// returned pod + service into the managed Deployment + Service and publishes its
+// address as status.endpoint; the engine-side wire ([InjectEngineConfig]) points a
+// per-pod node-local MP worker's L2 at that Redis. See
+// docs/design/sglang-lmcache-mp-mode.md.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return runtimeadapter.ResolveLMCacheServer(cache)
+	return runtimeadapter.ResolveRedisL2Server(cache)
 }
 
 // InjectEngineConfig injects SGLang's LMCache launch surface (--enable-lmcache +

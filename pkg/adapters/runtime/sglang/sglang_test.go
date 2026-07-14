@@ -68,29 +68,26 @@ func TestSGLangResolveCacheServer(t *testing.T) {
 	if pod == nil || svc == nil {
 		t.Fatalf("ResolveCacheServer returned nil pod or svc")
 	}
-	// The lmcache-server is engine-agnostic and shared with the vLLM adapter
-	// (the exhaustive resource/probe edge-cases live in the runtime package's
-	// vllm_lmcache_test.go); here we pin that SGLang renders the same standalone
-	// server so a (sglang, LMCache) backend provisions a real cache server.
-	if len(pod.Containers) != 1 || pod.Containers[0].Name != "lmcache-server" {
-		t.Fatalf("containers = %+v, want a single lmcache-server", pod.Containers)
+	// SGLang MP mode offloads to a shared Redis L2 (not the lm:// server — lm://
+	// is not a valid MP --l2-adapter type). The exhaustive render edge-cases live
+	// in the runtime package's redis_l2_test.go; here we pin that a (sglang,
+	// LMCache) backend provisions the Redis L2 store.
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != "redis-l2" {
+		t.Fatalf("containers = %+v, want a single redis-l2", pod.Containers)
 	}
-	if pod.Containers[0].Image != "lmcache/standalone:v0.4.7" {
-		t.Fatalf("image = %q, want lmcache/standalone:v0.4.7 default", pod.Containers[0].Image)
-	}
-	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
-		t.Fatalf("svc ports = %v, want a single 65432 port", svc.Spec.Ports)
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 6379 {
+		t.Fatalf("svc ports = %v, want a single 6379 port", svc.Spec.Ports)
 	}
 }
 
 func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 	a := NewAdapter()
-	cb := newSGLangBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
+	cb := newSGLangBackend(map[string]string{"redisImage": "registry.example.com/redis:pinned"})
 	pod, _, err := a.ResolveCacheServer(cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if got := pod.Containers[0].Image; got != "registry.example.com/lmcache:pinned" {
+	if got := pod.Containers[0].Image; got != "registry.example.com/redis:pinned" {
 		t.Fatalf("image = %q, want overridden", got)
 	}
 }
