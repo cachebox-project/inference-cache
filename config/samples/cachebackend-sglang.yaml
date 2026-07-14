@@ -1,8 +1,18 @@
 # A managed LMCache backend fronting SGLang engine pods — the (sglang, LMCache)
 # pair, the second engine the cache plane supports alongside vLLM. The
 # controller reconciles this into the same standalone lmcache-server Deployment
-# + ClusterIP Service the vLLM+LMCache backend uses (the lmcache-server is
-# engine-agnostic; engines reach it at lm://<svc>:65432).
+# + ClusterIP Service the vLLM+LMCache backend uses. NOTE: this is the currently
+# rendered but KNOWN-BROKEN topology for SGLang — for vLLM the engine reaches the
+# server at lm://<svc>:65432, but SGLang does NOT (it uses LMCache MP mode and
+# never dials it; see the KNOWN LIMITATION below).
+#
+# KNOWN LIMITATION (GPU-validated, fix pending): the lm:// wiring below is
+# modeled on vLLM+LMCache, but SGLang drives LMCache in MULTIPROCESS (MP) mode —
+# config via the --lmcache-config-file flag (the LMCACHE_* env is ignored),
+# node-local transfer, NOT a standalone lm:// server. As shipped this pair can
+# reconcile Ready while caching nothing; admission warns on apply. Treat this
+# sample as illustrative of the injection surface, not a working cache, until the
+# MP-mode adapter fix lands.
 #
 # spec.engineSelector identifies the user-owned SGLang pods the mutating Pod
 # webhook auto-wires. SGLang turns LMCache on through a different launch surface

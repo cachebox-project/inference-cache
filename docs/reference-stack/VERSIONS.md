@@ -3,12 +3,24 @@
 Everything the reference stack depends on, pinned. Bump here first, re-validate
 on a GPU host, then propagate to any automation that templates these manifests.
 
+> **KNOWN LIMITATION (GPU-validated 2026-07):** the SGLang rows describe an `lm://`
+> lmcache-server the SGLang engine "offloads to." GPU validation showed SGLang does
+> **not** use LMCache that way — it uses **multiprocess (MP) mode** (config via the
+> `--lmcache-config-file` flag, a node-local worker over `mp_host`/`mp_port`, not a
+> cluster-reachable `lm://` server). As shipped (env only, no `--lmcache-config-file`)
+> the engine **refuses to start** (`MP mode requires --lmcache-config-file`); a
+> `--lmcache-config-file` carrying `remote_url: lm://…` instead hangs. The SGLang
+> `lmcache-server` / `LMCACHE_REMOTE_URL` pins below are the
+> shipped (incorrect) wiring, pending the MP-mode fix. See the SGLang README's KNOWN
+> LIMITATION note and `docs/design/cachebackend-api.md` (SGLang engine support). The
+> vLLM rows are unaffected.
+
 | Component | Pin | Where | Notes |
 |---|---|---|---|
 | vLLM + LMCache image | `lmcache/vllm-openai@sha256:<pin>` | `manifests/deployment.yaml`, `helm/values-reference.yaml` | Upstream ships LMCache pre-installed. Requires the vLLM **v1** engine (`VLLM_USE_V1=1`). The manifests ship a **non-applyable placeholder digest** — substitute a real one (below) before the GPU run. |
 | Model | `meta-llama/Llama-3.1-8B-Instruct` | `manifests/deployment.yaml` | Gated on HF; needs `HF_TOKEN`. Small enough for a single A10/L40S-class GPU. Swap freely. |
 | SGLang image (derived) | `example.invalid/sglang-lmcache@sha256:<pin>` *(derived: base `lmsysorg/sglang` + lmcache)* | `manifests/sglang-lmcache/deployment.yaml` | Second-engine reference. **Not pinned to a runnable tuple** (no GPU build at authoring time) — see [SGLang derived image reproducibility](#sglang-derived-image-reproducibility) below for the build steps, alignment constraints, and the TODO to fill the concrete `(sglang-tag, lmcache-version)`. GPU-only. |
-| lmcache-server image | `lmcache/standalone:v0.4.7` → `@sha256:<pin>` | `manifests/sglang-lmcache/deployment.yaml` | Standalone lmcache-server the SGLang engine offloads to (`lm://`, port 65432) — same image + pinning rationale as the managed-backend default. `v0.4.7` is the version to run; **resolve it to an `@sha256:` digest before the GPU run** (steps below), matching the non-applyable placeholder digest the manifest ships. Must be wire-compatible with the lmcache client baked into the SGLang image. |
+| lmcache-server image | `lmcache/standalone:v0.4.7` → `@sha256:<pin>` | `manifests/sglang-lmcache/deployment.yaml` | **HISTORICAL / non-runnable for SGLang** — see the note above. This `lm://` server is what the shipped wiring *tries* to point SGLang at, but SGLang uses LMCache in MP mode and never dials it, so pinning a digest for a SGLang GPU run offloads nothing. Kept only to document the (broken) shipped topology; the MP-mode fix will reuse this image behind a per-node worker. The `lm://` server itself is correct and in-use for **vLLM+LMCache** (the managed-backend default), just not for SGLang. |
 | SGLang model | `meta-llama/Meta-Llama-3-8B-Instruct` | `manifests/sglang-lmcache/deployment.yaml` | Served model for the SGLang reference, kept equal to `config/samples/cachebackend-sglang.yaml`'s `backendConfig.model` so the managed-path docs line up. Gated on HF; needs `HF_TOKEN`. Swap freely, but keep the engine `--model-path`, the CacheBackend `backendConfig.model`, and request `model` identical. |
 | CPU image | `vllm/vllm-openai-cpu:latest-{x86_64,arm64}` | `manifests/cpu-local/deployment.yaml` | vLLM's dedicated CPU build (arch-tagged). Runs the v1 engine on CPU (vLLM >= ~0.21), incl. the KV-event publisher. Verified on `0.21.0` (arm64): prefix-cache hit + real ZMQ events. Needs adequate RAM (CPU baseline ~5 GiB + KV). |
 | CPU model | `Qwen/Qwen2.5-0.5B-Instruct` | `manifests/cpu-local/deployment.yaml` | Ungated, tiny, CPU-runnable. |

@@ -1,8 +1,12 @@
 # SGLang + LMCache reference stack
 
 The second-engine sibling of the top-level [vLLM + LMCache reference](../../README.md):
-a reproducible **SGLang** deployment serving a model with **LMCache** as its
-KV-cache backend, publishing **KV-cache events over ZMQ**. It is the hand-built
+a **SGLang** deployment publishing **KV-cache events over ZMQ** (the intended
+reference leg — usable on its own once `--enable-lmcache` is dropped; see the
+status caveat below). Its **LMCache offload** leg is a **non-working historical
+template** — GPU validation (2026-07) found it wired to the wrong LMCache mode
+(see the KNOWN LIMITATION below); treat it as a record of the shipped topology,
+not a serving cache. It is the hand-built
 reference the `(sglang, LMCache)` runtime adapter
 (`pkg/adapters/runtime/sglang`) was templated from: in [`deployment.yaml`](deployment.yaml)
 the SGLang container's **LMCache wiring** (`--enable-lmcache` + the `LMCACHE_*` /
@@ -11,18 +15,21 @@ of the manifest — image, resources, the lmcache-server, `--kv-events-config` �
 is operator-owned scaffolding the adapter assumes is already present, so the
 file as a whole is **not** byte-for-byte adapter output.
 
-> **Status — unvalidated template (no end-to-end GPU run).** No GPU was available
-> at authoring time, so nothing in the GPU flow below has been executed
-> end-to-end — treat this as a **template**, not a known-good run. Applied, it is
+> **KNOWN LIMITATION — the `lm://` LMCache offload wiring here is wrong for SGLang (GPU-validated 2026-07).** The `LMCACHE_REMOTE_URL` / standalone `lmcache-server` wiring below mirrors vLLM+LMCache, but SGLang drives LMCache in **multiprocess (MP) mode**: config from the **`--lmcache-config-file` flag** (the `LMCACHE_*` env is ignored) and a **node-local** worker addressed by `mp_host`/`mp_port` over shared memory — not a cluster-reachable `lm://` server. Applied as written (env only, **no** `--lmcache-config-file`) the SGLang engine **refuses to start** — `MP mode requires --lmcache-config-file`. (A *separate* case: supplying a `--lmcache-config-file` that carries `remote_url: lm://…` instead **hangs** the engine — that config is not what this manifest ships.) Either way it does not offload. Use this manifest to understand the KV-event path and the injection surface, **not** as a working LMCache offload. The correct MP-mode wiring (`--lmcache-config-file` + a per-node worker) is a pending fix; see `docs/design/cachebackend-api.md` (SGLang engine support). The "Status" note below predates this validation.
+
+> **Status.** The **LMCache-offload leg** HAS since been GPU-validated (2026-07) and
+> found **broken** — see the KNOWN LIMITATION above. The **KV-event leg** below
+> remains an **unvalidated template**: no GPU run has exercised it end-to-end.
+> Treat that leg as a **template**, not a known-good run. Applied, it is
 > *designed to* stand up the real SGLang → ZMQ **KV-event** path, and the
 > standalone flow's intended check is only that the publisher **starts** (from
 > engine logs) — it does **not** consume or assert `BlockStored` frames (there is
 > no standalone consumer). The one thing that **is** actually executed (off-GPU)
 > is SGLang's exact wire *shape*, via the Go test
 > (`go test ./pkg/adapters/engine/ -run SGLang`). The **LMCache offload** leg
-> (`LMCACHE_REMOTE_URL`) is **not** wire-tested at all; treat it as
-> **experimental until validated on a GPU** (see
-> [Wire-test caveat](#wire-test-caveat-open-item)).
+> (`LMCACHE_REMOTE_URL`) was GPU-validated and found **broken** — SGLang uses
+> LMCache MP mode, not this `lm://` env wiring (see
+> [Wire-test caveat — resolved](#wire-test-caveat-resolved)).
 
 ## Why this exists (and what's already validated)
 
@@ -41,18 +48,25 @@ SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
 2. **You can validate off-GPU** (below): the Go test covers SGLang's exact wire
    shape; the Python synthetic tooling covers the shared decode/redaction logic.
 
-What this reference stack adds on top of those tests is the **real engine →
-ZMQ events** path on a GPU — a live SGLang+LMCache pod publishing real
-`BlockStored`/`BlockRemoved` frames a subscriber can read. Extending that all
-the way to **index + `LookupRoute`** additionally requires the cache plane
+What this reference stack is *intended* to add on top of those tests is the
+**real engine → ZMQ events** path on a GPU — a live SGLang pod publishing real
+`BlockStored`/`BlockRemoved` frames a subscriber can read. **As shipped this is
+blocked:** with `--enable-lmcache` but no `--lmcache-config-file` the engine
+**refuses to start** (`MP mode requires --lmcache-config-file`) and never reaches
+serving/event publishing — drop `--enable-lmcache` to exercise the event path today. Extending
+that all the way to **index + `LookupRoute`** additionally requires the cache plane
 installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
 `engineSelector` matches these pods and whose `backendConfig.model` is set, so
 the controller auto-attaches the `kvevent-subscriber` sidecar (see
 `config/samples/cachebackend-sglang.yaml` and the install docs). The raw
-`kubectl apply` below stands up only the engine + lmcache-server, so from these
-steps alone the verifiable outcome is the engine serving traffic with its
-**KV-event publisher started** (asserted from the engine logs below) — not the
-consumed event stream (the standalone manifest ships no consumer) and not the
+`kubectl apply` below is *intended* to stand up the engine + lmcache-server, so
+that the verifiable outcome would be the engine serving traffic with its
+**KV-event publisher started** (asserted from the engine logs below). **As shipped
+with `--enable-lmcache` but no `--lmcache-config-file` the engine refuses to start
+(`MP mode requires --lmcache-config-file`, KNOWN LIMITATION), so none of that is
+reached** — drop `--enable-lmcache` to observe the engine + publisher. Even
+when it runs, this flow shows neither the consumed event stream (the standalone
+manifest ships no consumer) nor the
 populated index; the index/`LookupRoute` criterion below assumes the controller
 + that `CacheBackend` are also present.
 
@@ -64,7 +78,7 @@ populated index; the index/`LookupRoute` criterion below assumes the controller
 | vLLM-only env | `VLLM_USE_V1=1`, `PYTHONHASHSEED=0` | *(neither — no v1 codepath; SGLang sha256-hashes, independent of `PYTHONHASHSEED`)* |
 | Default HTTP port | 8000 | 30000 |
 | KV-event wire | ZMQ `BlockStored`/`BlockRemoved`/`AllBlocksCleared` | same event structs; batch envelope adds a trailing `attn_dp_rank` the decoder ignores |
-| LMCACHE_* tunables | same | same |
+| LMCACHE_* tunables | read from env (`LMCACHE_REMOTE_URL` etc.) | **ignored** — SGLang reads config only from `--lmcache-config-file` (KNOWN LIMITATION) |
 
 ## Deploy and test on a GPU
 
@@ -73,11 +87,15 @@ populated index; the index/`LookupRoute` criterion below assumes the controller
 > way as the vLLM path — see [`../../GPU-RUNBOOK.md`](../../GPU-RUNBOOK.md); the
 > 8B reference model fits on a single 24 GB card.
 
-This manifest is a **standalone** reference: the SGLang engine is wired to the
-**bundled `lmcache-server`** by the manifest itself (the `LMCACHE_REMOTE_URL` env
-points at the in-namespace Service), with **no controller or `CacheBackend` in
-the loop**. It stands up the real engine and emits real ZMQ KV events — the
-hand-built shape the adapter was templated from.
+This manifest is a **standalone** reference showing the hand-built shape the
+adapter was templated from, with **no controller or `CacheBackend` in the loop**
+(the `LMCACHE_REMOTE_URL` env points at the bundled in-namespace `lmcache-server`).
+**As shipped it does NOT come up:** with `--enable-lmcache` but no
+`--lmcache-config-file` the SGLang engine refuses to start
+(`MP mode requires --lmcache-config-file`, KNOWN LIMITATION), so it neither serves
+nor emits ZMQ events. The commands below are the intended shape,
+not a runnable flow — drop `--enable-lmcache` to bring up the engine + event path,
+and await the MP-mode fix for a working LMCache offload.
 
 Run the commands below from this directory
 (`docs/reference-stack/manifests/sglang-lmcache/`) — the relative paths
@@ -100,9 +118,18 @@ kubectl -n cache-substrate create secret generic hf-token --from-literal=token="
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Deploy the lmcache-server + SGLang engine (the manifest wires them together).
-#    Wait for BOTH rollouts: fail-open means the engine can serve traffic even if
-#    lmcache-server is unready or its image is bad, so a green engine rollout
-#    alone would hide a broken cache server (offload silently never happens).
+#
+#    !! WILL NOT COMPLETE AS-IS (GPU-validated 2026-07) !! As shipped (--enable-lmcache
+#    + env, no --lmcache-config-file) the SGLang engine REFUSES TO START
+#    (`MP mode requires --lmcache-config-file`; see "Wire-test caveat (resolved)"),
+#    so the sglang rollout below never goes green and steps 4+ (serving) cannot
+#    pass. These commands are kept as the intended SHAPE; they become runnable only
+#    after the MP-mode adapter fix (--lmcache-config-file + a per-node worker). Do
+#    NOT run this expecting a working LMCache offload today.
+#
+#    (Once fixed: wait for BOTH rollouts — fail-open means the engine can serve even
+#    if lmcache-server is unready, so a green engine rollout alone would hide a
+#    broken cache server, i.e. offload silently never happening.)
 kubectl apply -f deployment.yaml
 kubectl -n cache-substrate rollout status deploy/lmcache-server --timeout=5m
 kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeout=20m
@@ -169,10 +196,10 @@ kill "$pf" 2>/dev/null; trap - EXIT
 
   Full stream verification stops there standalone: this flow does **not** consume
   or assert the `BlockStored` frames themselves, **nor does it prove LMCache
-  offload works** — a passing standalone run says nothing about whether SGLang
-  actually stores KV into `lmcache-server` over `LMCACHE_REMOTE_URL` (that is the
-  open wire-test caveat below; confirm it by checking `lmcache-server` for
-  incoming stores on a real run). Observing the actual event stream needs a
+  offload works** — and in fact SGLang does **not** store KV into `lmcache-server`
+  over `LMCACHE_REMOTE_URL` at all: that offload wiring is broken (SGLang uses
+  LMCache MP mode; see [Wire-test caveat — resolved](#wire-test-caveat-resolved)),
+  so do not expect stores to arrive there. Observing the actual event stream needs a
   consumer (the managed Go sidecar below; this repo ships no standalone 3-tuple
   printer), and the decoder's correctness against SGLang's exact wire is covered
   offline by the Go test. End-to-end frame→index→`LookupRoute`
@@ -266,20 +293,23 @@ Two complementary off-GPU checks, with an important scope distinction:
    synthetic path above does **not** cover the 3-tuple; rely on the Go test for
    the SGLang-specific envelope.
 
-## Wire-test caveat (open item)
+## Wire-test caveat (resolved)
 
-This manifest wires SGLang's experimental LMCache path to a **remote**
-lmcache-server via `LMCACHE_REMOTE_URL` — the topology the adapter injects.
-Whether SGLang's experimental path honours `LMCACHE_REMOTE_URL` from the env vs.
-requiring a full `LMCACHE_CONFIG_FILE` has **not** been wire-tested end-to-end
-(no GPU available at authoring time). On a real run:
+GPU validation (2026-07) answered this: the `LMCACHE_REMOTE_URL` / remote
+`lmcache-server` topology this manifest wires is **wrong for SGLang, and must not
+be applied as a working config.** SGLang ignores the `LMCACHE_*` env, reads config
+only from the `--lmcache-config-file` flag, and drives LMCache in **MP
+(multiprocess) mode** — a node-local worker reached over `mp_host`/`mp_port`
+(default `5555`) + shared memory, not a cluster-reachable `lm://` server. A config
+with `remote_url: lm://…` does **not** offload — it **hangs the engine at
+startup**; with no config file the engine refuses to start
+(`MP mode requires --lmcache-config-file`).
 
-- If the lmcache-server logs show stores arriving, the env path works — done.
-- If not, mount an `LMCACHE_CONFIG_FILE` ConfigMap (with `remote_url:
-  lm://lmcache-server:65432`, `remote_serde: naive`, `chunk_size: 256`) into the
-  SGLang container and set `LMCACHE_CONFIG_FILE` to it; then update the adapter
-  (`enginewire.InjectSGLangLMCache`) to render the config-file path instead, and
-  drop the matching `TODO` there.
+**Do not** mount a `remote_url: lm://…` config expecting it to work. The correct
+wiring — a `--lmcache-config-file` carrying `mp_host`/`mp_port` plus a **per-node
+LMCache MP worker** (which may itself carry a `remote_url` for a shared tier) — is
+the tracked adapter follow-up. See `docs/design/cachebackend-api.md` (SGLang
+engine support).
 
 ## Teardown
 

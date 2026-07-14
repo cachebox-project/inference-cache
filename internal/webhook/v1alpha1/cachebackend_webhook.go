@@ -318,7 +318,10 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 // itself cannot express and the controller cannot close on the operator's behalf —
 // never for something a validation rule could simply reject.
 func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	return warnMooncakeEngineHostNetwork(cb)
+	var w admission.Warnings
+	w = append(w, warnMooncakeEngineHostNetwork(cb)...)
+	w = append(w, warnSGLangLMCacheDataPlaneUnverified(cb)...)
+	return w
 }
 
 // mooncakeEngineHostNetworkWarning names the one thing that still stands between a
@@ -352,6 +355,43 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 		return nil
 	}
 	return admission.Warnings{mooncakeEngineHostNetworkWarning}
+}
+
+// sglangLMCacheDataPlaneWarning flags the one thing GPU validation surfaced about
+// the (sglang, LMCache) pair: it is wired by analogy to (vllm, LMCache) — a
+// standalone lm:// server the engine reaches over LMCACHE_REMOTE_URL — but SGLang's
+// LMCache integration does NOT work that way. SGLang drives LMCache through its
+// LMCacheLayerwiseConnector in MULTIPROCESS (MP) mode: config is read from the
+// --lmcache-config-file flag (the LMCACHE_* env this adapter injects is ignored),
+// the transfer is node-local (mp_host/mp_port + pointer/shared-memory), and pointing
+// it at a bare remote lm:// URL leaves the engine hung at startup rather than
+// caching. So the pair can reconcile Ready while the data plane does nothing.
+//
+// This is advisory (not a reject) because the correct wiring — MP-mode config file,
+// per-node worker — is a follow-up that must be built and GPU-validated, and a hard
+// reject would strand operators who set up MP mode by hand. Say it out loud at apply
+// time so the lm:// wiring isn't mistaken for a working cache. Text stays within
+// [maxWarningLen]; the full rationale lives in docs/design/cachebackend-api.md
+// (the SGLang engine support section's KNOWN LIMITATION note).
+const sglangLMCacheDataPlaneWarning = "SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server (may hang or not cache)"
+
+// warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend
+// that actually wires an offload — i.e. all of them EXCEPT events-only, which
+// injects no LMCache connector at all (so there is no lm://-vs-MP mismatch to warn
+// about). Unlike the Mooncake warning there is no per-field opt-in that closes the
+// gap for an offload backend; the whole pairing is wired to the wrong LMCache mode.
+// Scoped by the same (runtime, type) test as [rejectUnsupportedSGLangRole].
+func warnSGLangLMCacheDataPlaneUnverified(cb *cachev1alpha1.CacheBackend) admission.Warnings {
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	if cb.Spec.IsEventsOnly() {
+		// Events-only (tier-1 routing) injects NO LMCache connector — it only wires
+		// the observation sidecar — so the lm://-vs-MP mismatch simply isn't present.
+		return nil
+	}
+	return admission.Warnings{sglangLMCacheDataPlaneWarning}
 }
 
 // rejectEngineHostNetworkOnBackendThatDoesNotNeedIt keeps

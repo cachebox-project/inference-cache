@@ -3347,6 +3347,38 @@ while IFS= read -r f; do
     sample_fail=$((sample_fail + 1))
   fi
 done <<< "$sample_list"
+# Operator-facing admission signal: applying the (sglang, LMCache) sample MUST
+# warn that its LMCache offload is misconfigured — SGLang drives LMCache in MP
+# mode, so the shipped lm:// wiring caches nothing and must not be mistaken for a
+# working backend. --dry-run=server reaches admission (where the warning is
+# emitted on stderr) and persists nothing. The loop above only asserts the sample
+# applies cleanly; this asserts the warning actually fires through a real apply.
+# Runs in $SAMPLE_APPLY_NS (still fresh — the loop's dry-runs persisted nothing)
+# BEFORE its delete below, so this is a clean CREATE, not an update of a same-named
+# object that might exist in another namespace.
+sglang_sample="config/samples/cachebackend-sglang.yaml"
+if [ -f "$sglang_sample" ]; then
+  # The `if cmd; then` form both keeps `set -e` from aborting on a rejected apply
+  # AND distinguishes the two failure modes: a NON-zero exit means the sample was
+  # rejected (fail with its output — the warning text alone must not mask that,
+  # since a rejection can print the warning before the error), a zero exit means it
+  # admitted and we then require the warning to be present.
+  if sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$sglang_sample" 2>&1)"; then
+    case "$sglang_warn_out" in
+      *"MP mode"*)
+        log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
+      *)
+        printf '%s\n' "$sglang_warn_out"
+        fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
+    esac
+  else
+    printf '%s\n' "$sglang_warn_out"
+    fail "(sglang, LMCache) sample did not apply cleanly under --dry-run=server (admission rejected it)"
+  fi
+else
+  fail "$sglang_sample missing — the SGLang MP-mode admission-warning assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
+fi
+
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # Guard against the backstop silently becoming a no-op if config/samples ends
