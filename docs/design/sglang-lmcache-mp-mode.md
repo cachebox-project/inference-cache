@@ -30,9 +30,9 @@ this design is what replaces the warning with a working data plane.
 
 ## Background: how SGLang+LMCache actually works
 
-Validated live on dev-ORD (H100/A100, `lmsysorg/sglang:nightly-dev-cu13` +
-in-pod `pip install lmcache`→0.5.1, Llama-3.1-8B). Full evidence in the
-bring-up notes; the load-bearing facts:
+Validated live on a GPU cluster (H100/A100, `lmsysorg/sglang:nightly-dev-cu13` +
+in-pod `pip install lmcache`→0.5.1, Llama-3.1-8B). The load-bearing facts, with
+the observed engine/worker log signals reproduced inline:
 
 1. **MP mode is hardcoded.** `lmc_radix_cache.py.__init__` sets
    `self._mode = LMCacheMode.MP`; the in-process (`IP`) path that would read a
@@ -56,10 +56,12 @@ bring-up notes; the load-bearing facts:
 
 ### Live proof — node-local caching
 
-Single pod, MP worker + engine co-located: request → worker `Stored 3584 tokens`;
-`POST /flush_cache` (clears the engine's GPU radix cache) → re-request → worker
-`Retrieved 3584 tokens`, engine `#cached-token: 3584`. Full store→load cycle,
-engine serves (no hang, no abort).
+Single pod, MP worker + engine co-located **in one GPU-bearing container** (this
+validates MP-mode caching over the CUDA-IPC data path — not yet the separate
+GPU-less sidecar packaging; see the open question below): request → worker
+`Stored 3584 tokens`; `POST /flush_cache` (clears the engine's GPU radix cache) →
+re-request → worker `Retrieved 3584 tokens`, engine `#cached-token: 3584`. Full
+store→load cycle, engine serves (no hang, no abort).
 
 ### Live proof — cross-node sharing (the shared L2)
 
@@ -103,7 +105,9 @@ new method**:
 
 The reconciler wraps the returned `(*PodSpec, *Service)` into one Deployment +
 Service owned by the CR. For SGLang, that workload becomes the **shared Redis L2**
-(image `redis`, `--maxmemory-policy allkeys-lru`, ClusterIP `:6379`), and
+(a **pinned** Redis image — a digest/tag tracked in `VERSIONS.md`, consistent with
+the lmcache-server image-pin policy, never a floating `redis` tag —
+`--maxmemory-policy allkeys-lru`, ClusterIP `:6379`), and
 `status.endpoint` becomes the Redis Service DNS. This replaces the `lm://`
 lmcache-server render (`ResolveLMCacheServer`) for the SGLang pair only — vLLM
 keeps `lm://`. Redis is a shared, network-addressable store that fits the
@@ -120,12 +124,18 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   Runs to completion before the engine, so `--lmcache-config-file` is never read
   before it exists. No ConfigMap needed (the webhook cannot create cluster
   resources; the values are static and small).
-- **sidecar `lmcache-mp-worker`** — `python -m lmcache.v1.multiprocess.server
-  --host 127.0.0.1 --port 5555 --chunk-size <n> --l1-size-gb <n>
+- **native sidecar `lmcache-mp-worker`** — `python -m
+  lmcache.v1.multiprocess.server --host 127.0.0.1 --port 5555 --chunk-size <n>
+  --l1-size-gb <n>
   --l2-adapter '{"type":"resp","host":<endpoint-host>,"port":<endpoint-port>}'`,
   where `<endpoint>` is the Redis address passed to `InjectEngineConfig`. Mounts
   the shared `/dev/shm` (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and
-  `/config`.
+  `/config`. **Startup ordering matters** — the engine dials the worker at launch,
+  and K8s does not order ordinary containers within a pod. So this is a **native
+  sidecar** (a `restartPolicy: Always` entry in `initContainers`, GA since K8s
+  1.29) with a `startupProbe` on the ZMQ port: native sidecars start and gate
+  ready **before** the main engine container, so the worker is always listening
+  when the engine connects. (An ordinary sidecar container would race the engine.)
 - **engine container** — add `--enable-lmcache`, `--lmcache-config-file
   /config/lmcache.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
   `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/config`. **Drop** the
@@ -192,15 +202,18 @@ data plane), different resolution because the data planes differ:
 
 ## Phased delivery
 
-- **Phase 1 (this doc).** Record the design; land the low-risk engine-wire hygiene
-  that is correct regardless of the worker outcome — stop injecting the MP-ignored
-  `LMCACHE_*` env, resolve the stale `TODO(wire-test before production)` in
-  `enginewire.go`, and tighten the adapter/godoc to the validated MP reality. The
-  advisory admission warning stays (no working data plane yet), so no regression.
+- **Phase 1 (this doc).** Record the design, and — **comment-only, no behavior
+  change** — resolve the stale `TODO(wire-test before production)` in
+  `enginewire.go` and align its godoc to the validated MP reality. The engine wire
+  is unchanged: dropping the MP-ignored `LMCACHE_*` env is deferred to Phase 2,
+  where `InjectSGLangLMCache` is rewritten wholesale (so it is edited once, not
+  twice). The advisory admission warning stays (no working data plane yet), so no
+  regression.
 - **Phase 2.** The working data plane: `ResolveCacheServer` → Redis L2;
-  `InjectEngineConfig` → config-file init container + MP-worker sidecar + engine
-  config-file wire + shared volumes; resolve the GPU-less-sidecar spike first.
-  Flip the advisory warning off once validated end-to-end.
+  `InjectSGLangLMCache` rewritten → config-file init container + MP-worker native
+  sidecar + engine config-file wire + shared volumes, **dropping the inert
+  `LMCACHE_*` env**; resolve the GPU-less-sidecar spike first. Flip the advisory
+  warning off once validated end-to-end.
 - **Phase 3.** Operator surface: `config/samples/cachebackend-sglang.yaml`, the
   `docs/reference-stack/manifests/sglang-lmcache/` reference leg, `VERSIONS.md`,
   the default-install smoke assertions, and correcting the
@@ -216,8 +229,8 @@ data plane), different resolution because the data planes differ:
   silently falls back to slow pickle serialization. The shared `emptyDir` must be
   `medium: Memory` and sized ≥ the L1.
 - **L2 durability/HA** — a single managed Redis is a simple default, not an HA
-  store; operators who need durability point `--l2-adapter` at `s3` or
-  `mooncake_store` (future `backendConfig` knob), mirroring the LMCache-vs-Mooncake
-  durability-is-a-backend-choice decision.
+  store. A planned `backendConfig` knob (not yet implemented) will let operators
+  who need durability select an `s3` or `mooncake_store` `--l2-adapter` instead,
+  mirroring the LMCache-vs-Mooncake durability-is-a-backend-choice decision.
 - **Bleeding edge** — SGLang's LMCache integration is new (early 2026); the working
   image/version tuple is pinned by the reference stack, not assumed stable.
