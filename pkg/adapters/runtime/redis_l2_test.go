@@ -105,6 +105,55 @@ func TestResolveRedisL2Server(t *testing.T) {
 	}
 }
 
+func TestResolveRedisL2ServerResourceContract(t *testing.T) {
+	// The renderer's resource contract, asserted on the surface its consumer uses
+	// (the rendered container) rather than only on the shared helper: spec.resources
+	// is the operator-owned baseline and passes through; autoscaling adds the
+	// CPU-request fallback the HPA needs as a utilization denominator; and the
+	// rendered resources must not ALIAS the CR — a caller mutating the pod it got
+	// back would otherwise be writing into the CacheBackend's spec.
+	t.Run("spec.resources passes through", func(t *testing.T) {
+		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
+		pod, _, err := ResolveRedisL2Server(cb)
+		if err != nil {
+			t.Fatalf("ResolveRedisL2Server: %v", err)
+		}
+		got := pod.Containers[0].Resources
+		if q := got.Limits[corev1.ResourceMemory]; q.String() != "3Gi" {
+			t.Errorf("limits.memory = %q, want the operator's 3Gi", q.String())
+		}
+		if q := got.Requests[corev1.ResourceMemory]; q.String() != "1Gi" {
+			t.Errorf("requests.memory = %q, want the operator's 1Gi", q.String())
+		}
+	})
+
+	t.Run("autoscaling adds the CPU-request fallback", func(t *testing.T) {
+		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
+		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+		pod, _, err := ResolveRedisL2Server(cb)
+		if err != nil {
+			t.Fatalf("ResolveRedisL2Server: %v", err)
+		}
+		cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]
+		if cpu.IsZero() {
+			t.Fatalf("requests.cpu is zero/absent under autoscaling — a targetCPUUtilization HPA would divide by zero: %+v", pod.Containers[0].Resources)
+		}
+	})
+
+	t.Run("rendered resources do not alias the CR", func(t *testing.T) {
+		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
+		pod, _, err := ResolveRedisL2Server(cb)
+		if err != nil {
+			t.Fatalf("ResolveRedisL2Server: %v", err)
+		}
+		// Mutate what the renderer handed back; the CR must be untouched.
+		pod.Containers[0].Resources.Limits[corev1.ResourceMemory] = resource.MustParse("99Gi")
+		if q := cb.Spec.Resources.Limits[corev1.ResourceMemory]; q.String() != "3Gi" {
+			t.Fatalf("mutating the rendered pod wrote through to the CacheBackend: spec.resources.limits.memory = %q, want 3Gi", q.String())
+		}
+	})
+}
+
 func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
 	cb.Spec.BackendConfig = map[string]string{cfgKeyRedisImage: "registry.example/redis@sha256:deadbeef"}
