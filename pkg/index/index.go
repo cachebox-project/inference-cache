@@ -131,6 +131,50 @@ type ReplicaStats struct {
 	T2QueryTokens int64
 }
 
+// CacheTier ranks WHERE a replica holds a prefix, from the most local / fastest
+// tier (T1 — engine KV cache) down to colder tiers (T2 — external offload such
+// as LMCache; T3 — remote / disaggregated store). Lower value = more local =
+// preferred (see betterTier). The zero value TierUnspecified means "no tier
+// known": the current ingest path normalizes it to TierT1 (see Ingest), and a
+// non-prefix hint (TENANT_HOT / AFFINITY_HINT) leaves it unspecified. Mirrors
+// the proto CacheTier enum values one-for-one. Tier *detection* (classifying a
+// hold as T2/T3) is out of scope — nothing sets a non-T1 tier yet.
+type CacheTier int32
+
+const (
+	TierUnspecified CacheTier = iota // 0 — mirrors CACHE_TIER_UNSPECIFIED
+	TierT1                           // 1 — engine KV cache (most local)
+	TierT2                           // 2 — external offload (e.g. LMCache)
+	TierT3                           // 3 — remote / disaggregated
+)
+
+// betterTier returns the more-preferred (more local) of two tiers: T1 beats T2
+// beats T3. TierUnspecified means "no tier known" and loses to any specified
+// tier. Used to summarize a multi-block chain match down to the best tier the
+// replica can serve the matched run from.
+func betterTier(a, b CacheTier) CacheTier {
+	switch {
+	case a == TierUnspecified:
+		return b
+	case b == TierUnspecified:
+		return a
+	case a < b: // lower enum value = more local (T1 < T2 < T3)
+		return a
+	default:
+		return b
+	}
+}
+
+// normalizeIngestTier applies the default-ingest rule: an entry that arrives
+// without a tier is tagged T1 (the local engine KV cache). A producer that
+// already classified the hold keeps its tier untouched.
+func normalizeIngestTier(t CacheTier) CacheTier {
+	if t == TierUnspecified {
+		return TierT1
+	}
+	return t
+}
+
 // PrefixRef is one prefix a replica reports holding: engine-opaque hash bytes
 // plus how many tokens that prefix covers.
 //
@@ -146,6 +190,11 @@ type PrefixRef struct {
 	TokenCount       int32
 	BlockHashes      [][]byte
 	BlockTokenCounts []int32
+	// Tier is which cache tier this replica holds the prefix in. Unset
+	// (TierUnspecified) is normalized to TierT1 at ingest — the current
+	// path only ever reports T1 (the engine KV cache); tier detection is a
+	// later ticket. A chain entry's Tier applies to every block it expands to.
+	Tier CacheTier
 }
 
 // Update is the authoritative state a replica reports (from ReportCacheState).
@@ -210,6 +259,13 @@ type ReplicaScore struct {
 	Score                 float32
 	MatchedTokens         int32
 	EstimatedCacheHitProb float32
+	// Tier is the best (most local) tier the replica holds the matched prefix
+	// in — for a chain match, the most-preferred tier across the matched run.
+	// TierUnspecified on a non-prefix hint (TENANT_HOT / AFFINITY_HINT), which
+	// carries no per-prefix tier evidence. Carried through to the response's
+	// ReplicaScore.tier; scoring itself does not read it (tier-weighted
+	// blending is a later ticket).
+	Tier CacheTier
 }
 
 // Strategy names which ranking-or-classification path produced a LookupResult,
@@ -397,6 +453,11 @@ type scopeKey struct {
 type replicaEntry struct {
 	tokenCount int32
 	lastSeen   time.Time
+	// tier is the cache tier this replica holds the prefix in, set by
+	// upsertReplicaLocked (normalized to T1 when the producer left it
+	// unspecified). Carried into the lookup's ReplicaScore.Tier; not read by
+	// the ranker. A re-ingest can move an entry between tiers (last write wins).
+	tier CacheTier
 	// accessCount is the LFU access counter. The lookup path CAPTURES the
 	// entries that contribute matched tokens (LFU namespaces only) but does not
 	// bump — the gRPC handler credits them lock-free via LookupResult.CreditHits
@@ -657,6 +718,10 @@ func (i *Index) Ingest(u Update) {
 	// do not index prefixes without one (fail open). Stats are scheme-independent.
 	if u.HashScheme != "" {
 		for _, p := range u.Prefixes {
+			// Default-ingest rule: an entry with no tier is tagged T1 (the
+			// engine KV cache). Resolved once per prefix so the chain's
+			// per-block entries and the preserved legacy blob share one tier.
+			tier := normalizeIngestTier(p.Tier)
 			// Chain form: expand into one per-block entry per hash, keyed by
 			// the block hash with cumulative tokenCount so a legacy exact-match
 			// against any single block hash still works. The parallel arrays
@@ -674,7 +739,7 @@ func (i *Index) Ingest(u Update) {
 				var cumulative int32
 				for j, h := range p.BlockHashes {
 					cumulative += p.BlockTokenCounts[j]
-					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(h)}, u.ReplicaID, cumulative, ts)
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(h)}, u.ReplicaID, cumulative, tier, ts)
 				}
 				// Preserve the legacy single-blob key too when the producer
 				// set both representations on the same entry — so legacy
@@ -682,14 +747,14 @@ func (i *Index) Ingest(u Update) {
 				// via exact-match on PrefixHash. The chain path otherwise
 				// silently breaks backward-compat for unmigrated clients.
 				if len(p.PrefixHash) > 0 {
-					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, ts)
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
 				}
 				continue
 			}
 			// Legacy single-blob exact-match entry. The helper does the
 			// totalEntries + scope bookkeeping that main's inline form did,
 			// so the chain and legacy paths agree on accounting.
-			i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, ts)
+			i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
 		}
 	}
 	if u.Stats != nil {
@@ -965,6 +1030,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			Score:                 float32(e.tokenCount) * fresh * pressureFactor * sloBias,
 			MatchedTokens:         e.tokenCount,
 			EstimatedCacheHitProb: fresh,
+			Tier:                  e.tier,
 		})
 	}
 	i.mu.RUnlock()
@@ -1003,6 +1069,10 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
+		// bestTier is the most-preferred tier across the blocks matched so far
+		// (folded via betterTier). Carried to the run's ReplicaScore.Tier so a
+		// chain hint reports the best tier the replica can serve the run from.
+		bestTier CacheTier
 		// entries are the block entries forming this replica's matched run,
 		// collected ONLY when the namespace runs LFU (nil otherwise, so the LRU
 		// hot path allocates nothing). Captured into the returned hits once the
@@ -1030,7 +1100,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 				if freshnessAt(now, e.lastSeen, ttl) <= 0 {
 					continue // stale; will be swept
 				}
-				r := running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen}
+				r := running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen, bestTier: e.tier}
 				if lfu {
 					r.entries = []*replicaEntry{e}
 				}
@@ -1048,7 +1118,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 				if e.lastSeen.Before(oldest) {
 					oldest = e.lastSeen
 				}
-				nr := running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest, entries: st.entries}
+				nr := running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest, bestTier: betterTier(st.bestTier, e.tier), entries: st.entries}
 				if lfu {
 					nr.entries = append(nr.entries, e)
 				}
@@ -1104,6 +1174,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			Score:                 float32(st.matchedTokens) * fresh * pressureFactor * sloBias,
 			MatchedTokens:         st.matchedTokens,
 			EstimatedCacheHitProb: fresh,
+			Tier:                  st.bestTier,
 		})
 	}
 	// Cardinality denominator for the distinguishing-power factor: every
@@ -2051,7 +2122,7 @@ func freshnessAt(now, lastSeen time.Time, ttl time.Duration) float32 {
 // memory cap stays accurate when chains expand into N per-block entries, and
 // bumps the (tenant, model, hash_scheme) → replica serving count in lockstep
 // so tenantHotCandidates' O(1) scope lookup stays consistent with i.prefixes.
-func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount int32, ts time.Time) {
+func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount int32, tier CacheTier, ts time.Time) {
 	replicas := i.prefixes[key]
 	if replicas == nil {
 		replicas = make(map[string]*replicaEntry)
@@ -2079,6 +2150,7 @@ func (i *Index) upsertReplicaLocked(key prefixKey, replicaID string, tokenCount 
 	}
 	e.tokenCount = tokenCount
 	e.lastSeen = ts
+	e.tier = tier
 }
 
 // removeReplicaLocked drops a replica from a prefix, deleting the prefix if it

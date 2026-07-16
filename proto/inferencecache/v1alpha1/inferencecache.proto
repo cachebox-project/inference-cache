@@ -98,11 +98,31 @@ message LookupRouteRequest {
   string prompt_text = 10;
 }
 
+// CacheTier ranks WHERE a replica holds a matched prefix, from the most local /
+// fastest tier (T1 — engine KV cache, e.g. GPU HBM) down to progressively colder
+// tiers (T2 — external offload such as an LMCache CPU/host pool; T3 — remote /
+// disaggregated store). Lower enum value = more local = preferred. UNSPECIFIED is
+// the wire default: a producer that never sets a tier, or a hint with no prefix
+// evidence (TENANT_HOT / AFFINITY_HINT), leaves it UNSPECIFIED so old clients that
+// ignore the field are unaffected. Tier *detection* (classifying a hold as T2/T3)
+// is out of scope here — the current ingest path tags every stored prefix T1.
+enum CacheTier {
+  CACHE_TIER_UNSPECIFIED = 0;
+  CACHE_TIER_T1 = 1;
+  CACHE_TIER_T2 = 2;
+  CACHE_TIER_T3 = 3;
+}
+
 message ReplicaScore {
   string replica_id = 1;
   float score = 2; // higher is better
   int32 matched_tokens = 3;
   float estimated_cache_hit_prob = 4;
+  // Best (most local) tier this replica holds the matched prefix in. For a
+  // block-chain match it is the most-preferred tier across the matched run.
+  // UNSPECIFIED when the hint carries no prefix evidence (TENANT_HOT /
+  // AFFINITY_HINT). Additive, v1alpha1-compatible.
+  CacheTier tier = 5;
 }
 
 message LookupRouteResponse {

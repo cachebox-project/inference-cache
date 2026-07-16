@@ -142,6 +142,75 @@ func TestLookupRouteReasonCodes(t *testing.T) {
 	})
 }
 
+// TestLookupRouteCarriesTier pins the tier plumbing through the gRPC handler:
+// a prefix match reports the entry's tier on the wire (T1 by default ingest),
+// while a hint with no per-prefix evidence (TENANT_HOT) leaves it UNSPECIFIED —
+// the backwards-compatible default old clients ignore.
+func TestLookupRouteCarriesTier(t *testing.T) {
+	t.Run("PREFIX_MATCH reports T1", func(t *testing.T) {
+		svc := newTestService()
+		svc.index.Ingest(index.Update{
+			ReplicaID: "r1", Model: "m", Tenant: "t", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 128}}, // Tier unset → T1
+		})
+		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
+		})
+		if err != nil {
+			t.Fatalf("LookupRoute: %v", err)
+		}
+		if len(resp.GetReplicaScores()) != 1 {
+			t.Fatalf("scores = %+v, want one", resp.GetReplicaScores())
+		}
+		if got := resp.GetReplicaScores()[0].GetTier(); got != icpb.CacheTier_CACHE_TIER_T1 {
+			t.Fatalf("tier = %v, want CACHE_TIER_T1", got)
+		}
+	})
+
+	t.Run("TENANT_HOT leaves tier UNSPECIFIED", func(t *testing.T) {
+		svc := newTestService()
+		svc.index.Ingest(index.Update{
+			ReplicaID: "warm", Model: "m", Tenant: "t", HashScheme: "vllm",
+			Prefixes: []index.PrefixRef{{PrefixHash: []byte("other"), TokenCount: 1}},
+			Stats:    &index.ReplicaStats{HitRate: 0.8},
+		})
+		resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+			ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("novel"),
+		})
+		if err != nil {
+			t.Fatalf("LookupRoute: %v", err)
+		}
+		if resp.GetReasonCode() != "TENANT_HOT" || len(resp.GetReplicaScores()) != 1 {
+			t.Fatalf("setup: want one TENANT_HOT score; got reason=%q scores=%+v",
+				resp.GetReasonCode(), resp.GetReplicaScores())
+		}
+		if got := resp.GetReplicaScores()[0].GetTier(); got != icpb.CacheTier_CACHE_TIER_UNSPECIFIED {
+			t.Fatalf("TENANT_HOT tier = %v, want CACHE_TIER_UNSPECIFIED (no per-prefix evidence)", got)
+		}
+	})
+}
+
+// TestCacheTierToProto pins the full index→wire tier mapping, including the
+// T2/T3 values the detection ticket will start emitting and the unknown→
+// UNSPECIFIED fallthrough.
+func TestCacheTierToProto(t *testing.T) {
+	cases := []struct {
+		in   index.CacheTier
+		want icpb.CacheTier
+	}{
+		{index.TierUnspecified, icpb.CacheTier_CACHE_TIER_UNSPECIFIED},
+		{index.TierT1, icpb.CacheTier_CACHE_TIER_T1},
+		{index.TierT2, icpb.CacheTier_CACHE_TIER_T2},
+		{index.TierT3, icpb.CacheTier_CACHE_TIER_T3},
+		{index.CacheTier(99), icpb.CacheTier_CACHE_TIER_UNSPECIFIED}, // unknown → fail-safe
+	}
+	for _, c := range cases {
+		if got := cacheTierToProto(c.in); got != c.want {
+			t.Errorf("cacheTierToProto(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 // TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC pins the contract through
 // the handler: even if the tenant has warm replicas that would qualify for
 // TENANT_HOT, an unspecified hash_scheme on the request must surface as

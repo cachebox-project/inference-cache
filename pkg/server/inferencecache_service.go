@@ -604,6 +604,7 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 				Score:                 sc.Score,
 				MatchedTokens:         sc.MatchedTokens,
 				EstimatedCacheHitProb: sc.EstimatedCacheHitProb,
+				Tier:                  cacheTierToProto(sc.Tier),
 			})
 		}
 	}
@@ -1067,6 +1068,22 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 		}
 	}
 	return out
+}
+
+// cacheTierToProto maps the index's cache-tier tag onto the wire enum. An
+// unknown/zero tier maps to CACHE_TIER_UNSPECIFIED so a non-prefix hint
+// (TENANT_HOT / AFFINITY_HINT) and any future value stay backwards-compatible.
+func cacheTierToProto(t index.CacheTier) icpb.CacheTier {
+	switch t {
+	case index.TierT1:
+		return icpb.CacheTier_CACHE_TIER_T1
+	case index.TierT2:
+		return icpb.CacheTier_CACHE_TIER_T2
+	case index.TierT3:
+		return icpb.CacheTier_CACHE_TIER_T3
+	default:
+		return icpb.CacheTier_CACHE_TIER_UNSPECIFIED
+	}
 }
 
 // eventTypeFromProto maps the proto enum to the index event type; returns 0 for
