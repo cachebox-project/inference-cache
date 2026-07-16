@@ -166,25 +166,28 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	// l1SizeGB resizes the tmpfs too). Caveat: a reused volume is the operator's, so
 	// its size is theirs to get right — too small silently degrades L1 to slow pickle
 	// serde.
-	shmVolumeName := sglangShmVolumeName
+	shmMount := corev1.VolumeMount{Name: sglangShmVolumeName, MountPath: sglangShmMountPath}
 	if existing := mountAtPath(c.VolumeMounts, sglangShmMountPath); existing != nil && !sglangMountIsOurs(existing, sglangShmVolumeName, owned) {
-		// The MP data path WRITES here, so a reused /dev/shm must be writable
-		// scratch. A read-only mount, or a projection-backed volume (ConfigMap /
-		// Secret / downwardAPI / projected are always read-only), would fail at
-		// runtime — deep inside LMCache, long after admission. Reject instead, and
+		// Not every mount can be reused — a read-only or projection-backed one breaks
+		// the MP data path at runtime, deep inside LMCache. Reject at admission and
 		// let the webhook fail open.
-		if err := sglangCheckShmWritable(work.Volumes, *existing); err != nil {
+		if err := sglangCheckShmReusable(work.Volumes, *existing); err != nil {
 			return err
 		}
-		shmVolumeName = existing.Name
+		// Mirror the engine's subPath. Both containers must land on the SAME
+		// directory, and "same volume" is not enough: an engine mounting subPath
+		// "shm" while the worker mounts the volume ROOT gives the two processes
+		// different directories, which admits cleanly and then silently transfers no
+		// KV — the worst failure shape available.
+		shmMount = corev1.VolumeMount{Name: existing.Name, MountPath: sglangShmMountPath, SubPath: existing.SubPath}
 	} else {
 		if work.Volumes, err = adoptVolume(work.Volumes, sglangShmVolume(l1SizeGB), owned); err != nil {
 			return err
 		}
-		c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangShmVolumeName, MountPath: sglangShmMountPath})
+		c.VolumeMounts = upsertMountByName(c.VolumeMounts, shmMount)
 	}
 
-	worker := sglangMPWorkerContainer(c.Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmVolumeName)
+	worker := sglangMPWorkerContainer(c.Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmMount)
 	if work.InitContainers, err = adoptContainer(work.InitContainers, worker, owned); err != nil {
 		return err
 	}
@@ -225,7 +228,7 @@ func mountAtPath(ms []corev1.VolumeMount, path string) *corev1.VolumeMount {
 // and the server listens before the engine starts. The worker image defaults to
 // the engine image (guaranteeing the same lmcache version — the two speak the MP
 // wire) and is overridable via backendConfig.workerImage.
-func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter, shmVolumeName string) corev1.Container {
+func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string, shmMount corev1.VolumeMount) corev1.Container {
 	image := ConfigOr(cfg, cfgKeyWorkerImage, engineImage)
 	configPath := sglangConfigMountPath + "/" + sglangConfigFileName
 	// The validated invocation is `python3 -m lmcache.v1.multiprocess.server`
@@ -264,12 +267,12 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 			// mistaking it for an operator's name squat (see sglangWireIsOurs).
 			{Name: envSGLangMPWorkerManaged, Value: sglangMPWorkerManagedVal},
 		},
-		// shmVolumeName is the engine's existing /dev/shm volume when it has one
-		// (reused so the two containers share the MP data path without a duplicate
-		// mountPath), else our own sized tmpfs.
+		// shmMount is the engine's existing /dev/shm mount when it has one — volume
+		// AND subPath mirrored, so the two containers share the same directory
+		// without a duplicate mountPath — else our own sized tmpfs.
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: sglangConfigVolumeName, MountPath: sglangConfigMountPath},
-			{Name: shmVolumeName, MountPath: sglangShmMountPath},
+			shmMount,
 		},
 		// The MP server binds mp_port on loopback, which a pod-IP tcp/http probe
 		// cannot reach — so exec a loopback check inside the container. This gates
@@ -297,9 +300,16 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 			PeriodSeconds:    3,
 			FailureThreshold: 40,
 		},
-		SecurityContext: &corev1.SecurityContext{
-			Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"IPC_LOCK"}},
-		},
+		// No added capabilities — deliberately. An earlier revision added IPC_LOCK
+		// (carried over from the RDMA-oriented reference manifests), but Pod Security
+		// permits added capabilities beyond a small allow-list under NEITHER baseline
+		// nor restricted, and IPC_LOCK is on neither list. Since this mutation lands
+		// BEFORE Pod Security admission, injecting it would turn an otherwise-valid
+		// engine pod into a REJECTED one in any enforcing namespace — the cache plane
+		// breaking the engine, which inverts the fail-open contract. The MP wire does
+		// not need it: the worker moves KV over CUDA-IPC and /dev/shm, not RDMA, and
+		// the engine side (which this adapter never grants capabilities to) would have
+		// needed it too if the data path did.
 	}
 }
 
@@ -398,13 +408,22 @@ func shellSingleQuote(s string) string {
 // changes — a moved status.endpoint or a retuned l1SizeGB renders a different, but
 // still ours, container. A pod annotation would be the idiomatic marker, but
 // InjectEngineConfig only receives the PodSpec.
+//
+// The marker is forgeable, and that is an accepted boundary rather than a hole: an
+// operator who both names their container lmcache-mp-worker AND stamps it with this
+// exact marker has, as far as any PodSpec-scoped check can tell, declared it
+// adapter-owned — and gets it converged on our render. Nothing in a PodSpec proves
+// provenance. What the marker does buy is the case that actually happens: an
+// ACCIDENTAL name collision carries no marker, so it is rejected, not overwritten.
 func sglangWireIsOurs(pod *corev1.PodSpec) bool {
 	for i := range pod.InitContainers {
 		if pod.InitContainers[i].Name != sglangMPWorkerContainerName {
 			continue
 		}
 		for _, e := range pod.InitContainers[i].Env {
-			if e.Name == envSGLangMPWorkerManaged {
+			// Value included: a same-named env carrying anything else is not the
+			// marker our render stamps.
+			if e.Name == envSGLangMPWorkerManaged && e.Value == sglangMPWorkerManagedVal {
 				return true
 			}
 		}
@@ -454,34 +473,52 @@ func adoptVolume(vs []corev1.Volume, want corev1.Volume, owned bool) ([]corev1.V
 	return append(vs, want), nil
 }
 
-// sglangCheckShmWritable rejects an engine-owned /dev/shm mount the MP data path
-// could not write to. The worker and the engine exchange KV through this volume, so
-// a read-only mount — or one backed by a projection source, which the kubelet always
-// mounts read-only — breaks the data path at runtime rather than at admission.
-// Sources not listed here (emptyDir, PVC, hostPath, CSI, ephemeral, …) are writable
-// or writability is the operator's to configure, so they pass.
-func sglangCheckShmWritable(vs []corev1.Volume, m corev1.VolumeMount) error {
+// sglangCheckShmReusable rejects an engine-owned /dev/shm mount the worker cannot
+// safely share. The engine and the worker exchange KV through this volume, so it
+// must be WRITABLE and both containers must resolve it to the SAME directory —
+// neither of which the kubelet reports back at admission; getting it wrong surfaces
+// as a silent no-transfer at runtime, deep inside LMCache.
+//
+// Read-only comes in two shapes, and both are checked: the MOUNT's readOnly, and the
+// SOURCE's — projection sources (configMap / secret / downwardAPI / projected) the
+// kubelet always mounts read-only, plus the explicit readOnly on persistentVolumeClaim
+// and csi. Sources not named here (emptyDir, hostPath, ephemeral, …) are writable, or
+// their writability is the operator's to configure, so they pass.
+func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 	if m.ReadOnly {
 		return fmt.Errorf("inject engine config: engine container mounts %q read-only (volume %q), but the LMCache MP data path writes there — drop readOnly or mount it elsewhere", sglangShmMountPath, m.Name)
+	}
+	// subPath is mirrorable (the caller copies it onto the worker's mount);
+	// subPathExpr is NOT: it expands $(VAR) from the mounting CONTAINER's env, and the
+	// worker's env is not the engine's, so the same expression can resolve to a
+	// different directory — or fail to expand at all. Silently landing the two
+	// containers on different directories is exactly the failure this guard exists to
+	// prevent, so reject rather than guess.
+	if m.SubPathExpr != "" {
+		return fmt.Errorf("inject engine config: engine container mounts %q with subPathExpr %q (volume %q); the LMCache MP worker cannot reproduce that expansion in its own env — use a literal subPath, or mount %[1]q without it", sglangShmMountPath, m.SubPathExpr, m.Name)
 	}
 	for i := range vs {
 		if vs[i].Name != m.Name {
 			continue
 		}
-		var kind string
+		var kind, why string
 		switch src := vs[i].VolumeSource; {
 		case src.ConfigMap != nil:
-			kind = "configMap"
+			kind, why = "configMap", "which the kubelet mounts read-only"
 		case src.Secret != nil:
-			kind = "secret"
+			kind, why = "secret", "which the kubelet mounts read-only"
 		case src.DownwardAPI != nil:
-			kind = "downwardAPI"
+			kind, why = "downwardAPI", "which the kubelet mounts read-only"
 		case src.Projected != nil:
-			kind = "projected"
+			kind, why = "projected", "which the kubelet mounts read-only"
+		case src.PersistentVolumeClaim != nil && src.PersistentVolumeClaim.ReadOnly:
+			kind, why = "persistentVolumeClaim", "declared readOnly"
+		case src.CSI != nil && src.CSI.ReadOnly != nil && *src.CSI.ReadOnly:
+			kind, why = "csi", "declared readOnly"
 		default:
 			return nil
 		}
-		return fmt.Errorf("inject engine config: engine container mounts %q from a %s volume (%q), which the kubelet mounts read-only, but the LMCache MP data path writes there — use an emptyDir (medium: Memory) instead", sglangShmMountPath, kind, m.Name)
+		return fmt.Errorf("inject engine config: engine container mounts %q from a %s volume (%q) %s, but the LMCache MP data path writes there — use an emptyDir (medium: Memory) instead", sglangShmMountPath, kind, m.Name, why)
 	}
 	return nil
 }

@@ -539,6 +539,127 @@ func TestSGLangInjectEngineConfigRejectsUnwritableDevShm(t *testing.T) {
 	}
 }
 
+func TestSGLangInjectEngineConfigWorkerAddsNoCapabilities(t *testing.T) {
+	// The worker must add NO capabilities. Pod Security allows added capabilities
+	// beyond a small allow-list under neither baseline nor restricted, and this
+	// mutation lands BEFORE Pod Security admission — so an injected capability turns
+	// an otherwise-valid engine pod into a REJECTED one in any enforcing namespace.
+	// The cache plane must never be the reason an engine cannot start.
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "sglang:test"}}}
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	if w.SecurityContext != nil && w.SecurityContext.Capabilities != nil && len(w.SecurityContext.Capabilities.Add) > 0 {
+		t.Fatalf("worker adds capabilities %v — Pod Security (baseline/restricted) rejects the whole pod for these, so the engine would not start at all", w.SecurityContext.Capabilities.Add)
+	}
+}
+
+func TestSGLangInjectEngineConfigMirrorsDevShmSubPath(t *testing.T) {
+	// Sharing the same VOLUME is not enough: if the engine mounts /dev/shm with a
+	// subPath and the worker mounts the volume root, the two land on DIFFERENT
+	// directories — the pod admits cleanly and then transfers no KV. Mirror the
+	// subPath so both resolve to the same place.
+	pod := &corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name: enginewire.SGLangEngineContainerName, Image: "sglang:test",
+			VolumeMounts: []corev1.VolumeMount{{Name: "scratch", MountPath: "/dev/shm", SubPath: "shm"}},
+		}},
+		Volumes: []corev1.Volume{{
+			Name:         "scratch",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+		}},
+	}
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	var got *corev1.VolumeMount
+	for i := range w.VolumeMounts {
+		if w.VolumeMounts[i].MountPath == "/dev/shm" {
+			got = &w.VolumeMounts[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("worker has no /dev/shm mount: %+v", w.VolumeMounts)
+	}
+	if got.Name != "scratch" || got.SubPath != "shm" {
+		t.Fatalf("worker /dev/shm = (volume %q, subPath %q), want (scratch, shm) — both containers must resolve to the SAME directory", got.Name, got.SubPath)
+	}
+}
+
+func TestSGLangInjectEngineConfigRejectsUnshareableDevShm(t *testing.T) {
+	// Shapes the worker cannot safely share: an expansion it cannot reproduce in its
+	// own env, and source-level read-only that the mount-level readOnly check misses.
+	engine := func(m corev1.VolumeMount) corev1.Container {
+		return corev1.Container{
+			Name: enginewire.SGLangEngineContainerName, Image: "sglang:test",
+			VolumeMounts: []corev1.VolumeMount{m},
+		}
+	}
+	csiReadOnly := true
+	cases := []struct {
+		name string
+		pod  *corev1.PodSpec
+		want string
+	}{
+		{
+			name: "subPathExpr cannot be reproduced in the worker's env",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "scratch", MountPath: "/dev/shm", SubPathExpr: "$(POD_NAME)/shm"})},
+				Volumes: []corev1.Volume{{
+					Name:         "scratch",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+				}},
+			},
+			want: "subPathExpr",
+		},
+		{
+			name: "read-only persistentVolumeClaim source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "pvc-shm", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name: "pvc-shm",
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: "c", ReadOnly: true,
+					}},
+				}},
+			},
+			want: "persistentVolumeClaim",
+		},
+		{
+			name: "read-only csi source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "csi-shm", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name: "csi-shm",
+					VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{
+						Driver: "d.example.com", ReadOnly: &csiReadOnly,
+					}},
+				}},
+			},
+			want: "csi",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			if err == nil {
+				t.Fatalf("want an error when the engine's /dev/shm is unshareable (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error must name %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestSGLangInjectEngineConfigWorkerHasMemoryBudget(t *testing.T) {
 	// The worker holds the L1 in a memory-backed tmpfs charged to its cgroup, so it
 	// must carry a matching memory request+limit (l1SizeGB + 1Gi) — otherwise the L1

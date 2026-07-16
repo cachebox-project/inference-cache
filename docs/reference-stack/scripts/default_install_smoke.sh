@@ -3359,11 +3359,15 @@ sglang_sample="config/samples/cachebackend-sglang.yaml"
 if [ -f "$sglang_sample" ]; then
   # `if cmd; then` keeps `set -e` from aborting on a rejected apply AND distinguishes
   # the failure modes: a NON-zero exit means admission rejected the sample; a zero
-  # exit means it admitted, and we then require the obsolete misconfigured/MP-mode
-  # warning to be ABSENT (its presence would mean the working wire didn't remove it).
+  # exit means it admitted, and we then require the obsolete warning to be ABSENT
+  # (its presence would mean the working wire didn't remove it). Match the retired
+  # warning's EXACT text, not loose fragments like "misconfigured" / "MP mode": those
+  # appear in ordinary prose, so an unrelated future warning would fail this gate for
+  # the wrong reason.
+  sglang_retired_warn="SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server"
   if sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$sglang_sample" 2>&1)"; then
     case "$sglang_warn_out" in
-      *"misconfigured"*|*"MP mode"*)
+      *"$sglang_retired_warn"*)
         printf '%s\n' "$sglang_warn_out"
         fail "(sglang, LMCache) still emits the obsolete offload-misconfigured warning — the MP-mode data plane should have removed it" ;;
       *)
