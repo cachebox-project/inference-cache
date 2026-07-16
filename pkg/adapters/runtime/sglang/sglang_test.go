@@ -648,6 +648,13 @@ func TestSGLangInjectEngineConfigBadInput(t *testing.T) {
 		{"nil cache", func() error { return a.InjectEngineConfig(good, "x.svc:65432", nil) }},
 		{"empty endpoint", func() error { return a.InjectEngineConfig(good, "", cb) }},
 		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, "x.svc:65432", cb) }},
+		// The resp --l2-adapter takes an INTEGER port, emitted unquoted into JSON. A
+		// non-numeric or out-of-range port would render invalid JSON, the worker would
+		// fail to parse it and never bind its ZMQ port, and the engine would sit behind
+		// the startup probe forever — reject at admission and let the webhook fail open.
+		{"non-numeric port", func() error { return a.InjectEngineConfig(good, "r.svc:redis", cb) }},
+		{"port out of range", func() error { return a.InjectEngineConfig(good, "r.svc:70000", cb) }},
+		{"zero port", func() error { return a.InjectEngineConfig(good, "r.svc:0", cb) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

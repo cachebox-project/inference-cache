@@ -317,7 +317,16 @@ func sglangL2AdapterJSON(endpoint string) (string, error) {
 	if !ok || host == "" || port == "" {
 		return "", fmt.Errorf("inject engine config: endpoint %q is not a host:port for the resp L2 adapter", endpoint)
 	}
-	// port is emitted unquoted (the resp adapter expects an integer).
+	// The port is emitted UNQUOTED (the resp adapter expects an integer), so a
+	// non-numeric or out-of-range one would render invalid JSON — and the worker
+	// would then fail to parse its --l2-adapter and never bind the ZMQ port, leaving
+	// the engine wedged behind the startup probe forever. That is worse than not
+	// wiring at all, so reject here: the webhook fails open and the pod starts
+	// un-wired. status.endpoint is controller-built and always numeric today; this
+	// is the boundary check that keeps it that way.
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > sglangMaxTCPPort {
+		return "", fmt.Errorf("inject engine config: endpoint %q has port %q, want an integer in 1-%d — the resp L2 adapter takes an integer port", endpoint, port, sglangMaxTCPPort)
+	}
 	return fmt.Sprintf(`{"type":"resp","host":%q,"port":%s}`, host, port), nil
 }
 
