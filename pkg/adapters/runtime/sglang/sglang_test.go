@@ -539,6 +539,35 @@ func TestSGLangInjectEngineConfigRejectsUnwritableDevShm(t *testing.T) {
 	}
 }
 
+func TestSGLangInjectEngineConfigReusesWritableNonEmptyDirDevShm(t *testing.T) {
+	// The writability guard must not over-reject: a source that HAS a readOnly flag
+	// but leaves it false is writable, and the engine's /dev/shm must still be reused
+	// (a second mount at the same path is an invalid Pod). Pins that the guard keys
+	// on the flag's value, not on the source being exotic.
+	pod := &corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name: enginewire.SGLangEngineContainerName, Image: "sglang:test",
+			VolumeMounts: []corev1.VolumeMount{{Name: "nfs-shm", MountPath: "/dev/shm"}},
+		}},
+		Volumes: []corev1.Volume{{
+			Name:         "nfs-shm",
+			VolumeSource: corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: "s", Path: "/p", ReadOnly: false}},
+		}},
+	}
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig rejected a writable /dev/shm: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	for _, m := range w.VolumeMounts {
+		if m.MountPath == "/dev/shm" && m.Name != "nfs-shm" {
+			t.Fatalf("worker /dev/shm volume = %q, want the engine's existing %q", m.Name, "nfs-shm")
+		}
+	}
+}
+
 func TestSGLangInjectEngineConfigWorkerSeesTheGPU(t *testing.T) {
 	// GPU visibility on the worker is LOAD-BEARING, not incidental: the engine hands
 	// it a device UUID and LMCache's CUDA-IPC wrapper resolves that to a local index,
@@ -675,6 +704,53 @@ func TestSGLangInjectEngineConfigRejectsUnshareableDevShm(t *testing.T) {
 				}},
 			},
 			want: "csi",
+		},
+		// A source-level readOnly is NOT overridden by a mount-level readOnly:false,
+		// so every in-tree source carrying its own flag must be caught. These shapes
+		// are exotic at /dev/shm, but the failure they produce is the silent one.
+		{
+			name: "read-only nfs source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "nfs-shm", MountPath: "/dev/shm", ReadOnly: false})},
+				Volumes: []corev1.Volume{{
+					Name:         "nfs-shm",
+					VolumeSource: corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: "s", Path: "/p", ReadOnly: true}},
+				}},
+			},
+			want: "nfs",
+		},
+		{
+			name: "read-only rbd source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "rbd-shm", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name:         "rbd-shm",
+					VolumeSource: corev1.VolumeSource{RBD: &corev1.RBDVolumeSource{RBDImage: "i", ReadOnly: true}},
+				}},
+			},
+			want: "rbd",
+		},
+		{
+			name: "read-only cephfs source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "ceph-shm", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name:         "ceph-shm",
+					VolumeSource: corev1.VolumeSource{CephFS: &corev1.CephFSVolumeSource{Monitors: []string{"m"}, ReadOnly: true}},
+				}},
+			},
+			want: "cephfs",
+		},
+		{
+			name: "read-only azureFile source",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "az-shm", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name:         "az-shm",
+					VolumeSource: corev1.VolumeSource{AzureFile: &corev1.AzureFileVolumeSource{SecretName: "s", ShareName: "sh", ReadOnly: true}},
+				}},
+			},
+			want: "azureFile",
 		},
 	}
 	for _, tc := range cases {

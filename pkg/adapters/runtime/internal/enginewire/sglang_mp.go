@@ -503,10 +503,12 @@ func adoptVolume(vs []corev1.Volume, want corev1.Volume, owned bool) ([]corev1.V
 // neither of which the kubelet reports back at admission; getting it wrong surfaces
 // as a silent no-transfer at runtime, deep inside LMCache.
 //
-// Read-only comes in two shapes, and both are checked: the MOUNT's readOnly, and the
-// SOURCE's — projection sources (configMap / secret / downwardAPI / projected) the
-// kubelet always mounts read-only, plus the explicit readOnly on persistentVolumeClaim
-// and csi. Sources not named here (emptyDir, hostPath, ephemeral, …) are writable, or
+// Read-only comes in two shapes, and both are checked. The MOUNT's readOnly is the
+// obvious one; the SOURCE's is the one that bites, because a mount-level
+// readOnly:false does NOT override a source-level readOnly:true. So this checks the
+// projection sources the kubelet always mounts read-only (configMap / secret /
+// downwardAPI / projected) AND every in-tree source carrying its own readOnly flag.
+// Sources with no such flag (emptyDir, hostPath, ephemeral, …) are writable, or
 // their writability is the operator's to configure, so they pass.
 func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 	if m.ReadOnly {
@@ -526,19 +528,65 @@ func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 			continue
 		}
 		var kind, why string
+		const projected = "which the kubelet mounts read-only"
+		const declared = "declared readOnly at the volume source"
 		switch src := vs[i].VolumeSource; {
+		// Projection sources: always read-only, regardless of any flag.
 		case src.ConfigMap != nil:
-			kind, why = "configMap", "which the kubelet mounts read-only"
+			kind, why = "configMap", projected
 		case src.Secret != nil:
-			kind, why = "secret", "which the kubelet mounts read-only"
+			kind, why = "secret", projected
 		case src.DownwardAPI != nil:
-			kind, why = "downwardAPI", "which the kubelet mounts read-only"
+			kind, why = "downwardAPI", projected
 		case src.Projected != nil:
-			kind, why = "projected", "which the kubelet mounts read-only"
+			kind, why = "projected", projected
+		// Sources with their own readOnly flag. Every in-tree source that has one is
+		// listed: a mount-level readOnly:false does NOT override a source-level
+		// readOnly:true, so checking only VolumeMount.ReadOnly (above) misses these
+		// and hands the worker an unwritable /dev/shm.
 		case src.PersistentVolumeClaim != nil && src.PersistentVolumeClaim.ReadOnly:
-			kind, why = "persistentVolumeClaim", "declared readOnly"
+			kind, why = "persistentVolumeClaim", declared
 		case src.CSI != nil && src.CSI.ReadOnly != nil && *src.CSI.ReadOnly:
-			kind, why = "csi", "declared readOnly"
+			kind, why = "csi", declared
+		case src.NFS != nil && src.NFS.ReadOnly:
+			kind, why = "nfs", declared
+		case src.CephFS != nil && src.CephFS.ReadOnly:
+			kind, why = "cephfs", declared
+		case src.RBD != nil && src.RBD.ReadOnly:
+			kind, why = "rbd", declared
+		case src.ISCSI != nil && src.ISCSI.ReadOnly:
+			kind, why = "iscsi", declared
+		case src.AzureFile != nil && src.AzureFile.ReadOnly:
+			kind, why = "azureFile", declared
+		case src.AzureDisk != nil && src.AzureDisk.ReadOnly != nil && *src.AzureDisk.ReadOnly:
+			kind, why = "azureDisk", declared
+		case src.Quobyte != nil && src.Quobyte.ReadOnly:
+			kind, why = "quobyte", declared
+		case src.PortworxVolume != nil && src.PortworxVolume.ReadOnly:
+			kind, why = "portworxVolume", declared
+		case src.ScaleIO != nil && src.ScaleIO.ReadOnly:
+			kind, why = "scaleIO", declared
+		case src.StorageOS != nil && src.StorageOS.ReadOnly:
+			kind, why = "storageos", declared
+		case src.Glusterfs != nil && src.Glusterfs.ReadOnly:
+			kind, why = "glusterfs", declared
+		case src.Cinder != nil && src.Cinder.ReadOnly:
+			kind, why = "cinder", declared
+		case src.FlexVolume != nil && src.FlexVolume.ReadOnly:
+			kind, why = "flexVolume", declared
+		case src.Flocker != nil:
+			// No readOnly field; falls through as writable.
+			return nil
+		case src.GCEPersistentDisk != nil && src.GCEPersistentDisk.ReadOnly:
+			kind, why = "gcePersistentDisk", declared
+		case src.AWSElasticBlockStore != nil && src.AWSElasticBlockStore.ReadOnly:
+			kind, why = "awsElasticBlockStore", declared
+		case src.FC != nil && src.FC.ReadOnly:
+			kind, why = "fc", declared
+		case src.VsphereVolume != nil, src.PhotonPersistentDisk != nil, src.GitRepo != nil, src.Image != nil:
+			// Either no readOnly field, or (gitRepo/image) not a shared-writable
+			// scratch shape anyone mounts at /dev/shm. Left as-is rather than guessed at.
+			return nil
 		default:
 			return nil
 		}

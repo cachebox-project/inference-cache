@@ -262,12 +262,16 @@ parts are named for what they are:
 > one. This is a property of **MP mode**, not of SGLang specifically: it is exactly
 > what the vLLM MP path would inherit too, and MP is the *upstream-recommended*
 > posture — so accepting it aligns with the converged direction rather than taking
-> on a SGLang-only wart. **Containment (all in Phase 2):** native sidecar + `restartPolicy:
-> Always` self-heals transient worker crashes; an engine **liveness probe** turns a
-> persistently-wedged engine into a whole-pod restart (self-healing) rather than a
-> silent hang; the `CacheBackend` `Degraded` condition surfaces worker unhealth; and
-> operator docs state plainly that for this pair the cache worker is a serving
-> component. Not a one-way door — if upstream SGLang adds a cacheless fallback, the
+> on a SGLang-only wart. **Containment (across Phase 2's increments — see
+> [Phased delivery](#phased-delivery) for which lands where):** native sidecar +
+> `restartPolicy: Always` self-heals transient worker crashes *(landed, increment
+> 2)*; an engine **liveness probe** turns a persistently-wedged engine into a
+> whole-pod restart (self-healing) rather than a silent hang *(increment 3 — it
+> mutates the operator-owned engine container, and is gated on measuring whether the
+> engine survives a mid-flight worker restart)*; the `CacheBackend` `Degraded`
+> condition surfaces worker unhealth *(increment 3 — controller/status surface)*;
+> and operator docs state plainly that for this pair the cache worker is a serving
+> component *(landed, increment 2)*. Not a one-way door — if upstream SGLang adds a cacheless fallback, the
 > guarantee upgrades with no redesign.
 
 Net: engine-local prefill proceeds whenever the *shared* cache is unavailable —
@@ -363,6 +367,29 @@ data plane), different resolution because the data planes differ:
   version-aligned worker/engine/Redis image tuple lands in **`VERSIONS.md` in this
   phase** (it is a Phase-2 correctness requirement, not a Phase-3 doc polish). Flip
   the advisory warning off once validated end-to-end.
+
+  **Phase 2 is delivered in three increments**, and the containment measures land
+  across them rather than all in the first code drop:
+
+  | Increment | Delivers | Status |
+  |---|---|---|
+  | 1 | `ResolveCacheServer` → the managed Redis L2 render + its `VERSIONS.md` pin | landed |
+  | 2 | `InjectSGLangLMCache` → the MP engine wire (worker sidecar, config file, shared volumes); advisory warning flipped off | landed, GPU-validated |
+  | 3 | Operator surface + the **remaining containment**: engine liveness probe, `CacheBackend` `Degraded` on worker unhealth, and the engine/lmcache image-tuple pin | **pending** |
+
+  **Why containment splits this way** (rather than shipping with increment 2): of
+  the four containment measures listed under [Fail-open semantics](#fail-open-semantics-resolving-the-startup-gate-tension),
+  increment 2 delivers the two that are properties of the wire it renders — the
+  native sidecar's `restartPolicy: Always` self-heal, and the operator docs naming
+  the worker a serving component. The other two are **different surfaces**: the
+  `Degraded` condition is controller/status work, and an engine liveness probe
+  mutates the *operator-owned* engine container (which may carry its own probe).
+  Both also depend on a Phase-2 finding this doc explicitly does not claim —
+  **whether the engine survives a mid-flight worker restart** (see the "Worker
+  crash / restart" bullet above). A restart-on-unhealthy loop built before that is
+  measured could convert "caching silently stopped" into "engine repeatedly
+  killed", which is worse than the failure it contains. So increment 3 validates
+  that behavior first, then ships the probe + condition together.
 - **Phase 3.** Operator surface: `config/samples/cachebackend-sglang.yaml`, the
   `docs/reference-stack/manifests/sglang-lmcache/` reference leg, the
   default-install smoke assertions, and fully rewriting the
