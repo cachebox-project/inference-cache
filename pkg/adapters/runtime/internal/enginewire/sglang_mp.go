@@ -54,6 +54,11 @@ const (
 	sglangDefaultMPPort   = "5555"
 	sglangDefaultL1SizeGB = "4"
 
+	// Upper bounds for the sanitized numeric tunables (see sglangIntInRangeOr).
+	sglangMaxChunkSize = 65536 // generous; chunk sizes are small
+	sglangMaxTCPPort   = 65535 // a valid TCP port
+	sglangMaxL1SizeGB  = 1024  // 1 TiB — bounded so ParseQuantity always sizes /dev/shm
+
 	// BackendConfig override keys.
 	cfgKeyWorkerImage = "workerImage"
 	cfgKeyL1SizeGB    = "l1SizeGB"
@@ -99,9 +104,9 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	// non-integer (typo or a shell-metacharacter injection attempt) falls back to
 	// the safe default and never reaches the shell. sglangPositiveIntOr is the
 	// sanitization boundary; it also guarantees the /dev/shm sizeLimit is bounded.
-	chunkSize := sglangPositiveIntOr(cfg, cfgKeyChunkSize, defaultChunkSize)
-	mpPort := sglangPositiveIntOr(cfg, cfgKeyMPPort, sglangDefaultMPPort)
-	l1SizeGB := sglangPositiveIntOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB)
+	chunkSize := sglangIntInRangeOr(cfg, cfgKeyChunkSize, defaultChunkSize, sglangMaxChunkSize)
+	mpPort := sglangIntInRangeOr(cfg, cfgKeyMPPort, sglangDefaultMPPort, sglangMaxTCPPort)
+	l1SizeGB := sglangIntInRangeOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB, sglangMaxL1SizeGB)
 
 	l2Adapter, err := sglangL2AdapterJSON(cfg, endpoint)
 	if err != nil {
@@ -224,16 +229,18 @@ func sglangShmVolume(l1SizeGB string) corev1.Volume {
 	return v
 }
 
-// sglangPositiveIntOr returns cfg[key] iff it is a plain positive integer, else
+// sglangIntInRangeOr returns cfg[key] iff it is an integer in [1, max], else
 // fallback. This is a hard sanitization boundary: chunkSize/mpPort/l1SizeGB are
 // substituted into the worker's `sh -c` command and into resource sizing, so a
-// non-integer value — a typo, or an injection attempt like "4; rm -rf /" — must
-// never reach the shell. It falls back to the (integer) default instead of failing
-// injection, so a mistyped tunable degrades to the default rather than crashing the
-// pod webhook. fallback MUST itself be a positive integer literal.
-func sglangPositiveIntOr(cfg map[string]string, key, fallback string) string {
+// non-integer — a typo or an injection attempt like "4; rm -rf /" — must never
+// reach the shell, AND an out-of-range value (a port > 65535, or an l1SizeGB so
+// large that resource.ParseQuantity can't size /dev/shm and leaves it unbounded)
+// must be rejected. It falls back to the (in-range integer) default rather than
+// failing injection, so a mistyped tunable degrades to the default instead of
+// crashing the pod webhook. fallback MUST itself be an in-range positive integer.
+func sglangIntInRangeOr(cfg map[string]string, key, fallback string, max int) string {
 	v := strings.TrimSpace(ConfigOr(cfg, key, ""))
-	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+	if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= max {
 		return v
 	}
 	return fallback

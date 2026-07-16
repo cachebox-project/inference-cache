@@ -371,9 +371,11 @@ func TestSGLangInjectEngineConfigSanitizesNumericConfig(t *testing.T) {
 		{"chunkSize", "$(evil)", "--chunk-size 256", "$(evil)"},
 		{"mpPort", "5555 && curl evil", "--port 5555", "curl evil"},
 		{"mpPort", "-1", "--port 5555", "--port -1"},
+		{"mpPort", "99999", "--port 5555", "--port 99999"}, // > 65535 → default
 		{"l1SizeGB", "4; cat /etc/passwd", "--l1-size-gb 4", "/etc/passwd"},
 		{"l1SizeGB", "abc", "--l1-size-gb 4", "--l1-size-gb abc"},
 		{"l1SizeGB", "0", "--l1-size-gb 4", "--l1-size-gb 0"},
+		{"l1SizeGB", "999999999", "--l1-size-gb 4", "--l1-size-gb 999999999"}, // huge → default (bounded /dev/shm)
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.bad, func(t *testing.T) {
