@@ -110,6 +110,23 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 
 	c := &pod.Containers[i]
 
+	// The config mount path is ADAPTER-OWNED (the worker writes the MP config file
+	// there and the engine reads it). A FOREIGN mount already at that path can
+	// neither be duplicated (a duplicate mountPath is an invalid Pod) nor safely
+	// reused (an operator's ConfigMap/secret mount is read-only, so the worker's
+	// write would fail at runtime) — reject with a message that names the fix; the
+	// pod webhook turns that into a fail-open admit, so the pod starts un-wired
+	// rather than broken. This differs from /dev/shm, which IS reused because it is
+	// plain shared scratch tmpfs the operator legitimately owns.
+	//
+	// Our OWN mount at that path is not a collision — it is a re-injection, which
+	// must stay idempotent (the webhook re-runs), so only a different volume name
+	// trips the guard.
+	if existing := mountAtPath(c.VolumeMounts, sglangConfigMountPath); existing != nil && existing.Name != sglangConfigVolumeName {
+		return fmt.Errorf("inject engine config: engine container already mounts %q (volume %q), but that path is reserved for the LMCache MP config file the worker writes — move that mount elsewhere",
+			sglangConfigMountPath, existing.Name)
+	}
+
 	pod.Volumes = upsertVolumeByName(pod.Volumes, corev1.Volume{
 		Name:         sglangConfigVolumeName,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
@@ -171,6 +188,17 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 			"--chunk-size %s --l1-size-gb %s --eviction-policy LRU --l2-adapter %s",
 		chunkSize, mpPort, configPath, mpPort, chunkSize, l1SizeGB, shellSingleQuote(l2Adapter))
 
+	// The worker holds the L1 in a memory-backed tmpfs charged to its own cgroup, so
+	// it MUST carry a matching memory request+limit — otherwise the L1 is invisible
+	// to the scheduler and can overcommit the node into a node-pressure OOM.
+	var resources corev1.ResourceRequirements
+	if q, ok := sglangMemBudget(l1SizeGB); ok {
+		resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: q},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: q},
+		}
+	}
+
 	always := corev1.ContainerRestartPolicyAlways
 	return corev1.Container{
 		Name:          sglangMPWorkerContainerName,
@@ -178,6 +206,7 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 		RestartPolicy: &always, // native sidecar: starts + gates ready before the engine
 		Command:       []string{"sh", "-c"},
 		Args:          []string{script},
+		Resources:     resources,
 		// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV; it
 		// consumes no device-plugin allocation (no nvidia.com/gpu limit).
 		Env: []corev1.EnvVar{{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"}},
@@ -238,10 +267,25 @@ func sglangL2AdapterJSON(endpoint string) (string, error) {
 	return fmt.Sprintf(`{"type":"resp","host":%q,"port":%s}`, host, port), nil
 }
 
-// sglangShmVolume returns the /dev/shm tmpfs volume sized from the L1 budget
-// (l1SizeGB + 1Gi headroom). l1SizeGB is a sanitized positive integer (see
-// sglangPositiveIntOr), so the sizeLimit is always bounded — a memory-backed
-// emptyDir must never be left unbounded or it can exhaust node memory.
+// sglangMemBudget returns the memory budget for the L1 tier: l1SizeGB + 1Gi
+// headroom. It sizes BOTH the /dev/shm tmpfs AND the worker container's memory
+// request/limit: the L1 lives in a memory-backed emptyDir, which is charged to the
+// cgroup of the container that writes it, so a worker with no request/limit would
+// not inform scheduling and could overcommit the node into a node-pressure OOM —
+// the same bounded-memory posture the Redis L2 render takes. l1SizeGB is a
+// sanitized in-range integer (see sglangIntInRangeOr), so this always parses.
+func sglangMemBudget(l1SizeGB string) (resource.Quantity, bool) {
+	q, err := resource.ParseQuantity(l1SizeGB + "Gi")
+	if err != nil {
+		return resource.Quantity{}, false
+	}
+	q.Add(resource.MustParse("1Gi"))
+	return q, true
+}
+
+// sglangShmVolume returns the /dev/shm tmpfs volume sized from the L1 budget. A
+// memory-backed emptyDir must never be left unbounded or it can exhaust node
+// memory.
 func sglangShmVolume(l1SizeGB string) corev1.Volume {
 	v := corev1.Volume{
 		Name: sglangShmVolumeName,
@@ -249,8 +293,7 @@ func sglangShmVolume(l1SizeGB string) corev1.Volume {
 			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
 		},
 	}
-	if q, err := resource.ParseQuantity(l1SizeGB + "Gi"); err == nil {
-		q.Add(resource.MustParse("1Gi"))
+	if q, ok := sglangMemBudget(l1SizeGB); ok {
 		v.EmptyDir.SizeLimit = &q
 	}
 	return v

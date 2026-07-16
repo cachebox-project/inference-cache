@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -371,6 +372,59 @@ func TestSGLangInjectEngineConfigReusesExistingDevShm(t *testing.T) {
 	}
 	if workerShm != "dshm" {
 		t.Fatalf("worker /dev/shm volume = %q, want the engine's existing %q — the MP data path needs both containers on the SAME volume", workerShm, "dshm")
+	}
+}
+
+func TestSGLangInjectEngineConfigRejectsConfigPathCollision(t *testing.T) {
+	// The config mount path is adapter-owned: the worker WRITES the MP config there.
+	// A pre-existing mount can neither be duplicated (invalid Pod) nor safely reused
+	// (a ConfigMap mount is read-only), so injection must reject with a clear reason
+	// — the webhook turns that into a fail-open admit.
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name:         enginewire.SGLangEngineContainerName,
+		Image:        "sglang:test",
+		VolumeMounts: []corev1.VolumeMount{{Name: "operator-cfg", MountPath: "/etc/lmcache"}},
+	}}}
+	err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil))
+	if err == nil {
+		t.Fatalf("want an error when the engine already mounts the adapter-owned config path")
+	}
+	if !strings.Contains(err.Error(), "/etc/lmcache") || !strings.Contains(err.Error(), "operator-cfg") {
+		t.Fatalf("error must name the path and the conflicting volume, got: %v", err)
+	}
+}
+
+func TestSGLangInjectEngineConfigWorkerHasMemoryBudget(t *testing.T) {
+	// The worker holds the L1 in a memory-backed tmpfs charged to its cgroup, so it
+	// must carry a matching memory request+limit (l1SizeGB + 1Gi) — otherwise the L1
+	// is invisible to the scheduler and can overcommit the node.
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: enginewire.SGLangEngineContainerName, Image: "sglang:test",
+	}}}
+	cb := newSGLangBackend(map[string]string{"l1SizeGB": "8"})
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", cb); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	want := resource.MustParse("9Gi") // 8Gi L1 + 1Gi headroom
+	req, hasReq := w.Resources.Requests[corev1.ResourceMemory]
+	lim, hasLim := w.Resources.Limits[corev1.ResourceMemory]
+	if !hasReq || !hasLim {
+		t.Fatalf("worker must carry a memory request AND limit, got %+v", w.Resources)
+	}
+	if req.Cmp(want) != 0 || lim.Cmp(want) != 0 {
+		t.Fatalf("worker memory = req %s / lim %s, want %s (l1SizeGB + 1Gi headroom)", req.String(), lim.String(), want.String())
+	}
+	// The tmpfs sizeLimit must agree with the container budget.
+	v := findVolume(pod.Volumes, "lmcache-dshm")
+	if v == nil || v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil {
+		t.Fatalf("/dev/shm tmpfs must be size-bounded, got %+v", v)
+	}
+	if v.EmptyDir.SizeLimit.Cmp(want) != 0 {
+		t.Fatalf("tmpfs sizeLimit = %s, want %s (must match the worker's memory budget)", v.EmptyDir.SizeLimit.String(), want.String())
 	}
 }
 
