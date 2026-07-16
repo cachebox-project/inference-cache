@@ -28,12 +28,16 @@ import (
 // (sglang, LMCache) adapter's engine path. It is factored out and unit-tested on
 // its own so the store render is reviewed independently of the engine wire.
 const (
-	// defaultRedisImage is the upstream Redis image for the managed L2 store. A
-	// major.minor-alpine tag is more stable than :7 / :latest but still mutable
-	// within its patch line, so it is a sane default, NOT a reproducible pin:
-	// production MUST pin an exact release or @sha256 digest via
-	// backendConfig.redisImage. This redis:7 line is what validation exercised
-	// against the pinned lmcache MP worker.
+	// defaultRedisImage is the upstream Redis image for the managed L2 store, and
+	// is tracked in docs/reference-stack/VERSIONS.md alongside the other stack
+	// pins. A major.minor-alpine tag is more stable than :7 / :latest but still
+	// mutable within its patch line, so it is a sane default, NOT a reproducible
+	// pin: production MUST pin an exact release or @sha256 digest via
+	// backendConfig.redisImage, per the image-pin policy in
+	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what validation
+	// exercised against the pinned lmcache MP worker. Redis needs no lmcache
+	// version alignment (the MP worker speaks RESP), so this pin moves
+	// independently of the engine/lmcache tuple.
 	defaultRedisImage = "docker.io/library/redis:7.4-alpine"
 	// defaultRedisPort is the canonical Redis port the `resp` L2 adapter dials.
 	defaultRedisPort = int32(6379)
