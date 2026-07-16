@@ -539,6 +539,36 @@ func TestSGLangInjectEngineConfigRejectsUnwritableDevShm(t *testing.T) {
 	}
 }
 
+func TestSGLangInjectEngineConfigWorkerSeesTheGPU(t *testing.T) {
+	// GPU visibility on the worker is LOAD-BEARING, not incidental: the engine hands
+	// it a device UUID and LMCache's CUDA-IPC wrapper resolves that to a local index,
+	// which fails unless the device is visible here. GPU-validated — with visibility
+	// revoked the worker dies on "Device UUID <uuid> not found in the discovered
+	// devices" and the engine never reaches ready.
+	//
+	// It cannot be narrowed to the engine's own device: the device plugin assigns the
+	// UUID at kubelet time, after this mutation runs. The isolation trade-off is
+	// documented for operators in docs/design/cachebackend-api.md. This test exists so
+	// the env is not dropped as dead weight — the failure it prevents is a wedged
+	// engine, not a cache miss.
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "sglang:test"}}}
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	if v, _ := lookupEnv(w.Env, "NVIDIA_VISIBLE_DEVICES"); v != "all" {
+		t.Fatalf("worker NVIDIA_VISIBLE_DEVICES = %q, want \"all\" — without it the CUDA-IPC UUID lookup fails and the engine hangs behind the startup probe", v)
+	}
+	// It must stay GPU-less at the scheduler: a device-plugin request would burn a
+	// second GPU and hand the worker a DIFFERENT device than the engine's.
+	if _, ok := w.Resources.Limits["nvidia.com/gpu"]; ok {
+		t.Fatalf("worker requests nvidia.com/gpu — it must consume no device-plugin allocation: %v", w.Resources.Limits)
+	}
+}
+
 func TestSGLangInjectEngineConfigWorkerAddsNoCapabilities(t *testing.T) {
 	// The worker must add NO capabilities. Pod Security allows added capabilities
 	// beyond a small allow-list under neither baseline nor restricted, and this

@@ -260,8 +260,32 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 		Args:          []string{script},
 		Resources:     resources,
 		Env: []corev1.EnvVar{
-			// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV; it
-			// consumes no device-plugin allocation (no nvidia.com/gpu limit).
+			// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV, and
+			// this is the only mechanism that grants it. GPU-VALIDATED, including the
+			// negative: with visibility revoked the worker dies on
+			//
+			//	RuntimeError: Device UUID <uuid> not found in the discovered devices.
+			//	Please make sure the process can see all the accelerator devices
+			//
+			// and the engine never reaches ready. The engine hands the worker a device
+			// UUID; LMCache's ipc_wrapper resolves it to a local index, which only
+			// works if the device is visible here.
+			//
+			// SCOPING THIS TO THE ENGINE'S DEVICE IS NOT POSSIBLE AT ADMISSION: the
+			// device plugin assigns the UUID at kubelet time, after this mutation runs
+			// — there is nothing to narrow to yet. Requesting nvidia.com/gpu for the
+			// worker would be worse: it burns a second GPU and the scheduler would hand
+			// it a DIFFERENT device than the engine's.
+			//
+			// The isolation cost is real and documented for operators (see the
+			// GPU-visibility note in docs/design/cachebackend-api.md): on a shared node
+			// the worker can see every GPU, not just its engine's. Note this is the
+			// engine image's own posture, not something this adapter introduces —
+			// sglang images ship NVIDIA_VISIBLE_DEVICES=all in their ENV, and the
+			// device plugin only overrides it for containers that request a GPU (the
+			// engine gets a UUID; a request-less sidecar keeps the image default).
+			// Setting it explicitly keeps the wire working on a workerImage that does
+			// not carry that default, rather than depending on an image side effect.
 			{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
 			// Marks this container as ours so a re-injection converges it instead of
 			// mistaking it for an operator's name squat (see sglangWireIsOurs).
