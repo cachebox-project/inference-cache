@@ -167,45 +167,38 @@ func (a adapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *core
 	})
 }
 
-// ReservedArgs returns the engine args this adapter injects that the LMCache
+// ReservedArgs returns the engine args this adapter injects that the LMCache MP
 // integration cannot function without. The validating webhook blocks an
 // spec.integration.engineOverrides entry that overrides or suppresses any of
 // these so the operator cannot silently un-wire the connector.
 //
-//   - "--enable-lmcache" is the SGLang flag that turns the LMCache connector on
-//     at startup; suppressing it means no LMCache wiring at all.
+//   - "--enable-lmcache" turns the LMCache connector on at startup; suppressing it
+//     means no LMCache wiring at all.
+//   - "--lmcache-config-file" points the engine at the MP config file the worker
+//     sidecar writes (mp_host/mp_port); without it SGLang's MP mode aborts at
+//     startup, so suppressing it breaks the engine, not just the cache.
 //
 // (Distinct from the vLLM adapter, which reserves --kv-transfer-config — the
 // two engines turn LMCache on through different launch surfaces.)
 func (adapter) ReservedArgs() []string {
-	return []string{enginewire.SGLangEnableLMCacheArg}
+	return []string{enginewire.SGLangEnableLMCacheArg, enginewire.SGLangConfigFileArg}
 }
 
 // ReservedEnv returns the env var names this adapter injects and blocks
-// engineOverrides from touching. NOTE (see the package KNOWN LIMITATION): not all
-// of these are load-bearing for SGLang today — the adapter injects the vLLM-style
-// wire, but SGLang uses LMCache MP mode, so some of it is inert. They are still
-// reserved (the operator must not silently mutate adapter-owned state), but the
-// rationale differs per var:
+// engineOverrides from touching. SGLang drives LMCache in MP mode (config-file +
+// node-local worker), so — unlike the old lm:// wire — LMCACHE_REMOTE_URL and the
+// serde/local-CPU tunables are NOT injected and NOT reserved. What remains:
 //
-//   - LMCACHE_REMOTE_URL is the rendered cache-server address for the vLLM path;
-//     SGLang IGNORES it (MP mode reads mp_host/mp_port from --lmcache-config-file),
-//     so it is currently inert — reserved to keep the shipped wire consistent, not
-//     because SGLang honors it. The MP-mode fix replaces it.
-//   - LMCACHE_USE_EXPERIMENTAL (set to "True") DOES matter — it gates SGLang's
-//     experimental LMCache path; without it, --enable-lmcache does not engage the
-//     connector at all.
+//   - LMCACHE_USE_EXPERIMENTAL (set to "True") gates SGLang's experimental LMCache
+//     path; without it, --enable-lmcache does not engage the connector at all.
 //   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the pod;
 //     an override would silently desync the pod from the CR contract.
 //
-// Unlike the vLLM adapter, VLLM_USE_V1 and PYTHONHASHSEED are NOT reserved —
-// they are not injected for SGLang at all (no vLLM v1 codepath; SGLang's
-// sha256-based prefix hashing does not depend on PYTHONHASHSEED). The LMCACHE_*
-// perf/mode tunables (chunk size / serde / local-CPU knobs) are likewise NOT
-// reserved.
+// Unlike the vLLM adapter, VLLM_USE_V1 and PYTHONHASHSEED are NOT reserved — they
+// are not injected for SGLang at all (no vLLM v1 codepath; SGLang's sha256-based
+// prefix hashing does not depend on PYTHONHASHSEED).
 func (adapter) ReservedEnv() []string {
 	return []string{
-		enginewire.EnvLMCacheRemoteURL,
 		enginewire.EnvLMCacheUseExperimental,
 		enginewire.EnvInferenceCacheFailOpen,
 	}

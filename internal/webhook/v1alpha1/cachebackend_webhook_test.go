@@ -2159,12 +2159,12 @@ func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha
 }
 
 func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
-	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache
-	// (args) and LMCACHE_REMOTE_URL / LMCACHE_USE_EXPERIMENTAL /
-	// INFERENCECACHE_FAIL_OPEN (env). Admission must reject an engineOverrides
-	// entry that overrides OR suppresses any of them, and name the sglang
-	// adapter in the rejection. Exercises the real shipping registry so the
-	// sglang adapter's reserved lists are the ones enforced.
+	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache and
+	// --lmcache-config-file (args), LMCACHE_USE_EXPERIMENTAL /
+	// INFERENCECACHE_FAIL_OPEN (env). In MP mode the old lm:// LMCACHE_REMOTE_URL is
+	// neither injected nor reserved. Admission must reject an engineOverrides entry
+	// that overrides OR suppresses any reserved item, and name the sglang adapter.
+	// Exercises the real shipping registry so the sglang reserved lists are enforced.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cases := []struct {
 		name     string
@@ -2174,7 +2174,7 @@ func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
 	}{
 		{"suppress --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--enable-lmcache"},
 		{"override --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{Args: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.args[0]", "--enable-lmcache"},
-		{"override LMCACHE_REMOTE_URL", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "lm://elsewhere:1"}}}, "spec.integration.engineOverrides.env[0].name", "LMCACHE_REMOTE_URL"},
+		{"suppress --lmcache-config-file", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--lmcache-config-file"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--lmcache-config-file"},
 		{"suppress LMCACHE_USE_EXPERIMENTAL", cachev1alpha1.EngineInjectionOverrides{SuppressEnv: []string{"LMCACHE_USE_EXPERIMENTAL"}}, "spec.integration.engineOverrides.suppressEnv[0]", "LMCACHE_USE_EXPERIMENTAL"},
 		{"override INFERENCECACHE_FAIL_OPEN", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}}}, "spec.integration.engineOverrides.env[0].name", "INFERENCECACHE_FAIL_OPEN"},
 	}

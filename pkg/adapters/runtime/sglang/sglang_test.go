@@ -3,6 +3,7 @@ package sglang
 import (
 	"flag"
 	"io"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +24,33 @@ func newSGLangBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 		},
 	}
 	return cb
+}
+
+func findInitContainer(cs []corev1.Container, name string) *corev1.Container {
+	for i := range cs {
+		if cs[i].Name == name {
+			return &cs[i]
+		}
+	}
+	return nil
+}
+
+func findVolume(vs []corev1.Volume, name string) *corev1.Volume {
+	for i := range vs {
+		if vs[i].Name == name {
+			return &vs[i]
+		}
+	}
+	return nil
+}
+
+func hasMount(ms []corev1.VolumeMount, name string) bool {
+	for _, m := range ms {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSGLangSupports(t *testing.T) {
@@ -104,9 +132,10 @@ func TestSGLangInjectEngineConfig(t *testing.T) {
 	pod := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name: enginewire.SGLangEngineContainerName,
-				Args: []string{"--page-size", "64"},
-				Env:  []corev1.EnvVar{{Name: "HF_TOKEN", Value: "secret-token"}},
+				Name:  enginewire.SGLangEngineContainerName,
+				Image: "sglang:test",
+				Args:  []string{"--page-size", "64"},
+				Env:   []corev1.EnvVar{{Name: "HF_TOKEN", Value: "secret-token"}},
 			},
 			{
 				Name: "sidecar",
@@ -115,43 +144,36 @@ func TestSGLangInjectEngineConfig(t *testing.T) {
 		},
 	}
 
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:6379", cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 
 	engine := pod.Containers[0]
-	if url, ok := lookupEnv(engine.Env, enginewire.EnvLMCacheRemoteURL); !ok || url != "lm://cache.ns1.svc.cluster.local:65432" {
-		t.Fatalf("%s = (%q, %v), want lm://cache.ns1.svc.cluster.local:65432", enginewire.EnvLMCacheRemoteURL, url, ok)
+
+	// MP-mode engine wire: connector on + config-file, and the lm:// env is GONE.
+	if !containsArg(engine.Args, enginewire.SGLangEnableLMCacheArg) {
+		t.Fatalf("engine args missing %s: %v", enginewire.SGLangEnableLMCacheArg, engine.Args)
+	}
+	if !containsArg(engine.Args, enginewire.SGLangConfigFileArg) {
+		t.Fatalf("engine args missing %s: %v", enginewire.SGLangConfigFileArg, engine.Args)
 	}
 	if v, ok := lookupEnv(engine.Env, enginewire.EnvLMCacheUseExperimental); !ok || v != "True" {
 		t.Fatalf("%s = (%q, %v), want True", enginewire.EnvLMCacheUseExperimental, v, ok)
 	}
-	if v, _ := lookupEnv(engine.Env, enginewire.EnvLMCacheRemoteSerde); v != "naive" {
-		t.Fatalf("%s = %q, want naive (CPU-safe default)", enginewire.EnvLMCacheRemoteSerde, v)
-	}
-	if v, _ := lookupEnv(engine.Env, enginewire.EnvLMCacheChunkSize); v != "256" {
-		t.Fatalf("%s = %q, want 256", enginewire.EnvLMCacheChunkSize, v)
-	}
-	if v, _ := lookupEnv(engine.Env, enginewire.EnvInferenceCacheFailOpen); v == "" {
+	if v, ok := lookupEnv(engine.Env, enginewire.EnvInferenceCacheFailOpen); !ok || v == "" {
 		t.Fatalf("%s missing", enginewire.EnvInferenceCacheFailOpen)
 	}
-
-	// Critical SGLang-vs-vLLM difference: VLLM_USE_V1 and PYTHONHASHSEED are
-	// vLLM-only and MUST NOT be injected for SGLang (no v1 codepath; SGLang's
-	// sha256-based prefix hashing does not depend on PYTHONHASHSEED). Injecting
-	// them would be cargo-culted noise at best and confusing at worst.
+	// The old lm:// env is NOT injected — SGLang MP mode ignores it.
+	if _, ok := lookupEnv(engine.Env, enginewire.EnvLMCacheRemoteURL); ok {
+		t.Fatalf("%s injected — SGLang MP mode must not use the lm:// env", enginewire.EnvLMCacheRemoteURL)
+	}
+	// vLLM-only env/args stay absent.
 	if _, ok := lookupEnv(engine.Env, enginewire.EnvVLLMUseV1); ok {
-		t.Fatalf("%s was injected for SGLang; it is vLLM-only", enginewire.EnvVLLMUseV1)
+		t.Fatalf("%s (vLLM-only) injected for SGLang", enginewire.EnvVLLMUseV1)
 	}
 	if _, ok := lookupEnv(engine.Env, enginewire.EnvPythonHashSeed); ok {
-		t.Fatalf("%s was injected for SGLang; it is vLLM-only", enginewire.EnvPythonHashSeed)
+		t.Fatalf("%s (vLLM-only) injected for SGLang", enginewire.EnvPythonHashSeed)
 	}
-
-	// --enable-lmcache (bare flag, not a --kv-transfer-config pair) is appended.
-	if !containsArg(engine.Args, enginewire.SGLangEnableLMCacheArg) {
-		t.Fatalf("engine args missing %s: %v", enginewire.SGLangEnableLMCacheArg, engine.Args)
-	}
-	// SGLang must NOT get vLLM's connector arg.
 	if containsArg(engine.Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config (vLLM-only) injected for SGLang: %v", engine.Args)
 	}
@@ -162,21 +184,57 @@ func TestSGLangInjectEngineConfig(t *testing.T) {
 	if v, _ := lookupEnv(engine.Env, "HF_TOKEN"); v != "secret-token" {
 		t.Fatalf("HF_TOKEN clobbered: got %q", v)
 	}
-	// Sidecar untouched.
-	if _, ok := lookupEnv(pod.Containers[1].Env, enginewire.EnvLMCacheRemoteURL); ok {
-		t.Fatalf("sidecar got LMCache env injected; adapter should target only the engine container")
+
+	// The MP-worker native sidecar is injected (an initContainer, restartPolicy
+	// Always), version-aligned to the engine image, GPU-visible but GPU-less, and
+	// pointing its resp --l2-adapter at the endpoint Redis.
+	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if worker == nil {
+		t.Fatalf("MP-worker sidecar not injected: initContainers = %+v", pod.InitContainers)
+	}
+	if worker.RestartPolicy == nil || *worker.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("worker is not a native sidecar (restartPolicy Always): %v", worker.RestartPolicy)
+	}
+	if worker.Image != "sglang:test" {
+		t.Fatalf("worker image = %q, want the engine image (version-aligned default)", worker.Image)
+	}
+	if v, _ := lookupEnv(worker.Env, "NVIDIA_VISIBLE_DEVICES"); v != "all" {
+		t.Fatalf("worker NVIDIA_VISIBLE_DEVICES = %q, want all (GPU-less sidecar must see the GPU for CUDA-IPC)", v)
+	}
+	joined := strings.Join(worker.Args, " ")
+	for _, want := range []string{`"type":"resp"`, `"host":"cache.ns1.svc.cluster.local"`, `"port":6379`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("worker --l2-adapter missing %s: %s", want, joined)
+		}
+	}
+
+	// Shared volumes (/dev/shm memory-backed) + engine mounts.
+	if findVolume(pod.Volumes, "lmcache-config") == nil {
+		t.Fatalf("config volume missing: %v", pod.Volumes)
+	}
+	shm := findVolume(pod.Volumes, "lmcache-dshm")
+	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.Medium != corev1.StorageMediumMemory {
+		t.Fatalf("/dev/shm is not a memory-backed emptyDir: %+v", shm)
+	}
+	if !hasMount(engine.VolumeMounts, "lmcache-config") || !hasMount(engine.VolumeMounts, "lmcache-dshm") {
+		t.Fatalf("engine volume mounts missing config/dshm: %v", engine.VolumeMounts)
+	}
+
+	// The non-engine sidecar container is untouched.
+	if len(pod.Containers[1].Env) != 1 || pod.Containers[1].Env[0].Name != "SIDECAR_VAR" {
+		t.Fatalf("non-engine sidecar was mutated: %v", pod.Containers[1].Env)
 	}
 }
 
 func TestSGLangInjectEngineConfigSingleContainerPodAcceptsAnyName(t *testing.T) {
 	a := NewAdapter()
 	cb := newSGLangBackend(nil)
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc:65432", cb); err != nil {
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine", Image: "img"}}}
+	if err := a.InjectEngineConfig(pod, "cache.ns1.svc:6379", cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
-	if _, ok := lookupEnv(pod.Containers[0].Env, enginewire.EnvLMCacheRemoteURL); !ok {
-		t.Fatalf("single-container pod missing %s; should have been treated as the engine", enginewire.EnvLMCacheRemoteURL)
+	if !containsArg(pod.Containers[0].Args, enginewire.SGLangConfigFileArg) {
+		t.Fatalf("single-container pod missing %s; should have been treated as the engine", enginewire.SGLangConfigFileArg)
 	}
 }
 
@@ -201,25 +259,12 @@ func TestSGLangInjectEngineConfigMultiContainerWithoutSGLangNameErrors(t *testin
 func TestSGLangInjectEngineConfigIdempotent(t *testing.T) {
 	a := NewAdapter()
 	cb := newSGLangBackend(nil)
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName}}}
-	if err := a.InjectEngineConfig(pod, "first.svc:65432", cb); err != nil {
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
+	if err := a.InjectEngineConfig(pod, "first.svc:6379", cb); err != nil {
 		t.Fatalf("first InjectEngineConfig: %v", err)
 	}
-	if err := a.InjectEngineConfig(pod, "second.svc:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, "second.svc:6379", cb); err != nil {
 		t.Fatalf("second InjectEngineConfig: %v", err)
-	}
-	// URL updated in place, exactly one entry.
-	urls := 0
-	for _, e := range pod.Containers[0].Env {
-		if e.Name == enginewire.EnvLMCacheRemoteURL {
-			urls++
-			if e.Value != "lm://second.svc:65432" {
-				t.Fatalf("idempotent inject did not update value: got %q", e.Value)
-			}
-		}
-	}
-	if urls != 1 {
-		t.Fatalf("expected exactly 1 %s entry, got %d", enginewire.EnvLMCacheRemoteURL, urls)
 	}
 	// --enable-lmcache appears exactly once (no duplicate on re-inject).
 	flags := 0
@@ -231,30 +276,72 @@ func TestSGLangInjectEngineConfigIdempotent(t *testing.T) {
 	if flags != 1 {
 		t.Fatalf("%s count = %d, want 1", enginewire.SGLangEnableLMCacheArg, flags)
 	}
+	// Exactly one worker sidecar and two volumes (config + dshm) — re-inject
+	// upserts by name rather than appending duplicates.
+	workers := 0
+	for _, c := range pod.InitContainers {
+		if c.Name == "lmcache-mp-worker" {
+			workers++
+		}
+	}
+	if workers != 1 {
+		t.Fatalf("worker sidecar count = %d, want 1", workers)
+	}
+	if len(pod.Volumes) != 2 {
+		t.Fatalf("volume count = %d, want 2 (config + dshm, not duplicated): %v", len(pod.Volumes), pod.Volumes)
+	}
+	// Re-inject updates the worker's L2 endpoint in place (second wins).
+	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if worker == nil || !strings.Contains(strings.Join(worker.Args, " "), `"host":"second.svc"`) {
+		t.Fatalf("re-inject did not update the worker's L2 endpoint: %+v", worker)
+	}
 }
 
 func TestSGLangInjectEngineConfigConfigOverrides(t *testing.T) {
 	a := NewAdapter()
 	cb := newSGLangBackend(map[string]string{
 		"chunkSize":   "512",
-		"remoteSerde": "cachegen",
-		"localCPU":    "True",
-		"maxLocalCPU": "40",
+		"l1SizeGB":    "8",
+		"workerImage": "registry.example/lmcache-worker:pinned",
+		"mpPort":      "6000",
 	})
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName}}}
-	if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
+	if err := a.InjectEngineConfig(pod, "x.svc:6379", cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
-	checks := map[string]string{
-		enginewire.EnvLMCacheChunkSize:   "512",
-		enginewire.EnvLMCacheRemoteSerde: "cachegen",
-		enginewire.EnvLMCacheLocalCPU:    "True",
-		enginewire.EnvLMCacheMaxLocalCPU: "40",
+	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if worker == nil {
+		t.Fatalf("no worker sidecar")
 	}
-	for name, want := range checks {
-		if v, _ := lookupEnv(pod.Containers[0].Env, name); v != want {
-			t.Fatalf("%s = %q, want %q (BackendConfig override)", name, v, want)
+	if worker.Image != "registry.example/lmcache-worker:pinned" {
+		t.Fatalf("worker image = %q, want the workerImage override", worker.Image)
+	}
+	joined := strings.Join(worker.Args, " ")
+	for _, want := range []string{"--chunk-size 512", "--l1-size-gb 8", "--port 6000"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("worker args missing %q: %s", want, joined)
 		}
+	}
+	if !containsArg(pod.Containers[0].Args, enginewire.SGLangConfigFileArg) {
+		t.Fatalf("engine missing %s", enginewire.SGLangConfigFileArg)
+	}
+}
+
+func TestSGLangInjectEngineConfigBYOL2Adapter(t *testing.T) {
+	a := NewAdapter()
+	byo := `{"type":"s3","bucket":"kv","region":"us"}`
+	cb := newSGLangBackend(map[string]string{"l2Adapter": byo})
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
+	// The endpoint is unused when the operator brings their own L2 adapter.
+	if err := a.InjectEngineConfig(pod, "unused.svc:6379", cb); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	joined := strings.Join(findInitContainer(pod.InitContainers, "lmcache-mp-worker").Args, " ")
+	if !strings.Contains(joined, `"type":"s3"`) || !strings.Contains(joined, `"bucket":"kv"`) {
+		t.Fatalf("BYO l2Adapter not used verbatim: %s", joined)
+	}
+	if strings.Contains(joined, `"type":"resp"`) {
+		t.Fatalf("default resp adapter injected despite a BYO l2Adapter: %s", joined)
 	}
 }
 
@@ -282,19 +369,6 @@ func TestSGLangInjectEngineConfigFailOpen(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", enginewire.EnvInferenceCacheFailOpen, v, tc.want)
 			}
 		})
-	}
-}
-
-func TestSGLangInjectEngineConfigPassesThroughLMScheme(t *testing.T) {
-	a := NewAdapter()
-	cb := newSGLangBackend(nil)
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName}}}
-	if err := a.InjectEngineConfig(pod, "lm://already.scheme:65432", cb); err != nil {
-		t.Fatalf("InjectEngineConfig: %v", err)
-	}
-	url, _ := lookupEnv(pod.Containers[0].Env, enginewire.EnvLMCacheRemoteURL)
-	if url != "lm://already.scheme:65432" {
-		t.Fatalf("%s = %q, want pass-through (no double prefix)", enginewire.EnvLMCacheRemoteURL, url)
 	}
 }
 
@@ -481,15 +555,20 @@ func TestSGLangObservationSidecarBadInput(t *testing.T) {
 
 func TestSGLangReservedArgs(t *testing.T) {
 	got := NewAdapter().ReservedArgs()
-	if len(got) != 1 || got[0] != enginewire.SGLangEnableLMCacheArg {
-		t.Fatalf("ReservedArgs = %v, want [%s]", got, enginewire.SGLangEnableLMCacheArg)
+	want := []string{enginewire.SGLangEnableLMCacheArg, enginewire.SGLangConfigFileArg}
+	if len(got) != len(want) {
+		t.Fatalf("ReservedArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ReservedArgs = %v, want %v", got, want)
+		}
 	}
 }
 
 func TestSGLangReservedEnv(t *testing.T) {
 	got := NewAdapter().ReservedEnv()
 	want := []string{
-		enginewire.EnvLMCacheRemoteURL,
 		enginewire.EnvLMCacheUseExperimental,
 		enginewire.EnvInferenceCacheFailOpen,
 	}
@@ -501,13 +580,15 @@ func TestSGLangReservedEnv(t *testing.T) {
 			t.Fatalf("ReservedEnv = %v, want %v", got, want)
 		}
 	}
-	// Negative control: vLLM-only env MUST NOT be reserved for SGLang (it is
-	// never injected), and the LMCACHE_* tunables stay overridable.
+	// Negative control: vLLM-only env MUST NOT be reserved for SGLang (never
+	// injected), the LMCACHE_* tunables stay overridable, and LMCACHE_REMOTE_URL
+	// (the old lm:// wire) is gone in MP mode so it must not be reserved either.
 	forbidden := map[string]bool{
 		enginewire.EnvVLLMUseV1:          true,
 		enginewire.EnvPythonHashSeed:     true,
 		enginewire.EnvLMCacheChunkSize:   true,
 		enginewire.EnvLMCacheRemoteSerde: true,
+		enginewire.EnvLMCacheRemoteURL:   true,
 	}
 	for _, name := range got {
 		if forbidden[name] {
