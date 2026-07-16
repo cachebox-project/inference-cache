@@ -18,9 +18,8 @@ import (
 // ZMQ (mp_host/mp_port) + a shared-memory data path, configured by a
 // --lmcache-config-file (the lm://-style LMCACHE_* env is ignored). The worker
 // holds L1 (host memory, in /dev/shm) and offloads to a shared L2 (its
-// --l2-adapter — the managed Redis this backend provisions, or an operator BYO
-// store). GPU-validated; full design + evidence in
-// docs/design/sglang-lmcache-mp-mode.md.
+// --l2-adapter — the managed Redis this backend provisions). GPU-validated; full
+// design + evidence in docs/design/sglang-lmcache-mp-mode.md.
 const (
 	// EnvLMCacheUseExperimental gates SGLang's experimental LMCache path; it MUST
 	// be "True" for --enable-lmcache to engage the connector.
@@ -63,10 +62,6 @@ const (
 	cfgKeyWorkerImage = "workerImage"
 	cfgKeyL1SizeGB    = "l1SizeGB"
 	cfgKeyMPPort      = "mpPort"
-	// cfgKeyL2Adapter, when set, is the worker's --l2-adapter JSON verbatim — an
-	// operator bring-your-own L2 store (external Redis/S3/Mooncake), used instead
-	// of the resp adapter pointed at the managed Redis endpoint.
-	cfgKeyL2Adapter = "l2Adapter"
 )
 
 // InjectSGLangLMCache wires an SGLang engine pod for LMCache MP mode. It mutates
@@ -74,17 +69,17 @@ const (
 //
 //   - a node-local MP-worker native sidecar (a restartPolicy: Always init
 //     container) that writes the MP config file then runs the LMCache MP server on
-//     127.0.0.1, offloading to the shared L2 (resp -> the managed Redis endpoint,
-//     or a BYO --l2-adapter). NVIDIA_VISIBLE_DEVICES=all lets the GPU-less sidecar
-//     CUDA-IPC the engine's GPU without consuming a device-plugin allocation;
+//     127.0.0.1, offloading to the shared L2 (resp -> the managed Redis endpoint).
+//     NVIDIA_VISIBLE_DEVICES=all lets the GPU-less sidecar CUDA-IPC the engine's
+//     GPU without consuming a device-plugin allocation;
 //   - shared emptyDir volumes for the config file and /dev/shm (the L1 tier);
 //   - on the engine container: --enable-lmcache, --lmcache-config-file, the
 //     LMCACHE_USE_EXPERIMENTAL + INFERENCECACHE_FAIL_OPEN env, and the shared
 //     volume mounts.
 //
 // endpoint is the managed Redis L2 address (host:port) the reconciler published to
-// status.endpoint; it is used only for the default resp --l2-adapter (ignored when
-// backendConfig.l2Adapter overrides it). The engine container is
+// status.endpoint; it is used only to build the worker's resp --l2-adapter (the
+// engine itself dials the local worker, never this endpoint). The engine container is
 // [SGLangEngineContainerName]; a single-container pod is accepted, a
 // multi-container pod with no `sglang` container is rejected.
 //
@@ -108,7 +103,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	mpPort := sglangIntInRangeOr(cfg, cfgKeyMPPort, sglangDefaultMPPort, sglangMaxTCPPort)
 	l1SizeGB := sglangIntInRangeOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB, sglangMaxL1SizeGB)
 
-	l2Adapter, err := sglangL2AdapterJSON(cfg, endpoint)
+	l2Adapter, err := sglangL2AdapterJSON(endpoint)
 	if err != nil {
 		return err
 	}
@@ -184,25 +179,16 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 	}
 }
 
-// SGLangBYOL2Adapter reports whether the backend brings its own L2 store via
-// backendConfig.l2Adapter (an external Redis/S3/Mooncake --l2-adapter the worker
-// uses verbatim). When true the controller must NOT provision the managed Redis
-// L2 — the SGLang ResolveCacheServer returns no server and the backend reconciles
-// unmanaged, exactly like the External backend type.
-func SGLangBYOL2Adapter(cache *cachev1alpha1.CacheBackend) bool {
-	if cache == nil {
-		return false
-	}
-	return strings.TrimSpace(ConfigOr(cache.Spec.BackendConfig, cfgKeyL2Adapter, "")) != ""
-}
-
-// sglangL2AdapterJSON returns the worker's --l2-adapter config: an operator BYO
-// value verbatim (backendConfig.l2Adapter), else the default resp adapter pointed
-// at the managed Redis endpoint (host:port).
-func sglangL2AdapterJSON(cfg map[string]string, endpoint string) (string, error) {
-	if raw := strings.TrimSpace(ConfigOr(cfg, cfgKeyL2Adapter, "")); raw != "" {
-		return raw, nil
-	}
+// sglangL2AdapterJSON returns the worker's --l2-adapter config: the resp adapter
+// pointed at the managed Redis endpoint (host:port).
+//
+// Operator-supplied ("bring your own") L2 stores are deliberately NOT supported
+// yet: skipping the managed Redis clears status.endpoint, and the pod webhook's
+// empty-endpoint gate then skips injection entirely, so a BYO backend would cache
+// nothing. Supporting it needs that gate to become adapter-aware first — the gate
+// exists only to protect vLLM's lm:// dial target, which SGLang MP does not have.
+// See the tracking issue linked from the package doc.
+func sglangL2AdapterJSON(endpoint string) (string, error) {
 	host, port, ok := splitLMCacheHostPort(strings.TrimSpace(endpoint))
 	if !ok || host == "" || port == "" {
 		return "", fmt.Errorf("inject engine config: endpoint %q is not a host:port for the resp L2 adapter", endpoint)

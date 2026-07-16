@@ -120,20 +120,6 @@ func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 	}
 }
 
-func TestSGLangResolveCacheServerBYOSkipsRedis(t *testing.T) {
-	// backendConfig.l2Adapter (BYO external L2) → the controller provisions no
-	// managed Redis: ResolveCacheServer renders no server, so the backend
-	// reconciles unmanaged (buildDeployment is skipped), like spec.type: External.
-	cb := newSGLangBackend(map[string]string{"l2Adapter": `{"type":"s3","bucket":"kv"}`})
-	pod, svc, err := NewAdapter().ResolveCacheServer(cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
-	if pod != nil || svc != nil {
-		t.Fatalf("BYO l2Adapter must render no managed Redis; got pod=%v svc=%v", pod, svc)
-	}
-}
-
 func TestSGLangResolveCacheServerNilCache(t *testing.T) {
 	if _, _, err := NewAdapter().ResolveCacheServer(nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
@@ -338,24 +324,6 @@ func TestSGLangInjectEngineConfigConfigOverrides(t *testing.T) {
 	}
 	if !containsArg(pod.Containers[0].Args, enginewire.SGLangConfigFileArg) {
 		t.Fatalf("engine missing %s", enginewire.SGLangConfigFileArg)
-	}
-}
-
-func TestSGLangInjectEngineConfigBYOL2Adapter(t *testing.T) {
-	a := NewAdapter()
-	byo := `{"type":"s3","bucket":"kv","region":"us"}`
-	cb := newSGLangBackend(map[string]string{"l2Adapter": byo})
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
-	// The endpoint is unused when the operator brings their own L2 adapter.
-	if err := a.InjectEngineConfig(pod, "unused.svc:6379", cb); err != nil {
-		t.Fatalf("InjectEngineConfig: %v", err)
-	}
-	joined := strings.Join(findInitContainer(pod.InitContainers, "lmcache-mp-worker").Args, " ")
-	if !strings.Contains(joined, `"type":"s3"`) || !strings.Contains(joined, `"bucket":"kv"`) {
-		t.Fatalf("BYO l2Adapter not used verbatim: %s", joined)
-	}
-	if strings.Contains(joined, `"type":"resp"`) {
-		t.Fatalf("default resp adapter injected despite a BYO l2Adapter: %s", joined)
 	}
 }
 

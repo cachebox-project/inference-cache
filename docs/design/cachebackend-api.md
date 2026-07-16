@@ -105,9 +105,9 @@ Server-side (consumed by `ResolveCacheServer` when rendering the cache-server po
 |---|---|---|
 | `serverImage` | `lmcache/standalone:v0.4.7` *(pinned, non-floating; see version-alignment note below)* | Container image for the standalone lmcache-server. The default is pinned to a specific version — **not** a floating `:latest` — because the server's wire protocol must match the lmcache *client* compiled into the engine; a drifting `:latest` silently breaks tier-2 offload (see [LMCache server / client version alignment](#lmcache-server--client-version-alignment)). Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
-| `redisImage` | `docker.io/library/redis:7.4-alpine` *(versioned default, mutable within its patch line; digest-pin in prod)* | **SGLang only.** Container image for the managed **Redis L2 store** the SGLang LMCache MP worker offloads to (its `resp` `--l2-adapter`); rendered by `ResolveRedisL2Server` for the `(sglang, LMCache)` pair (not provisioned when `l2Adapter` brings its own L2). `lm://` is not a valid MP `--l2-adapter` type, so SGLang cannot reuse the standalone lmcache-server. Production **must** pin an exact release or `@sha256:` digest. |
+| `redisImage` | `docker.io/library/redis:7.4-alpine` *(versioned default, mutable within its patch line; digest-pin in prod)* | **SGLang only.** Container image for the managed **Redis L2 store** the SGLang LMCache MP worker offloads to (its `resp` `--l2-adapter`); rendered by `ResolveRedisL2Server` for the `(sglang, LMCache)` pair. `lm://` is not a valid MP `--l2-adapter` type, so SGLang cannot reuse the standalone lmcache-server. Production **must** pin an exact release or `@sha256:` digest. |
 
-Engine-side (consumed by `InjectEngineConfig` when the webhook wires a managed-LMCache engine pod to the cache). The `LMCACHE_*` tunables below are the **vLLM** engine-side env; **SGLang MP mode does not use them** — it tunes the MP worker via `chunkSize` / `l1SizeGB` / `mpPort` / `workerImage` / `l2Adapter` (positive-integer-sanitized) instead, see [SGLang engine support](#sglang-engine-support--the-sglang-lmcache-pair):
+Engine-side (consumed by `InjectEngineConfig` when the webhook wires a managed-LMCache engine pod to the cache). The `LMCACHE_*` tunables below are the **vLLM** engine-side env; **SGLang MP mode does not use them** — it tunes the MP worker via `chunkSize` / `l1SizeGB` / `mpPort` / `workerImage` instead (the numeric ones positive-integer-sanitized), see [SGLang engine support](#sglang-engine-support--the-sglang-lmcache-pair):
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -144,7 +144,7 @@ The webhook renders the MP data plane on the SGLang engine pod. Alongside the
 engine container it adds a **node-local MP-worker native sidecar** (an init
 container with `restartPolicy: Always`) that writes the `--lmcache-config-file`
 then runs the LMCache MP server on `127.0.0.1`, offloading to the shared L2 (resp →
-the managed Redis, or a `backendConfig.l2Adapter` BYO store); `NVIDIA_VISIBLE_DEVICES=all`
+the managed Redis); `NVIDIA_VISIBLE_DEVICES=all`
 lets the GPU-less sidecar CUDA-IPC the engine's GPU with no device-plugin
 allocation, an `exec` startup-probe on the loopback ZMQ port gates the engine's
 start, and shared `emptyDir` volumes carry the config file + `/dev/shm` (the L1
@@ -155,7 +155,7 @@ tier). On the engine container (name `sglang`) it injects:
 - `LMCACHE_USE_EXPERIMENTAL=True` — gates SGLang's experimental LMCache integration; without it `--enable-lmcache` does not engage the connector.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — the `spec.integration.failOpen` mirror.
 
-The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is **NOT** injected — SGLang MP mode ignores it. `backendConfig` tunes the MP wire instead: `chunkSize`, `l1SizeGB`, `mpPort`, `workerImage` (defaults to the engine image, keeping the worker's lmcache version aligned with the engine's), and `l2Adapter` (BYO L2 — when set, `ResolveCacheServer` provisions no managed Redis). The numeric tunables are sanitized to positive integers (they flow into the worker's shell command).
+The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is **NOT** injected — SGLang MP mode ignores it. `backendConfig` tunes the MP wire instead: `chunkSize`, `l1SizeGB`, `mpPort`, and `workerImage` (defaults to the engine image, keeping the worker's lmcache version aligned with the engine's). The numeric tunables are sanitized to positive integers (they flow into the worker's shell command).
 
 Deliberately **not** injected for SGLang (a real engine difference, not an omission): `VLLM_USE_V1` (a vLLM-internal codepath with no SGLang analogue) and `PYTHONHASHSEED` (vLLM pins it to stabilise its builtin-`hash()`-seeded block-hash chain across TP workers; SGLang derives its prefix hash with `hashlib.sha256` over the token-id bytes, independent of `PYTHONHASHSEED`).
 
