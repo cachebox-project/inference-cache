@@ -165,6 +165,28 @@ spec:
             summary: "Synthetic CacheBackend probe failing on {{ $labels.backend }} in namespace {{ $labels.namespace }} (stage={{ $labels.stage }})."
             runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#serverprobefail"
 
+        - alert: BackendT2Degraded
+          # Per-CacheBackend tier-2 (external offload) silent-degradation signal:
+          # the controller's inferencecache_backend_t2_hit_rate gauge is 0, i.e.
+          # the tier was queried but has served zero reloads. Per-CacheBackend
+          # counterpart to the per-pod LMCacheT2NoHits (no scrape-scoping caveat);
+          # companion to the advisory T2Degraded CR condition (broader: also fires
+          # for External backends, whose condition the controller does not manage).
+          # The query-token rate is
+          # the activity gate (an idle backend's flat counter → rate ~0 → no page).
+          # See the flat alerting-rules.yaml for the full rationale.
+          expr: |
+            (max by (namespace, backend) (rate(inferencecache_backend_t2_query_tokens_total[10m])) > 1000)
+            and on (namespace, backend)
+            (max by (namespace, backend) (inferencecache_backend_t2_hit_rate) == 0)
+          for: 5m
+          labels:
+            severity: warning
+            component: inference-cache
+          annotations:
+            summary: "Tier-2 (external offload) on CacheBackend {{ $labels.backend }} is serving queries but zero reloads — silently degraded (store/connection failure, under-sized offload server, or scheduler/worker hash mismatch)."
+            runbook_url: "https://github.com/cachebox-project/inference-cache/blob/main/docs/observability/alerts.md#backendt2degraded"
+
     # ------------------------------------------------------------------------
     # DEFERRED — the metrics these alerts consume are not yet exposed on
     # /metrics. Enable each rule in the same change that ships its metric.
