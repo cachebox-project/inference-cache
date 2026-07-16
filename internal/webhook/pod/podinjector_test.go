@@ -240,10 +240,11 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	// Covers the production pod-webhook selection path for (sglang, LMCache):
 	// the nil-registry fallback now includes the SGLang adapter, so a SGLang
 	// engine pod matching a (sglang, LMCache) CacheBackend is injected with
-	// SGLang's LMCache wire (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL +
-	// LMCACHE_REMOTE_URL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
-	// PYTHONHASHSEED. Without the SGLang registration in the fallback, the
-	// webhook would fail-open and the pod would boot unwired.
+	// SGLang's LMCache MP wire (--enable-lmcache + --lmcache-config-file +
+	// LMCACHE_USE_EXPERIMENTAL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
+	// PYTHONHASHSEED — and NOT the lm:// LMCACHE_REMOTE_URL, which MP mode ignores.
+	// Without the SGLang registration in the fallback, the webhook would fail-open
+	// and the pod would boot unwired.
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
