@@ -2,6 +2,7 @@ package enginewire
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -93,9 +94,14 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 		return err
 	}
 	cfg := cache.Spec.BackendConfig
-	chunkSize := ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)
-	mpPort := ConfigOr(cfg, cfgKeyMPPort, sglangDefaultMPPort)
-	l1SizeGB := ConfigOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB)
+	// SECURITY: chunkSize/mpPort/l1SizeGB are substituted into the worker's `sh -c`
+	// command and into resource sizing, so they MUST be plain positive integers — a
+	// non-integer (typo or a shell-metacharacter injection attempt) falls back to
+	// the safe default and never reaches the shell. sglangPositiveIntOr is the
+	// sanitization boundary; it also guarantees the /dev/shm sizeLimit is bounded.
+	chunkSize := sglangPositiveIntOr(cfg, cfgKeyChunkSize, defaultChunkSize)
+	mpPort := sglangPositiveIntOr(cfg, cfgKeyMPPort, sglangDefaultMPPort)
+	l1SizeGB := sglangPositiveIntOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB)
 
 	l2Adapter, err := sglangL2AdapterJSON(cfg, endpoint)
 	if err != nil {
@@ -173,6 +179,18 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 	}
 }
 
+// SGLangBYOL2Adapter reports whether the backend brings its own L2 store via
+// backendConfig.l2Adapter (an external Redis/S3/Mooncake --l2-adapter the worker
+// uses verbatim). When true the controller must NOT provision the managed Redis
+// L2 — the SGLang ResolveCacheServer returns no server and the backend reconciles
+// unmanaged, exactly like the External backend type.
+func SGLangBYOL2Adapter(cache *cachev1alpha1.CacheBackend) bool {
+	if cache == nil {
+		return false
+	}
+	return strings.TrimSpace(ConfigOr(cache.Spec.BackendConfig, cfgKeyL2Adapter, "")) != ""
+}
+
 // sglangL2AdapterJSON returns the worker's --l2-adapter config: an operator BYO
 // value verbatim (backendConfig.l2Adapter), else the default resp adapter pointed
 // at the managed Redis endpoint (host:port).
@@ -189,8 +207,9 @@ func sglangL2AdapterJSON(cfg map[string]string, endpoint string) (string, error)
 }
 
 // sglangShmVolume returns the /dev/shm tmpfs volume sized from the L1 budget
-// (l1SizeGB + 1Gi headroom); a malformed l1SizeGB leaves it unbounded (node
-// default) rather than failing injection.
+// (l1SizeGB + 1Gi headroom). l1SizeGB is a sanitized positive integer (see
+// sglangPositiveIntOr), so the sizeLimit is always bounded — a memory-backed
+// emptyDir must never be left unbounded or it can exhaust node memory.
 func sglangShmVolume(l1SizeGB string) corev1.Volume {
 	v := corev1.Volume{
 		Name: sglangShmVolumeName,
@@ -203,6 +222,21 @@ func sglangShmVolume(l1SizeGB string) corev1.Volume {
 		v.EmptyDir.SizeLimit = &q
 	}
 	return v
+}
+
+// sglangPositiveIntOr returns cfg[key] iff it is a plain positive integer, else
+// fallback. This is a hard sanitization boundary: chunkSize/mpPort/l1SizeGB are
+// substituted into the worker's `sh -c` command and into resource sizing, so a
+// non-integer value — a typo, or an injection attempt like "4; rm -rf /" — must
+// never reach the shell. It falls back to the (integer) default instead of failing
+// injection, so a mistyped tunable degrades to the default rather than crashing the
+// pod webhook. fallback MUST itself be a positive integer literal.
+func sglangPositiveIntOr(cfg map[string]string, key, fallback string) string {
+	v := strings.TrimSpace(ConfigOr(cfg, key, ""))
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return v
+	}
+	return fallback
 }
 
 // shellSingleQuote wraps s in single quotes for safe use in a `sh -c` script,

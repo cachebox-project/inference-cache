@@ -120,6 +120,20 @@ func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 	}
 }
 
+func TestSGLangResolveCacheServerBYOSkipsRedis(t *testing.T) {
+	// backendConfig.l2Adapter (BYO external L2) → the controller provisions no
+	// managed Redis: ResolveCacheServer renders no server, so the backend
+	// reconciles unmanaged (buildDeployment is skipped), like spec.type: External.
+	cb := newSGLangBackend(map[string]string{"l2Adapter": `{"type":"s3","bucket":"kv"}`})
+	pod, svc, err := NewAdapter().ResolveCacheServer(cb)
+	if err != nil {
+		t.Fatalf("ResolveCacheServer: %v", err)
+	}
+	if pod != nil || svc != nil {
+		t.Fatalf("BYO l2Adapter must render no managed Redis; got pod=%v svc=%v", pod, svc)
+	}
+}
+
 func TestSGLangResolveCacheServerNilCache(t *testing.T) {
 	if _, _, err := NewAdapter().ResolveCacheServer(nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
@@ -342,6 +356,40 @@ func TestSGLangInjectEngineConfigBYOL2Adapter(t *testing.T) {
 	}
 	if strings.Contains(joined, `"type":"resp"`) {
 		t.Fatalf("default resp adapter injected despite a BYO l2Adapter: %s", joined)
+	}
+}
+
+func TestSGLangInjectEngineConfigSanitizesNumericConfig(t *testing.T) {
+	// chunkSize/mpPort/l1SizeGB flow into the worker's `sh -c` command; a
+	// non-positive-integer (typo, or a shell-injection attempt) MUST fall back to
+	// the safe default and never reach the shell verbatim.
+	// wantArg = the default arg that must appear; danger = the fragment that must
+	// NOT (asserting the bad value was not substituted, precisely — a short value
+	// like "0" is a substring of 127.0.0.1, so check the arg-in-context instead).
+	cases := []struct{ key, bad, wantArg, danger string }{
+		{"chunkSize", "256; rm -rf /", "--chunk-size 256", "rm -rf"},
+		{"chunkSize", "$(evil)", "--chunk-size 256", "$(evil)"},
+		{"mpPort", "5555 && curl evil", "--port 5555", "curl evil"},
+		{"mpPort", "-1", "--port 5555", "--port -1"},
+		{"l1SizeGB", "4; cat /etc/passwd", "--l1-size-gb 4", "/etc/passwd"},
+		{"l1SizeGB", "abc", "--l1-size-gb 4", "--l1-size-gb abc"},
+		{"l1SizeGB", "0", "--l1-size-gb 4", "--l1-size-gb 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key+"="+tc.bad, func(t *testing.T) {
+			cb := newSGLangBackend(map[string]string{tc.key: tc.bad})
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
+			if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", cb); err != nil {
+				t.Fatalf("InjectEngineConfig: %v", err)
+			}
+			joined := strings.Join(findInitContainer(pod.InitContainers, "lmcache-mp-worker").Args, " ")
+			if !strings.Contains(joined, tc.wantArg) {
+				t.Fatalf("want %q (sanitized to default); worker command: %s", tc.wantArg, joined)
+			}
+			if strings.Contains(joined, tc.danger) {
+				t.Fatalf("unsanitized value reached the worker shell command (%q): %s", tc.danger, joined)
+			}
+		})
 	}
 }
 

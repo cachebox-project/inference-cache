@@ -111,6 +111,13 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 // per-pod node-local MP worker's L2 at that Redis. See
 // docs/design/sglang-lmcache-mp-mode.md.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	if enginewire.SGLangBYOL2Adapter(cache) {
+		// The operator brought their own L2 store (backendConfig.l2Adapter) — the
+		// worker offloads to it directly, so the controller provisions no managed
+		// Redis. Returning a nil server reconciles the backend as unmanaged
+		// (buildDeployment is skipped), the same shape as spec.type: External.
+		return nil, nil, nil
+	}
 	return runtimeadapter.ResolveRedisL2Server(cache)
 }
 
