@@ -1,6 +1,6 @@
 # Design: LMCache MP mode — the converged worker model (SGLang now, vLLM migration)
 
-Status: design accepted; implementation pending (Phase 2–3, SGLang). Validated live facts vs. open Phase-2 spikes are marked inline. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
+Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
 
 **LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
 SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,
@@ -16,10 +16,12 @@ model, and **live GPU validation showed that is wrong for SGLang** — SGLang ha
 converged model and the driver for this design; the vLLM migration reuses the same
 infrastructure and is future work (see [Support matrix](#converged-foundation-mp-for-both-engines)).
 
-An advisory admission warning already ships for the SGLang pair (the validator's
-`sglangLMCacheDataPlaneWarning`) so operators are told the shipped data plane is
-non-functional (verified — it caches nothing); this design is what replaces the
-warning with a working data plane.
+**Status: implemented and GPU-validated (Phase 2, increments 1–2).** The wire
+described here is what the adapter renders today. The advisory admission warning
+that used to flag the SGLang pair as non-functional (`sglangLMCacheDataPlaneWarning`)
+is **retired** — it existed only because the shipped `lm://` wiring cached nothing,
+which this design replaced. What remains open is tracked in
+[Phased delivery](#phased-delivery).
 
 ## TL;DR
 
@@ -38,10 +40,10 @@ warning with a working data plane.
   methods**: `ResolveCacheServer` renders the **shared L2 (Redis)**;
   `InjectEngineConfig` adds a **config-file init container + a node-local MP worker
   + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
-  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. One
-  packaging detail is still open (a **GPU-less sidecar** vs. the proven
-  **single-container** form) pending a Phase-2 spike; the interface mapping and the
-  L2/config-file decisions hold either way.
+  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. The
+  packaging question (a **GPU-less sidecar** vs. a single container) is **resolved
+  in favour of the GPU-less native sidecar** — spiked, then GPU-validated end to end;
+  see [Resolved: GPU-less sidecar](#resolved-gpu-less-sidecar-vs-same-container).
 
 ## Converged foundation: MP for both engines
 
@@ -99,9 +101,10 @@ the observed engine/worker log signals reproduced inline:
 
 ### Live proof — node-local caching
 
-Single pod, MP worker + engine co-located **in one GPU-bearing container** (this
-validates MP-mode caching over the CUDA-IPC data path — not yet the separate
-GPU-less sidecar packaging; see the open question below): request → worker
+Single pod, MP worker + engine co-located **in one GPU-bearing container**. This
+was the FIRST proof — MP-mode caching over the CUDA-IPC data path — and predates the
+separate GPU-less sidecar packaging that shipped (independently validated; see
+[Resolved: GPU-less sidecar](#resolved-gpu-less-sidecar-vs-same-container)): request → worker
 `Stored 3584 tokens`; `POST /flush_cache` (clears the engine's GPU radix cache) →
 re-request → worker `Retrieved 3584 tokens`, engine `#cached-token: 3584`. Full
 store→load cycle, engine serves (no hang, no abort).
@@ -176,16 +179,22 @@ mesh), so **no `hostNetwork` is required for the L2**.
 The mutating Pod webhook already adds volumes, init containers, and sidecar
 containers to engine pods. For SGLang it adds, to the engine pod:
 
-- **initContainer `lmcache-config`** — writes `/config/lmcache.yaml`
-  (`chunk_size`, `mp_host: 127.0.0.1`, `mp_port: 5555`) into a shared `emptyDir`.
-  Runs to completion before the engine, so `--lmcache-config-file` is never read
-  before it exists. No ConfigMap needed (the webhook cannot create cluster
-  resources; the values are static and small).
+- **the MP config file** — `/etc/lmcache/config.yaml` (`chunk_size`,
+  `mp_host: 127.0.0.1`, `mp_port`) in a shared `emptyDir` (`lmcache-config`).
+  **As built, the worker sidecar writes this itself** and then `exec`s the MP
+  server, rather than a separate `lmcache-config` init container doing it: the two
+  always agree on `mp_port` because one process renders both sides, and the worker's
+  `startupProbe` already gates the engine on the server listening — which implies the
+  file exists, since the `exec` happens after the write. A separate init container
+  would have been a second place to keep in sync for no added ordering guarantee.
+  No ConfigMap needed (the webhook cannot create cluster resources; the values are
+  static and small).
 - **native sidecar `lmcache-mp-worker`** — runs the upstream-documented worker CLI
-  `lmcache server --host 127.0.0.1 --port 5555 --chunk-size <n> --l1-size-gb <n>
+  `python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port <mpPort>
+  --chunk-size <n> --l1-size-gb <n> --eviction-policy LRU
   --l2-adapter '{"type":"resp","host":<endpoint-host>,"port":<endpoint-port>}'`
-  (the `lmcache server` subcommand is the documented entrypoint; it is the same MP
-  server as `python -m lmcache.v1.multiprocess.server`, which validation used).
+  (the documented `lmcache server` subcommand is the equivalent entrypoint; the
+  rendered wire uses the `python3 -m` form, which is what validation exercised).
   `<endpoint>` is the Redis address passed to `InjectEngineConfig`. Its
   **image is pinned and version-aligned with the engine's LMCache connector** —
   the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew
@@ -193,7 +202,7 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   `VERSIONS.md` alongside the engine image (validation used the engine's own
   `pip install lmcache`→0.5.1, so the simplest pin is the same image and `lmcache`
   version for both). Mounts the shared `/dev/shm`
-  (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and `/config`. **Startup
+  (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and `/etc/lmcache`. **Startup
   ordering matters** — the engine dials the worker at launch, and K8s does not
   order ordinary containers within a pod. So this is a **native sidecar** (a
   `restartPolicy: Always` entry in `initContainers` — beta and on-by-default since
@@ -314,29 +323,43 @@ share instead through the L2, which is the cross-node path anyway). The DaemonSe
 topology stays available as an operator-provided option for dense multi-engine
 nodes, but is not what the managed adapter renders.
 
-## Open question (Phase-2 implementation spike): GPU-less sidecar vs. same container
+## Resolved: GPU-less sidecar vs. same container
 
-The one unresolved detail. The MP worker's data path is either **CUDA-IPC**
-(the worker maps the engine's GPU KV directly — needs GPU visibility) or **POSIX
-`/dev/shm`** (`non_gpu` transfer via `--shm-name` — the engine stages KV to shared
-host memory, the worker needs **no GPU**). The node-local proof above ran worker +
-engine in **one container** sharing the one GPU allocation, so it exercised the
-CUDA-IPC path.
+**Resolved in favour of the GPU-less native sidecar — spiked, then GPU-validated end
+to end.** This section records the answer, because the reasoning that got here is
+load-bearing for anyone touching the worker's security posture.
 
-- **If the `non_gpu` `/dev/shm` path works** for a co-located but separate sidecar
-  (no GPU request on the sidecar, shared `emptyDir` `/dev/shm`): the sidecar design
-  above is clean and cheap — no second GPU, standard pod.
-- **If the worker must share the GPU** (CUDA-IPC only): a separate sidecar cannot
-  get the engine's specific GPU (device-plugin allocation is per-container), so the
-  fallback is worker + engine in **one container** (an entrypoint that launches the
-  worker, then `exec`s the engine) — proven, but it wraps the operator's engine
-  command and is less K8s-idiomatic.
+The question was which data path the MP worker uses: **CUDA-IPC** (the worker maps
+the engine's GPU KV directly — needs GPU visibility) or **POSIX `/dev/shm`**
+(`non_gpu` transfer via `--shm-name` — no GPU needed). The answer is **CUDA-IPC**,
+and the worker therefore **does** need to see the engine's GPU.
 
-This is settled empirically before Phase 2 renders the sidecar (live cluster; two
-containers in one pod, GPU on the engine only, shared `/dev/shm`, worker in
-`non_gpu` mode → does the store→load cycle still pass?). The design is written for
-the sidecar outcome; the fallback is a localized change (fold the worker into the
-engine container's command) that does not affect the L2 or config-file decisions.
+But the anticipated consequence — "a separate sidecar cannot get the engine's GPU,
+so fall back to one container" — **does not hold**, which is why the clean design
+survived:
+
+- A sidecar does not need a device-plugin *allocation* to use a GPU; it needs
+  **visibility**. `NVIDIA_VISIBLE_DEVICES=all` grants that, and the sidecar consumes
+  **no** `nvidia.com/gpu` (no second GPU burned, engine's allocation untouched).
+- Validated: the GPU-less sidecar registers the engine's KV cache
+  (`Registered KV cache for GPU ID …`, `Initialized cuda stream on device cuda:N`)
+  and completes store→flush→retrieve.
+- The negative case is validated too — revoke visibility and the worker dies on
+  `RuntimeError: Device UUID <uuid> not found in the discovered devices`, and the
+  engine never reaches ready. So the env is **load-bearing, not cargo cult**.
+
+**The cost this locks in (and cannot design away):** the worker sees *every* GPU on
+the node, not just its engine's. It cannot be narrowed — the device plugin assigns
+the UUID at kubelet time, **after** the mutating webhook runs, so there is nothing to
+narrow to at admission. Nor does dropping the env help: sglang images ship
+`NVIDIA_VISIBLE_DEVICES=all` in their own `ENV`, and the device plugin overrides it
+only for containers that *request* a GPU — so a request-less worker keeps the image
+default regardless (measured). The adapter sets it explicitly so the wire also works
+on a `workerImage` lacking that default. Documented for operators as a shared-node
+isolation trade-off in [cachebackend-api.md](cachebackend-api.md), the same way
+Mooncake's `hostNetwork` is.
+
+The single-container fallback is therefore **not needed** and is not implemented.
 
 ## Comparison to the Mooncake hostNetwork resolution
 
