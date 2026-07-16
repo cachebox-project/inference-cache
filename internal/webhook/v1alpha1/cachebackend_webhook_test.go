@@ -420,7 +420,7 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 	// clients render them reliably. A warning that gets truncated — or dropped — is
 	// exactly the silent failure this warning exists to prevent, so guard the budget
 	// here rather than trusting review to catch a future edit that pads it out.
-	for _, w := range []string{mooncakeEngineHostNetworkWarning, sglangLMCacheDataPlaneWarning} {
+	for _, w := range []string{mooncakeEngineHostNetworkWarning} {
 		if got := len(w); got > maxWarningLen {
 			t.Fatalf("warning is %d chars, want <= %d — put the detail in the docs, not the warning:\n%q",
 				got, maxWarningLen, w)
@@ -430,9 +430,7 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 
 func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
 	// Blast radius: the DEFAULT (vLLM) LMCache pairing — engine unset defaults to
-	// vLLM — must stay warning-free: neither the Mooncake mesh warning nor the
-	// SGLang MP-mode warning applies to it. (SGLang+LMCache operators DO get a
-	// warning — see TestValidator_SGLangLMCacheWarnsDataPlaneUnverified.)
+	// vLLM — must stay warning-free (the Mooncake mesh warning does not apply to it).
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
@@ -445,13 +443,12 @@ func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
 	}
 }
 
-func TestValidator_SGLangLMCacheWarnsDataPlaneUnverified(t *testing.T) {
-	// GPU validation showed (sglang, LMCache) is wired like (vllm, LMCache) — a
-	// standalone lm:// server the engine reaches over LMCACHE_REMOTE_URL — but SGLang
-	// drives LMCache in MP mode (config via --lmcache-config-file, node-local
-	// transfer), so the lm:// wiring can reconcile Ready while caching nothing. Warn,
-	// don't reject: the MP-mode wiring is a follow-up, and a hard block would strand
-	// an operator running MP mode by hand.
+func TestValidator_SGLangLMCacheEmitsNoWarning(t *testing.T) {
+	// The (sglang, LMCache) adapter now renders the working LMCache MP-mode data
+	// plane (node-local MP-worker sidecar + config-file wire → managed Redis L2), so
+	// the old "misconfigured lm:// wiring" advisory is gone — the pair must be
+	// warning-free on both create and update. Assert the FULL list is empty so a
+	// resurrected or accidental new warning is caught.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
@@ -459,20 +456,18 @@ func TestValidator_SGLangLMCacheWarnsDataPlaneUnverified(t *testing.T) {
 
 	warnings, err := v.ValidateCreate(context.Background(), cb)
 	if err != nil {
-		t.Fatalf("(sglang, LMCache) must still be admitted (warning, not rejection): %v", err)
+		t.Fatalf("(sglang, LMCache) must be admitted: %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "MP mode") {
-		t.Fatalf("create warnings = %v, want one naming the MP-mode mismatch", warnings)
+	if len(warnings) != 0 {
+		t.Fatalf("(sglang, LMCache) must be warning-free, got: %v", warnings)
 	}
 
-	// Persists on update, not only first apply — and it's the SGLang MP-mode
-	// warning specifically, not just any warning.
 	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
 	if err != nil {
-		t.Fatalf("(sglang, LMCache) update must still be admitted: %v", err)
+		t.Fatalf("(sglang, LMCache) update must be admitted: %v", err)
 	}
-	if len(warnings) != 1 || warnings[0] != sglangLMCacheDataPlaneWarning {
-		t.Fatalf("update warnings = %v, want exactly the sglang MP-mode warning", warnings)
+	if len(warnings) != 0 {
+		t.Fatalf("(sglang, LMCache) update must be warning-free, got: %v", warnings)
 	}
 }
 
