@@ -134,11 +134,11 @@ type ReplicaStats struct {
 // CacheTier ranks WHERE a replica holds a prefix, from the most local / fastest
 // tier (T1 — engine KV cache) down to colder tiers (T2 — external offload such
 // as LMCache; T3 — remote / disaggregated store). Lower value = more local =
-// preferred (see betterTier). The zero value TierUnspecified means "no tier
-// known": the current ingest path normalizes it to TierT1 (see Ingest), and a
-// non-prefix hint (TENANT_HOT / AFFINITY_HINT) leaves it unspecified. Mirrors
-// the proto CacheTier enum values one-for-one. Tier *detection* (classifying a
-// hold as T2/T3) is out of scope — nothing sets a non-T1 tier yet.
+// preferred. The zero value TierUnspecified means "no tier known": the current
+// ingest path normalizes it to TierT1 (see Ingest), and a non-prefix hint
+// (TENANT_HOT / AFFINITY_HINT) leaves it unspecified. Mirrors the proto
+// CacheTier enum values one-for-one. Tier *detection* (classifying a hold as
+// T2/T3) is out of scope — nothing sets a non-T1 tier yet.
 type CacheTier int32
 
 const (
@@ -148,21 +148,22 @@ const (
 	TierT3                           // 3 — remote / disaggregated
 )
 
-// betterTier returns the more-preferred (more local) of two tiers: T1 beats T2
-// beats T3. TierUnspecified means "no tier known" and loses to any specified
-// tier. Used to summarize a multi-block chain match down to the best tier the
-// replica can serve the matched run from.
-func betterTier(a, b CacheTier) CacheTier {
-	switch {
-	case a == TierUnspecified:
-		return b
-	case b == TierUnspecified:
-		return a
-	case a < b: // lower enum value = more local (T1 < T2 < T3)
-		return a
-	default:
-		return b
+// worstTier returns the less-local (colder) of two tiers: T3 dominates T2
+// dominates T1. Used to summarize a multi-block chain match down to the tier
+// the replica can serve the ENTIRE matched run from — a single block only
+// present in a colder tier constrains the whole run (serving it means touching
+// that tier, so claiming the warmer tier would overstate the hint).
+// TierUnspecified poisons the fold: if any block's tier is unknown, the run's
+// tier is unknown — an honest "no claim" beats a fabricated one. (Unspecified
+// should not occur post-ingest normalization; this is defense in depth.)
+func worstTier(a, b CacheTier) CacheTier {
+	if a == TierUnspecified || b == TierUnspecified {
+		return TierUnspecified
 	}
+	if a > b { // higher enum value = colder (T1 < T2 < T3)
+		return a
+	}
+	return b
 }
 
 // normalizeIngestTier applies the default-ingest rule: an entry that arrives
@@ -259,10 +260,12 @@ type ReplicaScore struct {
 	Score                 float32
 	MatchedTokens         int32
 	EstimatedCacheHitProb float32
-	// Tier is the best (most local) tier the replica holds the matched prefix
-	// in — for a chain match, the most-preferred tier across the matched run.
-	// TierUnspecified on a non-prefix hint (TENANT_HOT / AFFINITY_HINT), which
-	// carries no per-prefix tier evidence. Carried through to the response's
+	// Tier is the tier the replica can serve the ENTIRE matched prefix from:
+	// the entry's tier for an exact match; for a chain match, the least-local
+	// (coldest) tier across the matched run — one block only present in a
+	// colder tier constrains the whole run (see worstTier). TierUnspecified on
+	// a non-prefix hint (TENANT_HOT / AFFINITY_HINT), which carries no
+	// per-prefix tier evidence. Carried through to the response's
 	// ReplicaScore.tier; scoring itself does not read it (tier-weighted
 	// blending is a later ticket).
 	Tier CacheTier
@@ -1069,10 +1072,12 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
-		// bestTier is the most-preferred tier across the blocks matched so far
-		// (folded via betterTier). Carried to the run's ReplicaScore.Tier so a
-		// chain hint reports the best tier the replica can serve the run from.
-		bestTier CacheTier
+		// runTier is the least-local (coldest) tier across the blocks matched
+		// so far (folded via worstTier) — the tier the replica can serve the
+		// ENTIRE run from. Carried to the run's ReplicaScore.Tier. Per-block
+		// entry tiers stay most-local (what the producer reported for that
+		// block); only the across-run summary takes the constraining view.
+		runTier CacheTier
 		// entries are the block entries forming this replica's matched run,
 		// collected ONLY when the namespace runs LFU (nil otherwise, so the LRU
 		// hot path allocates nothing). Captured into the returned hits once the
@@ -1100,7 +1105,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 				if freshnessAt(now, e.lastSeen, ttl) <= 0 {
 					continue // stale; will be swept
 				}
-				r := running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen, bestTier: e.tier}
+				r := running{matchedTokens: blockTokens, oldestLastSeen: e.lastSeen, runTier: e.tier}
 				if lfu {
 					r.entries = []*replicaEntry{e}
 				}
@@ -1118,7 +1123,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 				if e.lastSeen.Before(oldest) {
 					oldest = e.lastSeen
 				}
-				nr := running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest, bestTier: betterTier(st.bestTier, e.tier), entries: st.entries}
+				nr := running{matchedTokens: st.matchedTokens + blockTokens, oldestLastSeen: oldest, runTier: worstTier(st.runTier, e.tier), entries: st.entries}
 				if lfu {
 					nr.entries = append(nr.entries, e)
 				}
@@ -1174,7 +1179,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			Score:                 float32(st.matchedTokens) * fresh * pressureFactor * sloBias,
 			MatchedTokens:         st.matchedTokens,
 			EstimatedCacheHitProb: fresh,
-			Tier:                  st.bestTier,
+			Tier:                  st.runTier,
 		})
 	}
 	// Cardinality denominator for the distinguishing-power factor: every

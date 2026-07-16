@@ -477,8 +477,11 @@ type ReplicaScore struct {
 	Score                 float32                `protobuf:"fixed32,2,opt,name=score,proto3" json:"score,omitempty"` // higher is better
 	MatchedTokens         int32                  `protobuf:"varint,3,opt,name=matched_tokens,json=matchedTokens,proto3" json:"matched_tokens,omitempty"`
 	EstimatedCacheHitProb float32                `protobuf:"fixed32,4,opt,name=estimated_cache_hit_prob,json=estimatedCacheHitProb,proto3" json:"estimated_cache_hit_prob,omitempty"`
-	// Best (most local) tier this replica holds the matched prefix in. For a
-	// block-chain match it is the most-preferred tier across the matched run.
+	// Tier from which this replica can serve the ENTIRE matched prefix. For a
+	// block-chain match it is the least-local (coldest) tier across the matched
+	// run — a single block only present in a colder tier constrains the whole
+	// run, so claiming a warmer tier would overstate the hint. Per-block holds
+	// remain most-local at ingest; only this across-run summary is constraining.
 	// UNSPECIFIED when the hint carries no prefix evidence (TENANT_HOT /
 	// AFFINITY_HINT). Additive, v1alpha1-compatible.
 	Tier          CacheTier `protobuf:"varint,5,opt,name=tier,proto3,enum=inferencecache.v1alpha1.CacheTier" json:"tier,omitempty"`
