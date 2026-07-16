@@ -327,6 +327,53 @@ func TestSGLangInjectEngineConfigConfigOverrides(t *testing.T) {
 	}
 }
 
+func TestSGLangInjectEngineConfigReusesExistingDevShm(t *testing.T) {
+	// GPU engine manifests commonly mount their own tmpfs at /dev/shm. Appending a
+	// SECOND mount at the same mountPath makes the Pod invalid (the API server
+	// rejects duplicate mountPaths), so injection must REUSE the engine's volume for
+	// the worker rather than adding its own.
+	a := NewAdapter()
+	pod := &corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name:         enginewire.SGLangEngineContainerName,
+			Image:        "sglang:test",
+			VolumeMounts: []corev1.VolumeMount{{Name: "dshm", MountPath: "/dev/shm"}},
+		}},
+		Volumes: []corev1.Volume{{
+			Name:         "dshm",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+		}},
+	}
+	if err := a.InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	n := 0
+	for _, m := range pod.Containers[0].VolumeMounts {
+		if m.MountPath == "/dev/shm" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("engine has %d mounts at /dev/shm, want exactly 1 (a duplicate mountPath is an invalid Pod): %+v", n, pod.Containers[0].VolumeMounts)
+	}
+	if findVolume(pod.Volumes, "lmcache-dshm") != nil {
+		t.Fatalf("adapter added its own lmcache-dshm volume despite the engine already mounting /dev/shm")
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	var workerShm string
+	for _, m := range w.VolumeMounts {
+		if m.MountPath == "/dev/shm" {
+			workerShm = m.Name
+		}
+	}
+	if workerShm != "dshm" {
+		t.Fatalf("worker /dev/shm volume = %q, want the engine's existing %q — the MP data path needs both containers on the SAME volume", workerShm, "dshm")
+	}
+}
+
 func TestSGLangInjectEngineConfigSanitizesNumericConfig(t *testing.T) {
 	// chunkSize/mpPort/l1SizeGB flow into the worker's `sh -c` command; a
 	// non-positive-integer (typo, or a shell-injection attempt) MUST fall back to

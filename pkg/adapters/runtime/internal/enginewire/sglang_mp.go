@@ -108,22 +108,48 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 		return err
 	}
 
-	worker := sglangMPWorkerContainer(pod.Containers[i].Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter)
-	pod.InitContainers = upsertContainerByName(pod.InitContainers, worker)
+	c := &pod.Containers[i]
 
 	pod.Volumes = upsertVolumeByName(pod.Volumes, corev1.Volume{
 		Name:         sglangConfigVolumeName,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 	})
-	pod.Volumes = upsertVolumeByName(pod.Volumes, sglangShmVolume(l1SizeGB))
 
-	c := &pod.Containers[i]
+	// /dev/shm: GPU engine manifests commonly mount their own tmpfs there already.
+	// Appending a SECOND mount at the same mountPath makes the Pod INVALID (the API
+	// server rejects duplicate mountPaths), so reuse the engine's existing volume
+	// for the worker instead — the MP data path only needs both containers on the
+	// SAME volume, not on one we created. We add (and size) our own tmpfs only when
+	// the engine has none. Caveat: a reused volume is the operator's, so its size is
+	// theirs to get right — too small silently degrades L1 to slow pickle serde.
+	shmVolumeName := sglangShmVolumeName
+	if existing := mountAtPath(c.VolumeMounts, sglangShmMountPath); existing != nil {
+		shmVolumeName = existing.Name
+	} else {
+		pod.Volumes = upsertVolumeByName(pod.Volumes, sglangShmVolume(l1SizeGB))
+		c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangShmVolumeName, MountPath: sglangShmMountPath})
+	}
+
+	worker := sglangMPWorkerContainer(c.Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmVolumeName)
+	pod.InitContainers = upsertContainerByName(pod.InitContainers, worker)
+
 	c.Args = UpsertFlag(c.Args, SGLangEnableLMCacheArg)
 	c.Args = UpsertArgPair(c.Args, SGLangConfigFileArg, sglangConfigMountPath+"/"+sglangConfigFileName)
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvLMCacheUseExperimental, Value: lmcacheUseExperimentalVal})
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)})
 	c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangConfigVolumeName, MountPath: sglangConfigMountPath})
-	c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangShmVolumeName, MountPath: sglangShmMountPath})
+	return nil
+}
+
+// mountAtPath returns the existing mount at mountPath, or nil. Two mounts sharing a
+// mountPath make the Pod invalid, so callers reuse the existing volume rather than
+// appending their own.
+func mountAtPath(ms []corev1.VolumeMount, path string) *corev1.VolumeMount {
+	for i := range ms {
+		if ms[i].MountPath == path {
+			return &ms[i]
+		}
+	}
 	return nil
 }
 
@@ -133,7 +159,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 // and the server listens before the engine starts. The worker image defaults to
 // the engine image (guaranteeing the same lmcache version — the two speak the MP
 // wire) and is overridable via backendConfig.workerImage.
-func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string) corev1.Container {
+func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter, shmVolumeName string) corev1.Container {
 	image := ConfigOr(cfg, cfgKeyWorkerImage, engineImage)
 	configPath := sglangConfigMountPath + "/" + sglangConfigFileName
 	// The validated invocation is `python3 -m lmcache.v1.multiprocess.server`
@@ -155,14 +181,29 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 		// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV; it
 		// consumes no device-plugin allocation (no nvidia.com/gpu limit).
 		Env: []corev1.EnvVar{{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"}},
+		// shmVolumeName is the engine's existing /dev/shm volume when it has one
+		// (reused so the two containers share the MP data path without a duplicate
+		// mountPath), else our own sized tmpfs.
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: sglangConfigVolumeName, MountPath: sglangConfigMountPath},
-			{Name: sglangShmVolumeName, MountPath: sglangShmMountPath},
+			{Name: shmVolumeName, MountPath: sglangShmMountPath},
 		},
 		// The MP server binds mp_port on loopback, which a pod-IP tcp/http probe
 		// cannot reach — so exec a loopback check inside the container. This gates
-		// the engine's start on the ZMQ server being up (fail-open at the shared L2
-		// is separate: the worker starts L1-only even when Redis is unreachable).
+		// the engine's start on the ZMQ server being up.
+		//
+		// Gating the engine on the worker is DELIBERATE, and is the accepted
+		// fail-open boundary for this pair (see "Fail-open semantics" in
+		// docs/design/sglang-lmcache-mp-mode.md). The MP worker is a REQUIRED,
+		// co-scheduled component of the serving stack — the out-of-process analog of
+		// vLLM's in-process LMCache connector — not a remote dependency: SGLang has
+		// no cacheless fallback while --enable-lmcache is on, so letting the engine
+		// start before the worker listens makes it hang/abort, which is strictly
+		// worse than waiting. The failOpen contract is honored at the tier that can
+		// actually be "unavailable" — the SHARED L2: the worker comes up L1-only when
+		// Redis is unreachable (GPU-validated), so an L2 outage degrades rather than
+		// blocks. A worker that cannot start at all is a pod-health / CacheBackend
+		// Degraded condition, exactly as a broken engine connector would be.
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{Command: []string{
