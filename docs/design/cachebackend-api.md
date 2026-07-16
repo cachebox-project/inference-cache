@@ -155,7 +155,18 @@ tier). On the engine container (name `sglang`) it injects:
 - `LMCACHE_USE_EXPERIMENTAL=True` — gates SGLang's experimental LMCache integration; without it `--enable-lmcache` does not engage the connector.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — the `spec.integration.failOpen` mirror.
 
-The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is **NOT** injected — SGLang MP mode ignores it. `backendConfig` tunes the MP wire instead: `chunkSize`, `l1SizeGB`, `mpPort`, and `workerImage` (defaults to the engine image, keeping the worker's lmcache version aligned with the engine's). The numeric tunables are sanitized to positive integers (they flow into the worker's shell command).
+**Names the MP wire reserves on the engine pod.** The init container `lmcache-mp-worker`, the volumes `lmcache-config` + `lmcache-dshm`, and the mount path `/etc/lmcache` are adapter-owned. If the pod already carries one of them and the adapter did not render it, admission **rejects the injection** — which the pod webhook turns into a fail-open admit, so the pod starts **un-wired** (no cache) rather than with its own container silently overwritten. The same applies when the engine mounts `/dev/shm` read-only or from a `configMap`/`secret`/`downwardAPI`/`projected` volume: the MP data path writes there, so it is rejected at admission instead of failing deep inside LMCache at runtime. Rename the colliding object (or drop the `readOnly`) to get the pod wired. Re-injecting an already-wired pod is **not** a collision — the adapter recognises its own worker and converges it on the current render.
+
+The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is **NOT** injected — SGLang MP mode ignores it. `backendConfig` tunes the MP worker instead:
+
+| Key | Default | Bounds | Purpose |
+|---|---|---|---|
+| `chunkSize` | `256` | `1`–`65536` | The worker's `--chunk-size`, and `chunk_size` in the engine's config file (both sides must agree). Note this is the **worker's** knob — unlike vLLM's same-named key, which sets `LMCACHE_CHUNK_SIZE` on the engine container. |
+| `l1SizeGB` | `4` | `1`–`1024` | The worker's `--l1-size-gb` — the host-memory L1 tier, held in `/dev/shm`. Also **sizes two things the operator does not set directly**: the `/dev/shm` tmpfs `sizeLimit` and the worker container's memory request+limit, both `l1SizeGB + 1Gi`. The L1 is charged to the worker's cgroup, so an unbounded tmpfs / request-less worker could overcommit the node into a node-pressure OOM. Ignored when the engine already mounts its own `/dev/shm` — that volume's size is the operator's to get right, and one too small silently degrades L1 to slow pickle serialization. |
+| `mpPort` | `5555` | `1`–`65535` | The ZMQ port the worker binds on `127.0.0.1` and the engine dials (`mp_port` in the config file). Loopback-only — it is not a Service port and does not leave the pod. |
+| `workerImage` | *(the engine container's image)* | — | Image for the MP-worker sidecar. Defaulting to the engine's image keeps the worker's lmcache version aligned with the engine's, which the MP wire requires; override to pin the worker independently (e.g. a patched lmcache), accepting that alignment becomes yours to maintain. |
+
+The numeric tunables are **sanitized**: they are substituted into the worker's `sh -c` command line, so a value that is not a plain integer within its bounds (a typo, or a shell-metacharacter injection attempt) **falls back to the default** rather than reaching the shell or failing admission.
 
 Deliberately **not** injected for SGLang (a real engine difference, not an omission): `VLLM_USE_V1` (a vLLM-internal codepath with no SGLang analogue) and `PYTHONHASHSEED` (vLLM pins it to stabilise its builtin-`hash()`-seeded block-hash chain across TP workers; SGLang derives its prefix hash with `hashlib.sha256` over the token-id bytes, independent of `PYTHONHASHSEED`).
 

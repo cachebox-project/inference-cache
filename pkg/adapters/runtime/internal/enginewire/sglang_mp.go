@@ -39,6 +39,12 @@ const (
 
 	// sglangMPWorkerContainerName is the node-local MP worker native sidecar.
 	sglangMPWorkerContainerName = "lmcache-mp-worker"
+	// envSGLangMPWorkerManaged marks the MP worker as adapter-rendered, so a
+	// re-injection can tell OUR container from an operator's that happens to carry
+	// the same name (see sglangWireIsOurs). It is inert to LMCache — an unknown env
+	// var the worker never reads.
+	envSGLangMPWorkerManaged = "INFERENCECACHE_MP_WORKER"
+	sglangMPWorkerManagedVal = "true"
 	// sglangConfigVolumeName / MountPath / FileName: the shared dir the worker
 	// writes the MP config into and the engine reads via --lmcache-config-file.
 	sglangConfigVolumeName = "lmcache-config"
@@ -65,7 +71,9 @@ const (
 )
 
 // InjectSGLangLMCache wires an SGLang engine pod for LMCache MP mode. It mutates
-// pod in place, idempotently (a re-injection is a no-op), and adds:
+// pod in place — atomically (on error pod is untouched) and idempotently (a
+// re-injection converges on the current render instead of duplicating it) — and
+// adds:
 //
 //   - a node-local MP-worker native sidecar (a restartPolicy: Always init
 //     container) that writes the MP config file then runs the LMCache MP server on
@@ -81,7 +89,10 @@ const (
 // status.endpoint; it is used only to build the worker's resp --l2-adapter (the
 // engine itself dials the local worker, never this endpoint). The engine container is
 // [SGLangEngineContainerName]; a single-container pod is accepted, a
-// multi-container pod with no `sglang` container is rejected.
+// multi-container pod with no `sglang` container is rejected. A pre-existing
+// container or volume that squats one of the reserved names this wire renders — and
+// that this adapter did not render (see [sglangWireIsOurs]) — is also rejected
+// rather than overwritten; the pod webhook turns that into a fail-open admit.
 //
 // Note: unlike the old lm:// wire, this does NOT inject LMCACHE_REMOTE_URL / serde
 // / local-CPU env — SGLang MP mode ignores it.
@@ -108,7 +119,23 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 		return err
 	}
 
-	c := &pod.Containers[i]
+	// Mutate a COPY and commit it only on success, so injection is all-or-nothing.
+	// Several guards below reject mid-render (a foreign name squat, an unwritable
+	// /dev/shm), and an in-place mutator that had already appended half the wire
+	// would hand the caller a pod that is neither wired nor pristine. The pod webhook
+	// happens to fail open with its own pre-injection copy today, but this function's
+	// contract should not depend on that.
+	work := pod.DeepCopy()
+	c := &work.Containers[i]
+
+	// Did WE wire this pod already? The webhook can be handed a pod template this
+	// adapter has mutated before (re-admission, or an operator who copied a rendered
+	// spec), and re-injection must converge on the current render rather than
+	// duplicate or reject. Ownership is decided ONCE, up front, off the marker our
+	// worker carries — a name alone cannot tell our container from an operator's, and
+	// value-equality cannot either (a legitimate re-injection changes the endpoint or
+	// L1 size). Everything below keys reuse-vs-reject on this.
+	owned := sglangWireIsOurs(pod)
 
 	// The config mount path is ADAPTER-OWNED (the worker writes the MP config file
 	// there and the engine reads it). A FOREIGN mount already at that path can
@@ -118,44 +145,66 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	// pod webhook turns that into a fail-open admit, so the pod starts un-wired
 	// rather than broken. This differs from /dev/shm, which IS reused because it is
 	// plain shared scratch tmpfs the operator legitimately owns.
-	//
-	// Our OWN mount at that path is not a collision — it is a re-injection, which
-	// must stay idempotent (the webhook re-runs), so only a different volume name
-	// trips the guard.
-	if existing := mountAtPath(c.VolumeMounts, sglangConfigMountPath); existing != nil && existing.Name != sglangConfigVolumeName {
+	if existing := mountAtPath(c.VolumeMounts, sglangConfigMountPath); existing != nil && !sglangMountIsOurs(existing, sglangConfigVolumeName, owned) {
 		return fmt.Errorf("inject engine config: engine container already mounts %q (volume %q), but that path is reserved for the LMCache MP config file the worker writes — move that mount elsewhere",
 			sglangConfigMountPath, existing.Name)
 	}
 
-	pod.Volumes = upsertVolumeByName(pod.Volumes, corev1.Volume{
+	if work.Volumes, err = adoptVolume(work.Volumes, corev1.Volume{
 		Name:         sglangConfigVolumeName,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-	})
+	}, owned); err != nil {
+		return err
+	}
 
 	// /dev/shm: GPU engine manifests commonly mount their own tmpfs there already.
 	// Appending a SECOND mount at the same mountPath makes the Pod INVALID (the API
-	// server rejects duplicate mountPaths), so reuse the engine's existing volume
-	// for the worker instead — the MP data path only needs both containers on the
-	// SAME volume, not on one we created. We add (and size) our own tmpfs only when
-	// the engine has none. Caveat: a reused volume is the operator's, so its size is
-	// theirs to get right — too small silently degrades L1 to slow pickle serde.
+	// server rejects duplicate mountPaths), so reuse the engine's existing volume for
+	// the worker instead — the MP data path only needs both containers on the SAME
+	// volume, not on one we created. We add (and size) our own tmpfs only when the
+	// engine has none (or when the one there is ours, which we re-render so a changed
+	// l1SizeGB resizes the tmpfs too). Caveat: a reused volume is the operator's, so
+	// its size is theirs to get right — too small silently degrades L1 to slow pickle
+	// serde.
 	shmVolumeName := sglangShmVolumeName
-	if existing := mountAtPath(c.VolumeMounts, sglangShmMountPath); existing != nil {
+	if existing := mountAtPath(c.VolumeMounts, sglangShmMountPath); existing != nil && !sglangMountIsOurs(existing, sglangShmVolumeName, owned) {
+		// The MP data path WRITES here, so a reused /dev/shm must be writable
+		// scratch. A read-only mount, or a projection-backed volume (ConfigMap /
+		// Secret / downwardAPI / projected are always read-only), would fail at
+		// runtime — deep inside LMCache, long after admission. Reject instead, and
+		// let the webhook fail open.
+		if err := sglangCheckShmWritable(work.Volumes, *existing); err != nil {
+			return err
+		}
 		shmVolumeName = existing.Name
 	} else {
-		pod.Volumes = upsertVolumeByName(pod.Volumes, sglangShmVolume(l1SizeGB))
+		if work.Volumes, err = adoptVolume(work.Volumes, sglangShmVolume(l1SizeGB), owned); err != nil {
+			return err
+		}
 		c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangShmVolumeName, MountPath: sglangShmMountPath})
 	}
 
 	worker := sglangMPWorkerContainer(c.Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmVolumeName)
-	pod.InitContainers = upsertContainerByName(pod.InitContainers, worker)
+	if work.InitContainers, err = adoptContainer(work.InitContainers, worker, owned); err != nil {
+		return err
+	}
 
 	c.Args = UpsertFlag(c.Args, SGLangEnableLMCacheArg)
 	c.Args = UpsertArgPair(c.Args, SGLangConfigFileArg, sglangConfigMountPath+"/"+sglangConfigFileName)
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvLMCacheUseExperimental, Value: lmcacheUseExperimentalVal})
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)})
 	c.VolumeMounts = upsertMountByName(c.VolumeMounts, corev1.VolumeMount{Name: sglangConfigVolumeName, MountPath: sglangConfigMountPath})
+
+	*pod = *work // commit: every guard passed
 	return nil
+}
+
+// sglangMountIsOurs reports whether an existing mount is one THIS adapter placed —
+// i.e. the pod is one we already wired (owned, per [sglangWireIsOurs]) AND the mount
+// names the volume we render for that path. Our own mount is a re-injection to
+// converge, not a collision to reject.
+func sglangMountIsOurs(m *corev1.VolumeMount, volumeName string, owned bool) bool {
+	return owned && m.Name == volumeName
 }
 
 // mountAtPath returns the existing mount at mountPath, or nil. Two mounts sharing a
@@ -207,9 +256,14 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 		Command:       []string{"sh", "-c"},
 		Args:          []string{script},
 		Resources:     resources,
-		// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV; it
-		// consumes no device-plugin allocation (no nvidia.com/gpu limit).
-		Env: []corev1.EnvVar{{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"}},
+		Env: []corev1.EnvVar{
+			// The GPU-less sidecar must SEE the engine's GPU to CUDA-IPC its KV; it
+			// consumes no device-plugin allocation (no nvidia.com/gpu limit).
+			{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
+			// Marks this container as ours so a re-injection converges it instead of
+			// mistaking it for an operator's name squat (see sglangWireIsOurs).
+			{Name: envSGLangMPWorkerManaged, Value: sglangMPWorkerManagedVal},
+		},
 		// shmVolumeName is the engine's existing /dev/shm volume when it has one
 		// (reused so the two containers share the MP data path without a duplicate
 		// mountPath), else our own sized tmpfs.
@@ -323,26 +377,104 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// upsertContainerByName replaces the container with the same Name, or appends it.
-func upsertContainerByName(cs []corev1.Container, c corev1.Container) []corev1.Container {
-	for i := range cs {
-		if cs[i].Name == c.Name {
-			cs[i] = c
-			return cs
+// sglangWireIsOurs reports whether THIS adapter already wired pod — i.e. the MP
+// worker sidecar it carries is one we rendered, identified by the marker env var
+// our render always stamps ([envSGLangMPWorkerManaged]).
+//
+// This is the ownership test the reserved-name guards key on, and it must be
+// evaluated BEFORE any mutation. Two weaker tests were considered and rejected:
+// the container NAME alone cannot distinguish our sidecar from an operator's name
+// squat (that is the very thing being decided), and value-EQUALITY against a fresh
+// render mislabels a legitimate re-injection as foreign the moment any input
+// changes — a moved status.endpoint or a retuned l1SizeGB renders a different, but
+// still ours, container. A pod annotation would be the idiomatic marker, but
+// InjectEngineConfig only receives the PodSpec.
+func sglangWireIsOurs(pod *corev1.PodSpec) bool {
+	for i := range pod.InitContainers {
+		if pod.InitContainers[i].Name != sglangMPWorkerContainerName {
+			continue
+		}
+		for _, e := range pod.InitContainers[i].Env {
+			if e.Name == envSGLangMPWorkerManaged {
+				return true
+			}
 		}
 	}
-	return append(cs, c)
+	return false
 }
 
-// upsertVolumeByName replaces the volume with the same Name, or appends it.
-func upsertVolumeByName(vs []corev1.Volume, v corev1.Volume) []corev1.Volume {
-	for i := range vs {
-		if vs[i].Name == v.Name {
-			vs[i] = v
-			return vs
+// adoptContainer appends want; when an entry with the same name already exists it
+// either converges it to want (owned — our own prior injection, so the current
+// render wins) or rejects it (not owned).
+//
+// A container carrying our RESERVED name that we did NOT render is a FOREIGN
+// collision: mutating admission must never silently erase an operator's container,
+// so reject and let the pod webhook fail open — the pod admits un-wired rather than
+// corrupted. Silently leaving the foreign container in place is NOT an option here:
+// the engine is given --lmcache-config-file regardless, so it would block at
+// startup on a config file that nothing writes. owned comes from
+// [sglangWireIsOurs].
+func adoptContainer(cs []corev1.Container, want corev1.Container, owned bool) ([]corev1.Container, error) {
+	for i := range cs {
+		if cs[i].Name != want.Name {
+			continue
 		}
+		if !owned {
+			return nil, fmt.Errorf("inject engine config: pod already has a container named %q that this adapter did not render; that name is reserved for the LMCache MP worker — rename your container", want.Name)
+		}
+		cs[i] = want // our own prior injection — converge on the current render
+		return cs, nil
 	}
-	return append(vs, v)
+	return append(cs, want), nil
+}
+
+// adoptVolume is the volume analog of [adoptContainer]: append, converge our own
+// prior injection, or reject a foreign volume squatting one of our reserved names
+// (replacing it could corrupt unrelated mounts or invalidate the pod).
+func adoptVolume(vs []corev1.Volume, want corev1.Volume, owned bool) ([]corev1.Volume, error) {
+	for i := range vs {
+		if vs[i].Name != want.Name {
+			continue
+		}
+		if !owned {
+			return nil, fmt.Errorf("inject engine config: pod already has a volume named %q that this adapter did not render; that name is reserved for the LMCache MP wire — rename your volume", want.Name)
+		}
+		vs[i] = want // our own prior injection — converge on the current render
+		return vs, nil
+	}
+	return append(vs, want), nil
+}
+
+// sglangCheckShmWritable rejects an engine-owned /dev/shm mount the MP data path
+// could not write to. The worker and the engine exchange KV through this volume, so
+// a read-only mount — or one backed by a projection source, which the kubelet always
+// mounts read-only — breaks the data path at runtime rather than at admission.
+// Sources not listed here (emptyDir, PVC, hostPath, CSI, ephemeral, …) are writable
+// or writability is the operator's to configure, so they pass.
+func sglangCheckShmWritable(vs []corev1.Volume, m corev1.VolumeMount) error {
+	if m.ReadOnly {
+		return fmt.Errorf("inject engine config: engine container mounts %q read-only (volume %q), but the LMCache MP data path writes there — drop readOnly or mount it elsewhere", sglangShmMountPath, m.Name)
+	}
+	for i := range vs {
+		if vs[i].Name != m.Name {
+			continue
+		}
+		var kind string
+		switch src := vs[i].VolumeSource; {
+		case src.ConfigMap != nil:
+			kind = "configMap"
+		case src.Secret != nil:
+			kind = "secret"
+		case src.DownwardAPI != nil:
+			kind = "downwardAPI"
+		case src.Projected != nil:
+			kind = "projected"
+		default:
+			return nil
+		}
+		return fmt.Errorf("inject engine config: engine container mounts %q from a %s volume (%q), which the kubelet mounts read-only, but the LMCache MP data path writes there — use an emptyDir (medium: Memory) instead", sglangShmMountPath, kind, m.Name)
+	}
+	return nil
 }
 
 // upsertMountByName replaces the volume mount with the same Name, or appends it.

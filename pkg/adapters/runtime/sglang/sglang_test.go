@@ -3,6 +3,7 @@ package sglang
 import (
 	"flag"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -391,6 +392,150 @@ func TestSGLangInjectEngineConfigRejectsConfigPathCollision(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "/etc/lmcache") || !strings.Contains(err.Error(), "operator-cfg") {
 		t.Fatalf("error must name the path and the conflicting volume, got: %v", err)
+	}
+}
+
+func TestSGLangInjectEngineConfigRejectsForeignReservedNames(t *testing.T) {
+	// Mutating admission must never erase an operator's container or volume. A
+	// pre-existing object carrying one of the adapter's reserved names — but NOT
+	// rendered by the adapter (no marker env) — is a foreign collision: reject, so
+	// the pod webhook fails open and the pod admits un-wired rather than corrupted.
+	// Silently skipping is not an option for the worker: the engine gets
+	// --lmcache-config-file regardless and would block on a config nothing writes.
+	engine := corev1.Container{Name: enginewire.SGLangEngineContainerName, Image: "sglang:test"}
+	cases := []struct {
+		name string
+		pod  *corev1.PodSpec
+		want string // fragment the error must name so the operator can find it
+	}{
+		{
+			name: "container squats the worker name",
+			pod: &corev1.PodSpec{
+				Containers:     []corev1.Container{engine},
+				InitContainers: []corev1.Container{{Name: "lmcache-mp-worker", Image: "operator/own:v1"}},
+			},
+			want: "lmcache-mp-worker",
+		},
+		{
+			name: "volume squats the config-volume name",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine},
+				Volumes: []corev1.Volume{{
+					Name:         "lmcache-config",
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}},
+				}},
+			},
+			want: "lmcache-config",
+		},
+		{
+			name: "volume squats the dshm-volume name",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine},
+				Volumes: []corev1.Volume{{
+					Name:         "lmcache-dshm",
+					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/mnt/data"}},
+				}},
+			},
+			want: "lmcache-dshm",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := tc.pod.DeepCopy()
+			err := NewAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			if err == nil {
+				t.Fatalf("want an error when %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error must name the conflicting object %q, got: %v", tc.want, err)
+			}
+			// The operator's object must survive verbatim — an error that still
+			// clobbered the pod would defeat the purpose of rejecting.
+			if !reflect.DeepEqual(tc.pod.InitContainers, before.InitContainers) {
+				t.Fatalf("initContainers mutated despite the rejection:\n got %+v\nwant %+v", tc.pod.InitContainers, before.InitContainers)
+			}
+			if !reflect.DeepEqual(tc.pod.Volumes, before.Volumes) {
+				t.Fatalf("volumes mutated despite the rejection:\n got %+v\nwant %+v", tc.pod.Volumes, before.Volumes)
+			}
+		})
+	}
+}
+
+func TestSGLangInjectEngineConfigReinjectionConvergesOnCurrentRender(t *testing.T) {
+	// The marker env on the worker is what tells OUR container from an operator's
+	// squat — and it must keep doing so when the render legitimately CHANGES (a moved
+	// status.endpoint here). Value-equality against a fresh render would misread this
+	// as foreign; the second injection must instead converge the worker on the new
+	// endpoint rather than reject it, duplicate it, or leave the stale one.
+	a := NewAdapter()
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "img"}}}
+	if err := a.InjectEngineConfig(pod, "first.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("first InjectEngineConfig: %v", err)
+	}
+	if err := a.InjectEngineConfig(pod, "second.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("second InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if w == nil {
+		t.Fatalf("worker not injected")
+	}
+	script := strings.Join(w.Args, " ")
+	if !strings.Contains(script, "second.svc") {
+		t.Fatalf("worker did not converge on the current endpoint; --l2-adapter still reads: %s", script)
+	}
+	if strings.Contains(script, "first.svc") {
+		t.Fatalf("worker kept the stale endpoint from the first injection: %s", script)
+	}
+}
+
+func TestSGLangInjectEngineConfigRejectsUnwritableDevShm(t *testing.T) {
+	// A reused /dev/shm carries the MP data path, which WRITES. A read-only mount, or
+	// one backed by a projection source the kubelet always mounts read-only, would
+	// fail deep inside LMCache at runtime — reject at admission instead.
+	engine := func(m corev1.VolumeMount) corev1.Container {
+		return corev1.Container{
+			Name: enginewire.SGLangEngineContainerName, Image: "sglang:test",
+			VolumeMounts: []corev1.VolumeMount{m},
+		}
+	}
+	cases := []struct {
+		name string
+		pod  *corev1.PodSpec
+		want string
+	}{
+		{
+			name: "read-only mount",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "dshm", MountPath: "/dev/shm", ReadOnly: true})},
+				Volumes: []corev1.Volume{{
+					Name:         "dshm",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+				}},
+			},
+			want: "read-only",
+		},
+		{
+			name: "configMap-backed volume",
+			pod: &corev1.PodSpec{
+				Containers: []corev1.Container{engine(corev1.VolumeMount{Name: "shm-cfg", MountPath: "/dev/shm"})},
+				Volumes: []corev1.Volume{{
+					Name:         "shm-cfg",
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}},
+				}},
+			},
+			want: "configMap",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			if err == nil {
+				t.Fatalf("want an error when the engine's /dev/shm is not writable scratch (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), "/dev/shm") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error must name /dev/shm and %q, got: %v", tc.want, err)
+			}
+		})
 	}
 }
 
