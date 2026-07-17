@@ -104,8 +104,10 @@ message LookupRouteRequest {
 // disaggregated store). Lower enum value = more local = preferred. UNSPECIFIED is
 // the wire default: a producer that never sets a tier, or a hint with no prefix
 // evidence (TENANT_HOT / AFFINITY_HINT), leaves it UNSPECIFIED so old clients that
-// ignore the field are unaffected. Tier *detection* (classifying a hold as T2/T3)
-// is out of scope here — the current ingest path tags every stored prefix T1.
+// ignore the field are unaffected. The kvevent-subscriber classifies a hold from
+// the engine block lifecycle — stored → T1, evicted-but-L2-retained → T2 (see
+// PrefixEntry.tier). T3 (remote / disaggregated) is not yet emitted. The tier is
+// carried end-to-end but is not yet a routing input (the ranker does not read it).
 enum CacheTier {
   CACHE_TIER_UNSPECIFIED = 0;
   CACHE_TIER_T1 = 1;
@@ -168,6 +170,19 @@ message PrefixEntry {
   // for exact-match indexing (legacy path).
   repeated bytes block_hashes = 3;
   repeated int32 block_token_counts = 4;
+  // Cache tier this replica holds the entry in (see CacheTier). The producer
+  // (kvevent-subscriber) sets it from the block lifecycle: a stored block is
+  // resident in the engine KV cache (T1); a block the engine evicts from HBM
+  // while a paired L2 offload tier (e.g. LMCache) retains it is re-reported at
+  // T2 (reload-able from the offload tier) rather than deleted. A chain
+  // entry's tier applies to every block it expands to. UNSPECIFIED is the wire
+  // default; the server normalizes it to T1 at ingest, so an older producer
+  // that never sets the field still lands its stored prefixes at T1
+  // (additive, v1alpha1-compatible). A re-report of the same (replica,
+  // hash_scheme, prefix_hash) with a different tier moves the entry between
+  // tiers (last write wins) — this is how an eviction downgrades T1→T2 and a
+  // later re-store upgrades T2→T1.
+  CacheTier tier = 5;
 }
 
 message ReplicaStats {

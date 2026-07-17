@@ -15,14 +15,15 @@ import (
 // LookupRoute because the engine + LMCache pair churns each block through
 // BlockStored → (offload) → BlockRemoved, the subscriber forwarded the
 // BlockRemoved as PREFIX_EVICTED, and the index dropped the routing hint while
-// the block was still cached at the L2 tier. The fix adds
-// WithIgnoreBlockRemoved on the reporter — set in LMCache-integrated
-// deployments — which drops the per-block evictions so the index keeps the
-// hint until the freshness TTL expires.
+// the block was still cached at the L2 tier. The fix is WithIgnoreBlockRemoved on
+// the reporter — set in LMCache-integrated deployments — which, on a per-block
+// eviction, re-reports the block at tier T2 (reload-able from the L2 tier) instead
+// of deleting it, so the index keeps the hint (now honestly tagged colder than
+// HBM) until the freshness TTL expires.
 //
 // These tests pin the behavior on both branches: the default still forwards
 // BlockRemoved (single-tier deployments rely on prompt eviction), and the
-// L2-tier mode keeps the hint so LookupRoute matches.
+// L2-tier mode keeps the hint — tagged T2 — so LookupRoute matches.
 
 // runEngineReporterAgainstServer runs the engine Reporter against an
 // in-process server, feeds the batches, drains, and returns the client so
@@ -86,13 +87,14 @@ func tokenSeq(start, n int) []uint32 {
 	return out
 }
 
-// L2-tier mode: with WithIgnoreBlockRemoved set, BlockRemoved is dropped at
-// the reporter, so the index retains the routing hint and LookupRoute returns
-// PREFIX_MATCH for a block the engine has since evicted from GPU. This is the
-// scenario L2 offload regresses on (LMCache-integrated cache-stress runs).
+// L2-tier mode: with WithIgnoreBlockRemoved set, a BlockRemoved re-reports the
+// block at tier T2 (reload-able from L2) instead of deleting it, so the index
+// retains the routing hint and LookupRoute returns PREFIX_MATCH — now tagged T2 —
+// for a block the engine has since evicted from HBM. This is the scenario L2
+// offload regresses on (LMCache-integrated cache-stress runs).
 func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	// One stored block then an immediate remove for the same hash — the
-	// shape vLLM+LMCache produces every time the engine evicts a GPU block.
+	// shape vLLM+LMCache produces every time the engine evicts an HBM block.
 	// BlockSize=128 keeps the realized matched_tokens above the
 	// DefaultMinimumMatchedTokens floor so the assertion is about
 	// the offload-pinning behavior, not the floor; smaller block sizes would
@@ -104,10 +106,16 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
 	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
 
+	// The T2 re-report anchors the entry's freshness at the eviction event's
+	// timestamp (it's when reload-ability was last confirmed) — production vLLM
+	// emits real wall-clock times, so use a real "now" here. (A tiny fake epoch
+	// timestamp would land the entry in 1970 and get it swept as stale, which is
+	// a property of the test clock, not the offload-pinning behavior under test.)
+	now := float64(time.Now().Unix())
 	client, stop := runEngineReporterAgainstServer(t,
 		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
-		&engine.EventBatch{TimestampSeconds: 0, Events: []engine.Event{stored}},
-		&engine.EventBatch{TimestampSeconds: 2.0, Events: []engine.Event{removed}},
+		&engine.EventBatch{TimestampSeconds: now, Events: []engine.Event{stored}},
+		&engine.EventBatch{TimestampSeconds: now, Events: []engine.Event{removed}},
 	)
 	defer stop()
 
@@ -123,6 +131,11 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	}
 	if len(resp.GetReplicaScores()) == 0 || resp.GetReplicaScores()[0].GetReplicaId() != "vllm-engine-cs1" {
 		t.Fatalf("expected single hit for vllm-engine-cs1, got %+v", resp.GetReplicaScores())
+	}
+	// The retained hint is honestly tagged colder than HBM: the block moved to the
+	// L2 tier, so the surviving PREFIX_MATCH must report tier T2, not T1.
+	if got := resp.GetReplicaScores()[0].GetTier(); got != icpb.CacheTier_CACHE_TIER_T2 {
+		t.Fatalf("tier = %v, want CACHE_TIER_T2 (block moved HBM→L2 on eviction)", got)
 	}
 }
 

@@ -211,6 +211,69 @@ func TestCacheTierToProto(t *testing.T) {
 	}
 }
 
+// TestCacheTierFromProto pins the ingest wire→index mapping (inverse of
+// TestCacheTierToProto): the subscriber tags a PrefixEntry T1/T2, and an older
+// producer leaves it UNSPECIFIED. UNSPECIFIED and any unknown/future value map to
+// TierUnspecified, which the index normalizes to T1 at ingest — never dropped.
+func TestCacheTierFromProto(t *testing.T) {
+	cases := []struct {
+		in   icpb.CacheTier
+		want index.CacheTier
+	}{
+		{icpb.CacheTier_CACHE_TIER_UNSPECIFIED, index.TierUnspecified},
+		{icpb.CacheTier_CACHE_TIER_T1, index.TierT1},
+		{icpb.CacheTier_CACHE_TIER_T2, index.TierT2},
+		{icpb.CacheTier_CACHE_TIER_T3, index.TierT3},
+		{icpb.CacheTier(99), index.TierUnspecified}, // unknown/future → fail-safe (→ T1 at ingest)
+	}
+	for _, c := range cases {
+		if got := cacheTierFromProto(c.in); got != c.want {
+			t.Errorf("cacheTierFromProto(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestReportedTierSurfacesThroughLookup is the end-to-end tier-tagging assertion:
+// a producer's PrefixEntry.tier is carried through updateFromProto → index →
+// LookupRoute onto the response ReplicaScore.tier. Covers the three cases the
+// kvevent-subscriber produces: a stored prefix tagged T1, an evicted-but-L2
+// prefix re-reported at T2, and an older producer that leaves the field unset
+// (→ normalized T1).
+func TestReportedTierSurfacesThroughLookup(t *testing.T) {
+	cases := []struct {
+		name string
+		wire icpb.CacheTier
+		want icpb.CacheTier
+	}{
+		{"stored → T1", icpb.CacheTier_CACHE_TIER_T1, icpb.CacheTier_CACHE_TIER_T1},
+		{"evicted-but-L2 → T2", icpb.CacheTier_CACHE_TIER_T2, icpb.CacheTier_CACHE_TIER_T2},
+		{"unset → normalized T1", icpb.CacheTier_CACHE_TIER_UNSPECIFIED, icpb.CacheTier_CACHE_TIER_T1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc := newTestService()
+			// Ingest through updateFromProto (the exact wire→domain mapping the
+			// ReportCacheState handler uses) so the new tier field is exercised.
+			svc.index.Ingest(updateFromProto(&icpb.CacheStateUpdate{
+				ReplicaId: "r1", ModelId: "m", TenantId: "t", HashScheme: "vllm",
+				Prefixes: []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 128, Tier: c.wire}},
+			}))
+			resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
+				ModelId: "m", TenantId: "t", HashScheme: "vllm", PrefixHash: []byte("p"),
+			})
+			if err != nil {
+				t.Fatalf("LookupRoute: %v", err)
+			}
+			if len(resp.GetReplicaScores()) != 1 {
+				t.Fatalf("scores = %+v, want one", resp.GetReplicaScores())
+			}
+			if got := resp.GetReplicaScores()[0].GetTier(); got != c.want {
+				t.Fatalf("tier = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestLookupRouteEmptyHashSchemeFailsOpenOverGRPC pins the contract through
 // the handler: even if the tenant has warm replicas that would qualify for
 // TENANT_HOT, an unspecified hash_scheme on the request must surface as

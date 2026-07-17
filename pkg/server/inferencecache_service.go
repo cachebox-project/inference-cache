@@ -1053,6 +1053,7 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 			TokenCount:       p.GetTokenCount(),
 			BlockHashes:      p.GetBlockHashes(),
 			BlockTokenCounts: p.GetBlockTokenCounts(),
+			Tier:             cacheTierFromProto(p.GetTier()),
 		})
 	}
 	if st := u.GetStats(); st != nil {
@@ -1068,6 +1069,25 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 		}
 	}
 	return out
+}
+
+// cacheTierFromProto maps the ingest wire enum onto the index's cache-tier tag.
+// UNSPECIFIED (the wire default an older producer sends) maps to TierUnspecified,
+// which the index normalizes to T1 at ingest — so a producer that never sets the
+// field still lands its stored prefixes at T1. An unknown/future value also maps
+// to TierUnspecified (fail-safe → T1) rather than being dropped. Inverse of
+// cacheTierToProto.
+func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
+	switch t {
+	case icpb.CacheTier_CACHE_TIER_T1:
+		return index.TierT1
+	case icpb.CacheTier_CACHE_TIER_T2:
+		return index.TierT2
+	case icpb.CacheTier_CACHE_TIER_T3:
+		return index.TierT3
+	default:
+		return index.TierUnspecified
+	}
 }
 
 // cacheTierToProto maps the index's cache-tier tag onto the wire enum. An

@@ -60,6 +60,27 @@ func (s *recordingServer) PublishEvent(_ context.Context, ev *icpb.CacheEvent) (
 	return &icpb.Ack{Accepted: true}, nil
 }
 
+// prefixTiers returns, in send order, the tier of every forwarded PrefixEntry
+// whose prefix_hash equals want — across all ReportCacheState updates. Since the
+// single-goroutine reporter sends flushes sequentially and preserves event order
+// within a flush, the returned slice is the chronological tier history for that
+// prefix (e.g. [T1] for a store, [T1, T2] for a store then L2 eviction, and
+// [T1, T2, T1] for store → evict → re-store). Caller holds no lock; call after Run
+// has drained.
+func (s *recordingServer) prefixTiers(want []byte) []icpb.CacheTier {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []icpb.CacheTier
+	for _, u := range s.updates {
+		for _, p := range u.GetPrefixes() {
+			if bytes.Equal(p.GetPrefixHash(), want) {
+				out = append(out, p.GetTier())
+			}
+		}
+	}
+	return out
+}
+
 func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
 	return runReporterWindow(t, 20*time.Millisecond, batches...)
 }
@@ -247,16 +268,16 @@ func TestReporterForwardsRemovalsAndClear(t *testing.T) {
 	}
 }
 
-// With WithIgnoreBlockRemoved the reporter must NOT forward BlockRemoved
-// events as PREFIX_EVICTED. This is the L2-tier mode (e.g. LMCache): when
-// the engine evicts a block from GPU the block is still resident at L2 and
-// the cache plane should keep the routing hint until its freshness TTL
-// expires. Forwarding the eviction would erase the hint while the replica
-// can still serve the block from L2 — that is the cache-stress
-// 0-PREFIX_MATCH regression. We also assert that a BlockStored add still
-// reaches the server (via the shutdown flush) — silently dropping adds
-// alongside evictions would defeat the whole reporter.
-func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
+// In L2-tier mode the reporter must NEVER forward a BlockRemoved as
+// PREFIX_EVICTED: the block is still resident at L2, so deleting the hint would
+// erase a routing hint the replica can still serve — the cache-stress
+// 0-PREFIX_MATCH regression. Here the removed engine hash (0x02) was never stored,
+// so it maps to nothing and produces no T2 downgrade either; the point is purely
+// that no PREFIX_EVICTED is emitted, and that a BlockStored add still reaches the
+// server (via the shutdown flush) — silently dropping adds would defeat the whole
+// reporter. The store→evict→T2 downgrade of the SAME block is pinned separately by
+// TestReporterL2ModeDowngradesEvictionToT2.
+func TestReporterL2ModeNeverForwardsPrefixEvicted(t *testing.T) {
 	const bs = 16
 	toks := tokSeq(1, bs)
 	wantAdd := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
@@ -264,7 +285,7 @@ func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
 		// time.Hour so the only path that can deliver the add is the shutdown
 		// flush — exactly as in TestReporterFlushesPendingOnShutdown. That
 		// also confirms BlockRemoved doesn't accidentally trigger the
-		// pre-removal flush when ignore is set.
+		// pre-removal flush when the L2-tier flag is set.
 		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
 		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0x01}}, TokenIDs: toks, BlockSize: bs}}},
 		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0x02}}}}},
@@ -283,22 +304,113 @@ func TestReporterIgnoreBlockRemovedDropsEvictionsButForwardsAdds(t *testing.T) {
 		}
 	}
 	if !addFound {
-		t.Errorf("BlockStored add was not forwarded with ignore_block_removed=true; ops=%v", rec.ops)
+		t.Errorf("BlockStored add was not forwarded in L2-tier mode; ops=%v", rec.ops)
 	}
 
-	// Evictions are dropped — no PREFIX_EVICTED reaches the server.
+	// No PREFIX_EVICTED ever reaches the server in L2 mode.
 	for _, e := range rec.events {
 		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED {
-			t.Errorf("ignore_block_removed=true must drop PREFIX_EVICTED, got eviction for hash=%x", e.GetPrefixHash())
+			t.Errorf("L2-tier mode must never forward PREFIX_EVICTED, got eviction for hash=%x", e.GetPrefixHash())
 		}
 	}
 }
 
-// In L2 mode (ignore_block_removed), a BlockRemoved must still prune the
-// subscriber's reverse map even though the eviction is NOT forwarded — otherwise
-// the map grows unbounded until AllBlocksCleared (the L2 memory-leak path: the
-// engine evicts from GPU on every store, but the block stays at L2 so we keep the
-// server hint, yet we must still forget the engine-hash → our-hash mapping).
+// TestReporterL2ModeDowngradesEvictionToT2 is the core tier-tagging assertion:
+// with an L2 tier, a BlockRemoved of a previously-stored block re-reports that block's
+// prefix at T2 (reload-able from L2) through the ReportCacheState add path — it is
+// neither deleted (no PREFIX_EVICTED) nor left stale at T1. The prefix's tier
+// history on the wire is therefore [T1 (store), T2 (eviction)].
+func TestReporterL2ModeDowngradesEvictionToT2(t *testing.T) {
+	const bs = 16
+	toks := tokSeq(2, bs)
+	prefix := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
+	// time.Hour window: the store's T1 add and the eviction's T2 downgrade both sit
+	// in pending and flush together at shutdown, in event order, so the wire tier
+	// history is deterministic.
+	rec := runReporterWithOpts(t,
+		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xAA}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0xAA}}}}},
+	)
+
+	if got := rec.prefixTiers(prefix); len(got) != 2 ||
+		got[0] != icpb.CacheTier_CACHE_TIER_T1 || got[1] != icpb.CacheTier_CACHE_TIER_T2 {
+		t.Errorf("prefix tier history = %v, want [T1 T2] (store then L2 eviction)", got)
+	}
+
+	// The downgrade rides the add path, never PublishEvent — no PREFIX_EVICTED.
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, e := range rec.events {
+		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED {
+			t.Errorf("L2 downgrade must not emit PREFIX_EVICTED; got %x", e.GetPrefixHash())
+		}
+	}
+}
+
+// TestReporterL2ModeEvictThenRestore covers the eviction-then-rehit path: a block
+// stored (T1), evicted to L2 (T2), then re-stored when the engine pulls it back
+// into HBM (T1 again). The index applies last-write-wins on tier, so the wire tier
+// history for the prefix is [T1, T2, T1].
+func TestReporterL2ModeEvictThenRestore(t *testing.T) {
+	const bs = 16
+	toks := tokSeq(3, bs)
+	prefix := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
+	rec := runReporterWithOpts(t,
+		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xBB}}, TokenIDs: toks, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: 2, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0xBB}}}}},
+		&EventBatch{TimestampSeconds: 3, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xBB}}, TokenIDs: toks, BlockSize: bs}}},
+	)
+
+	got := rec.prefixTiers(prefix)
+	want := []icpb.CacheTier{
+		icpb.CacheTier_CACHE_TIER_T1,
+		icpb.CacheTier_CACHE_TIER_T2,
+		icpb.CacheTier_CACHE_TIER_T1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("prefix tier history = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("prefix tier history = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestReporterBlockStoredTaggedT1 pins that a stored block is reported at T1 on the
+// wire (resident in the engine KV cache) — the self-describing tag, independent of
+// the server's default-ingest normalization.
+func TestReporterBlockStoredTaggedT1(t *testing.T) {
+	const bs = 16
+	toks := tokSeq(4, 2*bs) // two full blocks
+	rec := runReporter(t, &EventBatch{
+		TimestampSeconds: 1,
+		Events:           []Event{BlockStored{BlockHashes: [][]byte{{0x1}, {0x2}}, TokenIDs: toks, BlockSize: bs}},
+	})
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var n int
+	for _, u := range rec.updates {
+		for _, p := range u.GetPrefixes() {
+			n++
+			if got := p.GetTier(); got != icpb.CacheTier_CACHE_TIER_T1 {
+				t.Errorf("stored prefix tier = %v, want CACHE_TIER_T1", got)
+			}
+		}
+	}
+	if n != 2 {
+		t.Errorf("forwarded %d prefixes, want 2", n)
+	}
+}
+
+// In L2 mode, a BlockRemoved must still prune the subscriber's reverse map even
+// though the block is re-reported at T2 rather than deleted — otherwise the map
+// grows unbounded until AllBlocksCleared (the L2 memory-leak path: the engine
+// evicts from HBM on every store, but the block stays at L2 so we keep the server
+// hint, yet we must still forget the engine-hash → our-hash mapping so a future
+// store re-chains cleanly).
 func TestReporterIgnoreBlockRemovedStillPrunesReverseMap(t *testing.T) {
 	const bs = 16
 	toks := tokSeq(70, bs)
