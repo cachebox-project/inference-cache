@@ -255,6 +255,55 @@ jobs:
         test -s "$sbom"
         jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
 
+    - name: Smoke registry image SBOM path
+      run: |
+        set -euo pipefail
+        fakebin="$RUNNER_TEMP/sbom-fakebin"
+        outdir="$RUNNER_TEMP/sbom-registry-smoke"
+        mkdir -p "$fakebin"
+
+        cat >"$fakebin/docker" <<'EOF'
+        #!/bin/sh
+        set -eu
+        if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
+          echo "Name:      $4"
+          echo "Digest:    sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          exit 0
+        fi
+        echo "unexpected docker invocation: $*" >&2
+        exit 2
+        EOF
+
+        cat >"$fakebin/syft" <<'EOF'
+        #!/bin/sh
+        set -eu
+        if [ "${1:-}" = "version" ]; then
+          echo "Application: syft"
+          echo "Version:    1.20.0"
+          exit 0
+        fi
+        out=""
+        for arg in "$@"; do
+          case "$arg" in
+            spdx-json=*) out=${arg#spdx-json=} ;;
+          esac
+        done
+        if [ -z "$out" ]; then
+          echo "missing spdx-json output" >&2
+          exit 2
+        fi
+        mkdir -p "$(dirname "$out")"
+        printf '{"spdxVersion":"SPDX-2.3","packages":[{"name":"fake"}]}\n' >"$out"
+        EOF
+
+        chmod +x "$fakebin/docker" "$fakebin/syft"
+        PATH="$fakebin:$PATH" make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir"
+        for component in controller server subscriber; do
+          sbom="$outdir/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
+          test -s "$sbom"
+          jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+        done
+
   tokenize-cgo:
     name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
     runs-on: ubuntu-latest

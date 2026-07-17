@@ -11,9 +11,12 @@ GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod | head -n1)
 
 REGISTRY ?= ghcr.io/cachebox-project
 TAG ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
-IMG ?= $(REGISTRY)/inference-cache-controller:$(TAG)
-SERVER_IMG ?= $(REGISTRY)/inference-cache-server:$(TAG)
-SUBSCRIBER_IMG ?= $(REGISTRY)/inference-cache-subscriber:$(TAG)
+CONTROLLER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-controller
+SERVER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-server
+SUBSCRIBER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-subscriber
+IMG ?= $(CONTROLLER_IMAGE_REPO):$(TAG)
+SERVER_IMG ?= $(SERVER_IMAGE_REPO):$(TAG)
+SUBSCRIBER_IMG ?= $(SUBSCRIBER_IMAGE_REPO):$(TAG)
 DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
@@ -360,6 +363,26 @@ sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-su
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json"
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SERVER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json"
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json"
+
+.PHONY: sbom-registry-images
+sbom-registry-images: syft-check ## Generate SBOMs for published release images by immutable registry digest.
+	mkdir -p "$(SBOM_DIR)"
+	@set -e; \
+	for image in \
+		"controller|$(CONTROLLER_IMAGE_REPO)" \
+		"server|$(SERVER_IMAGE_REPO)" \
+		"subscriber|$(SUBSCRIBER_IMAGE_REPO)"; do \
+		component="$${image%%|*}"; \
+		repo="$${image#*|}"; \
+		ref="$${repo}:$(TAG)"; \
+		digest="$$(docker buildx imagetools inspect "$$ref" | awk '/^Digest:/ {print $$2; exit}')"; \
+		if [ -z "$$digest" ]; then \
+			echo "ERROR: unable to resolve digest for $$ref" >&2; \
+			exit 1; \
+		fi; \
+		"$(SYFT)" scan "registry:$$repo@$$digest" \
+			-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$(SBOM_TAG).spdx.json"; \
+	done
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.

@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
     - name: Validate release tag
       env:
@@ -76,41 +76,8 @@ jobs:
     - name: Generate source SBOM
       run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-release TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
-    - name: Build, publish, and scan image SBOMs
-      env:
-        REGISTRY: ghcr.io/cachebox-project
-        RELEASE_TAG: ${{ env.RELEASE_TAG }}
-      run: |
-        set -euo pipefail
-        mkdir -p "$GITHUB_WORKSPACE/dist/sbom"
-
-        build_and_scan() {
-          component="$1"
-          target="$2"
-          image="$REGISTRY/inference-cache-$component:$RELEASE_TAG"
-          metadata="$RUNNER_TEMP/$component-image-metadata.json"
-
-          docker buildx build \
-            --push \
-            -f "$GITHUB_WORKSPACE/release-source/dockerfiles/Dockerfile" \
-            --target "$target" \
-            -t "$image" \
-            --metadata-file "$metadata" \
-            "$GITHUB_WORKSPACE/release-source"
-
-          digest="$(jq -r '."containerimage.digest" // empty' "$metadata")"
-          if [ -z "$digest" ]; then
-            echo "missing pushed digest for $image" >&2
-            exit 1
-          fi
-
-          syft scan "registry:$REGISTRY/inference-cache-$component@$digest" \
-            -o "spdx-json=$GITHUB_WORKSPACE/dist/sbom/inference-cache-$component-$RELEASE_TAG.spdx.json"
-        }
-
-        build_and_scan controller controller
-        build_and_scan server server
-        build_and_scan subscriber subscriber
+    - name: Generate published image SBOMs
+      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
     - name: Upload SBOM workflow artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
