@@ -274,6 +274,11 @@ jobs:
           esac
           case "${DOCKER_FAKE_MODE:-missing}" in
             authfail) echo "unauthorized: authentication required" >&2; exit 42 ;;
+            helperfail) echo 'error getting credentials - err: exec: "docker-credential-ghcr": executable file not found in $PATH' >&2; exit 1 ;;
+            existing)
+              printf 'Name:      %s\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    sha256:1111111111111111111111111111111111111111111111111111111111111111\n' "$4"
+              exit 0
+              ;;
             missing) echo "manifest unknown: manifest unknown" >&2; exit 1 ;;
             *) echo "unexpected fake mode: ${DOCKER_FAKE_MODE:-}" >&2; exit 2 ;;
           esac
@@ -315,6 +320,9 @@ jobs:
           exit 0
         fi
         case "${2:-}" in
+          registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
+          registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
+          registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
           registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
           registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
           registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222) ;;
@@ -339,10 +347,21 @@ jobs:
           echo "expected registry auth failure to stop without publishing" >&2
           exit 1
         fi
+        if PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=helperfail make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile; then
+          echo "expected credential-helper failure to stop without publishing" >&2
+          exit 1
+        fi
 
-        PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+        PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir/existing" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
         for component in controller server subscriber; do
-          sbom="$outdir/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
+          sbom="$outdir/existing/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
+          test -s "$sbom"
+          jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+        done
+
+        PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir/missing" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+        for component in controller server subscriber; do
+          sbom="$outdir/missing/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
           test -s "$sbom"
           jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
         done

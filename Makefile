@@ -388,7 +388,7 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 				rm -f "$$inspect_log"; \
 				exit 1; \
 			fi; \
-		elif grep -Eiq 'manifest unknown|manifest not found|not found|no such manifest|name unknown' "$$inspect_log"; then \
+		elif grep -Eiq 'manifest unknown|manifest not found|no such manifest|name unknown' "$$inspect_log"; then \
 			digest=""; \
 			missing=1; \
 		else \
