@@ -1,0 +1,67 @@
+name: Release SBOM
+
+on:
+  release:
+    types:
+    - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach SBOM artifacts to
+        required: true
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  SYFT_VERSION: v1.20.0
+
+jobs:
+  release-sbom:
+    name: Generate and Attach SBOMs
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      with:
+        ref: ${{ env.RELEASE_TAG }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4
+
+    - name: Install Syft
+      env:
+        SYFT_VERSION: ${{ env.SYFT_VERSION }}
+      run: |
+        set -euo pipefail
+        version="${SYFT_VERSION#v}"
+        archive="syft_${version}_linux_amd64.tar.gz"
+        checksums="syft_${version}_checksums.txt"
+        curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"
+        curl -fsSL -o "$RUNNER_TEMP/$checksums" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${checksums}"
+        grep "  ${archive}$" "$RUNNER_TEMP/$checksums" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/syft"
+        tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
+        echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/syft/syft" version
+
+    - name: Build images and generate SBOMs
+      run: make sbom TAG="${RELEASE_TAG}"
+
+    - name: Upload SBOM workflow artifacts
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: release-sboms
+        path: dist/sbom/*.spdx.json
+        if-no-files-found: error
+
+    - name: Attach SBOMs to GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload "${RELEASE_TAG}" dist/sbom/*.spdx.json --clobber

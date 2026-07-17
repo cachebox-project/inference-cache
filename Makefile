@@ -17,6 +17,9 @@ DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
 KIND_NODE_IMAGE ?= kindest/node:v1.31.0
+SYFT ?= syft
+SBOM_DIR ?= dist/sbom
+SBOM_TAG := $(subst /,_,$(TAG))
 
 version_pkg = $(MODULE)/pkg/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
@@ -320,6 +323,28 @@ server-image: ## Build the server container image.
 .PHONY: subscriber-image
 subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
 	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t $(SUBSCRIBER_IMG) .
+
+.PHONY: sbom
+sbom: image-build sbom-release sbom-images ## Generate release and per-image SPDX JSON SBOMs with Syft.
+
+.PHONY: sbom-release
+sbom-release: ## Generate a source/release SBOM for the checked-out tree.
+	@command -v $(SYFT) >/dev/null || { echo "ERROR: syft missing. Install syft or set SYFT=/path/to/syft"; exit 1; }
+	mkdir -p $(SBOM_DIR)
+	$(SYFT) scan dir:. \
+		--exclude './.git' \
+		--exclude './.cache' \
+		--exclude './bin' \
+		--exclude './dist' \
+		-o spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json
+
+.PHONY: sbom-images
+sbom-images: ## Generate SBOMs for the locally-built controller, server, and kvevent-subscriber images.
+	@command -v $(SYFT) >/dev/null || { echo "ERROR: syft missing. Install syft or set SYFT=/path/to/syft"; exit 1; }
+	mkdir -p $(SBOM_DIR)
+	$(SYFT) scan docker:$(IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json
+	$(SYFT) scan docker:$(SERVER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json
+	$(SYFT) scan docker:$(SUBSCRIBER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.
