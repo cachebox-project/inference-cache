@@ -154,6 +154,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectEventsOnlyMisconfiguration,
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
+	rejectSGLangRedisL2ScaleOut,
 }
 
 // rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
@@ -188,6 +189,41 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),
 		),
 	}
+}
+
+// rejectSGLangRedisL2ScaleOut hard-rejects a multi-replica or autoscaled
+// (sglang, LMCache) backend. That pair's managed cache-server is a single plain
+// Redis L2 store (the SGLang MP worker's --l2-adapter target), and a plain Redis is
+// not clustered: a second pod behind the one ClusterIP Service shards the keyspace
+// across independent instances, so a key stored via one is a miss via the other and
+// the L2 silently partitions. The failure looks like a healthy backend with a poor
+// hit rate, so reject at the door rather than warn — the same posture as
+// rejectMooncakeMasterScaleOut (a different singleton for a different reason).
+//
+// Scoped to (sglang, LMCache): vLLM's lm:// server is an ordinary pod-network
+// workload that scales, and other pairs are rejected on their own
+// (checkRuntimeAdapter). spec.replicas 0 (disabled) and 1 (the singleton) remain
+// valid. The reconciler's clampSingletonReplicas is the backstop for grandfathered
+// objects. If SGLang's shared tier gains a clustered store, lift this rule.
+func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
+			"the (sglang, LMCache) backend's Redis L2 store is a single non-clustered instance: a second replica behind the one Service shards the keyspace and silently partitions the cache. Set spec.replicas to 0 or 1.",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
+			"spec.autoscaling is not supported for the (sglang, LMCache) backend: its Redis L2 store is a single non-clustered instance, so scaling it out partitions the cache across independent keyspaces. Remove spec.autoscaling.",
+		))
+	}
+	return errs
 }
 
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the

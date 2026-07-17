@@ -560,6 +560,58 @@ func TestValidator_LMCacheScaleOutUnaffectedByMooncakeRule(t *testing.T) {
 	}
 }
 
+func sglangLMCacheBackend() *cachev1alpha1.CacheBackend {
+	cb := newBackend() // Type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	return cb
+}
+
+func TestValidator_SGLangRedisL2MultiReplicaRejected(t *testing.T) {
+	// The (sglang, LMCache) backend's cache-server is a single non-clustered Redis L2
+	// (the MP worker's --l2-adapter target). A second pod behind the one Service
+	// shards the keyspace across independent instances, so a key stored via one is a
+	// miss via the other — the L2 silently partitions. Reject at write time.
+	v := &CacheBackendValidator{}
+	cb := sglangLMCacheBackend()
+	two := int32(2)
+	cb.Spec.Replicas = &two
+	requireInvalidWithCause(t, v, cb, "spec.replicas", "single non-clustered instance")
+}
+
+func TestValidator_SGLangRedisL2AutoscalingRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := sglangLMCacheBackend()
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling", "not supported for the (sglang, LMCache) backend")
+}
+
+func TestValidator_SGLangRedisL2SingletonAndDisabledAccepted(t *testing.T) {
+	// 1 is the singleton; 0 is "disabled". Neither partitions the keyspace.
+	v := &CacheBackendValidator{}
+	for _, replicas := range []int32{0, 1} {
+		cb := sglangLMCacheBackend()
+		r := replicas
+		cb.Spec.Replicas = &r
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("(sglang, LMCache) with spec.replicas=%d must be admitted: %v", replicas, err)
+		}
+	}
+}
+
+func TestValidator_VLLMLMCacheScaleOutUnaffectedBySGLangRule(t *testing.T) {
+	// Blast radius: vLLM's lm:// server is an ordinary pod-network workload and must
+	// keep scaling out (and autoscaling) — the singleton rule is (sglang, LMCache)-only.
+	v := &CacheBackendValidator{}
+	cb := newBackend() // Type=LMCache, engine defaults to vllm
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	three := int32(3)
+	cb.Spec.Replicas = &three
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("multi-replica autoscaled (vllm, LMCache) must be admitted: %v", err)
+	}
+}
+
 func TestValidator_EndpointOnManagedTypeRejected(t *testing.T) {
 	// spec.endpoint is the External-passthrough field; setting it on a
 	// managed type silently does nothing today (the reconciler overwrites
