@@ -322,21 +322,33 @@ jobs:
           echo "Version:    1.20.0"
           exit 0
         fi
-        case "${2:-}" in
+        test "${1:-}" = "scan"
+        shift
+        out=""
+        platform=""
+        source=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --platform) platform="$2"; shift 2 ;;
+            -o) out=${2#spdx-json=}; shift 2 ;;
+            spdx-json=*) out=${1#spdx-json=}; shift ;;
+            registry:*) source="$1"; shift ;;
+            *) shift ;;
+          esac
+        done
+        case "$platform" in
+          linux/amd64|linux/arm64) ;;
+          *) echo "unexpected syft platform: $platform" >&2; exit 2 ;;
+        esac
+        case "$source" in
           registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
           registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
           registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111|\
           registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
           registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
           registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222) ;;
-          *) echo "unexpected syft source: ${2:-}" >&2; exit 2 ;;
+          *) echo "unexpected syft source: $source" >&2; exit 2 ;;
         esac
-        out=""
-        for arg in "$@"; do
-          case "$arg" in
-            spdx-json=*) out=${arg#spdx-json=} ;;
-          esac
-        done
         if [ -z "$out" ]; then
           echo "missing spdx-json output" >&2
           exit 2
@@ -357,16 +369,20 @@ jobs:
 
         PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir/existing" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
         for component in controller server subscriber; do
-          sbom="$outdir/existing/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
-          test -s "$sbom"
-          jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+          for platform in linux_amd64 linux_arm64; do
+            sbom="$outdir/existing/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
+            test -s "$sbom"
+            jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+          done
         done
 
         PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir/missing" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
         for component in controller server subscriber; do
-          sbom="$outdir/missing/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
-          test -s "$sbom"
-          jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+          for platform in linux_amd64 linux_arm64; do
+            sbom="$outdir/missing/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
+            test -s "$sbom"
+            jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+          done
         done
 
   tokenize-cgo:

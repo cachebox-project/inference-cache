@@ -416,8 +416,22 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 			echo "ERROR: unable to resolve digest for $$ref" >&2; \
 			exit 1; \
 		fi; \
-		"$(SYFT)" scan "registry:$$repo@$$digest" \
-			-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$(SBOM_TAG).spdx.json"; \
+		platforms="$(SBOM_IMAGE_PLATFORMS)"; \
+		if [ -z "$$platforms" ]; then \
+			"$(SYFT)" scan "registry:$$repo@$$digest" \
+				-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$(SBOM_TAG).spdx.json"; \
+		else \
+			old_ifs="$$IFS"; \
+			IFS=','; \
+			for platform in $$platforms; do \
+				IFS="$$old_ifs"; \
+				platform_suffix="$$(printf '%s' "$$platform" | tr '/,' '__')"; \
+				"$(SYFT)" scan --platform "$$platform" "registry:$$repo@$$digest" \
+					-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$$platform_suffix-$(SBOM_TAG).spdx.json"; \
+				IFS=','; \
+			done; \
+			IFS="$$old_ifs"; \
+		fi; \
 	done
 
 .PHONY: dev-cluster
