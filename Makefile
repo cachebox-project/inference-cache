@@ -30,6 +30,7 @@ SBOM_IMAGE_BUILD ?= 1
 SBOM_IMAGE_CONTEXT ?= .
 SBOM_DOCKERFILE ?= dockerfiles/Dockerfile
 SBOM_REGISTRY_PUBLISH_MISSING ?= 0
+SBOM_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
 SBOM_TAG := $(subst /,_,$(TAG))
 
 version_pkg = $(MODULE)/pkg/version
@@ -402,6 +403,7 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 			metadata="$$(mktemp)"; \
 			$(DOCKER_BUILD_CMD) buildx build \
 				--push \
+				--platform "$(SBOM_IMAGE_PLATFORMS)" \
 				-f "$(SBOM_DOCKERFILE)" \
 				--target "$$component" \
 				-t "$$ref" \
