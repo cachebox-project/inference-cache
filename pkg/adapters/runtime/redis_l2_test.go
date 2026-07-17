@@ -182,7 +182,7 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 		{"request-only 4Gi -> ignored, 80% of 8Gi default", "", "4Gi", 6871947674},
 		{"no sizing -> 80% of 8Gi default", "", "", 6871947674},
 		{"limit 100Mi -> 80%, in-bounds", "100Mi", "", 83886080},
-		{"sub-byte limit -> stays positive (never 0/unlimited), never exceeds base", "1", "", 1},
+		{"one-byte limit -> stays positive (never 0/unlimited), never exceeds base", "1", "", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
