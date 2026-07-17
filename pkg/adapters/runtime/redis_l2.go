@@ -85,7 +85,12 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 		Name:            "redis-l2",
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"redis-server"},
+		// No Command: the official Redis image's ENTRYPOINT (docker-entrypoint.sh)
+		// must run. When it sees `redis-server` as the first argument while running as
+		// root, it chowns the data dir and re-execs Redis as the unprivileged `redis`
+		// user (gosu). Setting Command would OVERRIDE that entrypoint and run Redis as
+		// root. So `redis-server` leads Args instead: args replace the image CMD but
+		// leave the ENTRYPOINT — and its privilege drop — intact.
 		// --save "" + --appendonly no: the L2 is an ephemeral cache tier, not a
 		// database — disable RDB/AOF persistence so a restart starts cold (the KV
 		// is soft state; loss is a cache miss, never a wrong answer) and no PVC is
@@ -97,6 +102,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 		// explicitly rather than relying on the image's default, and is consistent
 		// with the documented in-cluster-trust security posture.
 		Args: []string{
+			"redis-server",
 			"--save", "",
 			"--appendonly", "no",
 			"--protected-mode", "no",
@@ -151,8 +157,11 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 // stay under — basing an OOM-avoidance budget on it would be a false comfort. This
 // matches the accepted design (docs/design/sglang-lmcache-mp-mode.md: `--maxmemory`
 // "from the pod's memory limit (with headroom), falling back to an explicit bounded
-// default"). Sizing off the limit and staying below it (80%) keeps the budget inside
-// the cgroup with headroom, so LRU eviction reclaims space before the OOM killer fires.
+// default"). Sizing off the limit and staying below it (80%) keeps the dataset budget
+// inside the cgroup with headroom, so LRU eviction has room to reclaim space and
+// REDUCES the risk of an OOM kill. It cannot eliminate it: `--maxmemory` bounds the
+// dataset, not Redis's total RSS (fragmentation, client/output buffers, replication
+// backlog all live outside it), so a pathological workload can still exceed the cgroup.
 func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	base := redisMaxmemoryDefaultBytes
 	if cache != nil && cache.Spec.Resources != nil {
@@ -164,7 +173,7 @@ func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	// overflow for a non-negative int64) and inherently positive for base >= 1, so
 	// it never rounds to --maxmemory 0 (= unlimited in Redis) and needs no floor
 	// that could itself exceed a small limit. 80% is <= base (strictly < for the
-	// only realistic range, base >= 5 bytes), leaving cgroup headroom so LRU
-	// eviction — not the OOM killer — reclaims space.
+	// only realistic range, base >= 5 bytes), leaving cgroup headroom so LRU eviction
+	// has room to run before RSS reaches the limit.
 	return base - base/5
 }

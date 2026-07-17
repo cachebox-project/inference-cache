@@ -55,8 +55,15 @@ func TestResolveRedisL2Server(t *testing.T) {
 	if c.Image != defaultRedisImage {
 		t.Errorf("image = %q, want default %q", c.Image, defaultRedisImage)
 	}
-	if len(c.Command) != 1 || c.Command[0] != "redis-server" {
-		t.Errorf("command = %v, want [redis-server]", c.Command)
+	// Command MUST be empty and `redis-server` must lead Args: overriding the image
+	// ENTRYPOINT (docker-entrypoint.sh) would skip its root->redis privilege drop, so
+	// Redis would run as root. Leaving Command unset keeps the entrypoint; args
+	// replace only the image CMD.
+	if len(c.Command) != 0 {
+		t.Errorf("command = %v, want empty (setting it bypasses the image entrypoint's privilege drop, running Redis as root)", c.Command)
+	}
+	if len(c.Args) == 0 || c.Args[0] != "redis-server" {
+		t.Errorf("args[0] = %v, want redis-server leading (so docker-entrypoint.sh drops to the redis user then execs it)", c.Args)
 	}
 	// Ephemeral-cache posture: persistence off, bounded LRU.
 	if v, ok := argVal(c.Args, "--save"); !ok || v != "" {
