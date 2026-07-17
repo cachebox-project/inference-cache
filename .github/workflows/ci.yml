@@ -251,7 +251,7 @@ jobs:
         set -euo pipefail
         sbom="$RUNNER_TEMP/sbom-smoke/inference-cache-${IMAGE_TAG}.spdx.json"
         test -s "$sbom"
-        jq -e '.spdxVersion and .packages' "$sbom" >/dev/null
+        jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
 
   tokenize-cgo:
     name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
@@ -374,7 +374,7 @@ jobs:
         for component in controller server subscriber; do
           sbom="$RUNNER_TEMP/sbom-image-smoke/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
           test -s "$sbom"
-          jq -e '.spdxVersion and .packages' "$sbom" >/dev/null
+          jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
         done
 
     # Both image scans run with exit-code: 0 (and both SARIF uploads run with

@@ -18,6 +18,8 @@ KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
 KIND_NODE_IMAGE ?= kindest/node:v1.31.0
 SYFT ?= syft
+SYFT_VERSION ?= v1.20.0
+SYFT_VERSION_NO_V := $(patsubst v%,%,$(SYFT_VERSION))
 SBOM_DIR ?= dist/sbom
 SBOM_IMAGE_SOURCE ?= docker
 SBOM_IMAGE_BUILD ?= 1
@@ -316,42 +318,47 @@ image-build: controller-image server-image subscriber-image ## Build controller,
 
 .PHONY: controller-image
 controller-image: ## Build the controller container image.
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target controller -t $(IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target controller -t "$(IMG)" .
 
 .PHONY: server-image
 server-image: ## Build the server container image.
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target server -t $(SERVER_IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target server -t "$(SERVER_IMG)" .
 
 .PHONY: subscriber-image
 subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t $(SUBSCRIBER_IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t "$(SUBSCRIBER_IMG)" .
 
 .PHONY: syft-check
 syft-check: ## Fail fast when Syft is unavailable.
-	@command -v $(SYFT) >/dev/null || { echo "ERROR: syft missing. Install syft or set SYFT=/path/to/syft"; exit 1; }
+	@command -v "$(SYFT)" >/dev/null || { echo "ERROR: syft missing. Install syft $(SYFT_VERSION) or set SYFT=/path/to/syft"; exit 1; }
+	@version="$$("$(SYFT)" version 2>/dev/null | awk '/^Version:/ {print $$2; exit}')"; \
+	if [ "$$version" != "$(SYFT_VERSION_NO_V)" ]; then \
+		echo "ERROR: syft version $$version found; expected $(SYFT_VERSION_NO_V)"; \
+		exit 1; \
+	fi
 
 .PHONY: sbom
 sbom: sbom-release sbom-images ## Generate release and per-image SPDX JSON SBOMs with Syft.
 
 .PHONY: sbom-release
 sbom-release: syft-check ## Generate a source/release SBOM for the checked-out tree.
-	mkdir -p $(SBOM_DIR)
-	$(SYFT) scan dir:. \
+	mkdir -p "$(SBOM_DIR)"
+	"$(SYFT)" scan dir:. \
 		--exclude './.git' \
 		--exclude './.cache' \
 		--exclude './bin' \
 		--exclude './dist' \
-		-o spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json
+		-o "spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json"
 
 .PHONY: sbom-images
 sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-subscriber images.
 	@if [ "$(SBOM_IMAGE_SOURCE)" = "docker" ] && [ "$(SBOM_IMAGE_BUILD)" = "1" ]; then \
 		$(MAKE) image-build; \
 	fi
-	mkdir -p $(SBOM_DIR)
-	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json
-	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(SERVER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json
-	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json
+	mkdir -p "$(SBOM_DIR)"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SERVER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json"
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.

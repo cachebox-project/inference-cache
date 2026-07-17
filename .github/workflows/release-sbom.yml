@@ -26,6 +26,16 @@ jobs:
     name: Generate and Attach SBOMs
     runs-on: ubuntu-latest
     steps:
+    - name: Validate release tag
+      env:
+        RELEASE_TAG: ${{ env.RELEASE_TAG }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+          echo "Release tag must be a Docker-compatible tag: [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}" >&2
+          exit 1
+        fi
+
     - name: Checkout
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       with:
