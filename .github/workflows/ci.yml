@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SYFT_VERSION: v1.20.0
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -233,7 +236,6 @@ jobs:
       contents: read
     env:
       IMAGE_TAG: ci-${{ github.sha }}
-      SYFT_VERSION: v1.20.0
     steps:
     - name: Checkout
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -360,7 +362,7 @@ jobs:
     - name: Set up Syft
       uses: ./.github/actions/setup-syft
       with:
-        version: v1.20.0
+        version: ${{ env.SYFT_VERSION }}
 
     - name: Build images
       run: make image-build TAG=${IMAGE_TAG}

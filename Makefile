@@ -1,4 +1,5 @@
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
+MAKEFILE_SELF := $(abspath $(lastword $(MAKEFILE_LIST)))
 LOCALBIN ?= $(PROJECT_DIR)/bin
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
@@ -353,7 +354,7 @@ sbom-release: syft-check ## Generate a source/release SBOM for the checked-out t
 .PHONY: sbom-images
 sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-subscriber images.
 	@if [ "$(SBOM_IMAGE_SOURCE)" = "docker" ] && [ "$(SBOM_IMAGE_BUILD)" = "1" ]; then \
-		$(MAKE) image-build; \
+		$(MAKE) -f "$(MAKEFILE_SELF)" image-build; \
 	fi
 	mkdir -p "$(SBOM_DIR)"
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json"
