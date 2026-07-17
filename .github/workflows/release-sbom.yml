@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  packages: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag }}
@@ -37,11 +36,8 @@ jobs:
       with:
         version: ${{ env.SYFT_VERSION }}
 
-    - name: Log in to GHCR
-      run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
     - name: Generate SBOMs
-      run: make sbom-release sbom-images TAG="${RELEASE_TAG}" SBOM_IMAGE_SOURCE=registry
+      run: make sbom TAG="${RELEASE_TAG}"
 
     - name: Upload SBOM workflow artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

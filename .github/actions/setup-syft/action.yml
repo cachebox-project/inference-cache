@@ -6,6 +6,10 @@ inputs:
     description: Syft release version to install.
     required: false
     default: v1.20.0
+  linux-amd64-sha256:
+    description: Expected SHA-256 of the linux-amd64 Syft release archive.
+    required: false
+    default: 689e12c5cbf67521ce61b9c126068f9eaabe1223e77971b2fede50033ff6b5cc
 
 runs:
   using: composite
@@ -14,15 +18,13 @@ runs:
     shell: bash
     env:
       SYFT_VERSION: ${{ inputs.version }}
+      SYFT_SHA256: ${{ inputs.linux-amd64-sha256 }}
     run: |
       set -euo pipefail
       version="${SYFT_VERSION#v}"
       archive="syft_${version}_linux_amd64.tar.gz"
-      checksums="syft_${version}_checksums.txt"
       curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"
-      curl -fsSL -o "$RUNNER_TEMP/$checksums" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${checksums}"
-      grep "  ${archive}$" "$RUNNER_TEMP/$checksums" > "$RUNNER_TEMP/syft.sha256"
-      (cd "$RUNNER_TEMP" && sha256sum -c syft.sha256)
+      echo "${SYFT_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
       mkdir -p "$RUNNER_TEMP/syft"
       tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
       echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"

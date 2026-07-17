@@ -357,8 +357,25 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4
 
+    - name: Set up Syft
+      uses: ./.github/actions/setup-syft
+      with:
+        version: v1.20.0
+
     - name: Build images
       run: make image-build TAG=${IMAGE_TAG}
+
+    - name: Generate image SBOM smoke
+      run: make sbom-images TAG=${IMAGE_TAG} SBOM_IMAGE_BUILD=0 SBOM_DIR="$RUNNER_TEMP/sbom-image-smoke"
+
+    - name: Verify image SBOM outputs
+      run: |
+        set -euo pipefail
+        for component in controller server subscriber; do
+          sbom="$RUNNER_TEMP/sbom-image-smoke/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
+          test -s "$sbom"
+          jq -e '.spdxVersion and .packages' "$sbom" >/dev/null
+        done
 
     # Both image scans run with exit-code: 0 (and both SARIF uploads run with
     # if: always()) so a failing controller scan can't short-circuit the server
