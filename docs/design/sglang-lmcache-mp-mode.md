@@ -196,9 +196,13 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   (the documented `lmcache server` subcommand is the equivalent entrypoint; the
   rendered wire uses the `python3 -m` form, which is what validation exercised).
   `<endpoint>` is the Redis address passed to `InjectEngineConfig`. Its
-  **image is pinned and version-aligned with the engine's LMCache connector** —
-  the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew
-  between worker and engine is a correctness hazard; the tuple is tracked in
+  **image defaults to the engine's own image (and should be digest-pinned in
+  production)**, keeping it version-aligned with the engine's LMCache connector —
+  the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew between
+  worker and engine is a correctness hazard, and defaulting to the same image makes
+  the aligned case the zero-config one. `backendConfig.workerImage` overrides it, at
+  which point the alignment (and the digest pin) is the operator's to maintain; the
+  tuple is tracked in
   `VERSIONS.md` alongside the engine image (validation used the engine's own
   `pip install lmcache`→0.5.1, so the simplest pin is the same image and `lmcache`
   version for both). Mounts the shared `/dev/shm`
@@ -216,9 +220,9 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   connects. (An ordinary sidecar would race the engine.) The adapter's minimum is
   K8s ≥ 1.29. Fail-open interaction is resolved below.
 - **engine container** — add `--enable-lmcache`, `--lmcache-config-file
-  /config/lmcache.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
-  `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/config`. **Drop** the
-  MP-ignored `LMCACHE_REMOTE_URL` / `LMCACHE_REMOTE_SERDE` / `LMCACHE_LOCAL_CPU` /
+  /etc/lmcache/config.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
+  `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/etc/lmcache`. **Drop**
+  the MP-ignored `LMCACHE_REMOTE_URL` / `LMCACHE_REMOTE_SERDE` / `LMCACHE_LOCAL_CPU` /
   `LMCACHE_MAX_LOCAL_CPU_SIZE` env.
 
 `mp_host=127.0.0.1` works because the worker is a **same-pod sidecar** — it shares
@@ -295,10 +299,16 @@ serving component), and Phase 2 must *validate* rather than assume it:
   and if even that cannot preserve L1-only serving, "L2 required at startup"
   becomes a **documented limitation of the pair**, not a silent breakage. The
   viable mechanism is a Phase-2 finding, not claimed here.
-- **Worker crash / restart.** Whether the engine survives a mid-flight worker
-  restart (`restartPolicy: Always`) — recomputing during the gap, resuming cache
-  use after — is a Phase-2 acceptance test. If SGLang cannot tolerate worker loss
-  at all, that is the pair's documented fail-open boundary (the worker is a
+- **Worker crash / restart — DEFERRED, not yet measured.** Whether the engine
+  survives a mid-flight worker restart (`restartPolicy: Always`) — recomputing during
+  the gap, resuming cache use after — was NOT measured in increments 1–2, which
+  validated the store→flush→retrieve data path but not worker-loss recovery. It is
+  the first, gating step of increment 3 (the same increment that adds the engine
+  liveness probe + `Degraded` condition — see [Phased delivery](#phased-delivery)),
+  precisely because the containment mechanism depends on the answer: a
+  restart-on-unhealthy loop built before this is measured could turn "caching
+  silently stopped" into "engine repeatedly killed". If SGLang cannot tolerate worker
+  loss at all, that becomes the pair's documented fail-open boundary (the worker is a
   required serving component; not every engine/backend pair offers identical
   guarantees), surfaced via the `CacheBackend` `Degraded` condition.
 - **`failOpen: false`.** The operator has promoted the cache to a serving
