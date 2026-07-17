@@ -145,18 +145,18 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 }
 
 // redisMaxmemoryBytes derives Redis's `--maxmemory` LRU budget as 80% of the pod's
-// memory sizing: the memory limit, falling back to the request, then to
-// redisMaxmemoryDefaultBytes when neither is set. Deriving it from the same
-// spec.resources the container carries — and staying strictly below it (80%) —
-// keeps the budget inside the cgroup with headroom, so LRU eviction reclaims space
-// before the OOM killer ever fires.
+// memory LIMIT, falling back to redisMaxmemoryDefaultBytes when no positive limit is
+// set. It deliberately does NOT size off a memory request: a request is a scheduling
+// floor, not a ceiling, so a request-only pod has no cgroup bound for the budget to
+// stay under — basing an OOM-avoidance budget on it would be a false comfort. This
+// matches the accepted design (docs/design/sglang-lmcache-mp-mode.md: `--maxmemory`
+// "from the pod's memory limit (with headroom), falling back to an explicit bounded
+// default"). Sizing off the limit and staying below it (80%) keeps the budget inside
+// the cgroup with headroom, so LRU eviction reclaims space before the OOM killer fires.
 func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	base := redisMaxmemoryDefaultBytes
 	if cache != nil && cache.Spec.Resources != nil {
-		res := cache.Spec.Resources
-		if q, ok := res.Limits[corev1.ResourceMemory]; ok && q.Value() > 0 {
-			base = q.Value()
-		} else if q, ok := res.Requests[corev1.ResourceMemory]; ok && q.Value() > 0 {
+		if q, ok := cache.Spec.Resources.Limits[corev1.ResourceMemory]; ok && q.Value() > 0 {
 			base = q.Value()
 		}
 	}

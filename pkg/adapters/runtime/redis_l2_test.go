@@ -176,7 +176,10 @@ func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
 	}{
 		{"limit 8Gi -> 80%", "8Gi", "", 6871947674},
 		{"limit 4Gi wins over request -> 80% of limit", "4Gi", "2Gi", 3435973837},
-		{"request-only 4Gi -> 80% of request", "", "4Gi", 3435973837},
+		// A request is a scheduling floor, not a ceiling, so it is NOT a sizing
+		// source: a request-only block falls back to the bounded default, exactly as
+		// a resource-less spec does. (Matches the design: limit-or-fixed-default.)
+		{"request-only 4Gi -> ignored, 80% of 8Gi default", "", "4Gi", 6871947674},
 		{"no sizing -> 80% of 8Gi default", "", "", 6871947674},
 		{"limit 100Mi -> 80%, in-bounds", "100Mi", "", 83886080},
 		{"sub-byte limit -> stays positive (never 0/unlimited), never exceeds base", "1", "", 1},
