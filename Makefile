@@ -378,8 +378,27 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 		component="$${image%%|*}"; \
 		repo="$${image#*|}"; \
 		ref="$${repo}:$(TAG)"; \
-		digest="$$( { $(DOCKER_BUILD_CMD) buildx imagetools inspect "$$ref" 2>/dev/null || true; } | awk '/^Digest:/ {print $$2; exit}')"; \
-		if [ -z "$$digest" ] && [ "$(SBOM_REGISTRY_PUBLISH_MISSING)" = "1" ]; then \
+		inspect_log="$$(mktemp)"; \
+		missing=0; \
+		if $(DOCKER_BUILD_CMD) buildx imagetools inspect "$$ref" >"$$inspect_log" 2>&1; then \
+			digest="$$(awk '/^Digest:/ {print $$2; exit}' "$$inspect_log")"; \
+			if [ -z "$$digest" ]; then \
+				echo "ERROR: unable to resolve digest for $$ref" >&2; \
+				cat "$$inspect_log" >&2; \
+				rm -f "$$inspect_log"; \
+				exit 1; \
+			fi; \
+		elif grep -Eiq 'manifest unknown|manifest not found|not found|no such manifest|name unknown' "$$inspect_log"; then \
+			digest=""; \
+			missing=1; \
+		else \
+			echo "ERROR: unable to inspect $$ref" >&2; \
+			cat "$$inspect_log" >&2; \
+			rm -f "$$inspect_log"; \
+			exit 1; \
+		fi; \
+		rm -f "$$inspect_log"; \
+		if [ "$$missing" = "1" ] && [ "$(SBOM_REGISTRY_PUBLISH_MISSING)" = "1" ]; then \
 			metadata="$$(mktemp)"; \
 			$(DOCKER_BUILD_CMD) buildx build \
 				--push \

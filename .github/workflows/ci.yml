@@ -269,11 +269,20 @@ jobs:
           case "$4" in
             ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
             ghcr.io/cachebox-project/inference-cache-server:ci-*|\
-            ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) exit 1 ;;
+            ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) ;;
             *) echo "unexpected inspect ref: $4" >&2; exit 2 ;;
+          esac
+          case "${DOCKER_FAKE_MODE:-missing}" in
+            authfail) echo "unauthorized: authentication required" >&2; exit 42 ;;
+            missing) echo "manifest unknown: manifest unknown" >&2; exit 1 ;;
+            *) echo "unexpected fake mode: ${DOCKER_FAKE_MODE:-}" >&2; exit 2 ;;
           esac
         fi
         if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
+          if [ "${DOCKER_FAKE_MODE:-missing}" != "missing" ]; then
+            echo "build must not run for mode ${DOCKER_FAKE_MODE:-}" >&2
+            exit 2
+          fi
           metadata=""
           tag=""
           while [ "$#" -gt 0 ]; do
@@ -326,7 +335,12 @@ jobs:
         EOF
 
         chmod +x "$fakebin/docker" "$fakebin/syft"
-        PATH="$fakebin:$PATH" make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+        if PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=authfail make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile; then
+          echo "expected registry auth failure to stop without publishing" >&2
+          exit 1
+        fi
+
+        PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
         for component in controller server subscriber; do
           sbom="$outdir/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
           test -s "$sbom"
