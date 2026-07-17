@@ -226,6 +226,33 @@ jobs:
     - name: Build binaries
       run: make build
 
+  sbom-smoke:
+    name: SBOM Smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: ci-${{ github.sha }}
+      SYFT_VERSION: v1.20.0
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Set up Syft
+      uses: ./.github/actions/setup-syft
+      with:
+        version: ${{ env.SYFT_VERSION }}
+
+    - name: Generate source SBOM
+      run: make sbom-release TAG="${IMAGE_TAG}" SBOM_DIR="$RUNNER_TEMP/sbom-smoke"
+
+    - name: Verify SBOM output
+      run: |
+        set -euo pipefail
+        sbom="$RUNNER_TEMP/sbom-smoke/inference-cache-${IMAGE_TAG}.spdx.json"
+        test -s "$sbom"
+        jq -e '.spdxVersion and .packages' "$sbom" >/dev/null
+
   tokenize-cgo:
     name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
     runs-on: ubuntu-latest
@@ -270,6 +297,7 @@ jobs:
     - fingerprint-e2e
     - vulnerability-scan
     - build
+    - sbom-smoke
     - tokenize-cgo
     if: always()
     permissions:
@@ -282,6 +310,7 @@ jobs:
         FINGERPRINT_E2E_RESULT: ${{ needs.fingerprint-e2e.result }}
         VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
         BUILD_RESULT: ${{ needs.build.result }}
+        SBOM_SMOKE_RESULT: ${{ needs.sbom-smoke.result }}
         TOKENIZE_CGO_RESULT: ${{ needs.tokenize-cgo.result }}
       run: |
         failed=0
@@ -291,6 +320,7 @@ jobs:
           "fingerprint-e2e:$FINGERPRINT_E2E_RESULT" \
           "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
           "build:$BUILD_RESULT" \
+          "sbom-smoke:$SBOM_SMOKE_RESULT" \
           "tokenize-cgo:$TOKENIZE_CGO_RESULT"; do
           name="${item%%:*}"
           result="${item#*:}"

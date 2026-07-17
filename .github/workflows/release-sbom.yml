@@ -32,27 +32,16 @@ jobs:
       with:
         ref: ${{ env.RELEASE_TAG }}
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4
+    - name: Set up Syft
+      uses: ./.github/actions/setup-syft
+      with:
+        version: ${{ env.SYFT_VERSION }}
 
-    - name: Install Syft
-      env:
-        SYFT_VERSION: ${{ env.SYFT_VERSION }}
-      run: |
-        set -euo pipefail
-        version="${SYFT_VERSION#v}"
-        archive="syft_${version}_linux_amd64.tar.gz"
-        checksums="syft_${version}_checksums.txt"
-        curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"
-        curl -fsSL -o "$RUNNER_TEMP/$checksums" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${checksums}"
-        grep "  ${archive}$" "$RUNNER_TEMP/$checksums" | sha256sum -c -
-        mkdir -p "$RUNNER_TEMP/syft"
-        tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
-        echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
-        "$RUNNER_TEMP/syft/syft" version
+    - name: Log in to GHCR
+      run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-    - name: Build images and generate SBOMs
-      run: make sbom TAG="${RELEASE_TAG}"
+    - name: Generate SBOMs
+      run: make sbom-release sbom-images TAG="${RELEASE_TAG}" SBOM_IMAGE_SOURCE=registry
 
     - name: Upload SBOM workflow artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

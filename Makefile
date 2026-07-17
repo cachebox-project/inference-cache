@@ -19,7 +19,12 @@ KIND_CLUSTER ?= inference-cache
 KIND_NODE_IMAGE ?= kindest/node:v1.31.0
 SYFT ?= syft
 SBOM_DIR ?= dist/sbom
+SBOM_IMAGE_SOURCE ?= docker
 SBOM_TAG := $(subst /,_,$(TAG))
+SBOM_IMAGE_BUILD_DEPS :=
+ifeq ($(SBOM_IMAGE_SOURCE),docker)
+SBOM_IMAGE_BUILD_DEPS := image-build
+endif
 
 version_pkg = $(MODULE)/pkg/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
@@ -325,7 +330,7 @@ subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-
 	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t $(SUBSCRIBER_IMG) .
 
 .PHONY: sbom
-sbom: image-build sbom-release sbom-images ## Generate release and per-image SPDX JSON SBOMs with Syft.
+sbom: sbom-release sbom-images ## Generate release and per-image SPDX JSON SBOMs with Syft.
 
 .PHONY: sbom-release
 sbom-release: ## Generate a source/release SBOM for the checked-out tree.
@@ -339,12 +344,12 @@ sbom-release: ## Generate a source/release SBOM for the checked-out tree.
 		-o spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json
 
 .PHONY: sbom-images
-sbom-images: ## Generate SBOMs for the locally-built controller, server, and kvevent-subscriber images.
+sbom-images: $(SBOM_IMAGE_BUILD_DEPS) ## Generate SBOMs for controller, server, and kvevent-subscriber images.
 	@command -v $(SYFT) >/dev/null || { echo "ERROR: syft missing. Install syft or set SYFT=/path/to/syft"; exit 1; }
 	mkdir -p $(SBOM_DIR)
-	$(SYFT) scan docker:$(IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json
-	$(SYFT) scan docker:$(SERVER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json
-	$(SYFT) scan docker:$(SUBSCRIBER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json
+	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json
+	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(SERVER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json
+	$(SYFT) scan $(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG) -o spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.

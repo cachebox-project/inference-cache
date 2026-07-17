@@ -1,0 +1,29 @@
+name: Set up Syft
+description: Install a pinned Syft binary with upstream checksum verification.
+
+inputs:
+  version:
+    description: Syft release version to install.
+    required: false
+    default: v1.20.0
+
+runs:
+  using: composite
+  steps:
+  - name: Install Syft
+    shell: bash
+    env:
+      SYFT_VERSION: ${{ inputs.version }}
+    run: |
+      set -euo pipefail
+      version="${SYFT_VERSION#v}"
+      archive="syft_${version}_linux_amd64.tar.gz"
+      checksums="syft_${version}_checksums.txt"
+      curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"
+      curl -fsSL -o "$RUNNER_TEMP/$checksums" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${checksums}"
+      grep "  ${archive}$" "$RUNNER_TEMP/$checksums" > "$RUNNER_TEMP/syft.sha256"
+      (cd "$RUNNER_TEMP" && sha256sum -c syft.sha256)
+      mkdir -p "$RUNNER_TEMP/syft"
+      tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
+      echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
+      "$RUNNER_TEMP/syft/syft" version
