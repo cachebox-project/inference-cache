@@ -1604,6 +1604,97 @@ func TestChainLookupFullChainMatch(t *testing.T) {
 	}
 }
 
+// TestIngestDefaultsTierT1Exact pins the default-ingest rule on the legacy
+// exact-match path: a PrefixRef that leaves Tier unset is stored (and surfaced
+// on lookup) as T1 — the engine KV cache. No detection logic runs.
+func TestIngestDefaultsTierT1Exact(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 64}}}) // Tier unset
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p1")})
+	if len(got) != 1 || got[0].Tier != TierT1 {
+		t.Fatalf("unset tier must default to T1 on lookup; got %+v", got)
+	}
+}
+
+// TestIngestDefaultsTierT1Chain pins the same default-ingest rule on the
+// block-chain path: the run's summarized tier is T1 when every block was
+// ingested without an explicit tier (all blocks T1 → coldest is T1).
+func TestIngestDefaultsTierT1Chain(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2", "b3")
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{BlockHashes: hashes, BlockTokenCounts: counts}}}) // Tier unset
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(got) != 1 || got[0].Tier != TierT1 {
+		t.Fatalf("unset tier must default to T1 on a chain lookup; got %+v", got)
+	}
+}
+
+// TestIngestCarriesExplicitTier proves the plumbing round-trips a producer-set
+// tier unchanged (the substrate the future detection ticket writes into): an
+// entry ingested as T2 surfaces as T2 on lookup — no T1 defaulting overrides it.
+func TestIngestCarriesExplicitTier(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p1"), TokenCount: 64, Tier: TierT2}}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm", PrefixHash: hash("p1")})
+	if len(got) != 1 || got[0].Tier != TierT2 {
+		t.Fatalf("explicit T2 tier must round-trip unchanged; got %+v", got)
+	}
+}
+
+// TestChainLookupReportsColdestTierAcrossRun exercises worstTier folding: a
+// run that spans a T2 head block and a T1 tail block summarizes to the tier
+// the replica can serve the ENTIRE run from — T2, the constraining block's
+// tier. Claiming T1 would overstate the hint: serving the full matched prefix
+// means touching the T2-only block.
+func TestChainLookupReportsColdestTierAcrossRun(t *testing.T) {
+	idx := New(WithTTL(time.Hour))
+	hashes, counts := chain("b1", "b2")
+	// Two entries for the same replica under different tiers: block b1 held in
+	// T2, block b2 in T1. A single Update expands one tier across its blocks,
+	// so report the two blocks as separate prefixes to mix tiers within the run.
+	idx.Ingest(Update{ReplicaID: "replica-a", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{
+			{BlockHashes: hashes[:1], BlockTokenCounts: counts[:1], Tier: TierT2},
+			{BlockHashes: hashes[1:], BlockTokenCounts: counts[1:], Tier: TierT1},
+		}})
+
+	got := idx.Lookup(LookupRequest{Model: "m", Tenant: "t", HashScheme: "vllm",
+		BlockHashes: hashes, BlockTokenCounts: counts})
+	if len(got) != 1 || got[0].MatchedTokens != 32 {
+		t.Fatalf("expected a full 2-block run (matched_tokens=32); got %+v", got)
+	}
+	if got[0].Tier != TierT2 {
+		t.Fatalf("mixed-tier run must summarize to the coldest tier (T2 — the constraining block); got %v", got[0].Tier)
+	}
+}
+
+// TestWorstTierPrefersLeastLocal is a unit check on the across-run fold helper:
+// the colder tier (higher enum value) wins, and TierUnspecified poisons the
+// fold — an unknown block tier makes the run's tier unknown rather than a
+// false claim.
+func TestWorstTierPrefersLeastLocal(t *testing.T) {
+	cases := []struct{ a, b, want CacheTier }{
+		{TierT1, TierT2, TierT2},
+		{TierT3, TierT2, TierT3},
+		{TierT1, TierT1, TierT1},
+		{TierUnspecified, TierT3, TierUnspecified},
+		{TierT2, TierUnspecified, TierUnspecified},
+		{TierUnspecified, TierUnspecified, TierUnspecified},
+	}
+	for _, c := range cases {
+		if got := worstTier(c.a, c.b); got != c.want {
+			t.Errorf("worstTier(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
 // TestChainLookupNoOverlapReturnsEmpty: zero shared blocks → no hint. Guards
 // against the longest-prefix walk silently returning matched_tokens=0 scores.
 func TestChainLookupNoOverlapReturnsEmpty(t *testing.T) {
