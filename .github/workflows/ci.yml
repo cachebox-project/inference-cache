@@ -266,8 +266,31 @@ jobs:
         #!/bin/sh
         set -eu
         if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
-          echo "Name:      $4"
-          echo "Digest:    sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          case "$4" in
+            ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
+            ghcr.io/cachebox-project/inference-cache-server:ci-*|\
+            ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) exit 1 ;;
+            *) echo "unexpected inspect ref: $4" >&2; exit 2 ;;
+          esac
+        fi
+        if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
+          metadata=""
+          tag=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --metadata-file) metadata="$2"; shift 2 ;;
+              -t) tag="$2"; shift 2 ;;
+              *) shift ;;
+            esac
+          done
+          case "$tag" in
+            ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
+            ghcr.io/cachebox-project/inference-cache-server:ci-*|\
+            ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) ;;
+            *) echo "unexpected build tag: $tag" >&2; exit 2 ;;
+          esac
+          test -n "$metadata"
+          printf '{"containerimage.digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}\n' >"$metadata"
           exit 0
         fi
         echo "unexpected docker invocation: $*" >&2
@@ -282,6 +305,12 @@ jobs:
           echo "Version:    1.20.0"
           exit 0
         fi
+        case "${2:-}" in
+          registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
+          registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222|\
+          registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222) ;;
+          *) echo "unexpected syft source: ${2:-}" >&2; exit 2 ;;
+        esac
         out=""
         for arg in "$@"; do
           case "$arg" in
@@ -297,7 +326,7 @@ jobs:
         EOF
 
         chmod +x "$fakebin/docker" "$fakebin/syft"
-        PATH="$fakebin:$PATH" make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir"
+        PATH="$fakebin:$PATH" make sbom-registry-images TAG="${IMAGE_TAG}" SBOM_DIR="$outdir" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
         for component in controller server subscriber; do
           sbom="$outdir/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
           test -s "$sbom"

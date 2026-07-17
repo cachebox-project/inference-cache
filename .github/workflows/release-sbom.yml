@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
+      packages: write
     steps:
     - name: Validate release tag
       env:
@@ -77,7 +77,7 @@ jobs:
       run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-release TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
     - name: Generate published image SBOMs
-      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
+      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT="$GITHUB_WORKSPACE/release-source" SBOM_DOCKERFILE="$GITHUB_WORKSPACE/release-source/dockerfiles/Dockerfile"
 
     - name: Upload SBOM workflow artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

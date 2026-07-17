@@ -21,6 +21,12 @@ runs:
       SYFT_SHA256: ${{ inputs.linux-amd64-sha256 }}
     run: |
       set -euo pipefail
+      default_version="v1.20.0"
+      default_sha256="689e12c5cbf67521ce61b9c126068f9eaabe1223e77971b2fede50033ff6b5cc"
+      if [ "$SYFT_VERSION" != "$default_version" ] && [ "$SYFT_SHA256" = "$default_sha256" ]; then
+        echo "linux-amd64-sha256 must be supplied when overriding Syft version" >&2
+        exit 1
+      fi
       version="${SYFT_VERSION#v}"
       archive="syft_${version}_linux_amd64.tar.gz"
       curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"

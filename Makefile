@@ -27,6 +27,9 @@ SYFT_VERSION_NO_V := $(patsubst v%,%,$(SYFT_VERSION))
 SBOM_DIR ?= dist/sbom
 SBOM_IMAGE_SOURCE ?= docker
 SBOM_IMAGE_BUILD ?= 1
+SBOM_IMAGE_CONTEXT ?= .
+SBOM_DOCKERFILE ?= dockerfiles/Dockerfile
+SBOM_REGISTRY_PUBLISH_MISSING ?= 0
 SBOM_TAG := $(subst /,_,$(TAG))
 
 version_pkg = $(MODULE)/pkg/version
@@ -375,7 +378,19 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 		component="$${image%%|*}"; \
 		repo="$${image#*|}"; \
 		ref="$${repo}:$(TAG)"; \
-		digest="$$(docker buildx imagetools inspect "$$ref" | awk '/^Digest:/ {print $$2; exit}')"; \
+		digest="$$( { $(DOCKER_BUILD_CMD) buildx imagetools inspect "$$ref" 2>/dev/null || true; } | awk '/^Digest:/ {print $$2; exit}')"; \
+		if [ -z "$$digest" ] && [ "$(SBOM_REGISTRY_PUBLISH_MISSING)" = "1" ]; then \
+			metadata="$$(mktemp)"; \
+			$(DOCKER_BUILD_CMD) buildx build \
+				--push \
+				-f "$(SBOM_DOCKERFILE)" \
+				--target "$$component" \
+				-t "$$ref" \
+				--metadata-file "$$metadata" \
+				"$(SBOM_IMAGE_CONTEXT)"; \
+			digest="$$(jq -r '."containerimage.digest" // empty' "$$metadata")"; \
+			rm -f "$$metadata"; \
+		fi; \
 		if [ -z "$$digest" ]; then \
 			echo "ERROR: unable to resolve digest for $$ref" >&2; \
 			exit 1; \
