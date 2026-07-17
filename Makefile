@@ -476,6 +476,10 @@ verify-no-internal-refs: ## Fail if tracked files reference internal issue track
 	fi; \
 	echo "✓ no internal issue-tracker references"
 
+.PHONY: verify-syft-pin
+verify-syft-pin: ## Fail if the Syft version/checksum pin drifts across release tooling.
+	@bash hack/verify-syft-version.sh
+
 .PHONY: fmt-check
 fmt-check: ## Check Go formatting without modifying files.
 	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './bin/*' -not -path './.cache/*')); \
@@ -507,7 +511,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + Syft pin drift + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

@@ -5,6 +5,8 @@ inputs:
   version:
     description: Syft release version to install.
     required: false
+    # Keep this coordinated with Makefile/workflows; make verify-syft-pin
+    # checks the public release/SBOM tooling does not drift.
     default: v1.20.0
   linux-amd64-sha256:
     description: Expected SHA-256 of the linux-amd64 Syft release archive.
