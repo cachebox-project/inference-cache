@@ -36,18 +36,24 @@ jobs:
           exit 1
         fi
 
-    - name: Checkout
+    - name: Checkout SBOM tooling
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       with:
-        ref: ${{ env.RELEASE_TAG }}
+        ref: ${{ github.event.repository.default_branch }}
 
     - name: Set up Syft
       uses: ./.github/actions/setup-syft
       with:
         version: ${{ env.SYFT_VERSION }}
 
+    - name: Checkout release source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      with:
+        ref: ${{ env.RELEASE_TAG }}
+        path: release-source
+
     - name: Generate SBOMs
-      run: make sbom TAG="${RELEASE_TAG}"
+      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
     - name: Upload SBOM workflow artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
