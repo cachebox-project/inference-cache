@@ -138,9 +138,13 @@ from a T1 eviction combined with knowledge that an L2 tier is configured:
   content-fingerprint key at T2** (reload-able from L2) rather than deleting it.
   The index applies last-write-wins on tier, moving the entry T1→T2; a later
   `BlockStored` of the same content re-reports it at T1 (upgrade). The re-report
-  rides the same additive `ReportCacheState` path as adds, so store→evict order
-  is preserved and its freshness is anchored at the eviction time (when
-  reload-ability was last confirmed).
+  goes on the same additive `ReportCacheState` path as adds, but is flushed at the
+  eviction boundary as its **own** update carrying the eviction timestamp — a
+  `CacheStateUpdate` has a single `timestamp_us` for all its prefixes, so batching
+  the downgrade with a later store in the same debounce window would refresh the
+  T2 entry's freshness away from the eviction. Sending it separately keeps T2
+  freshness anchored at the eviction time (when reload-ability was last confirmed)
+  and preserves store→evict order.
 - **`BlockRemoved`, no L2 tier → delete.** Forward `PREFIX_EVICTED` (the prefix
   is genuinely gone).
 - **T3 (remote / disaggregated) is out of scope** — no engine signal

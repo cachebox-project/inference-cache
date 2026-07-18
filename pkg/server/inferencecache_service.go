@@ -1072,13 +1072,22 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 }
 
 // cacheTierFromProto maps the ingest wire enum onto the index's cache-tier tag.
-// UNSPECIFIED (the wire default an older producer sends) maps to TierUnspecified,
-// which the index normalizes to T1 at ingest — so a producer that never sets the
-// field still lands its stored prefixes at T1. An unknown/future value also maps
-// to TierUnspecified (fail-safe → T1) rather than being dropped. Inverse of
-// cacheTierToProto.
+// It must keep two cases DISTINCT:
+//   - CACHE_TIER_UNSPECIFIED (0) — a legacy producer omitted the field — maps to
+//     TierUnspecified, which the index normalizes to T1 at ingest. So an older
+//     subscriber that never sets the tier still lands its stored prefixes at T1.
+//   - An unrecognized NON-ZERO value — a future producer reporting a colder tier
+//     this server doesn't know yet — must NOT collapse to the T1 default (that
+//     would over-claim the hottest tier for a hold we know is colder). The raw
+//     value is retained (the index enum mirrors the proto values one-for-one), so
+//     it is carried honestly: worstTier ranks it colder than any known tier, and
+//     cacheTierToProto reports it back as UNSPECIFIED to old clients — never T1.
+//
+// Inverse of cacheTierToProto for the known values.
 func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
 	switch t {
+	case icpb.CacheTier_CACHE_TIER_UNSPECIFIED:
+		return index.TierUnspecified // legacy-unset → T1 at ingest
 	case icpb.CacheTier_CACHE_TIER_T1:
 		return index.TierT1
 	case icpb.CacheTier_CACHE_TIER_T2:
@@ -1086,7 +1095,7 @@ func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
 	case icpb.CacheTier_CACHE_TIER_T3:
 		return index.TierT3
 	default:
-		return index.TierUnspecified
+		return index.CacheTier(t) // future-unknown → retained, never conflated with unset/T1
 	}
 }
 

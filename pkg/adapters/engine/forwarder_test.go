@@ -81,6 +81,31 @@ func (s *recordingServer) prefixTiers(want []byte) []icpb.CacheTier {
 	return out
 }
 
+// wireEntry is one forwarded PrefixEntry paired with the timestamp_us of the
+// CacheStateUpdate that carried it — the freshness the server will anchor the
+// index entry at.
+type wireEntry struct {
+	tier icpb.CacheTier
+	tsUs int64
+}
+
+// prefixEntries returns, in send order, every forwarded entry for prefix want
+// together with its CSU timestamp. Lets a test assert not just the tier history
+// but the timestamp each tier was reported at.
+func (s *recordingServer) prefixEntries(want []byte) []wireEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []wireEntry
+	for _, u := range s.updates {
+		for _, p := range u.GetPrefixes() {
+			if bytes.Equal(p.GetPrefixHash(), want) {
+				out = append(out, wireEntry{tier: p.GetTier(), tsUs: u.GetTimestampUs()})
+			}
+		}
+	}
+	return out
+}
+
 func runReporter(t *testing.T, batches ...*EventBatch) *recordingServer {
 	return runReporterWindow(t, 20*time.Millisecond, batches...)
 }
@@ -345,6 +370,47 @@ func TestReporterL2ModeDowngradesEvictionToT2(t *testing.T) {
 		if e.GetType() == icpb.CacheEvent_PREFIX_EVICTED {
 			t.Errorf("L2 downgrade must not emit PREFIX_EVICTED; got %x", e.GetPrefixHash())
 		}
+	}
+}
+
+// TestReporterL2ModeDowngradeKeepsEvictionTimestamp pins that a T2 downgrade's
+// freshness is anchored at ITS OWN eviction time even when an unrelated
+// BlockStored arrives in the same debounce window. A CacheStateUpdate carries a
+// single timestamp_us for all its prefixes, so if the downgrade rode the shared
+// `pending` buffer the later store would overwrite the batch timestamp and refresh
+// the T2 entry away from the eviction. The reporter must send the downgrade as its
+// own update at the eviction timestamp.
+func TestReporterL2ModeDowngradeKeepsEvictionTimestamp(t *testing.T) {
+	const bs = 16
+	toksA := tokSeq(500, bs)
+	prefixA := fingerprint.Bytes(fingerprint.PrefixHashes(toksA, bs)[0])
+	toksB := tokSeq(600, bs) // unrelated content — must not lend its timestamp to A
+
+	const evictSec = 200.0
+	const storeBSec = 300.0
+	// time.Hour window: without the per-eviction send, A's T2 downgrade and B's T1
+	// store would coalesce into one CSU whose shared timestamp_us takes B's (later)
+	// value.
+	rec := runReporterWithOpts(t,
+		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
+		&EventBatch{TimestampSeconds: 100.0, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xA1}}, TokenIDs: toksA, BlockSize: bs}}},
+		&EventBatch{TimestampSeconds: evictSec, Events: []Event{BlockRemoved{BlockHashes: [][]byte{{0xA1}}}}},
+		&EventBatch{TimestampSeconds: storeBSec, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xB1}}, TokenIDs: toksB, BlockSize: bs}}},
+	)
+
+	var t2ts int64
+	var foundT2 bool
+	for _, we := range rec.prefixEntries(prefixA) {
+		if we.tier == icpb.CacheTier_CACHE_TIER_T2 {
+			t2ts = we.tsUs
+			foundT2 = true
+		}
+	}
+	if !foundT2 {
+		t.Fatalf("no T2 downgrade recorded for prefix A; entries=%v", rec.prefixEntries(prefixA))
+	}
+	if want := microsFromSeconds(evictSec); t2ts != want {
+		t.Errorf("T2 downgrade timestamp_us = %d, want %d (the eviction time) — a later unrelated BlockStored must not refresh it", t2ts, want)
 	}
 }
 

@@ -212,9 +212,7 @@ func TestCacheTierToProto(t *testing.T) {
 }
 
 // TestCacheTierFromProto pins the ingest wire→index mapping (inverse of
-// TestCacheTierToProto): the subscriber tags a PrefixEntry T1/T2, and an older
-// producer leaves it UNSPECIFIED. UNSPECIFIED and any unknown/future value map to
-// TierUnspecified, which the index normalizes to T1 at ingest — never dropped.
+// TestCacheTierToProto) for the known values.
 func TestCacheTierFromProto(t *testing.T) {
 	cases := []struct {
 		in   icpb.CacheTier
@@ -224,12 +222,38 @@ func TestCacheTierFromProto(t *testing.T) {
 		{icpb.CacheTier_CACHE_TIER_T1, index.TierT1},
 		{icpb.CacheTier_CACHE_TIER_T2, index.TierT2},
 		{icpb.CacheTier_CACHE_TIER_T3, index.TierT3},
-		{icpb.CacheTier(99), index.TierUnspecified}, // unknown/future → fail-safe (→ T1 at ingest)
 	}
 	for _, c := range cases {
 		if got := cacheTierFromProto(c.in); got != c.want {
 			t.Errorf("cacheTierFromProto(%v) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestCacheTierFromProtoDistinguishesUnsetFromUnknown keeps the two forward-compat
+// cases DISTINCT: a legacy producer that omits the field (UNSPECIFIED / 0) must get
+// the T1 ingest-default, but a future producer reporting a colder tier this server
+// doesn't recognize must NOT be conflated with legacy-unset — collapsing it to
+// TierUnspecified would silently over-claim the hold as the hottest tier (T1) at
+// ingest. The unknown value is retained instead.
+func TestCacheTierFromProtoDistinguishesUnsetFromUnknown(t *testing.T) {
+	// Legacy-unset → TierUnspecified, which normalizeIngestTier turns into T1.
+	if got := cacheTierFromProto(icpb.CacheTier_CACHE_TIER_UNSPECIFIED); got != index.TierUnspecified {
+		t.Fatalf("UNSPECIFIED mapped to %v, want TierUnspecified (the T1 ingest-default)", got)
+	}
+
+	// Future-unknown non-zero → retained, NEVER TierUnspecified (which would become
+	// T1) and never T1 directly.
+	const future = icpb.CacheTier(99)
+	got := cacheTierFromProto(future)
+	if got == index.TierUnspecified {
+		t.Fatal("future-unknown tier collapsed to TierUnspecified — it would be normalized to T1, over-claiming a colder hold as hottest")
+	}
+	if got == index.TierT1 {
+		t.Fatal("future-unknown tier mapped to T1 — must not over-claim the hottest tier")
+	}
+	if got != index.CacheTier(future) {
+		t.Fatalf("future-unknown tier = %v, want the raw value %v retained", got, index.CacheTier(future))
 	}
 }
 
@@ -248,6 +272,9 @@ func TestReportedTierSurfacesThroughLookup(t *testing.T) {
 		{"stored → T1", icpb.CacheTier_CACHE_TIER_T1, icpb.CacheTier_CACHE_TIER_T1},
 		{"evicted-but-L2 → T2", icpb.CacheTier_CACHE_TIER_T2, icpb.CacheTier_CACHE_TIER_T2},
 		{"unset → normalized T1", icpb.CacheTier_CACHE_TIER_UNSPECIFIED, icpb.CacheTier_CACHE_TIER_T1},
+		// A future colder tier this server doesn't recognize is carried through
+		// but reported UNSPECIFIED to clients — crucially NOT over-claimed as T1.
+		{"future-unknown → UNSPECIFIED, not T1", icpb.CacheTier(99), icpb.CacheTier_CACHE_TIER_UNSPECIFIED},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

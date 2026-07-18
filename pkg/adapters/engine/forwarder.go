@@ -157,28 +157,36 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// (which also forgets them) before deciding how to report.
 					evicted := r.pos.Removed(e)
 					if r.l2TierPresent {
-						// L2 tier present: the block moved from HBM to the offload
-						// tier, it is not gone. Re-report each evicted prefix at T2
-						// (reload-able from L2) instead of deleting it. This rides the
-						// SAME additive ReportCacheState path as adds, so store→evict
-						// order is preserved by slice position (no separate-RPC race,
-						// unlike the PREFIX_EVICTED path below) and the index applies
-						// last-write-wins on tier — moving the entry T1→T2. A later
-						// BlockStored re-store re-reports it at T1 (upgrade). Nothing
-						// to send when the block wasn't ours (evicted is empty).
+						// L2 tier present: the block moved from HBM to the offload tier,
+						// it is not gone. Re-report each evicted prefix at T2 (reload-able
+						// from L2) instead of deleting it — the index applies
+						// last-write-wins on tier, moving the entry T1→T2; a later
+						// BlockStored re-store re-reports it at T1 (upgrade). Nothing to
+						// do when the block wasn't ours.
+						if len(evicted) == 0 {
+							continue
+						}
+						// Send the downgrade as its OWN CacheStateUpdate carrying THIS
+						// eviction's timestamp. A CSU has a single timestamp_us for all
+						// its prefixes, so the T2 entry must NOT ride the debounced
+						// `pending` buffer: a later BlockStored in the same window would
+						// overwrite the shared pendTs and refresh the T2 entry's freshness
+						// away from the eviction time — but T2 freshness is meant to be
+						// anchored at the eviction (when reload-ability was last
+						// confirmed). Flush buffered adds first so store→evict order is
+						// preserved on the wire; sendAdds is synchronous (CloseAndRecv
+						// waits for the server to ingest), so the downgrade is fully
+						// applied before the next event is read.
+						flush()
+						downgrades := make([]*icpb.PrefixEntry, 0, len(evicted))
 						for _, ep := range evicted {
-							pending = append(pending, &icpb.PrefixEntry{
+							downgrades = append(downgrades, &icpb.PrefixEntry{
 								PrefixHash: ep.prefixHash,
 								TokenCount: ep.tokenCount,
 								Tier:       icpb.CacheTier_CACHE_TIER_T2,
 							})
 						}
-						if len(evicted) > 0 && tsUs > 0 {
-							pendTs = tsUs
-						}
-						if len(pending) >= r.maxPend {
-							flush()
-						}
+						r.sendAdds(downgrades, tsUs)
 						continue
 					}
 					// Single-tier: the block is gone. Removals are a separate unary
