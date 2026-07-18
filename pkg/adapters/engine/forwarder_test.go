@@ -349,9 +349,11 @@ func TestReporterL2ModeDowngradesEvictionToT2(t *testing.T) {
 	const bs = 16
 	toks := tokSeq(2, bs)
 	prefix := fingerprint.Bytes(fingerprint.PrefixHashes(toks, bs)[0])
-	// time.Hour window: the store's T1 add and the eviction's T2 downgrade both sit
-	// in pending and flush together at shutdown, in event order, so the wire tier
-	// history is deterministic.
+	// The BlockRemoved flushes the buffered T1 add first (preserving store→evict
+	// order) and then sends the T2 downgrade in its own CSU anchored at the
+	// eviction timestamp, so the wire tier history is a deterministic [T1, T2]
+	// regardless of window (time.Hour here only rules out an interleaving ticker
+	// flush).
 	rec := runReporterWithOpts(t,
 		[]ReporterOption{WithWindow(time.Hour), WithIgnoreBlockRemoved(true)},
 		&EventBatch{TimestampSeconds: 1, Events: []Event{BlockStored{BlockHashes: [][]byte{{0xAA}}, TokenIDs: toks, BlockSize: bs}}},
