@@ -22,21 +22,27 @@ if [ -z "$version" ] || [ -z "$checksum" ]; then
 fi
 
 failed=0
-require_literal() {
-  file="$1"
-  needle="$2"
-  label="$3"
-  if ! grep -Fq "$needle" "$file"; then
-    echo "missing Syft pin sync in $file: $label" >&2
+require_equal() {
+  label="$1"
+  actual="$2"
+  expected="$3"
+  if [ "$actual" != "$expected" ]; then
+    echo "Syft pin mismatch for $label: got '$actual', expected '$expected'" >&2
     failed=1
   fi
 }
 
-require_literal Makefile "SYFT_VERSION ?= $version" "Makefile SYFT_VERSION"
-require_literal .github/workflows/ci.yml "SYFT_VERSION: $version" "CI workflow SYFT_VERSION"
-require_literal .github/workflows/release-sbom.yml "SYFT_VERSION: $version" "Release SBOM workflow SYFT_VERSION"
-require_literal "$action" "default_version=\"$version\"" "setup action shell default version"
-require_literal "$action" "default_sha256=\"$checksum\"" "setup action shell default checksum"
+makefile_version="$(sed -n 's/^SYFT_VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+ci_version="$(awk '$1 == "SYFT_VERSION:" { print $2; exit }' .github/workflows/ci.yml)"
+release_version="$(awk '$1 == "SYFT_VERSION:" { print $2; exit }' .github/workflows/release-sbom.yml)"
+action_shell_version="$(awk -F '"' '/default_version=/{ print $2; exit }' "$action")"
+action_shell_checksum="$(awk -F '"' '/default_sha256=/{ print $2; exit }' "$action")"
+
+require_equal "Makefile SYFT_VERSION" "$makefile_version" "$version"
+require_equal "CI workflow SYFT_VERSION" "$ci_version" "$version"
+require_equal "Release SBOM workflow SYFT_VERSION" "$release_version" "$version"
+require_equal "setup action shell default version" "$action_shell_version" "$version"
+require_equal "setup action shell default checksum" "$action_shell_checksum" "$checksum"
 
 if [ "$failed" -ne 0 ]; then
   echo "Syft pin drift detected. Keep $action, Makefile, and workflows coordinated." >&2

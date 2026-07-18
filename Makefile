@@ -380,6 +380,7 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 		repo="$${image#*|}"; \
 		ref="$${repo}:$(TAG)"; \
 		inspect_log="$$(mktemp)"; \
+		available_platforms=""; \
 		missing=0; \
 		if $(DOCKER_BUILD_CMD) buildx imagetools inspect "$$ref" >"$$inspect_log" 2>&1; then \
 			digest="$$(awk '/^Digest:/ {print $$2; exit}' "$$inspect_log")"; \
@@ -389,6 +390,7 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 				rm -f "$$inspect_log"; \
 				exit 1; \
 			fi; \
+			available_platforms="$$(sed -n 's/^[[:space:]]*Platform:[[:space:]]*//p' "$$inspect_log" | sort -u | tr '\n' ',' | sed 's/,$$//')"; \
 		elif grep -Eiq 'manifest unknown|manifest not found|no such manifest|name unknown' "$$inspect_log"; then \
 			digest=""; \
 			missing=1; \
@@ -411,16 +413,34 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 				"$(SBOM_IMAGE_CONTEXT)"; \
 			digest="$$(jq -r '."containerimage.digest" // empty' "$$metadata")"; \
 			rm -f "$$metadata"; \
+			available_platforms="$(SBOM_IMAGE_PLATFORMS)"; \
 		fi; \
 		if [ -z "$$digest" ]; then \
 			echo "ERROR: unable to resolve digest for $$ref" >&2; \
 			exit 1; \
 		fi; \
-		platforms="$(SBOM_IMAGE_PLATFORMS)"; \
-		if [ -z "$$platforms" ]; then \
+		requested_platforms="$(SBOM_IMAGE_PLATFORMS)"; \
+		if [ -z "$$requested_platforms" ] || [ -z "$$available_platforms" ]; then \
 			"$(SYFT)" scan "registry:$$repo@$$digest" \
 				-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$(SBOM_TAG).spdx.json"; \
 		else \
+			platforms=""; \
+			old_ifs="$$IFS"; \
+			IFS=','; \
+			for platform in $$requested_platforms; do \
+				IFS="$$old_ifs"; \
+				case ",$$available_platforms," in \
+					*,"$$platform",*) \
+						if [ -z "$$platforms" ]; then platforms="$$platform"; else platforms="$$platforms,$$platform"; fi; \
+						;; \
+				esac; \
+				IFS=','; \
+			done; \
+			IFS="$$old_ifs"; \
+			if [ -z "$$platforms" ]; then \
+				echo "ERROR: none of SBOM_IMAGE_PLATFORMS ($$requested_platforms) are present in $$ref ($$available_platforms)" >&2; \
+				exit 1; \
+			fi; \
 			old_ifs="$$IFS"; \
 			IFS=','; \
 			for platform in $$platforms; do \
