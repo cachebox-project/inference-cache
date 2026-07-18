@@ -3,8 +3,8 @@
 The release tooling generates SPDX JSON Software Bill of Materials artifacts
 with [Syft](https://github.com/anchore/syft). CI installs the pinned Syft
 version with checksum verification through `.github/actions/setup-syft`.
-For local runs, install the version shown by `make syft-check` or set
-`SYFT=/path/to/syft`.
+For local runs, install the `SYFT_VERSION` declared in the Makefile
+(`v1.20.0` today) or set `SYFT=/path/to/syft`.
 
 ## Source SBOM
 

@@ -218,7 +218,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make build`: build the controller, server, kvevent-subscriber, and inferencecache binaries
 - `make test`: run unit tests
 - `make lint`: run gofmt and go vet
-- `make sbom-release`, `make sbom-images`, `make sbom-registry-images`: generate SPDX JSON SBOMs (see [`docs/operations/sbom.md`](docs/operations/sbom.md))
+- `make sbom`, `make sbom-release`, `make sbom-images`, `make sbom-registry-images`: generate SPDX JSON SBOMs (see [`docs/operations/sbom.md`](docs/operations/sbom.md))
 - `make ci-lint`: run golangci-lint
 - `make verify-prometheus`: lint + unit-test the Prometheus alerting rules under `config/observability/`
 - `make proto-gen`: regenerate protobuf Go code
