@@ -43,6 +43,10 @@ if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
       printf 'Name:      %s\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    sha256:3333333333333333333333333333333333333333333333333333333333333333\nManifests:\n  Name:      %s@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n  Platform:  linux/amd64\n' "$4" "${4%:*}"
       exit 0
       ;;
+    existing-single)
+      printf 'Name:      %s\nMediaType: application/vnd.oci.image.manifest.v1+json\nDigest:    sha256:4444444444444444444444444444444444444444444444444444444444444444\n' "$4"
+      exit 0
+      ;;
     missing) echo "manifest unknown: manifest unknown" >&2; exit 1 ;;
     denied) echo "denied: requested access to the resource is denied" >&2; exit 1 ;;
     missing-notfound) echo "$4: not found" >&2; exit 1 ;;
@@ -110,27 +114,36 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$platform" in
-  linux/amd64|linux/arm64) ;;
+  linux/amd64|linux/arm64|"") ;;
   *) echo "unexpected syft platform: $platform" >&2; exit 2 ;;
 esac
-case "$source|$platform" in
-  registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
-  registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-server@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
-  registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64) ;;
-  *) echo "unexpected syft source/platform: $source $platform" >&2; exit 2 ;;
-esac
+if [ -z "$platform" ]; then
+  case "$source" in
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:4444444444444444444444444444444444444444444444444444444444444444|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:4444444444444444444444444444444444444444444444444444444444444444|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:4444444444444444444444444444444444444444444444444444444444444444) ;;
+    *) echo "unexpected syft source/platform: $source $platform" >&2; exit 2 ;;
+  esac
+else
+  case "$source|$platform" in
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-server@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64) ;;
+    *) echo "unexpected syft source/platform: $source $platform" >&2; exit 2 ;;
+  esac
+fi
 if [ -z "$out" ]; then
   echo "missing spdx-json output" >&2
   exit 2
@@ -169,6 +182,15 @@ for component in controller server subscriber; do
   test -s "$sbom"
   jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
   test ! -e "$outdir/existing-amd64/inference-cache-${component}-linux_arm64-${IMAGE_TAG}.spdx.json"
+done
+
+PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing-single make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/existing-single" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+for component in controller server subscriber; do
+  sbom="$outdir/existing-single/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
+  test -s "$sbom"
+  jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+  test ! -e "$outdir/existing-single/inference-cache-${component}-linux_amd64-${IMAGE_TAG}.spdx.json"
+  test ! -e "$outdir/existing-single/inference-cache-${component}-linux_arm64-${IMAGE_TAG}.spdx.json"
 done
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/missing" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
