@@ -292,12 +292,18 @@ which is what the contract requires. This is a deliberate **contract
 interpretation** ("cache unavailable" = the remote/shared tier, not the local
 serving component), and Phase 2 must *validate* rather than assume it:
 
-- **Load-bearing L2 assumption.** That the lmcache MP server starts and serves
-  L1-only when its `--l2-adapter` target is unreachable (retrying L2), rather than
-  aborting. If it does **not** support that — nor reconfiguring/attaching L2 later
-  — the worker entrypoint supervises it (a restart/backoff loop re-attempting L2);
-  and if even that cannot preserve L1-only serving, "L2 required at startup"
-  becomes a **documented limitation of the pair**, not a silent breakage. The
+- **Load-bearing L2 assumption — VALIDATED (Phase-2 Spike B, dev-ORD).** That the
+  lmcache MP server starts and serves L1-only when its `--l2-adapter` target is
+  unreachable (retrying L2), rather than aborting. A worker-only pod pointed at a
+  **down** Redis logged the connection failures but did **not** abort: it created the
+  `resp` L2 adapter, started its Store/Prefetch/Eviction controllers, and came up
+  **listening on `mp_port` (L1-ready)**. So a Redis outage degrades to L1-only, as the
+  startup gate requires. The fallbacks below are retained only as the record of what
+  would have applied had the check failed — it did not, so no worker-side supervision
+  loop is needed. Had it failed — with no way to reconfigure/attach L2 later — the
+  worker entrypoint would have supervised a restart/backoff loop re-attempting L2;
+  and if even that could not preserve L1-only serving, "L2 required at startup" would
+  become a **documented limitation of the pair**, not a silent breakage. The
   viable mechanism is a Phase-2 finding, not claimed here.
 - **Worker crash / restart — DEFERRED, not yet measured.** Whether the engine
   survives a mid-flight worker restart (`restartPolicy: Always`) — recomputing during
@@ -407,8 +413,8 @@ data plane), different resolution because the data planes differ:
   | Increment | Delivers | Status |
   |---|---|---|
   | 1 | `ResolveCacheServer` → the managed Redis L2 render + its `VERSIONS.md` pin | landed |
-  | 2 | `InjectSGLangLMCache` → the MP engine wire (worker sidecar, config file, shared volumes); advisory warning flipped off | landed, GPU-validated |
-  | 3 | Operator surface + the **remaining containment**: engine liveness probe, `CacheBackend` `Degraded` on worker unhealth, and the engine/lmcache image-tuple pin | **pending** |
+  | 2 | `InjectSGLangLMCache` → the MP engine wire (worker sidecar, config file, shared volumes); the GPU-validated engine/lmcache image tuple recorded in `VERSIONS.md`; advisory warning flipped off | landed, GPU-validated |
+  | 3 | Operator surface (samples, reference-stack leg, injection smoke) + the **remaining containment**: engine liveness probe and `CacheBackend` `Degraded` on worker unhealth | **pending** |
 
   **Why containment splits this way** (rather than shipping with increment 2): of
   the four containment measures listed under [Fail-open semantics](#fail-open-semantics-resolving-the-startup-gate-tension),
