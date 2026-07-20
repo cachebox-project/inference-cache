@@ -174,7 +174,9 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 }
 
 func TestResolveRedisL2ServerMaxmemory(t *testing.T) {
-	// 80% via base - base/5 (overflow-safe, inherently positive, no floor).
+	// ~80% via base - base/5 — integer division rounds slightly UP of exact 80%
+	// (exact only when base is divisible by 5), erring toward more headroom. The
+	// one-byte case degenerates to 100% (1 - 1/5 = 1), which the label reflects.
 	// Precomputed: 8Gi->6871947674, 4Gi->3435973837, 100Mi->83886080, 1 byte->1.
 	cases := []struct {
 		name           string

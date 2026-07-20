@@ -150,7 +150,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	return pod, svc, nil
 }
 
-// redisMaxmemoryBytes derives Redis's `--maxmemory` LRU budget as 80% of the pod's
+// redisMaxmemoryBytes derives Redis's `--maxmemory` LRU budget as ~80% of the pod's
 // memory LIMIT, falling back to redisMaxmemoryDefaultBytes when no positive limit is
 // set. It deliberately does NOT size off a memory request: a request is a scheduling
 // floor, not a ceiling, so a request-only pod has no cgroup bound for the budget to
@@ -169,11 +169,14 @@ func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 			base = q.Value()
 		}
 	}
-	// 80%, computed base - base/5: overflow-safe (base/5 and the subtraction cannot
-	// overflow for a non-negative int64) and inherently positive for base >= 1, so
-	// it never rounds to --maxmemory 0 (= unlimited in Redis) and needs no floor
-	// that could itself exceed a small limit. 80% is <= base (strictly < for the
-	// only realistic range, base >= 5 bytes), leaving cgroup headroom so LRU eviction
-	// has room to run before RSS reaches the limit.
+	// ~80%, computed base - base/5. Integer division truncates base/5 DOWN, so the
+	// result rounds slightly UP of exact 80% (exact only when base is divisible by 5;
+	// e.g. base=173 → 139, vs 138.4 exact) — a negligible over-count at realistic
+	// limits, and it errs toward MORE headroom, never less. Overflow-safe (base/5 and
+	// the subtraction cannot overflow for a non-negative int64) and inherently
+	// positive for base >= 1, so it never rounds to --maxmemory 0 (= unlimited in
+	// Redis) and needs no floor that could itself exceed a small limit. The result is
+	// <= base (strictly < for the only realistic range, base >= 5 bytes), leaving
+	// cgroup headroom so LRU eviction has room to run before RSS reaches the limit.
 	return base - base/5
 }
