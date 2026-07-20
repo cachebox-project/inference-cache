@@ -1,4 +1,5 @@
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
+MAKEFILE_SELF := $(abspath $(lastword $(MAKEFILE_LIST)))
 LOCALBIN ?= $(PROJECT_DIR)/bin
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
@@ -10,13 +11,27 @@ GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod | head -n1)
 
 REGISTRY ?= ghcr.io/cachebox-project
 TAG ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
-IMG ?= $(REGISTRY)/inference-cache-controller:$(TAG)
-SERVER_IMG ?= $(REGISTRY)/inference-cache-server:$(TAG)
-SUBSCRIBER_IMG ?= $(REGISTRY)/inference-cache-subscriber:$(TAG)
+CONTROLLER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-controller
+SERVER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-server
+SUBSCRIBER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-subscriber
+IMG ?= $(CONTROLLER_IMAGE_REPO):$(TAG)
+SERVER_IMG ?= $(SERVER_IMAGE_REPO):$(TAG)
+SUBSCRIBER_IMG ?= $(SUBSCRIBER_IMAGE_REPO):$(TAG)
 DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
 KIND_NODE_IMAGE ?= kindest/node:v1.31.0
+SYFT ?= syft
+SYFT_VERSION ?= v1.20.0
+SYFT_VERSION_NO_V := $(patsubst v%,%,$(SYFT_VERSION))
+SBOM_DIR ?= dist/sbom
+SBOM_IMAGE_SOURCE ?= docker
+SBOM_IMAGE_BUILD ?= 1
+SBOM_IMAGE_CONTEXT ?= .
+SBOM_DOCKERFILE ?= dockerfiles/Dockerfile
+SBOM_REGISTRY_PUBLISH_MISSING ?= 0
+SBOM_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
+SBOM_TAG := $(subst /,_,$(TAG))
 
 version_pkg = $(MODULE)/pkg/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
@@ -311,15 +326,138 @@ image-build: controller-image server-image subscriber-image ## Build controller,
 
 .PHONY: controller-image
 controller-image: ## Build the controller container image.
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target controller -t $(IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target controller -t "$(IMG)" .
 
 .PHONY: server-image
 server-image: ## Build the server container image.
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target server -t $(SERVER_IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target server -t "$(SERVER_IMG)" .
 
 .PHONY: subscriber-image
 subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
-	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t $(SUBSCRIBER_IMG) .
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t "$(SUBSCRIBER_IMG)" .
+
+.PHONY: syft-check
+syft-check: ## Fail fast when Syft is unavailable.
+	@command -v "$(SYFT)" >/dev/null || { echo "ERROR: syft missing. Install syft $(SYFT_VERSION) or set SYFT=/path/to/syft"; exit 1; }
+	@version="$$("$(SYFT)" version 2>/dev/null | awk '/^Version:/ {print $$2; exit}')"; \
+	if [ "$$version" != "$(SYFT_VERSION_NO_V)" ]; then \
+		echo "ERROR: syft version $$version found; expected $(SYFT_VERSION_NO_V)"; \
+		exit 1; \
+	fi
+
+.PHONY: sbom
+sbom: sbom-release sbom-images ## Generate release and per-image SPDX JSON SBOMs with Syft.
+
+.PHONY: sbom-release
+sbom-release: syft-check ## Generate a source/release SBOM for the checked-out tree.
+	mkdir -p "$(SBOM_DIR)"
+	"$(SYFT)" scan dir:. \
+		--exclude './.git' \
+		--exclude './.cache' \
+		--exclude './bin' \
+		--exclude './dist' \
+		-o "spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json"
+
+.PHONY: sbom-images
+sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-subscriber images.
+	@if [ "$(SBOM_IMAGE_SOURCE)" = "docker" ] && [ "$(SBOM_IMAGE_BUILD)" = "1" ]; then \
+		$(MAKE) -f "$(MAKEFILE_SELF)" image-build; \
+	fi
+	mkdir -p "$(SBOM_DIR)"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SERVER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json"
+
+.PHONY: sbom-registry-images
+sbom-registry-images: syft-check ## Generate SBOMs for published release images by immutable registry digest.
+	mkdir -p "$(SBOM_DIR)"
+	@set -e; \
+	for image in \
+		"controller|$(CONTROLLER_IMAGE_REPO)" \
+		"server|$(SERVER_IMAGE_REPO)" \
+		"subscriber|$(SUBSCRIBER_IMAGE_REPO)"; do \
+		component="$${image%%|*}"; \
+		repo="$${image#*|}"; \
+		ref="$${repo}:$(TAG)"; \
+		inspect_log="$$(mktemp)"; \
+		available_platforms=""; \
+		missing=0; \
+		if $(DOCKER_BUILD_CMD) buildx imagetools inspect --format '{{json .Manifest}}' "$$ref" >"$$inspect_log" 2>&1; then \
+			digest="$$(jq -r '.digest // empty' "$$inspect_log")"; \
+			if [ -z "$$digest" ]; then \
+				echo "ERROR: unable to resolve digest for $$ref" >&2; \
+				cat "$$inspect_log" >&2; \
+				rm -f "$$inspect_log"; \
+				exit 1; \
+			fi; \
+			available_platforms="$$(jq -r '[.manifests[]? | select((.platform.os // "") != "" and (.platform.architecture // "") != "" and (.platform.os // "") != "unknown" and (.platform.architecture // "") != "unknown") | .platform.os + "/" + .platform.architecture + (if ((.platform.variant // "") == "") then "" else "/" + .platform.variant end)] | unique | join(",")' "$$inspect_log")"; \
+		elif grep -Eiq 'unauthorized|authentication required|error getting credentials|credential|permission denied|requested access to the resource is denied' "$$inspect_log"; then \
+			echo "ERROR: unable to inspect $$ref" >&2; \
+			cat "$$inspect_log" >&2; \
+			rm -f "$$inspect_log"; \
+			exit 1; \
+		elif grep -Eiq 'manifest unknown|manifest not found|no such manifest|name unknown|repository does not exist|(^|[[:space:]:])not found($$|[[:space:]])' "$$inspect_log"; then \
+			digest=""; \
+			missing=1; \
+		else \
+			echo "ERROR: unable to inspect $$ref" >&2; \
+			cat "$$inspect_log" >&2; \
+			rm -f "$$inspect_log"; \
+			exit 1; \
+		fi; \
+		rm -f "$$inspect_log"; \
+		if [ "$$missing" = "1" ] && [ "$(SBOM_REGISTRY_PUBLISH_MISSING)" = "1" ]; then \
+			metadata="$$(mktemp)"; \
+			$(DOCKER_BUILD_CMD) buildx build \
+				--push \
+				--platform "$(SBOM_IMAGE_PLATFORMS)" \
+				-f "$(SBOM_DOCKERFILE)" \
+				--target "$$component" \
+				-t "$$ref" \
+				--metadata-file "$$metadata" \
+				"$(SBOM_IMAGE_CONTEXT)"; \
+			digest="$$(jq -r '."containerimage.digest" // empty' "$$metadata")"; \
+			rm -f "$$metadata"; \
+			available_platforms="$(SBOM_IMAGE_PLATFORMS)"; \
+		fi; \
+		if [ -z "$$digest" ]; then \
+			echo "ERROR: unable to resolve digest for $$ref" >&2; \
+			exit 1; \
+		fi; \
+		requested_platforms="$(SBOM_IMAGE_PLATFORMS)"; \
+		if [ -z "$$requested_platforms" ] || [ -z "$$available_platforms" ]; then \
+			"$(SYFT)" scan "registry:$$repo@$$digest" \
+				-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$(SBOM_TAG).spdx.json"; \
+		else \
+			platforms=""; \
+			old_ifs="$$IFS"; \
+			IFS=','; \
+			for platform in $$requested_platforms; do \
+				IFS="$$old_ifs"; \
+				case ",$$available_platforms," in \
+					*,"$$platform",*) \
+						if [ -z "$$platforms" ]; then platforms="$$platform"; else platforms="$$platforms,$$platform"; fi; \
+						;; \
+				esac; \
+				IFS=','; \
+			done; \
+			IFS="$$old_ifs"; \
+			if [ -z "$$platforms" ]; then \
+				echo "ERROR: none of SBOM_IMAGE_PLATFORMS ($$requested_platforms) are present in $$ref ($$available_platforms)" >&2; \
+				exit 1; \
+			fi; \
+			old_ifs="$$IFS"; \
+			IFS=','; \
+			for platform in $$platforms; do \
+				IFS="$$old_ifs"; \
+				platform_suffix="$$(printf '%s' "$$platform" | tr '/,' '__')"; \
+				"$(SYFT)" scan --platform "$$platform" "registry:$$repo@$$digest" \
+					-o "spdx-json=$(SBOM_DIR)/inference-cache-$$component-$$platform_suffix-$(SBOM_TAG).spdx.json"; \
+				IFS=','; \
+			done; \
+			IFS="$$old_ifs"; \
+		fi; \
+	done
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.
@@ -363,6 +501,10 @@ verify-no-internal-refs: ## Fail if tracked files reference internal issue track
 	fi; \
 	echo "✓ no internal issue-tracker references"
 
+.PHONY: verify-syft-pin
+verify-syft-pin: ## Fail if the Syft version/checksum pin drifts across release tooling.
+	@bash hack/verify-syft-version.sh
+
 .PHONY: fmt-check
 fmt-check: ## Check Go formatting without modifying files.
 	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './bin/*' -not -path './.cache/*')); \
@@ -394,7 +536,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + Syft pin drift + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

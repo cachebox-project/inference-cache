@@ -1,0 +1,46 @@
+name: Set up Syft
+description: Install a pinned Syft binary with upstream checksum verification.
+
+inputs:
+  version:
+    description: Syft release version to install.
+    required: false
+    # Keep this coordinated with Makefile/workflows; make verify-syft-pin
+    # checks the public release/SBOM tooling does not drift.
+    default: v1.20.0
+  linux-amd64-sha256:
+    description: Expected SHA-256 of the linux-amd64 Syft release archive.
+    required: false
+    default: 689e12c5cbf67521ce61b9c126068f9eaabe1223e77971b2fede50033ff6b5cc
+
+runs:
+  using: composite
+  steps:
+  - name: Install Syft
+    shell: bash
+    env:
+      SYFT_VERSION: ${{ inputs.version }}
+      SYFT_SHA256: ${{ inputs.linux-amd64-sha256 }}
+    run: |
+      set -euo pipefail
+      default_version="v1.20.0"
+      default_sha256="689e12c5cbf67521ce61b9c126068f9eaabe1223e77971b2fede50033ff6b5cc"
+      if [ "$SYFT_VERSION" != "$default_version" ] && [ "$SYFT_SHA256" = "$default_sha256" ]; then
+        echo "linux-amd64-sha256 must be supplied when overriding Syft version" >&2
+        exit 1
+      fi
+      case "$(uname -sm)" in
+        "Linux x86_64") ;;
+        *)
+          echo "setup-syft currently supports only linux-amd64 runners" >&2
+          exit 1
+          ;;
+      esac
+      version="${SYFT_VERSION#v}"
+      archive="syft_${version}_linux_amd64.tar.gz"
+      curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"
+      echo "${SYFT_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+      mkdir -p "$RUNNER_TEMP/syft"
+      tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
+      echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
+      "$RUNNER_TEMP/syft/syft" version
