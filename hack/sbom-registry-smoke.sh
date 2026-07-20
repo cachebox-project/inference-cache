@@ -62,25 +62,45 @@ if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
       exit 2
       ;;
   esac
+  shift 2
   metadata=""
   platform=""
+  push=0
   tag=""
+  target=""
+  dockerfile=""
+  context=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --push) push=1; shift ;;
       --metadata-file) metadata="$2"; shift 2 ;;
       --platform) platform="$2"; shift 2 ;;
+      --target) target="$2"; shift 2 ;;
+      -f) dockerfile="$2"; shift 2 ;;
       -t) tag="$2"; shift 2 ;;
-      *) shift ;;
+      *)
+        if [ "$#" -eq 1 ]; then
+          context="$1"
+          shift
+        else
+          echo "unexpected build arg: $1" >&2
+          exit 2
+        fi
+        ;;
     esac
   done
   case "$tag" in
-    ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
-    ghcr.io/cachebox-project/inference-cache-server:ci-*|\
-    ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) ;;
+    ghcr.io/cachebox-project/inference-cache-controller:ci-*) expected_target=controller ;;
+    ghcr.io/cachebox-project/inference-cache-server:ci-*) expected_target=server ;;
+    ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) expected_target=subscriber ;;
     *) echo "unexpected build tag: $tag" >&2; exit 2 ;;
   esac
   test -n "$metadata"
+  test "$push" = "1"
   test "$platform" = "linux/amd64,linux/arm64"
+  test "$target" = "$expected_target"
+  test "$dockerfile" = "dockerfiles/Dockerfile"
+  test "$context" = "."
   printf '{"containerimage.digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}\n' >"$metadata"
   exit 0
 fi
