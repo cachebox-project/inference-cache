@@ -86,9 +86,10 @@ the observed engine/worker log signals reproduced inline:
 2. **Config comes from a file, not env.** MP mode requires
    `--lmcache-config-file <yaml>`; with no file the engine aborts at startup
    (`ValueError: MP mode requires ... mp_host / mp_port`). The `LMCACHE_*` env the
-   current adapter injects (`LMCACHE_REMOTE_URL`, serde, chunk size, local-CPU) is
-   **not read** on this path — `LMCACHE_USE_EXPERIMENTAL=True` is the one env that
-   still matters (it gates the connector).
+   PREVIOUS `lm://` adapter injected (`LMCACHE_REMOTE_URL`, serde, chunk size,
+   local-CPU) is **not read** on this path — which is exactly why the current wire
+   drops it; `LMCACHE_USE_EXPERIMENTAL=True` is the one env that still matters (it
+   gates the connector).
 3. **The engine dials a separate node-local worker.** The config yaml carries
    `mp_host`/`mp_port` (ZMQ, default `:5555`); the engine connects to an
    already-running `python -m lmcache.v1.multiprocess.server` process — it does
@@ -434,12 +435,17 @@ data plane), different resolution because the data planes differ:
   measured could convert "caching silently stopped" into "engine repeatedly
   killed", which is worse than the failure it contains. So increment 3 validates
   that behavior first, then ships the probe + condition together.
-- **Phase 3.** Operator surface: `config/samples/cachebackend-sglang.yaml`, the
-  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, the
-  default-install smoke assertions, and fully rewriting the
-  [cachebackend-api.md](cachebackend-api.md) SGLang section from the `lm://` model
-  to the MP-mode design (Phase 1 only flags it superseded — see below). Operator
-  docs **recommend MP mode** for LMCache and state that **SGLang is MP-only**.
+- **Phase 3 (increment 3).** The *remaining* operator surface:
+  `config/samples/cachebackend-sglang.yaml` polish, the
+  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, and the
+  default-install smoke assertion that the MP wire is actually **injected** (an
+  engine pod admitted through the live webhook carries the worker + config-file +
+  mounts). Two items this list used to defer here have **already landed in increment
+  2**: the [cachebackend-api.md](cachebackend-api.md) SGLang section was rewritten
+  from the `lm://` model to the MP design (not just flagged superseded), and the
+  smoke assertion that the obsolete offload-misconfigured warning is **absent** was
+  flipped. Operator docs **recommend MP mode** for LMCache and state that **SGLang is
+  MP-only**.
 - **Future (out of scope here): vLLM → MP migration.** A separate effort adds a
   vLLM MP path (`LMCacheMPConnector` + `kv_connector_extra_config`) reusing the
   worker + shared-L2 infrastructure this design builds, and switches the
