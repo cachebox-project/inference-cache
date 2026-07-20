@@ -26,30 +26,38 @@ cat >"$fakebin/docker" <<'DOCKER_FAKE'
 set -eu
 
 if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
-  case "$4" in
+  shift 3
+  format=""
+  if [ "${1:-}" = "--format" ]; then
+    format="$2"
+    shift 2
+  fi
+  ref="${1:-}"
+  test "$format" = "{{json .Manifest}}"
+  case "$ref" in
     ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
     ghcr.io/cachebox-project/inference-cache-server:ci-*|\
     ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) ;;
-    *) echo "unexpected inspect ref: $4" >&2; exit 2 ;;
+    *) echo "unexpected inspect ref: $ref" >&2; exit 2 ;;
   esac
   case "${DOCKER_FAKE_MODE:-missing}" in
     authfail) echo "unauthorized: authentication required" >&2; exit 42 ;;
     helperfail) echo 'error getting credentials - err: exec: "docker-credential-ghcr": executable file not found in $PATH' >&2; exit 1 ;;
     existing)
-      printf 'Name:      %s\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    sha256:1111111111111111111111111111111111111111111111111111111111111111\nManifests:\n  Name:      %s@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  Platform:  linux/amd64\n  Name:      %s@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  Platform:  linux/arm64\n' "$4" "${4%:*}" "${4%:*}"
+      printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"amd64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"arm64"}}]}\n'
       exit 0
       ;;
     existing-amd64)
-      printf 'Name:      %s\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    sha256:3333333333333333333333333333333333333333333333333333333333333333\nManifests:\n  Name:      %s@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n  Platform:  linux/amd64\n' "$4" "${4%:*}"
+      printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","platform":{"os":"linux","architecture":"amd64"}}]}\n'
       exit 0
       ;;
     existing-single)
-      printf 'Name:      %s\nMediaType: application/vnd.oci.image.manifest.v1+json\nDigest:    sha256:4444444444444444444444444444444444444444444444444444444444444444\n' "$4"
+      printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444"}\n'
       exit 0
       ;;
     missing) echo "manifest unknown: manifest unknown" >&2; exit 1 ;;
     denied) echo "denied: requested access to the resource is denied" >&2; exit 1 ;;
-    missing-notfound) echo "$4: not found" >&2; exit 1 ;;
+    missing-notfound) echo "$ref: not found" >&2; exit 1 ;;
     *) echo "unexpected fake mode: ${DOCKER_FAKE_MODE:-}" >&2; exit 2 ;;
   esac
 fi
@@ -222,14 +230,12 @@ for component in controller server subscriber; do
   done
 done
 
-for mode in missing-notfound; do
-  PATH="$fakebin:$PATH" DOCKER_FAKE_MODE="$mode" make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/$mode" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-  for component in controller server subscriber; do
-    for platform in linux_amd64 linux_arm64; do
-      sbom="$outdir/$mode/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
-      test -s "$sbom"
-      jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
-    done
+PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing-notfound make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/missing-notfound" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+for component in controller server subscriber; do
+  for platform in linux_amd64 linux_arm64; do
+    sbom="$outdir/missing-notfound/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
+    test -s "$sbom"
+    jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
   done
 done
 

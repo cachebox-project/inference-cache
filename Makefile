@@ -382,15 +382,15 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 		inspect_log="$$(mktemp)"; \
 		available_platforms=""; \
 		missing=0; \
-		if $(DOCKER_BUILD_CMD) buildx imagetools inspect "$$ref" >"$$inspect_log" 2>&1; then \
-			digest="$$(awk '/^Digest:/ {print $$2; exit}' "$$inspect_log")"; \
+		if $(DOCKER_BUILD_CMD) buildx imagetools inspect --format '{{json .Manifest}}' "$$ref" >"$$inspect_log" 2>&1; then \
+			digest="$$(jq -r '.digest // empty' "$$inspect_log")"; \
 			if [ -z "$$digest" ]; then \
 				echo "ERROR: unable to resolve digest for $$ref" >&2; \
 				cat "$$inspect_log" >&2; \
 				rm -f "$$inspect_log"; \
 				exit 1; \
 			fi; \
-			available_platforms="$$(sed -n 's/^[[:space:]]*Platform:[[:space:]]*//p' "$$inspect_log" | sort -u | tr '\n' ',' | sed 's/,$$//')"; \
+			available_platforms="$$(jq -r '[.manifests[]? | select((.platform.os // "") != "" and (.platform.architecture // "") != "" and (.platform.os // "") != "unknown" and (.platform.architecture // "") != "unknown") | .platform.os + "/" + .platform.architecture + (if ((.platform.variant // "") == "") then "" else "/" + .platform.variant end)] | unique | join(",")' "$$inspect_log")"; \
 		elif grep -Eiq 'unauthorized|authentication required|error getting credentials|credential|permission denied|requested access to the resource is denied' "$$inspect_log"; then \
 			echo "ERROR: unable to inspect $$ref" >&2; \
 			cat "$$inspect_log" >&2; \
