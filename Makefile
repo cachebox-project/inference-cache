@@ -391,7 +391,12 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 				exit 1; \
 			fi; \
 			available_platforms="$$(sed -n 's/^[[:space:]]*Platform:[[:space:]]*//p' "$$inspect_log" | sort -u | tr '\n' ',' | sed 's/,$$//')"; \
-		elif grep -Eiq 'manifest unknown|manifest not found|no such manifest|name unknown' "$$inspect_log"; then \
+		elif grep -Eiq 'unauthorized|authentication required|error getting credentials|credential|permission denied' "$$inspect_log"; then \
+			echo "ERROR: unable to inspect $$ref" >&2; \
+			cat "$$inspect_log" >&2; \
+			rm -f "$$inspect_log"; \
+			exit 1; \
+		elif grep -Eiq 'manifest unknown|manifest not found|no such manifest|name unknown|repository does not exist|(^|[[:space:]:])not found($$|[[:space:]])|denied: requested access to the resource is denied' "$$inspect_log"; then \
 			digest=""; \
 			missing=1; \
 		else \

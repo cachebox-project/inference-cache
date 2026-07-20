@@ -29,6 +29,13 @@ runs:
         echo "linux-amd64-sha256 must be supplied when overriding Syft version" >&2
         exit 1
       fi
+      case "$(uname -sm)" in
+        "Linux x86_64") ;;
+        *)
+          echo "setup-syft currently supports only linux-amd64 runners" >&2
+          exit 1
+          ;;
+      esac
       version="${SYFT_VERSION#v}"
       archive="syft_${version}_linux_amd64.tar.gz"
       curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${archive}"

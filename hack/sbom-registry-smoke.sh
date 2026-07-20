@@ -44,15 +44,20 @@ if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
       exit 0
       ;;
     missing) echo "manifest unknown: manifest unknown" >&2; exit 1 ;;
+    missing-denied) echo "denied: requested access to the resource is denied" >&2; exit 1 ;;
+    missing-notfound) echo "$4: not found" >&2; exit 1 ;;
     *) echo "unexpected fake mode: ${DOCKER_FAKE_MODE:-}" >&2; exit 2 ;;
   esac
 fi
 
 if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
-  if [ "${DOCKER_FAKE_MODE:-missing}" != "missing" ]; then
-    echo "build must not run for mode ${DOCKER_FAKE_MODE:-}" >&2
-    exit 2
-  fi
+  case "${DOCKER_FAKE_MODE:-missing}" in
+    missing|missing-denied|missing-notfound) ;;
+    *)
+      echo "build must not run for mode ${DOCKER_FAKE_MODE:-}" >&2
+      exit 2
+      ;;
+  esac
   metadata=""
   platform=""
   tag=""
@@ -168,6 +173,17 @@ for component in controller server subscriber; do
     sbom="$outdir/missing/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
     test -s "$sbom"
     jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+  done
+done
+
+for mode in missing-denied missing-notfound; do
+  PATH="$fakebin:$PATH" DOCKER_FAKE_MODE="$mode" make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/$mode" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
+  for component in controller server subscriber; do
+    for platform in linux_amd64 linux_arm64; do
+      sbom="$outdir/$mode/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
+      test -s "$sbom"
+      jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
+    done
   done
 done
 
