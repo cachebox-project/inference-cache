@@ -171,8 +171,9 @@ func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	}
 	// ~80%, computed base - base/5. Integer division truncates base/5 DOWN, so the
 	// result rounds slightly UP of exact 80% (exact only when base is divisible by 5;
-	// e.g. base=173 → 139, vs 138.4 exact) — a negligible over-count at realistic
-	// limits, and it errs toward MORE headroom, never less. Overflow-safe (base/5 and
+	// e.g. base=173 → 139, vs 138.4 exact). A larger budget means marginally LESS
+	// headroom, not more — negligible at realistic limits, and it never reaches base
+	// (see below), so the direction is safe. Overflow-safe (base/5 and
 	// the subtraction cannot overflow for a non-negative int64) and inherently
 	// positive for base >= 1, so it never rounds to --maxmemory 0 (= unlimited in
 	// Redis) and needs no floor that could itself exceed a small limit. The result is
