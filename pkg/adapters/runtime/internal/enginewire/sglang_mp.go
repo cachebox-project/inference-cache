@@ -187,7 +187,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 		c.VolumeMounts = upsertMountByName(c.VolumeMounts, shmMount)
 	}
 
-	worker := sglangMPWorkerContainer(c.Image, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmMount)
+	worker := sglangMPWorkerContainer(c.Image, c.SecurityContext, cfg, chunkSize, mpPort, l1SizeGB, l2Adapter, shmMount)
 	if work.InitContainers, err = adoptContainer(work.InitContainers, worker, owned); err != nil {
 		return err
 	}
@@ -228,7 +228,7 @@ func mountAtPath(ms []corev1.VolumeMount, path string) *corev1.VolumeMount {
 // and the server listens before the engine starts. The worker image defaults to
 // the engine image (guaranteeing the same lmcache version — the two speak the MP
 // wire) and is overridable via backendConfig.workerImage.
-func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string, shmMount corev1.VolumeMount) corev1.Container {
+func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContext, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string, shmMount corev1.VolumeMount) corev1.Container {
 	image := ConfigOr(cfg, cfgKeyWorkerImage, engineImage)
 	configPath := sglangConfigMountPath + "/" + sglangConfigFileName
 	// The validated invocation is `python3 -m lmcache.v1.multiprocess.server`
@@ -324,17 +324,52 @@ func sglangMPWorkerContainer(engineImage string, cfg map[string]string, chunkSiz
 			PeriodSeconds:    3,
 			FailureThreshold: 40,
 		},
-		// No added capabilities — deliberately. An earlier revision added IPC_LOCK
-		// (carried over from the RDMA-oriented reference manifests), but Pod Security
-		// permits added capabilities beyond a small allow-list under NEITHER baseline
-		// nor restricted, and IPC_LOCK is on neither list. Since this mutation lands
-		// BEFORE Pod Security admission, injecting it would turn an otherwise-valid
-		// engine pod into a REJECTED one in any enforcing namespace — the cache plane
-		// breaking the engine, which inverts the fail-open contract. The MP wire does
-		// not need it: the worker moves KV over CUDA-IPC and /dev/shm, not RDMA, and
-		// the engine side (which this adapter never grants capabilities to) would have
-		// needed it too if the data path did.
+		// Restricted-compatible securityContext (see sglangWorkerSecurityContext). This
+		// mutation lands BEFORE Pod Security admission, so a worker that did NOT carry
+		// the container-only Restricted requirements (allowPrivilegeEscalation: false,
+		// drop ALL capabilities) would get the whole engine pod REJECTED in a
+		// restricted namespace — the cache plane breaking the engine, the inverse of
+		// the fail-open contract. Notably NOT added: IPC_LOCK (an earlier revision
+		// carried it over from the RDMA reference manifests; the MP wire moves KV over
+		// CUDA-IPC and /dev/shm, not RDMA, so no capability is needed — and an added
+		// capability is itself a Restricted violation).
+		SecurityContext: sglangWorkerSecurityContext(engineSC),
 	}
+}
+
+// sglangWorkerSecurityContext builds the MP worker's securityContext so the worker
+// never turns an admissible engine pod into a Pod-Security-rejected one.
+//
+// It always sets the two container-only Restricted requirements — these cannot be
+// inherited from the pod, so the worker must carry them itself:
+//   - AllowPrivilegeEscalation=false,
+//   - Capabilities.Drop=[ALL] (the worker needs no capabilities; GPU access is via
+//     device files + /dev/shm, not caps).
+//
+// It also sets seccompProfile=RuntimeDefault (Restricted-required; harmless, and GPU
+// workloads run under it). It deliberately does NOT set RunAsNonRoot / RunAsUser /
+// ReadOnlyRootFilesystem to fixed values the way the distroless subscriber sidecar
+// does: the worker runs the operator's engine/worker image, whose user and writable
+// paths this adapter must not override (forcing a UID or a read-only rootfs can break
+// CUDA-IPC or the image's own writes). Instead it MIRRORS the engine container's user
+// identity (RunAsNonRoot / RunAsUser / RunAsGroup) when the engine sets it — the
+// worker defaults to the same image, so the same user is valid, and matching the
+// engine keeps the worker exactly as (non-)root as the pod was admitted to be. When
+// the engine leaves those unset, they are inherited from the pod securityContext (the
+// usual restricted-namespace shape), so the worker inherits the same.
+func sglangWorkerSecurityContext(engineSC *corev1.SecurityContext) *corev1.SecurityContext {
+	no := false
+	sc := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &no,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+	if engineSC != nil {
+		sc.RunAsNonRoot = engineSC.RunAsNonRoot
+		sc.RunAsUser = engineSC.RunAsUser
+		sc.RunAsGroup = engineSC.RunAsGroup
+	}
+	return sc
 }
 
 // sglangL2AdapterJSON returns the worker's --l2-adapter config: the resp adapter

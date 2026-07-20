@@ -598,12 +598,12 @@ func TestSGLangInjectEngineConfigWorkerSeesTheGPU(t *testing.T) {
 	}
 }
 
-func TestSGLangInjectEngineConfigWorkerAddsNoCapabilities(t *testing.T) {
-	// The worker must add NO capabilities. Pod Security allows added capabilities
-	// beyond a small allow-list under neither baseline nor restricted, and this
-	// mutation lands BEFORE Pod Security admission — so an injected capability turns
-	// an otherwise-valid engine pod into a REJECTED one in any enforcing namespace.
-	// The cache plane must never be the reason an engine cannot start.
+func TestSGLangInjectEngineConfigWorkerRestrictedSecurityContext(t *testing.T) {
+	// This mutation lands BEFORE Pod Security admission, so the worker must carry the
+	// container-only Restricted requirements itself — else it turns an admissible
+	// engine pod into a REJECTED one in a restricted namespace (the inverse of
+	// fail-open). And it must add NO capabilities (an added cap is itself a Restricted
+	// violation; IPC_LOCK is not needed — GPU access is via device files, not caps).
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "sglang:test"}}}
 	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
@@ -612,8 +612,70 @@ func TestSGLangInjectEngineConfigWorkerAddsNoCapabilities(t *testing.T) {
 	if w == nil {
 		t.Fatalf("worker not injected")
 	}
-	if w.SecurityContext != nil && w.SecurityContext.Capabilities != nil && len(w.SecurityContext.Capabilities.Add) > 0 {
-		t.Fatalf("worker adds capabilities %v — Pod Security (baseline/restricted) rejects the whole pod for these, so the engine would not start at all", w.SecurityContext.Capabilities.Add)
+	sc := w.SecurityContext
+	if sc == nil {
+		t.Fatalf("worker has no securityContext — a restricted namespace would reject the pod")
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("allowPrivilegeEscalation = %v, want false (container-only Restricted requirement)", sc.AllowPrivilegeEscalation)
+	}
+	if sc.Capabilities == nil || len(sc.Capabilities.Add) > 0 {
+		t.Errorf("capabilities.add = %v, want none (an added cap is a Restricted violation)", sc.Capabilities)
+	}
+	dropsAll := false
+	if sc.Capabilities != nil {
+		for _, c := range sc.Capabilities.Drop {
+			if c == "ALL" {
+				dropsAll = true
+			}
+		}
+	}
+	if !dropsAll {
+		t.Errorf("capabilities.drop = %v, want [ALL] (container-only Restricted requirement)", sc.Capabilities)
+	}
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("seccompProfile = %v, want RuntimeDefault", sc.SeccompProfile)
+	}
+}
+
+func TestSGLangInjectEngineConfigWorkerMirrorsEngineUserIdentity(t *testing.T) {
+	// The worker runs the operator's engine image (by default), so it must not force
+	// its own UID like the distroless subscriber does — it mirrors the engine's user
+	// identity instead, staying exactly as (non-)root as the pod was admitted to be.
+	nonRoot := true
+	uid := int64(1000)
+	gid := int64(2000)
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name:  enginewire.SGLangEngineContainerName,
+		Image: "sglang:test",
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot: &nonRoot, RunAsUser: &uid, RunAsGroup: &gid,
+		},
+	}}}
+	if err := NewAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	sc := w.SecurityContext
+	if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+		t.Errorf("runAsNonRoot not mirrored from engine: %v", sc.RunAsNonRoot)
+	}
+	if sc.RunAsUser == nil || *sc.RunAsUser != uid {
+		t.Errorf("runAsUser = %v, want mirrored %d", sc.RunAsUser, uid)
+	}
+	if sc.RunAsGroup == nil || *sc.RunAsGroup != gid {
+		t.Errorf("runAsGroup = %v, want mirrored %d", sc.RunAsGroup, gid)
+	}
+	// And it does NOT force a read-only rootfs or a fixed UID when the engine sets
+	// none — that would risk breaking the vendor image's writes / CUDA-IPC.
+	pod2 := &corev1.PodSpec{Containers: []corev1.Container{{Name: enginewire.SGLangEngineContainerName, Image: "sglang:test"}}}
+	_ = NewAdapter().InjectEngineConfig(pod2, "r.svc:6379", newSGLangBackend(nil))
+	w2 := findInitContainer(pod2.InitContainers, "lmcache-mp-worker")
+	if w2.SecurityContext.RunAsUser != nil {
+		t.Errorf("runAsUser forced to %v when engine set none — must inherit from the pod, not override the image", w2.SecurityContext.RunAsUser)
+	}
+	if w2.SecurityContext.ReadOnlyRootFilesystem != nil {
+		t.Errorf("readOnlyRootFilesystem set — the worker writes to its rootfs; must not force it")
 	}
 }
 

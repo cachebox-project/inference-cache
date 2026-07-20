@@ -67,8 +67,10 @@ cat > Dockerfile.sglang-lmcache <<'EOF'
 # would silently change the derived image's inputs on rebuild. Resolve the digest
 # with: docker pull lmsysorg/sglang:<tag> &&
 #   docker inspect --format='{{index .RepoDigests 0}}' lmsysorg/sglang:<tag>
+# The GPU-validated tuple is the nightly-dev-cu13-20260711-7de33ce8 base +
+# lmcache 0.5.1; resolve <pinned-base-digest> from that tag with the command above.
 FROM lmsysorg/sglang@sha256:<pinned-base-digest>
-RUN pip install --no-cache-dir lmcache==<wire- and CUDA-aligned version>
+RUN pip install --no-cache-dir lmcache==0.5.1
 EOF
 docker build -f Dockerfile.sglang-lmcache -t myrepo/sglang-lmcache:pinned .
 docker push myrepo/sglang-lmcache:pinned
