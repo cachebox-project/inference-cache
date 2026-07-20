@@ -38,8 +38,8 @@ which this design replaced. What remains open is tracked in
   `lm://` server, which is not even a valid MP `--l2-adapter` type.
 - The design fits the existing `KVCacheRuntimeAdapter` interface with **no new
   methods**: `ResolveCacheServer` renders the **shared L2 (Redis)**;
-  `InjectEngineConfig` adds a **config-file init container + a node-local MP worker
-  + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
+  `InjectEngineConfig` adds a **node-local MP-worker native sidecar (which writes
+  the config file it then serves) + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
   the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. The
   packaging question (a **GPU-less sidecar** vs. a single container) is **resolved
   in favour of the GPU-less native sidecar** — spiked, then GPU-validated end to end;
@@ -155,13 +155,18 @@ with three constraints the design must honor:
 
 - **Pinned image** — a digest/tag tracked in `VERSIONS.md`, consistent with the
   lmcache-server image-pin policy, never a floating `redis` tag.
-- **Single replica (enforced).** A plain Redis is not clustered; multiple pods
-  behind one Service would shard requests across independent key spaces and
-  silently partition the L2. So this backend is **clamped to one replica** and HPA
-  is not attached — the same single-instance constraint the `lm://` lmcache-server
-  already carries (a multi-replica `CacheBackend` for this type is rejected at
-  admission). A genuinely clustered/HA Redis is an operator-provided or future
-  option, out of scope for the managed default.
+- **Single replica (enforced) — specific to the SGLang Redis L2.** A plain Redis is
+  not clustered; multiple pods behind one Service would shard requests across
+  independent key spaces and silently partition the L2. So **this** backend is
+  **clamped to one replica** and HPA is not attached: admission rejects
+  `spec.replicas>1` / `spec.autoscaling` for `(sglang, LMCache)`
+  (`rejectSGLangRedisL2ScaleOut`), and the reconciler clamps as a backstop for
+  grandfathered objects (`clampSingletonReplicas`). This is **not** shared with
+  vLLM's `lm://` lmcache-server, which is an ordinary pod-network workload that
+  **does** scale out and autoscale — the singleton rule is scoped to the pair whose
+  managed server is a non-clustered Redis (and to the host-network Mooncake master,
+  for a different reason). A genuinely clustered/HA Redis is an operator-provided or
+  future option, out of scope for the managed default.
 - **Bounded memory.** `--maxmemory-policy allkeys-lru` only evicts once
   `--maxmemory` is set; without it Redis grows until the container is OOM-killed.
   The render derives `--maxmemory` from the pod's memory limit (with headroom),
@@ -174,7 +179,7 @@ the SGLang pair only — vLLM keeps `lm://`. Redis is a shared, network-addressa
 store that fits the one-Service, engines-anywhere model exactly (unlike Mooncake's
 mesh), so **no `hostNetwork` is required for the L2**.
 
-### `InjectEngineConfig` → config-file init container + MP-worker sidecar + engine wire
+### `InjectEngineConfig` → MP-worker native sidecar (writes its own config) + engine wire
 
 The mutating Pod webhook already adds volumes, init containers, and sidecar
 containers to engine pods. For SGLang it adds, to the engine pod:
@@ -400,8 +405,8 @@ data plane), different resolution because the data planes differ:
   twice). The advisory admission warning stays (no working data plane yet), so no
   regression.
 - **Phase 2.** The working data plane: `ResolveCacheServer` → Redis L2;
-  `InjectSGLangLMCache` rewritten → config-file init container + MP-worker native
-  sidecar + engine config-file wire + shared volumes, **dropping the inert
+  `InjectSGLangLMCache` rewritten → MP-worker native sidecar (writes its own
+  config file) + engine config-file wire + shared volumes, **dropping the inert
   `LMCACHE_*` env**; resolve the GPU-less-sidecar spike first. The pinned,
   version-aligned worker/engine/Redis image tuple lands in **`VERSIONS.md` in this
   phase** (it is a Phase-2 correctness requirement, not a Phase-3 doc polish). Flip
