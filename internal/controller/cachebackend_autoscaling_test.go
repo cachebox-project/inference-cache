@@ -428,6 +428,45 @@ func TestDesiredReplicasFallbackToSpecWhenNoAutoscaling(t *testing.T) {
 	}
 }
 
+func TestDesiredReplicasReflectsSingletonClamp(t *testing.T) {
+	// A singleton cache-server is clamped to one replica at deploy time. desiredReplicas
+	// — the readiness expectation — must reflect the clamp, or a grandfathered
+	// spec.replicas:3 (written before admission rejected it) deploys one pod but
+	// expects three and reports RolloutInProgress forever.
+	t.Run("sglang Redis L2 (pair-driven) clamps to 1", func(t *testing.T) {
+		cb := lmcacheBackend("cache", "ns1")
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		cb.Spec.Replicas = ptrInt32(3)
+		if got := desiredReplicas(cb, newDep(3)); got != 1 {
+			t.Fatalf("desiredReplicas = %d, want 1 (singleton readiness must match the clamp)", got)
+		}
+	})
+	t.Run("host-network master (hostNetwork-driven) clamps to 1", func(t *testing.T) {
+		cb := mooncakeBackend("cache", "ns1")
+		cb.Spec.Replicas = ptrInt32(3)
+		dep := newDep(3)
+		dep.Spec.Template.Spec.HostNetwork = true
+		if got := desiredReplicas(cb, dep); got != 1 {
+			t.Fatalf("desiredReplicas = %d, want 1 (host-network singleton)", got)
+		}
+	})
+	t.Run("disabled (0) is preserved, not clamped up", func(t *testing.T) {
+		cb := lmcacheBackend("cache", "ns1")
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		cb.Spec.Replicas = ptrInt32(0)
+		if got := desiredReplicas(cb, newDep(0)); got != 0 {
+			t.Fatalf("desiredReplicas = %d, want 0 (disabled preserved)", got)
+		}
+	})
+	t.Run("vllm+LMCache is NOT a singleton — spec.replicas honored", func(t *testing.T) {
+		cb := lmcacheBackend("cache", "ns1") // engine defaults to vllm
+		cb.Spec.Replicas = ptrInt32(3)
+		if got := desiredReplicas(cb, newDep(3)); got != 3 {
+			t.Fatalf("desiredReplicas = %d, want 3 (vLLM lm:// server scales, not a singleton)", got)
+		}
+	})
+}
+
 func TestManagedReadinessIgnoresSpecReplicasUnderHPA(t *testing.T) {
 	// spec.replicas=0 with autoscaling set must NOT trip the ScaledToZero
 	// guard — the HPA owns the count, and minReplicas>=1 is enforced by the

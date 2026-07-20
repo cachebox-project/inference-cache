@@ -44,6 +44,17 @@ The SGLang reference pins **two** images: (a) the **derived engine image** (whic
 the MP worker also runs by default), and (b) the **Redis L2** store. It does **not**
 pin an lmcache-server — SGLang never dials one.
 
+> **Note — the reference *manifest* is not yet updated to this topology.**
+> `manifests/sglang-lmcache/deployment.yaml` still ships the earlier
+> lmcache-server-based placeholder (a non-applyable digest); rewriting it to the MP
+> topology — derived engine image + a Redis L2 + the MP-worker sidecar — is part of
+> the increment-3 reference-stack leg (see the phased delivery in
+> [`sglang-lmcache-mp-mode.md`](../design/sglang-lmcache-mp-mode.md)). The **managed
+> path the controller renders** already matches this section (that is what
+> `redis_l2.go` + the SGLang adapter produce, GPU-validated); the pins below are
+> authoritative for that path. Until the manifest leg lands, this section is ahead of
+> the hand-written reference YAML — follow the pins here, not that manifest.
+
 (a) The **derived** SGLang engine image with the lmcache client baked in (the
 base `lmsysorg/sglang` does not bundle it). This image is used **twice**: as the
 engine, and — by default — as the MP worker (`backendConfig.workerImage` overrides

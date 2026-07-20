@@ -108,7 +108,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	// SECURITY: chunkSize/mpPort/l1SizeGB are substituted into the worker's `sh -c`
 	// command and into resource sizing, so they MUST be plain positive integers — a
 	// non-integer (typo or a shell-metacharacter injection attempt) falls back to
-	// the safe default and never reaches the shell. sglangPositiveIntOr is the
+	// the safe default and never reaches the shell. sglangIntInRangeOr is the
 	// sanitization boundary; it also guarantees the /dev/shm sizeLimit is bounded.
 	chunkSize := sglangIntInRangeOr(cfg, cfgKeyChunkSize, defaultChunkSize, sglangMaxChunkSize)
 	mpPort := sglangIntInRangeOr(cfg, cfgKeyMPPort, sglangDefaultMPPort, sglangMaxTCPPort)

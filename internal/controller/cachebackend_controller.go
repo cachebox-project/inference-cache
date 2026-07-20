@@ -1139,9 +1139,10 @@ func serviceEndpoint(svc *corev1.Service) string {
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
 // HPA's replica count rather than overwriting it — re-asserting replicas on
 // every reconcile would fight the HPA and churn the rollout. The one exception is
-// a host-network server, which is a singleton: clampHostNetworkToSingleton runs
-// last and overrides both the spec and the HPA (see its godoc for why admission
-// alone cannot protect a grandfathered object).
+// a singleton cache-server (a host-network master, or the SGLang Redis L2 — see
+// cacheServerIsSingleton): clampSingletonReplicas runs last and overrides both the
+// spec and the HPA (see its godoc for why admission alone cannot protect a
+// grandfathered object).
 //
 // Wrapped in RetryOnConflict because the kube Deployment controller writes
 // Deployment.Status often during rollout; without retry, the Get/Update inside
@@ -1948,7 +1949,22 @@ func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message st
 // should this backend be running". With autoscaling enabled the HPA writes
 // spec.replicas on the Deployment, so the live value is authoritative; without
 // it, the user's spec.replicas (default 1) wins.
+//
+// It applies the same singleton clamp the render path does (clampSingletonReplicas):
+// readiness must expect the count actually DEPLOYED, not the CR's grandfathered
+// spec.replicas. Without this, a singleton backend (SGLang Redis L2, or a
+// host-network Mooncake master) whose spec.replicas was set to 3 before admission
+// rejected it deploys one pod but expects three, and reports RolloutInProgress
+// forever. spec.replicas 0 (disabled) is preserved.
 func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	want := unclampedDesiredReplicas(backend, dep)
+	if want > 1 && cacheServerIsSingleton(backend, &dep.Spec.Template.Spec) {
+		return 1
+	}
+	return want
+}
+
+func unclampedDesiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
 	if backend.Spec.Autoscaling != nil {
 		// First reconcile after an HPA spec is added may briefly see
 		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
