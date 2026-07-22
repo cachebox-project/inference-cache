@@ -27,6 +27,18 @@ type positionalIndex struct {
 type posEntry struct {
 	prefixHash uint64 // our rolling positional prefix hash
 	tokenCount int32  // cumulative tokens of the prefix up to and including this block
+	// adapter is the resolved adapter identity (Config.AdapterID) the block was
+	// stored under — "" for the base model. Remembered per block so an eviction,
+	// which only names the engine block hash, can target the right index
+	// partition instead of dropping the same prefix hash under every adapter.
+	adapter string
+}
+
+// EvictedPrefix is one index key to drop: our content-fingerprint prefix hash
+// plus the adapter partition it lives in.
+type EvictedPrefix struct {
+	PrefixHash []byte
+	AdapterID  string
 }
 
 func newPositionalIndex() *positionalIndex {
@@ -46,7 +58,22 @@ func newPositionalIndex() *positionalIndex {
 // cost (a wrong hint degrades to a cache miss, never a wrong answer) and does not
 // occur on a clean cold start (no gaps). Hardening — learn NONE_HASH and drop
 // true gaps — is tracked as a follow-up. Returns nil when nothing is indexable.
-func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
+//
+// adapterID is the resolved adapter identity for this event (Config.AdapterID of
+// ev.LoRAID); "" is the base model / default partition. It is stamped on every
+// emitted PrefixEntry so the server partitions the index by adapter, and
+// remembered per block so a later eviction targets the same partition. It is
+// deliberately NOT folded into the prefix hash: the fingerprint stays a pure
+// function of token content (and its golden vectors stay valid) — adapter
+// identity separates the KEYSPACE instead.
+//
+// Chaining is adapter-scoped in practice: the engine only reports a parent block
+// that its own cache holds, and a block's KV belongs to exactly one adapter, so a
+// parent found in the reverse map was stored under this same adapter. The chain
+// is still allowed to proceed on a parent hit regardless — a defensive
+// adapter-mismatch drop would silently degrade every extension to a fresh root,
+// and the entry it produces is written to THIS event's partition either way.
+func (p *positionalIndex) Stored(ev BlockStored, adapterID string) []*icpb.PrefixEntry {
 	bs := int(ev.BlockSize)
 	if bs <= 0 || len(ev.BlockHashes) == 0 {
 		return nil
@@ -78,24 +105,38 @@ func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 		out = append(out, &icpb.PrefixEntry{
 			PrefixHash: fingerprint.Bytes(phs[i]),
 			TokenCount: tokens,
+			AdapterId:  adapterID,
 		})
-		p.blocks[string(ev.BlockHashes[i])] = posEntry{prefixHash: phs[i], tokenCount: tokens}
+		p.blocks[string(ev.BlockHashes[i])] = posEntry{
+			prefixHash: phs[i],
+			tokenCount: tokens,
+			adapter:    adapterID,
+		}
 	}
 	return out
 }
 
-// Removed maps each evicted engine block hash to our prefix hash (the index key to
-// drop) and forgets it. Unknown hashes are skipped. The caller turns each returned
-// hash into a PREFIX_EVICTED event via Config.EvictedEvent.
-func (p *positionalIndex) Removed(ev BlockRemoved) [][]byte {
+// Removed maps each evicted engine block hash to our prefix hash (the index key
+// to drop) PLUS the adapter partition it was stored under, and forgets it.
+// Unknown hashes are skipped. The caller turns each returned pair into a
+// PREFIX_EVICTED event via Config.EvictedEvent.
+//
+// Carrying the adapter matters here: the fingerprint is token-only, so the same
+// prefix hash can be live under several adapters at once. Without the partition
+// the server would drop all of them for one adapter's GPU eviction, throwing
+// away routing hints that are still valid.
+func (p *positionalIndex) Removed(ev BlockRemoved) []EvictedPrefix {
 	if len(ev.BlockHashes) == 0 {
 		return nil
 	}
-	out := make([][]byte, 0, len(ev.BlockHashes))
+	out := make([]EvictedPrefix, 0, len(ev.BlockHashes))
 	for _, h := range ev.BlockHashes {
 		key := string(h)
 		if pe, ok := p.blocks[key]; ok {
-			out = append(out, fingerprint.Bytes(pe.prefixHash))
+			out = append(out, EvictedPrefix{
+				PrefixHash: fingerprint.Bytes(pe.prefixHash),
+				AdapterID:  pe.adapter,
+			})
 			delete(p.blocks, key)
 		}
 	}

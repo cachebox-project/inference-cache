@@ -1340,6 +1340,86 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
 done
 log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned AFFINITY_HINT; trivial-match (matched_tokens<floor) lookup returned AFFINITY_HINT — both minimum-token policy knobs enforced end-to-end (the non-PREFIX_MATCH outcomes prove the gates fired; the affinity fallback then surfaces the single known replica)"
 
+# --- adapter (LoRA) index-partition probe ----------------------------------
+# The content fingerprint is derived from token IDs ALONE, so two requests with
+# identical tokens under different LoRA adapters produce the SAME prefix_hash.
+# adapter_id partitions the INDEX so those identical keys cannot alias — without
+# it, a lookup for adapter A could be handed a replica holding only adapter B's
+# KV. This drives the gRPC surface the way an operator would and needs no engine
+# traffic: seed ONE prefix under adapter "smoke-lora-a" via ReportCacheState,
+# then look the identical hash up three ways.
+#
+#   - same adapter      → PREFIX_MATCH (the partition is a partition, not a
+#                         hash change — matching inside it is unaffected)
+#   - different adapter → NOT PREFIX_MATCH (the alias this partition prevents)
+#   - no adapter at all → NOT PREFIX_MATCH (the default partition, where this
+#                         adapter-scoped content was never ingested)
+#
+# The two negative cases land on AFFINITY_HINT rather than NO_HINT because
+# cachepolicy-sample leaves affinityRouting at its Enabled default and the
+# replica is known to the scope; the assertion is on "not PREFIX_MATCH", which
+# is the property that matters (no cross-adapter cache claim).
+log "seeding an adapter-scoped prefix and asserting LookupRoute cannot alias it across adapter_id"
+adapter_model="install-smoke-adapter"
+adapter_replica="adapter-smoke-replica"
+adapter_hash_b64="YWRhcHRlci1wcmVmaXg=" # base64("adapter-prefix") — stored at tokenCount=64, clears both policy gates
+
+adapter_report_payload="$(cat <<EOF
+{"replicaId":"$adapter_replica","modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$adapter_hash_b64","tokenCount":64,"adapterId":"smoke-lora-a"}],"stats":{"replicaId":"$adapter_replica","hitRate":1}}
+EOF
+)"
+adapter_report_resp="$(grpcurl_report_cache_state "$adapter_report_payload" "$LOG_DIR/grpcurl-adapter-report.err")" || {
+  cat "$LOG_DIR/grpcurl-adapter-report.err" >&2 || true
+  fail "grpcurl ReportCacheState did not accept the adapter-scoped smoke prefix"
+}
+log "ReportCacheState (adapter-scoped) response: $adapter_report_resp"
+
+adapter_same_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64,"adapterId":"smoke-lora-a"}
+EOF
+)"
+adapter_other_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64,"adapterId":"smoke-lora-b"}
+EOF
+)"
+adapter_none_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64}
+EOF
+)"
+
+deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+adapter_same_resp=""
+until has_reason_code "$adapter_same_resp" "PREFIX_MATCH"; do
+  adapter_same_resp="$(grpcurl_lookup_route "$adapter_same_payload" "$LOG_DIR/grpcurl-adapter-same.err")" || true
+  if has_reason_code "$adapter_same_resp" "PREFIX_MATCH"; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "same-adapter LookupRoute response (want PREFIX_MATCH):" >&2
+    echo "$adapter_same_resp" >&2
+    if [ -s "$LOG_DIR/grpcurl-adapter-same.err" ]; then
+      cat "$LOG_DIR/grpcurl-adapter-same.err" >&2
+    fi
+    fail "LookupRoute with the ingesting adapter_id did not return PREFIX_MATCH within ${POLICY_PUSH_TIMEOUT}s — the adapter partition must not break matching inside it"
+  fi
+  sleep 2
+done
+
+adapter_other_resp="$(grpcurl_lookup_route "$adapter_other_payload" "$LOG_DIR/grpcurl-adapter-other.err")" || true
+if has_reason_code "$adapter_other_resp" "PREFIX_MATCH"; then
+  echo "different-adapter LookupRoute response (want NOT PREFIX_MATCH):" >&2
+  echo "$adapter_other_resp" >&2
+  fail "LookupRoute for adapter_id=smoke-lora-b matched a prefix ingested under smoke-lora-a — identical token content aliased across adapters, which would route to a replica holding a DIFFERENT adapter's KV"
+fi
+
+adapter_none_resp="$(grpcurl_lookup_route "$adapter_none_payload" "$LOG_DIR/grpcurl-adapter-none.err")" || true
+if has_reason_code "$adapter_none_resp" "PREFIX_MATCH"; then
+  echo "no-adapter LookupRoute response (want NOT PREFIX_MATCH):" >&2
+  echo "$adapter_none_resp" >&2
+  fail "LookupRoute without adapter_id matched an adapter-scoped prefix — adapter-scoped ingest must stay out of the default partition"
+fi
+log "adapter partition enforced end-to-end: same adapter_id → PREFIX_MATCH; a different adapter_id and an absent adapter_id both stayed off the prefix-match path on the identical prefix hash"
+
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server
 # resolver → buildLookupResponse downgrade. The same 64-token prefix that
@@ -3643,4 +3723,4 @@ log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, w
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"

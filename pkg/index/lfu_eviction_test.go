@@ -26,7 +26,7 @@ func accessCountOf(t *testing.T, idx *Index, tenant, model, scheme, prefix, repl
 	t.Helper()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	e := idx.prefixes[prefixKey{tenant, model, scheme, prefix}][replica]
+	e := idx.prefixes[prefixKey{tenant, model, scheme, "", prefix}][replica]
 	if e == nil {
 		t.Fatalf("no entry for prefix %q replica %q", prefix, replica)
 	}
@@ -39,7 +39,7 @@ func setAccessCount(t *testing.T, idx *Index, tenant, model, scheme, prefix, rep
 	t.Helper()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	e := idx.prefixes[prefixKey{tenant, model, scheme, prefix}][replica]
+	e := idx.prefixes[prefixKey{tenant, model, scheme, "", prefix}][replica]
 	if e == nil {
 		t.Fatalf("no entry for prefix %q replica %q", prefix, replica)
 	}

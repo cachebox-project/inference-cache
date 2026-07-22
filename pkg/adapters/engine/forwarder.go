@@ -114,7 +114,11 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 			for _, ev := range b.Events {
 				switch e := ev.(type) {
 				case BlockStored:
-					entries := r.pos.Stored(e)
+					// Resolve the engine's internal LoRA id to the stable adapter
+					// identity that partitions the index (see Config.AdapterID).
+					// nil id → "" → the default partition, i.e. exactly the
+					// pre-adapter behavior for every non-LoRA deployment.
+					entries := r.pos.Stored(e, r.cfg.AdapterID(e.LoRAID))
 					if len(entries) == 0 && len(e.BlockHashes) > 0 {
 						// A BlockStored carrying block hashes produced no index
 						// entries — either token_ids are absent (engine not emitting
@@ -156,8 +160,8 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// same block (store-then-evict within one window). Flush pending
 					// adds first to preserve store→evict order.
 					flush()
-					for _, ourHash := range r.pos.Removed(e) {
-						r.publish(r.cfg.EvictedEvent(ourHash, b.TimestampSeconds))
+					for _, ev := range r.pos.Removed(e) {
+						r.publish(r.cfg.EvictedEvent(ev.PrefixHash, ev.AdapterID, b.TimestampSeconds))
 					}
 				case AllBlocksCleared:
 					pending = pending[:0] // a clear supersedes buffered adds

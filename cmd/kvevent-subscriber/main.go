@@ -50,16 +50,24 @@ func main() {
 		cacheTier          = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
 		engineModel        = flag.String("engine-model-name", "", `value of the engine's `+"`model_name`"+` Prometheus label to filter /metrics by (e.g. "Qwen/Qwen2.5-0.5B-Instruct"). Distinct from --model-id (the cache-plane index key). Empty = no label filter (aggregates every series — fine when the engine serves one model).`)
 		ignoreBlockRemoved = flag.Bool("ignore-block-removed", false, `drop BlockRemoved events instead of forwarding them as PREFIX_EVICTED. Set for engines paired with an L2 cache tier (e.g. LMCache); default off for single-tier deployments. See docs/design/kvevent-subscriber-wiring.md "L2 cache tier semantics".`)
+		adapterNames       = flag.String("lora-adapter-names", "", `comma-separated `+"`id=name`"+` map from the engine's internal LoRA id (BlockStored.lora_id, assigned in --lora-modules load order) to the stable adapter identity used as the index partition — the same string the gateway sends as LookupRouteRequest.adapter_id (e.g. "1=sql-lora,2=chat-lora"). Unmapped ids fall back to "lora:<id>". Leave empty for single-adapter or LoRA-free deployments.`)
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
+	names, err := engine.ParseAdapterNames(*adapterNames)
+	if err != nil {
+		logger.Error("invalid --lora-adapter-names", "value", *adapterNames, "err", err)
+		os.Exit(2)
+	}
+
 	cfg := engine.Config{
-		ReplicaID:  *replica,
-		ModelID:    *model,
-		TenantID:   *tenant,
-		HashScheme: *scheme,
+		ReplicaID:    *replica,
+		ModelID:      *model,
+		TenantID:     *tenant,
+		HashScheme:   *scheme,
+		AdapterNames: names,
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid config", "err", err)

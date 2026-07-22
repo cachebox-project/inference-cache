@@ -148,6 +148,37 @@ the L2 tier is present only in one of them:
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off for the same reason as `EventsOnly`.
 
+## LoRA adapter identity — `--lora-adapter-names`
+
+The routing key is a **content fingerprint over token IDs only**, so two prompts
+with identical tokens under different LoRA adapters hash identically. The
+subscriber therefore reads `lora_id` off each `BlockStored` event and stamps the
+resolved adapter identity on every reported `PrefixEntry`, so the server can put
+them in disjoint **index partitions** rather than one aliased entry (see
+[`grpc-contract.md`](grpc-contract.md) "Update — adapter (LoRA) index
+partition"). The adapter never enters the hash.
+
+`lora_id` is vLLM's **internal load-order integer**, not a name: the same integer
+can mean different adapters on two replicas whose `--lora-modules` order differs,
+and the index is shared across replicas. `--lora-adapter-names` maps it to the
+stable identity the gateway sends as `LookupRouteRequest.adapter_id`:
+
+```
+--lora-adapter-names "1=sql-lora,2=chat-lora"
+```
+
+- **Unmapped id** → `lora:<id>`. Exact within a replica, and consistent across
+  replicas that share an adapter load order (the homogeneous-Deployment case).
+  Supply the map when replicas can diverge — runtime load/unload, rolling
+  updates — and make the gateway send the matching `adapter_id`.
+- **No LoRA at all** (the default): every event carries a nil `lora_id`, so
+  every entry and eviction lands in the default (`""`) partition — byte-for-byte
+  the pre-adapter behavior. Nothing to configure.
+
+The flag is not set by the CacheBackend-driven injection path today: the
+controller has no view of the engine's `--lora-modules` ordering, so operators
+running multi-adapter engines set it on the subscriber container explicitly.
+
 ## What this unblocks
 
 * The runbook / demo path no longer needs `port-forward` + a hand-launched
