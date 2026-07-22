@@ -598,6 +598,44 @@ func TestValidator_SGLangRedisL2SingletonAndDisabledAccepted(t *testing.T) {
 	}
 }
 
+func TestValidator_SGLangEventsOnlyScaleOutAccepted(t *testing.T) {
+	// EventsOnly provisions NO cache server (the reconciler sheds any owned
+	// workload), so there is no Redis L2 to partition — the singleton rule must not
+	// fire. Rejecting here would be factually wrong (the message explains a Redis
+	// split that cannot happen) and would make SGLang gratuitously stricter than an
+	// otherwise-identical (vllm, LMCache) events-only backend.
+	v := &CacheBackendValidator{}
+
+	t.Run("multi-replica is admitted", func(t *testing.T) {
+		cb := sglangLMCacheBackend()
+		cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		cb.Spec.Replicas = i32p(3)
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("(sglang, LMCache) EventsOnly with replicas=3 must be admitted (no Redis is provisioned): %v", err)
+		}
+	})
+
+	t.Run("autoscaling is rejected by the ENGINE-AGNOSTIC events-only rule, not the Redis one", func(t *testing.T) {
+		// Autoscaling on EventsOnly is rejected either way — but it must be for the
+		// generic "no server workload to autoscale" reason that applies to every
+		// engine, NOT the SGLang Redis-partitioning reason (which would be wrong here
+		// and would make SGLang stricter than vLLM). Pinning the reason is the point.
+		cb := sglangLMCacheBackend()
+		cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+		_, err := v.ValidateCreate(context.Background(), cb)
+		if err == nil {
+			t.Fatalf("EventsOnly + autoscaling should be rejected (nothing to autoscale)")
+		}
+		if !strings.Contains(err.Error(), "provision no server workload") {
+			t.Fatalf("want the engine-agnostic events-only reason, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "non-clustered") {
+			t.Fatalf("the SGLang Redis-partitioning rule fired on an events-only backend, which provisions no Redis: %v", err)
+		}
+	})
+}
+
 func TestValidator_VLLMLMCacheScaleOutUnaffectedBySGLangRule(t *testing.T) {
 	// Blast radius: vLLM's lm:// server is an ordinary pod-network workload and must
 	// keep scaling out (and autoscaling) — the singleton rule is (sglang, LMCache)-only.

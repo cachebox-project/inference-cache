@@ -203,11 +203,22 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // Scoped to (sglang, LMCache): vLLM's lm:// server is an ordinary pod-network
 // workload that scales, and other pairs are rejected on their own
 // (checkRuntimeAdapter). spec.replicas 0 (disabled) and 1 (the singleton) remain
-// valid. The reconciler's clampSingletonReplicas is the backstop for grandfathered
+// valid, as is EventsOnly (which provisions no server at all — see the guard).
+// The reconciler's clampSingletonReplicas is the backstop for grandfathered
 // objects. If SGLang's shared tier gains a clustered store, lift this rule.
 func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
 		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	// EventsOnly provisions NO cache server at all (the reconciler sheds any owned
+	// workload and wires only the kvevent-subscriber sidecar), so there is no Redis
+	// L2 to partition and nothing this rule protects. Rejecting scale-out here would
+	// be both factually wrong — the message explains a Redis split that cannot happen
+	// — and gratuitously stricter than the otherwise-identical (vllm, LMCache)
+	// events-only backend. The rule applies to the Offload path, which is what
+	// renders the singleton Redis.
+	if cb.Spec.IsEventsOnly() {
 		return nil
 	}
 	var errs field.ErrorList

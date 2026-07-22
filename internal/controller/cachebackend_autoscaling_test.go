@@ -458,6 +458,17 @@ func TestDesiredReplicasReflectsSingletonClamp(t *testing.T) {
 			t.Fatalf("desiredReplicas = %d, want 0 (disabled preserved)", got)
 		}
 	})
+	t.Run("EventsOnly is NOT a singleton — no cache-server is rendered", func(t *testing.T) {
+		cb := lmcacheBackend("cache", "ns1")
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+			Engine: "sglang",
+			Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+		}
+		cb.Spec.Replicas = ptrInt32(3)
+		if got := desiredReplicas(cb, newDep(3)); got != 3 {
+			t.Fatalf("desiredReplicas = %d, want 3 (EventsOnly provisions no Redis, so nothing to clamp)", got)
+		}
+	})
 	t.Run("vllm+LMCache is NOT a singleton — spec.replicas honored", func(t *testing.T) {
 		cb := lmcacheBackend("cache", "ns1") // engine defaults to vllm
 		cb.Spec.Replicas = ptrInt32(3)

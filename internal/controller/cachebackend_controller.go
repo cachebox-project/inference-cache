@@ -1015,6 +1015,12 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 // (rejectMooncakeMasterScaleOut, rejectSGLangRedisL2ScaleOut); this is the shared
 // predicate the reconciler backstop keys on.
 func cacheServerIsSingleton(backend *cachev1alpha1.CacheBackend, pod *corev1.PodSpec) bool {
+	// EventsOnly renders no cache-server at all (the reconciler sheds any owned
+	// workload), so there is no singleton to protect — keep the predicate honest, and
+	// aligned with the admission rules, which exempt EventsOnly for the same reason.
+	if backend.Spec.IsEventsOnly() {
+		return false
+	}
 	if pod != nil && pod.HostNetwork {
 		return true
 	}
