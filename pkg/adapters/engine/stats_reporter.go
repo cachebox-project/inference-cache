@@ -31,6 +31,13 @@ type StatsReporter struct {
 	rpcTimeout time.Duration
 	now        func() time.Time
 	logger     *slog.Logger
+
+	// staleThreshold consecutive scrape failures flips the reporter to "stale":
+	// it logs once at Error on that transition (IC is now ranking this replica
+	// without its live load signal) and once at Info on recovery. Guards against
+	// both per-tick log spam and silent load-signal loss.
+	staleThreshold int
+	consecFails    int
 }
 
 // StatsReporterOption configures a StatsReporter.
@@ -62,6 +69,8 @@ func NewStatsReporter(client icpb.InferenceCacheClient, scraper statsScraper, cf
 		rpcTimeout: 5 * time.Second,
 		now:        time.Now,
 		logger:     slog.Default(),
+
+		staleThreshold: 3,
 	}
 	for _, o := range opts {
 		o(r)
@@ -100,11 +109,27 @@ func (r *StatsReporter) Run(ctx context.Context) error {
 func (r *StatsReporter) tick(ctx context.Context) {
 	stats, err := r.scraper.Scrape(ctx)
 	if err != nil {
-		// Don't spam at error level: scrape outages are expected during engine
-		// restarts and the subscriber must survive them.
-		r.logger.Warn("stats scrape failed; skipping tick", "err", err)
+		r.consecFails++
+		switch {
+		case r.consecFails == r.staleThreshold:
+			// healthy -> stale transition: surface once, loudly. IC now ranks
+			// this replica without its live load signal (residency only).
+			r.logger.Error("engine load stats unavailable; IC routing without load signal for this replica",
+				"consecutive_failures", r.consecFails, "err", err)
+		case r.consecFails > r.staleThreshold:
+			// already surfaced; keep the per-tick detail out of the way.
+			r.logger.Debug("engine load stats still unavailable; skipping tick", "err", err)
+		default:
+			// Don't spam at error level: brief scrape outages are expected during
+			// engine restarts and the subscriber must survive them.
+			r.logger.Warn("stats scrape failed; skipping tick", "err", err)
+		}
 		return
 	}
+	if r.consecFails >= r.staleThreshold {
+		r.logger.Info("engine load stats recovered", "after_failures", r.consecFails)
+	}
+	r.consecFails = 0
 	csu := r.cfg.StatsUpdate(r.now().UnixMicro(), stats)
 	if csu == nil {
 		return

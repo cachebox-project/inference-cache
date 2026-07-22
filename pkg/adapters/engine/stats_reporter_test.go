@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,6 +132,67 @@ func TestStatsReporterScrapeErrorSurvivesAndRetries(t *testing.T) {
 	defer rec.mu.Unlock()
 	if len(rec.updates) != 0 {
 		t.Errorf("scrape errors must not emit CSUs, got %d", len(rec.updates))
+	}
+}
+
+// scrapeFunc adapts a func to statsScraper for per-call control.
+type scrapeFunc func() (*icpb.ReplicaStats, error)
+
+func (f scrapeFunc) Scrape(context.Context) (*icpb.ReplicaStats, error) { return f() }
+
+// TestStatsReporterStaleEscalation verifies the fail-silent -> loud transition:
+// after staleThreshold consecutive scrape failures the reporter logs exactly one
+// Error (IC now ranks this replica without its load signal), stays quiet while it
+// persists, and logs one Info on recovery — instead of a per-tick Warn that buries
+// the loss of load-aware routing.
+func TestStatsReporterStaleEscalation(t *testing.T) {
+	fail := errors.New("dial tcp: connection refused")
+	var n int
+	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) {
+		n++
+		if n <= 3 { // 3 failures (default threshold), then recover
+			return nil, fail
+		}
+		return &icpb.ReplicaStats{}, nil
+	})
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// bufconn client so the recovery tick's send() has a live server.
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	icpb.RegisterInferenceCacheServer(srv, &recordingServer{})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	r := NewStatsReporter(icpb.NewInferenceCacheClient(conn), scraper, testConfig(),
+		WithStatsLogger(logger), WithStatsRPCTimeout(time.Second))
+
+	ctx := context.Background()
+	for i := 0; i < 4; i++ { // fail, fail, fail(->Error), success(->Info)
+		r.tick(ctx)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
+		t.Fatalf("want exactly 1 ERROR on stale transition, got %d\n%s", got, out)
+	}
+	if !strings.Contains(out, "routing without load signal") {
+		t.Fatalf("stale ERROR missing distinct message:\n%s", out)
+	}
+	if got := strings.Count(out, "engine load stats recovered"); got != 1 {
+		t.Fatalf("want exactly 1 recovery INFO, got %d\n%s", got, out)
+	}
+	if got := strings.Count(out, `"level":"WARN"`); got != 2 {
+		t.Fatalf("want 2 WARN before threshold (not Error spam), got %d\n%s", got, out)
 	}
 }
 
