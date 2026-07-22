@@ -44,6 +44,7 @@ func main() {
 		scheme             = flag.String("hash-scheme", "vllm", "engine prefix-hash scheme (required, non-empty)")
 		window             = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
 		metricsURL         = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
+		loadsGrpc          = flag.String("engine-loads-grpc", "", "engine VllmEngine gRPC address (host:port) to read load via the GetLoads RPC instead of scraping --engine-metrics-url. Preferred for SMG gRPC engines, which expose no HTTP /metrics. Empty = use the HTTP scrape.")
 		statsInterval      = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
 		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
 		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
@@ -91,21 +92,44 @@ func main() {
 		engine.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
 	sub := engine.NewSubscriber(*endpoint, *topic, engine.WithSubscriberLogger(logger))
 
-	scraper := engine.NewMetricsScraper(
-		&http.Client{Timeout: 5 * time.Second},
-		engine.ScraperConfig{
-			URL:                   *metricsURL,
-			Tier:                  tier,
-			ModelLabel:            *engineModel,
+	// Load source: gRPC GetLoads (preferred for SMG gRPC engines, which expose no
+	// HTTP /metrics) when --engine-loads-grpc is set, else the HTTP /metrics scrape.
+	// Both satisfy the same statsScraper, so the StatsReporter is identical.
+	var statsReporter *engine.StatsReporter
+	if *loadsGrpc != "" {
+		gs, gerr := engine.NewGrpcLoadsScraper(engine.GrpcLoadsScraperConfig{
+			Addr:                  *loadsGrpc,
 			CacheSizeBytes:        *cacheSizeBytes,
 			MaxConcurrencyCeiling: *ceiling,
-		},
-		logger,
-	)
-	statsReporter := engine.NewStatsReporter(client, scraper, cfg,
-		engine.WithStatsInterval(*statsInterval),
-		engine.WithStatsLogger(logger),
-	)
+		})
+		if gerr != nil {
+			logger.Error("grpc loads scraper", "addr", *loadsGrpc, "err", gerr)
+			os.Exit(1)
+		}
+		defer func() { _ = gs.Close() }()
+		logger.Info("engine load source: GetLoads gRPC", "addr", *loadsGrpc)
+		statsReporter = engine.NewStatsReporter(client, gs, cfg,
+			engine.WithStatsInterval(*statsInterval),
+			engine.WithStatsLogger(logger),
+		)
+	} else {
+		scraper := engine.NewMetricsScraper(
+			&http.Client{Timeout: 5 * time.Second},
+			engine.ScraperConfig{
+				URL:                   *metricsURL,
+				Tier:                  tier,
+				ModelLabel:            *engineModel,
+				CacheSizeBytes:        *cacheSizeBytes,
+				MaxConcurrencyCeiling: *ceiling,
+			},
+			logger,
+		)
+		logger.Info("engine load source: HTTP /metrics scrape", "url", *metricsURL)
+		statsReporter = engine.NewStatsReporter(client, scraper, cfg,
+			engine.WithStatsInterval(*statsInterval),
+			engine.WithStatsLogger(logger),
+		)
+	}
 
 	out := make(chan *engine.EventBatch, 256)
 
