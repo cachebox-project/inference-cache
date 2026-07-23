@@ -190,12 +190,12 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
 		t.Fatalf("want exactly 1 ERROR on stale transition, got %d\n%s", got, out)
 	}
-	// A sample landed first, so the Error must name the retained last sample —
-	// not the cold-start "no sample yet" wording.
-	if !strings.Contains(out, "engine load stats stale") || !strings.Contains(out, "last sample") {
-		t.Fatalf("steady-state stale ERROR missing last-sample message:\n%s", out)
+	// A sample was delivered first, so the Error must name the retained last
+	// delivered sample — not the cold-start "nothing reached IC" wording.
+	if !strings.Contains(out, "engine load stats stale") || !strings.Contains(out, "last delivered sample") {
+		t.Fatalf("steady-state stale ERROR missing last-delivered-sample message:\n%s", out)
 	}
-	if strings.Contains(out, "no load signal yet") {
+	if strings.Contains(out, "undelivered since startup") {
 		t.Fatalf("steady-state ERROR wrongly used the cold-start wording:\n%s", out)
 	}
 	if got := strings.Count(out, `"level":"WARN"`); got != 2 {
@@ -249,11 +249,68 @@ func TestStatsReporterColdStartNeverSucceeded(t *testing.T) {
 	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
 		t.Fatalf("want exactly 1 ERROR at the cold-start stale transition, got %d\n%s", got, out)
 	}
-	if !strings.Contains(out, "no load signal yet") {
-		t.Fatalf("cold-start ERROR must state residency-only / no sample yet:\n%s", out)
+	if !strings.Contains(out, "undelivered since startup") {
+		t.Fatalf("cold-start ERROR must state nothing reached IC yet:\n%s", out)
 	}
-	if strings.Contains(out, "last sample") {
-		t.Fatalf("cold-start ERROR must not claim a retained last sample:\n%s", out)
+	if strings.Contains(out, "last delivered sample") {
+		t.Fatalf("cold-start ERROR must not claim a delivered sample:\n%s", out)
+	}
+}
+
+// failingReportServer accepts connections but rejects every ReportCacheState —
+// IC is reachable yet the stats stream never lands. A delivery failure, distinct
+// from a scrape failure.
+type failingReportServer struct {
+	icpb.UnimplementedInferenceCacheServer
+}
+
+func (failingReportServer) ReportCacheState(icpb.InferenceCache_ReportCacheStateServer) error {
+	return errors.New("ic rejected the stats stream")
+}
+
+// TestStatsReporterStaleOnDeliveryFailure proves the stale state machine keys on
+// DELIVERY, not just scrape: scrapes succeed but every ReportCacheState fails, so
+// no sample ever reaches IC. After the threshold the reporter must escalate with
+// the undelivered-since-startup wording (nothing landed) — not treat the healthy
+// scrapes as a delivered load signal — and must never claim recovery.
+func TestStatsReporterStaleOnDeliveryFailure(t *testing.T) {
+	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) {
+		return &icpb.ReplicaStats{CacheMemoryBytes: 1}, nil // scrape always succeeds
+	})
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	icpb.RegisterInferenceCacheServer(srv, failingReportServer{})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	r := NewStatsReporter(icpb.NewInferenceCacheClient(conn), scraper, testConfig(),
+		WithStatsLogger(logger), WithStatsRPCTimeout(time.Second))
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // deliver fails 3x → stale transition on the 3rd
+		r.tick(ctx)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
+		t.Fatalf("want 1 ERROR when delivery keeps failing, got %d\n%s", got, out)
+	}
+	if !strings.Contains(out, "undelivered since startup") {
+		t.Fatalf("delivery-failure ERROR must report nothing reached IC:\n%s", out)
+	}
+	if strings.Contains(out, "recovered") {
+		t.Fatalf("must not claim recovery — no sample ever reached IC:\n%s", out)
 	}
 }
 
