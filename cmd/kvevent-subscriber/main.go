@@ -156,7 +156,11 @@ func main() {
 		os.Exit(1)
 	}
 	if scraperCloser != nil {
-		defer func() { _ = scraperCloser.Close() }()
+		defer func() {
+			if err := scraperCloser.Close(); err != nil {
+				logger.Warn("closing load-scraper connection", "err", err)
+			}
+		}()
 	}
 
 	loadSource, loadTarget := "HTTP /metrics scrape", *metricsURL
