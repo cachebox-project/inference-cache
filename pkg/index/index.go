@@ -581,8 +581,8 @@ type Index struct {
 	reservedEntries int
 
 	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
-	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
-	// hold it), so the per-tenant quota check at ingest is O(1) instead of
+	// (tenant, model, hash_scheme, adapter, prefix_hash), regardless of how many
+	// replicas hold it), so the per-tenant quota check at ingest is O(1) instead of
 	// scanning i.prefixes. Maintained by upsert/removeReplicaLocked: bumped when a
 	// key is first created for the tenant, dropped when the key's last replica
 	// leaves. This is the unit maxIndexEntries bounds and the unit reported as
@@ -1709,7 +1709,7 @@ const DefaultTenantSentinel = ""
 // so they cannot disagree. Total == Σ PerTenant by construction — this is the
 // hard invariant the CacheIndex/CacheTenant status surfaces rely on (a tenant's
 // reported indexEntries always sum to the cluster prefix total). The counted
-// unit is a distinct prefix key — (tenant, model, hash_scheme, prefix_hash),
+// unit is a distinct prefix key — (tenant, model, hash_scheme, adapter, prefix_hash),
 // regardless of how many replicas hold it — which is exactly the unit
 // prefixes.summary.total reports and the per-tenant maxIndexEntries quota bounds.
 // (Tenant is part of the key, so the per-tenant partition is exact.)

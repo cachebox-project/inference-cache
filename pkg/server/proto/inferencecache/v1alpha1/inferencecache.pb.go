@@ -837,9 +837,9 @@ type PrefixEntry struct {
 	// default; the server normalizes it to T1 at ingest, so an older producer
 	// that never sets the field still lands its stored prefixes at T1
 	// (additive, v1alpha1-compatible). A re-report of the same (replica,
-	// hash_scheme, prefix_hash) with a different tier moves the entry between
-	// tiers (last write wins) — this is how an eviction downgrades T1→T2 and a
-	// later re-store upgrades T2→T1.
+	// hash_scheme, adapter, prefix_hash) with a different tier moves the entry
+	// between tiers (last write wins) — this is how an eviction downgrades T1→T2
+	// and a later re-store upgrades T2→T1.
 	Tier CacheTier `protobuf:"varint,5,opt,name=tier,proto3,enum=inferencecache.v1alpha1.CacheTier" json:"tier,omitempty"`
 	// Adapter (e.g. LoRA) whose KV this entry describes. Per-ENTRY rather than
 	// per-update because one engine replica can hold KV for several adapters at
