@@ -175,17 +175,34 @@ kill "$pf" 2>/dev/null; trap - EXIT
     || { echo "FAIL: KV-event publisher did not start (check --kv-events-config)"; exit 1; }
   ```
 
-- **KV offloaded to Redis.** LMCache MP mode is **write-through**: a stored prefix
-  lands in the L2 immediately, not only on HBM eviction (GPU-validated — a 3760-token
-  prompt took Redis `DBSIZE` 0→14, i.e. 14 chunks of the 256-token `chunk_size`). So
-  after driving the prompts above, assert the L2 keyspace is non-empty:
+- **KV *written* to Redis (write-through).** LMCache MP mode is write-through: a
+  stored prefix lands in the L2 immediately, not only on HBM eviction (GPU-validated —
+  a 3760-token prompt took Redis `DBSIZE` 0→14, i.e. 14 chunks of the 256-token
+  `chunk_size`). This proves the offload **write** path — assert the keyspace is
+  non-empty after the requests above:
 
   ```bash
-  # The MP worker offloads to redis-l2 over `resp`. dbsize > 0 after requests is the
-  # standalone signal that offload is actually happening.
+  # dbsize > 0 proves the MP worker wrote KV to redis-l2 over `resp`.
   n=$(kubectl -n cache-substrate exec deploy/redis-l2 -c redis-l2 -- redis-cli dbsize | tr -dc '0-9')
   [ "${n:-0}" -gt 0 ] || { echo "FAIL: Redis L2 empty after requests — offload not happening"; exit 1; }
   echo "Redis L2 holds $n KV chunks"
+  ```
+
+- **KV *reloaded* from Redis (the read path).** `DBSIZE > 0` only proves writes — a
+  repeat request could still be served from the engine's own GPU radix / L1 cache
+  without touching L2. To prove **retrieval**, flush the engine's local cache first,
+  then re-request, and look for the worker's reload signal (this is the
+  store→flush→retrieve cycle the managed path was GPU-validated on):
+
+  ```bash
+  kubectl -n cache-substrate port-forward svc/sglang-lmcache-llama-8b 30000:30000 & pf=$!; sleep 3
+  curl -sfS -X POST localhost:30000/flush_cache >/dev/null    # clear the engine's GPU radix cache
+  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null
+  kill "$pf" 2>/dev/null
+  # The MP worker logs a retrieval when it serves the prefix back from L1+L2:
+  kubectl -n cache-substrate logs deploy/sglang-lmcache-llama-8b -c lmcache-mp-worker \
+    | grep -iE 'Retrieved [0-9]+ tokens|Prefetch .*L2' \
+    || { echo "FAIL: no L2 retrieval after flush — reload path not working"; exit 1; }
   ```
 
   (Full frame→index→`LookupRoute` verification needs the **managed path** below; the
