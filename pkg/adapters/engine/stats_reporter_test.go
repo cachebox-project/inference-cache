@@ -140,22 +140,24 @@ type scrapeFunc func() (*icpb.ReplicaStats, error)
 
 func (f scrapeFunc) Scrape(context.Context) (*icpb.ReplicaStats, error) { return f() }
 
-// TestStatsReporterStaleEscalation verifies the fail-silent -> loud transition:
-// after staleThreshold consecutive scrape failures the reporter logs exactly one
-// Error (IC now ranks this replica on its stale last sample), then stays quiet at
-// Debug while the outage PERSISTS beyond the threshold, and logs one Info on
-// recovery — instead of a per-tick Warn/Error that buries the loss of load-aware
-// routing. The outage runs two ticks past the threshold so the consecFails >
-// staleThreshold suppression path is actually exercised.
+// TestStatsReporterStaleEscalation verifies the fail-silent -> loud transition in
+// the STEADY-STATE regime: one good scrape lands first, then the outage. After
+// staleThreshold consecutive failures the reporter logs exactly one Error naming
+// the retained last sample, then stays quiet at Debug while the outage PERSISTS
+// beyond the threshold, and logs one Info on recovery — instead of a per-tick
+// Warn/Error that buries the loss of load-aware routing. The outage runs two
+// ticks past the threshold so the consecFails > staleThreshold suppression path
+// is actually exercised.
 func TestStatsReporterStaleEscalation(t *testing.T) {
 	fail := errors.New("dial tcp: connection refused")
 	var n int
 	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) {
 		n++
-		if n <= 5 { // 5 failures (2 past the default threshold of 3), then recover
-			return nil, fail
+		// one good sample (n=1), then a 5-tick outage (n=2..6), then recover.
+		if n == 1 || n > 6 {
+			return &icpb.ReplicaStats{}, nil
 		}
-		return &icpb.ReplicaStats{}, nil
+		return nil, fail
 	})
 
 	var buf bytes.Buffer
@@ -179,8 +181,8 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 		WithStatsLogger(logger), WithStatsRPCTimeout(time.Second))
 
 	ctx := context.Background()
-	// fail, fail, fail(->Error), fail(->Debug), fail(->Debug), success(->Info)
-	for i := 0; i < 6; i++ {
+	// ok, fail, fail, fail(->Error), fail(->Debug), fail(->Debug), success(->Info)
+	for i := 0; i < 7; i++ {
 		r.tick(ctx)
 	}
 
@@ -188,8 +190,13 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
 		t.Fatalf("want exactly 1 ERROR on stale transition, got %d\n%s", got, out)
 	}
-	if !strings.Contains(out, "engine load stats stale") {
-		t.Fatalf("stale ERROR missing distinct message:\n%s", out)
+	// A sample landed first, so the Error must name the retained last sample —
+	// not the cold-start "no sample yet" wording.
+	if !strings.Contains(out, "engine load stats stale") || !strings.Contains(out, "last sample") {
+		t.Fatalf("steady-state stale ERROR missing last-sample message:\n%s", out)
+	}
+	if strings.Contains(out, "no load signal yet") {
+		t.Fatalf("steady-state ERROR wrongly used the cold-start wording:\n%s", out)
 	}
 	if got := strings.Count(out, `"level":"WARN"`); got != 2 {
 		t.Fatalf("want 2 WARN before threshold (not Error spam), got %d\n%s", got, out)
@@ -218,6 +225,36 @@ func recoveryAtInfo(logOutput string) bool {
 		}
 	}
 	return false
+}
+
+// TestStatsReporterColdStartNeverSucceeded covers the other regime: every scrape
+// since startup fails, so no sample was ever collected. The stale-transition
+// Error must say the replica is ranked on residency only (no signal yet) rather
+// than claiming a retained "last sample" that never existed. A nil client is
+// safe here — a failed scrape returns before any ReportCacheState send.
+func TestStatsReporterColdStartNeverSucceeded(t *testing.T) {
+	fail := errors.New("dial tcp: connection refused")
+	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) { return nil, fail })
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	r := NewStatsReporter(nil, scraper, testConfig(), WithStatsLogger(logger))
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // fail, fail, fail(->Error at threshold)
+		r.tick(ctx)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
+		t.Fatalf("want exactly 1 ERROR at the cold-start stale transition, got %d\n%s", got, out)
+	}
+	if !strings.Contains(out, "no load signal yet") {
+		t.Fatalf("cold-start ERROR must state residency-only / no sample yet:\n%s", out)
+	}
+	if strings.Contains(out, "last sample") {
+		t.Fatalf("cold-start ERROR must not claim a retained last sample:\n%s", out)
+	}
 }
 
 func TestStatsReporterStopsOnContextCancel(t *testing.T) {

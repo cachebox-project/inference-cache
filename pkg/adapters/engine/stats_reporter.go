@@ -33,12 +33,15 @@ type StatsReporter struct {
 	logger     *slog.Logger
 
 	// staleThreshold consecutive scrape failures flips the reporter to "stale":
-	// it logs once at Error on that transition (IC keeps ranking this replica on
-	// its last load sample until that sample ages out at the index TTL, and only
-	// then falls back to residency-only) and once at Info on recovery. Guards
-	// against both per-tick log spam and a silently unrefreshed load signal.
+	// it logs once at Error on that transition and once at Info on recovery,
+	// guarding against both per-tick log spam and a silently unrefreshed load
+	// signal. The transition message depends on everSucceeded: after at least one
+	// good scrape IC keeps ranking on that last sample until it ages out at the
+	// index TTL; if every scrape since startup has failed there is no sample at
+	// all and the replica is ranked on residency only from the outset.
 	staleThreshold int
 	consecFails    int
+	everSucceeded  bool
 }
 
 // StatsReporterOption configures a StatsReporter.
@@ -113,11 +116,18 @@ func (r *StatsReporter) tick(ctx context.Context) {
 		r.consecFails++
 		switch {
 		case r.consecFails == r.staleThreshold:
-			// healthy -> stale transition: surface once, loudly. IC keeps ranking
-			// this replica on its last load sample until that sample ages out at
-			// the index TTL; only then does it fall back to residency-only.
-			r.logger.Error("engine load stats stale; IC ranking this replica on its last sample until it ages out (index TTL), then residency-only",
-				"consecutive_failures", r.consecFails, "err", err)
+			// healthy -> stale transition: surface once, loudly. The accurate
+			// consequence differs by whether a sample was ever collected: with one
+			// in hand IC keeps ranking on it until the index TTL ages it out; with
+			// none (all scrapes failed since startup) there is nothing to fall back
+			// on and the replica is ranked on residency alone from the start.
+			if r.everSucceeded {
+				r.logger.Error("engine load stats stale; IC ranking this replica on its last sample until it ages out (index TTL), then residency-only",
+					"consecutive_failures", r.consecFails, "err", err)
+			} else {
+				r.logger.Error("engine load stats unavailable since startup; IC ranking this replica on residency only (no load signal yet)",
+					"consecutive_failures", r.consecFails, "err", err)
+			}
 		case r.consecFails > r.staleThreshold:
 			// already surfaced; keep the per-tick detail out of the way.
 			r.logger.Debug("engine load stats still unavailable; skipping tick", "err", err)
@@ -132,6 +142,7 @@ func (r *StatsReporter) tick(ctx context.Context) {
 		r.logger.Info("engine load stats recovered", "after_failures", r.consecFails)
 	}
 	r.consecFails = 0
+	r.everSucceeded = true // a real sample now exists for the fall-back window
 	csu := r.cfg.StatsUpdate(r.now().UnixMicro(), stats)
 	if csu == nil {
 		return
