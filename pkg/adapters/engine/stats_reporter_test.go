@@ -213,6 +213,9 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 	if !recoveryAtInfo(out) {
 		t.Fatalf("recovery record must be emitted at INFO level\n%s", out)
 	}
+	if !strings.Contains(out, `"event":"load_signal_recovered"`) {
+		t.Fatalf("recovery record must carry the stable event field for alerting:\n%s", out)
+	}
 }
 
 // recoveryAtInfo confirms the "engine load stats recovered" record is the one
@@ -311,6 +314,31 @@ func TestStatsReporterStaleOnDeliveryFailure(t *testing.T) {
 	}
 	if strings.Contains(out, "recovered") {
 		t.Fatalf("must not claim recovery — no sample ever reached IC:\n%s", out)
+	}
+}
+
+// TestStatsReporterNilStatsCountsAsStale covers the interface-permitted case where
+// a scrape succeeds but yields no ReplicaStats (StatsUpdate returns nil). Nothing
+// reaches IC, so it must count toward staleness — not leave the failure streak in
+// limbo — and the transition must carry the stable event=load_signal_stale field.
+func TestStatsReporterNilStatsCountsAsStale(t *testing.T) {
+	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) { return nil, nil }) // scrape ok, no stats
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	r := NewStatsReporter(nil, scraper, testConfig(), WithStatsLogger(logger))
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // nil, nil, nil(->Error at threshold)
+		r.tick(ctx)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
+		t.Fatalf("nil-stats ticks must count toward staleness: want 1 ERROR at threshold, got %d\n%s", got, out)
+	}
+	if !strings.Contains(out, `"event":"load_signal_stale"`) {
+		t.Fatalf("stale ERROR must carry the stable event field for alerting:\n%s", out)
 	}
 }
 

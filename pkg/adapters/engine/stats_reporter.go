@@ -111,6 +111,18 @@ func (r *StatsReporter) Run(ctx context.Context) error {
 	}
 }
 
+// Stable structured log-event values for the stale/recovery transitions. Emitted
+// under the "event" key so operators can alert on the machine-readable field
+// rather than the human-readable message text (which may be reworded).
+const (
+	loadSignalStale     = "load_signal_stale"
+	loadSignalRecovered = "load_signal_recovered"
+)
+
+// errNoStats marks a tick whose scrape succeeded but produced no ReplicaStats to
+// report — nothing reaches IC, so it counts as a non-delivery.
+var errNoStats = errors.New("scrape produced no stats to report")
+
 // tick scrapes once and delivers one stats-only CacheStateUpdate to IC. A tick
 // "succeeds" only when a fresh sample actually reaches IC — a failed scrape and a
 // failed delivery (ReportCacheState) are treated identically, since either one
@@ -124,7 +136,12 @@ func (r *StatsReporter) tick(ctx context.Context) {
 	}
 	csu := r.cfg.StatsUpdate(r.now().UnixMicro(), stats)
 	if csu == nil {
-		return // no stats to report this tick — neither progress nor a failure
+		// The scraper returned no usable stats (the interface permits a nil
+		// result). Nothing reaches IC, so this is a non-delivery like a failed
+		// scrape — count it toward staleness rather than silently leaving the
+		// failure streak untouched.
+		r.markStale(errNoStats)
+		return
 	}
 	if err := r.send(ctx, csu); err != nil {
 		r.markStale(err)
@@ -145,12 +162,14 @@ func (r *StatsReporter) markStale(cause error) {
 		// with one in IC's index it keeps ranking on that until the index TTL ages
 		// it out; with none (nothing has reached IC since startup) the replica is
 		// ranked on residency alone from the start.
+		// Both branches carry event=load_signal_stale so alerting keys on that
+		// stable structured field, not the human-readable message text.
 		if r.everDelivered {
 			r.logger.Error("engine load stats stale; IC ranking this replica on its last delivered sample until it ages out (index TTL), then residency-only",
-				"consecutive_failures", r.consecFails, "err", cause)
+				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
 		} else {
 			r.logger.Error("engine load stats undelivered since startup; IC has no load sample for this replica (residency-only ranking)",
-				"consecutive_failures", r.consecFails, "err", cause)
+				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
 		}
 	case r.consecFails > r.staleThreshold:
 		// already surfaced; keep the per-tick detail out of the way.
@@ -166,7 +185,7 @@ func (r *StatsReporter) markStale(cause error) {
 // sample for the fall-back window.
 func (r *StatsReporter) markDelivered() {
 	if r.consecFails >= r.staleThreshold {
-		r.logger.Info("engine load stats recovered", "after_failures", r.consecFails)
+		r.logger.Info("engine load stats recovered", "event", loadSignalRecovered, "after_failures", r.consecFails)
 	}
 	r.consecFails = 0
 	r.everDelivered = true
