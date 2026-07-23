@@ -17,12 +17,14 @@
 // module on purpose — it is a vendored external contract, not part of IC's own
 // gRPC API, so it is exempt from IC's buf-lint conventions.
 //
-// Provenance: this is a hand-copied subset, so it is only as correct as the
-// upstream file it was taken from. When re-syncing against a new SMG release,
-// copy from the pinned revision and record it here (repo + commit), and confirm
-// the GetLoads request/response field numbers still match — the bufconn test
-// (grpc_loads_scraper_test.go) proves this file round-trips against its own
-// generated stubs, NOT that it matches the engine actually deployed.
+// Provenance: vendored from machxai/smg crates/grpc_client/proto/vllm_engine.proto
+// at commit 6d63ec83f052af42649a330d91f39aa56471aceb (2026-07-09). The GetLoads
+// RPC and the GetLoadsRequest / GetLoadsResponse / SchedulerLoad messages below
+// were verified field-for-field (numbers and types) against that revision. When
+// re-syncing against a newer SMG release, re-copy from the pinned commit, update
+// this line, and re-verify the field numbers. The bufconn test
+// (grpc_loads_scraper_test.go) only proves this file round-trips against its own
+// generated stubs — NOT that it matches the engine actually deployed.
 //
 // Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
 // proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the

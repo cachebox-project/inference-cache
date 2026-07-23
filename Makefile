@@ -551,7 +551,7 @@ ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
-	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
+	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto pkg/adapters/engine/vllmengine'; \
 	if ! git diff --quiet -- $$gen; then \
 		echo "✗ generated-code drift — regenerate and commit these files:"; \
 		git --no-pager diff --name-only -- $$gen; \

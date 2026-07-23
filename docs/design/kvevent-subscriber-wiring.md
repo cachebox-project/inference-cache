@@ -71,10 +71,10 @@ Concretely:
   `/metrics` (the `--engine-metrics-url` default) and emits `ReplicaStats` on its own
   cadence. Explicit stats-path flags — `--stats-interval`, the cache-size/ceiling
   hints, and `--engine-loads-grpc` (read load via the engine's GetLoads gRPC RPC
-  instead of HTTP; see the deferred note below) — are a follow-up enrichment the
-  sidecar does not set yet; passing a flag the binary doesn't recognise would crash
-  the sidecar at startup. No operator-supplied `--replica-id` / `--model-id` on the
-  demo path.
+  instead of HTTP; see the deferred note below) — are all recognised by the binary
+  but not yet set by the sidecar; wiring them (and deriving their values from the
+  CR) is the follow-up enrichment tracked below. No operator-supplied
+  `--replica-id` / `--model-id` on the demo path.
 
 ### Why this combination
 
