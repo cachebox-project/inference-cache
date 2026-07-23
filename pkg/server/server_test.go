@@ -258,10 +258,23 @@ func TestCacheTierFromProtoDistinguishesUnsetFromUnknown(t *testing.T) {
 
 	// A NEGATIVE value is invalid (proto3 enums are open int32). It must NOT be
 	// retained raw: it sorts below TierUnspecified/T1, so worstTier's max()-fold
-	// would treat it as WARMER than T1 and could mislabel a mixed chain as hot. It
-	// is poisoned to TierUnspecified (fail-safe), never retained.
-	if got := cacheTierFromProto(icpb.CacheTier(-1)); got != index.TierUnspecified {
-		t.Fatalf("negative tier = %v, want TierUnspecified (poisoned, fail-safe)", got)
+	// would treat it as WARMER than T1 and could mislabel a mixed chain as hot.
+	// And it must NOT map to TierUnspecified: normalizeIngestTier would then
+	// default it to T1 at ingest — fail-hot. It maps to a cold sentinel that is
+	// nonzero (survives normalizeIngestTier), sorts coldest, and reports back as
+	// UNSPECIFIED (an honest no-claim).
+	neg := cacheTierFromProto(icpb.CacheTier(-1))
+	if neg == index.TierUnspecified {
+		t.Fatal("negative tier mapped to TierUnspecified — normalizeIngestTier would default it to T1 (fail-hot)")
+	}
+	if neg == index.TierT1 {
+		t.Fatal("negative tier mapped to T1 — corrupt input must never land at the hottest tier")
+	}
+	if neg <= index.TierT3 {
+		t.Fatalf("negative tier = %v, want a value colder than any known tier (> TierT3)", neg)
+	}
+	if got := cacheTierToProto(neg); got != icpb.CacheTier_CACHE_TIER_UNSPECIFIED {
+		t.Fatalf("negative tier reports back as %v, want UNSPECIFIED (honest no-claim)", got)
 	}
 }
 
@@ -283,6 +296,9 @@ func TestReportedTierSurfacesThroughLookup(t *testing.T) {
 		// A future colder tier this server doesn't recognize is carried through
 		// but reported UNSPECIFIED to clients — crucially NOT over-claimed as T1.
 		{"future-unknown → UNSPECIFIED, not T1", icpb.CacheTier(99), icpb.CacheTier_CACHE_TIER_UNSPECIFIED},
+		// An invalid negative tier is fail-safe: it must land coldest and report
+		// back UNSPECIFIED — never get defaulted to T1 by normalizeIngestTier.
+		{"invalid-negative → UNSPECIFIED, not T1", icpb.CacheTier(-1), icpb.CacheTier_CACHE_TIER_UNSPECIFIED},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
