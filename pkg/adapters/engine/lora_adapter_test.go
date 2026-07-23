@@ -70,20 +70,20 @@ func TestConfigAdapterID(t *testing.T) {
 	cfg := testConfig()
 	cfg.AdapterNames = map[int64]string{1: "sql-lora"}
 
-	if got := cfg.AdapterID(nil); got != "" {
-		t.Errorf("AdapterID(nil) = %q, want \"\" (base model → default partition)", got)
+	if got, ok := cfg.AdapterID(nil); got != "" || !ok {
+		t.Errorf("AdapterID(nil) = (%q, %v), want (\"\", true) — base model → default partition", got, ok)
 	}
 	one, two := int64(1), int64(2)
-	if got := cfg.AdapterID(&one); got != "sql-lora" {
-		t.Errorf("AdapterID(1) = %q, want sql-lora", got)
+	if got, ok := cfg.AdapterID(&one); got != "sql-lora" || !ok {
+		t.Errorf("AdapterID(1) = (%q, %v), want (sql-lora, true)", got, ok)
 	}
-	// Unmapped ids stay exact within a replica via the "lora:<id>" fallback —
-	// they must never collapse to "" (which would alias with the base model).
-	if got := cfg.AdapterID(&two); got != "lora:2" {
-		t.Errorf("AdapterID(2) = %q, want lora:2", got)
+	// An unmapped non-nil id is fail-closed: ok=false so the caller drops the
+	// event rather than indexing it under an alias-prone "lora:<id>".
+	if got, ok := cfg.AdapterID(&two); got != "" || ok {
+		t.Errorf("AdapterID(2) = (%q, %v), want (\"\", false) — unmapped → fail closed", got, ok)
 	}
-	if got := (Config{}).AdapterID(&one); got != "lora:1" {
-		t.Errorf("AdapterID with no map = %q, want lora:1", got)
+	if got, ok := (Config{}).AdapterID(&one); got != "" || ok {
+		t.Errorf("AdapterID with no map = (%q, %v), want (\"\", false) — unmapped → fail closed", got, ok)
 	}
 }
 
@@ -146,9 +146,11 @@ func TestStoredSameTokensDifferentAdaptersShareHashNotPartition(t *testing.T) {
 	}
 }
 
-// End-to-end through the Reporter: one batch carrying two adapters' blocks is
-// forwarded as entries stamped with each adapter's resolved identity, and the
-// eviction that follows names the partition it came from.
+// End-to-end through the Reporter: one batch carrying a mapped adapter's blocks,
+// an UNMAPPED adapter's blocks, and base-model blocks. The mapped adapter and the
+// base model are forwarded stamped with their resolved identity; the unmapped
+// adapter is fail-closed (dropped, never indexed under a hazardous "lora:<id>").
+// The eviction that follows names the partition it came from.
 func TestReporterPartitionsEntriesByLoRAID(t *testing.T) {
 	const bs = 16
 	one, two := int64(1), int64(2)
@@ -180,10 +182,12 @@ func TestReporterPartitionsEntriesByLoRAID(t *testing.T) {
 			adapters = append(adapters, p.GetAdapterId())
 		}
 	}
-	want := map[string]bool{"sql-lora": false, "lora:2": false, "": false}
+	// lora_id=2 is unmapped → fail-closed → dropped, so it must NOT appear (only
+	// the mapped sql-lora and the base "" partition are forwarded).
+	want := map[string]bool{"sql-lora": false, "": false}
 	for _, a := range adapters {
 		if _, known := want[a]; !known {
-			t.Errorf("unexpected adapter_id %q on a forwarded entry", a)
+			t.Errorf("unexpected adapter_id %q on a forwarded entry (unmapped lora_id=2 must be dropped, not partitioned)", a)
 			continue
 		}
 		want[a] = true
@@ -206,6 +210,38 @@ func TestReporterPartitionsEntriesByLoRAID(t *testing.T) {
 	}
 	if evictions != 1 {
 		t.Errorf("got %d evictions, want 1", evictions)
+	}
+}
+
+// An unmapped non-nil lora_id is fail-closed: with no --lora-adapter-names entry
+// its blocks are dropped rather than indexed under a replica-local "lora:<id>"
+// that could alias adapters across replicas. Nothing is forwarded — not the add,
+// and not an eviction for a block that was never indexed.
+func TestReporterFailsClosedOnUnmappedAdapter(t *testing.T) {
+	const bs = 16
+	seven := int64(7)
+	cfg := testConfig() // no AdapterNames → every non-nil lora_id is unmapped
+
+	rec := runReporterCfg(t, cfg, nil,
+		&EventBatch{TimestampSeconds: 2.0, Events: []Event{
+			BlockStored{BlockHashes: [][]byte{{0x0a}}, TokenIDs: tokSeq(1, bs), BlockSize: bs, LoRAID: &seven},
+		}},
+		&EventBatch{TimestampSeconds: 3.0, Events: []Event{
+			BlockRemoved{BlockHashes: [][]byte{{0x0a}}},
+		}},
+	)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, u := range rec.updates {
+		if n := len(u.GetPrefixes()); n != 0 {
+			t.Errorf("forwarded %d prefixes for an unmapped adapter; want 0 (fail-closed)", n)
+		}
+	}
+	for _, ev := range rec.events {
+		if ev.GetPrefixHash() != nil {
+			t.Errorf("forwarded a PREFIX_EVICTED (%x) for an unmapped adapter; want none — its block was never indexed", ev.GetPrefixHash())
+		}
 	}
 }
 

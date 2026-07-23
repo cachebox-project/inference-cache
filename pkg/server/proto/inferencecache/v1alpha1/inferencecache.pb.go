@@ -381,12 +381,13 @@ type LookupRouteRequest struct {
 	// serving no LoRA emits a nil lora_id, so ingest and lookup both land under ""
 	// and are unaffected. This is NOT a "single LoRA adapter just works" claim:
 	// only a nil lora_id uses ""; ANY LoRA adapter (even one) resolves to a
-	// configured name or the "lora:<id>" fallback and never "". A lookup that sets
-	// adapter_id will NOT match entries ingested without one (and vice versa), so
-	// even one adapter requires the ingest identifier to agree with the query
-	// adapter_id end-to-end or every lookup silently misses — the same rule
-	// hash_scheme already follows. The server treats the value as an opaque string
-	// and never interprets it. Additive, v1alpha1-compatible.
+	// configured --lora-adapter-names identity — an unmapped adapter is dropped at
+	// ingest (fail-closed), never indexed under "" or a replica-local alias. A
+	// lookup that sets adapter_id will NOT match entries ingested without one (and
+	// vice versa), so even one adapter requires the ingest identifier to agree with
+	// the query adapter_id end-to-end or every lookup silently misses — the same
+	// rule hash_scheme already follows. The server treats the value as an opaque
+	// string and never interprets it. Additive, v1alpha1-compatible.
 	AdapterId     string `protobuf:"bytes,11,opt,name=adapter_id,json=adapterId,proto3" json:"adapter_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

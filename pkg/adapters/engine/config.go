@@ -34,47 +34,53 @@ type Config struct {
 	// the aliasing this partition exists to prevent — across replicas instead of
 	// within one.
 	//
-	// Optional. An id with no mapping falls back to "lora:<id>", which is exact
-	// within a replica and agrees ACROSS replicas whenever they share the same
-	// adapter load order (the homogeneous-Deployment case). Supply the map — from
-	// the same --lora-modules ordering the engine gets — for deployments whose
-	// replicas can diverge (runtime load/unload, rolling updates), and supply the
-	// matching adapter_id from the gateway.
+	// Only a NIL lora_id (base model / no LoRA) uses the default ("") partition,
+	// and that path needs no configuration. A non-nil lora_id with NO mapping is
+	// FAIL-CLOSED at ingest — AdapterID reports ok=false and the subscriber drops
+	// the event rather than partitioning it under a replica-local "lora:<id>",
+	// which could place different adapters in one partition across replicas whose
+	// --lora-modules order differs (the very cross-replica alias this partition
+	// exists to prevent).
 	//
-	// Only a NIL lora_id (base model / no LoRA) uses the default ("") partition.
-	// A non-nil lora_id — INCLUDING a single-adapter deployment — always resolves
-	// to a configured name or the "lora:<id>" fallback, never "". So a LoRA
-	// deployment does not "just work": whatever identity is ingested here MUST
-	// match the adapter_id the gateway queries with, or every lookup silently
-	// misses (same producer/consumer agreement HashScheme requires). Nil/empty
-	// AdapterNames is correct only for base-model / non-LoRA traffic, or when
-	// both sides deliberately rely on the "lora:<id>" fallback.
+	// So LoRA caching REQUIRES this map: supply it from the same --lora-modules
+	// ordering the engine gets, and send the matching adapter_id from the gateway
+	// (whatever identity is ingested here MUST match the gateway's query id — the
+	// same producer/consumer agreement HashScheme requires). An unmapped adapter
+	// is neither aliased nor cached — its prefixes get no hint (a miss, never a
+	// wrong replica) until it is mapped. Nil/empty AdapterNames is correct only
+	// for base-model / non-LoRA traffic.
 	AdapterNames map[int64]string
 }
 
 // AdapterID resolves an engine LoRA id to the stable adapter identity that
-// partitions the index. A nil id (base model / no adapter) yields "" — the
-// default partition, which is the behavior for every non-LoRA deployment.
-// A mapped id yields its configured name; an unmapped one yields "lora:<id>"
-// (see AdapterNames for why that fallback is exact per-replica but only
-// load-order-stable across replicas).
-func (c Config) AdapterID(loraID *int64) string {
+// partitions the index, and reports whether that id is safe to ingest:
+//
+//   - a nil id (base model / no adapter) → ("", true): the default partition,
+//     the behavior for every non-LoRA deployment;
+//   - a mapped id → (name, true): its configured stable identity;
+//   - an unmapped non-nil id → ("", false): FAIL CLOSED. The engine's id is a
+//     replica-local load-order integer with no globally stable meaning, so
+//     indexing it under "lora:<id>" could place different adapters in the same
+//     partition on replicas whose --lora-modules order differs — the very
+//     cross-replica alias this partition exists to prevent. The caller drops the
+//     ingest; the adapter is cached only once --lora-adapter-names maps its id.
+func (c Config) AdapterID(loraID *int64) (string, bool) {
 	if loraID == nil {
-		return ""
+		return "", true
 	}
 	if name, ok := c.AdapterNames[*loraID]; ok && name != "" {
-		return name
+		return name, true
 	}
-	return "lora:" + strconv.FormatInt(*loraID, 10)
+	return "", false
 }
 
 // ParseAdapterNames parses a comma-separated "id=name" list into the
 // Config.AdapterNames map (e.g. "1=sql-lora,2=chat-lora"). Empty input yields a
-// nil map — no mapping, so every adapter id falls back to "lora:<id>". Blank
-// list entries are skipped so a trailing comma is tolerated; a malformed pair,
-// a non-integer id, an empty name, or a duplicate id is an error, because
-// silently dropping one would put that adapter's blocks in a different partition
-// than the gateway looks up and turn every one of its lookups into a miss.
+// nil map — no mapping, so every non-nil lora_id is fail-closed (dropped, not
+// cached) at ingest until it is mapped. Blank list entries are skipped so a
+// trailing comma is tolerated; a malformed pair, a non-integer id, an empty
+// name, or a duplicate id is an error, because silently dropping one would leave
+// that adapter unmapped — uncached where the operator asked for caching.
 func ParseAdapterNames(s string) (map[int64]string, error) {
 	var out map[int64]string
 	for _, pair := range strings.Split(s, ",") {

@@ -211,35 +211,39 @@ stable identity the gateway sends as `LookupRouteRequest.adapter_id`:
 --lora-adapter-names "1=sql-lora,2=chat-lora"
 ```
 
-- **Unmapped id** → `lora:<id>`. Exact within a replica, and consistent across
-  replicas that share an adapter load order (the homogeneous-Deployment case).
-  Supply the map for adapters **known at startup** when replicas can diverge
-  (rolling updates, heterogeneous load order), and make the gateway send the
-  matching `adapter_id`.
+- **Unmapped id** → **dropped (fail-closed)**. A non-nil `lora_id` with no
+  mapping has only a replica-local load-order integer, which could alias
+  different adapters across replicas whose load order differs — so its blocks are
+  dropped (not indexed) rather than partitioned under a hazardous `lora:<id>`.
+  The adapter gets no routing hint (a cache miss, never a wrong replica) until it
+  is mapped; supply the map — for adapters **known at startup** — and make the
+  gateway send the matching `adapter_id`.
 - **No LoRA at all** (the default): every event carries a nil `lora_id`, so
   every entry and eviction lands in the default (`""`) partition — byte-for-byte
   the pre-adapter behavior. Nothing to configure.
 
 ### Limitations of the static flag
 
-`--lora-adapter-names` is resolved once at **startup**, which leaves two gaps —
-both a tracked follow-up, and neither a regression (an unmapped id still
-partitions by `lora:<id>`, strictly fewer collisions than the pre-adapter
-single-partition behavior):
+`--lora-adapter-names` is resolved once at **startup**, so an adapter it does not
+name is **fail-closed** — its blocks are dropped (uncached), never aliased. That
+trades cache benefit for safety in two cases, both a tracked follow-up:
 
 - **Runtime loads.** An adapter loaded or reloaded *after* the subscriber starts
-  whose id isn't already in the map falls back to `lora:<id>` — a static list
-  can't name it. Covering arbitrary runtime loads needs the subscriber to
-  resolve adapter identity **dynamically** from the engine's adapter registry.
+  whose id isn't in the map is dropped — a static list can't name it. Covering
+  arbitrary runtime loads needs the subscriber to resolve adapter identity
+  **dynamically** from the engine's adapter registry.
 - **Managed injection.** On the `CacheBackend`-driven path the subscriber
   sidecar is **injected**, so operators cannot pass the flag on a container they
   do not define; the explicit-set guidance below applies only to a
   **self-managed** subscriber. Configuring the mapping through the managed path
   needs a `CacheBackend` field the webhook forwards.
 
-For a self-managed subscriber, set `--lora-adapter-names` on the container
-directly: the controller has no view of the engine's `--lora-modules` ordering,
-so multi-adapter engines must supply the map explicitly.
+Neither is a correctness regression — a dropped adapter gets no routing hint (a
+cache miss, never a wrong replica), strictly safer than the alias a replica-local
+`lora:<id>` fallback would risk. For a self-managed subscriber, set
+`--lora-adapter-names` on the container directly: the controller has no view of
+the engine's `--lora-modules` ordering, so multi-adapter engines must supply the
+map explicitly.
 
 ## What this unblocks
 
