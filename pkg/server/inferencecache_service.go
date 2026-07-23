@@ -1076,12 +1076,17 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 //   - CACHE_TIER_UNSPECIFIED (0) — a legacy producer omitted the field — maps to
 //     TierUnspecified, which the index normalizes to T1 at ingest. So an older
 //     subscriber that never sets the tier still lands its stored prefixes at T1.
-//   - An unrecognized NON-ZERO value — a future producer reporting a colder tier
+//   - An unrecognized POSITIVE value — a future producer reporting a colder tier
 //     this server doesn't know yet — must NOT collapse to the T1 default (that
 //     would over-claim the hottest tier for a hold we know is colder). The raw
 //     value is retained (the index enum mirrors the proto values one-for-one), so
 //     it is carried honestly: worstTier ranks it colder than any known tier, and
 //     cacheTierToProto reports it back as UNSPECIFIED to old clients — never T1.
+//   - A NEGATIVE value is invalid: proto3 enums are open int32, but no valid tier
+//     is negative. Retaining it raw would be UNSAFE — it sorts below both
+//     TierUnspecified and T1, so worstTier's max()-fold would treat it as WARMER
+//     than T1 and could report a mixed chain as fully-hot. It's mapped to
+//     TierUnspecified so it poisons the fold instead. Fail-safe, never fail-hot.
 //
 // Inverse of cacheTierToProto for the known values.
 func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
@@ -1095,7 +1100,10 @@ func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
 	case icpb.CacheTier_CACHE_TIER_T3:
 		return index.TierT3
 	default:
-		return index.CacheTier(t) // future-unknown → retained, never conflated with unset/T1
+		if t < 0 {
+			return index.TierUnspecified // invalid negative → poison the fold (fail-safe)
+		}
+		return index.CacheTier(t) // future colder tier → retained, sorts coldest
 	}
 }
 

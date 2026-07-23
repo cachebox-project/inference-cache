@@ -255,6 +255,14 @@ func TestCacheTierFromProtoDistinguishesUnsetFromUnknown(t *testing.T) {
 	if got != index.CacheTier(future) {
 		t.Fatalf("future-unknown tier = %v, want the raw value %v retained", got, index.CacheTier(future))
 	}
+
+	// A NEGATIVE value is invalid (proto3 enums are open int32). It must NOT be
+	// retained raw: it sorts below TierUnspecified/T1, so worstTier's max()-fold
+	// would treat it as WARMER than T1 and could mislabel a mixed chain as hot. It
+	// is poisoned to TierUnspecified (fail-safe), never retained.
+	if got := cacheTierFromProto(icpb.CacheTier(-1)); got != index.TierUnspecified {
+		t.Fatalf("negative tier = %v, want TierUnspecified (poisoned, fail-safe)", got)
+	}
 }
 
 // TestReportedTierSurfacesThroughLookup is the end-to-end tier-tagging assertion:
