@@ -121,6 +121,28 @@ func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
 	}
 }
 
+func TestGRPCLoadsScraperCacheBytesNoOverflow(t *testing.T) {
+	// At an extreme capacity, float64(CacheSizeBytes) rounds above the int64 range,
+	// so a naive int64(usage*float64(cap)) overflows to a negative. cache_memory_bytes
+	// must stay in [0, CacheSizeBytes].
+	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
+		{TokenUsage: 1.0}, // full cache
+	}}
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
+		GRPCLoadsScraperConfig{CacheSizeBytes: math.MaxInt64})
+
+	st, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if got := st.GetCacheMemoryBytes(); got < 0 || got > math.MaxInt64 {
+		t.Fatalf("cache_memory_bytes = %d, want within [0, MaxInt64] (no overflow)", got)
+	}
+	if got := st.GetCacheMemoryBytes(); got != math.MaxInt64 {
+		t.Errorf("cache_memory_bytes = %d, want MaxInt64 at usage=1.0 full capacity", got)
+	}
+}
+
 func TestGRPCLoadsScraperErrorIsSurfaced(t *testing.T) {
 	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{err: errors.New("unavailable")},
 		GRPCLoadsScraperConfig{Addr: "x:1"})

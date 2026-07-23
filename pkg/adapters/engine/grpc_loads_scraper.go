@@ -119,7 +119,19 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 	pressure := pressureFrom(float64(running+waiting), s.cfg.MaxConcurrencyCeiling)
 	var cacheBytes int64
 	if s.cfg.CacheSizeBytes > 0 {
-		cacheBytes = int64(usage * float64(s.cfg.CacheSizeBytes))
+		// usage ∈ [0,1] ⇒ bytes ∈ [0, CacheSizeBytes]. Clamp in float space BEFORE
+		// the int64 conversion: float64(CacheSizeBytes) can round above the int64
+		// range at extreme capacities, so int64(usage*float64(CacheSizeBytes)) could
+		// overflow to a negative. Returning the exact int64 capacity at the top end
+		// sidesteps the lossy conversion.
+		switch b := usage * float64(s.cfg.CacheSizeBytes); {
+		case b <= 0:
+			cacheBytes = 0
+		case b >= float64(s.cfg.CacheSizeBytes):
+			cacheBytes = s.cfg.CacheSizeBytes
+		default:
+			cacheBytes = int64(b)
+		}
 	}
 	return &icpb.ReplicaStats{
 		CacheMemoryBytes: cacheBytes,
