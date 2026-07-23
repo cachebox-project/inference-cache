@@ -158,17 +158,19 @@ func (r *StatsReporter) markStale(cause error) {
 	r.consecFails++
 	switch {
 	case r.consecFails == r.staleThreshold:
-		// The accurate consequence depends on whether a sample was ever delivered:
-		// with one in IC's index it keeps ranking on that until the index TTL ages
-		// it out; with none (nothing has reached IC since startup) the replica is
-		// ranked on residency alone from the start.
+		// Word the message to only what THIS subscriber knows — whether it has
+		// delivered a sample since startup — never what IC globally holds. IC ages
+		// any delivered sample out at its index TTL, after which it ranks on
+		// residency only; a subscriber that has delivered nothing since startup
+		// cannot assume IC is empty (a prior process may have left a sample that is
+		// still within TTL), so it does not claim so. everDelivered is per-process.
 		// Both branches carry event=load_signal_stale so alerting keys on that
 		// stable structured field, not the human-readable message text.
 		if r.everDelivered {
-			r.logger.Error("engine load stats stale; IC ranking this replica on its last delivered sample until it ages out (index TTL), then residency-only",
+			r.logger.Error("engine load stats stale; this subscriber's last delivered sample ages out at IC's index TTL, then IC ranks this replica on residency only",
 				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
 		} else {
-			r.logger.Error("engine load stats undelivered since startup; IC has no load sample for this replica (residency-only ranking)",
+			r.logger.Error("engine load stats undelivered since startup; this subscriber has sent IC no sample for this replica (any prior sample ages out at IC's index TTL)",
 				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
 		}
 	case r.consecFails > r.staleThreshold:

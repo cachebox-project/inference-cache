@@ -230,11 +230,12 @@ func recoveryAtInfo(logOutput string) bool {
 	return false
 }
 
-// TestStatsReporterColdStartNeverSucceeded covers the other regime: every scrape
-// since startup fails, so no sample was ever collected. The stale-transition
-// Error must say the replica is ranked on residency only (no signal yet) rather
-// than claiming a retained "last sample" that never existed. A nil client is
-// safe here — a failed scrape returns before any ReportCacheState send.
+// TestStatsReporterColdStartNeverSucceeded covers the other regime: this
+// subscriber has delivered nothing since startup (a fresh start OR a restart —
+// everDelivered is per-process). The stale-transition Error must speak only to
+// what this subscriber knows (it has sent no sample) and must NOT assert IC is
+// globally empty, since a prior process may have left a sample still within TTL.
+// A nil client is safe here — a failed scrape returns before any ReportCacheState send.
 func TestStatsReporterColdStartNeverSucceeded(t *testing.T) {
 	fail := errors.New("dial tcp: connection refused")
 	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) { return nil, fail })
@@ -253,10 +254,15 @@ func TestStatsReporterColdStartNeverSucceeded(t *testing.T) {
 		t.Fatalf("want exactly 1 ERROR at the cold-start stale transition, got %d\n%s", got, out)
 	}
 	if !strings.Contains(out, "undelivered since startup") {
-		t.Fatalf("cold-start ERROR must state nothing reached IC yet:\n%s", out)
+		t.Fatalf("cold-start ERROR must state this subscriber has sent nothing:\n%s", out)
 	}
 	if strings.Contains(out, "last delivered sample") {
 		t.Fatalf("cold-start ERROR must not claim a delivered sample:\n%s", out)
+	}
+	// Must not over-assert IC's global state — a prior process's sample may still
+	// be within TTL. The message speaks only to what this subscriber has sent.
+	if strings.Contains(out, "IC has no") {
+		t.Fatalf("cold-start ERROR must not claim IC globally has no sample:\n%s", out)
 	}
 }
 
