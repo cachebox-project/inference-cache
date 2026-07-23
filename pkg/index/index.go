@@ -137,8 +137,10 @@ type ReplicaStats struct {
 // preferred. The zero value TierUnspecified means "no tier known": the current
 // ingest path normalizes it to TierT1 (see Ingest), and a non-prefix hint
 // (TENANT_HOT / AFFINITY_HINT) leaves it unspecified. Mirrors the proto
-// CacheTier enum values one-for-one. Tier *detection* (classifying a hold as
-// T2/T3) is out of scope — nothing sets a non-T1 tier yet.
+// CacheTier enum values one-for-one. Tier *detection* is done upstream by the
+// kvevent-subscriber from the engine block lifecycle (stored → T1,
+// evicted-but-L2-retained → T2); the tier arrives set on the ingested
+// PrefixRef. T3 is not yet emitted.
 type CacheTier int32
 
 const (
@@ -192,9 +194,10 @@ type PrefixRef struct {
 	BlockHashes      [][]byte
 	BlockTokenCounts []int32
 	// Tier is which cache tier this replica holds the prefix in. Unset
-	// (TierUnspecified) is normalized to TierT1 at ingest — the current
-	// path only ever reports T1 (the engine KV cache); tier detection is a
-	// later ticket. A chain entry's Tier applies to every block it expands to.
+	// (TierUnspecified) is normalized to TierT1 at ingest. The kvevent-subscriber
+	// sets it from the engine block lifecycle: a stored block reports T1, a block
+	// the engine evicts while a paired L2 tier (LMCache) retains it is re-reported
+	// at T2. A chain entry's Tier applies to every block it expands to.
 	Tier CacheTier
 }
 

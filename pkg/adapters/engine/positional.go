@@ -78,24 +78,40 @@ func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 		out = append(out, &icpb.PrefixEntry{
 			PrefixHash: fingerprint.Bytes(phs[i]),
 			TokenCount: tokens,
+			// A stored block is resident in the engine KV cache — tier T1. Stamped
+			// explicitly so the wire is self-describing; the server would default
+			// an unset tier to T1 anyway, but being explicit keeps a captured
+			// CacheStateUpdate unambiguous and symmetric with the T2 downgrade the
+			// reporter emits on eviction (see forwarder.go BlockRemoved).
+			Tier: icpb.CacheTier_CACHE_TIER_T1,
 		})
 		p.blocks[string(ev.BlockHashes[i])] = posEntry{prefixHash: phs[i], tokenCount: tokens}
 	}
 	return out
 }
 
-// Removed maps each evicted engine block hash to our prefix hash (the index key to
-// drop) and forgets it. Unknown hashes are skipped. The caller turns each returned
-// hash into a PREFIX_EVICTED event via Config.EvictedEvent.
-func (p *positionalIndex) Removed(ev BlockRemoved) [][]byte {
+// evictedPrefix is one block the engine evicted, resolved back to the index key
+// we derived for it (our content fingerprint) plus its cumulative token count.
+// The token count lets the caller re-report the prefix at a colder tier (T2) when
+// a paired L2 store still holds it, instead of only being able to delete it.
+type evictedPrefix struct {
+	prefixHash []byte
+	tokenCount int32
+}
+
+// Removed maps each evicted engine block hash back to the index entry we derived
+// for it (prefix hash + token count) and forgets it. Unknown hashes are skipped.
+// The caller either forwards each as a PREFIX_EVICTED (single-tier: the block is
+// gone) or re-reports it at T2 (L2 tier present: the block moved tiers, not gone).
+func (p *positionalIndex) Removed(ev BlockRemoved) []evictedPrefix {
 	if len(ev.BlockHashes) == 0 {
 		return nil
 	}
-	out := make([][]byte, 0, len(ev.BlockHashes))
+	out := make([]evictedPrefix, 0, len(ev.BlockHashes))
 	for _, h := range ev.BlockHashes {
 		key := string(h)
 		if pe, ok := p.blocks[key]; ok {
-			out = append(out, fingerprint.Bytes(pe.prefixHash))
+			out = append(out, evictedPrefix{prefixHash: fingerprint.Bytes(pe.prefixHash), tokenCount: pe.tokenCount})
 			delete(p.blocks, key)
 		}
 	}

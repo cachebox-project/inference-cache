@@ -10,24 +10,34 @@ import (
 
 // Reporter forwards decoded KV-cache events to the policy server over gRPC.
 //
-// Adds (BlockStored) are accumulated and flushed on a short window — this
-// debounces high engine event rates. Each flush sends one CacheStateUpdate on a
-// fresh, time-bounded ReportCacheState stream; removals (BlockRemoved →
-// PREFIX_EVICTED, AllBlocksCleared → ALL_CLEARED) go via a time-bounded unary
-// PublishEvent.
+// Adds (BlockStored, tagged tier T1) are accumulated and flushed on a short
+// window — this debounces high engine event rates. Each flush sends one
+// CacheStateUpdate on a fresh, time-bounded ReportCacheState stream. A
+// BlockRemoved is handled one of two ways depending on whether the engine has an
+// L2 offload tier (WithIgnoreBlockRemoved): with one, the block moved tiers, so it
+// is re-reported at T2 through the same ReportCacheState add path; without one it
+// is gone, forwarded as PREFIX_EVICTED via a time-bounded unary PublishEvent.
+// AllBlocksCleared → ALL_CLEARED, also via PublishEvent.
 //
 // Every RPC uses its own bounded context, so a stalled or unreachable server can
 // never block the loop for longer than rpcTimeout — the cache is an optimization
 // and must never stall the engine. Errors are logged and dropped (soft state);
 // Run only returns on context cancellation or input close.
 type Reporter struct {
-	client             icpb.InferenceCacheClient
-	cfg                Config
-	window             time.Duration
-	rpcTimeout         time.Duration
-	maxPend            int
-	logger             *slog.Logger
-	ignoreBlockRemoved bool
+	client     icpb.InferenceCacheClient
+	cfg        Config
+	window     time.Duration
+	rpcTimeout time.Duration
+	maxPend    int
+	logger     *slog.Logger
+	// l2TierPresent records whether this replica's engine is paired with an L2
+	// offload tier (e.g. LMCache) that retains a block after the engine evicts it
+	// from HBM. It changes what a BlockRemoved means: with an L2 tier the block
+	// moved tiers (downgrade the hint to T2), without one it is gone (forward
+	// PREFIX_EVICTED). Set via WithIgnoreBlockRemoved (the operator flag is
+	// --ignore-block-removed; the name predates the T2 downgrade and is kept for
+	// compatibility — see that option's doc).
+	l2TierPresent bool
 	// pos derives our positional content fingerprint from each event's tokens and
 	// chains it across events. Owned by Run (single goroutine), so unsynchronized.
 	pos *positionalIndex
@@ -45,17 +55,24 @@ func WithRPCTimeout(d time.Duration) ReporterOption { return func(r *Reporter) {
 // WithLogger sets the logger (default slog.Default()).
 func WithLogger(l *slog.Logger) ReporterOption { return func(r *Reporter) { r.logger = l } }
 
-// WithIgnoreBlockRemoved drops BlockRemoved events instead of forwarding them as
-// PREFIX_EVICTED. Required when the engine is paired with an L2 cache tier
-// (e.g. LMCache) that retains a block after the engine evicts it from GPU:
-// vLLM emits BlockRemoved on every GPU eviction even when the block is still
-// resident at L2, and forwarding that as PREFIX_EVICTED makes the server drop
-// a routing hint the replica can still cheaply serve from the L2 tier. With
-// the flag set the index keeps the entry until the freshness TTL expires; a
-// stale hint is soft state (cache miss at worst, never a wrong answer), while
-// a missing one routes the request elsewhere and wastes the L2 cache hit.
+// WithIgnoreBlockRemoved declares that this replica's engine is paired with an L2
+// offload tier (e.g. LMCache) that retains a block after the engine evicts it from
+// HBM. vLLM emits BlockRemoved on every HBM eviction even when the block is still
+// resident at L2, so a plain PREFIX_EVICTED would drop a routing hint the replica
+// can still cheaply serve from the offload tier. With this set, a BlockRemoved is
+// instead re-reported as a T2 entry (reload-able from L2) rather than deleted — the
+// hint stays, but honestly tagged colder than HBM, and ages out on the freshness
+// TTL like any other entry. Without it (single-tier), a BlockRemoved forwards
+// PREFIX_EVICTED (the block is gone). A wrong T2 tag is soft state (a cache miss at
+// worst, never a wrong answer); a missing hint routes the request away from its
+// warm replica and wastes the L2 hit — the opposite risk, hence the split.
+//
+// The name (and the operator flag --ignore-block-removed) predates the T2 downgrade
+// — earlier this path simply suppressed the eviction and left the entry stale at
+// T1. It is kept for backward compatibility; the signal it carries ("this replica
+// has an L2 tier") is unchanged.
 func WithIgnoreBlockRemoved(b bool) ReporterOption {
-	return func(r *Reporter) { r.ignoreBlockRemoved = b }
+	return func(r *Reporter) { r.l2TierPresent = b }
 }
 
 // NewReporter builds a Reporter for one engine replica.
@@ -133,31 +150,53 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 						flush()
 					}
 				case BlockRemoved:
-					// When the engine has an L2 cache tier behind it (e.g. LMCache),
-					// BlockRemoved fires every time the engine evicts a block from
-					// GPU even though the block is still cached at L2 — forwarding
-					// it as PREFIX_EVICTED would drop the routing hint while the
-					// replica can still cheaply serve the block. With the flag set
-					// the entry stays in the index until the freshness TTL expires;
-					// rely on TTL for actual staleness and leave the L2-served hint
-					// intact. See WithIgnoreBlockRemoved.
-					//
-					// Either way the local reverse map MUST drop the evicted blocks:
-					// the engine never references a GPU-evicted block as a future
-					// parent, so retaining it only grows pos unbounded — and in
-					// L2 mode there is no other prune point until AllBlocksCleared.
-					// So prune locally even when we suppress the server-side eviction.
-					if r.ignoreBlockRemoved {
-						r.pos.Removed(e) // prune the reverse map; don't forward (L2 keeps the hint)
+					// The local reverse map MUST always drop the evicted blocks: the
+					// engine never references an HBM-evicted block as a future parent,
+					// so retaining it only grows pos unbounded — and in L2 mode there
+					// is no other prune point until AllBlocksCleared. Resolve the keys
+					// (which also forgets them) before deciding how to report.
+					evicted := r.pos.Removed(e)
+					if r.l2TierPresent {
+						// L2 tier present: the block moved from HBM to the offload tier,
+						// it is not gone. Re-report each evicted prefix at T2 (reload-able
+						// from L2) instead of deleting it — the index applies
+						// last-write-wins on tier, moving the entry T1→T2; a later
+						// BlockStored re-store re-reports it at T1 (upgrade). Nothing to
+						// do when the block wasn't ours.
+						if len(evicted) == 0 {
+							continue
+						}
+						// Send the downgrade as its OWN CacheStateUpdate carrying THIS
+						// eviction's timestamp. A CSU has a single timestamp_us for all
+						// its prefixes, so the T2 entry must NOT ride the debounced
+						// `pending` buffer: a later BlockStored in the same window would
+						// overwrite the shared pendTs and refresh the T2 entry's freshness
+						// away from the eviction time — but T2 freshness is meant to be
+						// anchored at the eviction (when reload-ability was last
+						// confirmed). Flush buffered adds first so store→evict order is
+						// preserved on the wire; sendAdds is synchronous (CloseAndRecv
+						// waits for the server to ingest), so the downgrade is fully
+						// applied before the next event is read.
+						flush()
+						downgrades := make([]*icpb.PrefixEntry, 0, len(evicted))
+						for _, ep := range evicted {
+							downgrades = append(downgrades, &icpb.PrefixEntry{
+								PrefixHash: ep.prefixHash,
+								TokenCount: ep.tokenCount,
+								Tier:       icpb.CacheTier_CACHE_TIER_T2,
+							})
+						}
+						r.sendAdds(downgrades, tsUs)
 						continue
 					}
-					// Removals are the pruning path and adds are additive, so the
-					// eviction must not be overtaken by a still-buffered add of the
-					// same block (store-then-evict within one window). Flush pending
-					// adds first to preserve store→evict order.
+					// Single-tier: the block is gone. Removals are a separate unary
+					// RPC and adds are additive, so the eviction must not be overtaken
+					// by a still-buffered add of the same block (store-then-evict
+					// within one window). Flush pending adds first to preserve
+					// store→evict order.
 					flush()
-					for _, ourHash := range r.pos.Removed(e) {
-						r.publish(r.cfg.EvictedEvent(ourHash, b.TimestampSeconds))
+					for _, ep := range evicted {
+						r.publish(r.cfg.EvictedEvent(ep.prefixHash, b.TimestampSeconds))
 					}
 				case AllBlocksCleared:
 					pending = pending[:0] // a clear supersedes buffered adds

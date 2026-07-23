@@ -104,8 +104,13 @@ func TestRemovedMapsAndForgets(t *testing.T) {
 	our := stored[0].PrefixHash
 
 	rm := p.Removed(BlockRemoved{BlockHashes: [][]byte{engHash(5)}})
-	if len(rm) != 1 || beU64(rm[0]) != beU64(our) {
+	if len(rm) != 1 || beU64(rm[0].prefixHash) != beU64(our) {
 		t.Fatalf("Removed = %v, want our prefix hash %d", rm, beU64(our))
+	}
+	// The token count is carried back so the caller can re-report the prefix at
+	// T2 (L2 mode) rather than only being able to delete it. One full block.
+	if rm[0].tokenCount != bs {
+		t.Fatalf("Removed token count = %d, want %d", rm[0].tokenCount, bs)
 	}
 	// Re-removing the now-forgotten hash yields nothing.
 	if rm2 := p.Removed(BlockRemoved{BlockHashes: [][]byte{engHash(5)}}); len(rm2) != 0 {
