@@ -16,7 +16,7 @@
 #
 # VALIDATION STATUS: this hand manifest is derived from the GPU-validated adapter
 # render (store->flush->retrieve reuses KV, via the controller-rendered managed
-# path, #149) and is structurally checked (kubectl apply --dry-run). It has NOT been
+# path, #149) and is structurally checked (kubectl apply --dry-run=client). It has NOT been
 # independently re-run end-to-end on a GPU in this exact shape — before treating it
 # as a golden reference, a GPU run should confirm: engine + MP-worker startup, the
 # config-file handoff, CUDA-IPC attachment, and a Redis store/retrieve (README step 4).

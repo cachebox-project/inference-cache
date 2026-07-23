@@ -14,7 +14,7 @@ is **not** byte-for-byte adapter output.
 > **Validation status.** This manifest is **derived from the GPU-validated adapter
 > render** (`sglang_mp.go` + `redis_l2.go`; the controller-rendered managed path was
 > validated store→flush→retrieve end-to-end in the MP-mode increment) and is
-> **structurally checked** (`kubectl apply --dry-run`). It has **not** been
+> **structurally checked** (`kubectl apply --dry-run=client`). It has **not** been
 > independently re-run end-to-end on a GPU in this exact hand shape — run it on a GPU
 > host (below) before treating it as a golden reference. All pins live in
 > [`../../VERSIONS.md`](../../VERSIONS.md).
@@ -195,12 +195,16 @@ kill "$pf" 2>/dev/null; trap - EXIT
   store→flush→retrieve cycle the managed path was GPU-validated on):
 
   ```bash
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # only count retrievals logged AFTER this point
   kubectl -n cache-substrate port-forward svc/sglang-lmcache-llama-8b 30000:30000 & pf=$!; sleep 3
-  curl -sfS -X POST localhost:30000/flush_cache >/dev/null    # clear the engine's GPU radix cache
-  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null
+  curl -sfS -X POST localhost:30000/flush_cache >/dev/null \
+    || { kill "$pf" 2>/dev/null; echo "FAIL: flush_cache request failed"; exit 1; }   # clear GPU radix cache
+  curl -sfS localhost:30000/v1/chat/completions -H 'content-type: application/json' -d "$BODY" >/dev/null \
+    || { kill "$pf" 2>/dev/null; echo "FAIL: post-flush request not served"; exit 1; }
   kill "$pf" 2>/dev/null
-  # The MP worker logs a retrieval when it serves the prefix back from L1+L2:
-  kubectl -n cache-substrate logs deploy/sglang-lmcache-llama-8b -c lmcache-mp-worker \
+  # A retrieval logged AFTER the flush (scoped by --since-time so a stale warm-up
+  # retrieval can't false-pass) proves the L1/L2 reload:
+  kubectl -n cache-substrate logs deploy/sglang-lmcache-llama-8b -c lmcache-mp-worker --since-time="$ts" \
     | grep -iE 'Retrieved [0-9]+ tokens|Prefetch .*L2' \
     || { echo "FAIL: no L2 retrieval after flush — reload path not working"; exit 1; }
   ```
