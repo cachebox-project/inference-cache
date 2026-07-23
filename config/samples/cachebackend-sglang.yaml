@@ -22,10 +22,11 @@
 #   - --enable-lmcache            (SGLang's store_true flag; replaces vLLM's --kv-transfer-config)
 #   - --lmcache-config-file <path> (the MP config the worker writes; MP mode aborts without it)
 #   - LMCACHE_USE_EXPERIMENTAL=True + INFERENCECACHE_FAIL_OPEN
-# The old lm:// env (LMCACHE_REMOTE_URL / SERDE / CHUNK_SIZE / LOCAL_CPU) is NOT
-# injected — MP mode ignores it. VLLM_USE_V1 and PYTHONHASHSEED are vLLM-only and
-# likewise absent (SGLang has no v1 codepath; its sha256 prefix hashing does not
-# depend on PYTHONHASHSEED). Unrelated user-set env/args on the pod template survive
+# The old lm:// env (LMCACHE_REMOTE_URL and the LMCACHE_REMOTE_SERDE / CHUNK_SIZE /
+# LOCAL_CPU / MAX_LOCAL_CPU_SIZE tunables) is NOT injected — MP mode ignores it.
+# VLLM_USE_V1 and PYTHONHASHSEED are vLLM-only and likewise absent (SGLang has no v1
+# codepath; its sha256 prefix hashing does not depend on PYTHONHASHSEED). Unrelated
+# user-set env/args on the pod template survive
 # injection — the adapter merges, upserting only the keys it owns (a pod-template
 # value colliding with an adapter-owned key is overwritten, not rejected). The
 # hard-reject is a separate surface: a `spec.integration.engineOverrides` entry that
@@ -71,7 +72,7 @@ spec:
     # an `@sha256:` digest for non-local runs.
     redisImage: docker.io/library/redis:7.4-alpine
     # Optional MP-worker tunables — all have defaults; shown here for reference:
-    #   workerImage: <engine image>   # runs the LMCache MP server; defaults to the SGLang engine's own image
+    #   workerImage: <engine image>   # the LMCache MP server; defaults to the engine image
     #   chunkSize:   "256"            # LMCache chunk size
     #   mpPort:      "5555"           # loopback ZMQ port the engine <-> worker use
     #   l1SizeGB:    "4"              # /dev/shm L1 budget (GiB); also sizes the shared shm emptyDir
