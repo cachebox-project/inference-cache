@@ -39,9 +39,16 @@ type Config struct {
 	// adapter load order (the homogeneous-Deployment case). Supply the map — from
 	// the same --lora-modules ordering the engine gets — for deployments whose
 	// replicas can diverge (runtime load/unload, rolling updates), and supply the
-	// matching adapter_id from the gateway. Nil/empty is the common single-adapter
-	// or LoRA-free deployment: every event has no lora_id and lands in the default
-	// ("") partition, i.e. exactly the pre-adapter behavior.
+	// matching adapter_id from the gateway.
+	//
+	// Only a NIL lora_id (base model / no LoRA) uses the default ("") partition.
+	// A non-nil lora_id — INCLUDING a single-adapter deployment — always resolves
+	// to a configured name or the "lora:<id>" fallback, never "". So a LoRA
+	// deployment does not "just work": whatever identity is ingested here MUST
+	// match the adapter_id the gateway queries with, or every lookup silently
+	// misses (same producer/consumer agreement HashScheme requires). Nil/empty
+	// AdapterNames is correct only for base-model / non-LoRA traffic, or when
+	// both sides deliberately rely on the "lora:<id>" fallback.
 	AdapterNames map[int64]string
 }
 

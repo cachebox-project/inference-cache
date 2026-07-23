@@ -1364,8 +1364,15 @@ adapter_model="install-smoke-adapter"
 adapter_replica="adapter-smoke-replica"
 adapter_hash_b64="YWRhcHRlci1wcmVmaXg=" # base64("adapter-prefix") — stored at tokenCount=64, clears both policy gates
 
+# No stats in this update: a warm hit_rate would let the negative probes below
+# qualify for TENANT_HOT, making the expected fail-open code ambiguous between
+# TENANT_HOT and AFFINITY_HINT. Without stats the non-matching adapter partitions
+# fall straight through to the affinity fallback, so the expected code is
+# deterministically AFFINITY_HINT (the replica still SERVES the adapter-blind
+# scope via the prefix ingest, so affinity has a candidate). PREFIX_MATCH on the
+# same adapter needs only the prefix entry, not stats.
 adapter_report_payload="$(cat <<EOF
-{"replicaId":"$adapter_replica","modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$adapter_hash_b64","tokenCount":64,"adapterId":"smoke-lora-a"}],"stats":{"replicaId":"$adapter_replica","hitRate":1}}
+{"replicaId":"$adapter_replica","modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$adapter_hash_b64","tokenCount":64,"adapterId":"smoke-lora-a"}]}
 EOF
 )"
 adapter_report_resp="$(grpcurl_report_cache_state "$adapter_report_payload" "$LOG_DIR/grpcurl-adapter-report.err")" || {
@@ -1405,20 +1412,45 @@ until has_reason_code "$adapter_same_resp" "PREFIX_MATCH"; do
   sleep 2
 done
 
-adapter_other_resp="$(grpcurl_lookup_route "$adapter_other_payload" "$LOG_DIR/grpcurl-adapter-other.err")" || true
-if has_reason_code "$adapter_other_resp" "PREFIX_MATCH"; then
-  echo "different-adapter LookupRoute response (want NOT PREFIX_MATCH):" >&2
-  echo "$adapter_other_resp" >&2
-  fail "LookupRoute for adapter_id=smoke-lora-b matched a prefix ingested under smoke-lora-a — identical token content aliased across adapters, which would route to a replica holding a DIFFERENT adapter's KV"
-fi
+# assert_adapter_no_alias runs one NEGATIVE adapter probe. The property under
+# test is "the identical prefix hash does NOT match in a different partition,"
+# but a transport error mustn't masquerade as that: grpcurl failing or returning
+# an empty body would leave has_reason_code false and silently pass. So require
+# the RPC to SUCCEED and return a non-empty body, then assert the expected
+# fail-open reason_code — AFFINITY_HINT, because affinityRouting is Enabled for
+# this tenant (the policy block above proved it) and the replica serves the
+# adapter-blind (tenant, model, hash_scheme) scope, so a non-matching adapter
+# partition downgrades to a stable affinity pick rather than a prefix hit. An
+# RPC error is therefore a red, not a green.
+assert_adapter_no_alias() {
+  local payload="$1" err_file="$2" label="$3" alias_msg="$4"
+  local resp
+  if ! resp="$(grpcurl_lookup_route "$payload" "$err_file")" || [ -z "$resp" ]; then
+    if [ -s "$err_file" ]; then
+      cat "$err_file" >&2
+    fi
+    echo "$label LookupRoute response: ${resp:-<empty>}" >&2
+    fail "$label LookupRoute returned no response — an RPC/transport error must fail the adapter-partition probe, not silently pass it as a non-match"
+  fi
+  if has_reason_code "$resp" "PREFIX_MATCH"; then
+    echo "$label LookupRoute response (want NOT PREFIX_MATCH):" >&2
+    echo "$resp" >&2
+    fail "$alias_msg"
+  fi
+  if ! has_reason_code "$resp" "AFFINITY_HINT"; then
+    echo "$label LookupRoute response (want fail-open AFFINITY_HINT):" >&2
+    echo "$resp" >&2
+    fail "$label LookupRoute did not return the expected fail-open AFFINITY_HINT — a non-matching adapter partition must downgrade to a stable affinity pick, never error and never PREFIX_MATCH"
+  fi
+}
 
-adapter_none_resp="$(grpcurl_lookup_route "$adapter_none_payload" "$LOG_DIR/grpcurl-adapter-none.err")" || true
-if has_reason_code "$adapter_none_resp" "PREFIX_MATCH"; then
-  echo "no-adapter LookupRoute response (want NOT PREFIX_MATCH):" >&2
-  echo "$adapter_none_resp" >&2
-  fail "LookupRoute without adapter_id matched an adapter-scoped prefix — adapter-scoped ingest must stay out of the default partition"
-fi
-log "adapter partition enforced end-to-end: same adapter_id → PREFIX_MATCH; a different adapter_id and an absent adapter_id both stayed off the prefix-match path on the identical prefix hash"
+assert_adapter_no_alias "$adapter_other_payload" "$LOG_DIR/grpcurl-adapter-other.err" \
+  "different-adapter" \
+  "LookupRoute for adapter_id=smoke-lora-b matched a prefix ingested under smoke-lora-a — identical token content aliased across adapters, which would route to a replica holding a DIFFERENT adapter's KV"
+assert_adapter_no_alias "$adapter_none_payload" "$LOG_DIR/grpcurl-adapter-none.err" \
+  "no-adapter" \
+  "LookupRoute without adapter_id matched an adapter-scoped prefix — adapter-scoped ingest must stay out of the default partition"
+log "adapter partition enforced end-to-end: same adapter_id → PREFIX_MATCH; a different adapter_id and an absent adapter_id each returned the fail-open AFFINITY_HINT (RPC succeeded, off the prefix-match path) on the identical prefix hash"
 
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server
