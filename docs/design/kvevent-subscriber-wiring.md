@@ -66,11 +66,15 @@ Concretely:
   admission picks it up once the operator sets the key), `--hash-scheme` ← the
   adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),
-  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags
-  (`--engine-metrics-url`, `--stats-interval`, etc.) are added by the adapter when the
-  shipped subscriber binary learns to scrape and emit `ReplicaStats`; passing flags the
-  binary doesn't recognise would crash the sidecar at startup. No operator-supplied
-  `--replica-id` / `--model-id` on the demo path.
+  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats path runs on
+  the subscriber binary's built-in defaults: it scrapes the engine's HTTP Prometheus
+  `/metrics` (the `--engine-metrics-url` default) and emits `ReplicaStats` on its own
+  cadence. Explicit stats-path flags — `--stats-interval`, the cache-size/ceiling
+  hints, and `--engine-loads-grpc` (read load via the engine's GetLoads gRPC RPC
+  instead of HTTP; see the deferred note below) — are a follow-up enrichment the
+  sidecar does not set yet; passing a flag the binary doesn't recognise would crash
+  the sidecar at startup. No operator-supplied `--replica-id` / `--model-id` on the
+  demo path.
 
 ### Why this combination
 
@@ -101,6 +105,16 @@ Concretely:
   ceilings, cache-size hint) — not added in this PR. The sidecar passes the
   `kvevent-subscriber` binary's flag defaults and can be enriched in a follow-up when an
   operator needs the knobs.
+* **Auto-injecting `--engine-loads-grpc` (GetLoads load source)** — the subscriber binary
+  can now read engine load over the VllmEngine `GetLoads` gRPC RPC instead of scraping HTTP
+  `/metrics` (an SMG gRPC engine exposes no `/metrics` endpoint at all), selected by the
+  `--engine-loads-grpc` flag. The sidecar renderer does **not** pass that flag yet, so
+  auto-injected sidecars keep the HTTP default. Deferred deliberately: `GetLoads` requires a
+  newer engine floor (SMG gRPC servicer ≥ 0.5.2 / vLLM ≥ 0.19) than the engine currently
+  deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC and flip
+  the load signal to "stale" (see the `StatsReporter` stale-escalation path). It gets wired
+  alongside the stats-path knobs above once the engine floor moves; until then it is opt-in
+  via the binary flag for gRPC-only engine deployments.
 * **TLS subscriber → policy-server** — separate ticket.
 * **HA / multi-server policy-server target** — separate ticket.
 * **Readiness gating on first KV event observed** — natural follow-up once this lands.

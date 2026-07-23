@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"google.golang.org/grpc"
@@ -12,8 +13,8 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
-// GrpcLoadsScraperConfig tunes the gRPC GetLoads scraper. Addr is required.
-type GrpcLoadsScraperConfig struct {
+// GRPCLoadsScraperConfig tunes the gRPC GetLoads scraper. Addr is required.
+type GRPCLoadsScraperConfig struct {
 	// Addr is the engine's VllmEngine gRPC address (host:port), e.g.
 	// 127.0.0.1:50051.
 	Addr string
@@ -29,7 +30,7 @@ type GrpcLoadsScraperConfig struct {
 	Timeout time.Duration
 }
 
-// GrpcLoadsScraper reads engine load via the SMG engine's GetLoads gRPC RPC and
+// GRPCLoadsScraper reads engine load via the SMG engine's GetLoads gRPC RPC and
 // projects it into a ReplicaStats — the gRPC-native alternative to scraping the
 // engine's HTTP /metrics. An SMG gRPC engine (vllm.entrypoints.grpc_server)
 // exposes no HTTP metrics endpoint; live load is available only over GetLoads.
@@ -40,16 +41,16 @@ type GrpcLoadsScraperConfig struct {
 // T2HitTokens/T2QueryTokens are left 0 here — those remain HTTP-/metrics-only.
 // The load signals the ranker actually uses (pressure, cache-usage, hit-rate)
 // are all provided.
-type GrpcLoadsScraper struct {
+type GRPCLoadsScraper struct {
 	client vpb.VllmEngineClient
-	cfg    GrpcLoadsScraperConfig
+	cfg    GRPCLoadsScraperConfig
 	closer func() error
 }
 
-// NewGrpcLoadsScraper dials the engine (lazily — grpc.NewClient does not connect
+// NewGRPCLoadsScraper dials the engine (lazily — grpc.NewClient does not connect
 // until the first RPC, so a down engine doesn't fail construction) and returns a
 // scraper. Call Close to release the connection.
-func NewGrpcLoadsScraper(cfg GrpcLoadsScraperConfig) (*GrpcLoadsScraper, error) {
+func NewGRPCLoadsScraper(cfg GRPCLoadsScraperConfig) (*GRPCLoadsScraper, error) {
 	if cfg.Addr == "" {
 		return nil, fmt.Errorf("grpc loads scraper: Addr is required")
 	}
@@ -60,24 +61,24 @@ func NewGrpcLoadsScraper(cfg GrpcLoadsScraperConfig) (*GrpcLoadsScraper, error) 
 	if err != nil {
 		return nil, fmt.Errorf("grpc loads scraper: dial %s: %w", cfg.Addr, err)
 	}
-	return &GrpcLoadsScraper{client: vpb.NewVllmEngineClient(conn), cfg: cfg, closer: conn.Close}, nil
+	return &GRPCLoadsScraper{client: vpb.NewVllmEngineClient(conn), cfg: cfg, closer: conn.Close}, nil
 }
 
-// newGrpcLoadsScraperWithClient injects a client (tests) and never owns a conn.
-func newGrpcLoadsScraperWithClient(c vpb.VllmEngineClient, cfg GrpcLoadsScraperConfig) *GrpcLoadsScraper {
+// newGRPCLoadsScraperWithClient injects a client (tests) and never owns a conn.
+func newGRPCLoadsScraperWithClient(c vpb.VllmEngineClient, cfg GRPCLoadsScraperConfig) *GRPCLoadsScraper {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultScrapeTimeout
 	}
-	return &GrpcLoadsScraper{client: c, cfg: cfg, closer: func() error { return nil }}
+	return &GRPCLoadsScraper{client: c, cfg: cfg, closer: func() error { return nil }}
 }
 
 // Close releases the underlying gRPC connection.
-func (s *GrpcLoadsScraper) Close() error { return s.closer() }
+func (s *GRPCLoadsScraper) Close() error { return s.closer() }
 
 // Scrape calls GetLoads once and projects the per-DP-rank SchedulerLoad into a
 // ReplicaStats. On error a zero-valued *icpb.ReplicaStats is returned alongside
 // the error — the StatsReporter logs and skips the tick, same as the HTTP path.
-func (s *GrpcLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error) {
+func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error) {
 	rctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
@@ -95,10 +96,14 @@ func (s *GrpcLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 	for _, l := range resp.GetLoads() {
 		running += int64(l.GetNumRunningReqs())
 		waiting += int64(l.GetNumWaitingReqs())
-		if u := l.GetTokenUsage(); u > usage {
+		// token_usage and cache_hit_rate come from an external process and are
+		// contractually ratios in [0,1]. Sanitize before use: an out-of-range or
+		// non-finite value must not overflow cache_memory_bytes (usage *
+		// CacheSizeBytes) or push hit_rate outside [0,1].
+		if u := finite01(l.GetTokenUsage()); u > usage {
 			usage = u
 		}
-		hitRateSum += l.GetCacheHitRate()
+		hitRateSum += finite01(l.GetCacheHitRate())
 		hitRateN++
 	}
 	hitRate := 0.0
@@ -116,4 +121,15 @@ func (s *GrpcLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 		HitRate:          float32(hitRate),
 		Pressure:         float32(pressure),
 	}, nil
+}
+
+// finite01 clamps a raw engine-reported ratio into [0,1], mapping non-finite
+// (NaN / ±Inf) values to 0. clamp01 alone would pass NaN through (NaN compares
+// false against both bounds), so this guards the external GetLoads values that
+// feed cache_memory_bytes and hit_rate.
+func finite01(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return clamp01(v)
 }

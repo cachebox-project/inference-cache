@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"testing"
 
@@ -23,12 +24,12 @@ func (f *fakeLoadsClient) GetLoads(_ context.Context, _ *vpb.GetLoadsRequest, _ 
 	return f.resp, f.err
 }
 
-func TestGrpcLoadsScraperMapsSingleRank(t *testing.T) {
+func TestGRPCLoadsScraperMapsSingleRank(t *testing.T) {
 	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
 		{NumRunningReqs: 6, NumWaitingReqs: 2, TokenUsage: 0.5, CacheHitRate: 0.8},
 	}}
-	s := newGrpcLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
-		GrpcLoadsScraperConfig{CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 16})
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
+		GRPCLoadsScraperConfig{CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 16})
 
 	st, err := s.Scrape(context.Background())
 	if err != nil {
@@ -45,14 +46,14 @@ func TestGrpcLoadsScraperMapsSingleRank(t *testing.T) {
 	}
 }
 
-func TestGrpcLoadsScraperAggregatesRanks(t *testing.T) {
+func TestGRPCLoadsScraperAggregatesRanks(t *testing.T) {
 	// two DP ranks: running/waiting SUM, usage MAX, hit-rate MEAN
 	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
 		{NumRunningReqs: 2, NumWaitingReqs: 1, TokenUsage: 0.3, CacheHitRate: 0.5},
 		{NumRunningReqs: 5, NumWaitingReqs: 4, TokenUsage: 0.7, CacheHitRate: 0.9},
 	}}
-	s := newGrpcLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
-		GrpcLoadsScraperConfig{CacheSizeBytes: 1000, MaxConcurrencyCeiling: 24})
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
+		GRPCLoadsScraperConfig{CacheSizeBytes: 1000, MaxConcurrencyCeiling: 24})
 
 	st, err := s.Scrape(context.Background())
 	if err != nil {
@@ -69,12 +70,12 @@ func TestGrpcLoadsScraperAggregatesRanks(t *testing.T) {
 	}
 }
 
-func TestGrpcLoadsScraperZeroConfigIsHonest(t *testing.T) {
+func TestGRPCLoadsScraperZeroConfigIsHonest(t *testing.T) {
 	// CacheSizeBytes=0 -> 0 bytes (not fabricated); ceiling=0 -> pressure 0
 	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
 		{NumRunningReqs: 9, NumWaitingReqs: 9, TokenUsage: 0.9},
 	}}
-	s := newGrpcLoadsScraperWithClient(&fakeLoadsClient{resp: resp}, GrpcLoadsScraperConfig{})
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp}, GRPCLoadsScraperConfig{})
 	st, err := s.Scrape(context.Background())
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
@@ -85,9 +86,43 @@ func TestGrpcLoadsScraperZeroConfigIsHonest(t *testing.T) {
 	}
 }
 
-func TestGrpcLoadsScraperErrorIsSurfaced(t *testing.T) {
-	s := newGrpcLoadsScraperWithClient(&fakeLoadsClient{err: errors.New("unavailable")},
-		GrpcLoadsScraperConfig{Addr: "x:1"})
+func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
+	// token_usage and cache_hit_rate are contractually [0,1] ratios, but come
+	// from an external engine process. Feed garbage across ranks: over 1, NaN,
+	// and negative. Sanitization must clamp/reject each so cache_memory_bytes
+	// never overflows past CacheSizeBytes and hit_rate stays finite in [0,1].
+	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
+		{TokenUsage: 5.0, CacheHitRate: 9.0},               // both way over 1
+		{TokenUsage: math.NaN(), CacheHitRate: math.NaN()}, // non-finite
+		{TokenUsage: -1.0, CacheHitRate: -0.5},             // negative
+	}}
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
+		GRPCLoadsScraperConfig{CacheSizeBytes: 1000, MaxConcurrencyCeiling: 8})
+
+	st, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	// usage clamps per-rank to [0,1]; MAX(1,0,0)=1 → bytes = 1*1000, never 5000/negative.
+	if got := st.GetCacheMemoryBytes(); got != 1000 {
+		t.Errorf("cache_memory_bytes = %d, want 1000 (usage clamped to 1, not overflowed)", got)
+	}
+	// hit_rate clamps per-rank to [0,1]; MEAN(1,0,0)=1/3, finite (no NaN poison).
+	hr := float64(st.GetHitRate())
+	if math.IsNaN(hr) || math.IsInf(hr, 0) {
+		t.Fatalf("hit_rate = %v, want a finite value (NaN input must not propagate)", hr)
+	}
+	if hr < 0 || hr > 1 {
+		t.Errorf("hit_rate = %v, want within [0,1]", hr)
+	}
+	if math.Abs(hr-1.0/3.0) > 1e-6 {
+		t.Errorf("hit_rate = %v, want ~0.3333 (mean of clamped 1,0,0)", hr)
+	}
+}
+
+func TestGRPCLoadsScraperErrorIsSurfaced(t *testing.T) {
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{err: errors.New("unavailable")},
+		GRPCLoadsScraperConfig{Addr: "x:1"})
 	st, err := s.Scrape(context.Background())
 	if err == nil {
 		t.Fatal("want error, got nil")
@@ -108,7 +143,7 @@ func (m *mockEngineServer) GetLoads(context.Context, *vpb.GetLoadsRequest) (*vpb
 	return m.resp, nil
 }
 
-func TestGrpcLoadsScraperEndToEndOverBufconn(t *testing.T) {
+func TestGRPCLoadsScraperEndToEndOverBufconn(t *testing.T) {
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
 	vpb.RegisterVllmEngineServer(srv, &mockEngineServer{
@@ -116,8 +151,15 @@ func TestGrpcLoadsScraperEndToEndOverBufconn(t *testing.T) {
 			{NumRunningReqs: 3, NumWaitingReqs: 1, TokenUsage: 0.25, CacheHitRate: 0.6},
 		}},
 	})
-	go func() { _ = srv.Serve(lis) }()
-	defer srv.Stop()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(lis) }()
+	t.Cleanup(func() {
+		srv.Stop()
+		// Serve returns ErrServerStopped on Stop(); anything else is a real fault.
+		if err := <-serveErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("bufconn Serve terminated unexpectedly: %v", err)
+		}
+	})
 
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
@@ -127,8 +169,8 @@ func TestGrpcLoadsScraperEndToEndOverBufconn(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	s := newGrpcLoadsScraperWithClient(vpb.NewVllmEngineClient(conn),
-		GrpcLoadsScraperConfig{CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 8})
+	s := newGRPCLoadsScraperWithClient(vpb.NewVllmEngineClient(conn),
+		GRPCLoadsScraperConfig{CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 8})
 	st, err := s.Scrape(context.Background())
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)

@@ -14,7 +14,11 @@
 // so the wire method path `/vllm.grpc.engine.VllmEngine/GetLoads` lines up;
 // field numbers mirror upstream. Kept out of the `proto/` module on purpose —
 // it is a vendored external contract, not part of IC's own gRPC API, so it is
-// not subject to IC's buf-lint conventions or the proto drift check.
+// exempt from IC's buf-lint conventions.
+//
+// Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
+// proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the
+// two committed stubs stay reproducible from this file.
 
 package vllmengine
 
