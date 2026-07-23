@@ -269,7 +269,7 @@ type LookupRequest struct {
 	// the producer ingested under or it will not match — the same producer/
 	// consumer agreement HashScheme already requires. Empty is the default
 	// partition, which is where every non-LoRA deployment both ingests and looks
-	// up, so single-adapter behavior is unchanged.
+	// up, so non-LoRA behavior is unchanged.
 	Adapter          string
 	PrefixHash       []byte
 	TokenCount       int32

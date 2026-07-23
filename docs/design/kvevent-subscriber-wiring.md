@@ -169,15 +169,33 @@ stable identity the gateway sends as `LookupRouteRequest.adapter_id`:
 
 - **Unmapped id** → `lora:<id>`. Exact within a replica, and consistent across
   replicas that share an adapter load order (the homogeneous-Deployment case).
-  Supply the map when replicas can diverge — runtime load/unload, rolling
-  updates — and make the gateway send the matching `adapter_id`.
+  Supply the map for adapters **known at startup** when replicas can diverge
+  (rolling updates, heterogeneous load order), and make the gateway send the
+  matching `adapter_id`.
 - **No LoRA at all** (the default): every event carries a nil `lora_id`, so
   every entry and eviction lands in the default (`""`) partition — byte-for-byte
   the pre-adapter behavior. Nothing to configure.
 
-The flag is not set by the CacheBackend-driven injection path today: the
-controller has no view of the engine's `--lora-modules` ordering, so operators
-running multi-adapter engines set it on the subscriber container explicitly.
+### Limitations of the static flag
+
+`--lora-adapter-names` is resolved once at **startup**, which leaves two gaps —
+both a tracked follow-up, and neither a regression (an unmapped id still
+partitions by `lora:<id>`, strictly fewer collisions than the pre-adapter
+single-partition behavior):
+
+- **Runtime loads.** An adapter loaded or reloaded *after* the subscriber starts
+  whose id isn't already in the map falls back to `lora:<id>` — a static list
+  can't name it. Covering arbitrary runtime loads needs the subscriber to
+  resolve adapter identity **dynamically** from the engine's adapter registry.
+- **Managed injection.** On the `CacheBackend`-driven path the subscriber
+  sidecar is **injected**, so operators cannot pass the flag on a container they
+  do not define; the explicit-set guidance below applies only to a
+  **self-managed** subscriber. Configuring the mapping through the managed path
+  needs a `CacheBackend` field the webhook forwards.
+
+For a self-managed subscriber, set `--lora-adapter-names` on the container
+directly: the controller has no view of the engine's `--lora-modules` ordering,
+so multi-adapter engines must supply the map explicitly.
 
 ## What this unblocks
 
