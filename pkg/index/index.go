@@ -893,10 +893,19 @@ func (i *Index) ApplyEvent(ev Event) {
 		// Adapter, unlike scheme, IS narrowed when the producer supplies it. The
 		// fingerprint is token-only, so one prefix hash can be live under several
 		// adapters at once on the same replica; dropping every partition for one
-		// adapter's GPU eviction would throw away hints that are still valid. An
-		// empty ev.Adapter keeps the original cross-partition sweep, which is
-		// exactly what a pre-adapter producer gets (all its entries are in the ""
-		// partition anyway).
+		// adapter's GPU eviction would throw away hints that are still valid.
+		//
+		// An empty ev.Adapter falls back to the original cross-partition sweep.
+		// That is exact for a pre-adapter producer (all its entries are in the ""
+		// partition anyway), but an adapter-aware producer ALSO emits "" for a
+		// genuine base-model eviction — and the sweep then drops live LoRA-
+		// partition hints for the same prefix hash too. That is conservative soft
+		// state (at worst a cache miss, re-added by the authoritative
+		// ReportCacheState path) and a strict non-regression (pre-partition, base
+		// and LoRA shared one partition, so a base eviction was already total).
+		// Making "" mean the base partition only, without breaking the legacy
+		// wildcard, needs explicit adapter_id presence on the event — a tracked
+		// follow-up.
 		for key, replicas := range i.prefixes {
 			if key.tenant != ev.Tenant || key.model != ev.Model || key.prefixHash != hash {
 				continue
