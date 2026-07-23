@@ -107,7 +107,8 @@ func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
 	if got := st.GetCacheMemoryBytes(); got != 1000 {
 		t.Errorf("cache_memory_bytes = %d, want 1000 (usage clamped to 1, not overflowed)", got)
 	}
-	// hit_rate clamps per-rank to [0,1]; MEAN(1,0,0)=1/3, finite (no NaN poison).
+	// hit_rate: the NaN rank is EXCLUDED (unavailable), the over-1 rank clamps to 1
+	// and the negative to 0 → MEAN(1,0)=0.5, finite (no NaN poison).
 	hr := float64(st.GetHitRate())
 	if math.IsNaN(hr) || math.IsInf(hr, 0) {
 		t.Fatalf("hit_rate = %v, want a finite value (NaN input must not propagate)", hr)
@@ -115,8 +116,8 @@ func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
 	if hr < 0 || hr > 1 {
 		t.Errorf("hit_rate = %v, want within [0,1]", hr)
 	}
-	if math.Abs(hr-1.0/3.0) > 1e-6 {
-		t.Errorf("hit_rate = %v, want ~0.3333 (mean of clamped 1,0,0)", hr)
+	if math.Abs(hr-0.5) > 1e-6 {
+		t.Errorf("hit_rate = %v, want 0.5 (mean of clamped 1 and 0; NaN rank excluded)", hr)
 	}
 }
 

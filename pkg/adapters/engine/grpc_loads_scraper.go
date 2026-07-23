@@ -89,22 +89,27 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 
 	// Aggregate across DP ranks: request counts SUM (total in-flight across the
 	// engine), KV-cache usage is the MAX (worst-case pressure proxy), hit-rate is
-	// the mean of ranks that report one.
+	// the mean over ranks that report a finite value.
+	//
+	// token_usage and cache_hit_rate come from an external process and are
+	// contractually ratios in [0,1] — sanitize both. token_usage feeds the MAX and
+	// then cache_memory_bytes, so a non-finite value maps to 0 (finite01) and just
+	// never wins the max. cache_hit_rate feeds a mean, so a non-finite (unavailable)
+	// rank is EXCLUDED rather than counted as 0 — otherwise one garbage sample would
+	// drag the average down; finite-but-out-of-range values are clamped and kept.
 	var running, waiting int64
 	var usage, hitRateSum float64
 	var hitRateN int
 	for _, l := range resp.GetLoads() {
 		running += int64(l.GetNumRunningReqs())
 		waiting += int64(l.GetNumWaitingReqs())
-		// token_usage and cache_hit_rate come from an external process and are
-		// contractually ratios in [0,1]. Sanitize before use: an out-of-range or
-		// non-finite value must not overflow cache_memory_bytes (usage *
-		// CacheSizeBytes) or push hit_rate outside [0,1].
 		if u := finite01(l.GetTokenUsage()); u > usage {
 			usage = u
 		}
-		hitRateSum += finite01(l.GetCacheHitRate())
-		hitRateN++
+		if hr := l.GetCacheHitRate(); !math.IsNaN(hr) && !math.IsInf(hr, 0) {
+			hitRateSum += clamp01(hr)
+			hitRateN++
+		}
 	}
 	hitRate := 0.0
 	if hitRateN > 0 {
