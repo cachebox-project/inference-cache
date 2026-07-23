@@ -126,8 +126,9 @@ kubectl -n cache-substrate rollout status deploy/redis-l2 --timeout=5m
 kubectl -n cache-substrate rollout status deploy/sglang-lmcache-llama-8b --timeout=20m
 
 # 4. Drive the SAME long-prefix prompt twice (first warms, second reuses). This
-#    exercises the engine, triggers its KV-event publisher on :5557, and — on HBM
-#    eviction — offloads KV to Redis via the MP worker. Swap the `prefix = ...` line
+#    exercises the engine, triggers its KV-event publisher on :5557, and — because
+#    MP mode is write-through — offloads stored KV to Redis immediately (not only on
+#    HBM eviction; see the DBSIZE check below). Swap the `prefix = ...` line
 #    for a REAL prompt long enough to span several KV blocks (>> the engine's
 #    --page-size in tokens); a short literal won't reliably produce BlockStored /
 #    prefix reuse.

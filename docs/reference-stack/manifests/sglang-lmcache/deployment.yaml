@@ -16,9 +16,11 @@
 #
 # VALIDATION STATUS: this hand manifest is derived from the GPU-validated adapter
 # render (store->flush->retrieve reuses KV, via the controller-rendered managed
-# path, #149) and is structurally checked (kubectl apply --dry-run). It has not been
-# independently re-run end-to-end on a GPU in this shape — run the SGLang leg of the
-# smoke / a GPU host before treating it as golden. Pins: docs/reference-stack/VERSIONS.md.
+# path, #149) and is structurally checked (kubectl apply --dry-run). It has NOT been
+# independently re-run end-to-end on a GPU in this exact shape — before treating it
+# as a golden reference, a GPU run should confirm: engine + MP-worker startup, the
+# config-file handoff, CUDA-IPC attachment, and a Redis store/retrieve (README step 4).
+# Pins: docs/reference-stack/VERSIONS.md.
 #
 # >> You need an NVIDIA GPU. << SGLang loads weights on CUDA and the LMCache MP
 # worker moves KV over CUDA-IPC. There is no first-class CPU fallback here, so this
@@ -71,9 +73,10 @@ spec:
           # (replaces CMD, keeps ENTRYPOINT). --save ""/--appendonly no: ephemeral
           # cache tier, no persistence/PVC (a restart starts cold — soft state).
           # --maxmemory + allkeys-lru bound the dataset so write load can't OOM the
-          # cgroup; the managed path derives ~80% of the memory limit (here ~6Gi of
-          # the 8Gi limit). --protected-mode no: the worker dials over the ClusterIP
-          # (a non-loopback client).
+          # cgroup; the managed path derives ~80% of the memory LIMIT (below: the
+          # byte-exact value for an 8Gi limit, 8589934592 - 8589934592/5 =
+          # 6871947674 ≈ 6.4Gi). --protected-mode no: the worker dials over the
+          # ClusterIP (a non-loopback client).
           args:
             - "redis-server"
             - "--save"
@@ -83,7 +86,7 @@ spec:
             - "--protected-mode"
             - "no"
             - "--maxmemory"
-            - "6gb"
+            - "6871947674" # bytes = ~80% of the 8Gi limit below (matches the managed render)
             - "--maxmemory-policy"
             - "allkeys-lru"
           ports:
@@ -232,8 +235,9 @@ spec:
             # kvevent-subscriber (managed path). Binds tcp://*:5557 — the operator
             # contract in docs/design/cachebackend-api.md (kept identical to the
             # vLLM reference). These raw frames carry token_ids; the Service below
-            # omits :5557 so they stay off the cluster network (the in-pod
-            # subscriber reads them over 127.0.0.1). See the README privacy note.
+            # omits :5557, so they aren't Service-exposed — but the pod IP is still
+            # directly reachable in-cluster unless a NetworkPolicy restricts it (the
+            # in-pod subscriber reads over 127.0.0.1). See the README privacy note.
             - "--kv-events-config"
             - '{"publisher":"zmq","endpoint":"tcp://*:5557","buffer_steps":10000,"topic":"kv-events"}'
           env:
