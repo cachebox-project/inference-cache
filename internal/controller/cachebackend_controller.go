@@ -996,24 +996,53 @@ func (r *CacheBackendReconciler) buildDeployment(backend *cachev1alpha1.CacheBac
 	if pod.HostNetwork {
 		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 	}
-	clampHostNetworkToSingleton(&dep.Spec)
+	clampSingletonReplicas(&dep.Spec, backend)
 	return dep
 }
 
-// clampHostNetworkToSingleton caps a host-network cache-server at one replica.
+// cacheServerIsSingleton reports whether the backend's managed cache-server must run
+// as exactly one replica — no scale-out, no HPA. Two backends require it, for
+// different reasons:
+//
+//   - a host-network server (the Mooncake master): a second replica cannot bind the
+//     node ports the first already holds, and on a different node comes up as an
+//     independent master that silently splits the store;
+//   - the (sglang, LMCache) Redis L2 store: a plain Redis is not clustered, so a
+//     second pod behind the one Service shards the keyspace across independent
+//     instances and silently partitions the cache.
+//
+// Admission rejects spec.replicas>1 / spec.autoscaling for both
+// (rejectMooncakeMasterScaleOut, rejectSGLangRedisL2ScaleOut); this is the shared
+// predicate the reconciler backstop keys on.
+func cacheServerIsSingleton(backend *cachev1alpha1.CacheBackend, pod *corev1.PodSpec) bool {
+	// EventsOnly renders no cache-server at all (the reconciler sheds any owned
+	// workload), so there is no singleton to protect — keep the predicate honest, and
+	// aligned with the admission rules, which exempt EventsOnly for the same reason.
+	if backend.Spec.IsEventsOnly() {
+		return false
+	}
+	if pod != nil && pod.HostNetwork {
+		return true
+	}
+	return adapterruntime.ResolveRuntimeID(backend) == adapterruntime.RuntimeSGLang &&
+		backend.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+}
+
+// clampSingletonReplicas caps a singleton cache-server (see cacheServerIsSingleton)
+// at one replica.
 //
 // Admission rejects spec.replicas>1 and spec.autoscaling for such a backend, but
 // that is not sufficient: ValidateUpdate only rejects violations an edit
 // *introduces*, so an object written before the rule existed — or before its
-// backend moved onto host networking — stays in etcd with replicas=3 and an HPA,
-// and is never re-validated. Rendering that faithfully would schedule several
-// masters: they contend for the same node ports, or land on different nodes and
-// come up as independent masters that silently split the store.
+// backend moved onto a singleton data plane — stays in etcd with replicas=3 and an
+// HPA, and is never re-validated. Rendering that faithfully would schedule several
+// servers: host-network masters contend for the same node ports or split the store;
+// several Redis pods behind one Service partition the keyspace.
 //
 // The reconciler is therefore the last line of defense, and it clamps rather than
 // obeys. 0 is preserved: that is "disabled", not "scaled out".
-func clampHostNetworkToSingleton(spec *appsv1.DeploymentSpec) {
-	if !spec.Template.Spec.HostNetwork || spec.Replicas == nil || *spec.Replicas <= 1 {
+func clampSingletonReplicas(spec *appsv1.DeploymentSpec, backend *cachev1alpha1.CacheBackend) {
+	if !cacheServerIsSingleton(backend, &spec.Template.Spec) || spec.Replicas == nil || *spec.Replicas <= 1 {
 		return
 	}
 	one := int32(1)
@@ -1116,9 +1145,10 @@ func serviceEndpoint(svc *corev1.Service) string {
 // When an HPA owns scaling (spec.autoscaling set), the reconciler defers to the
 // HPA's replica count rather than overwriting it — re-asserting replicas on
 // every reconcile would fight the HPA and churn the rollout. The one exception is
-// a host-network server, which is a singleton: clampHostNetworkToSingleton runs
-// last and overrides both the spec and the HPA (see its godoc for why admission
-// alone cannot protect a grandfathered object).
+// a singleton cache-server (a host-network master, or the SGLang Redis L2 — see
+// cacheServerIsSingleton): clampSingletonReplicas runs last and overrides both the
+// spec and the HPA (see its godoc for why admission alone cannot protect a
+// grandfathered object).
 //
 // Wrapped in RetryOnConflict because the kube Deployment controller writes
 // Deployment.Status often during rollout; without retry, the Get/Update inside
@@ -1168,9 +1198,9 @@ func (r *CacheBackendReconciler) applyDeployment(ctx context.Context, backend *c
 				dep.Spec.Replicas = &preserved
 			}
 			// LAST, after every other writer (desired spec, HPA preservation): a
-			// host-network server is a singleton and must never be scaled out, no
-			// matter what the spec or a stale HPA asks for.
-			clampHostNetworkToSingleton(&dep.Spec)
+			// singleton cache-server must never be scaled out, no matter what the
+			// spec or a stale HPA asks for.
+			clampSingletonReplicas(&dep.Spec, backend)
 			return controllerutil.SetControllerReference(backend, dep, r.Scheme)
 		})
 		return err
@@ -1925,7 +1955,22 @@ func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message st
 // should this backend be running". With autoscaling enabled the HPA writes
 // spec.replicas on the Deployment, so the live value is authoritative; without
 // it, the user's spec.replicas (default 1) wins.
+//
+// It applies the same singleton clamp the render path does (clampSingletonReplicas):
+// readiness must expect the count actually DEPLOYED, not the CR's grandfathered
+// spec.replicas. Without this, a singleton backend (SGLang Redis L2, or a
+// host-network Mooncake master) whose spec.replicas was set to 3 before admission
+// rejected it deploys one pod but expects three, and reports RolloutInProgress
+// forever. spec.replicas 0 (disabled) is preserved.
 func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	want := unclampedDesiredReplicas(backend, dep)
+	if want > 1 && cacheServerIsSingleton(backend, &dep.Spec.Template.Spec) {
+		return 1
+	}
+	return want
+}
+
+func unclampedDesiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
 	if backend.Spec.Autoscaling != nil {
 		// First reconcile after an HPA spec is added may briefly see
 		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
@@ -1963,12 +2008,13 @@ func initialReplicas(backend *cachev1alpha1.CacheBackend) int32 {
 // drives the backend Deployment's replica count. The HPA exists iff
 // spec.autoscaling is set; otherwise any controller-owned HPA is removed.
 func (r *CacheBackendReconciler) reconcileHPA(ctx context.Context, backend *cachev1alpha1.CacheBackend, deployment *appsv1.Deployment) error {
-	// A host-network cache-server is a singleton (see clampHostNetworkToSingleton):
-	// an HPA would fight that clamp on every reconcile and, whenever it won, put a
-	// second master on the cluster. Admission rejects spec.autoscaling for these
+	// A singleton cache-server (see cacheServerIsSingleton): an HPA would fight the
+	// clampSingletonReplicas clamp on every reconcile and, whenever it won, put a
+	// second server on the cluster — a split store (host-network master) or a
+	// partitioned keyspace (Redis L2). Admission rejects spec.autoscaling for these
 	// backends, but a grandfathered object still carries one — so tear the HPA down
-	// from the observed pod shape rather than trusting the spec.
-	if backend.Spec.Autoscaling == nil || deployment.Spec.Template.Spec.HostNetwork {
+	// from the observed shape rather than trusting the spec.
+	if backend.Spec.Autoscaling == nil || cacheServerIsSingleton(backend, &deployment.Spec.Template.Spec) {
 		// Autoscaling disabled (or impossible) — clean up any HPA we previously owned.
 		return r.deleteOwnedHPA(ctx, backend, deployment.Name)
 	}

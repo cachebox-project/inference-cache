@@ -3,25 +3,23 @@
 Everything the reference stack depends on, pinned. Bump here first, re-validate
 on a GPU host, then propagate to any automation that templates these manifests.
 
-> **KNOWN LIMITATION (GPU-validated 2026-07):** the SGLang rows describe an `lm://`
-> lmcache-server the SGLang engine "offloads to." GPU validation showed SGLang does
-> **not** use LMCache that way — it uses **multiprocess (MP) mode** (config via the
-> `--lmcache-config-file` flag, a node-local worker over `mp_host`/`mp_port`, not a
-> cluster-reachable `lm://` server). As shipped (env only, no `--lmcache-config-file`)
-> the engine **refuses to start** (`MP mode requires --lmcache-config-file`); a
-> `--lmcache-config-file` carrying `remote_url: lm://…` instead hangs. The SGLang
-> `lmcache-server` / `LMCACHE_REMOTE_URL` pins below are the
-> shipped (incorrect) wiring, pending the MP-mode fix. See the SGLang README's KNOWN
-> LIMITATION note and `docs/design/cachebackend-api.md` (SGLang engine support). The
-> vLLM rows are unaffected.
+> **SGLang runs LMCache in MP mode (implemented, GPU-validated).** SGLang does not
+> use the `lm://` lmcache-server model at all — it drives LMCache in **multiprocess
+> (MP) mode**: config via the `--lmcache-config-file` flag, a **node-local MP worker**
+> over `mp_host`/`mp_port`, and a shared **Redis L2** behind that worker (`lm://` is
+> not a valid MP `--l2-adapter` type, so it cannot be reused here). The adapter renders
+> exactly that. So the SGLang rows below pin **the engine/worker image tuple + Redis**,
+> NOT an `lm://` server. Authoritative design + evidence:
+> [`sglang-lmcache-mp-mode.md`](../design/sglang-lmcache-mp-mode.md). The vLLM rows are
+> unaffected — `lm://` remains vLLM's shipped, supported path.
 
 | Component | Pin | Where | Notes |
 |---|---|---|---|
 | vLLM + LMCache image | `lmcache/vllm-openai@sha256:<pin>` | `manifests/deployment.yaml`, `helm/values-reference.yaml` | Upstream ships LMCache pre-installed. Requires the vLLM **v1** engine (`VLLM_USE_V1=1`). The manifests ship a **non-applyable placeholder digest** — substitute a real one (below) before the GPU run. |
 | Model | `meta-llama/Llama-3.1-8B-Instruct` | `manifests/deployment.yaml` | Gated on HF; needs `HF_TOKEN`. Small enough for a single A10/L40S-class GPU. Swap freely. |
-| SGLang image (derived) | `example.invalid/sglang-lmcache@sha256:<pin>` *(derived: base `lmsysorg/sglang` + lmcache)* | `manifests/sglang-lmcache/deployment.yaml` | Second-engine reference. **Not pinned to a runnable tuple** (no GPU build at authoring time) — see [SGLang derived image reproducibility](#sglang-derived-image-reproducibility) below for the build steps, alignment constraints, and the TODO to fill the concrete `(sglang-tag, lmcache-version)`. GPU-only. |
-| lmcache-server image | `lmcache/standalone:v0.4.7` → `@sha256:<pin>` | `manifests/sglang-lmcache/deployment.yaml` | **HISTORICAL / non-runnable for SGLang** — see the note above. This `lm://` server is what the shipped wiring *tries* to point SGLang at, but SGLang uses LMCache in MP mode and never dials it, so pinning a digest for a SGLang GPU run offloads nothing. Kept only to document the (broken) shipped topology; the MP-mode fix will reuse this image behind a per-node worker. The `lm://` server itself is correct and in-use for **vLLM+LMCache** (the managed-backend default), just not for SGLang. |
-| Redis L2 store (SGLang) | `docker.io/library/redis:7.4-alpine` → `@sha256:<pin>` | `pkg/adapters/runtime/redis_l2.go` (`defaultRedisImage`); will be overridable per-CR via `backendConfig.redisImage` once wired | **Staged — the renderer (`ResolveRedisL2Server`) exists but nothing calls it yet; `ResolveCacheServer` wires it in the SGLang MP-mode engine increment (follow-up PR), at which point the controller renders it and `redisImage` takes effect.** The shared **L2** the SGLang LMCache **MP worker** offloads to (its `resp` `--l2-adapter`) — the SGLang analogue of the `lm://` lmcache-server, which SGLang cannot use (`lm://` is not a valid MP `--l2-adapter` type). Rendered by the controller, not a reference manifest, so this is a **code default** rather than a manifest pin. `7.4-alpine` is a minor-version tag: stable in wire protocol and config surface, but **mutable within its patch line**. Per the image-pin policy in [`sglang-lmcache-mp-mode.md`](../design/sglang-lmcache-mp-mode.md), production **must** override `backendConfig.redisImage` with an exact release or `@sha256:` digest — the default is a convenience for dev/smoke, not a reproducible pin. Redis itself needs no lmcache version alignment (the MP worker speaks RESP), so this pin is independent of the engine/lmcache tuple above. |
+| SGLang engine + MP worker | base `docker.io/lmsysorg/sglang:nightly-dev-cu13-20260711-7de33ce8` + **lmcache 0.5.1** → derive + `@sha256:<pin>` | `manifests/sglang-lmcache/deployment.yaml`; the controller-rendered worker defaults to the **engine's own image** (`backendConfig.workerImage` overrides) | **GPU-validated tuple** (store→flush→retrieve reuses KV). The engine and the MP worker MUST run the same lmcache version — they speak the MP wire to each other — which is why the worker defaults to the engine image; overriding `workerImage` makes that alignment yours to maintain. Base `lmsysorg/sglang` does **not** bundle lmcache: derive an image (`pip install lmcache==0.5.1`) and pin its digest. **cu13 is load-bearing**: lmcache 0.5.1 needs `libcudart.so.13`, so a cu12 base fails to align, and stock `v0.5.1.post2-cu126` is too old to have `--enable-lmcache`. See [SGLang derived image reproducibility](#sglang-derived-image-reproducibility). GPU-only. |
+| lmcache-server image | `lmcache/standalone:v0.4.7` → `@sha256:<pin>` | `manifests/deployment.yaml` (vLLM) | **vLLM only.** The `lm://` standalone server, correct and in use for the **vLLM+LMCache** managed-backend default. **Not part of the SGLang wire in any form**: SGLang is MP-only, and `lm://` is not a valid MP `--l2-adapter` type, so it is not reachable behind the MP worker either — the SGLang shared tier is the Redis L2 row below. (An earlier revision of this file predicted the MP fix would reuse this server behind a per-node worker; GPU validation disproved that, and the prediction is retired rather than left to mislead.) |
+| Redis L2 store (SGLang) | `docker.io/library/redis:7.4-alpine` → `@sha256:<pin>` | `pkg/adapters/runtime/redis_l2.go` (`defaultRedisImage`), overridable per-CR via `backendConfig.redisImage` | The shared **L2** the SGLang LMCache **MP worker** offloads to (its `resp` `--l2-adapter`) — the SGLang analogue of the `lm://` lmcache-server, which SGLang cannot use (`lm://` is not a valid MP `--l2-adapter` type). Rendered by the controller, not a reference manifest, so this is a **code default** rather than a manifest pin. `7.4-alpine` is a minor-version tag: stable in wire protocol and config surface, but **mutable within its patch line**. Per the image-pin policy in [`sglang-lmcache-mp-mode.md`](../design/sglang-lmcache-mp-mode.md), production **must** override `backendConfig.redisImage` with an exact release or `@sha256:` digest — the default is a convenience for dev/smoke, not a reproducible pin. Redis itself needs no lmcache version alignment (the MP worker speaks RESP), so this pin is independent of the engine/lmcache tuple above. |
 | SGLang model | `meta-llama/Meta-Llama-3-8B-Instruct` | `manifests/sglang-lmcache/deployment.yaml` | Served model for the SGLang reference, kept equal to `config/samples/cachebackend-sglang.yaml`'s `backendConfig.model` so the managed-path docs line up. Gated on HF; needs `HF_TOKEN`. Swap freely, but keep the engine `--model-path`, the CacheBackend `backendConfig.model`, and request `model` identical. |
 | CPU image | `vllm/vllm-openai-cpu:latest-{x86_64,arm64}` | `manifests/cpu-local/deployment.yaml` | vLLM's dedicated CPU build (arch-tagged). Runs the v1 engine on CPU (vLLM >= ~0.21), incl. the KV-event publisher. Verified on `0.21.0` (arm64): prefix-cache hit + real ZMQ events. Needs adequate RAM (CPU baseline ~5 GiB + KV). |
 | CPU model | `Qwen/Qwen2.5-0.5B-Instruct` | `manifests/cpu-local/deployment.yaml` | Ungated, tiny, CPU-runnable. |
@@ -42,34 +40,48 @@ docker inspect --format='{{index .RepoDigests 0}}' lmcache/vllm-openai:latest
 # -> lmcache/vllm-openai@sha256:...   put THIS in deployment.yaml + VERSIONS.md
 ```
 
-The SGLang reference pins **two** images. (a) The standalone lmcache-server
-(`lmcache/standalone:v0.4.7`) — pull + inspect it directly (it is NOT the vLLM
-path's `lmcache/vllm-openai` image):
+The SGLang reference pins **two** images: (a) the **derived engine image** (which
+the MP worker also runs by default), and (b) the **Redis L2** store. It does **not**
+pin an lmcache-server — SGLang never dials one.
 
-```bash
-docker pull lmcache/standalone:v0.4.7
-docker inspect --format='{{index .RepoDigests 0}}' lmcache/standalone:v0.4.7
-# -> lmcache/standalone@sha256:...   put THIS in manifests/sglang-lmcache/deployment.yaml
-```
+> **Note — the reference *manifest* is not yet updated to this topology.**
+> `manifests/sglang-lmcache/deployment.yaml` still ships the earlier
+> lmcache-server-based placeholder (a non-applyable digest); rewriting it to the MP
+> topology — derived engine image + a Redis L2 + the MP-worker sidecar — is part of
+> the increment-3 reference-stack leg (see the phased delivery in
+> [`sglang-lmcache-mp-mode.md`](../design/sglang-lmcache-mp-mode.md)). The **managed
+> path the controller renders** already matches this section (that is what
+> `redis_l2.go` + the SGLang adapter produce, GPU-validated); the pins below are
+> authoritative for that path. Until the manifest leg lands, this section is ahead of
+> the hand-written reference YAML — follow the pins here, not that manifest.
 
-(b) The **derived** SGLang engine image with the lmcache client baked in (the
-base `lmsysorg/sglang` does not bundle it):
+(a) The **derived** SGLang engine image with the lmcache client baked in (the
+base `lmsysorg/sglang` does not bundle it). This image is used **twice**: as the
+engine, and — by default — as the MP worker (`backendConfig.workerImage` overrides
+it), which is what keeps the two on the same lmcache version:
 
 ```bash
 # Build a derived SGLang image with a version-aligned lmcache client. The
-# lmcache version must satisfy BOTH alignment constraints: (1) wire-compatible
-# with the lmcache-server tag, AND (2) its native CUDA kernels match the SGLang
-# base image's CUDA runtime — a CUDA-mismatched wheel loads but silently falls
-# back to a slow non-native path, and the standalone reference has no
-# lmcache-kernel-check init container to catch it (see "LMCache client kernels ↔
-# engine-image CUDA / vLLM alignment" in docs/design/cachebackend-api.md).
+# lmcache version must satisfy BOTH alignment constraints: (1) ENGINE <-> MP WORKER
+# -- the two speak the LMCache MP wire to each other, so they must run the same
+# lmcache (trivially satisfied when the worker defaults to this same image), AND
+# (2) its native CUDA kernels match the SGLang base image's CUDA runtime -- a
+# CUDA-mismatched wheel loads but silently falls back to a slow non-native path,
+# and the standalone reference has no lmcache-kernel-check init container to catch
+# it (see "LMCache client kernels <-> engine-image CUDA / vLLM alignment" in
+# docs/design/cachebackend-api.md). GPU-validated tuple:
+# lmsysorg/sglang:nightly-dev-cu13-20260711-7de33ce8 + lmcache 0.5.1 -- cu13 is
+# load-bearing (0.5.1 links libcudart.so.13). NOTE: there is no lmcache-SERVER
+# alignment constraint here; the shared L2 is Redis, which speaks RESP.
 cat > Dockerfile.sglang-lmcache <<'EOF'
 # Digest-pin the base too — this file is the pinning authority, and a moving tag
 # would silently change the derived image's inputs on rebuild. Resolve the digest
 # with: docker pull lmsysorg/sglang:<tag> &&
 #   docker inspect --format='{{index .RepoDigests 0}}' lmsysorg/sglang:<tag>
+# The GPU-validated tuple is the nightly-dev-cu13-20260711-7de33ce8 base +
+# lmcache 0.5.1; resolve <pinned-base-digest> from that tag with the command above.
 FROM lmsysorg/sglang@sha256:<pinned-base-digest>
-RUN pip install --no-cache-dir lmcache==<wire- and CUDA-aligned version>
+RUN pip install --no-cache-dir lmcache==0.5.1
 EOF
 docker build -f Dockerfile.sglang-lmcache -t myrepo/sglang-lmcache:pinned .
 docker push myrepo/sglang-lmcache:pinned
@@ -82,23 +94,35 @@ docker buildx imagetools inspect myrepo/sglang-lmcache:pinned --format '{{.Manif
 
 ## SGLang derived image reproducibility
 
-The SGLang engine row above is **deliberately not pinned to a concrete, runnable
-tuple** — no GPU was available at authoring time to build and validate one, and
-inventing a plausible-looking digest/version would be worse than an honest
-placeholder. Concretely:
+The SGLang engine row above now names a **GPU-validated `(sglang-tag,
+lmcache-version)` tuple**; what is still yours to supply is the **digest of the
+derived image you build from it**. (This section previously said no validated tuple
+existed — true when it was written, before a GPU was available; the tuple below
+replaces that placeholder.) Concretely:
 
 - **Pin the DERIVED image, not the upstream base.** `lmsysorg/sglang` does **not**
-  bundle the lmcache client; bake `pip install lmcache` (version-aligned with the
-  lmcache-server tag) into your own image — see the build steps above. The
-  manifest ships a non-applyable placeholder digest under an
-  `example.invalid/sglang-lmcache` name (all-zero `@sha256:`); substitute your
-  derived image's real digest before the GPU run.
-- **TODO — fill the concrete `(sglang-tag, lmcache-version)` tuple** from your
-  first successful derived-image build, and record the resolved digest here. Both
-  stay as placeholders (`<pin>` / `<wire- and CUDA-aligned version>`) until then.
-  This is tracked, not an omission; the alignment constraints the tuple must
-  satisfy (lmcache ↔ lmcache-server wire compat, and lmcache kernels ↔ the SGLang
-  base image's CUDA runtime) are in the build steps above.
+  bundle the lmcache client; bake `pip install lmcache` into your own image — see the
+  build steps above. The **reference manifest** still ships a non-applyable
+  placeholder digest under an `example.invalid/sglang-lmcache` name (all-zero
+  `@sha256:`) — substitute your derived image's real digest before the GPU run.
+  (Updating that manifest to the validated tuple is part of the reference-stack
+  increment; the controller-rendered managed path does not read it.)
+- **RESOLVED — the concrete `(sglang-tag, lmcache-version)` tuple is
+  `(lmsysorg/sglang:nightly-dev-cu13-20260711-7de33ce8, lmcache 0.5.1)`**, validated
+  end-to-end on an A100: the MP worker registers the engine's KV cache over CUDA-IPC
+  and a flushed prompt is served back out of LMCache. Two constraints that tuple
+  encodes, both learned the hard way: **cu13 is load-bearing** (lmcache 0.5.1 links
+  `libcudart.so.13`, so a cu12 base mis-aligns at runtime), and the **stock
+  `v0.5.1.post2-cu126` tag is too old** — it predates `--enable-lmcache` entirely.
+  The validation installed lmcache with `pip` at pod start; a real deployment should
+  bake it into a derived image and pin THAT digest here (a runtime `pip install` is
+  not reproducible). The `@sha256:` digest is still yours to fill from your own
+  build. **The alignment that matters is engine ↔ MP worker (same lmcache, since they
+  speak the MP wire) plus lmcache ↔ CUDA runtime — NOT lmcache ↔ lmcache-server**: the
+  SGLang shared tier is Redis, which speaks RESP and carries no lmcache-version
+  constraint. Both constraints the tuple must
+  satisfy (engine ↔ worker lmcache parity, and lmcache kernels ↔ the SGLang base
+  image's CUDA runtime) are spelled out in the build steps above.
 - **What IS validated without a GPU:** SGLang's exact event wire is covered by the
   Go `pkg/adapters/engine` SGLang test; the Python synthetic publisher covers only
   the shared decode/redaction. See

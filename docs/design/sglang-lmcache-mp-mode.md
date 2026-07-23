@@ -1,6 +1,6 @@
 # Design: LMCache MP mode — the converged worker model (SGLang now, vLLM migration)
 
-Status: design accepted; implementation pending (Phase 2–3, SGLang). Validated live facts vs. open Phase-2 spikes are marked inline. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
+Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
 
 **LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
 SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,
@@ -16,10 +16,12 @@ model, and **live GPU validation showed that is wrong for SGLang** — SGLang ha
 converged model and the driver for this design; the vLLM migration reuses the same
 infrastructure and is future work (see [Support matrix](#converged-foundation-mp-for-both-engines)).
 
-An advisory admission warning already ships for the SGLang pair (the validator's
-`sglangLMCacheDataPlaneWarning`) so operators are told the shipped data plane is
-non-functional (verified — it caches nothing); this design is what replaces the
-warning with a working data plane.
+**Status: implemented and GPU-validated (Phase 2, increments 1–2).** The wire
+described here is what the adapter renders today. The advisory admission warning
+that used to flag the SGLang pair as non-functional (`sglangLMCacheDataPlaneWarning`)
+is **retired** — it existed only because the shipped `lm://` wiring cached nothing,
+which this design replaced. What remains open is tracked in
+[Phased delivery](#phased-delivery).
 
 ## TL;DR
 
@@ -36,12 +38,12 @@ warning with a working data plane.
   `lm://` server, which is not even a valid MP `--l2-adapter` type.
 - The design fits the existing `KVCacheRuntimeAdapter` interface with **no new
   methods**: `ResolveCacheServer` renders the **shared L2 (Redis)**;
-  `InjectEngineConfig` adds a **config-file init container + a node-local MP worker
-  + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
-  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. One
-  packaging detail is still open (a **GPU-less sidecar** vs. the proven
-  **single-container** form) pending a Phase-2 spike; the interface mapping and the
-  L2/config-file decisions hold either way.
+  `InjectEngineConfig` adds a **node-local MP-worker native sidecar (which writes
+  the config file it then serves) + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
+  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. The
+  packaging question (a **GPU-less sidecar** vs. a single container) is **resolved
+  in favour of the GPU-less native sidecar** — spiked, then GPU-validated end to end;
+  see [Resolved: GPU-less sidecar](#resolved-gpu-less-sidecar-vs-same-container).
 
 ## Converged foundation: MP for both engines
 
@@ -84,9 +86,10 @@ the observed engine/worker log signals reproduced inline:
 2. **Config comes from a file, not env.** MP mode requires
    `--lmcache-config-file <yaml>`; with no file the engine aborts at startup
    (`ValueError: MP mode requires ... mp_host / mp_port`). The `LMCACHE_*` env the
-   current adapter injects (`LMCACHE_REMOTE_URL`, serde, chunk size, local-CPU) is
-   **not read** on this path — `LMCACHE_USE_EXPERIMENTAL=True` is the one env that
-   still matters (it gates the connector).
+   PREVIOUS `lm://` adapter injected (`LMCACHE_REMOTE_URL`, serde, chunk size,
+   local-CPU) is **not read** on this path — which is exactly why the current wire
+   drops it; `LMCACHE_USE_EXPERIMENTAL=True` is the one env that still matters (it
+   gates the connector).
 3. **The engine dials a separate node-local worker.** The config yaml carries
    `mp_host`/`mp_port` (ZMQ, default `:5555`); the engine connects to an
    already-running `python -m lmcache.v1.multiprocess.server` process — it does
@@ -99,9 +102,10 @@ the observed engine/worker log signals reproduced inline:
 
 ### Live proof — node-local caching
 
-Single pod, MP worker + engine co-located **in one GPU-bearing container** (this
-validates MP-mode caching over the CUDA-IPC data path — not yet the separate
-GPU-less sidecar packaging; see the open question below): request → worker
+Single pod, MP worker + engine co-located **in one GPU-bearing container**. This
+was the FIRST proof — MP-mode caching over the CUDA-IPC data path — and predates the
+separate GPU-less sidecar packaging that shipped (independently validated; see
+[Resolved: GPU-less sidecar](#resolved-gpu-less-sidecar-vs-same-container)): request → worker
 `Stored 3584 tokens`; `POST /flush_cache` (clears the engine's GPU radix cache) →
 re-request → worker `Retrieved 3584 tokens`, engine `#cached-token: 3584`. Full
 store→load cycle, engine serves (no hang, no abort).
@@ -152,13 +156,18 @@ with three constraints the design must honor:
 
 - **Pinned image** — a digest/tag tracked in `VERSIONS.md`, consistent with the
   lmcache-server image-pin policy, never a floating `redis` tag.
-- **Single replica (enforced).** A plain Redis is not clustered; multiple pods
-  behind one Service would shard requests across independent key spaces and
-  silently partition the L2. So this backend is **clamped to one replica** and HPA
-  is not attached — the same single-instance constraint the `lm://` lmcache-server
-  already carries (a multi-replica `CacheBackend` for this type is rejected at
-  admission). A genuinely clustered/HA Redis is an operator-provided or future
-  option, out of scope for the managed default.
+- **Single replica (enforced) — specific to the SGLang Redis L2.** A plain Redis is
+  not clustered; multiple pods behind one Service would shard requests across
+  independent key spaces and silently partition the L2. So **this** backend is
+  **clamped to one replica** and HPA is not attached: admission rejects
+  `spec.replicas>1` / `spec.autoscaling` for `(sglang, LMCache)`
+  (`rejectSGLangRedisL2ScaleOut`), and the reconciler clamps as a backstop for
+  grandfathered objects (`clampSingletonReplicas`). This is **not** shared with
+  vLLM's `lm://` lmcache-server, which is an ordinary pod-network workload that
+  **does** scale out and autoscale — the singleton rule is scoped to the pair whose
+  managed server is a non-clustered Redis (and to the host-network Mooncake master,
+  for a different reason). A genuinely clustered/HA Redis is an operator-provided or
+  future option, out of scope for the managed default.
 - **Bounded memory.** `--maxmemory-policy allkeys-lru` only evicts once
   `--maxmemory` is set; without it Redis grows until the container is OOM-killed.
   The render derives `--maxmemory` from the pod's memory limit (with headroom),
@@ -171,29 +180,39 @@ the SGLang pair only — vLLM keeps `lm://`. Redis is a shared, network-addressa
 store that fits the one-Service, engines-anywhere model exactly (unlike Mooncake's
 mesh), so **no `hostNetwork` is required for the L2**.
 
-### `InjectEngineConfig` → config-file init container + MP-worker sidecar + engine wire
+### `InjectEngineConfig` → MP-worker native sidecar (writes its own config) + engine wire
 
 The mutating Pod webhook already adds volumes, init containers, and sidecar
 containers to engine pods. For SGLang it adds, to the engine pod:
 
-- **initContainer `lmcache-config`** — writes `/config/lmcache.yaml`
-  (`chunk_size`, `mp_host: 127.0.0.1`, `mp_port: 5555`) into a shared `emptyDir`.
-  Runs to completion before the engine, so `--lmcache-config-file` is never read
-  before it exists. No ConfigMap needed (the webhook cannot create cluster
-  resources; the values are static and small).
+- **the MP config file** — `/etc/lmcache/config.yaml` (`chunk_size`,
+  `mp_host: 127.0.0.1`, `mp_port`) in a shared `emptyDir` (`lmcache-config`).
+  **As built, the worker sidecar writes this itself** and then `exec`s the MP
+  server, rather than a separate `lmcache-config` init container doing it: the two
+  always agree on `mp_port` because one process renders both sides, and the worker's
+  `startupProbe` already gates the engine on the server listening — which implies the
+  file exists, since the `exec` happens after the write. A separate init container
+  would have been a second place to keep in sync for no added ordering guarantee.
+  No ConfigMap needed (the webhook cannot create cluster resources; the values are
+  static and small).
 - **native sidecar `lmcache-mp-worker`** — runs the upstream-documented worker CLI
-  `lmcache server --host 127.0.0.1 --port 5555 --chunk-size <n> --l1-size-gb <n>
+  `python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port <mpPort>
+  --chunk-size <n> --l1-size-gb <n> --eviction-policy LRU
   --l2-adapter '{"type":"resp","host":<endpoint-host>,"port":<endpoint-port>}'`
-  (the `lmcache server` subcommand is the documented entrypoint; it is the same MP
-  server as `python -m lmcache.v1.multiprocess.server`, which validation used).
+  (the documented `lmcache server` subcommand is the equivalent entrypoint; the
+  rendered wire uses the `python3 -m` form, which is what validation exercised).
   `<endpoint>` is the Redis address passed to `InjectEngineConfig`. Its
-  **image is pinned and version-aligned with the engine's LMCache connector** —
-  the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew
-  between worker and engine is a correctness hazard; the tuple is tracked in
+  **image defaults to the engine's own image (and should be digest-pinned in
+  production)**, keeping it version-aligned with the engine's LMCache connector —
+  the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew between
+  worker and engine is a correctness hazard, and defaulting to the same image makes
+  the aligned case the zero-config one. `backendConfig.workerImage` overrides it, at
+  which point the alignment (and the digest pin) is the operator's to maintain; the
+  tuple is tracked in
   `VERSIONS.md` alongside the engine image (validation used the engine's own
   `pip install lmcache`→0.5.1, so the simplest pin is the same image and `lmcache`
   version for both). Mounts the shared `/dev/shm`
-  (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and `/config`. **Startup
+  (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and `/etc/lmcache`. **Startup
   ordering matters** — the engine dials the worker at launch, and K8s does not
   order ordinary containers within a pod. So this is a **native sidecar** (a
   `restartPolicy: Always` entry in `initContainers` — beta and on-by-default since
@@ -207,9 +226,9 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   connects. (An ordinary sidecar would race the engine.) The adapter's minimum is
   K8s ≥ 1.29. Fail-open interaction is resolved below.
 - **engine container** — add `--enable-lmcache`, `--lmcache-config-file
-  /config/lmcache.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
-  `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/config`. **Drop** the
-  MP-ignored `LMCACHE_REMOTE_URL` / `LMCACHE_REMOTE_SERDE` / `LMCACHE_LOCAL_CPU` /
+  /etc/lmcache/config.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
+  `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/etc/lmcache`. **Drop**
+  the MP-ignored `LMCACHE_REMOTE_URL` / `LMCACHE_REMOTE_SERDE` / `LMCACHE_LOCAL_CPU` /
   `LMCACHE_MAX_LOCAL_CPU_SIZE` env.
 
 `mp_host=127.0.0.1` works because the worker is a **same-pod sidecar** — it shares
@@ -262,12 +281,16 @@ parts are named for what they are:
 > one. This is a property of **MP mode**, not of SGLang specifically: it is exactly
 > what the vLLM MP path would inherit too, and MP is the *upstream-recommended*
 > posture — so accepting it aligns with the converged direction rather than taking
-> on a SGLang-only wart. **Containment (all in Phase 2):** native sidecar + `restartPolicy:
-> Always` self-heals transient worker crashes; an engine **liveness probe** turns a
-> persistently-wedged engine into a whole-pod restart (self-healing) rather than a
-> silent hang; the `CacheBackend` `Degraded` condition surfaces worker unhealth; and
-> operator docs state plainly that for this pair the cache worker is a serving
-> component. Not a one-way door — if upstream SGLang adds a cacheless fallback, the
+> on a SGLang-only wart. **Containment (across Phase 2's increments — see
+> [Phased delivery](#phased-delivery) for which lands where):** native sidecar +
+> `restartPolicy: Always` self-heals transient worker crashes *(landed, increment
+> 2)*; an engine **liveness probe** turns a persistently-wedged engine into a
+> whole-pod restart (self-healing) rather than a silent hang *(increment 3 — it
+> mutates the operator-owned engine container, and is gated on measuring whether the
+> engine survives a mid-flight worker restart)*; the `CacheBackend` `Degraded`
+> condition surfaces worker unhealth *(increment 3 — controller/status surface)*;
+> and operator docs state plainly that for this pair the cache worker is a serving
+> component *(landed, increment 2)*. Not a one-way door — if upstream SGLang adds a cacheless fallback, the
 > guarantee upgrades with no redesign.
 
 Net: engine-local prefill proceeds whenever the *shared* cache is unavailable —
@@ -275,17 +298,29 @@ which is what the contract requires. This is a deliberate **contract
 interpretation** ("cache unavailable" = the remote/shared tier, not the local
 serving component), and Phase 2 must *validate* rather than assume it:
 
-- **Load-bearing L2 assumption.** That the lmcache MP server starts and serves
-  L1-only when its `--l2-adapter` target is unreachable (retrying L2), rather than
-  aborting. If it does **not** support that — nor reconfiguring/attaching L2 later
-  — the worker entrypoint supervises it (a restart/backoff loop re-attempting L2);
-  and if even that cannot preserve L1-only serving, "L2 required at startup"
-  becomes a **documented limitation of the pair**, not a silent breakage. The
+- **Load-bearing L2 assumption — VALIDATED (Phase-2 Spike B, dev-ORD).** That the
+  lmcache MP server starts and serves L1-only when its `--l2-adapter` target is
+  unreachable (retrying L2), rather than aborting. A worker-only pod pointed at a
+  **down** Redis logged the connection failures but did **not** abort: it created the
+  `resp` L2 adapter, started its Store/Prefetch/Eviction controllers, and came up
+  **listening on `mp_port` (L1-ready)**. So a Redis outage degrades to L1-only, as the
+  startup gate requires. The fallbacks below are retained only as the record of what
+  would have applied had the check failed — it did not, so no worker-side supervision
+  loop is needed. Had it failed — with no way to reconfigure/attach L2 later — the
+  worker entrypoint would have supervised a restart/backoff loop re-attempting L2;
+  and if even that could not preserve L1-only serving, "L2 required at startup" would
+  become a **documented limitation of the pair**, not a silent breakage. The
   viable mechanism is a Phase-2 finding, not claimed here.
-- **Worker crash / restart.** Whether the engine survives a mid-flight worker
-  restart (`restartPolicy: Always`) — recomputing during the gap, resuming cache
-  use after — is a Phase-2 acceptance test. If SGLang cannot tolerate worker loss
-  at all, that is the pair's documented fail-open boundary (the worker is a
+- **Worker crash / restart — DEFERRED, not yet measured.** Whether the engine
+  survives a mid-flight worker restart (`restartPolicy: Always`) — recomputing during
+  the gap, resuming cache use after — was NOT measured in increments 1–2, which
+  validated the store→flush→retrieve data path but not worker-loss recovery. It is
+  the first, gating step of increment 3 (the same increment that adds the engine
+  liveness probe + `Degraded` condition — see [Phased delivery](#phased-delivery)),
+  precisely because the containment mechanism depends on the answer: a
+  restart-on-unhealthy loop built before this is measured could turn "caching
+  silently stopped" into "engine repeatedly killed". If SGLang cannot tolerate worker
+  loss at all, that becomes the pair's documented fail-open boundary (the worker is a
   required serving component; not every engine/backend pair offers identical
   guarantees), surfaced via the `CacheBackend` `Degraded` condition.
 - **`failOpen: false`.** The operator has promoted the cache to a serving
@@ -310,29 +345,43 @@ share instead through the L2, which is the cross-node path anyway). The DaemonSe
 topology stays available as an operator-provided option for dense multi-engine
 nodes, but is not what the managed adapter renders.
 
-## Open question (Phase-2 implementation spike): GPU-less sidecar vs. same container
+## Resolved: GPU-less sidecar vs. same container
 
-The one unresolved detail. The MP worker's data path is either **CUDA-IPC**
-(the worker maps the engine's GPU KV directly — needs GPU visibility) or **POSIX
-`/dev/shm`** (`non_gpu` transfer via `--shm-name` — the engine stages KV to shared
-host memory, the worker needs **no GPU**). The node-local proof above ran worker +
-engine in **one container** sharing the one GPU allocation, so it exercised the
-CUDA-IPC path.
+**Resolved in favour of the GPU-less native sidecar — spiked, then GPU-validated end
+to end.** This section records the answer, because the reasoning that got here is
+load-bearing for anyone touching the worker's security posture.
 
-- **If the `non_gpu` `/dev/shm` path works** for a co-located but separate sidecar
-  (no GPU request on the sidecar, shared `emptyDir` `/dev/shm`): the sidecar design
-  above is clean and cheap — no second GPU, standard pod.
-- **If the worker must share the GPU** (CUDA-IPC only): a separate sidecar cannot
-  get the engine's specific GPU (device-plugin allocation is per-container), so the
-  fallback is worker + engine in **one container** (an entrypoint that launches the
-  worker, then `exec`s the engine) — proven, but it wraps the operator's engine
-  command and is less K8s-idiomatic.
+The question was which data path the MP worker uses: **CUDA-IPC** (the worker maps
+the engine's GPU KV directly — needs GPU visibility) or **POSIX `/dev/shm`**
+(`non_gpu` transfer via `--shm-name` — no GPU needed). The answer is **CUDA-IPC**,
+and the worker therefore **does** need to see the engine's GPU.
 
-This is settled empirically before Phase 2 renders the sidecar (live cluster; two
-containers in one pod, GPU on the engine only, shared `/dev/shm`, worker in
-`non_gpu` mode → does the store→load cycle still pass?). The design is written for
-the sidecar outcome; the fallback is a localized change (fold the worker into the
-engine container's command) that does not affect the L2 or config-file decisions.
+But the anticipated consequence — "a separate sidecar cannot get the engine's GPU,
+so fall back to one container" — **does not hold**, which is why the clean design
+survived:
+
+- A sidecar does not need a device-plugin *allocation* to use a GPU; it needs
+  **visibility**. `NVIDIA_VISIBLE_DEVICES=all` grants that, and the sidecar consumes
+  **no** `nvidia.com/gpu` (no second GPU burned, engine's allocation untouched).
+- Validated: the GPU-less sidecar registers the engine's KV cache
+  (`Registered KV cache for GPU ID …`, `Initialized cuda stream on device cuda:N`)
+  and completes store→flush→retrieve.
+- The negative case is validated too — revoke visibility and the worker dies on
+  `RuntimeError: Device UUID <uuid> not found in the discovered devices`, and the
+  engine never reaches ready. So the env is **load-bearing, not cargo cult**.
+
+**The cost this locks in (and cannot design away):** the worker sees *every* GPU on
+the node, not just its engine's. It cannot be narrowed — the device plugin assigns
+the UUID at kubelet time, **after** the mutating webhook runs, so there is nothing to
+narrow to at admission. Nor does dropping the env help: sglang images ship
+`NVIDIA_VISIBLE_DEVICES=all` in their own `ENV`, and the device plugin overrides it
+only for containers that *request* a GPU — so a request-less worker keeps the image
+default regardless (measured). The adapter sets it explicitly so the wire also works
+on a `workerImage` lacking that default. Documented for operators as a shared-node
+isolation trade-off in [cachebackend-api.md](cachebackend-api.md), the same way
+Mooncake's `hostNetwork` is.
+
+The single-container fallback is therefore **not needed** and is not implemented.
 
 ## Comparison to the Mooncake hostNetwork resolution
 
@@ -357,18 +406,46 @@ data plane), different resolution because the data planes differ:
   twice). The advisory admission warning stays (no working data plane yet), so no
   regression.
 - **Phase 2.** The working data plane: `ResolveCacheServer` → Redis L2;
-  `InjectSGLangLMCache` rewritten → config-file init container + MP-worker native
-  sidecar + engine config-file wire + shared volumes, **dropping the inert
+  `InjectSGLangLMCache` rewritten → MP-worker native sidecar (writes its own
+  config file) + engine config-file wire + shared volumes, **dropping the inert
   `LMCACHE_*` env**; resolve the GPU-less-sidecar spike first. The pinned,
   version-aligned worker/engine/Redis image tuple lands in **`VERSIONS.md` in this
   phase** (it is a Phase-2 correctness requirement, not a Phase-3 doc polish). Flip
   the advisory warning off once validated end-to-end.
-- **Phase 3.** Operator surface: `config/samples/cachebackend-sglang.yaml`, the
-  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, the
-  default-install smoke assertions, and fully rewriting the
-  [cachebackend-api.md](cachebackend-api.md) SGLang section from the `lm://` model
-  to the MP-mode design (Phase 1 only flags it superseded — see below). Operator
-  docs **recommend MP mode** for LMCache and state that **SGLang is MP-only**.
+
+  **Phase 2 is delivered in three increments**, and the containment measures land
+  across them rather than all in the first code drop:
+
+  | Increment | Delivers | Status |
+  |---|---|---|
+  | 1 | `ResolveCacheServer` → the managed Redis L2 render + its `VERSIONS.md` pin | landed |
+  | 2 | `InjectSGLangLMCache` → the MP engine wire (worker sidecar, config file, shared volumes); the GPU-validated engine/lmcache image tuple recorded in `VERSIONS.md`; advisory warning flipped off | landed, GPU-validated |
+  | 3 | Operator surface (samples, reference-stack leg, injection smoke) + the **remaining containment**: engine liveness probe and `CacheBackend` `Degraded` on worker unhealth | **pending** |
+
+  **Why containment splits this way** (rather than shipping with increment 2): of
+  the four containment measures listed under [Fail-open semantics](#fail-open-semantics-resolving-the-startup-gate-tension),
+  increment 2 delivers the two that are properties of the wire it renders — the
+  native sidecar's `restartPolicy: Always` self-heal, and the operator docs naming
+  the worker a serving component. The other two are **different surfaces**: the
+  `Degraded` condition is controller/status work, and an engine liveness probe
+  mutates the *operator-owned* engine container (which may carry its own probe).
+  Both also depend on a Phase-2 finding this doc explicitly does not claim —
+  **whether the engine survives a mid-flight worker restart** (see the "Worker
+  crash / restart" bullet above). A restart-on-unhealthy loop built before that is
+  measured could convert "caching silently stopped" into "engine repeatedly
+  killed", which is worse than the failure it contains. So increment 3 validates
+  that behavior first, then ships the probe + condition together.
+- **Phase 3 (increment 3).** The *remaining* operator surface:
+  `config/samples/cachebackend-sglang.yaml` polish, the
+  `docs/reference-stack/manifests/sglang-lmcache/` reference leg, and the
+  default-install smoke assertion that the MP wire is actually **injected** (an
+  engine pod admitted through the live webhook carries the worker + config-file +
+  mounts). Two items this list used to defer here have **already landed in increment
+  2**: the [cachebackend-api.md](cachebackend-api.md) SGLang section was rewritten
+  from the `lm://` model to the MP design (not just flagged superseded), and the
+  smoke assertion that the obsolete offload-misconfigured warning is **absent** was
+  flipped. Operator docs **recommend MP mode** for LMCache and state that **SGLang is
+  MP-only**.
 - **Future (out of scope here): vLLM → MP migration.** A separate effort adds a
   vLLM MP path (`LMCacheMPConnector` + `kv_connector_extra_config`) reusing the
   worker + shared-L2 infrastructure this design builds, and switches the

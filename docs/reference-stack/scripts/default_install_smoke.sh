@@ -3347,36 +3347,38 @@ while IFS= read -r f; do
     sample_fail=$((sample_fail + 1))
   fi
 done <<< "$sample_list"
-# Operator-facing admission signal: applying the (sglang, LMCache) sample MUST
-# warn that its LMCache offload is misconfigured — SGLang drives LMCache in MP
-# mode, so the shipped lm:// wiring caches nothing and must not be mistaken for a
-# working backend. --dry-run=server reaches admission (where the warning is
-# emitted on stderr) and persists nothing. The loop above only asserts the sample
-# applies cleanly; this asserts the warning actually fires through a real apply.
-# Runs in $SAMPLE_APPLY_NS (still fresh — the loop's dry-runs persisted nothing)
-# BEFORE its delete below, so this is a clean CREATE, not an update of a same-named
-# object that might exist in another namespace.
+# Operator-facing admission signal: the (sglang, LMCache) sample MUST now admit
+# CLEANLY under real server-side admission — the adapter renders the working
+# LMCache MP-mode data plane (node-local MP-worker sidecar + config-file wire → the
+# managed Redis L2), so the old "offload misconfigured (lm:// vs MP)" advisory is
+# gone. --dry-run=server reaches admission and persists nothing. The loop above only
+# asserts the sample parses/applies; this asserts it admits without the obsolete
+# warning through a real apply. Runs in $SAMPLE_APPLY_NS (still fresh — the loop's
+# dry-runs persisted nothing) BEFORE its delete below, so this is a clean CREATE.
 sglang_sample="config/samples/cachebackend-sglang.yaml"
 if [ -f "$sglang_sample" ]; then
-  # The `if cmd; then` form both keeps `set -e` from aborting on a rejected apply
-  # AND distinguishes the two failure modes: a NON-zero exit means the sample was
-  # rejected (fail with its output — the warning text alone must not mask that,
-  # since a rejection can print the warning before the error), a zero exit means it
-  # admitted and we then require the warning to be present.
+  # `if cmd; then` keeps `set -e` from aborting on a rejected apply AND distinguishes
+  # the failure modes: a NON-zero exit means admission rejected the sample; a zero
+  # exit means it admitted, and we then require the obsolete warning to be ABSENT
+  # (its presence would mean the working wire didn't remove it). Match the retired
+  # warning's EXACT text, not loose fragments like "misconfigured" / "MP mode": those
+  # appear in ordinary prose, so an unrelated future warning would fail this gate for
+  # the wrong reason.
+  sglang_retired_warn="SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server"
   if sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$sglang_sample" 2>&1)"; then
     case "$sglang_warn_out" in
-      *"MP mode"*)
-        log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
-      *)
+      *"$sglang_retired_warn"*)
         printf '%s\n' "$sglang_warn_out"
-        fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
+        fail "(sglang, LMCache) still emits the obsolete offload-misconfigured warning — the MP-mode data plane should have removed it" ;;
+      *)
+        log "(sglang, LMCache) sample admits cleanly (working MP-mode data plane wired, no obsolete warning)" ;;
     esac
   else
     printf '%s\n' "$sglang_warn_out"
     fail "(sglang, LMCache) sample did not apply cleanly under --dry-run=server (admission rejected it)"
   fi
 else
-  fail "$sglang_sample missing — the SGLang MP-mode admission-warning assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
+  fail "$sglang_sample missing — the SGLang admission assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
 fi
 
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true

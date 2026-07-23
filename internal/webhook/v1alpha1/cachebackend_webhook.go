@@ -154,6 +154,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectEventsOnlyMisconfiguration,
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
+	rejectSGLangRedisL2ScaleOut,
 }
 
 // rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
@@ -188,6 +189,52 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),
 		),
 	}
+}
+
+// rejectSGLangRedisL2ScaleOut hard-rejects a multi-replica or autoscaled
+// (sglang, LMCache) backend. That pair's managed cache-server is a single plain
+// Redis L2 store (the SGLang MP worker's --l2-adapter target), and a plain Redis is
+// not clustered: a second pod behind the one ClusterIP Service shards the keyspace
+// across independent instances, so a key stored via one is a miss via the other and
+// the L2 silently partitions. The failure looks like a healthy backend with a poor
+// hit rate, so reject at the door rather than warn — the same posture as
+// rejectMooncakeMasterScaleOut (a different singleton for a different reason).
+//
+// Scoped to (sglang, LMCache): vLLM's lm:// server is an ordinary pod-network
+// workload that scales, and other pairs are rejected on their own
+// (checkRuntimeAdapter). spec.replicas 0 (disabled) and 1 (the singleton) remain
+// valid, as is EventsOnly (which provisions no server at all — see the guard).
+// The reconciler's clampSingletonReplicas is the backstop for grandfathered
+// objects. If SGLang's shared tier gains a clustered store, lift this rule.
+func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	// EventsOnly provisions NO cache server at all (the reconciler sheds any owned
+	// workload and wires only the kvevent-subscriber sidecar), so there is no Redis
+	// L2 to partition and nothing this rule protects. Rejecting scale-out here would
+	// be both factually wrong — the message explains a Redis split that cannot happen
+	// — and gratuitously stricter than the otherwise-identical (vllm, LMCache)
+	// events-only backend. The rule applies to the Offload path, which is what
+	// renders the singleton Redis.
+	if cb.Spec.IsEventsOnly() {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
+			"the (sglang, LMCache) backend's Redis L2 store is a single non-clustered instance: a second replica behind the one Service shards the keyspace and silently partitions the cache. Set spec.replicas to 0 or 1.",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
+			"spec.autoscaling is not supported for the (sglang, LMCache) backend: its Redis L2 store is a single non-clustered instance, so scaling it out partitions the cache across independent keyspaces. Remove spec.autoscaling.",
+		))
+	}
+	return errs
 }
 
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
@@ -320,7 +367,6 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 	var w admission.Warnings
 	w = append(w, warnMooncakeEngineHostNetwork(cb)...)
-	w = append(w, warnSGLangLMCacheDataPlaneUnverified(cb)...)
 	return w
 }
 
@@ -357,42 +403,10 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 	return admission.Warnings{mooncakeEngineHostNetworkWarning}
 }
 
-// sglangLMCacheDataPlaneWarning flags the one thing GPU validation surfaced about
-// the (sglang, LMCache) pair: it is wired by analogy to (vllm, LMCache) — a
-// standalone lm:// server the engine reaches over LMCACHE_REMOTE_URL — but SGLang's
-// LMCache integration does NOT work that way. SGLang drives LMCache through its
-// LMCacheLayerwiseConnector in MULTIPROCESS (MP) mode: config is read from the
-// --lmcache-config-file flag (the LMCACHE_* env this adapter injects is ignored),
-// the transfer is node-local (mp_host/mp_port + pointer/shared-memory), and pointing
-// it at a bare remote lm:// URL leaves the engine hung at startup rather than
-// caching. So the pair can reconcile Ready while the data plane does nothing.
-//
-// This is advisory (not a reject) because the correct wiring — MP-mode config file,
-// per-node worker — is a follow-up that must be built and GPU-validated, and a hard
-// reject would strand operators who set up MP mode by hand. Say it out loud at apply
-// time so the lm:// wiring isn't mistaken for a working cache. Text stays within
-// [maxWarningLen]; the full rationale lives in docs/design/cachebackend-api.md
-// (the SGLang engine support section's KNOWN LIMITATION note).
-const sglangLMCacheDataPlaneWarning = "SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server (may hang or not cache)"
-
-// warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend
-// that actually wires an offload — i.e. all of them EXCEPT events-only, which
-// injects no LMCache connector at all (so there is no lm://-vs-MP mismatch to warn
-// about). Unlike the Mooncake warning there is no per-field opt-in that closes the
-// gap for an offload backend; the whole pairing is wired to the wrong LMCache mode.
-// Scoped by the same (runtime, type) test as [rejectUnsupportedSGLangRole].
-func warnSGLangLMCacheDataPlaneUnverified(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
-		return nil
-	}
-	if cb.Spec.IsEventsOnly() {
-		// Events-only (tier-1 routing) injects NO LMCache connector — it only wires
-		// the observation sidecar — so the lm://-vs-MP mismatch simply isn't present.
-		return nil
-	}
-	return admission.Warnings{sglangLMCacheDataPlaneWarning}
-}
+// The (sglang, LMCache) pair no longer needs an advisory warning: the adapter now
+// renders the working LMCache MP-mode data plane (a node-local MP-worker sidecar +
+// config-file wire offloading to the managed Redis L2), so there is no lm://-vs-MP
+// mismatch left to flag. See docs/design/sglang-lmcache-mp-mode.md.
 
 // rejectEngineHostNetworkOnBackendThatDoesNotNeedIt keeps
 // spec.integration.engineHostNetwork from sitting inert. Only Mooncake's

@@ -240,10 +240,11 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	// Covers the production pod-webhook selection path for (sglang, LMCache):
 	// the nil-registry fallback now includes the SGLang adapter, so a SGLang
 	// engine pod matching a (sglang, LMCache) CacheBackend is injected with
-	// SGLang's LMCache wire (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL +
-	// LMCACHE_REMOTE_URL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
-	// PYTHONHASHSEED. Without the SGLang registration in the fallback, the
-	// webhook would fail-open and the pod would boot unwired.
+	// SGLang's LMCache MP wire (--enable-lmcache + --lmcache-config-file +
+	// LMCACHE_USE_EXPERIMENTAL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
+	// PYTHONHASHSEED — and NOT the lm:// LMCACHE_REMOTE_URL, which MP mode ignores.
+	// Without the SGLang registration in the fallback, the webhook would fail-open
+	// and the pod would boot unwired.
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
@@ -262,11 +263,12 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 	mustHaveArgFlag(t, mutated, "--enable-lmcache")
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveArgFlag(t, mutated, "--lmcache-config-file")
 	mustHaveEnv(t, mutated, "LMCACHE_USE_EXPERIMENTAL", "True")
 
-	// Proof it went through the SGLang path, not vLLM's: the vLLM-only connector
-	// arg and env must be absent.
+	// Proof it went through the SGLang MP path: the vLLM-only connector arg/env
+	// must be absent, the old lm:// env must NOT be injected, and the MP-worker
+	// native sidecar must be present.
 	for _, c := range mutated.Spec.Containers {
 		if c.Name != "sglang" {
 			continue
@@ -280,7 +282,19 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 			if e.Name == adapterruntime.EnvVLLMUseV1 || e.Name == adapterruntime.EnvPythonHashSeed {
 				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
 			}
+			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+				t.Fatalf("SGLang MP wire must not inject %s", adapterruntime.EnvLMCacheRemoteURL)
+			}
 		}
+	}
+	hasWorker := false
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == "lmcache-mp-worker" {
+			hasWorker = true
+		}
+	}
+	if !hasWorker {
+		t.Fatalf("MP-worker sidecar not injected; initContainers = %+v", mutated.Spec.InitContainers)
 	}
 }
 

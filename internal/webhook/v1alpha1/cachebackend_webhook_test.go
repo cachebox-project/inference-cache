@@ -420,7 +420,7 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 	// clients render them reliably. A warning that gets truncated — or dropped — is
 	// exactly the silent failure this warning exists to prevent, so guard the budget
 	// here rather than trusting review to catch a future edit that pads it out.
-	for _, w := range []string{mooncakeEngineHostNetworkWarning, sglangLMCacheDataPlaneWarning} {
+	for _, w := range []string{mooncakeEngineHostNetworkWarning} {
 		if got := len(w); got > maxWarningLen {
 			t.Fatalf("warning is %d chars, want <= %d — put the detail in the docs, not the warning:\n%q",
 				got, maxWarningLen, w)
@@ -430,9 +430,7 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 
 func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
 	// Blast radius: the DEFAULT (vLLM) LMCache pairing — engine unset defaults to
-	// vLLM — must stay warning-free: neither the Mooncake mesh warning nor the
-	// SGLang MP-mode warning applies to it. (SGLang+LMCache operators DO get a
-	// warning — see TestValidator_SGLangLMCacheWarnsDataPlaneUnverified.)
+	// vLLM — must stay warning-free (the Mooncake mesh warning does not apply to it).
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
@@ -445,13 +443,12 @@ func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
 	}
 }
 
-func TestValidator_SGLangLMCacheWarnsDataPlaneUnverified(t *testing.T) {
-	// GPU validation showed (sglang, LMCache) is wired like (vllm, LMCache) — a
-	// standalone lm:// server the engine reaches over LMCACHE_REMOTE_URL — but SGLang
-	// drives LMCache in MP mode (config via --lmcache-config-file, node-local
-	// transfer), so the lm:// wiring can reconcile Ready while caching nothing. Warn,
-	// don't reject: the MP-mode wiring is a follow-up, and a hard block would strand
-	// an operator running MP mode by hand.
+func TestValidator_SGLangLMCacheEmitsNoWarning(t *testing.T) {
+	// The (sglang, LMCache) adapter now renders the working LMCache MP-mode data
+	// plane (node-local MP-worker sidecar + config-file wire → managed Redis L2), so
+	// the old "misconfigured lm:// wiring" advisory is gone — the pair must be
+	// warning-free on both create and update. Assert the FULL list is empty so a
+	// resurrected or accidental new warning is caught.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
@@ -459,20 +456,18 @@ func TestValidator_SGLangLMCacheWarnsDataPlaneUnverified(t *testing.T) {
 
 	warnings, err := v.ValidateCreate(context.Background(), cb)
 	if err != nil {
-		t.Fatalf("(sglang, LMCache) must still be admitted (warning, not rejection): %v", err)
+		t.Fatalf("(sglang, LMCache) must be admitted: %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "MP mode") {
-		t.Fatalf("create warnings = %v, want one naming the MP-mode mismatch", warnings)
+	if len(warnings) != 0 {
+		t.Fatalf("(sglang, LMCache) must be warning-free, got: %v", warnings)
 	}
 
-	// Persists on update, not only first apply — and it's the SGLang MP-mode
-	// warning specifically, not just any warning.
 	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
 	if err != nil {
-		t.Fatalf("(sglang, LMCache) update must still be admitted: %v", err)
+		t.Fatalf("(sglang, LMCache) update must be admitted: %v", err)
 	}
-	if len(warnings) != 1 || warnings[0] != sglangLMCacheDataPlaneWarning {
-		t.Fatalf("update warnings = %v, want exactly the sglang MP-mode warning", warnings)
+	if len(warnings) != 0 {
+		t.Fatalf("(sglang, LMCache) update must be warning-free, got: %v", warnings)
 	}
 }
 
@@ -562,6 +557,96 @@ func TestValidator_LMCacheScaleOutUnaffectedByMooncakeRule(t *testing.T) {
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("multi-replica autoscaled LMCache must be admitted: %v", err)
+	}
+}
+
+func sglangLMCacheBackend() *cachev1alpha1.CacheBackend {
+	cb := newBackend() // Type=LMCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	return cb
+}
+
+func TestValidator_SGLangRedisL2MultiReplicaRejected(t *testing.T) {
+	// The (sglang, LMCache) backend's cache-server is a single non-clustered Redis L2
+	// (the MP worker's --l2-adapter target). A second pod behind the one Service
+	// shards the keyspace across independent instances, so a key stored via one is a
+	// miss via the other — the L2 silently partitions. Reject at write time.
+	v := &CacheBackendValidator{}
+	cb := sglangLMCacheBackend()
+	two := int32(2)
+	cb.Spec.Replicas = &two
+	requireInvalidWithCause(t, v, cb, "spec.replicas", "single non-clustered instance")
+}
+
+func TestValidator_SGLangRedisL2AutoscalingRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := sglangLMCacheBackend()
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	requireInvalidWithCause(t, v, cb, "spec.autoscaling", "not supported for the (sglang, LMCache) backend")
+}
+
+func TestValidator_SGLangRedisL2SingletonAndDisabledAccepted(t *testing.T) {
+	// 1 is the singleton; 0 is "disabled". Neither partitions the keyspace.
+	v := &CacheBackendValidator{}
+	for _, replicas := range []int32{0, 1} {
+		cb := sglangLMCacheBackend()
+		r := replicas
+		cb.Spec.Replicas = &r
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("(sglang, LMCache) with spec.replicas=%d must be admitted: %v", replicas, err)
+		}
+	}
+}
+
+func TestValidator_SGLangEventsOnlyScaleOutAccepted(t *testing.T) {
+	// EventsOnly provisions NO cache server (the reconciler sheds any owned
+	// workload), so there is no Redis L2 to partition — the singleton rule must not
+	// fire. Rejecting here would be factually wrong (the message explains a Redis
+	// split that cannot happen) and would make SGLang gratuitously stricter than an
+	// otherwise-identical (vllm, LMCache) events-only backend.
+	v := &CacheBackendValidator{}
+
+	t.Run("multi-replica is admitted", func(t *testing.T) {
+		cb := sglangLMCacheBackend()
+		cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		cb.Spec.Replicas = i32p(3)
+		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("(sglang, LMCache) EventsOnly with replicas=3 must be admitted (no Redis is provisioned): %v", err)
+		}
+	})
+
+	t.Run("autoscaling is rejected by the ENGINE-AGNOSTIC events-only rule, not the Redis one", func(t *testing.T) {
+		// Autoscaling on EventsOnly is rejected either way — but it must be for the
+		// generic "no server workload to autoscale" reason that applies to every
+		// engine, NOT the SGLang Redis-partitioning reason (which would be wrong here
+		// and would make SGLang stricter than vLLM). Pinning the reason is the point.
+		cb := sglangLMCacheBackend()
+		cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+		_, err := v.ValidateCreate(context.Background(), cb)
+		if err == nil {
+			t.Fatalf("EventsOnly + autoscaling should be rejected (nothing to autoscale)")
+		}
+		if !strings.Contains(err.Error(), "provision no server workload") {
+			t.Fatalf("want the engine-agnostic events-only reason, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "non-clustered") {
+			t.Fatalf("the SGLang Redis-partitioning rule fired on an events-only backend, which provisions no Redis: %v", err)
+		}
+	})
+}
+
+func TestValidator_VLLMLMCacheScaleOutUnaffectedBySGLangRule(t *testing.T) {
+	// Blast radius: vLLM's lm:// server is an ordinary pod-network workload and must
+	// keep scaling out (and autoscaling) — the singleton rule is (sglang, LMCache)-only.
+	v := &CacheBackendValidator{}
+	cb := newBackend() // Type=LMCache, engine defaults to vllm
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	three := int32(3)
+	cb.Spec.Replicas = &three
+	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("multi-replica autoscaled (vllm, LMCache) must be admitted: %v", err)
 	}
 }
 
@@ -2159,12 +2244,12 @@ func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha
 }
 
 func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
-	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache
-	// (args) and LMCACHE_REMOTE_URL / LMCACHE_USE_EXPERIMENTAL /
-	// INFERENCECACHE_FAIL_OPEN (env). Admission must reject an engineOverrides
-	// entry that overrides OR suppresses any of them, and name the sglang
-	// adapter in the rejection. Exercises the real shipping registry so the
-	// sglang adapter's reserved lists are the ones enforced.
+	// The SGLang adapter reserves a DIFFERENT set than vLLM: --enable-lmcache and
+	// --lmcache-config-file (args), LMCACHE_USE_EXPERIMENTAL /
+	// INFERENCECACHE_FAIL_OPEN (env). In MP mode the old lm:// LMCACHE_REMOTE_URL is
+	// neither injected nor reserved. Admission must reject an engineOverrides entry
+	// that overrides OR suppresses any reserved item, and name the sglang adapter.
+	// Exercises the real shipping registry so the sglang reserved lists are enforced.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cases := []struct {
 		name     string
@@ -2174,7 +2259,7 @@ func TestValidator_EngineOverrides_SGLangReservedRejected(t *testing.T) {
 	}{
 		{"suppress --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--enable-lmcache"},
 		{"override --enable-lmcache", cachev1alpha1.EngineInjectionOverrides{Args: []string{"--enable-lmcache"}}, "spec.integration.engineOverrides.args[0]", "--enable-lmcache"},
-		{"override LMCACHE_REMOTE_URL", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "lm://elsewhere:1"}}}, "spec.integration.engineOverrides.env[0].name", "LMCACHE_REMOTE_URL"},
+		{"suppress --lmcache-config-file", cachev1alpha1.EngineInjectionOverrides{SuppressArgs: []string{"--lmcache-config-file"}}, "spec.integration.engineOverrides.suppressArgs[0]", "--lmcache-config-file"},
 		{"suppress LMCACHE_USE_EXPERIMENTAL", cachev1alpha1.EngineInjectionOverrides{SuppressEnv: []string{"LMCACHE_USE_EXPERIMENTAL"}}, "spec.integration.engineOverrides.suppressEnv[0]", "LMCACHE_USE_EXPERIMENTAL"},
 		{"override INFERENCECACHE_FAIL_OPEN", cachev1alpha1.EngineInjectionOverrides{Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}}}, "spec.integration.engineOverrides.env[0].name", "INFERENCECACHE_FAIL_OPEN"},
 	}
