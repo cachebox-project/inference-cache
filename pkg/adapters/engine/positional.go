@@ -34,11 +34,17 @@ type posEntry struct {
 	adapter string
 }
 
-// EvictedPrefix is one index key to drop: our content-fingerprint prefix hash
-// plus the adapter partition it lives in.
+// EvictedPrefix is one index key the engine evicted, resolved back to the entry
+// we derived for it: our content-fingerprint prefix hash, the adapter partition
+// it lives in, and its cumulative token count. The adapter scopes the eviction to
+// the right partition (the fingerprint is token-only, so one prefix hash can be
+// live under several adapters at once); the token count lets the caller re-report
+// the prefix at a colder tier (T2) when a paired L2 store still holds it, instead
+// of only being able to delete it.
 type EvictedPrefix struct {
 	PrefixHash []byte
 	AdapterID  string
+	TokenCount int32
 }
 
 func newPositionalIndex() *positionalIndex {
@@ -106,6 +112,12 @@ func (p *positionalIndex) Stored(ev BlockStored, adapterID string) []*icpb.Prefi
 			PrefixHash: fingerprint.Bytes(phs[i]),
 			TokenCount: tokens,
 			AdapterId:  adapterID,
+			// A stored block is resident in the engine KV cache — tier T1. Stamped
+			// explicitly so the wire is self-describing; the server would default
+			// an unset tier to T1 anyway, but being explicit keeps a captured
+			// CacheStateUpdate unambiguous and symmetric with the T2 downgrade the
+			// reporter emits on eviction (see forwarder.go BlockRemoved).
+			Tier: icpb.CacheTier_CACHE_TIER_T1,
 		})
 		p.blocks[string(ev.BlockHashes[i])] = posEntry{
 			prefixHash: phs[i],
@@ -116,15 +128,17 @@ func (p *positionalIndex) Stored(ev BlockStored, adapterID string) []*icpb.Prefi
 	return out
 }
 
-// Removed maps each evicted engine block hash to our prefix hash (the index key
-// to drop) PLUS the adapter partition it was stored under, and forgets it.
-// Unknown hashes are skipped. The caller turns each returned pair into a
-// PREFIX_EVICTED event via Config.EvictedEvent.
+// Removed maps each evicted engine block hash back to the entry we derived for it
+// — prefix hash (the index key), the adapter partition it was stored under, and
+// its cumulative token count — and forgets it. Unknown hashes are skipped. The
+// caller either forwards each as a PREFIX_EVICTED (single-tier: the block is gone)
+// or re-reports it at T2 (L2 tier present: the block moved tiers, not gone), in
+// both cases scoped to the returned adapter partition.
 //
 // Carrying the adapter matters here: the fingerprint is token-only, so the same
 // prefix hash can be live under several adapters at once. Without the partition
-// the server would drop all of them for one adapter's GPU eviction, throwing
-// away routing hints that are still valid.
+// the server would drop (or downgrade) all of them for one adapter's GPU
+// eviction, throwing away routing hints that are still valid.
 func (p *positionalIndex) Removed(ev BlockRemoved) []EvictedPrefix {
 	if len(ev.BlockHashes) == 0 {
 		return nil
@@ -136,6 +150,7 @@ func (p *positionalIndex) Removed(ev BlockRemoved) []EvictedPrefix {
 			out = append(out, EvictedPrefix{
 				PrefixHash: fingerprint.Bytes(pe.prefixHash),
 				AdapterID:  pe.adapter,
+				TokenCount: pe.tokenCount,
 			})
 			delete(p.blocks, key)
 		}

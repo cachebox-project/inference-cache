@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -31,6 +33,18 @@ type StatsReporter struct {
 	rpcTimeout time.Duration
 	now        func() time.Time
 	logger     *slog.Logger
+
+	// staleThreshold consecutive ticks that fail to deliver a fresh sample to IC
+	// (a failed scrape OR a failed ReportCacheState — either way IC gets nothing)
+	// flip the reporter to "stale": it logs once at Error on that transition and
+	// once at Info on recovery, guarding against both per-tick log spam and a
+	// silently unrefreshed load signal. The transition message depends on
+	// everDelivered: once a sample has actually reached IC it keeps ranking on
+	// that until the index TTL ages it out; if nothing has reached IC since
+	// startup the replica is ranked on residency alone from the outset.
+	staleThreshold int
+	consecFails    int
+	everDelivered  bool
 }
 
 // StatsReporterOption configures a StatsReporter.
@@ -62,6 +76,8 @@ func NewStatsReporter(client icpb.InferenceCacheClient, scraper statsScraper, cf
 		rpcTimeout: 5 * time.Second,
 		now:        time.Now,
 		logger:     slog.Default(),
+
+		staleThreshold: 3,
 	}
 	for _, o := range opts {
 		o(r)
@@ -95,44 +111,116 @@ func (r *StatsReporter) Run(ctx context.Context) error {
 	}
 }
 
-// tick scrapes once and sends one stats-only CacheStateUpdate. All failures are
-// non-fatal — they log and return so the next tick retries.
+// Stable structured log-event values for the stale/recovery transitions. Emitted
+// under the "event" key so operators can alert on the machine-readable field
+// rather than the human-readable message text (which may be reworded).
+const (
+	loadSignalStale     = "load_signal_stale"
+	loadSignalRecovered = "load_signal_recovered"
+)
+
+// errNoStats marks a tick whose scrape succeeded but produced no ReplicaStats to
+// report — nothing reaches IC, so it counts as a non-delivery.
+var errNoStats = errors.New("scrape produced no stats to report")
+
+// tick scrapes once and delivers one stats-only CacheStateUpdate to IC. A tick
+// "succeeds" only when a fresh sample actually reaches IC — a failed scrape and a
+// failed delivery (ReportCacheState) are treated identically, since either one
+// leaves IC without a fresh load signal for this replica. All failures are
+// non-fatal: they log per the stale state machine and the next tick retries.
 func (r *StatsReporter) tick(ctx context.Context) {
 	stats, err := r.scraper.Scrape(ctx)
 	if err != nil {
-		// Don't spam at error level: scrape outages are expected during engine
-		// restarts and the subscriber must survive them.
-		r.logger.Warn("stats scrape failed; skipping tick", "err", err)
+		r.markStale(err)
 		return
 	}
 	csu := r.cfg.StatsUpdate(r.now().UnixMicro(), stats)
 	if csu == nil {
+		// The scraper returned no usable stats (the interface permits a nil
+		// result). Nothing reaches IC, so this is a non-delivery like a failed
+		// scrape — count it toward staleness rather than silently leaving the
+		// failure streak untouched.
+		r.markStale(errNoStats)
 		return
 	}
-	r.send(ctx, csu)
+	if err := r.send(ctx, csu); err != nil {
+		r.markStale(err)
+		return
+	}
+	r.markDelivered()
 }
 
-// send opens a fresh, time-bounded ReportCacheState stream and sends exactly
-// one stats-only CSU before half-closing. Errors are logged and dropped — the
-// next tick will re-emit a fresh sample (soft state).
-func (r *StatsReporter) send(ctx context.Context, csu *icpb.CacheStateUpdate) {
+// markStale records one tick that failed to deliver a fresh sample to IC and
+// logs the healthy -> stale transition exactly once, loudly; it then stays quiet
+// (Debug) while the outage persists and Warn below the threshold, so a sustained
+// loss of load-aware routing is surfaced without per-tick spam.
+func (r *StatsReporter) markStale(cause error) {
+	r.consecFails++
+	switch {
+	case r.consecFails == r.staleThreshold:
+		// Word the message to only what THIS subscriber knows — whether it has
+		// delivered a sample since startup — never what IC globally holds. IC ages
+		// any delivered sample out at its index TTL, after which it ranks on
+		// residency only; a subscriber that has delivered nothing since startup
+		// cannot assume IC is empty (a prior process may have left a sample that is
+		// still within TTL), so it does not claim so. everDelivered is per-process.
+		// Both branches carry event=load_signal_stale so alerting keys on that
+		// stable structured field, not the human-readable message text.
+		if r.everDelivered {
+			r.logger.Error("engine load stats stale; this subscriber's last delivered sample ages out at IC's index TTL, then IC ranks this replica on residency only",
+				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
+		} else {
+			r.logger.Error("engine load stats undelivered since startup; this subscriber has sent IC no sample for this replica (any prior sample ages out at IC's index TTL)",
+				"event", loadSignalStale, "consecutive_failures", r.consecFails, "err", cause)
+		}
+	case r.consecFails > r.staleThreshold:
+		// already surfaced; keep the per-tick detail out of the way.
+		r.logger.Debug("engine load stats still not reaching IC; skipping tick", "err", cause)
+	default:
+		// Brief outages are expected during engine/server restarts; don't spam Error.
+		r.logger.Warn("engine load stats update failed; will retry", "err", cause)
+	}
+}
+
+// markDelivered records a fresh sample reaching IC: it logs recovery once if the
+// reporter was stale, clears the failure counter, and notes that IC now holds a
+// sample for the fall-back window.
+func (r *StatsReporter) markDelivered() {
+	if r.consecFails >= r.staleThreshold {
+		r.logger.Info("engine load stats recovered", "event", loadSignalRecovered, "after_failures", r.consecFails)
+	}
+	r.consecFails = 0
+	r.everDelivered = true
+}
+
+// send opens a fresh, time-bounded ReportCacheState stream, delivers exactly one
+// stats-only CSU, and half-closes. It returns the delivery error (nil on
+// success) so the caller's stale state machine can treat a sample that never
+// reached IC the same as a failed scrape. Soft state: the next tick re-emits a
+// fresh sample, so a dropped one is never fatal.
+func (r *StatsReporter) send(ctx context.Context, csu *icpb.CacheStateUpdate) error {
 	sendCtx, cancel := context.WithTimeout(ctx, r.rpcTimeout)
 	defer cancel()
 
 	stream, err := r.client.ReportCacheState(sendCtx)
 	if err != nil {
-		r.logger.Warn("open stats report stream failed; dropping stats", "err", err)
-		return
+		return fmt.Errorf("open stats stream: %w", err)
 	}
-	if err := stream.Send(csu); err != nil {
-		// io.EOF on Send means the server closed the stream early; CloseAndRecv
-		// will surface the actual status. Fall through into it rather than
-		// returning here so the recv'd reason ends up in the log.
-		if !errors.Is(err, context.Canceled) {
-			r.logger.Warn("stats send failed; awaiting close for reason", "err", err)
-		}
+	// io.EOF on Send means the server closed the stream early; CloseAndRecv
+	// carries the real status, so always call it and treat its result as
+	// authoritative for whether the sample landed.
+	sendErr := stream.Send(csu)
+	ack, closeErr := stream.CloseAndRecv()
+	if closeErr != nil {
+		return fmt.Errorf("deliver stats: %w", closeErr)
 	}
-	if _, err := stream.CloseAndRecv(); err != nil {
-		r.logger.Warn("stats report close failed", "err", err)
+	// A clean close with accepted=false is an explicit rejection by IC — the
+	// stream succeeded but the sample was NOT indexed, so it did not land.
+	if ack != nil && !ack.GetAccepted() {
+		return fmt.Errorf("deliver stats: IC rejected the update (accepted=false)")
 	}
+	if sendErr != nil && !errors.Is(sendErr, io.EOF) && !errors.Is(sendErr, context.Canceled) {
+		return fmt.Errorf("send stats: %w", sendErr)
+	}
+	return nil
 }

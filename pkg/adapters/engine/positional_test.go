@@ -110,6 +110,11 @@ func TestRemovedMapsAndForgets(t *testing.T) {
 	if rm[0].AdapterID != "" {
 		t.Errorf("AdapterID = %q, want \"\" (block stored without an adapter)", rm[0].AdapterID)
 	}
+	// The token count is carried back so the caller can re-report the prefix at
+	// T2 (L2 mode) rather than only being able to delete it. One full block.
+	if rm[0].TokenCount != bs {
+		t.Fatalf("Removed token count = %d, want %d", rm[0].TokenCount, bs)
+	}
 	// Re-removing the now-forgotten hash yields nothing.
 	if rm2 := p.Removed(BlockRemoved{BlockHashes: [][]byte{engHash(5)}}); len(rm2) != 0 {
 		t.Fatalf("re-remove returned %d, want 0", len(rm2))
