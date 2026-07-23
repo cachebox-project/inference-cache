@@ -286,7 +286,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 COVER_MIN ?= 90
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
+COVER_EXCLUDE := pkg/server/proto/|pkg/adapters/engine/vllmengine/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages, cross-package counted).

@@ -7,10 +7,18 @@ syntax = "proto3";
 // engine does not expose).
 //
 // The package name MUST stay `vllm.grpc.engine` to match the upstream service
-// so the wire method path `/vllm.grpc.engine.VllmEngine/GetLoads` lines up;
-// field numbers mirror upstream. Kept out of the `proto/` module on purpose —
-// it is a vendored external contract, not part of IC's own gRPC API, so it is
-// exempt from IC's buf-lint conventions.
+// so the wire method path `/vllm.grpc.engine.VllmEngine/GetLoads` lines up; the
+// message names, field numbers, and types below are copied verbatim from the
+// source file so the wire encoding is byte-compatible. Kept out of the `proto/`
+// module on purpose — it is a vendored external contract, not part of IC's own
+// gRPC API, so it is exempt from IC's buf-lint conventions.
+//
+// Provenance: this is a hand-copied subset, so it is only as correct as the
+// upstream file it was taken from. When re-syncing against a new SMG release,
+// copy from the pinned revision and record it here (repo + commit), and confirm
+// the GetLoads request/response field numbers still match — the bufconn test
+// (grpc_loads_scraper_test.go) proves this file round-trips against its own
+// generated stubs, NOT that it matches the engine actually deployed.
 //
 // Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
 // proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the
