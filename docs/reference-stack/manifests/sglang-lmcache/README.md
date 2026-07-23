@@ -174,21 +174,21 @@ kill "$pf" 2>/dev/null; trap - EXIT
     || { echo "FAIL: KV-event publisher did not start (check --kv-events-config)"; exit 1; }
   ```
 
-- **KV offloaded to Redis.** After driving traffic that spans an HBM eviction, the L2
-  keyspace is non-empty — a quick check via the MP worker container:
+- **KV offloaded to Redis.** LMCache MP mode is **write-through**: a stored prefix
+  lands in the L2 immediately, not only on HBM eviction (GPU-validated — a 3760-token
+  prompt took Redis `DBSIZE` 0→14, i.e. 14 chunks of the 256-token `chunk_size`). So
+  after driving the prompts above, assert the L2 keyspace is non-empty:
 
   ```bash
-  # The MP worker offloads to redis-l2 over `resp`. A non-zero dbsize after eviction
-  # is the standalone signal that offload is actually happening.
-  kubectl -n cache-substrate exec deploy/redis-l2 -c redis-l2 -- redis-cli dbsize
+  # The MP worker offloads to redis-l2 over `resp`. dbsize > 0 after requests is the
+  # standalone signal that offload is actually happening.
+  n=$(kubectl -n cache-substrate exec deploy/redis-l2 -c redis-l2 -- redis-cli dbsize | tr -dc '0-9')
+  [ "${n:-0}" -gt 0 ] || { echo "FAIL: Redis L2 empty after requests — offload not happening"; exit 1; }
+  echo "Redis L2 holds $n KV chunks"
   ```
 
-  (Whether an eviction occurs depends on model size vs. HBM; a larger working set or a
-  smaller `--mem-fraction-static` forces it. On a small model with plenty of HBM the
-  L1 may hold everything and Redis stays empty — that is not a failure, just no
-  eviction. Full frame→index→`LookupRoute` verification needs the **managed path**
-  below; the standalone manifest ships no event consumer, so it never populates the
-  index.)
+  (Full frame→index→`LookupRoute` verification needs the **managed path** below; the
+  standalone manifest ships no event consumer, so it never populates the index.)
 
 - **Privacy boundary — the RAW ZMQ frames carry `token_ids`.** Both vLLM's and
   SGLang's `BlockStored` wire includes the block's token ids; the "metadata-only,

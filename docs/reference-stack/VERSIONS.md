@@ -103,8 +103,9 @@ replaces that placeholder.) Concretely:
   build steps above. The **reference manifest** still ships a non-applyable
   placeholder digest under an `example.invalid/sglang-lmcache` name (all-zero
   `@sha256:`) — substitute your derived image's real digest before the GPU run.
-  (Updating that manifest to the validated tuple is part of the reference-stack
-  increment; the controller-rendered managed path does not read it.)
+  (The manifest already renders the MP topology — Redis L2 + MP-worker sidecar; only
+  substituting your operator-built image digest remains. The controller-rendered
+  managed path does not read this manifest.)
 - **RESOLVED — the concrete `(sglang-tag, lmcache-version)` tuple is
   `(lmsysorg/sglang:nightly-dev-cu13-20260711-7de33ce8, lmcache 0.5.1)`**, validated
   end-to-end on an A100: the MP worker registers the engine's KV cache over CUDA-IPC
