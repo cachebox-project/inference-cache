@@ -25,10 +25,12 @@
 # The old lm:// env (LMCACHE_REMOTE_URL / SERDE / CHUNK_SIZE / LOCAL_CPU) is NOT
 # injected — MP mode ignores it. VLLM_USE_V1 and PYTHONHASHSEED are vLLM-only and
 # likewise absent (SGLang has no v1 codepath; its sha256 prefix hashing does not
-# depend on PYTHONHASHSEED). Unrelated user-set env/args survive injection — the
-# adapter merges, upserting only the keys it owns; a colliding value for a reserved
-# key is hard-rejected at admission, not silently overridden. A pod can opt out
-# per-instance with the annotation `inferencecache.io/skip-inject`.
+# depend on PYTHONHASHSEED). Unrelated user-set env/args on the pod template survive
+# injection — the adapter merges, upserting only the keys it owns (a pod-template
+# value colliding with an adapter-owned key is overwritten, not rejected). The
+# hard-reject is a separate surface: a `spec.integration.engineOverrides` entry that
+# overrides or suppresses a RESERVED arg/env is rejected at admission. A pod can opt
+# out per-instance with the annotation `inferencecache.io/skip-inject`.
 #
 # The auto-attached kvevent-subscriber sidecar tags every report
 # `--hash-scheme=sglang`, keeping SGLang prefixes in an index domain disjoint from
