@@ -208,8 +208,14 @@ func (r *StatsReporter) send(ctx context.Context, csu *icpb.CacheStateUpdate) er
 	// carries the real status, so always call it and treat its result as
 	// authoritative for whether the sample landed.
 	sendErr := stream.Send(csu)
-	if _, closeErr := stream.CloseAndRecv(); closeErr != nil {
+	ack, closeErr := stream.CloseAndRecv()
+	if closeErr != nil {
 		return fmt.Errorf("deliver stats: %w", closeErr)
+	}
+	// A clean close with accepted=false is an explicit rejection by IC — the
+	// stream succeeded but the sample was NOT indexed, so it did not land.
+	if ack != nil && !ack.GetAccepted() {
+		return fmt.Errorf("deliver stats: IC rejected the update (accepted=false)")
 	}
 	if sendErr != nil && !errors.Is(sendErr, io.EOF) && !errors.Is(sendErr, context.Canceled) {
 		return fmt.Errorf("send stats: %w", sendErr)

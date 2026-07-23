@@ -342,6 +342,61 @@ func TestStatsReporterNilStatsCountsAsStale(t *testing.T) {
 	}
 }
 
+// rejectingReportServer accepts the ReportCacheState stream cleanly but replies
+// Ack{accepted:false} — IC received the RPC yet did NOT index the update.
+type rejectingReportServer struct {
+	icpb.UnimplementedInferenceCacheServer
+}
+
+func (rejectingReportServer) ReportCacheState(stream icpb.InferenceCache_ReportCacheStateServer) error {
+	for {
+		if _, err := stream.Recv(); err != nil { // EOF on client half-close
+			return stream.SendAndClose(&icpb.Ack{Accepted: false})
+		}
+	}
+}
+
+// TestStatsReporterRejectedAckCountsAsStale proves a clean CloseAndRecv carrying
+// accepted=false is a non-delivery: the RPC succeeded but IC rejected the sample,
+// so the reporter must escalate and never claim recovery.
+func TestStatsReporterRejectedAckCountsAsStale(t *testing.T) {
+	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) {
+		return &icpb.ReplicaStats{CacheMemoryBytes: 1}, nil // scrape + send both "work"
+	})
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	icpb.RegisterInferenceCacheServer(srv, rejectingReportServer{})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	r := NewStatsReporter(icpb.NewInferenceCacheClient(conn), scraper, testConfig(),
+		WithStatsLogger(logger), WithStatsRPCTimeout(time.Second))
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // rejected 3x → stale transition on the 3rd
+		r.tick(ctx)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
+		t.Fatalf("Ack{accepted:false} must count as non-delivery: want 1 ERROR, got %d\n%s", got, out)
+	}
+	if strings.Contains(out, "recovered") {
+		t.Fatalf("must not claim recovery — IC rejected every update:\n%s", out)
+	}
+}
+
 func TestStatsReporterStopsOnContextCancel(t *testing.T) {
 	scraper := &stubScraper{stats: &icpb.ReplicaStats{}}
 	_, r, stop := startRecordingReporter(t, scraper, time.Hour) // ticker won't fire
