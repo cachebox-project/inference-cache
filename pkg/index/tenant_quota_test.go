@@ -199,3 +199,77 @@ func TestTenantQuotaZeroBudgetEvictsAll(t *testing.T) {
 		t.Fatalf("tenant entries = %d, want 0 (zero budget)", got)
 	}
 }
+
+// The quota-eviction victim is chosen by (age, then the full remaining prefix
+// key). When two of a tenant's prefixes share an age, the tie MUST break on
+// every remaining key field — model, hashScheme, adapter, prefixHash — or the
+// victim would depend on Go's randomized map iteration order. This pins that
+// each field participates: two same-age keys differing in exactly ONE field are
+// ingested with a budget of 1, so precisely the analytically-smaller key is
+// evicted, and the scenario is repeated enough times that an incomplete
+// comparator (which would treat the pair as equal and pick a map-order victim)
+// would flake here rather than in production.
+func TestTenantQuotaTieBreakIsDeterministicAcrossFullKey(t *testing.T) {
+	// key varies one field of the prefix identity; lo sorts before hi, so lo is
+	// the deterministic eviction victim and hi must survive.
+	type keyid struct{ model, scheme, adapter, prefix string }
+	cases := map[string]struct{ lo, hi keyid }{
+		"model": {
+			lo: keyid{"m1", "vllm", "", "p"},
+			hi: keyid{"m2", "vllm", "", "p"},
+		},
+		"hashScheme": {
+			lo: keyid{"m", "vllm-a", "", "p"},
+			hi: keyid{"m", "vllm-b", "", "p"},
+		},
+		"adapter": {
+			lo: keyid{"m", "vllm", "lora-a", "p"},
+			hi: keyid{"m", "vllm", "lora-b", "p"},
+		},
+		"prefixHash": {
+			lo: keyid{"m", "vllm", "lora", "p1"},
+			hi: keyid{"m", "vllm", "lora", "p2"},
+		},
+	}
+
+	ingest := func(idx *Index, k keyid, ts time.Time) {
+		idx.Ingest(Update{
+			ReplicaID:  "r1",
+			Model:      k.model,
+			Tenant:     "team",
+			HashScheme: k.scheme,
+			Adapter:    k.adapter,
+			Timestamp:  ts,
+			Prefixes:   []PrefixRef{{PrefixHash: hash(k.prefix), TokenCount: 1}},
+		})
+	}
+	held := func(idx *Index, k keyid) bool {
+		return len(idx.Lookup(LookupRequest{
+			Model: k.model, Tenant: "team", HashScheme: k.scheme,
+			Adapter: k.adapter, PrefixHash: hash(k.prefix),
+		})) > 0
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Many independent index instances → many independent map seeds, so a
+			// tie-break that ignored this field would evict hi on some runs.
+			for iter := 0; iter < 64; iter++ {
+				base := time.Unix(20_000_000, 0)
+				clk := &fakeClock{t: base.Add(time.Minute)} // both entries fresh, equal age
+				idx := New(withClock(clk.now), WithTenantQuotaResolver(fakeQuota{"team": 1}))
+
+				// Same timestamp for both → identical age → the tie-break decides.
+				ingest(idx, tc.hi, base) // ingest hi first so insertion order can't be what saves it
+				ingest(idx, tc.lo, base) // second ingest pushes over budget 1 → exactly one eviction
+
+				if held(idx, tc.lo) {
+					t.Fatalf("iter %d: lo key %+v survived — it is the smaller of the tie and must be the victim", iter, tc.lo)
+				}
+				if !held(idx, tc.hi) {
+					t.Fatalf("iter %d: hi key %+v was evicted — victim selection is not deterministic on the %s field (map-iteration-order dependent)", iter, tc.hi, name)
+				}
+			}
+		})
+	}
+}

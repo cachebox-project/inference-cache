@@ -2547,17 +2547,26 @@ func (i *Index) evictOldestForTenantLocked(tenant string, maxPrefixes int64) int
 		all = append(all, ref{key, newest})
 	}
 	sort.Slice(all, func(a, b int) bool {
+		x, y := all[a].key, all[b].key
 		if !all[a].age.Equal(all[b].age) {
 			return all[a].age.Before(all[b].age)
 		}
-		if all[a].key.prefixHash != all[b].key.prefixHash {
-			return all[a].key.prefixHash < all[b].key.prefixHash
+		// Break age ties on the FULL remaining key so victim selection never
+		// depends on map iteration order. tenant is constant here (this helper
+		// only scans one tenant's prefixes), but model, hashScheme, and adapter
+		// are all free to differ within it — and two keys can even share a
+		// prefixHash across adapters (the fingerprint is token-only). Compare
+		// every field that completes the key, mirroring the cap-sweep comparator.
+		if x.model != y.model {
+			return x.model < y.model
 		}
-		// Same tenant + same prefix hash under two different adapters is a
-		// genuine pair of distinct keys — the fingerprint is token-only — so the
-		// adapter has to break the tie or the victim order would depend on map
-		// iteration order.
-		return all[a].key.adapter < all[b].key.adapter
+		if x.hashScheme != y.hashScheme {
+			return x.hashScheme < y.hashScheme
+		}
+		if x.adapter != y.adapter {
+			return x.adapter < y.adapter
+		}
+		return x.prefixHash < y.prefixHash
 	})
 	removed := 0
 	for _, r := range all {

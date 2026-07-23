@@ -45,7 +45,9 @@ service InferenceCache {
 - **RenderTemplateResponse** `{ bytes rendered_prompt; bytes stable_prefix_hash; bytes tenant_namespace; string reason_code; string template_revision; }`
   reason ∈ `OK | TEMPLATE_NOT_FOUND | RENDER_ERROR`
 - **LookupRouteRequest** `{ string model_id = 1; string tenant_id = 2; bytes prefix_hash = 3; int32 prefix_token_count = 4; string hash_scheme = 5; SLO slo = 6; repeated bytes block_hashes = 7; repeated int32 block_token_counts = 8; repeated uint32 token_ids = 9; string prompt_text = 10; string adapter_id = 11; }`
+  `adapter_id` selects the **index partition** to look up in (see "Update — adapter (LoRA) index partition" below). Empty is the default partition and matches the pre-adapter behavior **only for base-model / non-LoRA traffic**; because the fingerprint is token-only, *any* LoRA adapter (even one) must set the same `adapter_id` the producer ingested under — never `""` — or the lookup silently misses.
 - **LookupRouteResponse** `{ repeated ReplicaScore replica_scores; string reason_code; int64 lookup_latency_us; repeated uint32 token_ids = 4; string adapter_id = 5; }`
+  `adapter_id` echoes the partition the index was consulted in (the request's `adapter_id`); empty on the fail-open envelopes returned before the index is consulted (`TIMEOUT`, tokenizer fail-open, `POLICY_REQUIRES_CHAIN`).
   reason ∈ `PREFIX_MATCH | TENANT_HOT | AFFINITY_HINT | NO_HINT | POLICY_REQUIRES_CHAIN | TIMEOUT | UNKNOWN_TENANT | UNKNOWN_MODEL | UNKNOWN_HASH_SCHEME`
 - **LookupPDRouteRequest** `{ string model_id; string tenant_id; bytes prefix_hash; int32 prefix_token_count; string pd_topology_ref; }`
 - **LookupPDRouteResponse** `{ string prefill_replica_id; string decode_replica_id; string transport_hint; string reason_code; }`
