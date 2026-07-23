@@ -33,9 +33,10 @@ type StatsReporter struct {
 	logger     *slog.Logger
 
 	// staleThreshold consecutive scrape failures flips the reporter to "stale":
-	// it logs once at Error on that transition (IC is now ranking this replica
-	// without its live load signal) and once at Info on recovery. Guards against
-	// both per-tick log spam and silent load-signal loss.
+	// it logs once at Error on that transition (IC keeps ranking this replica on
+	// its last load sample until that sample ages out at the index TTL, and only
+	// then falls back to residency-only) and once at Info on recovery. Guards
+	// against both per-tick log spam and a silently unrefreshed load signal.
 	staleThreshold int
 	consecFails    int
 }
@@ -112,9 +113,10 @@ func (r *StatsReporter) tick(ctx context.Context) {
 		r.consecFails++
 		switch {
 		case r.consecFails == r.staleThreshold:
-			// healthy -> stale transition: surface once, loudly. IC now ranks
-			// this replica without its live load signal (residency only).
-			r.logger.Error("engine load stats unavailable; IC routing without load signal for this replica",
+			// healthy -> stale transition: surface once, loudly. IC keeps ranking
+			// this replica on its last load sample until that sample ages out at
+			// the index TTL; only then does it fall back to residency-only.
+			r.logger.Error("engine load stats stale; IC ranking this replica on its last sample until it ages out (index TTL), then residency-only",
 				"consecutive_failures", r.consecFails, "err", err)
 		case r.consecFails > r.staleThreshold:
 			// already surfaced; keep the per-tick detail out of the way.

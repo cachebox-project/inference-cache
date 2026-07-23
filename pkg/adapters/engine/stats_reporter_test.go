@@ -142,15 +142,17 @@ func (f scrapeFunc) Scrape(context.Context) (*icpb.ReplicaStats, error) { return
 
 // TestStatsReporterStaleEscalation verifies the fail-silent -> loud transition:
 // after staleThreshold consecutive scrape failures the reporter logs exactly one
-// Error (IC now ranks this replica without its load signal), stays quiet while it
-// persists, and logs one Info on recovery — instead of a per-tick Warn that buries
-// the loss of load-aware routing.
+// Error (IC now ranks this replica on its stale last sample), then stays quiet at
+// Debug while the outage PERSISTS beyond the threshold, and logs one Info on
+// recovery — instead of a per-tick Warn/Error that buries the loss of load-aware
+// routing. The outage runs two ticks past the threshold so the consecFails >
+// staleThreshold suppression path is actually exercised.
 func TestStatsReporterStaleEscalation(t *testing.T) {
 	fail := errors.New("dial tcp: connection refused")
 	var n int
 	scraper := scrapeFunc(func() (*icpb.ReplicaStats, error) {
 		n++
-		if n <= 3 { // 3 failures (default threshold), then recover
+		if n <= 5 { // 5 failures (2 past the default threshold of 3), then recover
 			return nil, fail
 		}
 		return &icpb.ReplicaStats{}, nil
@@ -177,7 +179,8 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 		WithStatsLogger(logger), WithStatsRPCTimeout(time.Second))
 
 	ctx := context.Background()
-	for i := 0; i < 4; i++ { // fail, fail, fail(->Error), success(->Info)
+	// fail, fail, fail(->Error), fail(->Debug), fail(->Debug), success(->Info)
+	for i := 0; i < 6; i++ {
 		r.tick(ctx)
 	}
 
@@ -185,15 +188,36 @@ func TestStatsReporterStaleEscalation(t *testing.T) {
 	if got := strings.Count(out, `"level":"ERROR"`); got != 1 {
 		t.Fatalf("want exactly 1 ERROR on stale transition, got %d\n%s", got, out)
 	}
-	if !strings.Contains(out, "routing without load signal") {
+	if !strings.Contains(out, "engine load stats stale") {
 		t.Fatalf("stale ERROR missing distinct message:\n%s", out)
-	}
-	if got := strings.Count(out, "engine load stats recovered"); got != 1 {
-		t.Fatalf("want exactly 1 recovery INFO, got %d\n%s", got, out)
 	}
 	if got := strings.Count(out, `"level":"WARN"`); got != 2 {
 		t.Fatalf("want 2 WARN before threshold (not Error spam), got %d\n%s", got, out)
 	}
+	// The two ticks PAST the threshold must be suppressed to Debug, not repeat
+	// the Error or fall back to Warn — this is the persistent-outage path.
+	if got := strings.Count(out, `"level":"DEBUG"`); got != 2 {
+		t.Fatalf("want 2 DEBUG while the outage persists past threshold, got %d\n%s", got, out)
+	}
+	// Recovery must be exactly one record, emitted at INFO (behavior contract).
+	if got := strings.Count(out, "engine load stats recovered"); got != 1 {
+		t.Fatalf("want exactly 1 recovery record, got %d\n%s", got, out)
+	}
+	if !recoveryAtInfo(out) {
+		t.Fatalf("recovery record must be emitted at INFO level\n%s", out)
+	}
+}
+
+// recoveryAtInfo confirms the "engine load stats recovered" record is the one
+// carrying "level":"INFO" — asserting the level of the specific line, not just
+// that some INFO exists somewhere in the buffer.
+func recoveryAtInfo(logOutput string) bool {
+	for _, line := range strings.Split(strings.TrimSpace(logOutput), "\n") {
+		if strings.Contains(line, "engine load stats recovered") {
+			return strings.Contains(line, `"level":"INFO"`)
+		}
+	}
+	return false
 }
 
 func TestStatsReporterStopsOnContextCancel(t *testing.T) {
