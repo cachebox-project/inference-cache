@@ -6,10 +6,13 @@
 // Two independent paths share the gRPC client:
 //   - Event path: ZMQ → decoded EventBatch → ReportCacheState (prefix adds) +
 //     PublishEvent (removals/clears). Debounced on a short window.
-//   - Stats path: HTTP GET against the engine's Prometheus /metrics → derived
-//     ReplicaStats → ReportCacheState (stats-only CSU). Ticks on its own
-//     cadence (~10s), so the snapshot/CR status surface (cache_memory_bytes,
-//     hit_rate, pressure) lights up regardless of event rate.
+//   - Stats path: engine load → derived ReplicaStats → ReportCacheState
+//     (stats-only CSU). The load source is selectable: HTTP GET against the
+//     engine's Prometheus /metrics (default), or the VllmEngine GetLoads gRPC
+//     RPC when --engine-loads-grpc is set (SMG gRPC engines expose no HTTP
+//     /metrics). Ticks on its own cadence (~10s), so the snapshot/CR status
+//     surface (cache_memory_bytes, hit_rate, pressure) lights up regardless of
+//     event rate.
 //
 // The two paths are independent failure domains — a scrape failure never
 // blocks the event stream, and an event-stream drop never delays a stats tick.
@@ -19,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,6 +37,50 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
+// engineScraper is the load-source contract both scrapers satisfy — a local
+// mirror of the engine package's unexported statsScraper. NewStatsReporter
+// accepts either concrete type through it.
+type engineScraper interface {
+	Scrape(context.Context) (*icpb.ReplicaStats, error)
+}
+
+// scraperParams carries the load-source selection inputs for buildStatsScraper.
+type scraperParams struct {
+	loadsGRPC      string
+	metricsURL     string
+	engineModel    string
+	tier           engine.CacheTier
+	cacheSizeBytes int64
+	ceiling        int
+}
+
+// buildStatsScraper selects the engine load source: the GetLoads gRPC scraper
+// when loadsGRPC is non-empty (preferred for SMG gRPC engines, which expose no
+// HTTP /metrics), else the HTTP /metrics scraper. It returns the scraper, an
+// optional closer (the gRPC scraper owns a client conn — the HTTP one owns
+// nothing, so closer is nil), and an error only from gRPC dial setup.
+func buildStatsScraper(p scraperParams, httpClient *http.Client, logger *slog.Logger) (engineScraper, io.Closer, error) {
+	if p.loadsGRPC != "" {
+		gs, err := engine.NewGRPCLoadsScraper(engine.GRPCLoadsScraperConfig{
+			Addr:                  p.loadsGRPC,
+			CacheSizeBytes:        p.cacheSizeBytes,
+			MaxConcurrencyCeiling: p.ceiling,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return gs, gs, nil
+	}
+	ms := engine.NewMetricsScraper(httpClient, engine.ScraperConfig{
+		URL:                   p.metricsURL,
+		Tier:                  p.tier,
+		ModelLabel:            p.engineModel,
+		CacheSizeBytes:        p.cacheSizeBytes,
+		MaxConcurrencyCeiling: p.ceiling,
+	}, logger)
+	return ms, nil, nil
+}
+
 func main() {
 	var (
 		endpoint           = flag.String("engine-endpoint", "tcp://127.0.0.1:5557", "engine KV-event ZMQ PUB endpoint")
@@ -44,6 +92,7 @@ func main() {
 		scheme             = flag.String("hash-scheme", "vllm", "engine prefix-hash scheme (required, non-empty)")
 		window             = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
 		metricsURL         = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
+		loadsGRPC          = flag.String("engine-loads-grpc", "", "engine VllmEngine gRPC address (host:port) to read load via the GetLoads RPC instead of scraping --engine-metrics-url. Preferred for SMG gRPC engines, which expose no HTTP /metrics. Empty = use the HTTP scrape.")
 		statsInterval      = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
 		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
 		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
@@ -99,17 +148,35 @@ func main() {
 		engine.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
 	sub := engine.NewSubscriber(*endpoint, *topic, engine.WithSubscriberLogger(logger))
 
-	scraper := engine.NewMetricsScraper(
-		&http.Client{Timeout: 5 * time.Second},
-		engine.ScraperConfig{
-			URL:                   *metricsURL,
-			Tier:                  tier,
-			ModelLabel:            *engineModel,
-			CacheSizeBytes:        *cacheSizeBytes,
-			MaxConcurrencyCeiling: *ceiling,
-		},
-		logger,
-	)
+	// Load source: gRPC GetLoads (preferred for SMG gRPC engines, which expose no
+	// HTTP /metrics) when --engine-loads-grpc is set, else the HTTP /metrics scrape.
+	// Both satisfy the same statsScraper, so the StatsReporter is identical.
+	scraper, scraperCloser, serr := buildStatsScraper(scraperParams{
+		loadsGRPC:      *loadsGRPC,
+		metricsURL:     *metricsURL,
+		engineModel:    *engineModel,
+		tier:           tier,
+		cacheSizeBytes: *cacheSizeBytes,
+		ceiling:        *ceiling,
+	}, &http.Client{Timeout: 5 * time.Second}, logger)
+	if serr != nil {
+		logger.Error("build stats scraper", "err", serr)
+		os.Exit(1)
+	}
+	if scraperCloser != nil {
+		defer func() {
+			if err := scraperCloser.Close(); err != nil {
+				logger.Warn("closing load-scraper connection", "err", err)
+			}
+		}()
+	}
+
+	loadSource, loadTarget := "HTTP /metrics scrape", *metricsURL
+	if *loadsGRPC != "" {
+		loadSource, loadTarget = "GetLoads gRPC", *loadsGRPC
+	}
+	logger.Info("engine load source", "source", loadSource, "target", loadTarget)
+
 	statsReporter := engine.NewStatsReporter(client, scraper, cfg,
 		engine.WithStatsInterval(*statsInterval),
 		engine.WithStatsLogger(logger),
@@ -143,7 +210,8 @@ func main() {
 		"server", *server,
 		"replica_id", *replica,
 		"model_id", *model,
-		"engine_metrics_url", *metricsURL,
+		"load_source", loadSource,
+		"load_target", loadTarget,
 		"stats_interval", statsInterval.String(),
 		"cache_tier", *cacheTier,
 		"engine_model_name", *engineModel,

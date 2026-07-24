@@ -106,8 +106,8 @@ jobs:
     - name: Verify protobufs up to date
       run: |
         make proto-gen
-        if [ -n "$(git status --porcelain -- pkg/server/proto)" ]; then
-          git status --short -- pkg/server/proto
+        if [ -n "$(git status --porcelain -- pkg/server/proto pkg/adapters/engine/vllmengine)" ]; then
+          git status --short -- pkg/server/proto pkg/adapters/engine/vllmengine
           exit 1
         fi
 

@@ -17,14 +17,15 @@ type statsScraper interface {
 	Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 }
 
-// StatsReporter periodically scrapes engine /metrics and emits a stats-only
-// CacheStateUpdate via ReportCacheState. It runs alongside the event Reporter
+// StatsReporter periodically pulls engine load from a statsScraper and emits a
+// stats-only CacheStateUpdate via ReportCacheState. The scraper is the load source
+// — MetricsScraper (HTTP /metrics) or GRPCLoadsScraper (the GetLoads gRPC RPC) — so
+// the reporter itself is source-neutral. It runs alongside the event Reporter
 // (different cadence, different data source) and shares the same gRPC client.
 //
-// Failure independence is load-bearing: a scrape failure (engine /metrics down,
-// HTTP timeout, parse error) logs and skips the tick — it never blocks the
-// event path or kills the subscriber. The two paths are independent failure
-// domains.
+// Failure independence is load-bearing: a scrape failure (engine load unavailable,
+// timeout, parse error) logs and skips the tick — it never blocks the event path or
+// kills the subscriber. The two paths are independent failure domains.
 type StatsReporter struct {
 	client     icpb.InferenceCacheClient
 	scraper    statsScraper

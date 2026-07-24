@@ -220,8 +220,18 @@ manifests: controller-gen ## Generate CRD, RBAC, and webhook manifests.
 	$(CONTROLLER_GEN) rbac:roleName=inference-cache-manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac output:webhook:artifacts:config=config/webhook
 
 .PHONY: proto-gen
-proto-gen: protoc-gen-go ## Generate protobuf Go code.
+proto-gen: protoc-gen-go proto-gen-vendored ## Generate protobuf Go code (IC contract + vendored external stubs).
 	PATH="$(LOCALBIN):$$PATH" protoc -I proto --go_out=. --go_opt=module=$(MODULE) --go-grpc_out=. --go-grpc_opt=module=$(MODULE) $$(find proto -name '*.proto' | sort)
+
+# The vendored external engine contract (GetLoads only) lives OUTSIDE proto/ on
+# purpose — it is not part of IC's own gRPC API and is exempt from buf lint — so
+# `proto-gen` above (which only scans proto/) does not cover it. This target
+# regenerates its stubs from the same pinned generators; it is a prerequisite of
+# proto-gen so a plain `make proto-gen` keeps both in sync, and CI diffs the
+# output the same way. See pkg/adapters/engine/vllmengine/vllm_engine.proto.
+.PHONY: proto-gen-vendored
+proto-gen-vendored: protoc-gen-go ## Regenerate the vendored external vLLM engine stubs (pkg/adapters/engine/vllmengine).
+	PATH="$(LOCALBIN):$$PATH" protoc -I pkg/adapters/engine/vllmengine --go_out=. --go_opt=module=$(MODULE) --go-grpc_out=. --go-grpc_opt=module=$(MODULE) pkg/adapters/engine/vllmengine/vllm_engine.proto
 
 .PHONY: proto-lint
 proto-lint: buf ## Lint the gRPC contract with buf (lint-only; codegen stays on protoc).
@@ -276,7 +286,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 COVER_MIN ?= 90
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
+COVER_EXCLUDE := pkg/server/proto/|pkg/adapters/engine/vllmengine/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages, cross-package counted).
@@ -541,7 +551,7 @@ ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
-	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
+	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto pkg/adapters/engine/vllmengine'; \
 	if ! git diff --quiet -- $$gen; then \
 		echo "✗ generated-code drift — regenerate and commit these files:"; \
 		git --no-pager diff --name-only -- $$gen; \
