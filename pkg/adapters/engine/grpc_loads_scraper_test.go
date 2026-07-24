@@ -135,8 +135,8 @@ func TestGRPCLoadsScraperCacheBytesNoOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if got := st.GetCacheMemoryBytes(); got < 0 || got > math.MaxInt64 {
-		t.Fatalf("cache_memory_bytes = %d, want within [0, MaxInt64] (no overflow)", got)
+	if got := st.GetCacheMemoryBytes(); got < 0 {
+		t.Fatalf("cache_memory_bytes = %d, want non-negative (overflow would wrap to negative)", got)
 	}
 	if got := st.GetCacheMemoryBytes(); got != math.MaxInt64 {
 		t.Errorf("cache_memory_bytes = %d, want MaxInt64 at usage=1.0 full capacity", got)
