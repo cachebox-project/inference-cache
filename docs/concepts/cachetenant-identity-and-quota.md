@@ -20,8 +20,11 @@ These are the only spec fields — do not expect others.
 | `isolationMode` | enum (`Fairness`) | `Fairness` | Only value implemented today. |
 | `crypto` | object | empty | Reserved for future cryptographic isolation; carries no fields today. |
 
-The quota unit is the **distinct key** `(tenant, model, hash_scheme, prefix_hash)`.
+The quota unit is the **distinct key** `(tenant, model, hash_scheme, adapter, prefix_hash)`.
 A prefix held warm on several replicas counts **once**, not once per replica.
+Because `adapter` is part of the key (`""` for base-model / non-LoRA traffic),
+the *same* prompt content served under N LoRA adapters counts as N distinct keys
+— serving many adapters multiplies quota consumption accordingly.
 
 ## Status and printer columns
 
@@ -43,7 +46,7 @@ Columns: **Tenant** (`spec.tenantID`), **Entries** (`status.indexEntries`),
 
 ## Identity isolation is structural
 
-The index keys every entry by `(tenant, model, hash_scheme, prefix_hash)`, so
+The index keys every entry by `(tenant, model, hash_scheme, adapter, prefix_hash)`, so
 tenant A's hint records can never collide with tenant B's, and `LookupRoute` is
 tenant-scoped: a lookup carrying `tenant_id = A` only ever sees A's prefixes.
 This isolation is a property of **our** data structure, not of the engine — it
