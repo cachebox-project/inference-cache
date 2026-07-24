@@ -188,7 +188,7 @@ func TestAdapterPartitionEvictionIsScopedToItsAdapter(t *testing.T) {
 	idx.ApplyEvent(Event{
 		Type: EventPrefixEvicted, ReplicaID: "replica-0",
 		Model: adapterModel, Tenant: adapterTenant,
-		PrefixHash: hash("same-tokens"), Adapter: "sql-lora",
+		PrefixHash: hash("same-tokens"), Adapter: "sql-lora", AdapterScoped: true,
 	})
 
 	if got := lookupUnder(idx, "sql-lora", "same-tokens"); len(got) != 0 {
@@ -196,6 +196,51 @@ func TestAdapterPartitionEvictionIsScopedToItsAdapter(t *testing.T) {
 	}
 	if got := lookupUnder(idx, "chat-lora", "same-tokens"); len(got) != 1 {
 		t.Errorf("chat-lora entry = %+v, want it untouched by the sql-lora eviction", got)
+	}
+}
+
+// A base-model eviction (Adapter "" WITH AdapterScoped) drops ONLY the base
+// partition and must not sweep a live LoRA hint for the same token hash — the
+// over-sweep that the adapter_scoped flag exists to fix.
+func TestAdapterPartitionBaseEvictionScopedSparesLoRA(t *testing.T) {
+	idx := New()
+	ingestUnder(idx, "replica-0", "", "same-tokens")
+	ingestUnder(idx, "replica-0", "sql-lora", "same-tokens")
+
+	idx.ApplyEvent(Event{
+		Type: EventPrefixEvicted, ReplicaID: "replica-0",
+		Model: adapterModel, Tenant: adapterTenant,
+		PrefixHash: hash("same-tokens"), Adapter: "", AdapterScoped: true,
+	})
+
+	if got := lookupUnder(idx, "", "same-tokens"); len(got) != 0 {
+		t.Errorf("base entry survived its own eviction: %+v", got)
+	}
+	if got := lookupUnder(idx, "sql-lora", "same-tokens"); len(got) != 1 {
+		t.Errorf("sql-lora entry = %+v, want it untouched by the base-model eviction", got)
+	}
+}
+
+// Upgrade compatibility: a pre-adapter_scoped producer (new server, not-yet-
+// upgraded subscriber) sends a non-empty adapter_id but leaves adapter_scoped
+// false. Its LoRA eviction must still narrow to that adapter, not regress into a
+// cross-partition sweep that wipes another adapter's live hint.
+func TestAdapterPartitionEvictionNonEmptyAdapterScopesWithoutFlag(t *testing.T) {
+	idx := New()
+	ingestUnder(idx, "replica-0", "sql-lora", "same-tokens")
+	ingestUnder(idx, "replica-0", "chat-lora", "same-tokens")
+
+	idx.ApplyEvent(Event{
+		Type: EventPrefixEvicted, ReplicaID: "replica-0",
+		Model: adapterModel, Tenant: adapterTenant,
+		PrefixHash: hash("same-tokens"), Adapter: "sql-lora", // AdapterScoped left false (pre-upgrade producer)
+	})
+
+	if got := lookupUnder(idx, "sql-lora", "same-tokens"); len(got) != 0 {
+		t.Errorf("sql-lora entry survived its own eviction: %+v", got)
+	}
+	if got := lookupUnder(idx, "chat-lora", "same-tokens"); len(got) != 1 {
+		t.Errorf("chat-lora entry = %+v, want it untouched — a non-empty adapter_id must narrow even without adapter_scoped", got)
 	}
 }
 

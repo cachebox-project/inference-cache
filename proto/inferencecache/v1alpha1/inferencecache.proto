@@ -297,15 +297,25 @@ message CacheEvent {
   string tenant_id = 4;
   bytes prefix_hash = 5;
   int64 timestamp_us = 6;
-  // Adapter partition a PREFIX_EVICTED removal targets. Set, the server drops
-  // the prefix only from that partition; empty, it drops the prefix across
-  // EVERY adapter partition — the conservative legacy behavior (removal is
-  // soft state: an over-eager drop costs a cache miss, never a wrong answer),
-  // and identical to today for producers that never populate the field.
-  // Ignored by ALL_CLEARED (a cache flush clears the replica across every
-  // adapter) and by REPLICA_UPDATED (liveness is adapter-independent).
-  // Additive, v1alpha1-compatible.
+  // Adapter partition a PREFIX_EVICTED removal targets. Honored when
+  // adapter_scoped is set, OR when non-empty (a pre-adapter_scoped producer that
+  // named a LoRA adapter). "" is the base-model / non-LoRA partition. Ignored by
+  // ALL_CLEARED (a cache flush clears the replica across every adapter) and by
+  // REPLICA_UPDATED (liveness is adapter-independent). Additive,
+  // v1alpha1-compatible.
   string adapter_id = 7;
+  // adapter_scoped marks adapter_id as authoritative for a PREFIX_EVICTED so that
+  // adapter_id="" targets the base-model partition instead of sweeping every
+  // partition — the signal that lets a base-model eviction avoid discarding live
+  // LoRA hints for the same token-derived hash. An adapter-aware producer always
+  // sets it. The server ALSO narrows on a non-empty adapter_id when this is false,
+  // so a pre-adapter_scoped producer's LoRA eviction keeps narrowing on a
+  // mixed-version fleet; only an empty adapter_id with adapter_scoped=false takes
+  // the conservative cross-partition sweep. Removal is soft state: an over-eager
+  // drop costs a cache miss, never a wrong answer. A new bool rather than making
+  // adapter_id `optional`, which the wire-compat gate rejects as a cardinality
+  // change. Additive; ignored outside PREFIX_EVICTED.
+  bool adapter_scoped = 8;
 }
 
 message StreamEventsRequest {

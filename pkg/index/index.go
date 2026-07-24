@@ -243,14 +243,18 @@ type Event struct {
 	Model      string
 	Tenant     string
 	PrefixHash []byte
-	// Adapter narrows a PREFIX_EVICTED removal to one adapter partition. Empty
-	// removes the prefix from EVERY adapter partition — the conservative legacy
-	// behavior, and identical to the pre-adapter code for producers that never
-	// set it (all of whose entries live in the "" partition anyway). Ignored by
-	// ALL_CLEARED (a flush clears the replica across adapters) and by
+	// Adapter narrows a PREFIX_EVICTED removal to one adapter partition. The removal
+	// scopes to Adapter when AdapterScoped is set (the authoritative signal — so
+	// Adapter="" targets the base partition, not a sweep) OR when Adapter is
+	// non-empty (a pre-adapter_scoped producer naming a LoRA adapter; honored so a
+	// mixed-version fleet doesn't regress its narrowing into a sweep). It sweeps
+	// EVERY adapter partition only when Adapter is empty AND AdapterScoped is unset
+	// — the conservative legacy behavior for a no-adapter producer. Both are ignored
+	// by ALL_CLEARED (a flush clears the replica across adapters) and by
 	// REPLICA_UPDATED (liveness is adapter-independent).
-	Adapter   string
-	Timestamp time.Time
+	Adapter       string
+	AdapterScoped bool
+	Timestamp     time.Time
 }
 
 // LookupRequest asks which replicas hold a given prefix, within a hash scheme.
@@ -898,22 +902,23 @@ func (i *Index) ApplyEvent(ev Event) {
 		// adapters at once on the same replica; dropping every partition for one
 		// adapter's GPU eviction would throw away hints that are still valid.
 		//
-		// An empty ev.Adapter falls back to the original cross-partition sweep.
-		// That is exact for a pre-adapter producer (all its entries are in the ""
-		// partition anyway), but an adapter-aware producer ALSO emits "" for a
-		// genuine base-model eviction — and the sweep then drops live LoRA-
-		// partition hints for the same prefix hash too. That is conservative soft
-		// state (at worst a cache miss, re-added by the authoritative
-		// ReportCacheState path) and a strict non-regression (pre-partition, base
-		// and LoRA shared one partition, so a base eviction was already total).
-		// Making "" mean the base partition only, without breaking the legacy
-		// wildcard, needs explicit adapter_id presence on the event — a tracked
-		// follow-up.
+		// The removal narrows to ev.Adapter unless it genuinely cannot tell which
+		// partition to target. It narrows when EITHER:
+		//   - the producer set adapter_scoped — the new authoritative signal, so
+		//     adapter_id="" means the base partition, not a sweep; OR
+		//   - adapter_id is non-empty — a pre-adapter_scoped producer that named a
+		//     LoRA adapter. Honoring that keeps its narrowing on a mixed-version
+		//     fleet (new server + not-yet-upgraded subscriber) rather than
+		//     regressing a "sql-lora" eviction into a cross-partition sweep.
+		// It sweeps EVERY partition only when adapter_id is empty AND adapter_scoped
+		// is unset — a legacy no-adapter producer, whose entries all live in the ""
+		// partition anyway, so the sweep is exact for it.
+		scoped := ev.AdapterScoped || ev.Adapter != ""
 		for key, replicas := range i.prefixes {
 			if key.tenant != ev.Tenant || key.model != ev.Model || key.prefixHash != hash {
 				continue
 			}
-			if ev.Adapter != "" && key.adapter != ev.Adapter {
+			if scoped && key.adapter != ev.Adapter {
 				continue
 			}
 			i.removeReplicaLocked(key, replicas, ev.ReplicaID)
