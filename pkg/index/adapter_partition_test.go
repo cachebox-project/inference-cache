@@ -202,7 +202,7 @@ func TestAdapterPartitionEvictionIsScopedToItsAdapter(t *testing.T) {
 // A base-model eviction (Adapter "" WITH presence) drops ONLY the base partition
 // and must not sweep a live LoRA hint for the same token hash — the over-sweep
 // that adapter_id presence exists to fix.
-func TestAdapterPartitionBaseEvictionWithPresenceSpareLoRA(t *testing.T) {
+func TestAdapterPartitionBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
 	idx := New()
 	ingestUnder(idx, "replica-0", "", "same-tokens")
 	ingestUnder(idx, "replica-0", "sql-lora", "same-tokens")

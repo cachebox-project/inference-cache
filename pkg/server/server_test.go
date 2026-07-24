@@ -1455,11 +1455,11 @@ func TestPublishEventAppliesToIndex(t *testing.T) {
 }
 
 // TestPublishEventBaseEvictionWithPresenceSparesLoRA pins the full wire→index
-// seam: a base-model PREFIX_EVICTED carrying adapter_id="" WITH proto3 presence
-// drops ONLY the base ("") partition. The service must translate wire presence
-// (ev.AdapterId != nil) into index.Event.AdapterSet — reading the VALUE the way
-// GetAdapterId does would misclassify a present-but-empty adapter as the legacy
-// wildcard and wrongly sweep the co-resident LoRA hint for the same hash.
+// seam: a base-model PREFIX_EVICTED carrying adapter_id="" with adapter_scoped=true
+// drops ONLY the base ("") partition. The service must translate adapter_scoped
+// into index.Event.AdapterSet — reading the adapter_id VALUE ("") instead would
+// misclassify a base-scoped eviction as the legacy wildcard and wrongly sweep the
+// co-resident LoRA hint for the same hash.
 func TestPublishEventBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
 	svc := newTestService()
 	for _, a := range []string{"", "sql-lora"} {
@@ -1469,11 +1469,10 @@ func TestPublishEventBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
 			Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 10}},
 		})
 	}
-	emptyAdapter := "" // present, empty → base partition only (not the wildcard)
 	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
 		Type: icpb.CacheEvent_PREFIX_EVICTED, ReplicaId: "replica-0",
 		ModelId: "m", TenantId: "t", PrefixHash: []byte("p"),
-		AdapterId: &emptyAdapter,
+		AdapterId: "", AdapterScoped: true, // base partition only, not the wildcard
 	})
 	if err != nil {
 		t.Fatalf("PublishEvent: %v", err)

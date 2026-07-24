@@ -89,19 +89,20 @@ func (c Config) ClearedEvent(tsSeconds float64) *icpb.CacheEvent {
 // EvictedEvent builds one PREFIX_EVICTED CacheEvent for an already-derived prefix
 // hash (our content fingerprint, the index key to drop) in a specific adapter
 // partition. The subscriber maps an evicted engine block hash to both via
-// positionalIndex.Removed. adapterID is always set WITH presence (even "" for the
-// base-model partition), so the server drops the prefix from exactly that one
-// partition — a base-model eviction never sweeps live LoRA hints for the same
-// token hash. (A producer that omits the field entirely reads as absent → the
-// server's conservative cross-partition legacy sweep.)
+// positionalIndex.Removed. adapter_scoped is always set, so the server drops the
+// prefix from exactly the adapterID partition (even "" for the base model) — a
+// base-model eviction never sweeps live LoRA hints for the same token hash.
+// (A producer that leaves adapter_scoped false gets the conservative
+// cross-partition legacy sweep.)
 func (c Config) EvictedEvent(prefixHash []byte, adapterID string, tsSeconds float64) *icpb.CacheEvent {
 	return &icpb.CacheEvent{
-		Type:        icpb.CacheEvent_PREFIX_EVICTED,
-		ReplicaId:   c.ReplicaID,
-		ModelId:     c.ModelID,
-		TenantId:    c.TenantID,
-		PrefixHash:  prefixHash,
-		AdapterId:   &adapterID,
-		TimestampUs: microsFromSeconds(tsSeconds),
+		Type:          icpb.CacheEvent_PREFIX_EVICTED,
+		ReplicaId:     c.ReplicaID,
+		ModelId:       c.ModelID,
+		TenantId:      c.TenantID,
+		PrefixHash:    prefixHash,
+		AdapterId:     adapterID,
+		AdapterScoped: true,
+		TimestampUs:   microsFromSeconds(tsSeconds),
 	}
 }
