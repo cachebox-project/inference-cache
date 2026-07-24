@@ -221,6 +221,29 @@ func TestAdapterPartitionBaseEvictionScopedSparesLoRA(t *testing.T) {
 	}
 }
 
+// Upgrade compatibility: a pre-adapter_scoped producer (new server, not-yet-
+// upgraded subscriber) sends a non-empty adapter_id but leaves adapter_scoped
+// false. Its LoRA eviction must still narrow to that adapter, not regress into a
+// cross-partition sweep that wipes another adapter's live hint.
+func TestAdapterPartitionEvictionNonEmptyAdapterScopesWithoutFlag(t *testing.T) {
+	idx := New()
+	ingestUnder(idx, "replica-0", "sql-lora", "same-tokens")
+	ingestUnder(idx, "replica-0", "chat-lora", "same-tokens")
+
+	idx.ApplyEvent(Event{
+		Type: EventPrefixEvicted, ReplicaID: "replica-0",
+		Model: adapterModel, Tenant: adapterTenant,
+		PrefixHash: hash("same-tokens"), Adapter: "sql-lora", // AdapterScoped left false (pre-upgrade producer)
+	})
+
+	if got := lookupUnder(idx, "sql-lora", "same-tokens"); len(got) != 0 {
+		t.Errorf("sql-lora entry survived its own eviction: %+v", got)
+	}
+	if got := lookupUnder(idx, "chat-lora", "same-tokens"); len(got) != 1 {
+		t.Errorf("chat-lora entry = %+v, want it untouched — a non-empty adapter_id must narrow even without adapter_scoped", got)
+	}
+}
+
 // An eviction with NO adapter keeps the original conservative behavior: it
 // sweeps every partition. That is what a pre-adapter producer emits, and for
 // such a producer all entries live in the "" partition anyway — so the

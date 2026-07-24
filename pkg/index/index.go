@@ -243,15 +243,15 @@ type Event struct {
 	Model      string
 	Tenant     string
 	PrefixHash []byte
-	// Adapter narrows a PREFIX_EVICTED removal to one adapter partition, but only
-	// when AdapterScoped says the producer marked it authoritative (the
-	// adapter_scoped wire flag). With AdapterScoped, the removal targets exactly
-	// Adapter — including "" for a base-model eviction, which then does NOT sweep
-	// live LoRA hints for the same token hash. Without AdapterScoped (a legacy
-	// producer that never set the flag), the removal sweeps EVERY adapter partition
-	// — the conservative legacy behavior. Both are ignored by ALL_CLEARED (a flush
-	// clears the replica across adapters) and by REPLICA_UPDATED (liveness is
-	// adapter-independent).
+	// Adapter narrows a PREFIX_EVICTED removal to one adapter partition. The removal
+	// scopes to Adapter when AdapterScoped is set (the authoritative signal — so
+	// Adapter="" targets the base partition, not a sweep) OR when Adapter is
+	// non-empty (a pre-adapter_scoped producer naming a LoRA adapter; honored so a
+	// mixed-version fleet doesn't regress its narrowing into a sweep). It sweeps
+	// EVERY adapter partition only when Adapter is empty AND AdapterScoped is unset
+	// — the conservative legacy behavior for a no-adapter producer. Both are ignored
+	// by ALL_CLEARED (a flush clears the replica across adapters) and by
+	// REPLICA_UPDATED (liveness is adapter-independent).
 	Adapter       string
 	AdapterScoped bool
 	Timestamp     time.Time
@@ -902,18 +902,23 @@ func (i *Index) ApplyEvent(ev Event) {
 		// adapters at once on the same replica; dropping every partition for one
 		// adapter's GPU eviction would throw away hints that are still valid.
 		//
-		// The adapter_scoped flag (ev.AdapterScoped), not emptiness, decides the
-		// scope. An adapter-aware producer sets it and ev.Adapter — including "" for
-		// a genuine base-model eviction — so the removal targets exactly that one
-		// partition and a base eviction no longer sweeps live LoRA hints for the same
-		// hash. A legacy producer that never sets the flag leaves AdapterScoped false,
-		// and the removal falls back to the original cross-partition sweep (exact for
-		// such a producer, whose entries all live in the "" partition anyway).
+		// The removal narrows to ev.Adapter unless it genuinely cannot tell which
+		// partition to target. It narrows when EITHER:
+		//   - the producer set adapter_scoped — the new authoritative signal, so
+		//     adapter_id="" means the base partition, not a sweep; OR
+		//   - adapter_id is non-empty — a pre-adapter_scoped producer that named a
+		//     LoRA adapter. Honoring that keeps its narrowing on a mixed-version
+		//     fleet (new server + not-yet-upgraded subscriber) rather than
+		//     regressing a "sql-lora" eviction into a cross-partition sweep.
+		// It sweeps EVERY partition only when adapter_id is empty AND adapter_scoped
+		// is unset — a legacy no-adapter producer, whose entries all live in the ""
+		// partition anyway, so the sweep is exact for it.
+		scoped := ev.AdapterScoped || ev.Adapter != ""
 		for key, replicas := range i.prefixes {
 			if key.tenant != ev.Tenant || key.model != ev.Model || key.prefixHash != hash {
 				continue
 			}
-			if ev.AdapterScoped && key.adapter != ev.Adapter {
+			if scoped && key.adapter != ev.Adapter {
 				continue
 			}
 			i.removeReplicaLocked(key, replicas, ev.ReplicaID)

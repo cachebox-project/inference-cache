@@ -1307,22 +1307,24 @@ type CacheEvent struct {
 	TenantId    string                 `protobuf:"bytes,4,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	PrefixHash  []byte                 `protobuf:"bytes,5,opt,name=prefix_hash,json=prefixHash,proto3" json:"prefix_hash,omitempty"`
 	TimestampUs int64                  `protobuf:"varint,6,opt,name=timestamp_us,json=timestampUs,proto3" json:"timestamp_us,omitempty"`
-	// Adapter partition a PREFIX_EVICTED removal targets, honored only when
-	// adapter_scoped is set. "" is the base-model / non-LoRA partition. Ignored by
+	// Adapter partition a PREFIX_EVICTED removal targets. Honored when
+	// adapter_scoped is set, OR when non-empty (a pre-adapter_scoped producer that
+	// named a LoRA adapter). "" is the base-model / non-LoRA partition. Ignored by
 	// ALL_CLEARED (a cache flush clears the replica across every adapter) and by
 	// REPLICA_UPDATED (liveness is adapter-independent). Additive,
 	// v1alpha1-compatible.
 	AdapterId string `protobuf:"bytes,7,opt,name=adapter_id,json=adapterId,proto3" json:"adapter_id,omitempty"`
-	// adapter_scoped marks adapter_id as authoritative for a PREFIX_EVICTED: the
-	// removal targets exactly the adapter_id partition — INCLUDING "" for a
-	// base-model eviction — instead of sweeping every partition. An adapter-aware
-	// producer always sets it; false (the default, and what a legacy producer
-	// sends) keeps the conservative cross-partition sweep. This is the presence
-	// signal that lets a base-model eviction ("") avoid discarding live LoRA hints
-	// for the same token-derived hash. Removal is soft state: an over-eager drop
-	// costs a cache miss, never a wrong answer. A new bool field rather than
-	// making adapter_id `optional`, which the wire-compat gate rejects as a
-	// cardinality change. Additive; ignored outside PREFIX_EVICTED.
+	// adapter_scoped marks adapter_id as authoritative for a PREFIX_EVICTED so that
+	// adapter_id="" targets the base-model partition instead of sweeping every
+	// partition — the signal that lets a base-model eviction avoid discarding live
+	// LoRA hints for the same token-derived hash. An adapter-aware producer always
+	// sets it. The server ALSO narrows on a non-empty adapter_id when this is false,
+	// so a pre-adapter_scoped producer's LoRA eviction keeps narrowing on a
+	// mixed-version fleet; only an empty adapter_id with adapter_scoped=false takes
+	// the conservative cross-partition sweep. Removal is soft state: an over-eager
+	// drop costs a cache miss, never a wrong answer. A new bool rather than making
+	// adapter_id `optional`, which the wire-compat gate rejects as a cardinality
+	// change. Additive; ignored outside PREFIX_EVICTED.
 	AdapterScoped bool `protobuf:"varint,8,opt,name=adapter_scoped,json=adapterScoped,proto3" json:"adapter_scoped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
