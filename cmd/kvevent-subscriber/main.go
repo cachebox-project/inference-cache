@@ -50,16 +50,24 @@ func main() {
 		cacheTier          = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
 		engineModel        = flag.String("engine-model-name", "", `value of the engine's `+"`model_name`"+` Prometheus label to filter /metrics by (e.g. "Qwen/Qwen2.5-0.5B-Instruct"). Distinct from --model-id (the cache-plane index key). Empty = no label filter (aggregates every series — fine when the engine serves one model).`)
 		ignoreBlockRemoved = flag.Bool("ignore-block-removed", false, `declare that this engine is paired with an L2 offload tier (e.g. LMCache): a BlockRemoved is re-reported as a T2 (reload-from-L2) entry instead of a PREFIX_EVICTED delete, so the routing hint survives the HBM eviction but is honestly tagged colder. Default off for single-tier deployments (BlockRemoved → PREFIX_EVICTED). Name kept for compatibility. See docs/design/kvevent-subscriber-wiring.md "L2 cache tier semantics".`)
+		adapterNames       = flag.String("lora-adapter-names", "", `comma-separated `+"`id=name`"+` map from the engine's internal LoRA id (BlockStored.lora_id, assigned in --lora-modules load order) to the stable adapter identity used as the index partition — the same string the gateway sends as LookupRouteRequest.adapter_id (e.g. "1=sql-lora,2=chat-lora"). An unmapped non-nil lora_id is FAIL-CLOSED: its blocks are dropped (not cached) rather than indexed under a replica-local "lora:<id>" that could alias different adapters across replicas — so LoRA caching REQUIRES this map. Omit ONLY for base-model / non-LoRA traffic (nil lora_id → the default "" partition). The identity mapped here MUST match the gateway's LookupRoute query adapter_id end-to-end or every lookup silently misses (the same agreement --hash-scheme requires).`)
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
+	names, err := engine.ParseAdapterNames(*adapterNames)
+	if err != nil {
+		logger.Error("invalid --lora-adapter-names", "value", *adapterNames, "err", err)
+		os.Exit(2)
+	}
+
 	cfg := engine.Config{
-		ReplicaID:  *replica,
-		ModelID:    *model,
-		TenantID:   *tenant,
-		HashScheme: *scheme,
+		ReplicaID:    *replica,
+		ModelID:      *model,
+		TenantID:     *tenant,
+		HashScheme:   *scheme,
+		AdapterNames: names,
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid config", "err", err)

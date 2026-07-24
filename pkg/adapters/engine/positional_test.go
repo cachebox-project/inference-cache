@@ -37,14 +37,14 @@ func TestStoredChainMatchesFullRoll(t *testing.T) {
 		BlockHashes: [][]byte{engHash(10), engHash(11), engHash(12)},
 		TokenIDs:    full[:3*bs],
 		BlockSize:   bs,
-	})
+	}, "")
 	// Event 2: incremental, blocks 3..4, parent = engine hash of block 2.
 	got2 := p.Stored(BlockStored{
 		BlockHashes:     [][]byte{engHash(13), engHash(14)},
 		ParentBlockHash: engHash(12),
 		TokenIDs:        full[3*bs : 5*bs],
 		BlockSize:       bs,
-	})
+	}, "")
 
 	var got []uint64
 	for _, e := range got1 {
@@ -72,7 +72,7 @@ func TestStoredFreshPrefixZero(t *testing.T) {
 	const bs = 16
 	toks := tokSeq(1, bs)
 	p := newPositionalIndex()
-	got := p.Stored(BlockStored{BlockHashes: [][]byte{engHash(1)}, TokenIDs: toks, BlockSize: bs})
+	got := p.Stored(BlockStored{BlockHashes: [][]byte{engHash(1)}, TokenIDs: toks, BlockSize: bs}, "")
 	if len(got) != 1 || beU64(got[0].PrefixHash) != fingerprint.ContentHash(toks) {
 		t.Fatal("fresh prefix[0] != content[0]")
 	}
@@ -89,7 +89,7 @@ func TestStoredUnknownParentStartsFresh(t *testing.T) {
 		ParentBlockHash: engHash(0xDEAD), // never stored
 		TokenIDs:        toks,
 		BlockSize:       bs,
-	})
+	}, "")
 	if len(got) != 1 || beU64(got[0].PrefixHash) != fingerprint.ContentHash(toks) {
 		t.Fatal("unknown parent did not start a fresh sequence")
 	}
@@ -100,17 +100,20 @@ func TestRemovedMapsAndForgets(t *testing.T) {
 	const bs = 16
 	toks := tokSeq(1, bs)
 	p := newPositionalIndex()
-	stored := p.Stored(BlockStored{BlockHashes: [][]byte{engHash(5)}, TokenIDs: toks, BlockSize: bs})
+	stored := p.Stored(BlockStored{BlockHashes: [][]byte{engHash(5)}, TokenIDs: toks, BlockSize: bs}, "")
 	our := stored[0].PrefixHash
 
 	rm := p.Removed(BlockRemoved{BlockHashes: [][]byte{engHash(5)}})
-	if len(rm) != 1 || beU64(rm[0].prefixHash) != beU64(our) {
+	if len(rm) != 1 || beU64(rm[0].PrefixHash) != beU64(our) {
 		t.Fatalf("Removed = %v, want our prefix hash %d", rm, beU64(our))
+	}
+	if rm[0].AdapterID != "" {
+		t.Errorf("AdapterID = %q, want \"\" (block stored without an adapter)", rm[0].AdapterID)
 	}
 	// The token count is carried back so the caller can re-report the prefix at
 	// T2 (L2 mode) rather than only being able to delete it. One full block.
-	if rm[0].tokenCount != bs {
-		t.Fatalf("Removed token count = %d, want %d", rm[0].tokenCount, bs)
+	if rm[0].TokenCount != bs {
+		t.Fatalf("Removed token count = %d, want %d", rm[0].TokenCount, bs)
 	}
 	// Re-removing the now-forgotten hash yields nothing.
 	if rm2 := p.Removed(BlockRemoved{BlockHashes: [][]byte{engHash(5)}}); len(rm2) != 0 {
@@ -124,7 +127,7 @@ func TestClearedResets(t *testing.T) {
 	const bs = 16
 	full := tokSeq(1, 2*bs)
 	p := newPositionalIndex()
-	p.Stored(BlockStored{BlockHashes: [][]byte{engHash(1), engHash(2)}, TokenIDs: full, BlockSize: bs})
+	p.Stored(BlockStored{BlockHashes: [][]byte{engHash(1), engHash(2)}, TokenIDs: full, BlockSize: bs}, "")
 	p.Cleared()
 	suffix := tokSeq(500, bs)
 	got := p.Stored(BlockStored{
@@ -132,7 +135,7 @@ func TestClearedResets(t *testing.T) {
 		ParentBlockHash: engHash(2), // gone after Cleared
 		TokenIDs:        suffix,
 		BlockSize:       bs,
-	})
+	}, "")
 	if len(got) != 1 || beU64(got[0].PrefixHash) != fingerprint.ContentHash(suffix) {
 		t.Fatal("after Cleared, a stale parent should have forced a fresh sequence")
 	}

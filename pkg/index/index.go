@@ -199,6 +199,13 @@ type PrefixRef struct {
 	// the engine evicts while a paired L2 tier (LMCache) retains it is re-reported
 	// at T2. A chain entry's Tier applies to every block it expands to.
 	Tier CacheTier
+	// Adapter is the stable adapter (e.g. LoRA) identity whose KV this entry
+	// describes — the index partition the entry lands in. Per-entry because one
+	// replica can hold KV for several adapters at once. Empty falls back to
+	// Update.Adapter, and an empty result is the default partition: identical to
+	// the behavior before adapters existed. A chain entry's Adapter applies to
+	// every per-block entry it expands to.
+	Adapter string
 }
 
 // Update is the authoritative state a replica reports (from ReportCacheState).
@@ -207,9 +214,14 @@ type Update struct {
 	Model      string
 	Tenant     string
 	HashScheme string
-	Timestamp  time.Time // zero → treated as "now"
-	Prefixes   []PrefixRef
-	Stats      *ReplicaStats
+	// Adapter is the default adapter partition for Prefixes that set no Adapter
+	// of their own — the convenient form for a producer whose replica serves a
+	// single adapter. Empty = the default partition (pre-adapter behavior).
+	// Stats are adapter-independent and are never partitioned by it.
+	Adapter   string
+	Timestamp time.Time // zero → treated as "now"
+	Prefixes  []PrefixRef
+	Stats     *ReplicaStats
 }
 
 // EventType mirrors the proto CacheEvent.Type deltas.
@@ -231,7 +243,14 @@ type Event struct {
 	Model      string
 	Tenant     string
 	PrefixHash []byte
-	Timestamp  time.Time
+	// Adapter narrows a PREFIX_EVICTED removal to one adapter partition. Empty
+	// removes the prefix from EVERY adapter partition — the conservative legacy
+	// behavior, and identical to the pre-adapter code for producers that never
+	// set it (all of whose entries live in the "" partition anyway). Ignored by
+	// ALL_CLEARED (a flush clears the replica across adapters) and by
+	// REPLICA_UPDATED (liveness is adapter-independent).
+	Adapter   string
+	Timestamp time.Time
 }
 
 // LookupRequest asks which replicas hold a given prefix, within a hash scheme.
@@ -245,9 +264,16 @@ type Event struct {
 // TTFTBudgetMs / TBTBudgetMs carry the caller's SLO targets (proto SLO message);
 // 0 means "no SLO hint" and the ranker treats the request as baseline-latency.
 type LookupRequest struct {
-	Model            string
-	Tenant           string
-	HashScheme       string
+	Model      string
+	Tenant     string
+	HashScheme string
+	// Adapter selects the adapter partition to match in. Because the content
+	// fingerprint is token-only, a lookup MUST supply the same adapter identity
+	// the producer ingested under or it will not match — the same producer/
+	// consumer agreement HashScheme already requires. Empty is the default
+	// partition, which is where every non-LoRA deployment both ingests and looks
+	// up, so non-LoRA behavior is unchanged.
+	Adapter          string
 	PrefixHash       []byte
 	TokenCount       int32
 	BlockHashes      [][]byte
@@ -425,10 +451,22 @@ func DefaultRankerConfig() RankerConfig {
 	}
 }
 
+// prefixKey is the index partition key. adapter joins (tenant, model,
+// hashScheme) ahead of the content hash because the content fingerprint is
+// derived from token IDs ALONE: two requests with identical tokens under
+// different LoRA adapters produce the SAME prefixHash, and without the partition
+// they would collide on one map entry — a lookup for adapter A could be handed a
+// replica that only holds adapter B's KV for those tokens. Partitioning (rather
+// than mixing the adapter into the hash) keeps the fingerprint construction and
+// its golden vectors untouched, and keeps the empty-adapter case byte-identical
+// to the pre-adapter key.
+//
+// scopeKey deliberately does NOT gain adapter — see its doc comment.
 type prefixKey struct {
 	tenant     string
 	model      string
 	hashScheme string
+	adapter    string // stable adapter identity ("" = default / no adapter)
 	prefixHash string // raw engine bytes, used as an opaque map key
 }
 
@@ -450,6 +488,20 @@ type modelKey struct {
 
 // scopeKey identifies a (tenant, model, hash_scheme) — the engine domain
 // granularity TENANT_HOT needs for its serving-membership check.
+//
+// Adapter is intentionally NOT part of this key, even though it IS part of
+// prefixKey. scopeKey answers a REPLICA-membership question ("which replicas
+// serve this engine domain?"), and the surfaces that read it — the
+// distinguishing-power denominator, the TENANT_HOT serving check, the
+// AFFINITY_HINT candidate set, and the UNKNOWN_HASH_SCHEME classifier — carry no
+// per-adapter cache-content claim (TENANT_HOT and AFFINITY_HINT ship
+// matched_tokens=0 by contract). Adapters are also loaded and unloaded under a
+// live engine, so adapter residency is a property of individual KV entries, not
+// of a replica's membership in an engine domain. The aliasing hazard is
+// content-level, so the CONTENT key is what gets partitioned; keeping scopeKey
+// adapter-free additionally leaves the diagnostic reason codes meaning exactly
+// what they meant before (UNKNOWN_HASH_SCHEME still means "wrong hash_scheme",
+// not "unseen adapter").
 type scopeKey struct {
 	tenant     string
 	model      string
@@ -529,8 +581,8 @@ type Index struct {
 	reservedEntries int
 
 	// prefixesByTenant counts DISTINCT prefix keys per tenant (one per
-	// (tenant, model, hash_scheme, prefix_hash), regardless of how many replicas
-	// hold it), so the per-tenant quota check at ingest is O(1) instead of
+	// (tenant, model, hash_scheme, adapter, prefix_hash), regardless of how many
+	// replicas hold it), so the per-tenant quota check at ingest is O(1) instead of
 	// scanning i.prefixes. Maintained by upsert/removeReplicaLocked: bumped when a
 	// key is first created for the tenant, dropped when the key's last replica
 	// leaves. This is the unit maxIndexEntries bounds and the unit reported as
@@ -728,6 +780,14 @@ func (i *Index) Ingest(u Update) {
 			// engine KV cache). Resolved once per prefix so the chain's
 			// per-block entries and the preserved legacy blob share one tier.
 			tier := normalizeIngestTier(p.Tier)
+			// Adapter partition for this entry: its own, else the update-level
+			// default, else "" (the default partition — pre-adapter behavior).
+			// Resolved once per prefix so a chain's per-block entries and the
+			// preserved legacy blob all land in the same partition.
+			adapter := p.Adapter
+			if adapter == "" {
+				adapter = u.Adapter
+			}
 			// Chain form: expand into one per-block entry per hash, keyed by
 			// the block hash with cumulative tokenCount so a legacy exact-match
 			// against any single block hash still works. The parallel arrays
@@ -745,7 +805,7 @@ func (i *Index) Ingest(u Update) {
 				var cumulative int32
 				for j, h := range p.BlockHashes {
 					cumulative += p.BlockTokenCounts[j]
-					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(h)}, u.ReplicaID, cumulative, tier, ts)
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, adapter, string(h)}, u.ReplicaID, cumulative, tier, ts)
 				}
 				// Preserve the legacy single-blob key too when the producer
 				// set both representations on the same entry — so legacy
@@ -753,14 +813,14 @@ func (i *Index) Ingest(u Update) {
 				// via exact-match on PrefixHash. The chain path otherwise
 				// silently breaks backward-compat for unmigrated clients.
 				if len(p.PrefixHash) > 0 {
-					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
+					i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, adapter, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
 				}
 				continue
 			}
 			// Legacy single-blob exact-match entry. The helper does the
 			// totalEntries + scope bookkeeping that main's inline form did,
 			// so the chain and legacy paths agree on accounting.
-			i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
+			i.upsertReplicaLocked(prefixKey{u.Tenant, u.Model, u.HashScheme, adapter, string(p.PrefixHash)}, u.ReplicaID, p.TokenCount, tier, ts)
 		}
 	}
 	if u.Stats != nil {
@@ -832,8 +892,28 @@ func (i *Index) ApplyEvent(ev Event) {
 	case EventPrefixEvicted:
 		// Remove the replica from the prefix across schemes — removal is
 		// conservative, so matching opaque bytes without a scheme is safe.
+		//
+		// Adapter, unlike scheme, IS narrowed when the producer supplies it. The
+		// fingerprint is token-only, so one prefix hash can be live under several
+		// adapters at once on the same replica; dropping every partition for one
+		// adapter's GPU eviction would throw away hints that are still valid.
+		//
+		// An empty ev.Adapter falls back to the original cross-partition sweep.
+		// That is exact for a pre-adapter producer (all its entries are in the ""
+		// partition anyway), but an adapter-aware producer ALSO emits "" for a
+		// genuine base-model eviction — and the sweep then drops live LoRA-
+		// partition hints for the same prefix hash too. That is conservative soft
+		// state (at worst a cache miss, re-added by the authoritative
+		// ReportCacheState path) and a strict non-regression (pre-partition, base
+		// and LoRA shared one partition, so a base eviction was already total).
+		// Making "" mean the base partition only, without breaking the legacy
+		// wildcard, needs explicit adapter_id presence on the event — a tracked
+		// follow-up.
 		for key, replicas := range i.prefixes {
 			if key.tenant != ev.Tenant || key.model != ev.Model || key.prefixHash != hash {
+				continue
+			}
+			if ev.Adapter != "" && key.adapter != ev.Adapter {
 				continue
 			}
 			i.removeReplicaLocked(key, replicas, ev.ReplicaID)
@@ -926,7 +1006,7 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 // inspect reason_code
 // continue to fail open on a downgrade.
 func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
-	key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(req.PrefixHash)}
+	key := prefixKey{req.Tenant, req.Model, req.HashScheme, req.Adapter, string(req.PrefixHash)}
 	now := i.now()
 	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
 
@@ -1100,7 +1180,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	current := map[string]running{}
 	finalized := map[string]running{}
 	for blockIdx, h := range req.BlockHashes {
-		key := prefixKey{req.Tenant, req.Model, req.HashScheme, string(h)}
+		key := prefixKey{req.Tenant, req.Model, req.HashScheme, req.Adapter, string(h)}
 		holders := i.prefixes[key]
 		blockTokens := req.BlockTokenCounts[blockIdx]
 		if blockIdx == 0 {
@@ -1629,7 +1709,7 @@ const DefaultTenantSentinel = ""
 // so they cannot disagree. Total == Σ PerTenant by construction — this is the
 // hard invariant the CacheIndex/CacheTenant status surfaces rely on (a tenant's
 // reported indexEntries always sum to the cluster prefix total). The counted
-// unit is a distinct prefix key — (tenant, model, hash_scheme, prefix_hash),
+// unit is a distinct prefix key — (tenant, model, hash_scheme, adapter, prefix_hash),
 // regardless of how many replicas hold it — which is exactly the unit
 // prefixes.summary.total reports and the per-tenant maxIndexEntries quota bounds.
 // (Tenant is part of the key, so the per-tenant partition is exact.)
@@ -2393,6 +2473,14 @@ func (i *Index) enforceCapLocked() map[string]int {
 			if x.key.hashScheme != y.key.hashScheme {
 				return x.key.hashScheme < y.key.hashScheme
 			}
+			// The adapter partition is part of the key, so it must be part of
+			// the tie-break too: two adapters can hold the SAME prefixHash
+			// (the fingerprint is token-only), and without this the comparator
+			// would report "equal" for two distinct keys and reintroduce
+			// map-iteration-order dependence in the victim set.
+			if x.key.adapter != y.key.adapter {
+				return x.key.adapter < y.key.adapter
+			}
 			return x.key.prefixHash < y.key.prefixHash
 		}
 		return x.replica < y.replica
@@ -2471,10 +2559,26 @@ func (i *Index) evictOldestForTenantLocked(tenant string, maxPrefixes int64) int
 		all = append(all, ref{key, newest})
 	}
 	sort.Slice(all, func(a, b int) bool {
+		x, y := all[a].key, all[b].key
 		if !all[a].age.Equal(all[b].age) {
 			return all[a].age.Before(all[b].age)
 		}
-		return all[a].key.prefixHash < all[b].key.prefixHash
+		// Break age ties on the FULL remaining key so victim selection never
+		// depends on map iteration order. tenant is constant here (this helper
+		// only scans one tenant's prefixes), but model, hashScheme, and adapter
+		// are all free to differ within it — and two keys can even share a
+		// prefixHash across adapters (the fingerprint is token-only). Compare
+		// every field that completes the key, mirroring the cap-sweep comparator.
+		if x.model != y.model {
+			return x.model < y.model
+		}
+		if x.hashScheme != y.hashScheme {
+			return x.hashScheme < y.hashScheme
+		}
+		if x.adapter != y.adapter {
+			return x.adapter < y.adapter
+		}
+		return x.prefixHash < y.prefixHash
 	})
 	removed := 0
 	for _, r := range all {

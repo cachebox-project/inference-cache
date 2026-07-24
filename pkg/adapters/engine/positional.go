@@ -27,6 +27,24 @@ type positionalIndex struct {
 type posEntry struct {
 	prefixHash uint64 // our rolling positional prefix hash
 	tokenCount int32  // cumulative tokens of the prefix up to and including this block
+	// adapter is the resolved adapter identity (Config.AdapterID) the block was
+	// stored under — "" for the base model. Remembered per block so an eviction,
+	// which only names the engine block hash, can target the right index
+	// partition instead of dropping the same prefix hash under every adapter.
+	adapter string
+}
+
+// EvictedPrefix is one index key the engine evicted, resolved back to the entry
+// we derived for it: our content-fingerprint prefix hash, the adapter partition
+// it lives in, and its cumulative token count. The adapter scopes the eviction to
+// the right partition (the fingerprint is token-only, so one prefix hash can be
+// live under several adapters at once); the token count lets the caller re-report
+// the prefix at a colder tier (T2) when a paired L2 store still holds it, instead
+// of only being able to delete it.
+type EvictedPrefix struct {
+	PrefixHash []byte
+	AdapterID  string
+	TokenCount int32
 }
 
 func newPositionalIndex() *positionalIndex {
@@ -46,7 +64,22 @@ func newPositionalIndex() *positionalIndex {
 // cost (a wrong hint degrades to a cache miss, never a wrong answer) and does not
 // occur on a clean cold start (no gaps). Hardening — learn NONE_HASH and drop
 // true gaps — is tracked as a follow-up. Returns nil when nothing is indexable.
-func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
+//
+// adapterID is the resolved adapter identity for this event (Config.AdapterID of
+// ev.LoRAID); "" is the base model / default partition. It is stamped on every
+// emitted PrefixEntry so the server partitions the index by adapter, and
+// remembered per block so a later eviction targets the same partition. It is
+// deliberately NOT folded into the prefix hash: the fingerprint stays a pure
+// function of token content (and its golden vectors stay valid) — adapter
+// identity separates the KEYSPACE instead.
+//
+// Chaining is adapter-scoped in practice: the engine only reports a parent block
+// that its own cache holds, and a block's KV belongs to exactly one adapter, so a
+// parent found in the reverse map was stored under this same adapter. The chain
+// is still allowed to proceed on a parent hit regardless — a defensive
+// adapter-mismatch drop would silently degrade every extension to a fresh root,
+// and the entry it produces is written to THIS event's partition either way.
+func (p *positionalIndex) Stored(ev BlockStored, adapterID string) []*icpb.PrefixEntry {
 	bs := int(ev.BlockSize)
 	if bs <= 0 || len(ev.BlockHashes) == 0 {
 		return nil
@@ -78,6 +111,7 @@ func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 		out = append(out, &icpb.PrefixEntry{
 			PrefixHash: fingerprint.Bytes(phs[i]),
 			TokenCount: tokens,
+			AdapterId:  adapterID,
 			// A stored block is resident in the engine KV cache — tier T1. Stamped
 			// explicitly so the wire is self-describing; the server would default
 			// an unset tier to T1 anyway, but being explicit keeps a captured
@@ -85,33 +119,39 @@ func (p *positionalIndex) Stored(ev BlockStored) []*icpb.PrefixEntry {
 			// reporter emits on eviction (see forwarder.go BlockRemoved).
 			Tier: icpb.CacheTier_CACHE_TIER_T1,
 		})
-		p.blocks[string(ev.BlockHashes[i])] = posEntry{prefixHash: phs[i], tokenCount: tokens}
+		p.blocks[string(ev.BlockHashes[i])] = posEntry{
+			prefixHash: phs[i],
+			tokenCount: tokens,
+			adapter:    adapterID,
+		}
 	}
 	return out
 }
 
-// evictedPrefix is one block the engine evicted, resolved back to the index key
-// we derived for it (our content fingerprint) plus its cumulative token count.
-// The token count lets the caller re-report the prefix at a colder tier (T2) when
-// a paired L2 store still holds it, instead of only being able to delete it.
-type evictedPrefix struct {
-	prefixHash []byte
-	tokenCount int32
-}
-
-// Removed maps each evicted engine block hash back to the index entry we derived
-// for it (prefix hash + token count) and forgets it. Unknown hashes are skipped.
-// The caller either forwards each as a PREFIX_EVICTED (single-tier: the block is
-// gone) or re-reports it at T2 (L2 tier present: the block moved tiers, not gone).
-func (p *positionalIndex) Removed(ev BlockRemoved) []evictedPrefix {
+// Removed maps each evicted engine block hash back to the entry we derived for it
+// — prefix hash (the index key), the adapter partition it was stored under, and
+// its cumulative token count — and forgets it. Unknown hashes are skipped. The
+// caller either forwards each as a PREFIX_EVICTED (single-tier: the block is gone)
+// or re-reports it at T2 (L2 tier present: the block moved tiers, not gone), in
+// both cases scoped to the returned adapter partition.
+//
+// Carrying the adapter matters here: the fingerprint is token-only, so the same
+// prefix hash can be live under several adapters at once. Without the partition
+// the server would drop (or downgrade) all of them for one adapter's GPU
+// eviction, throwing away routing hints that are still valid.
+func (p *positionalIndex) Removed(ev BlockRemoved) []EvictedPrefix {
 	if len(ev.BlockHashes) == 0 {
 		return nil
 	}
-	out := make([]evictedPrefix, 0, len(ev.BlockHashes))
+	out := make([]EvictedPrefix, 0, len(ev.BlockHashes))
 	for _, h := range ev.BlockHashes {
 		key := string(h)
 		if pe, ok := p.blocks[key]; ok {
-			out = append(out, evictedPrefix{prefixHash: fingerprint.Bytes(pe.prefixHash), tokenCount: pe.tokenCount})
+			out = append(out, EvictedPrefix{
+				PrefixHash: fingerprint.Bytes(pe.prefixHash),
+				AdapterID:  pe.adapter,
+				TokenCount: pe.tokenCount,
+			})
 			delete(p.blocks, key)
 		}
 	}

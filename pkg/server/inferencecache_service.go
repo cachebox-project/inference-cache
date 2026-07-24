@@ -294,9 +294,13 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 
 	slo := req.GetSlo()
 	lookupReq := index.LookupRequest{
-		Model:            model,
-		Tenant:           tenant,
-		HashScheme:       req.GetHashScheme(),
+		Model:      model,
+		Tenant:     tenant,
+		HashScheme: req.GetHashScheme(),
+		// Adapter partition to match in. The content fingerprint is token-only,
+		// so this is what keeps two adapters' identical token content in disjoint
+		// keyspaces. Empty = the default partition (unchanged legacy behavior).
+		Adapter:          req.GetAdapterId(),
 		PrefixHash:       in.exactPrefixHash,
 		TokenCount:       in.exactTokenCount,
 		BlockHashes:      lookupBlockHashes,
@@ -614,6 +618,9 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 	// the same tokens this lookup was fingerprinted over. Empty on the
 	// token_ids / pre-fingerprinted paths (the caller already has the tokens).
 	resp.TokenIds = in.echoTokens
+	// Echo the adapter partition the index was consulted in, so a caller can
+	// confirm which partition answered without correlating back to its request.
+	resp.AdapterId = req.GetAdapterId()
 	resp.LookupLatencyUs = elapsed.Microseconds()
 	s.metrics.observeLookup(model, resp.ReasonCode, len(result.Scores) > 0, elapsed)
 	return resp
@@ -668,6 +675,9 @@ func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest
 		// when the routing hint is an affinity pick. Empty on the block_hashes /
 		// token_ids paths (the caller already holds the tokens).
 		TokenIds: in.echoTokens,
+		// Same partition echo as buildLookupResponse — the affinity pick was
+		// made after the index was consulted in this adapter's partition.
+		AdapterId: req.GetAdapterId(),
 	}
 	s.metrics.observeLookup(model, resp.ReasonCode, true, elapsed)
 	return resp
@@ -1024,7 +1034,10 @@ func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEv
 			Model:      ev.GetModelId(),
 			Tenant:     ev.GetTenantId(),
 			PrefixHash: ev.GetPrefixHash(),
-			Timestamp:  microsToTime(ev.GetTimestampUs()),
+			// Narrows a PREFIX_EVICTED to one adapter partition; empty keeps the
+			// conservative cross-partition removal (legacy producers).
+			Adapter:   ev.GetAdapterId(),
+			Timestamp: microsToTime(ev.GetTimestampUs()),
 		})
 	}
 	return &icpb.Ack{Accepted: true}, nil
@@ -1046,7 +1059,12 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 		Model:      u.GetModelId(),
 		Tenant:     u.GetTenantId(),
 		HashScheme: u.GetHashScheme(),
-		Timestamp:  microsToTime(u.GetTimestampUs()),
+		// Update-level adapter is only the DEFAULT for entries that set none —
+		// the index applies the per-entry override. A multi-adapter producer
+		// (the kvevent subscriber, which batches events across adapters into one
+		// update) stamps each entry instead and leaves this empty.
+		Adapter:   u.GetAdapterId(),
+		Timestamp: microsToTime(u.GetTimestampUs()),
 	}
 	for _, p := range u.GetPrefixes() {
 		out.Prefixes = append(out.Prefixes, index.PrefixRef{
@@ -1054,6 +1072,7 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 			TokenCount:       p.GetTokenCount(),
 			BlockHashes:      p.GetBlockHashes(),
 			BlockTokenCounts: p.GetBlockTokenCounts(),
+			Adapter:          p.GetAdapterId(),
 			Tier:             cacheTierFromProto(p.GetTier()),
 		})
 	}

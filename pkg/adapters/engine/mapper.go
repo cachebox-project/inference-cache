@@ -24,6 +24,12 @@ func microsFromSeconds(s float64) int64 {
 
 // Update stamps the replica/model/tenant/hash_scheme identity onto a set of
 // prefixes. Returns nil for an empty prefix set (nothing to report).
+//
+// The update-level adapter_id is deliberately left empty: one replica can hold
+// KV for several adapters at once and the Reporter batches events across them
+// into a single update, so adapter identity is stamped PER ENTRY in
+// positionalIndex.Stored. The server treats the update-level field only as a
+// default for entries that set none, so leaving it empty is correct here.
 func (c Config) Update(tsUs int64, prefixes []*icpb.PrefixEntry) *icpb.CacheStateUpdate {
 	if len(prefixes) == 0 {
 		return nil
@@ -81,15 +87,18 @@ func (c Config) ClearedEvent(tsSeconds float64) *icpb.CacheEvent {
 }
 
 // EvictedEvent builds one PREFIX_EVICTED CacheEvent for an already-derived prefix
-// hash (our content fingerprint, the index key to drop). The subscriber maps an
-// evicted engine block hash to this key via positionalIndex.Removed.
-func (c Config) EvictedEvent(prefixHash []byte, tsSeconds float64) *icpb.CacheEvent {
+// hash (our content fingerprint, the index key to drop) in a specific adapter
+// partition. The subscriber maps an evicted engine block hash to both via
+// positionalIndex.Removed. An empty adapterID is the default partition; the
+// server then falls back to its cross-partition (legacy) removal.
+func (c Config) EvictedEvent(prefixHash []byte, adapterID string, tsSeconds float64) *icpb.CacheEvent {
 	return &icpb.CacheEvent{
 		Type:        icpb.CacheEvent_PREFIX_EVICTED,
 		ReplicaId:   c.ReplicaID,
 		ModelId:     c.ModelID,
 		TenantId:    c.TenantID,
 		PrefixHash:  prefixHash,
+		AdapterId:   adapterID,
 		TimestampUs: microsFromSeconds(tsSeconds),
 	}
 }

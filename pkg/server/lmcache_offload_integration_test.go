@@ -33,15 +33,22 @@ import (
 // canonical L2 offload shape.
 func runEngineReporterAgainstServer(t *testing.T, opts []engine.ReporterOption, batches ...*engine.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
 	t.Helper()
-	conn, _, stopServer := startInProcessServerConn(t)
-	client = icpb.NewInferenceCacheClient(conn)
-
-	cfg := engine.Config{
+	return runEngineReporterCfgAgainstServer(t, engine.Config{
 		ReplicaID:  "vllm-engine-cs1",
 		ModelID:    "vllm-model",
 		TenantID:   "ic-smoke",
 		HashScheme: "vllm",
-	}
+	}, opts, batches...)
+}
+
+// runEngineReporterCfgAgainstServer is runEngineReporterAgainstServer with an
+// explicit subscriber Config, so a test can vary the engine-side identity (e.g.
+// supply Config.AdapterNames to exercise LoRA index partitioning end to end).
+func runEngineReporterCfgAgainstServer(t *testing.T, cfg engine.Config, opts []engine.ReporterOption, batches ...*engine.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
+	t.Helper()
+	conn, _, stopServer := startInProcessServerConn(t)
+	client = icpb.NewInferenceCacheClient(conn)
+
 	// Short flush window so the Run loop drains promptly when the input closes.
 	opts = append([]engine.ReporterOption{engine.WithWindow(10 * time.Millisecond)}, opts...)
 	reporter := engine.NewReporter(client, cfg, opts...)

@@ -192,6 +192,59 @@ Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off for the same reason as `EventsOnly` — their stored prefixes stay
 T1 and a `BlockRemoved` deletes them.
 
+## LoRA adapter identity — `--lora-adapter-names`
+
+The routing key is a **content fingerprint over token IDs only**, so two prompts
+with identical tokens under different LoRA adapters hash identically. The
+subscriber therefore reads `lora_id` off each `BlockStored` event and stamps the
+resolved adapter identity on every reported `PrefixEntry`, so the server can put
+them in disjoint **index partitions** rather than one aliased entry (see
+[`grpc-contract.md`](grpc-contract.md) "Update — adapter (LoRA) index
+partition"). The adapter never enters the hash.
+
+`lora_id` is vLLM's **internal load-order integer**, not a name: the same integer
+can mean different adapters on two replicas whose `--lora-modules` order differs,
+and the index is shared across replicas. `--lora-adapter-names` maps it to the
+stable identity the gateway sends as `LookupRouteRequest.adapter_id`:
+
+```
+--lora-adapter-names "1=sql-lora,2=chat-lora"
+```
+
+- **Unmapped id** → **dropped (fail-closed)**. A non-nil `lora_id` with no
+  mapping has only a replica-local load-order integer, which could alias
+  different adapters across replicas whose load order differs — so its blocks are
+  dropped (not indexed) rather than partitioned under a hazardous `lora:<id>`.
+  The adapter gets no routing hint (a cache miss, never a wrong replica) until it
+  is mapped; supply the map — for adapters **known at startup** — and make the
+  gateway send the matching `adapter_id`.
+- **No LoRA at all** (the default): every event carries a nil `lora_id`, so
+  every entry and eviction lands in the default (`""`) partition — byte-for-byte
+  the pre-adapter behavior. Nothing to configure.
+
+### Limitations of the static flag
+
+`--lora-adapter-names` is resolved once at **startup**, so an adapter it does not
+name is **fail-closed** — its blocks are dropped (uncached), never aliased. That
+trades cache benefit for safety in two cases, both a tracked follow-up:
+
+- **Runtime loads.** An adapter loaded or reloaded *after* the subscriber starts
+  whose id isn't in the map is dropped — a static list can't name it. Covering
+  arbitrary runtime loads needs the subscriber to resolve adapter identity
+  **dynamically** from the engine's adapter registry.
+- **Managed injection.** On the `CacheBackend`-driven path the subscriber
+  sidecar is **injected**, so operators cannot pass the flag on a container they
+  do not define; the explicit-set guidance below applies only to a
+  **self-managed** subscriber. Configuring the mapping through the managed path
+  needs a `CacheBackend` field the webhook forwards.
+
+Neither is a correctness regression — a dropped adapter gets no routing hint (a
+cache miss, never a wrong replica), strictly safer than the alias a replica-local
+`lora:<id>` fallback would risk. For a self-managed subscriber, set
+`--lora-adapter-names` on the container directly: the controller has no view of
+the engine's `--lora-modules` ordering, so multi-adapter engines must supply the
+map explicitly.
+
 ## What this unblocks
 
 * The runbook / demo path no longer needs `port-forward` + a hand-launched

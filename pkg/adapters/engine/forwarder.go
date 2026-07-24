@@ -17,7 +17,8 @@ import (
 // L2 offload tier (WithIgnoreBlockRemoved): with one, the block moved tiers, so it
 // is re-reported at T2 through the same ReportCacheState add path; without one it
 // is gone, forwarded as PREFIX_EVICTED via a time-bounded unary PublishEvent.
-// AllBlocksCleared → ALL_CLEARED, also via PublishEvent.
+// AllBlocksCleared → ALL_CLEARED, also via PublishEvent. Adds, T2 downgrades, and
+// evictions all carry the entry's resolved adapter partition (see positionalIndex).
 //
 // Every RPC uses its own bounded context, so a stalled or unreachable server can
 // never block the loop for longer than rpcTimeout — the cache is an optimization
@@ -41,6 +42,10 @@ type Reporter struct {
 	// pos derives our positional content fingerprint from each event's tokens and
 	// chains it across events. Owned by Run (single goroutine), so unsynchronized.
 	pos *positionalIndex
+	// warnedAdapters remembers which unmapped LoRA ids we've already logged a
+	// fail-closed drop for, so a hot adapter warns once rather than per event.
+	// Owned by Run (single goroutine), so unsynchronized.
+	warnedAdapters map[int64]bool
 }
 
 // ReporterOption configures a Reporter.
@@ -78,13 +83,14 @@ func WithIgnoreBlockRemoved(b bool) ReporterOption {
 // NewReporter builds a Reporter for one engine replica.
 func NewReporter(client icpb.InferenceCacheClient, cfg Config, opts ...ReporterOption) *Reporter {
 	r := &Reporter{
-		client:     client,
-		cfg:        cfg,
-		window:     100 * time.Millisecond,
-		rpcTimeout: 5 * time.Second,
-		maxPend:    4096,
-		logger:     slog.Default(),
-		pos:        newPositionalIndex(),
+		client:         client,
+		cfg:            cfg,
+		window:         100 * time.Millisecond,
+		rpcTimeout:     5 * time.Second,
+		maxPend:        4096,
+		logger:         slog.Default(),
+		pos:            newPositionalIndex(),
+		warnedAdapters: make(map[int64]bool),
 	}
 	for _, o := range opts {
 		o(r)
@@ -131,7 +137,21 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 			for _, ev := range b.Events {
 				switch e := ev.(type) {
 				case BlockStored:
-					entries := r.pos.Stored(e)
+					// Resolve the engine's internal LoRA id to the stable adapter
+					// identity that partitions the index (see Config.AdapterID). A
+					// nil id → "" → the default partition, exactly the pre-adapter
+					// behavior for every non-LoRA deployment. A non-nil id with no
+					// --lora-adapter-names mapping is FAIL-CLOSED: its only identity
+					// is a replica-local load-order integer that could alias
+					// different adapters across replicas, so drop the event rather
+					// than index it under a hazardous partition (warned once per id).
+					// The adapter is cached once its id is mapped.
+					adapterID, ok := r.cfg.AdapterID(e.LoRAID)
+					if !ok {
+						r.warnUnmappedAdapter(e.LoRAID)
+						continue
+					}
+					entries := r.pos.Stored(e, adapterID)
 					if len(entries) == 0 && len(e.BlockHashes) > 0 {
 						// A BlockStored carrying block hashes produced no index
 						// entries — either token_ids are absent (engine not emitting
@@ -154,15 +174,16 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// engine never references an HBM-evicted block as a future parent,
 					// so retaining it only grows pos unbounded — and in L2 mode there
 					// is no other prune point until AllBlocksCleared. Resolve the keys
-					// (which also forgets them) before deciding how to report.
+					// (which also forgets them, and carries each block's adapter
+					// partition) before deciding how to report.
 					evicted := r.pos.Removed(e)
 					if r.l2TierPresent {
 						// L2 tier present: the block moved from HBM to the offload tier,
 						// it is not gone. Re-report each evicted prefix at T2 (reload-able
-						// from L2) instead of deleting it — the index applies
-						// last-write-wins on tier, moving the entry T1→T2; a later
-						// BlockStored re-store re-reports it at T1 (upgrade). Nothing to
-						// do when the block wasn't ours.
+						// from L2) in its own adapter partition instead of deleting it —
+						// the index applies last-write-wins on tier, moving the entry
+						// T1→T2; a later BlockStored re-store re-reports it at T1
+						// (upgrade). Nothing to do when the block wasn't ours.
 						if len(evicted) == 0 {
 							continue
 						}
@@ -181,8 +202,9 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 						downgrades := make([]*icpb.PrefixEntry, 0, len(evicted))
 						for _, ep := range evicted {
 							downgrades = append(downgrades, &icpb.PrefixEntry{
-								PrefixHash: ep.prefixHash,
-								TokenCount: ep.tokenCount,
+								PrefixHash: ep.PrefixHash,
+								TokenCount: ep.TokenCount,
+								AdapterId:  ep.AdapterID,
 								Tier:       icpb.CacheTier_CACHE_TIER_T2,
 							})
 						}
@@ -196,7 +218,7 @@ func (r *Reporter) Run(ctx context.Context, in <-chan *EventBatch) error {
 					// store→evict order.
 					flush()
 					for _, ep := range evicted {
-						r.publish(r.cfg.EvictedEvent(ep.prefixHash, b.TimestampSeconds))
+						r.publish(r.cfg.EvictedEvent(ep.PrefixHash, ep.AdapterID, b.TimestampSeconds))
 					}
 				case AllBlocksCleared:
 					pending = pending[:0] // a clear supersedes buffered adds
@@ -230,6 +252,22 @@ func (r *Reporter) sendAdds(prefixes []*icpb.PrefixEntry, tsUs int64) {
 	if _, err := stream.CloseAndRecv(); err != nil {
 		r.logger.Warn("report close failed", "err", err)
 	}
+}
+
+// warnUnmappedAdapter logs, once per LoRA id, that a BlockStored was dropped
+// because the id has no --lora-adapter-names mapping (fail-closed — see
+// Config.AdapterID). Run is single-goroutine, so warnedAdapters needs no lock.
+func (r *Reporter) warnUnmappedAdapter(loraID *int64) {
+	if loraID == nil {
+		return
+	}
+	id := *loraID
+	if r.warnedAdapters[id] {
+		return
+	}
+	r.warnedAdapters[id] = true
+	r.logger.Warn("dropping BlockStored for an unmapped LoRA id (fail-closed; add it to --lora-adapter-names to cache this adapter)",
+		"lora_id", id)
 }
 
 // publish sends a single CacheEvent via a time-bounded unary PublishEvent.
