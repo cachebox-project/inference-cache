@@ -1,10 +1,16 @@
 # Index sizing & memory tuning
 
 The inferencecache-server holds a soft-state cache-state index in process memory:
-distinct prefix entries per `(tenant, model, hash_scheme, prefix_hash)`, replica
+distinct prefix entries per `(tenant, model, hash_scheme, adapter, prefix_hash)`, replica
 stats per `(tenant, model, replica_id)`, plus a few secondary indices. This guide
 gives operators the numbers and dials to size the server pod and the per-namespace /
 per-tenant knobs that bound the index footprint.
+
+> **LoRA note.** `adapter` (`""` for base-model / non-LoRA traffic) is part of the
+> prefix key, so identical prompt content served under N adapters is N distinct
+> entries. A multi-adapter workload multiplies key cardinality — and therefore
+> memory and eviction pressure — by roughly the number of actively-cached
+> adapters; size `maxIndexEntries` and pod memory for that fan-out.
 
 **Audience.** Cluster operators picking pod resource limits, `CachePolicy.spec.evictionTTL`,
 and `CacheTenant.spec.quota.maxIndexEntries` for their workload.
@@ -54,7 +60,7 @@ so reaching for a larger footprint needs a recompile today.
 **Two units that get conflated.** The CRD field name `maxIndexEntries`, the snapshot
 field `tenants[].indexEntries`, and the metric `inferencecache_index_entries` (with a
 `model` label, e.g. `inferencecache_index_entries{model="meta-llama/Llama-3"}`) all
-count **distinct prefix keys** — one per `(tenant, model, hash_scheme, prefix_hash)`,
+count **distinct prefix keys** — one per `(tenant, model, hash_scheme, adapter, prefix_hash)`,
 regardless of how many replicas hold it. The internal `pkg/index.DefaultMaxEntries` cap,
 by contrast, counts **total storage entries** — one per `(prefix_key, replica)` tuple.
 A single prefix held by R replicas is 1 "indexEntries" but R "storage entries". When
@@ -86,7 +92,7 @@ table — the rule of thumb is for back-of-envelope work, not a tight predictor.
 A single entry is a chain of small Go allocations under two nested `map`s:
 
 - outer `map[prefixKey]…` bucket header + the prefix-key strings (tenant, model,
-  hash_scheme, prefix_hash);
+  hash_scheme, adapter, prefix_hash);
 - inner `map[replicaID]*replicaEntry` header + the replica-id string;
 - the `replicaEntry` struct (token count + lastSeen `time.Time` + `atomic.Int64`
   LFU counter).
