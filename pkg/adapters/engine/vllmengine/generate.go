@@ -1,4 +1,4 @@
-// Package vllmengine holds a minimal vendored subset of the SMG vLLM engine gRPC
+// Package vllmengine holds a minimal vendored subset of the vLLM engine gRPC
 // contract (GetLoads only), used by the kvevent-subscriber to read engine load
 // over gRPC instead of scraping HTTP /metrics. The .pb.go files are generated,
 // not hand-edited.

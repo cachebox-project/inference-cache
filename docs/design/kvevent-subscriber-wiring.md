@@ -107,10 +107,10 @@ Concretely:
   operator needs the knobs.
 * **Auto-injecting `--engine-loads-grpc` (GetLoads load source)** — the subscriber binary
   can now read engine load over the VllmEngine `GetLoads` gRPC RPC instead of scraping HTTP
-  `/metrics` (an SMG gRPC engine exposes no `/metrics` endpoint at all), selected by the
+  `/metrics` (a vLLM engine served over gRPC exposes no `/metrics` endpoint at all), selected by the
   `--engine-loads-grpc` flag. The sidecar renderer does **not** pass that flag yet, so
   auto-injected sidecars keep the HTTP default. Deferred deliberately: `GetLoads` requires a
-  newer engine floor (SMG gRPC servicer ≥ 0.5.2 / vLLM ≥ 0.19) than the engine currently
+  newer engine floor (a gRPC server that implements `GetLoads`; vLLM ≥ 0.19) than the engine currently
   deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC and flip
   the load signal to "stale" (see the `StatsReporter` stale-escalation path). It gets wired
   alongside the stats-path knobs above once the engine floor moves; until then it is opt-in

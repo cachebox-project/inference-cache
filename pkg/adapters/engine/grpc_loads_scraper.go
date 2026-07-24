@@ -30,9 +30,9 @@ type GRPCLoadsScraperConfig struct {
 	Timeout time.Duration
 }
 
-// GRPCLoadsScraper reads engine load via the SMG engine's GetLoads gRPC RPC and
+// GRPCLoadsScraper reads engine load via the vLLM engine's GetLoads gRPC RPC and
 // projects it into a ReplicaStats — the gRPC-native alternative to scraping the
-// engine's HTTP /metrics. An SMG gRPC engine (vllm.entrypoints.grpc_server)
+// engine's HTTP /metrics. A vLLM engine served over gRPC (vllm.entrypoints.grpc_server)
 // exposes no HTTP metrics endpoint; live load is available only over GetLoads.
 // It implements the same statsScraper interface as MetricsScraper, so the
 // StatsReporter uses whichever is configured, unchanged.

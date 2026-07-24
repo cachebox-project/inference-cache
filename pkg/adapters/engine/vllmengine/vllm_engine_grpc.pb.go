@@ -4,27 +4,26 @@
 // - protoc             v7.34.1
 // source: vllm_engine.proto
 
-// Minimal vendored subset of the SMG vLLM engine gRPC contract
-// (machxai/smg: crates/grpc_client/proto/vllm_engine.proto) — ONLY the GetLoads
-// RPC and its messages. The kvevent-subscriber uses this to read engine load
-// over gRPC as an alternative to scraping HTTP /metrics (which an SMG gRPC
-// engine does not expose).
+// Minimal vendored subset of the vLLM engine gRPC contract (the
+// `vllm.grpc.engine.VllmEngine` service exposed by vLLM's
+// `vllm.entrypoints.grpc_server`) — ONLY the GetLoads RPC and its messages. The
+// kvevent-subscriber uses this to read engine load over gRPC as an alternative to
+// scraping HTTP /metrics (which a vLLM engine served over gRPC does not expose).
 //
 // The package name MUST stay `vllm.grpc.engine` to match the upstream service
 // so the wire method path `/vllm.grpc.engine.VllmEngine/GetLoads` lines up; the
 // message names, field numbers, and types below are copied verbatim from the
-// source file so the wire encoding is byte-compatible. Kept out of the `proto/`
-// module on purpose — it is a vendored external contract, not part of IC's own
-// gRPC API, so it is exempt from IC's buf-lint conventions.
+// upstream contract so the wire encoding is byte-compatible. Kept out of the
+// `proto/` module on purpose — it is a vendored external contract, not part of
+// IC's own gRPC API, so it is exempt from IC's buf-lint conventions.
 //
-// Provenance: vendored from machxai/smg crates/grpc_client/proto/vllm_engine.proto
-// at commit 6d63ec83f052af42649a330d91f39aa56471aceb (2026-07-09). The GetLoads
-// RPC and the GetLoadsRequest / GetLoadsResponse / SchedulerLoad messages below
-// were verified field-for-field (numbers and types) against that revision. When
-// re-syncing against a newer SMG release, re-copy from the pinned commit, update
-// this line, and re-verify the field numbers. The bufconn test
-// (grpc_loads_scraper_test.go) only proves this file round-trips against its own
-// generated stubs — NOT that it matches the engine actually deployed.
+// Provenance: a hand-copied subset of the upstream vLLM engine gRPC contract; the
+// GetLoads RPC and the GetLoadsRequest / GetLoadsResponse / SchedulerLoad messages
+// below were verified field-for-field (numbers and types) against it. When
+// re-syncing against a newer engine release, re-copy from the upstream proto and
+// re-verify the field numbers. The bufconn test (grpc_loads_scraper_test.go) only
+// proves this file round-trips against its own generated stubs — NOT that it
+// matches the engine actually deployed.
 //
 // Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
 // proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the

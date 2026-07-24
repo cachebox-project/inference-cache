@@ -9,7 +9,7 @@
 //   - Stats path: engine load → derived ReplicaStats → ReportCacheState
 //     (stats-only CSU). The load source is selectable: HTTP GET against the
 //     engine's Prometheus /metrics (default), or the VllmEngine GetLoads gRPC
-//     RPC when --engine-loads-grpc is set (SMG gRPC engines expose no HTTP
+//     RPC when --engine-loads-grpc is set (vLLM gRPC engines expose no HTTP
 //     /metrics). Ticks on its own cadence (~10s), so the snapshot/CR status
 //     surface (cache_memory_bytes, hit_rate, pressure) lights up regardless of
 //     event rate.
@@ -55,7 +55,7 @@ type scraperParams struct {
 }
 
 // buildStatsScraper selects the engine load source: the GetLoads gRPC scraper
-// when loadsGRPC is non-empty (preferred for SMG gRPC engines, which expose no
+// when loadsGRPC is non-empty (preferred for vLLM gRPC engines, which expose no
 // HTTP /metrics), else the HTTP /metrics scraper. It returns the scraper, an
 // optional closer (the gRPC scraper owns a client conn — the HTTP one owns
 // nothing, so closer is nil), and an error only from gRPC dial setup.
@@ -92,7 +92,7 @@ func main() {
 		scheme             = flag.String("hash-scheme", "vllm", "engine prefix-hash scheme (required, non-empty)")
 		window             = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
 		metricsURL         = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
-		loadsGRPC          = flag.String("engine-loads-grpc", "", "engine VllmEngine gRPC address (host:port) to read load via the GetLoads RPC instead of scraping --engine-metrics-url. Preferred for SMG gRPC engines, which expose no HTTP /metrics. Empty = use the HTTP scrape.")
+		loadsGRPC          = flag.String("engine-loads-grpc", "", "engine VllmEngine gRPC address (host:port) to read load via the GetLoads RPC instead of scraping --engine-metrics-url. Preferred for vLLM gRPC engines, which expose no HTTP /metrics. Empty = use the HTTP scrape.")
 		statsInterval      = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
 		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
 		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
@@ -140,7 +140,7 @@ func main() {
 		engine.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
 	sub := engine.NewSubscriber(*endpoint, *topic, engine.WithSubscriberLogger(logger))
 
-	// Load source: gRPC GetLoads (preferred for SMG gRPC engines, which expose no
+	// Load source: gRPC GetLoads (preferred for vLLM gRPC engines, which expose no
 	// HTTP /metrics) when --engine-loads-grpc is set, else the HTTP /metrics scrape.
 	// Both satisfy the same statsScraper, so the StatsReporter is identical.
 	scraper, scraperCloser, serr := buildStatsScraper(scraperParams{
