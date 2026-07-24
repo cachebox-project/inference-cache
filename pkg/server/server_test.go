@@ -1454,13 +1454,13 @@ func TestPublishEventAppliesToIndex(t *testing.T) {
 	}
 }
 
-// TestPublishEventBaseEvictionWithPresenceSparesLoRA pins the full wire→index
+// TestPublishEventBaseEvictionScopedSparesLoRA pins the full wire→index
 // seam: a base-model PREFIX_EVICTED carrying adapter_id="" with adapter_scoped=true
 // drops ONLY the base ("") partition. The service must translate adapter_scoped
-// into index.Event.AdapterSet — reading the adapter_id VALUE ("") instead would
+// into index.Event.AdapterScoped — reading the adapter_id VALUE ("") instead would
 // misclassify a base-scoped eviction as the legacy wildcard and wrongly sweep the
 // co-resident LoRA hint for the same hash.
-func TestPublishEventBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
+func TestPublishEventBaseEvictionScopedSparesLoRA(t *testing.T) {
 	svc := newTestService()
 	for _, a := range []string{"", "sql-lora"} {
 		svc.index.Ingest(index.Update{

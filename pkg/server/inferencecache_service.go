@@ -1038,9 +1038,9 @@ func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEv
 			// marked adapter_id authoritative (adapter_scoped) — including "" for a
 			// base-model eviction. Unset keeps the conservative cross-partition
 			// removal (legacy producers).
-			Adapter:    ev.GetAdapterId(),
-			AdapterSet: ev.GetAdapterScoped(),
-			Timestamp:  microsToTime(ev.GetTimestampUs()),
+			Adapter:       ev.GetAdapterId(),
+			AdapterScoped: ev.GetAdapterScoped(),
+			Timestamp:     microsToTime(ev.GetTimestampUs()),
 		})
 	}
 	return &icpb.Ack{Accepted: true}, nil

@@ -188,7 +188,7 @@ func TestAdapterPartitionEvictionIsScopedToItsAdapter(t *testing.T) {
 	idx.ApplyEvent(Event{
 		Type: EventPrefixEvicted, ReplicaID: "replica-0",
 		Model: adapterModel, Tenant: adapterTenant,
-		PrefixHash: hash("same-tokens"), Adapter: "sql-lora", AdapterSet: true,
+		PrefixHash: hash("same-tokens"), Adapter: "sql-lora", AdapterScoped: true,
 	})
 
 	if got := lookupUnder(idx, "sql-lora", "same-tokens"); len(got) != 0 {
@@ -199,10 +199,10 @@ func TestAdapterPartitionEvictionIsScopedToItsAdapter(t *testing.T) {
 	}
 }
 
-// A base-model eviction (Adapter "" WITH presence) drops ONLY the base partition
-// and must not sweep a live LoRA hint for the same token hash — the over-sweep
-// that adapter_id presence exists to fix.
-func TestAdapterPartitionBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
+// A base-model eviction (Adapter "" WITH AdapterScoped) drops ONLY the base
+// partition and must not sweep a live LoRA hint for the same token hash — the
+// over-sweep that the adapter_scoped flag exists to fix.
+func TestAdapterPartitionBaseEvictionScopedSparesLoRA(t *testing.T) {
 	idx := New()
 	ingestUnder(idx, "replica-0", "", "same-tokens")
 	ingestUnder(idx, "replica-0", "sql-lora", "same-tokens")
@@ -210,7 +210,7 @@ func TestAdapterPartitionBaseEvictionWithPresenceSparesLoRA(t *testing.T) {
 	idx.ApplyEvent(Event{
 		Type: EventPrefixEvicted, ReplicaID: "replica-0",
 		Model: adapterModel, Tenant: adapterTenant,
-		PrefixHash: hash("same-tokens"), Adapter: "", AdapterSet: true,
+		PrefixHash: hash("same-tokens"), Adapter: "", AdapterScoped: true,
 	})
 
 	if got := lookupUnder(idx, "", "same-tokens"); len(got) != 0 {
