@@ -22,8 +22,12 @@ func TestEvictedEvent(t *testing.T) {
 	if !bytes.Equal(e.PrefixHash, []byte{0x01, 0x02}) {
 		t.Errorf("prefix hash = %x, want 0102", e.PrefixHash)
 	}
-	if e.AdapterId != "" {
-		t.Errorf("adapter id = %q, want \"\" (no adapter)", e.AdapterId)
+	// A base-model eviction carries adapter_id="" WITH presence, so the server
+	// drops only the base ("") partition instead of sweeping every adapter.
+	if e.AdapterId == nil {
+		t.Error("adapter id absent; a base eviction must set it WITH presence to scope removal to the base partition")
+	} else if got := e.GetAdapterId(); got != "" {
+		t.Errorf("adapter id = %q, want \"\" (base partition)", got)
 	}
 }
 
@@ -31,8 +35,8 @@ func TestEvictedEvent(t *testing.T) {
 // prefix only there — the same hash can be live under another adapter.
 func TestEvictedEventCarriesAdapter(t *testing.T) {
 	e := testConfig().EvictedEvent([]byte{0x01}, "sql-lora", 1.0)
-	if e.AdapterId != "sql-lora" {
-		t.Errorf("adapter id = %q, want sql-lora", e.AdapterId)
+	if e.AdapterId == nil || e.GetAdapterId() != "sql-lora" {
+		t.Errorf("adapter id = %v, want sql-lora (present)", e.AdapterId)
 	}
 }
 

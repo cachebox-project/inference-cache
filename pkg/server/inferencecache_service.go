@@ -1034,10 +1034,14 @@ func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEv
 			Model:      ev.GetModelId(),
 			Tenant:     ev.GetTenantId(),
 			PrefixHash: ev.GetPrefixHash(),
-			// Narrows a PREFIX_EVICTED to one adapter partition; empty keeps the
-			// conservative cross-partition removal (legacy producers).
-			Adapter:   ev.GetAdapterId(),
-			Timestamp: microsToTime(ev.GetTimestampUs()),
+			// Narrows a PREFIX_EVICTED to one adapter partition when the producer
+			// supplied adapter_id (proto3 presence) — including "" for a base-model
+			// eviction. Absent keeps the conservative cross-partition removal
+			// (legacy producers). GetAdapterId() flattens nil to "", so read the
+			// pointer directly for presence.
+			Adapter:    ev.GetAdapterId(),
+			AdapterSet: ev.AdapterId != nil,
+			Timestamp:  microsToTime(ev.GetTimestampUs()),
 		})
 	}
 	return &icpb.Ack{Accepted: true}, nil

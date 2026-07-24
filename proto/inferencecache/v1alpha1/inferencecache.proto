@@ -297,15 +297,19 @@ message CacheEvent {
   string tenant_id = 4;
   bytes prefix_hash = 5;
   int64 timestamp_us = 6;
-  // Adapter partition a PREFIX_EVICTED removal targets. Set, the server drops
-  // the prefix only from that partition; empty, it drops the prefix across
-  // EVERY adapter partition — the conservative legacy behavior (removal is
-  // soft state: an over-eager drop costs a cache miss, never a wrong answer),
-  // and identical to today for producers that never populate the field.
-  // Ignored by ALL_CLEARED (a cache flush clears the replica across every
-  // adapter) and by REPLICA_UPDATED (liveness is adapter-independent).
-  // Additive, v1alpha1-compatible.
-  string adapter_id = 7;
+  // Adapter partition a PREFIX_EVICTED removal targets, with explicit presence.
+  // PRESENT (even "") drops the prefix from exactly that ONE partition ("" is the
+  // base-model / non-LoRA partition); ABSENT drops it across EVERY adapter
+  // partition — the conservative legacy sweep, kept for producers that never
+  // populate the field. Presence is what lets an adapter-aware producer evict the
+  // base ("") partition WITHOUT also sweeping live LoRA hints for the same
+  // token-derived hash. Removal is soft state: an over-eager drop costs a cache
+  // miss, never a wrong answer. Ignored by ALL_CLEARED (a cache flush clears the
+  // replica across every adapter) and by REPLICA_UPDATED (liveness is
+  // adapter-independent). Additive, v1alpha1-compatible (proto3 presence uses the
+  // same wire format; an old producer that never set the field still reads as
+  // ABSENT → legacy sweep).
+  optional string adapter_id = 7;
 }
 
 message StreamEventsRequest {
