@@ -2,6 +2,42 @@
 
 A Kubernetes-native cache plane for LLM inference.
 
+## What's Inference Cache?
+
+Inference Cache helps LLM serving systems reuse work that has already been
+computed. It observes which engine replicas hold reusable prompt-prefix KV
+blocks, maintains a cluster-wide view of that cache locality, and returns
+ranked routing hints so a gateway can send each request to a replica likely to
+have the best prefix match.
+
+It also gives operators a Kubernetes-native way to provision shared cache
+backends, connect them to inference engines, and define cache, tenant, and
+prompt policies through CRDs. The cache plane carries metadata and policy, not
+prompt text or KV tensors, and it never makes the final routing decision. When
+no useful hint is available, the gateway follows its normal routing policy:
+Inference Cache is designed to fail open.
+
+## Key Features
+
+- **Cache-aware routing hints** — ranks engine replicas by reusable prefix
+  locality, including longest-prefix block-chain matches and affinity fallback
+  for requests without an exact match.
+- **Event-driven cache index** — consumes KV-cache events from inference
+  engines and maintains a metadata-only, cluster-wide view of cached prefixes,
+  replicas, and tenants.
+- **Pluggable engine and backend integration** — adapter-based wiring connects
+  supported inference engines to managed or external cache backends without
+  coupling the core API to one implementation.
+- **Declarative cache policy** — Kubernetes CRDs configure backend lifecycle,
+  lookup behavior, tenant isolation and quotas, and expose observed cache state
+  through familiar status and condition surfaces.
+- **Fail-open request path** — returns `NO_HINT` when cache information is
+  missing, stale, or unusable, allowing the gateway to continue with its
+  default routing policy.
+- **Built-in operations surface** — provides health and readiness endpoints,
+  Prometheus metrics and alerts, Kubernetes events, functional probes, and the
+  `inferencecache doctor` diagnostic command.
+
 ## Repository layout
 
 One operator, split across two control-plane binaries (controller + server) plus
