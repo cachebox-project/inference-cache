@@ -18,6 +18,10 @@ type stubAdapter struct {
 	supportsFn func(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 }
 
+type endpointFreeStub struct{ stubAdapter }
+
+func (endpointFreeStub) RequiresEndpoint() bool { return false }
+
 func (s stubAdapter) Supports(r RuntimeID, c *cachev1alpha1.CacheBackend) bool {
 	if s.supportsFn == nil {
 		return false
@@ -286,6 +290,16 @@ func TestRegistryResolvesReferenceAdapterByRuntime(t *testing.T) {
 	}
 	if _, isRef := got.(referenceAdapter); !isRef {
 		t.Fatalf("Select(reference) returned %T, want referenceAdapter", got)
+	}
+}
+
+func TestAdapterRequiresEndpointDefaultsTrue(t *testing.T) {
+	base := stubAdapter{}
+	if !AdapterRequiresEndpoint(base) {
+		t.Fatal("adapter without EndpointRequirement must require an endpoint")
+	}
+	if AdapterRequiresEndpoint(endpointFreeStub{stubAdapter: base}) {
+		t.Fatal("endpoint-free adapter was treated as endpoint-bearing")
 	}
 }
 

@@ -6,8 +6,11 @@ import (
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 const (
@@ -19,6 +22,170 @@ const (
 	SGLangHiCacheMemoryLayoutArg = "--hicache-mem-layout"
 )
 
+type hiCacheAdapter struct {
+	subscriberImage         string
+	policyServerGRPCAddress string
+}
+
+// NewHiCacheAdapter returns the endpoint-free adapter for SGLang's native
+// host-memory hierarchical cache.
+func NewHiCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
+	var cfg runtimeadapter.Options
+	for _, option := range opts {
+		option(&cfg)
+	}
+	return hiCacheAdapter{
+		subscriberImage:         cfg.SubscriberImage,
+		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
+	}
+}
+
+func (hiCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
+	return cache != nil &&
+		runtime == runtimeadapter.RuntimeSGLang &&
+		cache.Spec.Type == cachev1alpha1.CacheBackendTypeSGLangHiCache
+}
+
+func (hiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
+	return []runtimeadapter.SupportedPair{{
+		Runtime: runtimeadapter.RuntimeSGLang,
+		Backend: cachev1alpha1.CacheBackendTypeSGLangHiCache,
+	}}
+}
+
+func (hiCacheAdapter) RequiresEndpoint() bool { return false }
+
+func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	if err := ValidateHiCacheBackend(cache); err != nil {
+		return nil, nil, err
+	}
+	return nil, nil, nil
+}
+
+func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *cachev1alpha1.CacheBackend) error {
+	cfg, err := resolveHiCacheConfig(cache)
+	if err != nil {
+		return err
+	}
+	if pod == nil {
+		return fmt.Errorf("inject SGLang HiCache config: pod is nil")
+	}
+	if len(pod.Containers) == 0 {
+		return fmt.Errorf("inject SGLang HiCache config: pod has no containers")
+	}
+	engineIndex, err := enginewire.EngineContainerIndexNamed(pod, enginewire.SGLangEngineContainerName)
+	if err != nil {
+		return err
+	}
+
+	// Validate every collision against the original args before changing a
+	// copy. The pod webhook fail-opens on an error, so injection must be
+	// all-or-nothing.
+	args := pod.Containers[engineIndex].Args
+	if hasArg(args, enginewire.SGLangEnableLMCacheArg) || hasArg(args, enginewire.SGLangConfigFileArg) {
+		return fmt.Errorf("inject SGLang HiCache config: native HiCache conflicts with SGLang LMCache arguments")
+	}
+	if err := validateEnableArg(args); err != nil {
+		return err
+	}
+
+	type desiredArg struct {
+		flag       string
+		value      string
+		equivalent func(string, string) bool
+	}
+	desired := make([]desiredArg, 0, 4)
+	if cfg.sizeGB != nil {
+		desired = append(desired, desiredArg{
+			flag:       SGLangHiCacheSizeArg,
+			value:      strconv.FormatInt(int64(*cfg.sizeGB), 10),
+			equivalent: equivalentInteger,
+		})
+		if err := rejectPresentArg(args, SGLangHiCacheRatioArg, "conflicts with spec.hiCache.sizeGB"); err != nil {
+			return err
+		}
+	} else {
+		desired = append(desired, desiredArg{
+			flag:       SGLangHiCacheRatioArg,
+			value:      cfg.ratio,
+			equivalent: equivalentNumber,
+		})
+		if err := rejectPresentArg(args, SGLangHiCacheSizeArg, "conflicts with spec.hiCache.ratio"); err != nil {
+			return err
+		}
+	}
+	if cfg.writePolicy != "" {
+		desired = append(desired, desiredArg{
+			flag:       SGLangHiCacheWritePolicyArg,
+			value:      string(cfg.writePolicy),
+			equivalent: equivalentExact,
+		})
+	}
+	if cfg.ioBackend != "" {
+		desired = append(desired, desiredArg{
+			flag:       SGLangHiCacheIOBackendArg,
+			value:      string(cfg.ioBackend),
+			equivalent: equivalentExact,
+		})
+	}
+	if cfg.memoryLayout != "" {
+		desired = append(desired, desiredArg{
+			flag:       SGLangHiCacheMemoryLayoutArg,
+			value:      string(cfg.memoryLayout),
+			equivalent: equivalentExact,
+		})
+	}
+
+	present := make(map[string]bool, len(desired))
+	for _, want := range desired {
+		values, malformed := argValues(args, want.flag)
+		if malformed || len(values) > 1 {
+			return fmt.Errorf("inject SGLang HiCache config: %s is duplicated or malformed", want.flag)
+		}
+		if len(values) == 0 {
+			continue
+		}
+		if !want.equivalent(values[0], want.value) {
+			return fmt.Errorf("inject SGLang HiCache config: existing %s=%q conflicts with desired value %q",
+				want.flag, values[0], want.value)
+		}
+		present[want.flag] = true
+	}
+
+	work := pod.DeepCopy()
+	updated := append([]string(nil), work.Containers[engineIndex].Args...)
+	if !hasExactArg(updated, SGLangEnableHiCacheArg) {
+		updated = append(updated, SGLangEnableHiCacheArg)
+	}
+	for _, want := range desired {
+		if !present[want.flag] {
+			updated = append(updated, want.flag, want.value)
+		}
+	}
+	work.Containers[engineIndex].Args = updated
+	*pod = *work
+	return nil
+}
+
+func (hiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+
+func (a hiCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
+		Image:            a.subscriberImage,
+		ServerAddr:       a.policyServerGRPCAddress,
+		Cache:            cache,
+		Pod:              pod,
+		HashScheme:       subscriberHashScheme,
+		EngineZMQPortStr: defaultEngineZMQPortStr,
+	})
+}
+
+func (hiCacheAdapter) ReservedArgs() []string {
+	return hiCacheReservedArgs()
+}
+
 func hiCacheReservedArgs() []string {
 	return []string{
 		SGLangEnableHiCacheArg,
@@ -28,6 +195,12 @@ func hiCacheReservedArgs() []string {
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
 	}
+}
+
+func (hiCacheAdapter) ReservedEnv() []string { return nil }
+
+func (hiCacheAdapter) EngineContainerName() string {
+	return enginewire.SGLangEngineContainerName
 }
 
 type resolvedHiCacheConfig struct {
@@ -168,6 +341,74 @@ func validMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) bool {
 	}
 }
 
+func validateEnableArg(args []string) error {
+	count := 0
+	for _, arg := range args {
+		switch {
+		case arg == SGLangEnableHiCacheArg:
+			count++
+		case strings.HasPrefix(arg, SGLangEnableHiCacheArg+"="):
+			return fmt.Errorf("inject SGLang HiCache config: %s is a boolean flag and must not carry a value", SGLangEnableHiCacheArg)
+		}
+	}
+	if count > 1 {
+		return fmt.Errorf("inject SGLang HiCache config: %s is duplicated", SGLangEnableHiCacheArg)
+	}
+	return nil
+}
+
+func rejectPresentArg(args []string, flag, reason string) error {
+	values, malformed := argValues(args, flag)
+	if malformed {
+		return fmt.Errorf("inject SGLang HiCache config: %s is malformed", flag)
+	}
+	if len(values) > 0 {
+		return fmt.Errorf("inject SGLang HiCache config: existing %s %s", flag, reason)
+	}
+	return nil
+}
+
+func argValues(args []string, flag string) (values []string, malformed bool) {
+	prefix := flag + "="
+	for index := 0; index < len(args); index++ {
+		switch {
+		case args[index] == flag:
+			if index+1 >= len(args) || strings.HasPrefix(args[index+1], "--") {
+				malformed = true
+				continue
+			}
+			values = append(values, args[index+1])
+			index++
+		case strings.HasPrefix(args[index], prefix):
+			value := strings.TrimPrefix(args[index], prefix)
+			if value == "" {
+				malformed = true
+				continue
+			}
+			values = append(values, value)
+		}
+	}
+	return values, malformed
+}
+
+func hasArg(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExactArg(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
+}
+
 func leadingFlagToken(arg string) string {
 	if !strings.HasPrefix(arg, "-") {
 		return ""
@@ -186,3 +427,25 @@ func isHiCacheReservedArg(flag string) bool {
 	}
 	return false
 }
+
+func equivalentExact(actual, desired string) bool { return actual == desired }
+
+func equivalentInteger(actual, desired string) bool {
+	actualValue, actualErr := strconv.ParseInt(actual, 10, 64)
+	desiredValue, desiredErr := strconv.ParseInt(desired, 10, 64)
+	return actualErr == nil && desiredErr == nil && actualValue == desiredValue
+}
+
+func equivalentNumber(actual, desired string) bool {
+	actualValue, actualErr := strconv.ParseFloat(actual, 64)
+	desiredValue, desiredErr := strconv.ParseFloat(desired, 64)
+	return actualErr == nil && desiredErr == nil &&
+		!math.IsNaN(actualValue) && !math.IsNaN(desiredValue) &&
+		!math.IsInf(actualValue, 0) && !math.IsInf(desiredValue, 0) &&
+		actualValue == desiredValue
+}
+
+var (
+	_ runtimeadapter.KVCacheRuntimeAdapter = hiCacheAdapter{}
+	_ runtimeadapter.EndpointRequirement   = hiCacheAdapter{}
+)
