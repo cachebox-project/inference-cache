@@ -12,10 +12,10 @@ have the best prefix match.
 
 It also gives operators a Kubernetes-native way to provision shared cache
 backends, connect them to inference engines, and define cache, tenant, and
-prompt policies through CRDs. The cache plane carries metadata and policy, not
-prompt text or KV tensors, and it never makes the final routing decision. When
-no useful hint is available, the gateway follows its normal routing policy:
-Inference Cache is designed to fail open.
+prompt policies through CRDs. Its cache index stores metadata rather than
+prompt text or KV tensors, and the cache plane never makes the final routing
+decision. When no useful hint is available, the gateway follows its normal
+routing policy: Inference Cache is designed to fail open.
 
 ## Key Features
 
@@ -31,9 +31,9 @@ Inference Cache is designed to fail open.
 - **Declarative cache policy** — Kubernetes CRDs configure backend lifecycle,
   lookup behavior, tenant isolation and quotas, and expose observed cache state
   through familiar status and condition surfaces.
-- **Fail-open request path** — returns `NO_HINT` when cache information is
-  missing, stale, or unusable, allowing the gateway to continue with its
-  default routing policy.
+- **Fail-open request path** — returns advisory routing results that gateways
+  may ignore; missing, stale, timed-out, or unusable cache information never
+  prevents the gateway from following its default routing policy.
 - **Built-in operations surface** — provides health and readiness endpoints,
   Prometheus metrics and alerts, Kubernetes events, functional probes, and the
   `inferencecache doctor` diagnostic command.
