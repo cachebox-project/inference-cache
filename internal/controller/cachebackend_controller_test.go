@@ -12,6 +12,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -648,6 +649,74 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 	// reuse this pre-unmanaged time and breach the first-event window instantly.
 	if got.Status.FirstAvailableAt != nil {
 		t.Fatalf("status.firstAvailableAt = %v, want cleared on managed→unmanaged transition", got.Status.FirstAvailableAt)
+	}
+}
+
+func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
+	scheme := newScheme(t)
+	r := newReconciler(
+		scheme,
+		lmcacheBackend("cache", "ns1"),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-0", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-1", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
+	)
+	reconcile(t, r, "cache", "ns1")
+
+	live := getBackend(t, r, "cache", "ns1")
+	matched := int32(2)
+	live.Status.Endpoint = "cache.ns1.svc:65432"
+	live.Status.ObservedServerInstance = "cache-pod-uid:0"
+	live.Status.MatchedEnginePods = &matched
+	live.Status.IndexParticipation = &cachev1alpha1.CacheBackendIndexParticipation{PrefixCount: 7}
+	meta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
+		Type:   conditionTypeReady,
+		Status: metav1.ConditionTrue,
+		Reason: "Available",
+	})
+	if err := r.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("plant managed status: %v", err)
+	}
+
+	switching := getBackend(t, r, "cache", "ns1")
+	switching.Generation = 2
+	switching.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+	switching.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "sglang",
+		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
+		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+	}
+	switching.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "sglang"},
+	}
+	switching.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
+	if err := r.Update(context.Background(), switching); err != nil {
+		t.Fatalf("switch to SGLangHiCache: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+
+	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); !apierrors.IsNotFound(err) {
+		t.Fatalf("managed Deployment still exists after switch: %v", err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("managed Service still exists after switch: %v", err)
+	}
+	got := getBackend(t, r, "cache", "ns1")
+	if got.Status.Endpoint != "" || got.Status.ObservedServerInstance != "" {
+		t.Fatalf("stale managed endpoint/server instance survived: %+v", got.Status)
+	}
+	if len(got.Status.Conditions) != 0 {
+		t.Fatalf("SGLangHiCache first commit must publish no conditions, got %v", got.Status.Conditions)
+	}
+	if got.Status.ObservedGeneration != got.Generation {
+		t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
+	}
+	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 2 {
+		t.Fatalf("matchedEnginePods = %v, want preserved 2", got.Status.MatchedEnginePods)
+	}
+	if got.Status.IndexParticipation == nil || got.Status.IndexParticipation.PrefixCount != 7 {
+		t.Fatalf("indexParticipation = %+v, want preserved", got.Status.IndexParticipation)
 	}
 }
 

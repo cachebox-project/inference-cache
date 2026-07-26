@@ -156,6 +156,10 @@ func main() {
 		adapterruntime.WithSubscriberImage(opts.subscriberImage),
 		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
 	))
+	adapterRegistry.Register(sglangadapter.NewHiCacheAdapter(
+		adapterruntime.WithSubscriberImage(opts.subscriberImage),
+		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
+	))
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
 	// An empty ProbeURL disables the gate — useful for local-dev runs that
