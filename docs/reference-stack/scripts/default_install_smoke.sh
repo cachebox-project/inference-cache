@@ -93,6 +93,12 @@
 #      gate as a managed backend. The managed-only conditions (FunctionalProbeOK
 #      / EngineKernelsHealthy / T2Degraded / EngineCompatibility) are absent.
 #      Also exercises the validating webhook's EventsOnly+External rejection.
+#   9c. Native SGLang HiCache end-to-end: applying the committed HiCache sample
+#      is observed by the controller without rendering a Deployment, Service, or
+#      HPA; status.endpoint stays empty and no synthetic Ready condition is
+#      published. A matching engine Pod sent through real server-side dry-run
+#      admission receives the complete native --hicache-* argument contract,
+#      proving the endpoint-free Pod webhook path without starting SGLang.
 #  10. The /snapshot endpoint rejects unauthenticated callers AT THE NETWORK
 #      LAYER: a side curl pod outside the controller's SA identity (and outside
 #      the NetworkPolicy allowlist) has its connection to :8081 DROPPED by the
@@ -237,6 +243,7 @@
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
 #           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
+#           HICACHE_SMOKE_TIMEOUT, HICACHE_SMOKE_NS, HICACHE_SMOKE_CB_NAME,
 #           KERNEL_CHECK_SMOKE_NS, KERNEL_CHECK_POD_TIMEOUT,
 #           KERNEL_CHECK_COND_TIMEOUT, MOONCAKE_SMOKE_NS, MOONCAKE_MASTER_IMAGE.
 
@@ -271,6 +278,7 @@ EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 # KV-event gate publishing Ready=False/AwaitingFirstKVEvent — a sub-second
 # server-less reconcile; the budget covers APIReader warm-up + leader-election.
 EVENTSONLY_BACKEND_TIMEOUT="${EVENTSONLY_BACKEND_TIMEOUT:-30}" # seconds
+HICACHE_SMOKE_TIMEOUT="${HICACHE_SMOKE_TIMEOUT:-30}"           # seconds
 
 # Kernel-check smoke tunables (assertions 14 + 15).
 # KERNEL_CHECK_SMOKE_NS is a dedicated namespace created + deleted by those
@@ -349,6 +357,12 @@ EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 # events-only section creates the objects.
 EVENTSONLY_SMOKE_NS="${EVENTSONLY_SMOKE_NS:-ic-smoke-events-only}"
 EVENTSONLY_SMOKE_CB_NAME="${EVENTSONLY_SMOKE_CB_NAME:-cachebackend-events-only}"
+
+# Native SGLang HiCache fixture identifiers. This engine-local backend has no
+# endpoint or controller-owned workload, so its dedicated namespace should
+# contain only the persisted CacheBackend used by the smoke.
+HICACHE_SMOKE_NS="${HICACHE_SMOKE_NS:-ic-smoke-sglang-hicache}"
+HICACHE_SMOKE_CB_NAME="${HICACHE_SMOKE_CB_NAME:-sglang-hicache}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
@@ -429,6 +443,12 @@ collect_diagnostics() {
     >"$LOG_DIR/events-only-cb.yaml" 2>&1 || true
   kubectl get deploy,svc -n "$EVENTSONLY_SMOKE_NS" \
     >"$LOG_DIR/events-only-ns-workloads.txt" 2>&1 || true
+  # Native SGLang HiCache smoke artefacts. Best-effort — the CR may not exist
+  # if the smoke aborted before that section.
+  kubectl get cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" -o yaml \
+    >"$LOG_DIR/sglang-hicache-cb.yaml" 2>&1 || true
+  kubectl get deploy,svc,hpa -n "$HICACHE_SMOKE_NS" \
+    >"$LOG_DIR/sglang-hicache-ns-workloads.txt" 2>&1 || true
   # Kernel-check smoke artefacts. Best-effort — the objects may not
   # exist if the smoke aborted before that section.
   kubectl get cb -n "$KERNEL_CHECK_SMOKE_NS" -o yaml \
@@ -2534,6 +2554,105 @@ log "admission rejected EventsOnly+External misconfiguration"
 kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$EVENTSONLY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
 
+# --- Native SGLang HiCache end-to-end --------------------------------------
+# This phase drives the new operator-facing surface through the real installed
+# CRD, validating webhook, controller, and Pod mutating webhook. HiCache is
+# engine-local, so the observable controller contract is deliberately negative:
+# no cache-server workload, no endpoint, and no synthetic Ready condition. The
+# Pod is server-side dry-run only; its admitted shape proves native argument
+# injection without pulling or starting a real SGLang image.
+log "exercising native SGLang HiCache end-to-end in namespace $HICACHE_SMOKE_NS"
+kubectl create namespace "$HICACHE_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Apply the committed sample rather than duplicating its CacheBackend contract
+# inline. Only the name is tunable; the sample remains namespace-less so -n
+# places it in the dedicated smoke namespace.
+hc_sample_tmp="$(mktemp "$tmpdir/sample-sglang-hicache.XXXXXX")"
+sed "s|^  name: sglang-hicache\$|  name: $HICACHE_SMOKE_CB_NAME|" \
+  config/samples/cachebackend-sglang-hicache.yaml > "$hc_sample_tmp"
+kubectl -n "$HICACHE_SMOKE_NS" apply -f "$hc_sample_tmp" >/dev/null \
+  || fail "kubectl apply native SGLang HiCache sample failed"
+
+# Wait until the controller has taken the engine-local path. observedGeneration
+# is the positive acknowledgement; endpoint/Ready/workload assertions below pin
+# what that path intentionally does not publish or provision.
+hc_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.metadata.generation}')"
+deadline=$(($(date +%s) + HICACHE_SMOKE_TIMEOUT))
+hc_observed_generation=""
+until [ "$hc_observed_generation" = "$hc_generation" ]; do
+  hc_observed_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+    fail "native HiCache CR was not observed within ${HICACHE_SMOKE_TIMEOUT}s: generation=$hc_generation observedGeneration=$hc_observed_generation"
+  fi
+  sleep 1
+done
+log "native HiCache CR observed at generation $hc_observed_generation"
+
+hc_endpoint="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+hc_ready="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].type}' 2>/dev/null || true)"
+if [ -n "$hc_endpoint" ] || [ -n "$hc_ready" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+  fail "native HiCache published server-backed status (endpoint=$hc_endpoint Ready=$hc_ready, want both absent)"
+fi
+
+hc_dep_count="$(kubectl -n "$HICACHE_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_svc_count="$(kubectl -n "$HICACHE_SMOKE_NS" get svc -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_hpa_count="$(kubectl -n "$HICACHE_SMOKE_NS" get hpa -o name 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$hc_dep_count" != "0" ] || [ "$hc_svc_count" != "0" ] || [ "$hc_hpa_count" != "0" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get deploy,svc,hpa || true
+  fail "native HiCache rendered controller-owned workload (deploy=$hc_dep_count svc=$hc_svc_count hpa=$hc_hpa_count, want 0/0/0)"
+fi
+log "native HiCache rendered no Deployment, Service, or HPA and published no endpoint/Ready condition"
+
+# Exercise the installed Pod mutating webhook with a matching, single-container
+# engine Pod. The dry-run response is the fully admitted Pod, including webhook
+# mutations, but nothing is persisted or started.
+hc_engine_fixture="$(mktemp "$tmpdir/pod-sglang-hicache.XXXXXX.yaml")"
+cat > "$hc_engine_fixture" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-hicache-engine
+  namespace: $HICACHE_SMOKE_NS
+  labels:
+    app: sglang
+spec:
+  containers:
+    - name: sglang
+      image: busybox:1.36
+      args:
+        - sleep
+        - "3600"
+EOF
+
+if ! hc_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{range (index .spec.containers 0).args}}{{println .}}{{end}}' 2>/dev/null)"; then
+  fail "matching SGLang Pod did not pass server-side dry-run admission"
+fi
+hc_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first'
+if [ "$hc_pod_args" != "$hc_expected_args" ]; then
+  printf '[install-smoke] admitted SGLang args:\n%s\n' "$hc_pod_args" >&2
+  fail "native HiCache Pod mutation did not produce the expected complete argument contract"
+fi
+
+hc_injected_by="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{index .metadata.annotations "inferencecache.io/injected-by"}}' 2>/dev/null)" \
+  || fail "could not read native HiCache injection annotation from dry-run Pod"
+if [ "$hc_injected_by" != "$HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME" ]; then
+  fail "native HiCache dry-run Pod injected-by=$hc_injected_by, want $HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME"
+fi
+log "native HiCache Pod webhook injected the complete CLI contract and backend identity"
+
+kubectl delete cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
+kubectl delete namespace "$HICACHE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
+
 # --- /snapshot NetworkPolicy-drop assertion -------------------------------
 # The CacheIndex CR being populated above already proves the controller can
 # scrape /snapshot with its SA token (the bearer path). The complementary
@@ -3757,4 +3876,4 @@ log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, w
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
