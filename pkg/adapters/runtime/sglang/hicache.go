@@ -88,6 +88,16 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 	if err := validateEnableArg(args); err != nil {
 		return err
 	}
+	for _, flag := range []string{
+		SGLangHiCacheWritePolicyArg,
+		SGLangHiCacheIOBackendArg,
+		SGLangHiCacheMemoryLayoutArg,
+	} {
+		values, malformed := argValues(args, flag)
+		if malformed || len(values) > 1 {
+			return fmt.Errorf("inject SGLang HiCache config: %s is duplicated or malformed", flag)
+		}
+	}
 
 	type desiredArg struct {
 		flag       string

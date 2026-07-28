@@ -128,8 +128,7 @@ func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 
 func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{
-		Ratio:       "2.0",
-		WritePolicy: cachev1alpha1.SGLangHiCacheWriteThrough,
+		Ratio: "2.0",
 	})
 	originalArgs := []string{
 		"--model-path", "model",
@@ -137,6 +136,7 @@ func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 		SGLangHiCacheRatioArg + "=2",
 		SGLangHiCacheWritePolicyArg, "write_through",
 		"--hicache-io-backend=kernel",
+		SGLangHiCacheMemoryLayoutArg, "page_first",
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{
 		Name: enginewire.SGLangEngineContainerName,
@@ -182,6 +182,37 @@ func TestHiCacheConflictsFailAtomically(t *testing.T) {
 			}
 			before := pod.DeepCopy()
 			if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", base); err == nil {
+				t.Fatal("InjectEngineConfig returned no error")
+			}
+			if !reflect.DeepEqual(pod, before) {
+				t.Fatalf("failed injection mutated pod:\nbefore=%+v\nafter=%+v", before, pod)
+			}
+		})
+	}
+}
+
+func TestHiCacheOmittedOptionalArgsFailAtomicallyWhenMalformedOrDuplicated(t *testing.T) {
+	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"malformed write policy", []string{SGLangHiCacheWritePolicyArg}},
+		{"duplicate write policy", []string{SGLangHiCacheWritePolicyArg, "write_back", SGLangHiCacheWritePolicyArg + "=write_through"}},
+		{"malformed io backend", []string{SGLangHiCacheIOBackendArg}},
+		{"duplicate io backend", []string{SGLangHiCacheIOBackendArg, "direct", SGLangHiCacheIOBackendArg + "=kernel"}},
+		{"malformed memory layout", []string{SGLangHiCacheMemoryLayoutArg}},
+		{"duplicate memory layout", []string{SGLangHiCacheMemoryLayoutArg, "layer_first", SGLangHiCacheMemoryLayoutArg + "=page_first"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{
+				Name: enginewire.SGLangEngineContainerName,
+				Args: append([]string(nil), tc.args...),
+				Env:  []corev1.EnvVar{{Name: "KEEP", Value: "yes"}},
+			}}}
+			before := pod.DeepCopy()
+			if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
