@@ -501,6 +501,13 @@ verify-no-internal-refs: ## Fail if tracked files reference internal issue track
 	fi; \
 	echo "✓ no internal issue-tracker references"
 
+# Base ref the docs-sync check diffs against. CI overrides it with the PR base
+# (origin/<base-branch>); locally it defaults to origin/main.
+DOCS_SYNC_BASE ?= origin/main
+.PHONY: verify-docs-sync
+verify-docs-sync: ## Fail if a CRD/proto change in this branch updates no docs (site/ or docs/). Override base with DOCS_SYNC_BASE=.
+	@bash hack/verify-docs-sync.sh "$(DOCS_SYNC_BASE)"
+
 .PHONY: verify-syft-pin
 verify-syft-pin: ## Fail if the Syft version/checksum pin drifts across release tooling.
 	@bash hack/verify-syft-version.sh
