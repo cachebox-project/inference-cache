@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -155,6 +156,33 @@ func TestGRPCLoadsScraperErrorIsSurfaced(t *testing.T) {
 	}
 }
 
+// blockUntilCtxDone models an engine that never answers within the deadline: it
+// returns only once the call's context is cancelled, echoing that context's error.
+type blockUntilCtxDone struct{}
+
+func (blockUntilCtxDone) GetLoads(ctx context.Context, _ *vpb.GetLoadsRequest, _ ...grpc.CallOption) (*vpb.GetLoadsResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestGRPCLoadsScraperTimeoutIsSurfaced(t *testing.T) {
+	// The scraper bounds each GetLoads with its own Timeout. A call that outlives it
+	// must surface the deadline (not hang) and still return a non-nil zero
+	// ReplicaStats, so the StatsReporter logs and skips the tick like any other error.
+	s := newGRPCLoadsScraperWithClient(blockUntilCtxDone{},
+		GRPCLoadsScraperConfig{Addr: "x:1", Timeout: time.Millisecond})
+	st, err := s.Scrape(context.Background())
+	if err == nil {
+		t.Fatal("want deadline error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("want context.DeadlineExceeded, got %v", err)
+	}
+	if st == nil {
+		t.Fatal("want zero ReplicaStats on timeout, got nil")
+	}
+}
+
 // mockEngineServer implements the generated VllmEngineServer for a bufconn
 // end-to-end test through the real generated stubs.
 type mockEngineServer struct {
@@ -203,5 +231,8 @@ func TestGRPCLoadsScraperEndToEndOverBufconn(t *testing.T) {
 	}
 	if st.GetCacheMemoryBytes() != int64(0.25*float64(1<<30)) {
 		t.Errorf("cache_memory_bytes = %d", st.GetCacheMemoryBytes())
+	}
+	if got, want := st.GetHitRate(), float32(0.6); got != want { // the third advertised signal
+		t.Errorf("hit_rate = %v, want %v", got, want)
 	}
 }

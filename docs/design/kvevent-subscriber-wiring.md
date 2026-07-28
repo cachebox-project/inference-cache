@@ -111,10 +111,11 @@ Concretely:
   `--engine-loads-grpc` flag. The sidecar renderer does **not** pass that flag yet, so
   auto-injected sidecars keep the HTTP default. Deferred deliberately: `GetLoads` requires a
   newer engine floor (a gRPC server that implements `GetLoads`; vLLM ≥ 0.19) than the engine currently
-  deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC and flip
-  the load signal to "stale" (see the `StatsReporter` stale-escalation path). It gets wired
-  alongside the stats-path knobs above once the engine floor moves; until then it is opt-in
-  via the binary flag for gRPC-only engine deployments.
+  deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC: every
+  scrape would fail, the `StatsReporter` would log and skip each tick, and the ranker would be
+  left with a stale (never-updated) load signal. It gets wired alongside the stats-path knobs
+  above once the engine floor moves; until then it is opt-in via the binary flag for
+  gRPC-only engine deployments.
 * **TLS subscriber → policy-server** — separate ticket.
 * **HA / multi-server policy-server target** — separate ticket.
 * **Readiness gating on first KV event observed** — natural follow-up once this lands.
