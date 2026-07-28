@@ -654,13 +654,22 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 
 func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	scheme := newScheme(t)
+	managed := lmcacheBackend("cache", "ns1")
+	managed.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
+		MinReplicas: ptrInt32(1),
+		MaxReplicas: 3,
+	}
 	r := newReconciler(
 		scheme,
-		lmcacheBackend("cache", "ns1"),
+		managed,
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-0", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-1", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
 	)
 	reconcile(t, r, "cache", "ns1")
+	var managedHPA autoscalingv2.HorizontalPodAutoscaler
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &managedHPA); err != nil {
+		t.Fatalf("get managed HPA before switch: %v", err)
+	}
 
 	live := getBackend(t, r, "cache", "ns1")
 	matched := int32(2)
@@ -689,6 +698,7 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	switching.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "sglang"},
 	}
+	switching.Spec.Autoscaling = nil
 	switching.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
 	if err := r.Update(context.Background(), switching); err != nil {
 		t.Fatalf("switch to SGLangHiCache: %v", err)
@@ -701,6 +711,10 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	var service corev1.Service
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &service); !apierrors.IsNotFound(err) {
 		t.Fatalf("managed Service still exists after switch: %v", err)
+	}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &hpa); !apierrors.IsNotFound(err) {
+		t.Fatalf("managed HPA still exists after switch: %v", err)
 	}
 	got := getBackend(t, r, "cache", "ns1")
 	if got.Status.Endpoint != "" || got.Status.ObservedServerInstance != "" {
