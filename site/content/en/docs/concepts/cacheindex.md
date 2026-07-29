@@ -17,7 +17,7 @@ never reads the CR.
 
 `CacheIndex` is the only cluster-scoped inference-cache CRD, short name `ci`. Its `spec` is
 intentionally empty; the controller maintains its `status` by polling the server's
-`/snapshot` endpoint (see [the controller↔server bridge](/docs/concepts/architecture/#the-controller--server-bridge)).
+`/snapshot` endpoint (see [the controller↔server bridge]({{< relref "/docs/concepts/architecture/#the-controller--server-bridge" >}})).
 
 ```bash
 kubectl get cacheindex cluster-default -o yaml

@@ -66,5 +66,5 @@ defines the shape the full implementation will consume.
 
 ## Related pages
 
-- [The gRPC contract](/docs/concepts/grpc-contract/) — the `LookupPDRoute` RPC.
-- [CacheBackend](/docs/concepts/cachebackend/) — Mooncake as a transfer backend.
+- [The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) — the `LookupPDRoute` RPC.
+- [CacheBackend]({{< relref "/docs/concepts/cachebackend/" >}}) — Mooncake as a transfer backend.

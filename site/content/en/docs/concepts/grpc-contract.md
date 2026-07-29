@@ -12,7 +12,7 @@ description: >
 The `InferenceCache` gRPC service is the data-plane API that gateways and engines integrate
 against. It is defined in `proto/inferencecache/v1alpha1/inferencecache.proto`, package
 `inferencecache.v1alpha1`, and served on `:9090` (plaintext by default; TLS is an opt-in
-overlay — see [gRPC TLS](/docs/administration/grpc-tls/)).
+overlay — see [gRPC TLS]({{< relref "/docs/administration/grpc-tls/" >}})).
 
 ## Eight RPCs, three roles
 
@@ -21,7 +21,7 @@ bookkeeping:**
 
 | RPC | Kind | Purpose |
 |---|---|---|
-| `LookupRoute` | unary | The core cache-aware routing hint. See [LookupRoute & ranking](/docs/concepts/lookuproute/). |
+| `LookupRoute` | unary | The core cache-aware routing hint. See [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}). |
 | `RenderTemplate` | unary | Deterministic mutable-slot prompt render. Fail-open stub today. |
 | `LookupPDRoute` | unary | Prefill/decode split routing. Phase-2 stub. |
 | `GetCacheState` | unary | The `(tenant, model)` aggregate (replica stats + summary). |
@@ -145,6 +145,6 @@ is verified drift-free in CI.
 
 ## Related pages
 
-- [Reason codes](/docs/reference/reason-codes/) — the full string-code vocabulary.
-- [gRPC API reference](/docs/reference/grpc-api/) — RPC-by-RPC detail.
-- [LookupRoute & ranking](/docs/concepts/lookuproute/) — how the hint is computed.
+- [Reason codes]({{< relref "/docs/reference/reason-codes/" >}}) — the full string-code vocabulary.
+- [gRPC API reference]({{< relref "/docs/reference/grpc-api/" >}}) — RPC-by-RPC detail.
+- [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}) — how the hint is computed.

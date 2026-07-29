@@ -11,26 +11,26 @@ This section covers the operational concerns of running inference-cache in produ
 
 ## Monitoring & operations
 
-### [Observability & Alerts](/docs/administration/observability-and-alerts/)
+### [Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}})
 
 The opt-in Prometheus alert bundle, what each alert means and when it fires, and the
 scraping you must configure for both the server and the controller pod.
 
-### [Index sizing](/docs/administration/index-sizing/)
+### [Index sizing]({{< relref "/docs/administration/index-sizing/" >}})
 
 How the in-memory index consumes memory, the pod-budget table, the sizing formula, and the
 levers (TTL, eviction, quota) for keeping it in bounds.
 
 ## Security
 
-### [gRPC TLS](/docs/administration/grpc-tls/)
+### [gRPC TLS]({{< relref "/docs/administration/grpc-tls/" >}})
 
 The locked TLS design, why gRPC is plaintext by default, and how to enable the opt-in TLS
 overlay.
 
 ## Troubleshooting
 
-### [Troubleshooting](/docs/administration/troubleshooting/)
+### [Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}})
 
 The `CacheBackend` readiness runbook (per condition and reason) and the `inferencecache
 doctor` check catalog.

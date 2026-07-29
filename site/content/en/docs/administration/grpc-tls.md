@@ -71,5 +71,5 @@ doctor dials gRPC plaintext.
 
 ## Related pages
 
-- [Architecture](/docs/concepts/architecture/) — the listeners and the bridge.
-- [The gRPC contract](/docs/concepts/grpc-contract/) — what flows over `:9090`.
+- [Architecture]({{< relref "/docs/concepts/architecture/" >}}) — the listeners and the bridge.
+- [The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) — what flows over `:9090`.

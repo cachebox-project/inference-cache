@@ -8,8 +8,8 @@ description: >
 
 Service **`InferenceCache`**, package **`inferencecache.v1alpha1`**, proto
 `proto/inferencecache/v1alpha1/inferencecache.proto`. Served on `:9090` (plaintext by
-default; [TLS overlay](/docs/administration/grpc-tls/) available). See
-[The gRPC contract](/docs/concepts/grpc-contract/) for the guarantees; this page is the
+default; [TLS overlay]({{< relref "/docs/administration/grpc-tls/" >}}) available). See
+[The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) for the guarantees; this page is the
 per-RPC reference.
 
 ## Consumer RPCs
@@ -29,7 +29,7 @@ entries' eviction access counters.
   `prompt_text`. Caller-supplied `token_ids` are not echoed.
 - **Reason codes:** `PREFIX_MATCH`, `TENANT_HOT`, `AFFINITY_HINT`, `NO_HINT`,
   `POLICY_REQUIRES_CHAIN`, `TIMEOUT`, `UNKNOWN_TENANT`, `UNKNOWN_MODEL`,
-  `UNKNOWN_HASH_SCHEME`. See [reason codes](/docs/reference/reason-codes/).
+  `UNKNOWN_HASH_SCHEME`. See [reason codes]({{< relref "/docs/reference/reason-codes/" >}}).
 
 ### `RenderTemplate(RenderTemplateRequest) → RenderTemplateResponse`
 

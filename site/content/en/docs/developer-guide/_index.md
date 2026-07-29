@@ -13,7 +13,7 @@ kubebuilder-style controller conventions with generated code checked in.
 
 ## Getting started
 
-### [Contributing](/docs/developer-guide/contributing/)
+### [Contributing]({{< relref "/docs/developer-guide/contributing/" >}})
 
 Local setup, the build/test/verify targets, the required checks before a PR, and the two
 project rules the tooling enforces (vendor-neutral naming and no internal issue-tracker

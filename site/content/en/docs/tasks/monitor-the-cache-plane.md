@@ -28,12 +28,12 @@ When a backend is not `Ready`, the reason is in `.status.conditions[]`:
 kubectl get cachebackend my-cache -o yaml | yq '.status.conditions'
 ```
 
-See [Troubleshooting](/docs/administration/troubleshooting/) for the per-reason runbook.
+See [Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}) for the per-reason runbook.
 
 ## The metrics that matter
 
 Both binaries expose Prometheus metrics on their pod's `:8080/metrics`, prefixed
-`inferencecache_*`. The [metrics reference](/docs/reference/metrics/) lists them all; these
+`inferencecache_*`. The [metrics reference]({{< relref "/docs/reference/metrics/" >}}) lists them all; these
 are the ones to watch day-to-day:
 
 | Signal | Metric | Why |
@@ -42,11 +42,11 @@ are the ones to watch day-to-day:
 | Are lookups producing hints? | `inferencecache_lookup_route_calls_total{model,reason_code,hint_used}` | A high `NO_HINT` share (or `UNKNOWN_*`) means no reuse — or a client misconfiguration. |
 | Lookup latency | `inferencecache_lookup_route_latency_seconds{model}` | The hot path should stay in the sub-millisecond buckets. |
 | Tier-2 offload health | `inferencecache_backend_t2_hit_rate{backend}` | `0` while queries flow = a silently-degraded offload tier. |
-| Cap pressure | `inferencecache_index_evictions_total{reason="cap"}` | Sustained cap evictions mean the index is over budget — see [index sizing](/docs/administration/index-sizing/). |
+| Cap pressure | `inferencecache_index_evictions_total{reason="cap"}` | Sustained cap evictions mean the index is over budget — see [index sizing]({{< relref "/docs/administration/index-sizing/" >}}). |
 | Functional probe | `inferencecache_backend_probe_result_total{backend,stage,result}` | Repeated `result="failed"` is the controller-side health signal. |
 
 The opt-in alert bundle turns these into alerts — see
-[Observability & Alerts](/docs/administration/observability-and-alerts/).
+[Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}}).
 
 ## The doctor pre-flight check
 
@@ -68,12 +68,12 @@ inferencecache doctor -o json
 
 Exit codes make it CI-friendly: `0` (≤ INFO), `1` (≥ WARN), `2` (≥ FAIL). Under the gRPC TLS
 overlay, use `--config-only` (the doctor dials gRPC plaintext). See
-[Troubleshooting](/docs/administration/troubleshooting/) for the full check catalog and
+[Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}) for the full check catalog and
 finding codes.
 
 ## Related pages
 
-- [Observability & Alerts](/docs/administration/observability-and-alerts/) — the alert
+- [Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}}) — the alert
   bundle and how to wire scraping.
-- [Metrics reference](/docs/reference/metrics/) — every series.
-- [CLI reference](/docs/reference/cli-doctor/) — every flag and finding code.
+- [Metrics reference]({{< relref "/docs/reference/metrics/" >}}) — every series.
+- [CLI reference]({{< relref "/docs/reference/cli-doctor/" >}}) — every flag and finding code.

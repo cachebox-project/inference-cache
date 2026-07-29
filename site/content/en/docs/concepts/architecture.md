@@ -62,7 +62,7 @@ the controller injects it only when started with a `--kvevent-subscriber-image`.
 ### `inferencecache` CLI
 
 `inferencecache doctor` runs a read-only pre-flight diagnostic across the install — see
-[Troubleshooting](/docs/administration/troubleshooting/).
+[Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}).
 
 ## The controller ↔ server bridge
 

@@ -10,7 +10,7 @@ Multi-tenancy in inference-cache comes in two layers: **structural identity isol
 (always on) and an optional **entry-count quota**. For byte-level isolation you use
 Kubernetes, not a cache field — this page explains why and how.
 
-See [CacheTenant](/docs/concepts/cachetenant/) for the field reference.
+See [CacheTenant]({{< relref "/docs/concepts/cachetenant/" >}}) for the field reference.
 
 ## Identity isolation is automatic
 
@@ -47,7 +47,7 @@ a tenant exceeds it, the **oldest entries are evicted** (Fairness) — a lookup 
 rejected. Unset means unbounded.
 
 Pick a budget from your cluster index cap and how many tenants share it — see
-[Index sizing](/docs/administration/index-sizing/) for the sizing math. A bounded, non-zero
+[Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) for the sizing math. A bounded, non-zero
 `inferencecache_tenant_evictions_total` for a tenant is normal Fairness behavior, not an
 error.
 
@@ -66,7 +66,7 @@ error.
 There is deliberately **no** per-tenant memory quota. Engine KV memory is a single shared,
 tenant-unaware LRU pool — the cache plane can neither enforce a byte budget on it nor
 honestly attribute bytes per tenant on a shared engine (they would double-count). See the
-[enforcement boundary](/docs/concepts/architecture/#enforcement-boundary).
+[enforcement boundary]({{< relref "/docs/concepts/architecture/#enforcement-boundary" >}}).
 
 **The supported pattern for hard byte isolation is Kubernetes-native:** run a separate engine
 Deployment (and its own `CacheBackend`) per tenant, and let pod memory limits enforce at the
@@ -107,5 +107,5 @@ ceiling — the isolation the cache plane cannot provide on a shared engine.
 
 ## Related pages
 
-- [CacheTenant](/docs/concepts/cachetenant/) — the field reference.
-- [Index sizing](/docs/administration/index-sizing/) — quota budgeting.
+- [CacheTenant]({{< relref "/docs/concepts/cachetenant/" >}}) — the field reference.
+- [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) — quota budgeting.

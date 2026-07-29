@@ -101,12 +101,12 @@ Useful flags: `--kubeconfig`, `--context`, `-n/--namespace`, `--server-endpoint`
 `--snapshot-token-file`, `-o/--output` (`human`/`json`/`table`), `--no-color`,
 `--config-only`, `--timeout` (default 30s).
 
-Under the [gRPC TLS overlay](/docs/administration/grpc-tls/), use `--config-only` — the
+Under the [gRPC TLS overlay]({{< relref "/docs/administration/grpc-tls/" >}}), use `--config-only` — the
 doctor dials gRPC plaintext.
 
 ## Related pages
 
-- [Deploy a CacheBackend](/docs/tasks/deploy-a-cache-backend/) — the readiness gates in
+- [Deploy a CacheBackend]({{< relref "/docs/tasks/deploy-a-cache-backend/" >}}) — the readiness gates in
   context.
-- [CLI reference](/docs/reference/cli-doctor/) — every finding code.
-- [Reason codes](/docs/reference/reason-codes/) — the lookup outcomes referenced above.
+- [CLI reference]({{< relref "/docs/reference/cli-doctor/" >}}) — every finding code.
+- [Reason codes]({{< relref "/docs/reference/reason-codes/" >}}) — the lookup outcomes referenced above.

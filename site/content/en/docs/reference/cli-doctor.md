@@ -59,7 +59,7 @@ in parentheses.
 
 {{% alert title="Under the TLS overlay" color="info" %}}
 The doctor dials gRPC **plaintext**. If you enabled the
-[gRPC TLS overlay](/docs/administration/grpc-tls/), run with `--config-only` so it skips the
+[gRPC TLS overlay]({{< relref "/docs/administration/grpc-tls/" >}}), run with `--config-only` so it skips the
 live gRPC probes.
 {{% /alert %}}
 
@@ -69,6 +69,6 @@ cluster or with an appropriate token.
 
 ## Related pages
 
-- [Troubleshooting](/docs/administration/troubleshooting/) — the readiness runbook the
+- [Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}) — the readiness runbook the
   per-backend checks map to.
-- [Monitor the cache plane](/docs/tasks/monitor-the-cache-plane/) — where doctor fits.
+- [Monitor the cache plane]({{< relref "/docs/tasks/monitor-the-cache-plane/" >}}) — where doctor fits.

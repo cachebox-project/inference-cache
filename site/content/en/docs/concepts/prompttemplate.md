@@ -68,4 +68,4 @@ Printer columns: `Revision`, `Age`.
 
 ## Related pages
 
-- [The gRPC contract](/docs/concepts/grpc-contract/) — the `RenderTemplate` RPC.
+- [The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) — the `RenderTemplate` RPC.

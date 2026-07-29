@@ -53,10 +53,10 @@ per install by that label).
 | **`ServerProbeFail`** | critical | 5m | Two or more functional-probe failures in 5m (controller-emitted — needs the PodMonitor). |
 | **`LMCacheT2NoHits`** | warning | 5m | More than 1000 tier-2 query tokens/sec but zero hit tokens — a silently-degraded offload tier. |
 
-Four of these (`IndexEmpty`, `LookupRouteDegenerate`, `LookupRouteHighTimeout`,
-`IndexEvictionsSpike`) become active as soon as the operator is installed and the selectors
-match; they stay quiet on a healthy or idle install (each is gated by traffic/rate/eviction
-thresholds).
+Five of these (`IndexEmpty`, `LookupRouteDegenerate`, `LookupRouteHighTimeout`,
+`IndexEvictionsSpike`, `ServerProbeFail`) become active as soon as the operator is installed
+and the selectors match; they stay quiet on a healthy or idle install (each is gated by
+traffic/rate/eviction thresholds).
 
 {{% alert title="LMCacheT2NoHits needs an extra scrape" color="warning" %}}
 `LMCacheT2NoHits` reads `vllm:external_prefix_cache_*` from the **engine pods directly**, not
@@ -68,7 +68,7 @@ the pods your `CacheBackend.spec.engineSelector` matches) that preserves both `n
 
 ## Related pages
 
-- [Metrics reference](/docs/reference/metrics/) — the underlying series.
-- [Index sizing](/docs/administration/index-sizing/) — the eviction/memory relationship
+- [Metrics reference]({{< relref "/docs/reference/metrics/" >}}) — the underlying series.
+- [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) — the eviction/memory relationship
   behind `IndexEvictionsSpike`.
-- [Monitor the cache plane](/docs/tasks/monitor-the-cache-plane/) — the day-to-day view.
+- [Monitor the cache plane]({{< relref "/docs/tasks/monitor-the-cache-plane/" >}}) — the day-to-day view.

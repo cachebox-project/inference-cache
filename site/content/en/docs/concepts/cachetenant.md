@@ -56,7 +56,7 @@ never rejects. An unset quota, or a tenant with no `CacheTenant` at all, is unbo
 
 ### Why there is no memory quota
 
-This is the [enforcement boundary](/docs/concepts/architecture/#enforcement-boundary) in
+This is the [enforcement boundary]({{< relref "/docs/concepts/architecture/#enforcement-boundary" >}}) in
 action. The index entry table is a data structure inference-cache **owns**, so an entry-count
 quota is enforceable. Engine KV memory is **not** ours — vLLM's KV cache is a single shared
 LRU pool indexed by block hash, with no tenant awareness. On a shared engine the plane could
@@ -79,5 +79,5 @@ Printer columns: `Tenant`, `Entries`, `Quota`, `Isolation`, `Age`.
 
 ## Related pages
 
-- [Isolate tenants](/docs/tasks/isolate-tenants/) — the recommended isolation patterns.
-- [Index sizing](/docs/administration/index-sizing/) — choosing a `maxIndexEntries` budget.
+- [Isolate tenants]({{< relref "/docs/tasks/isolate-tenants/" >}}) — the recommended isolation patterns.
+- [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) — choosing a `maxIndexEntries` budget.

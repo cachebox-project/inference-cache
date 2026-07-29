@@ -162,5 +162,5 @@ The pod is admitted vanilla, stamped `inferencecache.io/inject-skipped`, and get
 
 ## Related pages
 
-- [CacheBackend](/docs/concepts/cachebackend/) — the resource in full.
-- [Troubleshooting](/docs/administration/troubleshooting/) — the readiness runbook.
+- [CacheBackend]({{< relref "/docs/concepts/cachebackend/" >}}) — the resource in full.
+- [Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}) — the readiness runbook.

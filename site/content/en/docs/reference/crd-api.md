@@ -52,7 +52,7 @@ at `v1beta1`.
 (`prefixCount`, `lastEventAt`, `hitRate *string`, `t2HitRate *string`), `failOpen`,
 `observedGeneration`, `conditions`.
 
-Full page: [CacheBackend](/docs/concepts/cachebackend/).
+Full page: [CacheBackend]({{< relref "/docs/concepts/cachebackend/" >}}).
 
 ## CachePolicy
 
@@ -70,7 +70,7 @@ Full page: [CacheBackend](/docs/concepts/cachebackend/).
 | `affinityRouting` | `Enabled`, `Disabled` | `Enabled` |
 
 `status` is reserved (not written today). Full page:
-[CachePolicy](/docs/concepts/cachepolicy/).
+[CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}).
 
 ## CacheTenant
 
@@ -83,7 +83,7 @@ Full page: [CacheBackend](/docs/concepts/cachebackend/).
 
 `status`: `indexEntries` (`*int64`), `conditions`, `observedGeneration`. There is
 deliberately **no** `maxMemoryBytes` / `memoryUsed`. Full page:
-[CacheTenant](/docs/concepts/cachetenant/).
+[CacheTenant]({{< relref "/docs/concepts/cachetenant/" >}}).
 
 ## CacheIndex
 
@@ -91,17 +91,17 @@ deliberately **no** `maxMemoryBytes` / `memoryUsed`. Full page:
 (`id`, `tenant`, `cacheMemoryBytes`, `hitRate *string`, `pressure`, `lastUpdate`),
 `tenants[]` (`id`, `indexEntries *int64`, `hitRate *string`, `memoryUsed` — deprecated,
 always 0), `prefixes.summary` (`total`, `hot`=0), `observedServer`, `lastUpdated`. Full page:
-[CacheIndex](/docs/concepts/cacheindex/).
+[CacheIndex]({{< relref "/docs/concepts/cacheindex/" >}}).
 
 ## PromptTemplate
 
 `spec`: `body` (required), `slots[]` (`name`, `type` = `Stable`|`Mutable`, `required`,
 `description`). `status`: `templateRevision`, `conditions`, `observedGeneration`. Full page:
-[PromptTemplate](/docs/concepts/prompttemplate/).
+[PromptTemplate]({{< relref "/docs/concepts/prompttemplate/" >}}).
 
 ## PDTopology
 
 `spec`: `prefillPools[]`, `decodePools[]` (`name`, `matchLabels`, `replicas`,
 `acceleratorType`), `acceleratorTypes[]` (`name`, `vendor`, `model`, `matchLabels`).
 `status`: `conditions`, `observedGeneration`. Full page:
-[PDTopology](/docs/concepts/pdtopology/).
+[PDTopology]({{< relref "/docs/concepts/pdtopology/" >}}).

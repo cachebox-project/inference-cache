@@ -67,7 +67,6 @@ ignoreFiles = []
   github_repo = "https://github.com/cachebox-project/inference-cache"
   github_project_repo = "https://github.com/cachebox-project/inference-cache"
   github_subdir = "site"
-  RSSLink = "/index.xml"
   author = "The inference-cache authors"
   github = "cachebox-project"
 

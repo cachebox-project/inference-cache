@@ -9,7 +9,7 @@ description: >
 
 Get a cache-aware inference setup running in about five minutes. This assumes the
 inference-cache operator (controller + policy server + CRDs) is already
-[installed](/docs/installation/).
+[installed]({{< relref "/docs/installation/" >}}).
 
 ## 1. Write the minimum CacheBackend
 
@@ -49,7 +49,8 @@ setup you also need engine pods carrying that label and publishing KV events. Th
 path is the CPU dev recipe, which needs no GPU:
 
 ```bash
-kubectl apply -f config/samples/recipe-cpu-dev.yaml
+kubectl apply -f \
+  https://raw.githubusercontent.com/cachebox-project/inference-cache/main/config/samples/recipe-cpu-dev.yaml
 ```
 
 That single file ships the `CacheBackend` above plus a matching tiny-model vLLM engine
@@ -99,7 +100,7 @@ kubectl get cachebackend my-cache -o yaml | yq '.status.conditions'
 | `FunctionalProbeOK=Unknown` / `ProbeError` | The controller couldn't reach the server's `/probe` endpoint. Transient outages don't flap `Ready` — unless a real stage failure was already published (that stays sticky). |
 | `FunctionalProbeOK=True` / `ProbeBypassed` | Someone set `inferencecache.io/skip-functional-probe: "true"`. Remove it once you no longer need the bypass. |
 
-See [Troubleshooting](/docs/administration/troubleshooting/) for the full per-reason runbook.
+See [Troubleshooting]({{< relref "/docs/administration/troubleshooting/" >}}) for the full per-reason runbook.
 
 ## What you get
 
@@ -114,8 +115,8 @@ Once the backend is Ready and engine pods are bound, three things are live:
 
 ## Next steps
 
-- [Bind an engine](/docs/tasks/bind-an-engine/) — the selector → webhook → injection model
+- [Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}}) — the selector → webhook → injection model
   and its failure modes.
-- [Tune lookup and eviction](/docs/tasks/tune-lookup-and-eviction/) — per-namespace
+- [Tune lookup and eviction]({{< relref "/docs/tasks/tune-lookup-and-eviction/" >}}) — per-namespace
   `CachePolicy`.
-- [CacheBackend reference](/docs/concepts/cachebackend/) — every field.
+- [CacheBackend reference]({{< relref "/docs/concepts/cachebackend/" >}}) — every field.

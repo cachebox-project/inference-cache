@@ -32,7 +32,7 @@ The three `UNKNOWN_*` codes distinguish a genuinely novel prefix from a client s
 contract keys (the common silent misconfiguration: mismatched `hash_scheme` or `tenant_id`
 between the producer and the gateway). Treat them like an HTTP 4xx — **log, emit a metric,
 fail open, and do not retry.** The mismatch is in your client configuration, not the server.
-See [LookupRoute & ranking](/docs/concepts/lookuproute/#diagnostics-telling-a-novel-prefix-from-a-misconfiguration).
+See [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/#diagnostics-telling-a-novel-prefix-from-a-misconfiguration" >}}).
 
 ## The ranking knobs behind these codes
 
@@ -64,5 +64,5 @@ See [LookupRoute & ranking](/docs/concepts/lookuproute/#diagnostics-telling-a-no
 
 ## Related pages
 
-- [LookupRoute & ranking](/docs/concepts/lookuproute/) — how the codes are decided.
-- [The gRPC contract](/docs/concepts/grpc-contract/) — why the codes are strings.
+- [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}) — how the codes are decided.
+- [The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) — why the codes are strings.

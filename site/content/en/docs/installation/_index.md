@@ -29,13 +29,14 @@ following are true:
 
 ## 1. Install cert-manager
 
-The controller serves three admission webhooks over TLS: defaulting + validation for
-`CacheBackend`, `CachePolicy`, and `CacheTenant`, plus a mutating Pod webhook that
-auto-injects engine configuration into pods that match a `CacheBackend`'s
+The controller serves seven admission webhook entries over TLS across two Kubernetes
+webhook configurations: mutating defaults for `CacheBackend`, `CachePolicy`, and
+`CacheTenant`; validation for those same three resources; and a mutating Pod webhook that
+auto-injects engine configuration into pods matching a `CacheBackend`'s
 `spec.engineSelector`. The default install provisions a self-signed `Issuer` and a
 `Certificate` for the webhook serving cert and relies on cert-manager's
-`cert-manager.io/inject-ca-from` annotation to inject the CA bundle into the generated
-webhook configurations.
+`cert-manager.io/inject-ca-from` annotation to inject the CA bundle into both webhook
+configurations.
 
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
@@ -47,6 +48,8 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 The default Kustomize overlay brings up both control-plane components:
 
 ```bash
+git clone https://github.com/cachebox-project/inference-cache.git
+cd inference-cache
 kubectl apply -k config/default
 ```
 
@@ -67,7 +70,7 @@ the server binary by hand for local development, pass `--insecure-disable-auth` 
 {{% /alert %}}
 
 gRPC on `:9090` is **plaintext by default** — see
-[gRPC TLS](/docs/administration/grpc-tls/) for the opt-in TLS overlay and why the default
+[gRPC TLS]({{< relref "/docs/administration/grpc-tls/" >}}) for the opt-in TLS overlay and why the default
 is plaintext.
 
 ## 3. Verify the install
@@ -103,7 +106,7 @@ All three custom resources carry example labels (`prometheus: k8s`) that match t
 kube-prometheus stack. If your `Prometheus` custom resource's selectors use a different
 label set (for example `release: my-prom` from the `kube-prometheus-stack` Helm chart),
 `kubectl apply -k` succeeds but Prometheus silently ignores the resources. See
-[Observability & Alerts](/docs/administration/observability-and-alerts/) for the full
+[Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}}) for the full
 discussion, and for the extra engine-pod scrape the tier-2 alert needs.
 {{% /alert %}}
 

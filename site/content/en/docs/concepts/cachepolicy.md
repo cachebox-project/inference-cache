@@ -49,7 +49,7 @@ The `minimumMatchedTokens` floor exists because chat templates frame every promp
 shared system-prompt prefix; without a floor, that shared framing would match every replica
 and produce a useless hint. The `routingFloorScore` gate catches the mirror case — a prefix
 held by *every* replica has zero distinguishing power (see
-[LookupRoute & ranking](/docs/concepts/lookuproute/)).
+[LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}})).
 
 ## Eviction
 
@@ -77,7 +77,7 @@ it to 0 expecting immediate timeouts.
 `spec.affinityRouting` (`Enabled` by default, `Disabled` to turn off) decides the final
 fallback: when the ranker would otherwise return `NO_HINT`, affinity routing returns a
 single stable replica chosen by a consistent hash — useful for diffuse single-turn
-workloads. See [reason codes](/docs/reference/reason-codes/).
+workloads. See [reason codes]({{< relref "/docs/reference/reason-codes/" >}}).
 
 ## Status
 
@@ -87,7 +87,7 @@ not through a status handshake.
 
 ## Related pages
 
-- [LookupRoute & ranking](/docs/concepts/lookuproute/) — how these knobs feed the ranker.
-- [Tune lookup and eviction](/docs/tasks/tune-lookup-and-eviction/) — worked examples.
-- [Index sizing](/docs/administration/index-sizing/) — how `evictionTTL` and `eviction`
+- [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}) — how these knobs feed the ranker.
+- [Tune lookup and eviction]({{< relref "/docs/tasks/tune-lookup-and-eviction/" >}}) — worked examples.
+- [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) — how `evictionTTL` and `eviction`
   affect memory.

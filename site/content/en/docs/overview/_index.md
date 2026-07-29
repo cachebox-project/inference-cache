@@ -108,11 +108,11 @@ an in-cluster sidecar:
 
 ## Where to go next
 
-- New here? Start with the [Installation](/docs/installation/) guide, then the
-  [Quickstart](/docs/tasks/deploy-a-cache-backend/).
-- Want the mental model? Read [Concepts](/docs/concepts/) — the CRDs, the gRPC contract,
+- New here? Start with the [Installation]({{< relref "/docs/installation/" >}}) guide, then the
+  [Quickstart]({{< relref "/docs/tasks/deploy-a-cache-backend/" >}}).
+- Want the mental model? Read [Concepts]({{< relref "/docs/concepts/" >}}) — the CRDs, the gRPC contract,
   and how `LookupRoute` ranks replicas.
-- Operating a cluster? See [Administration](/docs/administration/) for observability,
+- Operating a cluster? See [Administration]({{< relref "/docs/administration/" >}}) for observability,
   index sizing, TLS, and troubleshooting.
-- Need field-level detail? The [Reference](/docs/reference/) section covers the CRD API,
+- Need field-level detail? The [Reference]({{< relref "/docs/reference/" >}}) section covers the CRD API,
   the gRPC contract, metrics, reason codes, and the CLI.

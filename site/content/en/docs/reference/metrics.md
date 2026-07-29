@@ -68,7 +68,7 @@ alerts have no series to evaluate.
 
 ## Related pages
 
-- [Observability & Alerts](/docs/administration/observability-and-alerts/) — the alerts
+- [Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}}) — the alerts
   built on these series.
-- [Index sizing](/docs/administration/index-sizing/) — the eviction/memory relationship.
-- [Monitor the cache plane](/docs/tasks/monitor-the-cache-plane/) — the day-to-day view.
+- [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}) — the eviction/memory relationship.
+- [Monitor the cache plane]({{< relref "/docs/tasks/monitor-the-cache-plane/" >}}) — the day-to-day view.

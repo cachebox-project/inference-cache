@@ -114,7 +114,7 @@ adapter's canonical injection:
 Each adapter declares **reserved** args and env that carry correctness guarantees.
 Overriding a reserved value is **hard-rejected at admission**, not merely warned — a warning
 would be ignored and the engine would crash later with no breadcrumb. See
-[Bind an engine](/docs/tasks/bind-an-engine/) for the reserved lists per runtime.
+[Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}}) for the reserved lists per runtime.
 
 ## Engine binding (`spec.engineSelector`)
 
@@ -185,7 +185,7 @@ Two advisory conditions worth calling out:
 
 ## Related pages
 
-- [Bind an engine](/docs/tasks/bind-an-engine/) — the injection contract, reserved
+- [Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}}) — the injection contract, reserved
   args/env, and the skip annotation.
-- [CachePolicy](/docs/concepts/cachepolicy/) — per-namespace lookup and eviction tuning.
-- [CRD API reference](/docs/reference/crd-api/) — every field.
+- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) — per-namespace lookup and eviction tuning.
+- [CRD API reference]({{< relref "/docs/reference/crd-api/" >}}) — every field.

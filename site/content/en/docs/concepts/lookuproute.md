@@ -96,7 +96,7 @@ score = matched_tokens
   collapses toward 0 and it gets filtered by the score floor. A prefix only one replica
   holds has full distinguishing power.
 
-Two policy filters bound the result (see [CachePolicy](/docs/concepts/cachepolicy/)):
+Two policy filters bound the result (see [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}})):
 
 1. **`minimumMatchedTokens`** (default 64) — a per-replica floor applied first.
 2. **`routingFloorScore`** (default `"0.1"`) — a whole-response floor on the top score.
@@ -138,10 +138,10 @@ metric, fail open, and **do not retry** — it means your client configuration i
 that the server is down. The `inferencecache_lookup_route_calls_total{reason_code=…}` metric
 picks up these label values automatically.
 
-See the full list in [reason codes](/docs/reference/reason-codes/).
+See the full list in [reason codes]({{< relref "/docs/reference/reason-codes/" >}}).
 
 ## Related pages
 
-- [CachePolicy](/docs/concepts/cachepolicy/) — the knobs that tune matching and ranking.
-- [The gRPC contract](/docs/concepts/grpc-contract/) — the message shapes.
-- [Reason codes](/docs/reference/reason-codes/) — every code and when it is emitted.
+- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) — the knobs that tune matching and ranking.
+- [The gRPC contract]({{< relref "/docs/concepts/grpc-contract/" >}}) — the message shapes.
+- [Reason codes]({{< relref "/docs/reference/reason-codes/" >}}) — every code and when it is emitted.

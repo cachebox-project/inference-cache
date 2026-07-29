@@ -9,14 +9,14 @@ no_list: true
 
 Precise, lookup-oriented reference material.
 
-- **[CRD API](/docs/reference/crd-api/)** — the six custom resources, their groups, scopes,
+- **[CRD API]({{< relref "/docs/reference/crd-api/" >}})** — the six custom resources, their groups, scopes,
   short names, and key fields.
-- **[gRPC API](/docs/reference/grpc-api/)** — the `InferenceCache` service, RPC by RPC.
-- **[Metrics](/docs/reference/metrics/)** — every `inferencecache_*` series, its labels, and
+- **[gRPC API]({{< relref "/docs/reference/grpc-api/" >}})** — the `InferenceCache` service, RPC by RPC.
+- **[Metrics]({{< relref "/docs/reference/metrics/" >}})** — every `inferencecache_*` series, its labels, and
   which binary emits it.
-- **[Reason codes](/docs/reference/reason-codes/)** — the string `reason_code` vocabulary and
+- **[Reason codes]({{< relref "/docs/reference/reason-codes/" >}})** — the string `reason_code` vocabulary and
   when each is emitted.
-- **[CLI: `inferencecache doctor`](/docs/reference/cli-doctor/)** — checks, finding codes,
+- **[CLI: `inferencecache doctor`]({{< relref "/docs/reference/cli-doctor/" >}})** — checks, finding codes,
   flags, and exit codes.
 
 {{% alert title="The generated source of truth" color="info" %}}

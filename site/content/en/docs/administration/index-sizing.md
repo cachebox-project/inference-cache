@@ -95,7 +95,7 @@ Three choices, cheapest first:
 
 ## Related pages
 
-- [CachePolicy](/docs/concepts/cachepolicy/) — the TTL and eviction fields.
-- [CacheTenant](/docs/concepts/cachetenant/) — the entry-count quota.
-- [Observability & Alerts](/docs/administration/observability-and-alerts/) — the
+- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) — the TTL and eviction fields.
+- [CacheTenant]({{< relref "/docs/concepts/cachetenant/" >}}) — the entry-count quota.
+- [Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}}) — the
   `IndexEvictionsSpike` alert.

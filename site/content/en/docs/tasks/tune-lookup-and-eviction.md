@@ -10,7 +10,7 @@ Most namespaces need no `CachePolicy` — the server ships sane defaults. Reach 
 you want to change how lookups are filtered/ranked, or how the index evicts, in a specific
 namespace. There is **at most one `CachePolicy` per namespace**.
 
-See [CachePolicy](/docs/concepts/cachepolicy/) for the field-by-field reference; this page
+See [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) for the field-by-field reference; this page
 is worked examples.
 
 ## A production-shaped policy
@@ -71,7 +71,7 @@ spec:
 ```
 
 Shortening `evictionTTL` is also the cheapest lever when the index is over its memory budget
-— see [Index sizing](/docs/administration/index-sizing/).
+— see [Index sizing]({{< relref "/docs/administration/index-sizing/" >}}).
 
 ### Require a block-hash chain
 
@@ -106,6 +106,6 @@ Set it to `Disabled` to force `NO_HINT` (pure round-robin) when there is no real
 
 ## Related pages
 
-- [CachePolicy](/docs/concepts/cachepolicy/) — every field.
-- [LookupRoute & ranking](/docs/concepts/lookuproute/) — how these knobs feed the ranker.
-- [Reason codes](/docs/reference/reason-codes/) — what each outcome means.
+- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) — every field.
+- [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}) — how these knobs feed the ranker.
+- [Reason codes]({{< relref "/docs/reference/reason-codes/" >}}) — what each outcome means.
