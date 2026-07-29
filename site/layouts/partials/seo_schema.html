@@ -1,0 +1,32 @@
+{{- $description := "" -}}
+{{- if .Description -}}
+  {{- $description = .Description -}}
+{{- else if .IsPage -}}
+  {{- $description = .Summary | plainify -}}
+{{- end -}}
+{{- $keywords := slice "inference-cache" -}}
+{{- with .Params.tags -}}
+  {{- $keywords = union . $keywords -}}
+{{- end -}}
+{{- $schema := dict
+  "@context" "https://schema.org"
+  "@type" "WebSite"
+  "mainEntityOfPage" (dict "@type" "WebPage" "@id" .Site.BaseURL)
+  "articleSection" .Section
+  "name" .Title
+  "headline" .Title
+  "description" $description
+  "inLanguage" "en-US"
+  "author" .Site.Params.author
+  "creator" .Site.Params.author
+  "publisher" .Site.Params.author
+  "accountablePerson" .Site.Params.author
+  "copyrightHolder" .Site.Params.author
+  "copyrightYear" (.Date.Format "2006")
+  "datePublished" .Date
+  "dateModified" .Lastmod
+  "url" .Permalink
+  "wordCount" .WordCount
+  "keywords" $keywords
+-}}
+<script type="application/ld+json">{{ $schema | jsonify | safeJS }}</script>

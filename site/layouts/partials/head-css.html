@@ -1,0 +1,11 @@
+{{ $scssMain := "scss/main.scss" }}
+{{ if not hugo.IsProduction }}
+{{/* Dev build: transpile with Hugo Extended's built-in SCSS support, no PostCSS. */}}
+{{ $css := resources.Get $scssMain | toCSS (dict "enableSourceMap" true) }}
+<link href="{{ $css.RelPermalink }}" rel="stylesheet">
+{{ else }}
+{{/* Production build uses Hugo Extended only, with no Node/npm dependency. */}}
+{{ $css := resources.Get $scssMain | toCSS (dict "enableSourceMap" false) | minify | fingerprint }}
+<link rel="preload" href="{{ $css.RelPermalink }}" as="style">
+<link href="{{ $css.RelPermalink }}" rel="stylesheet" integrity="{{ $css.Data.integrity }}">
+{{ end }}
