@@ -574,9 +574,9 @@ spec:
                       default — the field carries no meaningful "wait forever" or "fail
                       immediately" semantics.
 
-                      The first SGLangHiCache implementation publishes no Ready condition, so
-                      this field is inert for that engine-local backend until its separate
-                      readiness contract is implemented.
+                      SGLangHiCache readiness is derived from engine Pod injection receipts and
+                      Kubernetes Pod readiness rather than KV events, so this field is inert
+                      for that engine-local backend.
 
                       The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
                       schema types it as a string; a malformed value is rejected when

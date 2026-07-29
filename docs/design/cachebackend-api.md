@@ -394,10 +394,12 @@ args/env only.
 
 The `(sglang, SGLangHiCache)` pair configures the selected SGLang engine Pods
 directly. It does not create a cache-server Deployment, Service, HPA, or
-endpoint. The first implementation intentionally publishes no `Ready`
-condition: Kubernetes Pod readiness proves that SGLang is serving, but does not
-prove a HiCache host-tier write/read round trip. A dedicated readiness contract
-is a separate follow-up.
+endpoint. Its `Ready` condition reports configuration rollout and serving
+availability, not a HiCache data-plane probe: `Ready=True` means every
+participating engine Pod carries the current CacheBackend name, UID, and
+generation receipt written by the webhook and has Kubernetes `Ready=True`.
+It does not prove a host-tier write/read round trip or distinguish a GPU hit
+from a host-tier read.
 
 The required integration shape is:
 
@@ -440,6 +442,32 @@ Changing or deleting the CacheBackend does not mutate live Pods. Roll the
 SGLang workload to apply a new configuration or switch between LMCache and
 HiCache. The webhook does not inspect image tags: the chosen image must support
 these SGLang arguments.
+
+The controller evaluates selector-matched Pods with this contract:
+
+| Pod set | `Ready` | `Progressing` | `Degraded` | Reason |
+|---|---|---|---|---|
+| No active matching Pods | `False` | `True` | `False` | `AwaitingEnginePods` |
+| Every active matching Pod explicitly opted out with the verified skip marker | `True` | `False` | `False` | `AllEnginePodsSkipped` |
+| Any participating Pod lacks a complete injection receipt | `False` | `False` | `True` | `EnginePodsNotInjected` |
+| Any receipt names another CacheBackend identity or a future generation | `False` | `False` | `True` | `EnginePodsInjectionMismatch` |
+| At least one receipt carries an older generation | `False` | `True` | `False` | `EnginePodsRolloutInProgress` |
+| All receipts are current, but at least one Pod is not Kubernetes Ready | `False` | `False` | `True` | `EnginePodsUnavailable` |
+| All participating Pods carry the current receipt and are Kubernetes Ready | `True` | `False` | `False` | `EnginePodsReady` |
+
+Terminating Pods and terminal `Succeeded`/`Failed` Pods are excluded. A Pod
+with both a truthy `inferencecache.io/skip-inject` and
+`inferencecache.io/inject-skipped: skip-inject-annotation` explicitly opts out
+and does not block the remaining participants. The controller does not parse
+the SGLang arguments a second time: the name/UID/generation annotations are the
+webhook's operational receipt, not a security boundary.
+
+The controller does not restart user-owned engine workloads. After a
+CacheBackend spec update, old-generation Pods keep the backend at
+`EnginePodsRolloutInProgress` until the workload owner rolls them. The
+controller polls every 5 seconds while not Ready and uses the existing
+30-second matched-Pod cadence after convergence; it does not add a
+cluster-wide Pod watch.
 
 HiCache host memory is charged to the engine container's cgroup. The operator
 must size the engine's memory request/limit and node capacity accordingly.

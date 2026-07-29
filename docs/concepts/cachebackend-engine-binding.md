@@ -48,8 +48,11 @@ The match is evaluated **once at pod CREATE** by the mutating webhook. The wirin
 > **Native SGLang HiCache exception.** `type: SGLangHiCache` is engine-local:
 > the controller creates no backend workload or endpoint, and the webhook does
 > not wait for `status.endpoint`. It injects the typed `spec.hiCache` launch
-> flags directly into matching SGLang Pods. The LMCache lifecycle below remains
-> the endpoint-bearing path.
+> flags directly into matching SGLang Pods. Its readiness is engine-side:
+> every participating Pod must carry the current CacheBackend name, UID, and
+> generation receipt and be Kubernetes Ready. This reports rollout and serving
+> availability, not a proven HiCache host-tier read/write. The LMCache lifecycle
+> below remains the endpoint-bearing path.
 
 ## Lifecycle
 
