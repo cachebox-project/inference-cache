@@ -37,8 +37,8 @@ for every gateway client, and no routing logic fragmented across clients.
   pressure, SLO, and distinguishing power).
 
 - 🔌 **Engine integration by admission webhook** — label an engine pod and the mutating Pod
-  webhook injects the KV-connector configuration and an observation sidecar automatically.
-  No manual engine wiring.
+  webhook injects the KV-connector configuration automatically. The observation sidecar is
+  also injected when the controller's opt-in `--kvevent-subscriber-image` is configured.
 
 - 🧩 **Pluggable KV-cache backends** — the default in-memory LMCache backend for the simple
   path; Mooncake for a durable, shared, peer-to-peer store; or point at an `External`

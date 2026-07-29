@@ -13,12 +13,12 @@ is the one failure the soft-state design cannot hide).
 
 ## Pod budget at a glance
 
-| Distinct prefix keys | Peak RSS | Recommended pod memory |
+| Storage entries (distinct prefix keys × replicas reporting each) | Peak RSS | Recommended pod memory |
 |---|---|---|
-| 100K | ~110 MiB | 256 MiB |
-| 500K | ~300 MiB | 512 MiB |
-| 1M (the default cap) | ~540 MiB | **1 GiB (recommended floor)** |
-| 1.5M | ~700 MiB | 1.5 GiB |
+| 100K storage entries | ~110 MiB | 256 MiB |
+| 500K storage entries | ~300 MiB | 512 MiB |
+| 1M storage entries (the default cap) | ~540 MiB | **1 GiB (recommended floor)** |
+| 1.5M storage entries | ~700 MiB | 1.5 GiB |
 
 These include roughly 20% headroom over measured heap. The default entry cap is 1,000,000.
 
@@ -46,11 +46,13 @@ one entry per block in its prefix chain. A 1000-token prompt at a 16-token block
 ~63 entries *per replica*. So:
 
 ```
-distinct_keys ≈ distinct_prompts × block_chain_length × replicas
+distinct_keys ≈ distinct_prompts × block_chain_length
+storage_entries ≈ distinct_keys × replicas
 ```
 
-A workload with 5,000 distinct prompts, ~60-block chains, across 3 replicas is already
-~900K keys — near the default cap. Size for the block-expanded number, not the prompt count.
+A workload with 5,000 distinct prompts and ~60-block chains has about 300K distinct keys.
+Across 3 replicas that is about 900K storage entries — near the default cap. Size for the
+block-expanded storage-entry count, not the prompt count.
 
 {{% alert title="Two different units" color="info" %}}
 `maxIndexEntries`, `tenants[].indexEntries`, and `inferencecache_index_entries{model}` count
@@ -65,7 +67,7 @@ Runtime-tunable (no rebuild):
 
 | Lever | Where | Effect |
 |---|---|---|
-| **Pod memory limit** | `CacheBackend.spec.resources` | The only hard ceiling. |
+| **Pod memory limit** | `Deployment/inference-cache-server`, container `server` | The only hard ceiling. Update the installed manifest or patch this Deployment's resources. |
 | **`evictionTTL`** | `CachePolicy` (default 30m) | Shorter TTL ⇒ smaller index. The cheapest lever, roughly linear. |
 | **`eviction`** | `CachePolicy` (`LRU`/`LFU`) | Which entries go first under the cap. |
 | **`maxIndexEntries`** | `CacheTenant.spec.quota` | Per-tenant distinct-key cap; over-budget evicts oldest (Fairness). |

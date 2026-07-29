@@ -20,16 +20,16 @@ The controller-runtime manager. It:
 
 - **Reconciles the CRDs** — provisions the managed cache-server workload and Service for a
   `CacheBackend`, computes readiness, and writes status.
-- **Serves three admission webhooks** (over TLS, via cert-manager): defaulting + validation
-  for `CacheBackend`, `CachePolicy`, and `CacheTenant`.
-- **Serves a mutating Pod webhook** — the *linker*. When an engine pod matches a
-  `CacheBackend`'s `spec.engineSelector`, this webhook injects the KV-connector
+- **Serves six CR admission webhook entries** (over TLS, via cert-manager): defaulting +
+  validation for `CacheBackend`, `CachePolicy`, and `CacheTenant`.
+- **Serves the seventh entry, a mutating Pod webhook** — the *linker*. When an engine pod
+  matches a `CacheBackend`'s `spec.engineSelector`, this webhook injects the KV-connector
   configuration and (optionally) the `kvevent-subscriber` sidecar into the pod. One webhook
   does both engine-config injection and sidecar injection.
 - **Runs the bridge** to the server (see below).
 
-Owns the `pkg/adapters/runtime` and `pkg/adapters/backend` adapters that render the
-cache-server pod/Service and the engine-side pod configuration.
+Owns the `pkg/adapters/runtime` adapters that render the cache-server pod/Service and the
+engine-side pod configuration.
 
 ### `inferencecache-server`
 
@@ -44,9 +44,8 @@ The gRPC + HTTP server. It:
   aggregate), `/policy` (controller writes resolved policy), `/probe` (functional
   self-test). All three are gated by ServiceAccount bearer auth + a `NetworkPolicy`.
 
-Owns the index (`pkg/index`), the mutable-slot render pipeline (`pkg/render`), the engine
-KV-event hook (`pkg/adapters/engine`), and the deterministic content fingerprint
-(`pkg/fingerprint`).
+Owns the index (`pkg/index`), the mutable-slot render pipeline (`pkg/render`), and the
+deterministic content fingerprint (`pkg/fingerprint`).
 
 The server **fails closed**: without `--allowed-controller-sa` or
 `--insecure-disable-auth` it exits rather than silently shipping unauthenticated endpoints.
@@ -58,6 +57,7 @@ event stream, computes the content fingerprint in-pod, and calls the server's
 `ReportCacheState`. It sets `replica_id = <pod-name>` and also runs a stats reporter that
 derives `cache_memory_bytes` from a scraped usage percentage. Auto-injection is opt-in —
 the controller injects it only when started with a `--kvevent-subscriber-image`.
+The subscriber binary owns the engine event adapters in `pkg/adapters/engine`.
 
 ### `inferencecache` CLI
 
@@ -66,8 +66,8 @@ the controller injects it only when started with a `--kvevent-subscriber-image`.
 
 ## The controller ↔ server bridge
 
-The controller and server talk over **two HTTP endpoints, in opposite directions, under the
-same ServiceAccount identity.** Both are intra-cluster, both are soft state.
+The controller and server use **two directional HTTP flows under the same ServiceAccount
+identity.** Both are intra-cluster and soft state:
 
 - **PULL — `GET :8081/snapshot`.** The controller's CacheIndex poller scrapes the server's
   aggregate roughly every 25–30 seconds and writes both the cluster-wide `CacheIndex.status`
@@ -78,6 +78,9 @@ same ServiceAccount identity.** Both are intra-cluster, both are soft state.
   POSTs the full snapshot. The server adopts **replace-on-write** — deleting a `CachePolicy`
   reverts its namespace to server defaults. A periodic re-push keeps a restarted server in
   sync.
+
+The controller also calls `POST :8081/probe` for the functional self-test; it is not a
+state-replication flow.
 
 Pulled state (CacheIndex) reflects what the server has heard from the substrate; pushed
 state (policy) is operator intent flowing the other way. Operators reason about both at the

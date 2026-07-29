@@ -15,10 +15,12 @@ backend and the engine-integration policy that uses it. Applying one:
 1. **Provisions** a managed cache-server workload (for backend types that need one) and a
    `ClusterIP` Service.
 2. **Binds** to inference-engine pods by label (`spec.engineSelector`). The mutating Pod
-   webhook injects the KV-connector configuration and an observation sidecar into matching
-   pods.
-3. **Makes the engine's KV cache reusable** — offloaded to the backend (tier 2) and
-   surfaced to routing (tier 1) so a warm prefix skips prefill.
+   webhook injects the KV-connector configuration into matching pods. It also injects the
+   observation sidecar when the controller has `--kvevent-subscriber-image` configured and
+   `backendConfig.model` is set.
+3. **Makes the engine's KV cache reusable** — offloaded to the backend (tier 2) and, when
+   subscriber reporting is enabled, surfaced to routing (tier 1) so a warm prefix skips
+   prefill.
 
 `CacheBackend` is namespaced. Group `inferencecache.io`, version `v1alpha1`, short name
 `cb`.

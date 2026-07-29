@@ -17,10 +17,11 @@ All CRDs are in the API group **`inferencecache.io`**, version **`v1alpha1`**.
 | `PromptTemplate` | Namespaced | `pt` | Declarative | Cache-aware prompt template + stable/mutable slots. |
 | `PDTopology` | Namespaced | `pdt` | Declarative | Prefill/decode topology for disaggregated serving. |
 
-{{% alert title="v1alpha1 is unstable" color="info" %}}
-Per Kubernetes convention, `v1alpha1` permits breaking CRD schema changes. The gRPC/proto
-contract, by contrast, stays backward-compatible because it has external consumers. Both lock
-at `v1beta1`.
+{{% alert title="v1alpha1 compatibility" color="info" %}}
+Although the API is still evolving, existing `v1alpha1` objects must remain valid. Schema
+changes are additive or otherwise backward-compatible; removals and incompatible validation
+changes require a new version and migration path. The gRPC/proto contract follows the same
+backward-compatibility rule for its external consumers.
 {{% /alert %}}
 
 ## CacheBackend

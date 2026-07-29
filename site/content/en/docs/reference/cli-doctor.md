@@ -16,8 +16,8 @@ inferencecache doctor -n serving
 
 ## Checks and finding codes
 
-Nine checks run in a fixed order. Finding codes are stable and greppable; severity is shown
-in parentheses.
+After the Kubernetes API prerequisite (check 0), nine diagnostic checks run in a fixed
+order. Finding codes are stable and greppable; severity is shown in parentheses.
 
 | # | Check | Codes |
 |---|---|---|
