@@ -67,6 +67,14 @@ const AnnotationInjectedBy = "inferencecache.io/injected-by"
 // the event.
 const AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
 
+// AnnotationInjectedGeneration is stamped alongside [AnnotationInjectedBy]
+// and [AnnotationInjectedByUID] on every successful injection. It records the
+// CacheBackend metadata.generation whose spec the runtime adapter validated
+// and rendered into the pod. Engine-local readiness uses the complete
+// name/UID/generation receipt to distinguish current pods from pods that still
+// carry an older CacheBackend configuration.
+const AnnotationInjectedGeneration = "inferencecache.io/injected-generation"
+
 // AnnotationInjectSkipped is stamped when the webhook intentionally skips
 // injection because the operator set [AnnotationSkip]. It lets a persisted pod
 // distinguish an explicit opt-out from selector drift or fail-open admission.
@@ -411,6 +419,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	delete(mutated.Annotations, AnnotationInjectSkipped)
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
 	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
+	mutated.Annotations[AnnotationInjectedGeneration] = strconv.FormatInt(cache.Generation, 10)
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -526,13 +535,15 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	hasInjectedGeneration := pod.Annotations[AnnotationInjectedGeneration] != ""
 	hasInjectSkipped := pod.Annotations[AnnotationInjectSkipped] != ""
-	if !hasInjectedBy && !hasInjectedByUID && !hasInjectSkipped {
+	if !hasInjectedBy && !hasInjectedByUID && !hasInjectedGeneration && !hasInjectSkipped {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
 	delete(cleared.Annotations, AnnotationInjectedByUID)
+	delete(cleared.Annotations, AnnotationInjectedGeneration)
 	delete(cleared.Annotations, AnnotationInjectSkipped)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
@@ -558,11 +569,13 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 	}
 	delete(mutated.Annotations, AnnotationInjectedBy)
 	delete(mutated.Annotations, AnnotationInjectedByUID)
+	delete(mutated.Annotations, AnnotationInjectedGeneration)
 	mutated.Annotations[AnnotationInjectSkipped] = InjectSkippedReasonSkipAnnotation
 
 	if pod.Annotations[AnnotationInjectSkipped] == InjectSkippedReasonSkipAnnotation &&
 		pod.Annotations[AnnotationInjectedBy] == "" &&
-		pod.Annotations[AnnotationInjectedByUID] == "" {
+		pod.Annotations[AnnotationInjectedByUID] == "" &&
+		pod.Annotations[AnnotationInjectedGeneration] == "" {
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 	raw, err := json.Marshal(mutated)

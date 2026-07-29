@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -155,9 +156,10 @@ func sglangEnginePod(name string, labels map[string]string) *corev1.Pod {
 func readyCacheBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
+			Name:       name,
+			Namespace:  namespace,
+			UID:        types.UID("cb-" + namespace + "-" + name + "-uid"),
+			Generation: 7,
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendTypeLMCache,
@@ -231,6 +233,9 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	// would break the binding signal end-to-end.
 	if got, want := mutated.Annotations[AnnotationInjectedByUID], string(cb.UID); got != want {
 		t.Fatalf("annotation %s: got %q, want %q (matched CR UID)", AnnotationInjectedByUID, got, want)
+	}
+	if got, want := mutated.Annotations[AnnotationInjectedGeneration], strconv.FormatInt(cb.Generation, 10); got != want {
+		t.Fatalf("annotation %s: got %q, want %q (matched CR generation)", AnnotationInjectedGeneration, got, want)
 	}
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
@@ -1997,9 +2002,10 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Annotations = map[string]string{
-		AnnotationSkip:          "true",
-		AnnotationInjectedBy:    ns + "/" + cb.Name,
-		AnnotationInjectedByUID: string(cb.UID),
+		AnnotationSkip:               "true",
+		AnnotationInjectedBy:         ns + "/" + cb.Name,
+		AnnotationInjectedByUID:      string(cb.UID),
+		AnnotationInjectedGeneration: strconv.FormatInt(cb.Generation, 10),
 	}
 	req := newRequest(t, pod, ns)
 
@@ -2016,6 +2022,9 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	}
 	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
 		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedByUID, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedGeneration, got)
 	}
 }
 
@@ -2222,7 +2231,11 @@ func TestHandle_FailOpenClearsForgedInjectedByAnnotation(t *testing.T) {
 			}
 
 			pod := vllmEnginePod("forger", tc.labels)
-			pod.Annotations = map[string]string{AnnotationInjectedBy: ns + "/totally-not-a-real-cb"}
+			pod.Annotations = map[string]string{
+				AnnotationInjectedBy:         ns + "/totally-not-a-real-cb",
+				AnnotationInjectedByUID:      "forged-uid",
+				AnnotationInjectedGeneration: "999",
+			}
 			req := newRequest(t, pod, ns)
 
 			resp := h.Handle(context.Background(), req)
@@ -2236,6 +2249,12 @@ func TestHandle_FailOpenClearsForgedInjectedByAnnotation(t *testing.T) {
 			mutated := applyPatches(t, req.Object.Raw, resp)
 			if got := mutated.Annotations[AnnotationInjectedBy]; got != "" {
 				t.Fatalf("forged %s annotation survived fail-open: got %q, want \"\"", AnnotationInjectedBy, got)
+			}
+			if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
+				t.Fatalf("forged %s annotation survived fail-open: got %q, want \"\"", AnnotationInjectedByUID, got)
+			}
+			if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+				t.Fatalf("forged %s annotation survived fail-open: got %q, want \"\"", AnnotationInjectedGeneration, got)
 			}
 		})
 	}
