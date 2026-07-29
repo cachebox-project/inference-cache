@@ -45,6 +45,12 @@ The match is evaluated **once at pod CREATE** by the mutating webhook. The wirin
 
 `*` The kvevent-subscriber sidecar is opt-in. It is appended only when the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has `backendConfig.model` configured; otherwise the engine is wired without it. The default install does not auto-attach the sidecar.
 
+> **Native SGLang HiCache exception.** `type: SGLangHiCache` is engine-local:
+> the controller creates no backend workload or endpoint, and the webhook does
+> not wait for `status.endpoint`. It injects the typed `spec.hiCache` launch
+> flags directly into matching SGLang Pods. The LMCache lifecycle below remains
+> the endpoint-bearing path.
+
 ## Lifecycle
 
 1. **Apply the CacheBackend.** `kubectl apply -f cachebackend.yaml`. The reconciler creates the managed lmcache-server Deployment + Service and publishes the resolved address in `status.endpoint`.

@@ -46,8 +46,9 @@ type CacheBackendIntegrationMode string
 
 const (
 	// CacheBackendIntegrationModeOffload is the default: the engine is wired for
-	// cache-aware routing (tier-1) AND the KV-offload connector (tier-2), and
-	// the controller provisions a managed backend server for the offload tier.
+	// cache-aware routing (tier-1) AND the configured offload tier (tier-2).
+	// Server-backed adapters provision a managed backend; engine-local adapters
+	// such as native SGLang HiCache configure the engine Pod directly.
 	CacheBackendIntegrationModeOffload CacheBackendIntegrationMode = "Offload"
 	// CacheBackendIntegrationModeEventsOnly wires the engine for cache-aware
 	// routing (tier-1) ONLY: the kvevent-subscriber observation sidecar is
@@ -61,6 +62,72 @@ const (
 	// lighter deployment for routing-only users who do not want an offload tier.
 	CacheBackendIntegrationModeEventsOnly CacheBackendIntegrationMode = "EventsOnly"
 )
+
+// +kubebuilder:validation:Enum=write_back;write_through;write_through_selective
+
+// SGLangHiCacheWritePolicy controls when SGLang copies KV pages to host memory.
+type SGLangHiCacheWritePolicy string
+
+const (
+	SGLangHiCacheWriteBack             SGLangHiCacheWritePolicy = "write_back"
+	SGLangHiCacheWriteThrough          SGLangHiCacheWritePolicy = "write_through"
+	SGLangHiCacheWriteThroughSelective SGLangHiCacheWritePolicy = "write_through_selective"
+)
+
+// +kubebuilder:validation:Enum=direct;kernel;kernel_ascend
+
+// SGLangHiCacheIOBackend selects SGLang's host/device transfer implementation.
+type SGLangHiCacheIOBackend string
+
+const (
+	SGLangHiCacheIODirect       SGLangHiCacheIOBackend = "direct"
+	SGLangHiCacheIOKernel       SGLangHiCacheIOBackend = "kernel"
+	SGLangHiCacheIOKernelAscend SGLangHiCacheIOBackend = "kernel_ascend"
+)
+
+// +kubebuilder:validation:Enum=layer_first;page_first;page_first_direct;page_first_kv_split;page_head
+
+// SGLangHiCacheMemoryLayout selects SGLang's host-memory tensor layout.
+type SGLangHiCacheMemoryLayout string
+
+const (
+	SGLangHiCacheMemoryLayerFirst       SGLangHiCacheMemoryLayout = "layer_first"
+	SGLangHiCacheMemoryPageFirst        SGLangHiCacheMemoryLayout = "page_first"
+	SGLangHiCacheMemoryPageFirstDirect  SGLangHiCacheMemoryLayout = "page_first_direct"
+	SGLangHiCacheMemoryPageFirstKVSplit SGLangHiCacheMemoryLayout = "page_first_kv_split"
+	SGLangHiCacheMemoryPageHead         SGLangHiCacheMemoryLayout = "page_head"
+)
+
+// SGLangHiCacheSpec configures SGLang's native, engine-local host-memory cache.
+// Exactly one of SizeGB and Ratio must be set. Optional tuning fields are
+// passed to SGLang only when explicitly configured, so the engine version owns
+// their defaults.
+type SGLangHiCacheSpec struct {
+	// SizeGB sets the host KV-cache pool size in decimal gigabytes.
+	// Mutually exclusive with Ratio.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	SizeGB *int32 `json:"sizeGB,omitempty"`
+
+	// Ratio sets the host KV-cache pool size relative to the device KV-cache
+	// pool. It is a string because Kubernetes APIs avoid floating-point fields.
+	// Admission requires a finite number greater than zero.
+	// Mutually exclusive with SizeGB.
+	// +optional
+	Ratio string `json:"ratio,omitempty"`
+
+	// WritePolicy maps to --hicache-write-policy.
+	// +optional
+	WritePolicy SGLangHiCacheWritePolicy `json:"writePolicy,omitempty"`
+
+	// IOBackend maps to --hicache-io-backend.
+	// +optional
+	IOBackend SGLangHiCacheIOBackend `json:"ioBackend,omitempty"`
+
+	// MemoryLayout maps to --hicache-mem-layout.
+	// +optional
+	MemoryLayout SGLangHiCacheMemoryLayout `json:"memoryLayout,omitempty"`
+}
 
 // CacheBackendSpec defines the desired state of a cache backend.
 //
@@ -119,15 +186,14 @@ type CacheBackendSpec struct {
 	// in MatchLabels must be present on the pod. The full
 	// metav1.LabelSelector surface (matchExpressions, operator-based
 	// selection) is NOT exposed today — only MatchLabels.
-	// Pods that match get LMCache engine wiring (env vars + CLI args)
-	// injected by the mutating Pod admission webhook at pod CREATE time,
-	// PROVIDED the matched CacheBackend's status.endpoint has been
-	// published by the time admission runs. The webhook fail-opens
-	// (admits the pod unmodified) when status.endpoint is empty — so a
-	// pod that loses the race against the reconciler is admitted
-	// uncached for its whole lifetime. Admission is CREATE-only;
-	// recovery is to recreate the pod (e.g. `kubectl rollout restart`),
-	// not to edit the live pod's labels.
+	// Pods that match get runtime-adapter engine wiring injected by the
+	// mutating Pod admission webhook at pod CREATE time. Server-backed
+	// adapters require status.endpoint to be published first; the webhook
+	// fail-opens when it is empty. Engine-local adapters such as native
+	// SGLang HiCache explicitly require no endpoint and inject immediately.
+	// Admission is CREATE-only; recovery or a configuration update requires
+	// recreating the pod (e.g. `kubectl rollout restart`), not editing its
+	// live labels.
 	//
 	// This describes the default spec.integration.mode=Offload path. For
 	// spec.integration.mode=EventsOnly no KV connector wiring (env vars +
@@ -158,6 +224,13 @@ type CacheBackendSpec struct {
 	// lifecycle, an annotated example, and common failure modes.
 	// +optional
 	EngineSelector *CacheBackendEngineSelector `json:"engineSelector,omitempty"`
+
+	// HiCache configures SGLang's native, engine-local hierarchical cache. It
+	// is required for type=SGLangHiCache and rejected for other backend types.
+	// The selected engine Pods own the host-memory allocation; no cache-server
+	// workload or network endpoint is created.
+	// +optional
+	HiCache *SGLangHiCacheSpec `json:"hiCache,omitempty"`
 
 	// BackendConfig contains backend-specific string settings.
 	// +optional
@@ -219,8 +292,8 @@ type CacheBackendSpec struct {
 	// absent and replaced, because the HPA cannot use 0 as a
 	// denominator.
 	//
-	// External backends provision no workload of their own, so the field
-	// is inert for spec.type=External.
+	// External and SGLangHiCache backends provision no workload of their own,
+	// so the field is inert for those types.
 	//
 	// +optional
 	// +kubebuilder:default={requests: {memory: "4Gi"}, limits: {memory: "8Gi"}}
@@ -325,6 +398,7 @@ type CacheBackendIntegrationSpec struct {
 	// anyone who does not want an offload tier). Because EventsOnly provisions
 	// no server, status.endpoint stays empty and the autoscaling spec is
 	// rejected at admission; Ready is still gated on the first observed KV event.
+	// SGLangHiCache supports Offload only and is rejected with EventsOnly.
 	// See the CacheBackendIntegrationMode godoc.
 	// +optional
 	// +kubebuilder:default=Offload
@@ -378,6 +452,10 @@ type CacheBackendIntegrationSpec struct {
 	// default — the field carries no meaningful "wait forever" or "fail
 	// immediately" semantics.
 	//
+	// The first SGLangHiCache implementation publishes no Ready condition, so
+	// this field is inert for that engine-local backend until its separate
+	// readiness contract is implemented.
+	//
 	// The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
 	// schema types it as a string; a malformed value is rejected when
 	// admission decodes the object into this typed field, and if admission is
@@ -402,6 +480,8 @@ type CacheBackendIntegrationSpec struct {
 	// inject it). Per-request fail-open enforcement at the engine level is the
 	// engine/connector's responsibility; the cache plane surfaces the bit so
 	// the engine can honor it.
+	// SGLangHiCache accepts only the default true value and does not inject this
+	// env var because native HiCache exposes no equivalent fail-closed control.
 	// +optional
 	// +kubebuilder:default=true
 	FailOpen *bool `json:"failOpen,omitempty"`
@@ -540,7 +620,7 @@ func IntegrationFailOpen(spec *CacheBackendIntegrationSpec) bool {
 
 // IntegrationMode returns the effective integration mode for a CacheBackend
 // integration spec. Missing spec or empty field defaults to Offload, matching
-// the API default — full routing + offload + a managed backend server. The
+// the API default — full routing plus the selected offload tier. The
 // admission defaulter materialises the field on submitted objects; this helper
 // is the read-time fallback for callers that bypass the apiserver (raw-struct
 // test invocation, partial deserialization).

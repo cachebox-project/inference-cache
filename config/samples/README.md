@@ -13,7 +13,10 @@ multi-tenant, Namespaces):
   one per CRD kind. Useful as a starting point or for the first
   `kubectl apply` after a fresh install.
 - **`cachebackend-*.yaml`** — earlier hand-curated CacheBackend shapes, retained
-  for back-compat. The `recipe-*.yaml` catalog is the maintained entry point.
+  for back-compat, plus the focused
+  [`cachebackend-sglang-hicache.yaml`](cachebackend-sglang-hicache.yaml)
+  engine-local example. The `recipe-*.yaml` catalog is the maintained entry
+  point for LMCache scenarios.
 
 ## Recipe catalog
 
@@ -49,6 +52,11 @@ which requires the controller to run with `--kvevent-subscriber-image` set
 degrades to `NoKVEventsObserved`. `External` backends are exempt from that gate —
 they go `Ready` as soon as admission accepts the endpoint. See the
 [quickstart](../../docs/quickstart.md).
+
+`SGLangHiCache` is endpoint-free and has no endpoint publication race. Its
+first implementation intentionally publishes no `Ready` condition; the
+matching Pod's injection annotations are the available wiring signal until the
+separate HiCache readiness contract ships.
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
 `# verify-samples: skip` marker — server-side dry-run can't create the
