@@ -33,10 +33,10 @@ spec:
 
 ## Identity isolation is structural
 
-The index is keyed by `(tenant, model, hash_scheme, prefix_hash)`. Because `tenant` is part
-of the key, tenant A's hint records physically cannot collide with tenant B's, and
-`LookupRoute` is tenant-scoped. This isolation is real regardless of the underlying engine
-shape.
+The index is keyed by `(tenant, model, hash_scheme, adapter_id, prefix_hash)`. Because
+`tenant` is part of the key, tenant A's hint records physically cannot collide with tenant
+B's, and `LookupRoute` is tenant-scoped. This isolation is real regardless of the underlying
+engine shape.
 
 - `spec.tenantID` is the identity carried in the gRPC wire (`CacheStateUpdate.tenant_id`),
   **not** the Kubernetes object name.

@@ -14,10 +14,10 @@ See [CacheTenant]({{< relref "/docs/concepts/cachetenant/" >}}) for the field re
 
 ## Identity isolation is automatic
 
-The index is keyed by `(tenant, model, hash_scheme, prefix_hash)`. Because `tenant` is part
-of the key, one tenant's hints can never collide with another's, and `LookupRoute` is
-tenant-scoped. You get this the moment your producers report a `tenant_id` — you do not need
-a `CacheTenant` for isolation to hold.
+The index is keyed by `(tenant, model, hash_scheme, adapter_id, prefix_hash)`. Because
+`tenant` is part of the key, one tenant's hints can never collide with another's, and
+`LookupRoute` is tenant-scoped. You get this the moment your producers report a `tenant_id`
+— you do not need a `CacheTenant` for isolation to hold.
 
 You create a `CacheTenant` to give a tenant a **named, quota-bearing** identity:
 
@@ -79,6 +79,11 @@ kind: Deployment
 metadata:
   name: engine-tenant-a
 spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: engine-a
+      tenant: a
   template:
     metadata:
       labels:
@@ -87,6 +92,8 @@ spec:
     spec:
       containers:
         - name: vllm
+          image: vllm/vllm-openai:latest
+          command: ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct"]
           resources:
             limits:
               memory: 40Gi      # hard per-tenant ceiling, enforced by the kubelet cgroup

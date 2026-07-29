@@ -37,7 +37,7 @@ The gRPC + HTTP server. It:
 
 - Serves the **`InferenceCache` gRPC API** on `:9090` (plus `grpc.health.v1`).
 - Holds the **in-memory cache-state index** — a soft-state aggregate keyed by
-  `(tenant, model, hash_scheme, prefix_hash)`.
+  `(tenant, model, hash_scheme, adapter_id, prefix_hash)`.
 - Exposes HTTP on `:8080` — `/healthz` (liveness), `/readyz` (readiness → index ready),
   `/metrics` (Prometheus `inferencecache_*`).
 - Exposes a **controller-facing listener** on `:8081` — `/snapshot` (controller reads the

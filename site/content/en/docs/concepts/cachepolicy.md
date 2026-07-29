@@ -49,7 +49,7 @@ The `minimumMatchedTokens` floor exists because chat templates frame every promp
 shared system-prompt prefix; without a floor, that shared framing would match every replica
 and produce a useless hint. The `routingFloorScore` gate catches the mirror case — a prefix
 held by *every* replica has zero distinguishing power (see
-[LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}})).
+[LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}).
 
 ## Eviction
 

@@ -45,8 +45,8 @@ for every gateway client, and no routing logic fragmented across clients.
   endpoint you manage.
 
 - 🏠 **Multi-tenant by construction** — the cache-state index is keyed by
-  `(tenant, model, hash_scheme, prefix_hash)`, so tenants' hints can never collide, and an
-  optional entry-count quota caps a tenant's index footprint.
+  `(tenant, model, hash_scheme, adapter_id, prefix_hash)`, so tenants' hints can never
+  collide, and an optional entry-count quota caps a tenant's index footprint.
 
 - 🛟 **Fail-open and soft-state** — the cache is an optimization, never a serving
   dependency. Lost state degrades to a cache miss, never a wrong answer. The hot path never

@@ -128,9 +128,10 @@ reports how many pods currently match.
 A pod carrying the annotation `inferencecache.io/skip-inject: "true"` is skipped entirely —
 the all-or-nothing escape hatch.
 
-The **replica identity convention** ties it together: the subscriber sets
-`replica_id = <pod-name>`; the pod name is prefixed by its Deployment name, which equals the
-`CacheBackend` name. Consumers map a replica back to its backend by prefix match.
+The subscriber sets `replica_id = <pod-name>`. Treat that ID as opaque: engine Deployment
+names do not need to equal the `CacheBackend` name. The controller attributes pods to a
+backend through `spec.engineSelector` and the webhook's `inferencecache.io/injected-by`
+metadata, not a pod-name prefix.
 
 ## Readiness
 
