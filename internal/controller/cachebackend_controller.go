@@ -33,23 +33,27 @@ import (
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
-// Status condition types published on a managed CacheBackend.
+// Status condition types published on a CacheBackend with an active lifecycle.
 //
-// Ready reports whether the managed backend workload is currently serving
-// (gated by the KV-event readiness gate — see evaluateKVEventReadiness).
+// Ready reports whether the backend's serving contract is currently satisfied:
+// a managed backend workload is serving (optionally gated by KV events), an
+// External endpoint is accepted, or every participating engine Pod for an
+// engine-local backend carries the current injected generation and is Ready.
 // Progressing reports whether the controller is still driving the live state
 // toward the desired state (template render, child apply, rollout in flight,
-// awaiting first KV event). Degraded reports a terminal unhealthy state.
+// awaiting engine Pods, awaiting first KV event). Degraded reports a terminal
+// unhealthy state.
 // Ready + Progressing together tell a still-converging backend
 // (Ready=False, Progressing=True) apart from a stuck/degraded one
 // (Ready=False, Progressing=False); Degraded names the specific failure.
 const (
 	conditionTypeReady       = "Ready"
 	conditionTypeProgressing = "Progressing"
-	// Degraded is published alongside Ready. It is True only when the
-	// backend is in a genuinely degraded terminal state (rolled out but
-	// replicas unavailable, or the workload is Available but no KV events
-	// observed within firstEventTimeout).
+	// Degraded is published alongside Ready. It is True only when the backend
+	// is in a genuinely degraded terminal state (rolled out but replicas are
+	// unavailable, an engine-local injection receipt is invalid, or the
+	// workload is Available but no KV events were observed within
+	// firstEventTimeout).
 	conditionTypeDegraded = "Degraded"
 )
 
@@ -918,9 +922,14 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, rendered *backendadapter.RenderedStorage) (ctrl.Result, error) {
 	podSpec, svcSpec := rendered.PodSpec, rendered.Service
 	if podSpec == nil || svcSpec == nil {
-		// Engine-local adapters such as native SGLang HiCache intentionally
-		// render no cache-server. Reuse the unmanaged lifecycle to shed any
-		// previously owned workload and clear server-backed status.
+		// Native SGLang HiCache is engine-local: it renders no cache-server,
+		// but unlike an unsupported backend it has a real lifecycle to report
+		// from the selector-matched engine Pods.
+		if backend.Spec.Type == cachev1alpha1.CacheBackendTypeSGLangHiCache {
+			return r.reconcileEngineLocal(ctx, backend)
+		}
+		// Other nil renders remain unmanaged: shed any previously owned
+		// workload and clear server-backed status.
 		logger.V(1).Info("adapter rendered no cache-server; treating as unmanaged",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)

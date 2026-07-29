@@ -804,15 +804,20 @@ func TestReconcileSwitchToStatefulSetClearsObservedServerInstance(t *testing.T) 
 func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	scheme := newScheme(t)
 	managed := lmcacheBackend("cache", "ns1")
+	managed.UID = types.UID("cache-uid")
 	managed.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
 		MinReplicas: ptrInt32(1),
 		MaxReplicas: 3,
 	}
+	injectedOwner := managed.DeepCopy()
+	injectedOwner.Generation = 2
+	pod0 := engineLocalPodFixture("sglang-0", injectedOwner, injectedOwner.Generation, true)
+	pod1 := engineLocalPodFixture("sglang-1", injectedOwner, injectedOwner.Generation, true)
 	r := newReconciler(
 		scheme,
 		managed,
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-0", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sglang-1", Namespace: "ns1", Labels: map[string]string{"app": "sglang"}}},
+		&pod0,
+		&pod1,
 	)
 	reconcile(t, r, "cache", "ns1")
 	var managedHPA autoscalingv2.HorizontalPodAutoscaler
@@ -869,8 +874,17 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	if got.Status.Endpoint != "" || got.Status.ObservedServerInstance != "" {
 		t.Fatalf("stale managed endpoint/server instance survived: %+v", got.Status)
 	}
-	if len(got.Status.Conditions) != 0 {
-		t.Fatalf("SGLangHiCache first commit must publish no conditions, got %v", got.Status.Conditions)
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != reasonEnginePodsReady {
+		t.Fatalf("Ready = %+v, want True/%s", ready, reasonEnginePodsReady)
+	}
+	progressing := meta.FindStatusCondition(got.Status.Conditions, conditionTypeProgressing)
+	if progressing == nil || progressing.Status != metav1.ConditionFalse {
+		t.Fatalf("Progressing = %+v, want False", progressing)
+	}
+	degraded := meta.FindStatusCondition(got.Status.Conditions, conditionTypeDegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("Degraded = %+v, want False", degraded)
 	}
 	if got.Status.ObservedGeneration != got.Generation {
 		t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
