@@ -4,13 +4,7 @@
 {{ $css := resources.Get $scssMain | toCSS (dict "enableSourceMap" true) }}
 <link href="{{ $css.RelPermalink }}" rel="stylesheet">
 {{ else }}
-{{/*
-  Production build. PostCSS (autoprefixer) is intentionally omitted so the site
-  builds with only Hugo Extended — no Node/npm toolchain required. This keeps the
-  docs buildable in any environment (`hugo --minify`).
-  To re-enable vendor-prefixing, add `| postCSS` to the pipeline below and install
-  the devDependencies declared in package.json (`npm install`).
-*/}}
+{{/* Production build uses Hugo Extended only, with no Node/npm dependency. */}}
 {{ $css := resources.Get $scssMain | toCSS (dict "enableSourceMap" false) | minify | fingerprint }}
 <link rel="preload" href="{{ $css.RelPermalink }}" as="style">
 <link href="{{ $css.RelPermalink }}" rel="stylesheet" integrity="{{ $css.Data.integrity }}">

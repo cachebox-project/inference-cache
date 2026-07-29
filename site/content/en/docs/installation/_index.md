@@ -39,7 +39,7 @@ auto-injects engine configuration into pods matching a `CacheBackend`'s
 configurations.
 
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.1/cert-manager.yaml
 kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout=180s
 ```
 

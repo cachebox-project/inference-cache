@@ -42,13 +42,12 @@ spec:
       description: Per-request conversation history.
 ```
 
-## Why stable vs mutable matters
+## Planned stable vs mutable semantics
 
-The stable slots contribute to the **stable prefix hash**; the mutable slots do not. By
-holding the stable framing constant and isolating the parts that change, a template keeps a
-long cacheable prefix that many requests can reuse — the render pipeline produces the same
-stable prefix hash whenever the stable slots are unchanged, so the engine's prefix cache and
-inference-cache's routing hint both stay warm.
+When the render controller and `RenderTemplate` RPC are implemented, stable slots will
+contribute to the **stable prefix hash** and mutable slots will not. Holding the stable
+framing constant while isolating the parts that change will let a template retain a long
+cacheable prefix across requests.
 
 ## Spec
 
@@ -61,8 +60,8 @@ inference-cache's routing hint both stay warm.
 
 | Field | Meaning |
 |---|---|
-| `templateRevision` | A stable revision identifier used for cache invalidation — it flows through to `RenderTemplateResponse.template_revision`. |
-| `conditions`, `observedGeneration` | Standard bookkeeping. |
+| `templateRevision` | Reserved for the future render controller's stable cache-invalidation revision. It is not populated today. |
+| `conditions`, `observedGeneration` | Reserved controller bookkeeping; no PromptTemplate controller writes these fields today. |
 
 Printer columns: `Revision`, `Age`.
 

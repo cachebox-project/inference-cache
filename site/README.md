@@ -14,7 +14,7 @@ module).
 - Go (Hugo fetches the Docsy theme as a Go module on first build).
 
 No Node/npm toolchain is required to build — the CSS pipeline uses Hugo Extended's built-in
-SCSS support. (See "Optional: vendor-prefixed CSS" below.)
+SCSS support.
 
 ## Preview locally
 
@@ -52,15 +52,3 @@ site/
 
 Each page carries Hugo front matter (`title`, `weight`, `description`). Sidebar order is
 controlled by the `weight` field; sections are defined by each directory's `_index.md`.
-
-## Optional: vendor-prefixed CSS
-
-The production build intentionally skips PostCSS/autoprefixer so the site builds with only
-Hugo Extended. To re-enable vendor-prefixing, add `| postCSS` back to the pipeline in
-`layouts/partials/head-css.html` and install the dev dependencies:
-
-```bash
-npm install
-```
-
-`package.json` declares the required tools (`postcss-cli`, `autoprefixer`).

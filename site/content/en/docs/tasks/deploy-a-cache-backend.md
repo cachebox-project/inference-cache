@@ -63,15 +63,46 @@ multi-tenant, and engine-tuning scenarios.
 
 ## 3. Enable KV-event observability
 
-{{% alert title="Install-time prerequisite" color="warning" %}}
-The `kvevent-subscriber` sidecar — the piece that publishes KV events — is only auto-attached
-when the controller runs with `--kvevent-subscriber-image` set, which is **empty by
-default.** Engine↔cache wiring (KV reuse) works without it, but until it is set no KV events
-are reported: a managed backend holds at `Ready=False` (`AwaitingFirstKVEvent`) and then, after
-`firstEventTimeout`, flips to `Ready=False` (`NoKVEventsObserved`) with `Degraded=True`. Set
-the flag on the controller to get the readiness/observability surface below. (External
-backends are exempt from this gate.)
-{{% /alert %}}
+The `kvevent-subscriber` sidecar publishes the KV events used by the readiness and
+observability surfaces below. Auto-attach is disabled by default. Enable it before creating
+engine pods, replacing `<tag>` with the same release or development tag used for the other
+inference-cache images:
+
+```bash
+kubectl -n inference-cache-system patch deployment \
+  inference-cache-controller-manager --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kvevent-subscriber-image=ghcr.io/cachebox-project/inference-cache-subscriber:<tag>"}]'
+kubectl -n inference-cache-system rollout status \
+  deployment/inference-cache-controller-manager
+```
+
+The Pod webhook runs only on CREATE. If the engine Deployment already exists, recreate its
+pods after the controller rollout:
+
+```bash
+kubectl rollout restart deployment/cpu-dev-engine
+kubectl rollout status deployment/cpu-dev-engine
+```
+
+Finally, send one request so vLLM publishes the first KV event. Keep the port-forward running
+in one terminal:
+
+```bash
+kubectl port-forward deployment/cpu-dev-engine 8000:8000
+```
+
+Then call the engine from another:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Hello"}],"max_tokens":8}'
+```
+
+Without the subscriber, engine↔cache wiring (KV reuse) still works, but no KV events are
+reported: a managed backend holds at `Ready=False` (`AwaitingFirstKVEvent`) and then, after
+`firstEventTimeout`, flips to `Ready=False` (`NoKVEventsObserved`) with `Degraded=True`.
+External backends are exempt from this gate.
 
 ## 4. Read the readiness
 
