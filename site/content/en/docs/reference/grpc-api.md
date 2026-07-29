@@ -16,13 +16,17 @@ per-RPC reference.
 
 ### `LookupRoute(LookupRouteRequest) → LookupRouteResponse`
 
-The core cache-aware routing hint. Unary, fail-open, side-effect-free apart from metrics.
+The core cache-aware routing hint. Unary and fail-open. Lookups are side-effect-free apart
+from metrics, except that a delivered prefix hit under an LFU policy credits the matched
+entries' eviction access counters.
 
 - **Request:** `model_id`, `tenant_id`, `hash_scheme`, and a prefix identified (in precedence
   order) by `prefix_hash` + `block_hashes` chain, or `token_ids`, or `prompt_text`; plus
-  optional `slo`.
+  optional `slo` and `adapter_id`. The adapter ID selects the LoRA index partition and must
+  match the producer's value.
 - **Response:** `replica_scores[]` (best-first), `reason_code` (string), `lookup_latency_us`,
-  and echoed `token_ids` on the token/prompt path.
+  `adapter_id` (the partition consulted), and `token_ids` only when the server tokenized
+  `prompt_text`. Caller-supplied `token_ids` are not echoed.
 - **Reason codes:** `PREFIX_MATCH`, `TENANT_HOT`, `AFFINITY_HINT`, `NO_HINT`,
   `POLICY_REQUIRES_CHAIN`, `TIMEOUT`, `UNKNOWN_TENANT`, `UNKNOWN_MODEL`,
   `UNKNOWN_HASH_SCHEME`. See [reason codes](/docs/reference/reason-codes/).
@@ -48,9 +52,10 @@ The `(tenant, model)` aggregate — replica stats plus a cache summary.
 ### `ReportCacheState(stream CacheStateUpdate) → Ack`
 
 Client-stream. The authoritative, **additive** ingest of prefix/replica state, idempotent per
-`(replica, hash_scheme, prefix_hash)`. `CacheStateUpdate` carries `replica_id`, `model_id`,
-`tenant_id`, `hash_scheme`, `timestamp_us`, `PrefixEntry[]`, and `ReplicaStats`. Absence of a
-prefix in a later update does **not** remove it.
+`(replica, hash_scheme, adapter_id, prefix_hash)`. `CacheStateUpdate` carries `replica_id`,
+`model_id`, `tenant_id`, `hash_scheme`, `timestamp_us`, `PrefixEntry[]`, `ReplicaStats`, and
+an update-level `adapter_id` fallback. A `PrefixEntry` may select its own adapter partition.
+Absence of a prefix in a later update does **not** remove it.
 
 ### `PublishEvent(CacheEvent) → Ack`
 
@@ -70,11 +75,19 @@ Live metrics. Stub today.
 ## Core messages
 
 ```proto
+enum CacheTier {
+  CACHE_TIER_UNSPECIFIED = 0;
+  CACHE_TIER_T1          = 1;
+  CACHE_TIER_T2          = 2;
+  CACHE_TIER_T3          = 3;
+}
+
 message ReplicaScore {
   string replica_id               = 1;
   float  score                    = 2;
   int32  matched_tokens           = 3;
   float  estimated_cache_hit_prob = 4;
+  CacheTier tier                  = 5;
 }
 
 message PrefixEntry {                    // metadata only
@@ -82,6 +95,8 @@ message PrefixEntry {                    // metadata only
   int32  token_count                = 2;
   repeated bytes block_hashes       = 3;
   repeated int32 block_token_counts = 4;
+  CacheTier tier                    = 5;
+  string adapter_id                 = 6;
 }
 
 message ReplicaStats {

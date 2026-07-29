@@ -16,8 +16,10 @@ cache hit — reusing KV / skipping prefill, lowering TTFT and cost — or round
 there is no hint.
 
 It is a **hint, not a command.** The gateway owns routing; inference-cache only surfaces
-state. Lookups are fail-open and side-effect-free apart from metrics — an empty result and
-`NO_HINT` is a perfectly valid answer, and the call never errors on the hot path.
+state. Lookups are fail-open and side-effect-free apart from metrics, except that a
+delivered prefix hit under an LFU policy credits the matched entries' eviction access
+counters. An empty result and `NO_HINT` is a perfectly valid answer, and the call never
+errors on the hot path.
 
 ## What the request carries
 
@@ -30,8 +32,9 @@ A `LookupRouteRequest` identifies the prefix in one of three ways, in precedence
    server to be built with tokenizer support and pointed at a models directory, else it
    fails open to `NO_HINT`).
 
-It also carries `hash_scheme` (`vllm` / `sglang`) and an optional `SLO` (`ttft_ms`,
-`tbt_ms`).
+It also carries `hash_scheme` (`vllm` / `sglang`), an optional `SLO` (`ttft_ms`, `tbt_ms`),
+and an optional `adapter_id`. The adapter ID selects the LoRA index partition and must match
+the producer's value; empty selects the base-model partition.
 
 ### The hash_scheme domain
 

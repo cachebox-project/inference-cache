@@ -13,8 +13,8 @@ module).
   ```
 - Go (Hugo fetches the Docsy theme as a Go module on first build).
 
-No Node/npm toolchain is required to build — the CSS pipeline uses Hugo's bundled Dart Sass.
-(See "Optional: vendor-prefixed CSS" below.)
+No Node/npm toolchain is required to build — the CSS pipeline uses Hugo Extended's built-in
+SCSS support. (See "Optional: vendor-prefixed CSS" below.)
 
 ## Preview locally
 
@@ -48,7 +48,6 @@ site/
     developer-guide/            # contributing
   layouts/                      # Docsy theme overrides (partials, shortcodes)
   assets/scss/                  # theme color/style overrides
-  static/                       # favicons, redirects
 ```
 
 Each page carries Hugo front matter (`title`, `weight`, `description`). Sidebar order is
@@ -61,7 +60,7 @@ Hugo Extended. To re-enable vendor-prefixing, add `| postCSS` back to the pipeli
 `layouts/partials/head-css.html` and install the dev dependencies:
 
 ```bash
-npm ci
+npm install
 ```
 
 `package.json` declares the required tools (`postcss-cli`, `autoprefixer`).

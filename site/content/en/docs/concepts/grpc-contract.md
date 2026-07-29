@@ -16,7 +16,8 @@ overlay — see [gRPC TLS](/docs/administration/grpc-tls/)).
 
 ## Eight RPCs, three roles
 
-**Consumer side (gateways) — fail-open, side-effect-free apart from metrics:**
+**Consumer side (gateways) — fail-open; only delivered LFU hits update eviction
+bookkeeping:**
 
 | RPC | Kind | Purpose |
 |---|---|---|
@@ -53,13 +54,22 @@ message LookupRouteRequest {
   repeated int32 block_token_counts = 8;
   repeated uint32 token_ids   = 9;   // dual-input: server fingerprints
   string prompt_text          = 10;  // dual-input: server tokenizes + fingerprints
+  string adapter_id           = 11;  // LoRA index partition
 }
 
 message LookupRouteResponse {
   repeated ReplicaScore replica_scores = 1;
   string reason_code                   = 2;
   int64  lookup_latency_us             = 3;
-  repeated uint32 token_ids            = 4;  // echoed on the token_ids/prompt_text path
+  repeated uint32 token_ids            = 4;  // set only when prompt_text was tokenized
+  string adapter_id                    = 5;  // partition consulted
+}
+
+enum CacheTier {
+  CACHE_TIER_UNSPECIFIED = 0;
+  CACHE_TIER_T1          = 1;
+  CACHE_TIER_T2          = 2;
+  CACHE_TIER_T3          = 3;
 }
 
 message ReplicaScore {
@@ -67,6 +77,7 @@ message ReplicaScore {
   float  score                    = 2;
   int32  matched_tokens           = 3;
   float  estimated_cache_hit_prob = 4;
+  CacheTier tier                  = 5;
 }
 
 message PrefixEntry {              // metadata only — never KV tensors or prompt text
@@ -74,6 +85,8 @@ message PrefixEntry {              // metadata only — never KV tensors or prom
   int32  token_count        = 2;
   repeated bytes block_hashes       = 3;
   repeated int32 block_token_counts = 4;
+  CacheTier tier                    = 5;
+  string adapter_id                 = 6;
 }
 
 message ReplicaStats {
@@ -102,9 +115,9 @@ These are the contract properties clients are allowed to depend on:
   namespace credits per-entry access counters on a *delivered* prefix-match hit.
 - **Engine-opaque hashes, scheme-scoped.** `prefix_hash` / `block_hashes` are matched only
   within a matching `hash_scheme`; an empty scheme is not a valid domain.
-- **Metadata only.** Messages carry hashes and statistics — **never** KV tensors or prompt
-  text. (The one exception is the optional `prompt_text` *input* to `LookupRoute`, which
-  strengthens the case for enabling TLS on `:9090`.)
+- **Metadata-only index updates.** `CacheStateUpdate` and `PrefixEntry` carry hashes and
+  statistics — **never** KV tensors or prompt text. `LookupRoute` may carry optional
+  `prompt_text` input, which strengthens the case for enabling TLS on `:9090`.
 - **`CacheStateUpdate` is an additive delta, not a snapshot.** A prefix's absence from a
   later update does *not* remove it. Removals come only via `CacheEvent`
   (`PREFIX_EVICTED` / `ALL_CLEARED`) or TTL. This matches the engine's own KV-event model,
@@ -117,8 +130,8 @@ These are the contract properties clients are allowed to depend on:
 Engine adapters feed the index through the observation sidecar:
 
 - `ReportCacheState` is the authoritative, idempotent ingest keyed on
-  `(replica, hash_scheme, prefix_hash)`. It carries `PrefixEntry` metadata plus
-  `ReplicaStats`.
+  `(replica, hash_scheme, adapter_id, prefix_hash)`. It carries `PrefixEntry` metadata plus
+  `ReplicaStats`; an entry-level `adapter_id` falls back to the update-level value.
 - `PublishEvent` carries scheme-safe deltas. `PREFIX_ADDED` is a no-op (events carry no
   `hash_scheme`, and `ReportCacheState` is authoritative for adds); `REPLICA_UPDATED`
   refreshes replica stats; `PREFIX_EVICTED` / `ALL_CLEARED` remove.
