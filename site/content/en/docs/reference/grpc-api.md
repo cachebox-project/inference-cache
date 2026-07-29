@@ -16,9 +16,9 @@ per-RPC reference.
 
 ### `LookupRoute(LookupRouteRequest) → LookupRouteResponse`
 
-The core cache-aware routing hint. Unary and fail-open. Lookups are side-effect-free apart
-from metrics, except that a delivered prefix hit under an LFU policy credits the matched
-entries' eviction access counters.
+The core cache-aware routing hint. Unary and fail-open. It does not mutate cache membership
+or response-visible routing state. It emits metrics, and a delivered prefix hit under an LFU
+policy credits the matched entries' internal eviction access counters.
 
 - **Request:** `model_id`, `tenant_id`, `hash_scheme`, and a prefix identified (in precedence
   order) by `prefix_hash` + `block_hashes` chain, or `token_ids`, or `prompt_text`; plus

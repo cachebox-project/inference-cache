@@ -16,10 +16,10 @@ cache hit — reusing KV / skipping prefill, lowering TTFT and cost — or round
 there is no hint.
 
 It is a **hint, not a command.** The gateway owns routing; inference-cache only surfaces
-state. Lookups are fail-open and side-effect-free apart from metrics, except that a
-delivered prefix hit under an LFU policy credits the matched entries' eviction access
-counters. An empty result and `NO_HINT` is a perfectly valid answer, and the call never
-errors on the hot path.
+state. Lookups are fail-open and do not mutate cache membership or response-visible routing
+state. They emit metrics, and a delivered prefix hit under an LFU policy credits the matched
+entries' internal eviction access counters. An empty result and `NO_HINT` is a perfectly
+valid answer, and the call never errors on the hot path.
 
 ## What the request carries
 

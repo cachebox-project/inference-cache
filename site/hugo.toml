@@ -74,6 +74,7 @@ ignoreFiles = []
   # Apache-2.0 licensed, developed in the open under the cachebox-project org.
 
   prism_syntax_highlighting = true
+  offlineSearch = true
   # Text label for the version menu in the top bar of the website.
   version_menu = "Version"
 

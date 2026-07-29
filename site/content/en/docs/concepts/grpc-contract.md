@@ -111,8 +111,9 @@ These are the contract properties clients are allowed to depend on:
   old clients — a client that does not recognize a code must treat it as the no-hint default.
 - **Fail-open.** An empty `replica_scores` list is always valid. `TIMEOUT` is a fail-open
   outcome, not an error. The hot path never returns a gRPC error for a cache miss.
-- **Side-effect-free lookups** (apart from metrics). The one narrow exception: an `LFU`
-  namespace credits per-entry access counters on a *delivered* prefix-match hit.
+- **No cache-membership mutation on lookups.** A lookup does not add, remove, or rewrite
+  indexed prefixes. Metrics are emitted, and an `LFU` namespace credits internal eviction
+  access counters on a *delivered* prefix-match hit.
 - **Engine-opaque hashes, scheme-scoped.** `prefix_hash` / `block_hashes` are matched only
   within a matching `hash_scheme`; an empty scheme is not a valid domain.
 - **Metadata-only index updates.** `CacheStateUpdate` and `PrefixEntry` carry hashes and
