@@ -4,6 +4,16 @@ on:
   pull_request:
     branches:
     - main
+    # Include label events so the docs-sync 'no-docs-needed' escape hatch takes
+    # effect immediately — the default pull_request activity types omit
+    # 'labeled'/'unlabeled', so a label added after a failing run would otherwise
+    # never re-trigger CI.
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - labeled
+    - unlabeled
   push:
     branches:
     - main
@@ -43,6 +53,9 @@ jobs:
 
     - name: Verify Syft pin drift
       run: make verify-syft-pin
+
+    - name: Test docs-sync gate
+      run: make test-docs-sync
 
     - name: Install protoc
       env:

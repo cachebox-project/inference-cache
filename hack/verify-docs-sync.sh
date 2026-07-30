@@ -26,9 +26,16 @@ TRIGGER_RE='^(api/v1alpha1/[^/]*_types\.go|proto/.*\.proto)$'
 # Paths that count as a documentation update.
 DOC_RE='^(site/|docs/)'
 
+# Fail closed: a gate presented as enforcement must not pass silently when it
+# cannot run. A missing base ref is an operator/CI error, not a reason to skip.
 if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
-  echo "verify-docs-sync: base ref '${BASE}' not found — skipping (fetch it to enable the check)." >&2
-  exit 0
+  {
+    echo "✗ docs-sync: base ref '${BASE}' not found — cannot verify docs are in sync."
+    echo "  Fetch it first (e.g. 'git fetch origin main'), or pass the correct base:"
+    echo "    hack/verify-docs-sync.sh <base-ref>"
+    echo "    make verify-docs-sync DOCS_SYNC_BASE=<base-ref>"
+  } >&2
+  exit 1
 fi
 
 # Prefer the merge base (three-dot semantics) so only THIS branch's changes are
@@ -53,7 +60,10 @@ if [ -z "${triggers}" ]; then
   exit 0
 fi
 
-docs="$(printf '%s\n' "${changed}" | grep -E "${DOC_RE}" || true)"
+# Only ADDED / MODIFIED / RENAMED-to docs count as a documentation update.
+# --diff-filter=ACMR excludes deletions (D), so removing a file under docs/ or
+# site/ can't masquerade as "the docs were updated".
+docs="$(git diff --name-only --diff-filter=ACMR "${diff_base}" HEAD | grep -E "${DOC_RE}" || true)"
 if [ -n "${docs}" ]; then
   echo "✓ docs-sync: public-surface change is accompanied by a docs update"
   exit 0
