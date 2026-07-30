@@ -1364,6 +1364,59 @@ func TestReconcileCanonicalExternalInvalidEndpointNamesCanonicalField(t *testing
 	}
 }
 
+func TestReconcileCanonicalExternalEndpointUsesProviderProtocol(t *testing.T) {
+	scheme := newScheme(t)
+	tests := []struct {
+		name       string
+		runtime    cachev1alpha1.CacheBackendRuntime
+		provider   cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint   string
+		wantStatus metav1.ConditionStatus
+		wantReason string
+	}{
+		{
+			name:       "redis rejects lm scheme",
+			runtime:    cachev1alpha1.CacheBackendRuntimeSGLang,
+			provider:   cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			endpoint:   "lm://redis.example:6379",
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonExternalEndpointInvalid,
+		},
+		{
+			name:       "mooncake accepts explicit scheme",
+			runtime:    cachev1alpha1.CacheBackendRuntimeVLLM,
+			provider:   cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+			endpoint:   "mooncakestore://cache.example:50051",
+			wantStatus: metav1.ConditionTrue,
+			wantReason: conditionReasonExternalEndpointAccepted,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "external", Namespace: "default"},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Runtime: tt.runtime,
+					Type:    cachev1alpha1.CacheBackendTypeLMCache,
+					RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+						Provider:  tt.provider,
+						Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+						Endpoint:  tt.endpoint,
+					},
+				},
+			}
+			r := newReconciler(scheme, cb)
+			reconcile(t, r, cb.Name, cb.Namespace)
+
+			ready := findCondition(getBackend(t, r, cb.Name, cb.Namespace).Status.Conditions, conditionTypeReady)
+			if ready == nil || ready.Status != tt.wantStatus || ready.Reason != tt.wantReason {
+				t.Fatalf("Ready = %+v, want %s/%s", ready, tt.wantStatus, tt.wantReason)
+			}
+		})
+	}
+}
+
 func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	// Admission rejects this case at the webhook, but a CR already in etcd
 	// from before the webhook was installed must still publish a visible

@@ -331,7 +331,7 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 		if strings.TrimSpace(storage.Endpoint) == "" {
 			errs = append(errs, field.Required(storagePath.Child("endpoint"),
 				"required when remoteStorage.ownership=External"))
-		} else if err := adapterruntime.ValidateLMCacheEndpoint(storage.Endpoint); err != nil {
+		} else if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			errs = append(errs, field.Invalid(storagePath.Child("endpoint"), storage.Endpoint, err.Error()))
 		}
 	}

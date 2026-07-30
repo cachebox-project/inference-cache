@@ -147,6 +147,45 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 		}
 	})
 
+	t.Run("external endpoint scheme follows provider protocol", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			runtime  cachev1alpha1.CacheBackendRuntime
+			provider cachev1alpha1.CacheBackendRemoteStorageProvider
+			endpoint string
+			wantErr  bool
+		}{
+			{name: "redis bare", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
+			{name: "redis rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
+			{name: "redis rejects named port", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+			{name: "lmcache bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
+			{name: "lmcache explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
+			{name: "lmcache rejects mooncake scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+			{name: "mooncake bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncake.example:50051"},
+			{name: "mooncake explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:50051"},
+			{name: "mooncake rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://mooncake.example:50051", wantErr: true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = tt.runtime
+				cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  tt.provider,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+					Endpoint:  tt.endpoint,
+				}
+				if tt.wantErr {
+					requireInvalidWithCause(t, validator, cb, "spec.remoteStorage.endpoint", "")
+					return
+				}
+				if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+					t.Fatalf("ValidateCreate: %v", err)
+				}
+			})
+		}
+	})
+
 	t.Run("managed provider resources are validated at their typed path", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang

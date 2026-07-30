@@ -384,14 +384,11 @@ func sglangWorkerSecurityContext(engineSC *corev1.SecurityContext) *corev1.Secur
 }
 
 // sglangL2AdapterJSON returns the worker's --l2-adapter config: the resp adapter
-// pointed at the managed Redis endpoint (host:port).
+// pointed at the resolved Redis endpoint (host:port).
 //
-// Operator-supplied ("bring your own") L2 stores are deliberately NOT supported
-// yet: skipping the managed Redis clears status.endpoint, and the pod webhook's
-// empty-endpoint gate then skips injection entirely, so a BYO backend would cache
-// nothing. Supporting it needs that gate to become adapter-aware first — the gate
-// exists only to protect vLLM's lm:// dial target, which SGLang MP does not have.
-// See the tracking issue linked from the package doc.
+// The endpoint may come from a controller-managed Redis Service or a canonical
+// External Redis binding. Admission keeps both shapes at bare host:port because
+// the RESP adapter takes host and numeric port as separate fields.
 func sglangL2AdapterJSON(endpoint string) (string, error) {
 	host, port, ok := splitLMCacheHostPort(strings.TrimSpace(endpoint))
 	if !ok || host == "" || port == "" {

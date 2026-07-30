@@ -1136,6 +1136,30 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 	}
 }
 
+func TestEffectiveEndpointCanonicalExternalUsesProviderProtocol(t *testing.T) {
+	cache := &cachev1alpha1.CacheBackend{
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "mooncakestore://cache.example:50051",
+			},
+		},
+	}
+	if got := effectiveEndpoint(cache); got != cache.Spec.RemoteStorage.Endpoint {
+		t.Fatalf("effectiveEndpoint(Mooncake) = %q, want %q", got, cache.Spec.RemoteStorage.Endpoint)
+	}
+
+	cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cache.Spec.RemoteStorage.Provider = cachev1alpha1.CacheBackendRemoteStorageProviderRedis
+	cache.Spec.RemoteStorage.Endpoint = "lm://redis.example:6379"
+	if got := effectiveEndpoint(cache); got != "" {
+		t.Fatalf("effectiveEndpoint(Redis with lm scheme) = %q, want empty fail-open endpoint", got)
+	}
+}
+
 func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	// Pod admission is CREATE-only — if an engine pod admits before the
 	// controller has mirrored spec.endpoint into status.endpoint, the

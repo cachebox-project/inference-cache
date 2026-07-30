@@ -200,15 +200,15 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
 		//     yet (steady-state during initial rollout).
-		//   - External CR: spec.endpoint is empty (admission rejects
+		//   - External CR: its spec endpoint is empty (admission rejects
 		//     this on fresh CRs; only reachable from a pre-existing
 		//     stored value).
-		//   - External CR: spec.endpoint is set but fails the shared
-		//     shape check (also pre-existing-only; current admission
+		//   - External CR: its endpoint fails the selected provider's
+		//     shared shape check (also pre-existing-only; current admission
 		//     rejects malformed values). effectiveEndpoint deliberately
 		//     returns "" for this case so the engine pod admits
-		//     un-wired rather than receiving an LMCACHE_REMOTE_URL the
-		//     connector refuses at startup.
+		//     un-wired rather than receiving an endpoint its connector
+		//     refuses at startup.
 		// Surface the field name (and the shape error when applicable)
 		// so the operator looks at the right place. Route through
 		// failOpen so any pre-supplied injected-by annotations on the
@@ -222,7 +222,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			if !cache.Spec.UsesCanonicalCacheHierarchy() {
 				missingField = "spec.endpoint"
 			}
-			if err := adapterruntime.ValidateLMCacheEndpoint(storage.Endpoint); err != nil {
+			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 				extra = ": " + err.Error()
 			}
 		}
@@ -618,23 +618,22 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	}
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
 		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
-		// For External, re-apply the admission-time shape check on
-		// the stored spec.endpoint. The validating webhook already
+		// For External, re-apply the provider-specific admission-time shape
+		// check on the stored spec endpoint. The validating webhook already
 		// rejects malformed values at write time, but a pre-existing
 		// CR in etcd from before the shape rule shipped (or stored
 		// when an earlier, laxer rule set was in effect) can still
 		// carry e.g. `https://...`, a portless host, or embedded
-		// whitespace. Returning the malformed value would let the
-		// adapter prepend `lm://` and inject an URL the engine
-		// connector refuses at startup — turning a cache
-		// misconfiguration into a serving outage. Treat invalid the
+		// whitespace. Returning the malformed value would let the adapter
+		// inject an endpoint its provider connector refuses at startup,
+		// turning a cache misconfiguration into a serving outage. Treat invalid the
 		// same way we treat empty: return "" and let the caller's
 		// existing fail-open branch admit the pod un-wired.
 		ep := strings.TrimSpace(storage.Endpoint)
 		if ep == "" {
 			return ""
 		}
-		if err := adapterruntime.ValidateLMCacheEndpoint(storage.Endpoint); err != nil {
+		if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			return ""
 		}
 		return ep

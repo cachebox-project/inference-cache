@@ -111,7 +111,7 @@ New manifests should use the canonical fields. In particular, setting
 | `remoteStorage` | object | Optional remote tier. Omitting it means host-only and provisions no provider workload. |
 | `remoteStorage.provider` | enum | `Redis`, `LMCacheServer`, or `Mooncake`. |
 | `remoteStorage.ownership` | enum | `Managed` or `External`. |
-| `remoteStorage.endpoint` | string | Required for `External`, rejected for `Managed`; managed endpoints are controller-observed in status. |
+| `remoteStorage.endpoint` | string | Required for `External`, rejected for `Managed`; managed endpoints are controller-observed in status. Bare `host:port` is portable across all providers. `LMCacheServer` also accepts `lm://host:port`, `Mooncake` also accepts `mooncakestore://host:port`, and `Redis` accepts only bare `host:port` with a numeric port in `1-65535`. Admission rejects schemes belonging to another provider. |
 | `remoteStorage.redis` | object | Redis-owned image and resource configuration. |
 | `remoteStorage.lmCacheServer` | object | Standalone LMCache-server-owned image, command, and resource configuration. |
 | `remoteStorage.mooncake` | object | Mooncake-owned image, command, and resource configuration. |

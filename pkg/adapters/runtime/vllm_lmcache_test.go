@@ -832,6 +832,38 @@ func TestVLLMLMCacheReservedEnv(t *testing.T) {
 	}
 }
 
+func TestValidateExternalEndpointProviderSchemes(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint string
+		wantErr  bool
+	}{
+		{name: "redis bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
+		{name: "redis rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
+		{name: "redis rejects named port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+		{name: "lmcache bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
+		{name: "lmcache explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
+		{name: "lmcache rejects mooncake", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+		{name: "mooncake bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "cache.example:50051"},
+		{name: "mooncake explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:50051"},
+		{name: "mooncake rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://cache.example:50051", wantErr: true},
+		{name: "mooncake rejects nested scheme", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://lm://cache.example:50051", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateExternalEndpoint(tt.provider, tt.endpoint)
+			if tt.wantErr && err == nil {
+				t.Fatalf("ValidateExternalEndpoint(%s, %q) succeeded, want error", tt.provider, tt.endpoint)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateExternalEndpoint(%s, %q): %v", tt.provider, tt.endpoint, err)
+			}
+		})
+	}
+}
+
 // TestVLLMLMCacheEngineContainerName confirms the adapter exposes its
 // canonical container name to the pod webhook so the override merge lands on
 // the same container [InjectEngineConfig] modified.

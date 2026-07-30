@@ -530,20 +530,19 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
 // honest about CRs that were stored under a laxer rule set:
 //
-//   - spec.endpoint empty                  → Ready=False/ExternalEndpointMissing
-//   - spec.endpoint set but malformed      → Ready=False/ExternalEndpointInvalid
-//   - spec.endpoint set and well-formed    → Ready=True/ExternalEndpointAccepted
+//   - external endpoint empty             → Ready=False/ExternalEndpointMissing
+//   - endpoint malformed for its provider → Ready=False/ExternalEndpointInvalid
+//   - endpoint valid for its provider     → Ready=True/ExternalEndpointAccepted
 //
 // The "invalid" branch matters because admission's shape rule tightened
 // over the life of the CRD (added port-required, bracket-required-IPv6,
 // no-embedded-whitespace, etc. as we learned what the engine connector
 // rejects). A pre-existing stored CR carrying e.g. `https://...` or a
 // portless host would otherwise be marked Ready=True/ExternalEndpointAccepted
-// here; the pod webhook would then read spec.endpoint, prepend `lm://`,
-// and inject a URL the engine can't parse — turning a cache
-// misconfiguration into a serving outage. Publishing Ready=False with a
-// specific reason names the gap, and the pod webhook short-circuits on
-// the same check (returns no-injection, fail-open).
+// here; the pod webhook would then hand the value to a provider wire that
+// cannot parse it, turning a cache misconfiguration into a serving outage.
+// Publishing Ready=False with a specific reason names the gap, and the pod
+// webhook short-circuits on the same check (returns no-injection, fail-open).
 //
 // External backends never enter the KV-event readiness gate, so the
 // managed-only Degraded condition is cleared here. Two status fields are
@@ -577,8 +576,9 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// means the pod webhook's `endpoint == ""` short-circuit
 		// naturally catches whitespace too without a second TrimSpace
 		// at the consumer.
+		storage := backend.Spec.EffectiveRemoteStorage()
 		endpoint := ""
-		if storage := backend.Spec.EffectiveRemoteStorage(); storage != nil {
+		if storage != nil {
 			endpoint = strings.TrimSpace(storage.Endpoint)
 		}
 		backend.Status.Endpoint = endpoint
@@ -608,7 +608,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			// operator running kubectl describe sees the same
 			// shape complaint they would get on a fresh kubectl
 			// apply.
-			if err := adapterruntime.ValidateLMCacheEndpoint(endpoint); err != nil {
+			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
 				fieldPrefix := "spec."
 				if backend.Spec.UsesCanonicalCacheHierarchy() {

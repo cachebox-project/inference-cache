@@ -2,6 +2,9 @@ package runtime
 
 import (
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -258,17 +261,55 @@ var (
 	upsertArgPair    = enginewire.UpsertArgPair
 )
 
-// ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint]
-// so consumers outside pkg/adapters/runtime — the validating webhook in
-// internal/webhook/v1alpha1, the C2 reconciler in internal/controller,
-// and the pod webhook in internal/webhook/pod — can call the same
-// endpoint-shape check that admission uses. Go's internal-package rule
-// keeps the enginewire subpackage adapter-scoped; this re-export is the
-// public seam those layers reach for. Returns nil when s is a valid
-// LMCache endpoint, otherwise an error whose message describes the
-// shape problem (kubectl admission paths wrap it in field.Invalid;
-// reconciler/pod-webhook paths surface the message in a status reason
-// or fail-open log).
+// ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint] for
+// the legacy External API and LMCache-specific callers. Canonical
+// remoteStorage callers use [ValidateExternalEndpoint], which dispatches this
+// same host/port shape check according to the selected provider.
 func ValidateLMCacheEndpoint(s string) error {
 	return enginewire.ValidateLMCacheEndpoint(s)
+}
+
+// ValidateExternalEndpoint is the shared canonical endpoint seam used by
+// admission, reconciliation, and pod injection. It validates an
+// operator-supplied endpoint against the selected remote provider's wire
+// protocol. Bare host:port is portable across providers; explicit schemes are
+// accepted only when the provider's engine wire consumes them.
+func ValidateExternalEndpoint(provider cachev1alpha1.CacheBackendRemoteStorageProvider, endpoint string) error {
+	trimmed := strings.TrimSpace(endpoint)
+	switch provider {
+	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
+		return enginewire.ValidateLMCacheEndpoint(trimmed)
+	case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
+		if scheme, _, ok := strings.Cut(trimmed, "://"); ok {
+			return fmt.Errorf("scheme %q is not supported for remoteStorage.provider=%s; use bare host:port",
+				scheme, provider)
+		}
+		if err := enginewire.ValidateLMCacheEndpoint(trimmed); err != nil {
+			return err
+		}
+		_, port, err := net.SplitHostPort(trimmed)
+		if err != nil {
+			return fmt.Errorf("Redis endpoint must be a bare host:port: %w", err)
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("Redis endpoint port %q must be an integer in 1-65535", port)
+		}
+		return nil
+	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
+		if scheme, address, ok := strings.Cut(trimmed, "://"); ok {
+			if !strings.EqualFold(scheme, "mooncakestore") {
+				return fmt.Errorf("scheme %q is not supported for remoteStorage.provider=%s; use bare host:port or mooncakestore://host:port",
+					scheme, provider)
+			}
+			if strings.Contains(address, "://") {
+				return fmt.Errorf("nested endpoint schemes are not supported for remoteStorage.provider=%s; use mooncakestore://host:port",
+					provider)
+			}
+			trimmed = address
+		}
+		return enginewire.ValidateLMCacheEndpoint(trimmed)
+	default:
+		return fmt.Errorf("remote-storage provider %q has no endpoint protocol", provider)
+	}
 }
