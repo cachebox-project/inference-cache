@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,11 +106,11 @@ type CacheBackendValidator struct {
 	// at admission time. A nil Registry falls back to
 	// [defaultShippingRegistry], which mirrors the production cmd/controller
 	// wiring: [adapterruntime.DefaultRegistry] plus the External and
-	// SGLang+LMCache adapters (registered explicitly because those
+	// SGLang adapters (registered explicitly because those
 	// subpackages can't be imported by DefaultRegistry without a cycle). The
 	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
 	// (engine, backend) pair the running controller supports, including
-	// External and SGLang+LMCache — so admission doesn't silently reject an
+	// External and SGLang backends — so admission doesn't silently reject an
 	// otherwise-valid CR just because the caller forgot to pass a registry.
 	Registry *adapterruntime.Registry
 }
@@ -116,12 +118,13 @@ type CacheBackendValidator struct {
 // defaultShippingRegistry returns a Registry with every adapter the
 // production cmd/controller wiring installs: the in-package vLLM+LMCache
 // adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
-// External and SGLang+LMCache adapters. Centralised here so the validator's
+// External and SGLang adapters. Centralised here so the validator's
 // nil-Registry fallback admits the same set the running controller does.
 func defaultShippingRegistry() *adapterruntime.Registry {
 	r := adapterruntime.DefaultRegistry()
 	r.Register(externaladapter.NewAdapter())
 	r.Register(sglangadapter.NewAdapter())
+	r.Register(sglangadapter.NewHiCacheAdapter())
 	return r
 }
 
@@ -152,9 +155,178 @@ var DefaultValidationRules = []ValidationRule{
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
 	rejectEventsOnlyMisconfiguration,
+	validateSGLangHiCache,
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
 	rejectSGLangRedisL2ScaleOut,
+}
+
+func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	hiCachePath := field.NewPath("spec", "hiCache")
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
+		if cb.Spec.HiCache != nil {
+			return field.ErrorList{field.Forbidden(
+				hiCachePath,
+				fmt.Sprintf("spec.hiCache is only valid when spec.type=%q", cachev1alpha1.CacheBackendTypeSGLangHiCache),
+			)}
+		}
+		return nil
+	}
+
+	var errs field.ErrorList
+	if cb.Spec.HiCache == nil {
+		errs = append(errs, field.Required(hiCachePath,
+			fmt.Sprintf("required when spec.type=%q", cachev1alpha1.CacheBackendTypeSGLangHiCache)))
+	} else {
+		spec := cb.Spec.HiCache
+		sizePath := hiCachePath.Child("sizeGB")
+		ratioPath := hiCachePath.Child("ratio")
+		switch {
+		case spec.SizeGB == nil && spec.Ratio == "":
+			errs = append(errs, field.Required(hiCachePath,
+				"exactly one of sizeGB and ratio must be set"))
+		case spec.SizeGB != nil && spec.Ratio != "":
+			errs = append(errs, field.Invalid(hiCachePath, spec,
+				"sizeGB and ratio are mutually exclusive"))
+		}
+		if spec.SizeGB != nil && *spec.SizeGB < 1 {
+			errs = append(errs, field.Invalid(sizePath, *spec.SizeGB, "must be at least 1"))
+		}
+		if spec.Ratio != "" {
+			ratio, err := strconv.ParseFloat(spec.Ratio, 64)
+			if err != nil || ratio <= 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+				errs = append(errs, field.Invalid(ratioPath, spec.Ratio,
+					"must be a finite number greater than zero"))
+			}
+		}
+		if !validHiCacheWritePolicy(spec.WritePolicy) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("writePolicy"), spec.WritePolicy,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheWriteBack),
+					string(cachev1alpha1.SGLangHiCacheWriteThrough),
+					string(cachev1alpha1.SGLangHiCacheWriteThroughSelective),
+				},
+			))
+		}
+		if !validHiCacheIOBackend(spec.IOBackend) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("ioBackend"), spec.IOBackend,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheIODirect),
+					string(cachev1alpha1.SGLangHiCacheIOKernel),
+					string(cachev1alpha1.SGLangHiCacheIOKernelAscend),
+				},
+			))
+		}
+		if !validHiCacheMemoryLayout(spec.MemoryLayout) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("memoryLayout"), spec.MemoryLayout,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheMemoryLayerFirst),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirst),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirstDirect),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageHead),
+				},
+			))
+		}
+	}
+
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang {
+		value := ""
+		if cb.Spec.Integration != nil {
+			value = cb.Spec.Integration.Engine
+		}
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "integration", "engine"), value,
+			"SGLangHiCache requires integration.engine=sglang",
+		))
+	}
+	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+		errs = append(errs, field.Required(
+			field.NewPath("spec", "engineSelector", "matchLabels"),
+			"SGLangHiCache must select the engine Pods to inject",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "autoscaling"),
+			"SGLangHiCache is engine-local and has no backend workload to autoscale",
+		))
+	}
+	if cachev1alpha1.IntegrationMode(cb.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
+		errs = append(errs, field.NotSupported(
+			field.NewPath("spec", "integration", "mode"),
+			cb.Spec.Integration.Mode,
+			[]string{string(cachev1alpha1.CacheBackendIntegrationModeOffload)},
+		))
+	}
+	if cb.Spec.Integration != nil {
+		role := cb.Spec.Integration.Role
+		if role != "" && role != cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "integration", "role"),
+				role,
+				[]string{string(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)},
+			))
+		}
+		if !cachev1alpha1.IntegrationFailOpen(cb.Spec.Integration) {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "integration", "failOpen"),
+				false,
+				[]string{"true"},
+			))
+		}
+	}
+	for key := range cb.Spec.BackendConfig {
+		if key != "model" {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "backendConfig").Key(key),
+				key,
+				[]string{"model"},
+			))
+		}
+	}
+	return errs
+}
+
+func validHiCacheWritePolicy(value cachev1alpha1.SGLangHiCacheWritePolicy) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheWriteBack,
+		cachev1alpha1.SGLangHiCacheWriteThrough,
+		cachev1alpha1.SGLangHiCacheWriteThroughSelective:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHiCacheIOBackend(value cachev1alpha1.SGLangHiCacheIOBackend) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheIODirect,
+		cachev1alpha1.SGLangHiCacheIOKernel,
+		cachev1alpha1.SGLangHiCacheIOKernelAscend:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHiCacheMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheMemoryLayerFirst,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirst,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirstDirect,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit,
+		cachev1alpha1.SGLangHiCacheMemoryPageHead:
+		return true
+	default:
+		return false
+	}
 }
 
 // rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
@@ -269,7 +441,7 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
 // [defaultShippingRegistry] (DefaultRegistry plus the External and
-// SGLang+LMCache adapters), mirroring cmd/controller's production wiring so a zero-value validator
+// SGLang adapters), mirroring cmd/controller's production wiring so a zero-value validator
 // sees the same adapter set the running controller does. cmd/controller
 // threads the same instance the reconciler + pod webhook receive so all
 // three layers agree on what's supported.

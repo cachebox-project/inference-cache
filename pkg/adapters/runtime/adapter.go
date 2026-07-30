@@ -90,8 +90,10 @@ type KVCacheRuntimeAdapter interface {
 	// these.
 	//
 	// Tunable flags the operator may legitimately want to change MUST NOT
-	// appear here. The list is exact: matching is per-leading-flag-token,
-	// so equality is the contract (no prefix/wildcards).
+	// appear here unless they have a dedicated typed CacheBackend field that
+	// is the integration's single source of truth. The list is exact: matching
+	// is per-leading-flag-token, so equality is the contract (no
+	// prefix/wildcards).
 	ReservedArgs() []string
 
 	// ReservedEnv returns the env var Names this adapter will inject as
@@ -113,6 +115,21 @@ type KVCacheRuntimeAdapter interface {
 	// name (e.g. the reference adapter writes to every container) — the
 	// webhook skips override application in that case.
 	EngineContainerName() string
+}
+
+// EndpointRequirement is an optional adapter capability for engine-local
+// integrations that do not dial a separate cache server. Adapters that do not
+// implement it require an endpoint by default, preserving the existing
+// LMCache, Mooncake, and External behavior.
+type EndpointRequirement interface {
+	RequiresEndpoint() bool
+}
+
+// AdapterRequiresEndpoint returns the endpoint requirement declared by
+// adapter, defaulting to true for adapters that predate EndpointRequirement.
+func AdapterRequiresEndpoint(adapter KVCacheRuntimeAdapter) bool {
+	requirement, ok := adapter.(EndpointRequirement)
+	return !ok || requirement.RequiresEndpoint()
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter

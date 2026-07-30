@@ -32,6 +32,124 @@ func newBackend() *cachev1alpha1.CacheBackend {
 
 func i32p(v int32) *int32 { return &v }
 
+func newHiCacheBackend() *cachev1alpha1.CacheBackend {
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Engine: "sglang",
+				Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "sglang"},
+			},
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{
+				Ratio:        "2.0",
+				WritePolicy:  cachev1alpha1.SGLangHiCacheWriteThroughSelective,
+				IOBackend:    cachev1alpha1.SGLangHiCacheIOKernel,
+				MemoryLayout: cachev1alpha1.SGLangHiCacheMemoryPageFirst,
+			},
+			BackendConfig: map[string]string{"model": "model-a"},
+		},
+	}
+}
+
+func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
+	if _, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), newHiCacheBackend()); err != nil {
+		t.Fatalf("valid SGLangHiCache rejected: %v", err)
+	}
+}
+
+func TestValidator_SGLangHiCacheContract(t *testing.T) {
+	falseValue := false
+	size := int32(64)
+	zero := int32(0)
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+		want   string
+	}{
+		{"missing hiCache", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache = nil }, "spec.hiCache"},
+		{"missing capacity", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.Ratio = "" }, "exactly one"},
+		{"both capacities", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.SizeGB = &size }, "mutually exclusive"},
+		{"zero size", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.HiCache.Ratio = ""
+			cb.Spec.HiCache.SizeGB = &zero
+		}, "sizeGB"},
+		{"invalid ratio", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.Ratio = "Inf" }, "ratio"},
+		{"wrong engine", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.Integration.Engine = "vllm" }, "integration.engine"},
+		{"missing selector", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.EngineSelector = nil }, "engineSelector.matchLabels"},
+		{"events only", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		}, "integration.mode"},
+		{"read only", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.Role = cachev1alpha1.CacheBackendIntegrationRoleReadOnly
+		}, "integration.role"},
+		{"fail closed", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.FailOpen = &falseValue
+		}, "integration.failOpen"},
+		{"autoscaling", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 2}
+		}, "spec.autoscaling"},
+		{"unknown backendConfig", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.BackendConfig["l1SizeGB"] = "8"
+		}, "backendConfig[l1SizeGB]"},
+		{"invalid write policy", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.HiCache.WritePolicy = "sometimes"
+		}, "writePolicy"},
+		{"invalid io backend", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.HiCache.IOBackend = "userspace"
+		}, "ioBackend"},
+		{"invalid memory layout", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.HiCache.MemoryLayout = "tensor_first"
+		}, "memoryLayout"},
+	}
+	validator := &CacheBackendValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newHiCacheBackend()
+			tc.mutate(cb)
+			_, err := validator.ValidateCreate(context.Background(), cb)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateCreate error = %v, want text %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidator_HiCacheBlockRejectedOnOtherTypes(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
+	_, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), cb)
+	if err == nil || !strings.Contains(err.Error(), "spec.hiCache") {
+		t.Fatalf("ValidateCreate error = %v, want hiCache type-scope error", err)
+	}
+}
+
+func TestValidator_SGLangHiCacheArgsAreReserved(t *testing.T) {
+	for _, flag := range []string{
+		"--enable-hierarchical-cache",
+		"--hicache-size",
+		"--hicache-ratio",
+		"--hicache-write-policy",
+		"--hicache-io-backend",
+		"--hicache-mem-layout",
+	} {
+		t.Run(flag, func(t *testing.T) {
+			cb := newHiCacheBackend()
+			cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+				SuppressArgs: []string{flag},
+			}
+			_, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), cb)
+			if err == nil || !strings.Contains(err.Error(), flag) || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("ValidateCreate error = %v, want reserved %s", err, flag)
+			}
+		})
+	}
+}
+
 func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	// The webhook materialises spec.integration solely to persist
 	// firstEventTimeout: the CRD-schema default for firstEventTimeout only

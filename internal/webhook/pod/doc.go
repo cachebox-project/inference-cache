@@ -13,7 +13,8 @@
 //     spec.endpoint edit and the reconciler's mirror is wired to the
 //     fresh address, not the stale one), Status.Endpoint for managed
 //     types (the reconciler builds it from the live Service; spec.endpoint
-//     is admission-rejected on managed types); and
+//     is admission-rejected on managed types). Endpoint-free adapters such
+//     as native SGLang HiCache bypass this gate; and
 //  5. calls adapter.InjectEngineConfig(pod.Spec, endpoint, cache) to merge
 //     the cache-server endpoint + connector env/args into the pod spec.
 //

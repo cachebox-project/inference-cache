@@ -98,7 +98,7 @@ type EngineInjector struct {
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
 	// nil falls back to [adapterruntime.DefaultRegistry] plus the External
-	// and SGLang+LMCache adapters (registered explicitly because those
+	// and SGLang adapters (registered explicitly because those
 	// subpackages can't be imported by DefaultRegistry without a cycle).
 	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
 	// doesn't silently fail-open on External CRs that the running webhook
@@ -160,6 +160,24 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 	log = log.WithValues("cachebackend", cache.Namespace+"/"+cache.Name)
 
+	runtimeID := adapterruntime.ResolveRuntimeID(cache)
+	registry := h.Registry
+	if registry == nil {
+		// Mirror production cmd/controller wiring: DefaultRegistry plus the
+		// import-cycle-bound External and SGLang adapters.
+		registry = adapterruntime.DefaultRegistry()
+		registry.Register(externaladapter.NewAdapter())
+		registry.Register(sglangadapter.NewAdapter())
+		registry.Register(sglangadapter.NewHiCacheAdapter())
+	}
+	adapter, err := registry.Select(runtimeID, cache)
+	if err != nil {
+		log.V(1).Info("fail-open: no runtime adapter",
+			"runtime", string(runtimeID), "backend", string(cache.Spec.Type), "error", err.Error())
+		return failOpen(req, &pod, fmt.Sprintf("no adapter for runtime=%q backend=%q (fail-open): %v",
+			runtimeID, cache.Spec.Type, err))
+	}
+
 	endpoint := effectiveEndpoint(cache)
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
@@ -167,7 +185,9 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
 	// events-only pod injects only the observation sidecar (InjectEngineConfig
 	// is a no-op in this mode), so bypass the gate and inject without one.
-	if endpoint == "" && !cache.Spec.IsEventsOnly() {
+	// Engine-local adapters such as native SGLang HiCache also bypass this
+	// gate through the optional EndpointRequirement capability.
+	if endpoint == "" && !cache.Spec.IsEventsOnly() && adapterruntime.AdapterRequiresEndpoint(adapter) {
 		// The endpoint source is type-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
@@ -210,30 +230,6 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// upsertFlag) and a no-op merge produces an
 	// empty patch set, so re-admissions on an already-injected pod are
 	// free at the apiserver.
-	runtimeID := adapterruntime.ResolveRuntimeID(cache)
-	registry := h.Registry
-	if registry == nil {
-		// Mirror production cmd/controller wiring: DefaultRegistry +
-		// the External and SGLang+LMCache adapters (registered explicitly
-		// because those subpackages can't be imported by DefaultRegistry
-		// without a cycle). Keeps the nil-fallback consistent with the
-		// running controller so a bare `EngineInjector{}` doesn't silently
-		// fail-open on External / SGLang CRs that the production webhook
-		// would have wired. The no-arg SGLang adapter renders no subscriber
-		// sidecar (no image configured) — engine config injection still
-		// happens; only auto-attach is gated on the controller flag.
-		registry = adapterruntime.DefaultRegistry()
-		registry.Register(externaladapter.NewAdapter())
-		registry.Register(sglangadapter.NewAdapter())
-	}
-	adapter, err := registry.Select(runtimeID, cache)
-	if err != nil {
-		log.V(1).Info("fail-open: no runtime adapter",
-			"runtime", string(runtimeID), "backend", string(cache.Spec.Type), "error", err.Error())
-		return failOpen(req, &pod, fmt.Sprintf("no adapter for runtime=%q backend=%q (fail-open): %v",
-			runtimeID, cache.Spec.Type, err))
-	}
-
 	mutated := pod.DeepCopy()
 
 	// Snapshot the engine container's pre-injection args/env so the
@@ -582,6 +578,9 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 //     provisions, and spec.endpoint is admission-rejected for these
 //     types (see rejectEndpointOnNonExternal), so there's nothing
 //     else to fall back on. The webhook must wait for status.
+//   - Engine-local types (SGLangHiCache): no endpoint is required. The
+//     selected adapter's EndpointRequirement capability bypasses the gate
+//     before this empty result is consumed.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
 //

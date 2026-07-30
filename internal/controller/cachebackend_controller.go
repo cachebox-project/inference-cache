@@ -394,12 +394,13 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
 		// nil-fallback manages the same backends the validator + pod webhook
 		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
-		// plus the SGLang+LMCache adapter (a subpackage DefaultRegistry can't
+		// plus the SGLang adapters (a subpackage DefaultRegistry can't
 		// import without a cycle). External is intentionally absent — a
 		// type==External backend short-circuits to the unmanaged External path
 		// before ever reaching Select, so registering it here would be dead code.
 		registry = adapterruntime.DefaultRegistry()
 		registry.Register(sglangadapter.NewAdapter())
+		registry.Register(sglangadapter.NewHiCacheAdapter())
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 
@@ -451,8 +452,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	}
 
 	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
-	// module. Phase 1 manages a Deployment only.
-	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet {
+	// module. Phase 1 manages a Deployment only. SGLangHiCache is engine-local,
+	// so the schema-defaulted deploymentKind is inert for it.
+	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet &&
+		backend.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
 		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
@@ -799,9 +802,9 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		return ctrl.Result{}, fmt.Errorf("resolve cache server for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	if podSpec == nil || svcSpec == nil {
-		// An adapter that genuinely needs no cache-server (e.g. an
-		// engine-colocated backend) is a valid future case. For Phase 1 it
-		// shouldn't happen for managed types — surface as unmanaged.
+		// Engine-local adapters such as native SGLang HiCache intentionally
+		// render no cache-server. Reuse the unmanaged lifecycle to shed any
+		// previously owned workload and clear server-backed status.
 		logger.V(1).Info("adapter rendered no cache-server; treating as unmanaged",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)

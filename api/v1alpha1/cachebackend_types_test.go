@@ -27,6 +27,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"autoscaling",
 		"integration",
 		"engineSelector",
+		"hiCache",
 		"backendConfig",
 		"template",
 		"endpoint",
@@ -92,6 +93,28 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 
 	requireNotRequired(t, specSchema, "type")
 	requireMinimum(t, mustProperty(t, specSchema, "replicas"), 0)
+	hiCacheSchema := mustProperty(t, specSchema, "hiCache")
+	requireMinimum(t, mustProperty(t, hiCacheSchema, "sizeGB"), 1)
+	if got := mustProperty(t, hiCacheSchema, "ratio")["type"]; got != "string" {
+		t.Fatalf("spec.hiCache.ratio type = %v, want string", got)
+	}
+	requireEnum(t, mustProperty(t, hiCacheSchema, "writePolicy"), []string{
+		"write_back",
+		"write_through",
+		"write_through_selective",
+	})
+	requireEnum(t, mustProperty(t, hiCacheSchema, "ioBackend"), []string{
+		"direct",
+		"kernel",
+		"kernel_ascend",
+	})
+	requireEnum(t, mustProperty(t, hiCacheSchema, "memoryLayout"), []string{
+		"layer_first",
+		"page_first",
+		"page_first_direct",
+		"page_first_kv_split",
+		"page_head",
+	})
 	firstEventTimeoutSchema := mustPath[map[string]any](t, integrationSchema, "properties", "firstEventTimeout")
 	if got, ok := firstEventTimeoutSchema["default"].(string); !ok || got != "5m" {
 		t.Fatalf("integration.firstEventTimeout default = %v, want \"5m\"", firstEventTimeoutSchema["default"])
@@ -188,6 +211,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	terminationGracePeriodSeconds := int64(30)
 	autoscalingMin := int32(2)
 	autoscalingTargetCPU := int32(70)
+	hiCacheSize := int32(64)
 	backend := &CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: CacheBackendSpec{
@@ -206,6 +230,10 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 			},
 			EngineSelector: &CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
+			},
+			HiCache: &SGLangHiCacheSpec{
+				SizeGB:      &hiCacheSize,
+				WritePolicy: SGLangHiCacheWriteThrough,
 			},
 			BackendConfig: map[string]string{"evictionPolicy": "LRU"},
 			Template: &CacheBackendPodSpecOverride{
@@ -249,6 +277,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	backend.Spec.Autoscaling.MaxReplicas = 9
 	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
 	backend.Spec.Integration.FirstEventTimeout.Duration = time.Hour
+	*backend.Spec.HiCache.SizeGB = 128
 	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
 	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
 	backend.Spec.Template.NodeSelector["pool"] = "general"
@@ -284,6 +313,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Spec.Integration.Engine != "SGLang" {
 		t.Fatalf("integration.engine was not deep-copied")
+	}
+	if copied.Spec.HiCache == nil || copied.Spec.HiCache.SizeGB == nil || *copied.Spec.HiCache.SizeGB != 64 {
+		t.Fatalf("hiCache.sizeGB was not deep-copied")
 	}
 	if copied.Spec.BackendConfig["evictionPolicy"] != "LRU" {
 		t.Fatalf("backendConfig was not deep-copied")
