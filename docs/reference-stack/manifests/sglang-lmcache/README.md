@@ -12,7 +12,8 @@ are operator-owned scaffolding the adapter assumes is present, so the file as a 
 is **not** byte-for-byte adapter output.
 
 > **Validation status.** This manifest is **derived from the GPU-validated adapter
-> render** (`sglang_mp.go` + `redis_l2.go`; the controller-rendered managed path was
+> render** (`pkg/adapters/runtime/internal/enginewire/sglang_mp.go` +
+> `pkg/adapters/backend/provider/redis_l2.go`; the controller-rendered managed path was
 > validated store→flush→retrieve end-to-end in the MP-mode increment) and is
 > **structurally checked** (`kubectl apply --dry-run=client`). It has **not** been
 > independently re-run end-to-end on a GPU in this exact hand shape — run it on a GPU
@@ -43,9 +44,10 @@ What this reference adds on top of those tests is the **real engine → ZMQ even
 LMCache offload** path on a GPU: a live SGLang pod publishing real
 `BlockStored`/`BlockRemoved` frames while the MP worker offloads evicted KV to Redis.
 Extending that to **index + `LookupRoute`** additionally requires the cache plane
-installed and a `CacheBackend` (`engine: sglang`, `type: LMCache`) whose
-`engineSelector` matches these pods and whose `backendConfig.model` is set, so the
-controller auto-attaches the `kvevent-subscriber` sidecar (see
+installed and a `CacheBackend` with `runtime: SGLang`, `type: LMCache`, a
+Managed Redis `remoteStorage`, an `engineSelector` matching these pods, and
+`observation.modelID` set. The controller then auto-attaches the
+`kvevent-subscriber` sidecar (see
 `config/samples/cachebackend-sglang.yaml` and the install docs). The standalone
 manifest ships no event consumer, so on its own it shows the engine serving + the
 publisher started + KV offloading to Redis, **not** a populated index.
@@ -236,8 +238,9 @@ kill "$pf" 2>/dev/null; trap - EXIT
 
 ### The managed path (what the adapter automates)
 
-In a real install you do **not** hand-write this manifest. You create a `CacheBackend`
-(`engine: sglang`, `type: LMCache`; see
+In a real install you do **not** hand-write this manifest. You create a
+`CacheBackend` with `runtime: SGLang`, `type: LMCache`, and a Managed Redis
+`remoteStorage` (see
 [`config/samples/cachebackend-sglang.yaml`](../../../../config/samples/cachebackend-sglang.yaml))
 whose `engineSelector` matches your SGLang pods, and the controller renders the **Redis
 L2** store, injects the **MP-worker sidecar + `--enable-lmcache` + `--lmcache-config-file`**
@@ -252,8 +255,8 @@ address) must be **published** before the engine pod is created, or the pod admi
 unwired and must be recreated. (The precondition is specifically `status.endpoint`,
 **not** `Ready` — managed `Ready` is gated on the first KV event observed *from these
 very pods*, so waiting for `Ready` first would be circular.) The served model, the
-CacheBackend's `backendConfig.model`, and the request's `model` must all agree, or the
-index keys per-model and `LookupRoute` silently misses. **Block-size caveat:** for
+CacheBackend's `observation.modelID`, and the request's `model` must all agree, or
+the index keys per-model and `LookupRoute` silently misses. **Block-size caveat:** for
 raw-`token_ids`/`prompt_text` lookups the server fingerprints at its single global
 `--engine-block-size` (default 16, vLLM's); SGLang's page size (e.g. 64) must match it,
 or gateways must send pre-computed `prefix_hash`/`block_hashes` — otherwise

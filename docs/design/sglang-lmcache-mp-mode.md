@@ -405,7 +405,7 @@ data plane), different resolution because the data planes differ:
 | Real data plane | P2P transfer-engine mesh (master returns a directory pointer; engine dials node IPs on dynamic ports) | Node-local MP worker + shared L2 store |
 | Engine `hostNetwork` | **Required** (mesh needs real host IP + all ports) | **Not required** (worker is a same-pod sidecar; loopback + shared `/dev/shm`) |
 | Shared/cross-node tier | The mesh itself | Networked L2 (`resp`/Redis, `s3`, `mooncake_store`, `p2p`) |
-| `ResolveCacheServer` renders | Mooncake master (hostNetwork, node-IP endpoint) | Shared Redis L2 (ClusterIP) |
+| Provider adapter renders | Mooncake master (hostNetwork, node-IP endpoint) | Shared Redis L2 (ClusterIP) |
 | Determinism knob | `PYTHONHASHSEED=0` (vLLM builtin-hash) | none needed (SGLang sha256) |
 
 ## Phased delivery
