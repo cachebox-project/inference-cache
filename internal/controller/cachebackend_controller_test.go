@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
@@ -210,6 +211,51 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
 	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != conditionReasonHostOnlyActive {
 		t.Fatalf("Ready = %+v, want True/%s", ready, conditionReasonHostOnlyActive)
+	}
+}
+
+func TestReconcileCanonicalHostOnlyCacheReportsEngineDiagnostics(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("host-only-kernel", "ns1")
+	cb.UID = types.UID("host-only-kernel-uid")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "engine"},
+	}
+	pod := strictPodWithKernelStatus(termed(1, adapterruntime.KernelCheckMsgFailPrefix+" lmcache c_ops failed"))
+	pod.ObjectMeta = metav1.ObjectMeta{
+		Name:      "engine",
+		Namespace: cb.Namespace,
+		Labels:    map[string]string{"app": "engine"},
+		Annotations: map[string]string{
+			podwebhook.AnnotationInjectedBy:    cb.Namespace + "/" + cb.Name,
+			podwebhook.AnnotationInjectedByUID: string(cb.UID),
+		},
+	}
+	pod.Spec.Containers = []corev1.Container{{Name: "vllm"}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "vllm",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason: crashLoopBackOffReason,
+		}},
+	}}
+	r := newReconciler(scheme, cb, &pod)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	kernels := meta.FindStatusCondition(got.Status.Conditions, conditionTypeEngineKernelsHealthy)
+	if kernels == nil || kernels.Status != metav1.ConditionFalse || kernels.Reason != reasonKernelLoadFailed {
+		t.Fatalf("EngineKernelsHealthy = %+v, want False/%s", kernels, reasonKernelLoadFailed)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonEngineKernelDegraded {
+		t.Fatalf("Ready = %+v, want False/%s", ready, reasonEngineKernelDegraded)
+	}
+	compatibility := meta.FindStatusCondition(got.Status.Conditions, conditionTypeEngineCompatibility)
+	if compatibility == nil || compatibility.Status != metav1.ConditionFalse ||
+		compatibility.Reason != reasonInjectedEngineCrashLooping {
+		t.Fatalf("EngineCompatibility = %+v, want False/%s", compatibility, reasonInjectedEngineCrashLooping)
 	}
 }
 

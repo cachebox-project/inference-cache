@@ -675,8 +675,9 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 //
 // Like reconcileExternal it clears the in-memory cascade shadow and the
 // functional-probe rate-limit entry (there is no server to cascade-restart or
-// probe) and clears the managed-only FunctionalProbeOK / EngineKernelsHealthy /
-// T2Degraded / EngineCompatibility conditions.
+// probe) and clears the managed-only FunctionalProbeOK / T2Degraded conditions.
+// Events-only also clears EngineKernelsHealthy / EngineCompatibility because it
+// loads no connector; host-only evaluates both engine-side diagnostics normally.
 // The firstEventTimeout window is anchored on status.firstAvailableAt, latched
 // here on the first reconcile — an events-only backend is "up" the moment it
 // exists (no workload to wait on), so the gate starts its clock immediately and
@@ -721,6 +722,22 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 		activeReason,
 		activeMessage,
 		anchor, now, transitionedFromServerMode)
+	kernelVerdict := kernelHealthVerdict{}
+	engineCompatMsg := ""
+	engineCompatObserved := false
+	previousEngineIncompatible := false
+	eventsOnly := backend.Spec.IsEventsOnly()
+	if !eventsOnly {
+		kernelReader := client.Reader(r.APIReader)
+		if kernelReader == nil {
+			kernelReader = r.Client
+		}
+		kernelPods, kernelListedOK := listMatchedEnginePods(ctx, kernelReader, backend)
+		kernelVerdict = evaluateEngineKernelHealth(backend, gate, kernelPods, kernelListedOK)
+		gate = downgradeKernelReadyVerdict(gate, kernelVerdict)
+		engineCompatMsg, engineCompatObserved = r.detectEngineConnectorCrashLoop(ctx, backend)
+		previousEngineIncompatible = meta.IsStatusConditionFalse(backend.Status.Conditions, conditionTypeEngineCompatibility)
+	}
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 
 	// No server to cascade-restart or functionally probe — drop both in-memory
@@ -772,20 +789,42 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 		})
 		// Managed-only advisories never apply to a server-less backend.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
-		// EngineKernelsHealthy is a managed-path-only condition (events-only
-		// loads no LMCache connector, so the kernel-check init container is
-		// never injected). Clear any left over from a prior Offload generation
-		// so an Offload→EventsOnly flip doesn't strand a stale kernel verdict —
-		// events-only publishes only Ready/Degraded/Progressing.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		if eventsOnly {
+			// Events-only loads no LMCache connector, so the kernel-check init
+			// container is never injected. Clear any prior Offload verdict.
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		} else {
+			switch {
+			case kernelVerdict.shouldWriteCondition:
+				condition := kernelVerdict.condition
+				condition.ObservedGeneration = backend.Generation
+				meta.SetStatusCondition(&backend.Status.Conditions, condition)
+			case kernelVerdict.removeCondition:
+				meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+			}
+		}
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
-		// EngineCompatibility is likewise managed-path-only: it flags an injected
-		// engine crash-looping after the cache plane wired a KV connector, but
-		// events-only injects no connector, so the advisory can never apply.
-		// Clear any verdict left over from a prior Offload generation so an
-		// Offload→EventsOnly flip doesn't strand a stale incompatibility.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		if eventsOnly {
+			// Events-only injects no connector, so the advisory cannot apply.
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		} else if engineCompatObserved {
+			if engineCompatMsg != "" {
+				meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+					Type:               conditionTypeEngineCompatibility,
+					Status:             metav1.ConditionFalse,
+					Reason:             reasonInjectedEngineCrashLooping,
+					Message:            engineCompatMsg,
+					ObservedGeneration: backend.Generation,
+				})
+			} else {
+				meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+			}
+		}
 	})
+	if err == nil && engineCompatObserved && engineCompatMsg != "" && !previousEngineIncompatible && r.Recorder != nil {
+		r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning,
+			reasonInjectedEngineCrashLooping, reasonInjectedEngineCrashLooping, "%s", engineCompatMsg)
+	}
 	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
 }
 

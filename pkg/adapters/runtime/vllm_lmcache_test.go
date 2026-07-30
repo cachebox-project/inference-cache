@@ -678,7 +678,13 @@ func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
 			},
 		},
 	}
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: EngineContainerName,
+		Env: []corev1.EnvVar{
+			{Name: EnvLMCacheRemoteURL, Value: "lm://stale-provider:8200"},
+			{Name: "KEEP_ME", Value: "preserved"},
+		},
+	}}}
 	adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
 	if err := adapter.InjectEngineConfigWithBinding(pod, nil, cb); err != nil {
 		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
@@ -687,7 +693,7 @@ func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
 	checks := map[string]string{
 		EnvLMCacheChunkSize:   "128",
 		EnvLMCacheRemoteSerde: "naive",
-		EnvLMCacheLocalCPU:    "False",
+		EnvLMCacheLocalCPU:    "True",
 		EnvLMCacheMaxLocalCPU: "20",
 	}
 	for name, want := range checks {
@@ -696,7 +702,10 @@ func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
 		}
 	}
 	if _, ok := lookupEnv(env, EnvLMCacheRemoteURL); ok {
-		t.Fatalf("%s was injected for a host-only binding", EnvLMCacheRemoteURL)
+		t.Fatalf("%s survived host-only injection", EnvLMCacheRemoteURL)
+	}
+	if got, ok := lookupEnv(env, "KEEP_ME"); !ok || got != "preserved" {
+		t.Fatalf("unrelated env was disturbed: KEEP_ME = %q, present=%v", got, ok)
 	}
 }
 

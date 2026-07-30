@@ -167,6 +167,43 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 		}
 	})
 
+	t.Run("managed provider command requires non-empty entries", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			command []string
+			path    string
+		}{
+			{name: "empty command", command: []string{}, path: "spec.remoteStorage.lmCacheServer.command"},
+			{name: "empty executable", command: []string{""}, path: "spec.remoteStorage.lmCacheServer.command[0]"},
+			{name: "blank argument", command: []string{"cache-server", " "}, path: "spec.remoteStorage.lmCacheServer.command[1]"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+						Command: tt.command,
+					},
+				}
+				requireInvalidWithCause(t, validator, cb, tt.path, "must")
+			})
+		}
+
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Mooncake: &cachev1alpha1.MooncakeRemoteStorageSpec{
+				Command: []string{""},
+			},
+		}
+		requireInvalidWithCause(t, validator, cb, "spec.remoteStorage.mooncake.command[0]", "must not be empty")
+	})
+
 	t.Run("rejects legacy backendConfig", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang

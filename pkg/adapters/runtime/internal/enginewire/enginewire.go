@@ -168,6 +168,9 @@ func injectLMCacheConnector(pod *corev1.PodSpec, endpoint, remoteURL string, cac
 	for _, e := range env {
 		pod.Containers[i].Env = UpsertEnv(pod.Containers[i].Env, e)
 	}
+	if remoteURL == "" {
+		pod.Containers[i].Env = removeEnv(pod.Containers[i].Env, EnvLMCacheRemoteURL)
+	}
 	pod.Containers[i].Args = UpsertArgPair(pod.Containers[i].Args, args[0], args[1])
 	return nil
 }
@@ -260,6 +263,9 @@ func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend, cfg map[string]string)
 		return "True"
 	}
 	if cache.Spec.UsesCanonicalCacheHierarchy() {
+		if cache.Spec.RemoteStorage == nil {
+			return "True"
+		}
 		return defaultLocalCPU
 	}
 	return ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)
@@ -415,6 +421,16 @@ func UpsertEnv(env []corev1.EnvVar, want corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return append(env, want)
+}
+
+func removeEnv(env []corev1.EnvVar, name string) []corev1.EnvVar {
+	out := env[:0]
+	for _, entry := range env {
+		if entry.Name != name {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // ConfigOr reads key from cfg or returns fallback when key is absent or empty.

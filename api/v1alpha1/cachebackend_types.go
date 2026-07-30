@@ -222,6 +222,8 @@ type LMCacheServerRemoteStorageSpec struct {
 
 	// Command overrides the managed server command and arguments.
 	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:MinLength=1
 	Command []string `json:"command,omitempty"`
 
 	// Resources are applied to the managed lmcache-server container.
@@ -237,6 +239,8 @@ type MooncakeRemoteStorageSpec struct {
 
 	// Command overrides the managed Mooncake master command and arguments.
 	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:MinLength=1
 	Command []string `json:"command,omitempty"`
 
 	// Resources are applied to the managed Mooncake master container.

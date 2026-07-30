@@ -356,7 +356,42 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 				"provider workload configuration is valid only with Managed ownership"))
 		}
 	}
+	if storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
+		switch storage.Provider {
+		case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
+			if storage.LMCacheServer != nil {
+				errs = append(errs, validateManagedProviderCommand(
+					storagePath.Child("lmCacheServer", "command"),
+					storage.LMCacheServer.Command,
+				)...)
+			}
+		case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
+			if storage.Mooncake != nil {
+				errs = append(errs, validateManagedProviderCommand(
+					storagePath.Child("mooncake", "command"),
+					storage.Mooncake.Command,
+				)...)
+			}
+		}
+	}
 
+	return errs
+}
+
+func validateManagedProviderCommand(path *field.Path, command []string) field.ErrorList {
+	if command == nil {
+		return nil
+	}
+	if len(command) == 0 {
+		return field.ErrorList{field.Invalid(path, command, "must contain an executable")}
+	}
+
+	var errs field.ErrorList
+	for i, part := range command {
+		if strings.TrimSpace(part) == "" {
+			errs = append(errs, field.Invalid(path.Index(i), part, "must not be empty"))
+		}
+	}
 	return errs
 }
 

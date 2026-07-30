@@ -700,7 +700,9 @@ spec:
                         description: Command overrides the managed server command
                           and arguments.
                         items:
+                          minLength: 1
                           type: string
+                        minItems: 1
                         type: array
                       image:
                         description: Image is used only when ownership is Managed.
@@ -773,7 +775,9 @@ spec:
                         description: Command overrides the managed Mooncake master
                           command and arguments.
                         items:
+                          minLength: 1
                           type: string
+                        minItems: 1
                         type: array
                       image:
                         description: Image is used only when ownership is Managed.
