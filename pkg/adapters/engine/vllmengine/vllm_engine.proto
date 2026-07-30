@@ -13,13 +13,16 @@ syntax = "proto3";
 // `proto/` module on purpose — it is a vendored external contract, not part of
 // IC's own gRPC API, so it is exempt from IC's buf-lint conventions.
 //
-// Provenance: a hand-copied subset of the upstream vLLM engine gRPC contract; the
-// GetLoads RPC and the GetLoadsRequest / GetLoadsResponse / SchedulerLoad messages
-// below were verified field-for-field (numbers and types) against it. When
-// re-syncing against a newer engine release, re-copy from the upstream proto and
-// re-verify the field numbers. The bufconn test (grpc_loads_scraper_test.go) only
-// proves this file round-trips against its own generated stubs — NOT that it
-// matches the engine actually deployed.
+// Provenance & license: this file mirrors the `vllm.grpc.engine.VllmEngine` wire
+// contract that vLLM's Apache-2.0 `vllm.entrypoints.grpc_server` serves, and is carried
+// in the Inference Cache repo under its own Apache-2.0 license (see repo LICENSE). There
+// is no standalone upstream .proto to pin a commit against: the messages ship inside the
+// engine's Python gRPC package as generated `*_pb2` stubs, so the authoritative source is
+// the ENGINE IMAGE this deployment pins. The GetLoads RPC and the GetLoadsRequest /
+// GetLoadsResponse / SchedulerLoad messages below were verified field-for-field (numbers
+// and types) against that image's contract; when bumping the pinned engine, re-verify them
+// against the new image. The bufconn test (grpc_loads_scraper_test.go) only proves this
+// file round-trips against its own generated stubs — NOT that it matches the deployed engine.
 //
 // Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
 // proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the

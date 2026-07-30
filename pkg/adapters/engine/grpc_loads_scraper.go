@@ -88,28 +88,40 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 	}
 
 	// Aggregate across DP ranks: request counts SUM (total in-flight across the
-	// engine), KV-cache usage is the MAX (worst-case pressure proxy), hit-rate is
-	// the mean over ranks that report a finite value.
+	// engine), KV-cache usage is the MEAN, hit-rate is the mean over ranks that report
+	// a finite value. Usage is a mean, not a max, because CacheSizeBytes is the engine's
+	// *total* capacity and each of the N DP ranks owns ~1/N of it — so the average
+	// per-rank fill maps to true total bytes, whereas a max would overstate a multi-rank
+	// engine (two ranks at 30%/70% use 50% of total, not 70%). For the single-rank case
+	// the two are identical.
 	//
-	// token_usage and cache_hit_rate come from an external process and are
-	// contractually ratios in [0,1] — sanitize both. token_usage feeds the MAX and
-	// then cache_memory_bytes, so a non-finite value maps to 0 (finite01) and just
-	// never wins the max. cache_hit_rate feeds a mean, so a non-finite (unavailable)
-	// rank is EXCLUDED rather than counted as 0 — otherwise one garbage sample would
-	// drag the average down; finite-but-out-of-range values are clamped and kept.
+	// Values from the external engine are sanitized. Request counts are clamped to >= 0
+	// so a malformed negative rank can't cancel healthy ranks' pressure. token_usage and
+	// cache_hit_rate are contractually ratios in [0,1]: token_usage feeds the usage mean,
+	// so a non-finite value maps to 0 (finite01) and reads as an empty rank; cache_hit_rate
+	// feeds its own mean, so a non-finite (unavailable) rank is EXCLUDED rather than counted
+	// as 0 — otherwise one garbage sample would drag the average down; finite-but-out-of-range
+	// values are clamped and kept.
 	var running, waiting int64
-	var usage, hitRateSum float64
+	var usageSum, hitRateSum float64
 	var hitRateN int
+	ranks := len(resp.GetLoads())
 	for _, l := range resp.GetLoads() {
-		running += int64(l.GetNumRunningReqs())
-		waiting += int64(l.GetNumWaitingReqs())
-		if u := finite01(l.GetTokenUsage()); u > usage {
-			usage = u
+		if r := l.GetNumRunningReqs(); r > 0 {
+			running += int64(r)
 		}
+		if w := l.GetNumWaitingReqs(); w > 0 {
+			waiting += int64(w)
+		}
+		usageSum += finite01(l.GetTokenUsage())
 		if hr := l.GetCacheHitRate(); !math.IsNaN(hr) && !math.IsInf(hr, 0) {
 			hitRateSum += clamp01(hr)
 			hitRateN++
 		}
+	}
+	usage := 0.0
+	if ranks > 0 {
+		usage = usageSum / float64(ranks)
 	}
 	hitRate := 0.0
 	if hitRateN > 0 {

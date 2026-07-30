@@ -48,7 +48,7 @@ func TestGRPCLoadsScraperMapsSingleRank(t *testing.T) {
 }
 
 func TestGRPCLoadsScraperAggregatesRanks(t *testing.T) {
-	// two DP ranks: running/waiting SUM, usage MAX, hit-rate MEAN
+	// two DP ranks: running/waiting SUM, usage MEAN, hit-rate MEAN
 	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
 		{NumRunningReqs: 2, NumWaitingReqs: 1, TokenUsage: 0.3, CacheHitRate: 0.5},
 		{NumRunningReqs: 5, NumWaitingReqs: 4, TokenUsage: 0.7, CacheHitRate: 0.9},
@@ -63,7 +63,7 @@ func TestGRPCLoadsScraperAggregatesRanks(t *testing.T) {
 	if got, want := st.GetPressure(), float32(12.0/24.0); got != want { // (7+5)/24
 		t.Errorf("pressure = %v, want %v", got, want)
 	}
-	if got, want := st.GetCacheMemoryBytes(), int64(0.7*1000); got != want { // max usage
+	if got, want := st.GetCacheMemoryBytes(), int64(0.5*1000); got != want { // mean(0.3,0.7)
 		t.Errorf("cache_memory_bytes = %d, want %d", got, want)
 	}
 	if got, want := st.GetHitRate(), float32(0.7); got != want { // mean(0.5,0.9)
@@ -88,14 +88,16 @@ func TestGRPCLoadsScraperZeroConfigIsHonest(t *testing.T) {
 }
 
 func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
-	// token_usage and cache_hit_rate are contractually [0,1] ratios, but come
-	// from an external engine process. Feed garbage across ranks: over 1, NaN,
-	// and negative. Sanitization must clamp/reject each so cache_memory_bytes
-	// never overflows past CacheSizeBytes and hit_rate stays finite in [0,1].
+	// token_usage and cache_hit_rate are contractually [0,1] ratios, and request
+	// counts are non-negative — but all come from an external engine process. Feed
+	// garbage across ranks: ratios over 1, NaN, negative ratios, and a negative
+	// request count. Sanitization must clamp/reject each so cache_memory_bytes never
+	// overflows, hit_rate stays finite in [0,1], and a malformed negative count can't
+	// suppress a healthy rank's pressure.
 	resp := &vpb.GetLoadsResponse{Loads: []*vpb.SchedulerLoad{
-		{TokenUsage: 5.0, CacheHitRate: 9.0},               // both way over 1
-		{TokenUsage: math.NaN(), CacheHitRate: math.NaN()}, // non-finite
-		{TokenUsage: -1.0, CacheHitRate: -0.5},             // negative
+		{NumRunningReqs: -100, TokenUsage: 5.0, CacheHitRate: 9.0}, // over 1 + malformed negative count
+		{TokenUsage: math.NaN(), CacheHitRate: math.NaN()},         // non-finite
+		{NumRunningReqs: 4, TokenUsage: -1.0, CacheHitRate: -0.5},  // one healthy count + negative ratios
 	}}
 	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: resp},
 		GRPCLoadsScraperConfig{CacheSizeBytes: 1000, MaxConcurrencyCeiling: 8})
@@ -104,9 +106,14 @@ func TestGRPCLoadsScraperSanitizesOutOfRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	// usage clamps per-rank to [0,1]; MAX(1,0,0)=1 → bytes = 1*1000, never 5000/negative.
-	if got := st.GetCacheMemoryBytes(); got != 1000 {
-		t.Errorf("cache_memory_bytes = %d, want 1000 (usage clamped to 1, not overflowed)", got)
+	// usage clamps per-rank to [0,1] → [1,0,0]; MEAN = 1/3 → bytes ≈ 333, never 5000/negative.
+	meanUsage := 1.0 / 3.0
+	if got, want := st.GetCacheMemoryBytes(), int64(meanUsage*1000); got != want {
+		t.Errorf("cache_memory_bytes = %d, want %d (usage clamped then meaned, not overflowed)", got, want)
+	}
+	// negative request count clamped to 0: pressure = (0+0+4)/8 = 0.5, not suppressed by -100.
+	if got, want := st.GetPressure(), float32(0.5); got != want {
+		t.Errorf("pressure = %v, want %v (a negative count must clamp to 0, not cancel healthy ranks)", got, want)
 	}
 	// hit_rate: the NaN rank is EXCLUDED (unavailable), the over-1 rank clamps to 1
 	// and the negative to 0 → MEAN(1,0)=0.5, finite (no NaN poison).
