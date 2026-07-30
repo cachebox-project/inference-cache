@@ -212,6 +212,28 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	}
 }
 
+func TestReconcileLegacyCacheWithTypedObservationRetainsProviderWorkload(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("legacy-observed", "ns1")
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); err != nil {
+		t.Fatalf("managed deployment was not retained: %v", err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}, &service); err != nil {
+		t.Fatalf("managed service was not retained: %v", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	wantEndpoint := "legacy-observed.ns1.svc.cluster.local:65432"
+	if got.Status.Endpoint != wantEndpoint {
+		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, wantEndpoint)
+	}
+}
+
 // mooncakeBackend is the managed-Mooncake fixture, mirroring lmcacheBackend:
 // it opts OUT of the KV-event readiness gate so the rollout-driven Ready
 // assertion is orthogonal to the gate.

@@ -997,7 +997,7 @@ spec:
                   This deprecated field is accepted only by legacy resource shapes.
                   Canonical resources must configure resources under the selected
                   remoteStorage provider; admission rejects this field when runtime,
-                  lmCache, remoteStorage, or observation selects the canonical API.
+                  lmCache, or remoteStorage selects the canonical API.
                   External and SGLangHiCache legacy backends provision no workload of
                   their own, so the field remains inert for those legacy types.
                 properties:
@@ -2489,12 +2489,13 @@ spec:
               type:
                 default: LMCache
                 description: |-
-                  Type identifies the backing cache implementation. Defaults to LMCache —
-                  the standalone lmcache-server workload Phase-1 ships; operators pick
-                  External (operator-supplied endpoint) or another type explicitly when
-                  they need to. The CRD does not constrain Type to an enum today; the
-                  admission validator's runtime-adapter check is the authoritative reject
-                  for unsupported (engine, type) pairs.
+                  Type identifies the engine-side cache implementation and defaults to
+                  LMCache. Canonical resources select provider technology and ownership
+                  independently through remoteStorage; omitting remoteStorage requests a
+                  host-only hierarchy. Legacy Mooncake and External values remain readable
+                  as compatibility inputs. The CRD does not constrain Type to an enum
+                  today; admission is the authoritative reject for unsupported pairs and
+                  for legacy provider values used in canonical resources.
                 type: string
             type: object
           status:

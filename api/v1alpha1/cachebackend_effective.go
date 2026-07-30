@@ -10,7 +10,7 @@ import (
 // runtime/cache/storage API. Legacy resources are detected by the absence of
 // these fields and retain their historical implicit provider mapping.
 func (s *CacheBackendSpec) UsesCanonicalCacheHierarchy() bool {
-	return s.Runtime != "" || s.LMCache != nil || s.RemoteStorage != nil || s.Observation != nil
+	return s.Runtime != "" || s.LMCache != nil || s.RemoteStorage != nil
 }
 
 // EffectiveRuntime returns the canonical inference runtime while preserving

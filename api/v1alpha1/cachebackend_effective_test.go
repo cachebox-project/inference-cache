@@ -52,15 +52,18 @@ func TestEffectiveRuntimePrefersCanonicalField(t *testing.T) {
 	}
 }
 
-func TestObservationSelectsCanonicalHierarchy(t *testing.T) {
+func TestObservationDoesNotSelectCanonicalHierarchy(t *testing.T) {
 	spec := CacheBackendSpec{
 		Type:        CacheBackendTypeLMCache,
 		Observation: &CacheBackendObservationSpec{ModelID: "model-a"},
 	}
-	if !spec.UsesCanonicalCacheHierarchy() {
-		t.Fatal("typed observation must select the canonical hierarchy")
+	if spec.UsesCanonicalCacheHierarchy() {
+		t.Fatal("typed observation must remain independent from cache/provider hierarchy selection")
 	}
-	if got := spec.EffectiveRemoteStorage(); got != nil {
-		t.Fatalf("EffectiveRemoteStorage() = %+v, want nil host-only hierarchy", got)
+	got := spec.EffectiveRemoteStorage()
+	if got == nil ||
+		got.Provider != CacheBackendRemoteStorageProviderLMCacheServer ||
+		got.Ownership != CacheBackendRemoteStorageOwnershipManaged {
+		t.Fatalf("EffectiveRemoteStorage() = %+v, want legacy Managed LMCacheServer", got)
 	}
 }

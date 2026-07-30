@@ -268,6 +268,18 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 		}
 	}
 
+	if !canonical &&
+		cb.Spec.Observation != nil &&
+		cb.Spec.Observation.ModelID != "" &&
+		cb.Spec.BackendConfig["model"] != "" &&
+		cb.Spec.Observation.ModelID != cb.Spec.BackendConfig["model"] {
+		errs = append(errs, field.Invalid(
+			specPath.Child("backendConfig").Key("model"),
+			cb.Spec.BackendConfig["model"],
+			"conflicts with spec.observation.modelID",
+		))
+	}
+
 	if cb.Spec.LMCache != nil && cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
 		errs = append(errs, field.Forbidden(
 			specPath.Child("lmCache"),

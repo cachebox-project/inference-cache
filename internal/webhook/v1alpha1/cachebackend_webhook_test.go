@@ -140,12 +140,27 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 			"deprecated top-level configuration")
 	})
 
-	t.Run("typed observation rejects legacy backendConfig", func(t *testing.T) {
+	t.Run("typed observation preserves legacy provider mapping", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
 		cb.Spec.BackendConfig = map[string]string{"model": "model-a"}
-		requireInvalidWithCause(t, validator, cb, "spec.backendConfig",
-			"deprecated top-level configuration")
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+		storage := cb.Spec.EffectiveRemoteStorage()
+		if storage == nil ||
+			storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer ||
+			storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
+			t.Fatalf("EffectiveRemoteStorage() = %+v, want legacy Managed LMCacheServer", storage)
+		}
+	})
+
+	t.Run("typed observation rejects conflicting legacy model", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+		cb.Spec.BackendConfig = map[string]string{"model": "model-b"}
+		requireInvalidWithCause(t, validator, cb, "spec.backendConfig[model]",
+			"conflicts with spec.observation.modelID")
 	})
 
 	t.Run("rejects legacy top-level resources", func(t *testing.T) {
