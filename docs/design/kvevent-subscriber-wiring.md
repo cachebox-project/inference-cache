@@ -112,9 +112,10 @@ Concretely:
   auto-injected sidecars keep the HTTP default. Deferred deliberately: `GetLoads` requires a
   newer engine floor (a gRPC server that implements `GetLoads`; vLLM ≥ 0.19) than the engine currently
   deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC: every
-  scrape would fail and the `StatsReporter` would escalate the loss loudly (its stale-load
-  path) while the ranker falls back to a stale (never-updated) load signal. It gets wired
-  alongside the stats-path knobs
+  scrape would fail, so the `StatsReporter` would escalate the loss loudly (its stale-load
+  path) and — since no sample ever reaches IC — the ranker would route this replica on
+  residency alone (not "stale," which applies only after a sample has been delivered). It
+  gets wired alongside the stats-path knobs
   above once the engine floor moves; until then it is opt-in via the binary flag for
   gRPC-only engine deployments.
 * **TLS subscriber → policy-server** — separate ticket.
