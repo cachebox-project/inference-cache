@@ -38,7 +38,7 @@ type GRPCLoadsScraperConfig struct {
 // StatsReporter uses whichever is configured, unchanged.
 //
 // Note: GetLoads carries no external-tier (T2/LMCache) token counters, so
-// T2HitTokens/T2QueryTokens are left 0 here — those remain HTTP-/metrics-only.
+// T2HitTokens/T2QueryTokens are left 0 here — those remain HTTP `/metrics`-only.
 // The load signals the ranker actually uses (pressure, cache-usage, hit-rate)
 // are all provided.
 type GRPCLoadsScraper struct {

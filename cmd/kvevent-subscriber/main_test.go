@@ -12,9 +12,9 @@ import (
 // TestBuildStatsScraperSelectsSource pins the load-source control flow: a
 // non-empty --engine-loads-grpc must select the GetLoads gRPC scraper (and hand
 // back a closer for its conn), while an empty flag must preserve the HTTP
-// /metrics scraper (which owns no conn, so no closer). This is the crux of
-// Option B — the wrong branch silently leaves a vLLM engine served over gRPC reporting no
-// load — so it gets an explicit test.
+// /metrics scraper (which owns no conn, so no closer). This branch is the crux of
+// the gRPC load source: the wrong branch silently leaves a vLLM engine served over
+// gRPC reporting no load, so it gets an explicit test.
 func TestBuildStatsScraperSelectsSource(t *testing.T) {
 	hc := &http.Client{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
