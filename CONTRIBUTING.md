@@ -170,3 +170,15 @@ Each package's `doc.go` (or package comment) states which binary (`inferencecach
 **Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
 
 **gRPC contract:** when you change `proto/`, update [`docs/design/grpc-contract.md`](docs/design/grpc-contract.md) in the same commit so the design doc stays accurate. The pre-commit hook blocks a commit that touches a `.proto` without touching that doc (override with `--no-verify` only if the change truly doesn't affect the contract).
+
+## Documentation stays in sync (required)
+
+The public surfaces have user-facing documentation, and it must not drift behind the code. **A change to the CRD API types ([`api/v1alpha1/*_types.go`](api/v1alpha1)) or the gRPC contract ([`proto/`](proto)) must also update the documentation in the same PR** — the docs site under [`site/`](site) and/or the design docs under [`docs/`](docs). For example, a `proto/` change updates `docs/design/grpc-contract.md` (and the site's gRPC reference); a CRD field change updates the matching concept and reference pages under `site/content/`.
+
+### Enforcement
+
+```bash
+make verify-docs-sync    # checks the current branch's diff vs origin/main; also runs in CI on every PR
+```
+
+CI runs this check on each pull request (as part of the **Lint, Generated Code, Proto** job). If a public-surface change genuinely needs no doc update, add the **`no-docs-needed`** label to the PR to waive it.

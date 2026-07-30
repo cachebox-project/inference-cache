@@ -501,6 +501,17 @@ verify-no-internal-refs: ## Fail if tracked files reference internal issue track
 	fi; \
 	echo "✓ no internal issue-tracker references"
 
+# Base ref the docs-sync check diffs against. CI overrides it with the PR base
+# (origin/<base-branch>); locally it defaults to origin/main.
+DOCS_SYNC_BASE ?= origin/main
+.PHONY: verify-docs-sync
+verify-docs-sync: ## Fail if a CRD/proto change in this branch updates no docs (site/ or docs/). Override base with DOCS_SYNC_BASE=.
+	@bash hack/verify-docs-sync.sh "$(DOCS_SYNC_BASE)"
+
+.PHONY: test-docs-sync
+test-docs-sync: ## Run the self-contained tests for the docs-sync gate (no network; throwaway git repos).
+	@bash hack/verify-docs-sync_test.sh
+
 .PHONY: verify-syft-pin
 verify-syft-pin: ## Fail if the Syft version/checksum pin drifts across release tooling.
 	@bash hack/verify-syft-version.sh
@@ -536,7 +547,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-race build ## Local CI gate (naming + internal-refs + Syft pin drift + fmt + vet + lint + Prometheus rules + golden vectors + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft pin drift + fmt + vet + lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

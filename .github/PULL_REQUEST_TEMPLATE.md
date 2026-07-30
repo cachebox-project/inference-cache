@@ -28,3 +28,4 @@
 - [ ] Change matches the tech spec (or the spec is updated in the same PR).
 - [ ] Backward compatibility considered for `v1alpha1` consumers (engines, gateway clients).
 - [ ] If `proto/` changed, `docs/design/grpc-contract.md` is updated to match (the pre-commit hook enforces this).
+- [ ] If CRD API types (`api/v1alpha1/*_types.go`) or the proto contract changed, the **documentation is updated to match** — the docs site (`site/`) and/or the design docs (`docs/`). CI enforces this (`make verify-docs-sync`); add the `no-docs-needed` label to waive a genuinely doc-exempt change.

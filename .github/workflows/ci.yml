@@ -4,6 +4,16 @@ on:
   pull_request:
     branches:
     - main
+    # Include label events so the docs-sync 'no-docs-needed' escape hatch takes
+    # effect immediately — the default pull_request activity types omit
+    # 'labeled'/'unlabeled', so a label added after a failing run would otherwise
+    # never re-trigger CI.
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - labeled
+    - unlabeled
   push:
     branches:
     - main
@@ -44,6 +54,9 @@ jobs:
     - name: Verify Syft pin drift
       run: make verify-syft-pin
 
+    - name: Test docs-sync gate
+      run: make test-docs-sync
+
     - name: Install protoc
       env:
         PROTOC_VERSION: 34.1
@@ -82,6 +95,17 @@ jobs:
       env:
         PR_BASE_REF: ${{ github.base_ref }}
       run: buf breaking --against ".git#ref=origin/${PR_BASE_REF}"
+
+    # Documentation stays in sync with the public surface: a change to the CRD
+    # API types (api/v1alpha1/*_types.go) or the gRPC contract (proto/) must
+    # also update the docs (site/ or docs/) in the same PR. Reuses the base ref
+    # fetched above. Waived when the PR carries the 'no-docs-needed' label.
+    # See CONTRIBUTING.md "Documentation stays in sync".
+    - name: Verify docs updated for public-surface changes
+      if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'no-docs-needed')
+      env:
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: make verify-docs-sync DOCS_SYNC_BASE="origin/${PR_BASE_REF}"
 
     - name: Lint
       run: |
