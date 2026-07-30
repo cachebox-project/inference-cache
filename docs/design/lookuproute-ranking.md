@@ -26,11 +26,15 @@ response is ever an error on the hot path. Fail open.
 
 ## 2. The baseline strategy — `PREFIX_MATCH`
 
-The index keys cached prefixes by `(tenant, model, hash_scheme, prefix_hash)`
+The index keys cached prefixes by `(tenant, model, hash_scheme, adapter, prefix_hash)`
 → the set of replicas that hold it, with per-replica `token_count` and a
-`last_seen` timestamp. A baseline lookup:
+`last_seen` timestamp. `adapter` is the resolved LoRA identity (`""` for
+base-model / non-LoRA traffic); it partitions the content, never the fingerprint,
+so identical tokens under different adapters share a hash but not an entry. The
+`(tenant, model, hash_scheme)` *scope* used by the fallbacks below deliberately
+stays adapter-blind. A baseline lookup:
 
-1. Look up the request's `(tenant, model, hash_scheme, prefix_hash)`.
+1. Look up the request's `(tenant, model, hash_scheme, adapter, prefix_hash)`.
 2. For each replica that holds it, compute
 
    ```
@@ -71,7 +75,7 @@ collapses back to `matched_tokens × freshness`.
 
 ### Why the exact-full-hash path leaves hits on the table
 
-§2 looks up the request's `(tenant, model, hash_scheme, prefix_hash)` as
+§2 looks up the request's `(tenant, model, hash_scheme, adapter, prefix_hash)` as
 **one opaque blob**. Two requests that share the first N KV blocks of a
 prefix but diverge after — common with a shared system prompt plus
 per-request RAG context — hash to different `prefix_hash` values and miss
@@ -116,7 +120,7 @@ slip into a non-additive change.
 ### How the lookup walks the chain
 
 For each block `block_hashes[i]` the request carries, the index already
-holds a `(tenant, model, hash_scheme, block_hash)` → `{replicaID →
+holds a `(tenant, model, hash_scheme, adapter, block_hash)` → `{replicaID →
 {tokenCount, lastSeen}}` entry — populated either from a single chain
 `PrefixEntry` (the index *expands* the chain into N per-block entries)
 or from N legacy single-blob `PrefixEntry` reports (one per block, the
