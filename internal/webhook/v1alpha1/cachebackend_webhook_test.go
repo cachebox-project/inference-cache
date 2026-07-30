@@ -73,6 +73,14 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 		}
 	})
 
+	t.Run("host-only rejects autoscaling", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+		requireInvalidWithCause(t, validator, cb, "spec.autoscaling",
+			"canonical host-only backends")
+	})
+
 	t.Run("sglang managed redis", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
@@ -1616,6 +1624,34 @@ func TestValidator_CrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
 	}
 }
 
+func TestValidator_CanonicalCrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  "shared-cache.team-b.svc.cluster.local:9000",
+	}
+	requireInvalidWithCause(t, v, cb, "spec.remoteStorage.endpoint",
+		"references namespace \"team-b\"")
+}
+
+func TestValidator_CanonicalCrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  "shared-cache.team-b.svc.cluster.local:9000",
+	}
+	cb.Spec.AllowCrossNamespace = true
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("canonical cross-namespace endpoint with opt-in rejected: %v", err)
+	}
+}
+
 func TestValidator_SameNamespaceEndpointAdmitted(t *testing.T) {
 	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
 	cb := newBackend()
@@ -2932,6 +2968,22 @@ func TestValidator_EventsOnly_AutoscalingRejected(t *testing.T) {
 	}
 	requireInvalidWithCause(t, v, cb, "spec.autoscaling",
 		"nothing to autoscale")
+}
+
+func TestValidator_EventsOnly_RemoteStorageRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = eventsOnlyIntegration()
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+			Image: "cache-server:test",
+		},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.remoteStorage",
+		"provision no remote-storage provider")
 }
 
 func TestValidator_EventsOnly_LMCacheAdmitted(t *testing.T) {

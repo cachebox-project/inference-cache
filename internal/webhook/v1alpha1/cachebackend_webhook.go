@@ -266,6 +266,12 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 				"deprecated top-level resources are not valid in the canonical API; use spec.remoteStorage.<provider>.resources",
 			))
 		}
+		if cb.Spec.RemoteStorage == nil && cb.Spec.Autoscaling != nil {
+			errs = append(errs, field.Forbidden(
+				specPath.Child("autoscaling"),
+				"canonical host-only backends omit spec.remoteStorage and provision no provider workload, so there is nothing to autoscale",
+			))
+		}
 	}
 
 	if !canonical &&
@@ -1415,6 +1421,8 @@ func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 //     adapter (vLLM, Mooncake) is registered: before it shipped, non-LMCache
 //     managed types were caught by the runtime-adapter check, but Mooncake now
 //     passes that check and would otherwise be admitted in events-only mode.
+//   - spec.remoteStorage requests an offload provider that the controller
+//     deliberately removes in events-only mode.
 //   - spec.autoscaling has no workload to scale — the controller deploys
 //     nothing for an events-only backend.
 //
@@ -1453,18 +1461,33 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
 		))
 	}
+	if cb.Spec.RemoteStorage != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "remoteStorage"),
+			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no remote-storage provider; remove spec.remoteStorage",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
+		))
+	}
 	return errs
 }
 
-// rejectCrossNamespaceEndpointWithoutOptIn rejects an Endpoint that
+// rejectCrossNamespaceEndpointWithoutOptIn rejects an external endpoint that
 // resolves into a Service in a namespace other than the CacheBackend's
 // own, unless spec.allowCrossNamespace is true. Crossing a namespace is
 // a tenancy boundary the operator should explicitly acknowledge; the
-// rule fires only when the Endpoint is a recognisable in-cluster Service
-// DNS — external hostnames and IPs pass through (we have no namespace to
-// compare against).
+// rule covers both canonical spec.remoteStorage.endpoint and deprecated
+// spec.endpoint, and fires only when the endpoint is a recognisable in-cluster
+// Service DNS. External hostnames and IPs pass through because they expose no
+// namespace to compare against.
 func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	ns, ok := serviceDNSNamespace(cb.Spec.Endpoint)
+	endpoint := cb.Spec.Endpoint
+	endpointPath := field.NewPath("spec", "endpoint")
+	if cb.Spec.RemoteStorage != nil && strings.TrimSpace(cb.Spec.RemoteStorage.Endpoint) != "" {
+		endpoint = cb.Spec.RemoteStorage.Endpoint
+		endpointPath = field.NewPath("spec", "remoteStorage", "endpoint")
+	}
+
+	ns, ok := serviceDNSNamespace(endpoint)
 	if !ok {
 		return nil
 	}
@@ -1476,10 +1499,10 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 	}
 	return field.ErrorList{
 		field.Forbidden(
-			field.NewPath("spec", "endpoint"),
-			fmt.Sprintf("spec.endpoint references namespace %q but CacheBackend is in namespace %q; "+
+			endpointPath,
+			fmt.Sprintf("%s references namespace %q but CacheBackend is in namespace %q; "+
 				"set spec.allowCrossNamespace=true to opt in to the cross-namespace reference",
-				ns, cb.Namespace),
+				endpointPath.String(), ns, cb.Namespace),
 		),
 	}
 }
