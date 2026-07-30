@@ -1036,8 +1036,9 @@ func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEv
 			PrefixHash: ev.GetPrefixHash(),
 			// Narrows a PREFIX_EVICTED to one adapter partition when the producer
 			// marked adapter_id authoritative (adapter_scoped) — including "" for a
-			// base-model eviction. Unset keeps the conservative cross-partition
-			// removal (legacy producers).
+			// base-model eviction. Absent adapter_scoped still narrows on a non-empty
+			// adapter_id (pre-flag producers); only an empty adapter_id with
+			// adapter_scoped unset keeps the conservative cross-partition removal.
 			Adapter:       ev.GetAdapterId(),
 			AdapterScoped: ev.GetAdapterScoped(),
 			Timestamp:     microsToTime(ev.GetTimestampUs()),

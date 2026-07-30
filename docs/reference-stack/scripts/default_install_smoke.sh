@@ -1196,6 +1196,25 @@ grpcurl_report_cache_state() {
     2>>"$err_file"
 }
 
+grpcurl_publish_event() {
+  local payload="$1"
+  local err_file="${2:-$LOG_DIR/grpcurl-publish-event.err}"
+  # Default install is plaintext (see grpcurl_lookup_route).
+  if printf '%s\n' "$payload" | grpcurl -plaintext -max-time 5 -d @ \
+       "localhost:$GRPC_LOCAL_PORT" \
+       inferencecache.v1alpha1.InferenceCache/PublishEvent \
+       2>"$err_file"; then
+    return 0
+  fi
+  log "reflection PublishEvent probe failed; falling back to proto-file probe" >&2
+  printf '%s\n' "$payload" | grpcurl -plaintext -max-time 5 \
+    -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto \
+    -d @ \
+    "localhost:$GRPC_LOCAL_PORT" \
+    inferencecache.v1alpha1.InferenceCache/PublishEvent \
+    2>>"$err_file"
+}
+
 has_reason_code() {
   local resp="$1"
   local want="$2"
@@ -1471,6 +1490,86 @@ assert_adapter_no_alias "$adapter_none_payload" "$LOG_DIR/grpcurl-adapter-none.e
   "no-adapter" \
   "LookupRoute without adapter_id matched an adapter-scoped prefix — adapter-scoped ingest must stay out of the default partition"
 log "adapter partition enforced end-to-end: same adapter_id → PREFIX_MATCH; a different adapter_id and an absent adapter_id each returned the fail-open AFFINITY_HINT (RPC succeeded, off the prefix-match path) on the identical prefix hash"
+
+# --- adapter-scoped eviction probe (adapter_scoped) ------------------------
+#
+# A base-model PREFIX_EVICTED (adapter_id="" WITH adapter_scoped) must drop ONLY
+# the base partition and leave a co-resident LoRA hint for the SAME token hash
+# intact — the over-sweep the adapter_scoped flag fixes. Driven end-to-end with no
+# engine traffic: seed the identical prefix hash under BOTH the base ("") and an
+# "evict-lora" partition on one replica, PublishEvent a base-scoped eviction, then
+# assert via LookupRoute that the base partition stopped matching while the LoRA
+# partition still returns PREFIX_MATCH.
+log "seeding base + LoRA partitions and asserting a base-scoped PREFIX_EVICTED spares the LoRA hint"
+evict_replica="evict-smoke-replica"
+evict_hash_b64="ZXZpY3QtcHJlZml4" # base64("evict-prefix"); tokenCount=64 clears both policy gates
+
+evict_base_seed="{\"replicaId\":\"$evict_replica\",\"modelId\":\"$adapter_model\",\"tenantId\":\"$POLICY_SMOKE_NS\",\"hashScheme\":\"vllm\",\"prefixes\":[{\"prefixHash\":\"$evict_hash_b64\",\"tokenCount\":64}]}"
+evict_lora_seed="{\"replicaId\":\"$evict_replica\",\"modelId\":\"$adapter_model\",\"tenantId\":\"$POLICY_SMOKE_NS\",\"hashScheme\":\"vllm\",\"prefixes\":[{\"prefixHash\":\"$evict_hash_b64\",\"tokenCount\":64,\"adapterId\":\"evict-lora\"}]}"
+for seed in "$evict_base_seed" "$evict_lora_seed"; do
+  grpcurl_report_cache_state "$seed" "$LOG_DIR/grpcurl-evict-seed.err" >/dev/null || {
+    cat "$LOG_DIR/grpcurl-evict-seed.err" >&2 || true
+    fail "grpcurl ReportCacheState did not accept an eviction-probe seed"
+  }
+done
+
+evict_base_lookup="{\"modelId\":\"$adapter_model\",\"tenantId\":\"$POLICY_SMOKE_NS\",\"hashScheme\":\"vllm\",\"prefixHash\":\"$evict_hash_b64\",\"prefixTokenCount\":64}"
+evict_lora_lookup="{\"modelId\":\"$adapter_model\",\"tenantId\":\"$POLICY_SMOKE_NS\",\"hashScheme\":\"vllm\",\"prefixHash\":\"$evict_hash_b64\",\"prefixTokenCount\":64,\"adapterId\":\"evict-lora\"}"
+
+# Precondition: both partitions match before the eviction. Wait for the seeds to
+# apply (evict-lora), then confirm base is present too — else "base gone" below
+# would pass vacuously.
+deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+evict_lora_pre=""
+until has_reason_code "$evict_lora_pre" "PREFIX_MATCH"; do
+  evict_lora_pre="$(grpcurl_lookup_route "$evict_lora_lookup" "$LOG_DIR/grpcurl-evict-pre-lora.err")" || true
+  has_reason_code "$evict_lora_pre" "PREFIX_MATCH" && break
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "evict-lora precondition LookupRoute (want PREFIX_MATCH):" >&2; echo "$evict_lora_pre" >&2
+    fail "eviction-probe precondition: the evict-lora partition never matched within ${POLICY_PUSH_TIMEOUT}s"
+  fi
+  sleep 2
+done
+evict_base_pre="$(grpcurl_lookup_route "$evict_base_lookup" "$LOG_DIR/grpcurl-evict-pre-base.err")" || true
+has_reason_code "$evict_base_pre" "PREFIX_MATCH" || {
+  echo "base precondition LookupRoute (want PREFIX_MATCH):" >&2; echo "$evict_base_pre" >&2
+  fail "eviction-probe precondition: the base partition did not match before the eviction"
+}
+
+# Base-scoped eviction: adapter_scoped=true with an empty adapter_id targets the
+# base partition ONLY (without the flag an empty adapter_id sweeps every partition).
+evict_event="{\"type\":\"PREFIX_EVICTED\",\"replicaId\":\"$evict_replica\",\"modelId\":\"$adapter_model\",\"tenantId\":\"$POLICY_SMOKE_NS\",\"prefixHash\":\"$evict_hash_b64\",\"adapterScoped\":true}"
+evict_ack="$(grpcurl_publish_event "$evict_event" "$LOG_DIR/grpcurl-evict-publish.err")" || {
+  cat "$LOG_DIR/grpcurl-evict-publish.err" >&2 || true
+  fail "grpcurl PublishEvent did not accept the base-scoped PREFIX_EVICTED"
+}
+log "PublishEvent (base-scoped eviction) response: $evict_ack"
+
+# The base partition must stop matching (proves the eviction applied); once it
+# has, the LoRA partition must STILL match (proves it was not over-swept).
+deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+evict_base_post=""
+while :; do
+  evict_base_post="$(grpcurl_lookup_route "$evict_base_lookup" "$LOG_DIR/grpcurl-evict-post-base.err")" || true
+  if [ -n "$evict_base_post" ] && ! has_reason_code "$evict_base_post" "PREFIX_MATCH"; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "base LookupRoute after eviction (want NOT PREFIX_MATCH):" >&2; echo "$evict_base_post" >&2
+    fail "the base partition was still PREFIX_MATCH ${POLICY_PUSH_TIMEOUT}s after a base-scoped PREFIX_EVICTED — the eviction did not apply"
+  fi
+  sleep 2
+done
+
+evict_lora_post="$(grpcurl_lookup_route "$evict_lora_lookup" "$LOG_DIR/grpcurl-evict-post-lora.err")" || {
+  cat "$LOG_DIR/grpcurl-evict-post-lora.err" >&2 || true
+  fail "grpcurl LookupRoute (evict-lora, post-eviction) failed — a transport error must not mask the over-sweep check"
+}
+has_reason_code "$evict_lora_post" "PREFIX_MATCH" || {
+  echo "evict-lora LookupRoute after the base eviction (want PREFIX_MATCH):" >&2; echo "$evict_lora_post" >&2
+  fail "a base-scoped PREFIX_EVICTED also swept the evict-lora partition — the adapter_scoped over-sweep fix regressed"
+}
+log "adapter_scoped eviction enforced end-to-end: a base-scoped PREFIX_EVICTED dropped the base partition while the co-resident LoRA hint for the identical hash survived"
 
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server

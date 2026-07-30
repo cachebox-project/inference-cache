@@ -92,8 +92,8 @@ func (c Config) ClearedEvent(tsSeconds float64) *icpb.CacheEvent {
 // positionalIndex.Removed. adapter_scoped is always set, so the server drops the
 // prefix from exactly the adapterID partition (even "" for the base model) — a
 // base-model eviction never sweeps live LoRA hints for the same token hash.
-// (A producer that leaves adapter_scoped false gets the conservative
-// cross-partition legacy sweep.)
+// (Only a producer that leaves adapter_scoped false AND adapter_id empty gets the
+// conservative cross-partition legacy sweep; a non-empty adapter_id still narrows.)
 func (c Config) EvictedEvent(prefixHash []byte, adapterID string, tsSeconds float64) *icpb.CacheEvent {
 	return &icpb.CacheEvent{
 		Type:          icpb.CacheEvent_PREFIX_EVICTED,

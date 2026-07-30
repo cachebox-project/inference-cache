@@ -1454,12 +1454,14 @@ func TestPublishEventAppliesToIndex(t *testing.T) {
 	}
 }
 
-// TestPublishEventBaseEvictionScopedSparesLoRA pins the full wire→index
-// seam: a base-model PREFIX_EVICTED carrying adapter_id="" with adapter_scoped=true
-// drops ONLY the base ("") partition. The service must translate adapter_scoped
-// into index.Event.AdapterScoped — reading the adapter_id VALUE ("") instead would
-// misclassify a base-scoped eviction as the legacy wildcard and wrongly sweep the
-// co-resident LoRA hint for the same hash.
+// TestPublishEventBaseEvictionScopedSparesLoRA pins the service→index
+// translation: a base-model PREFIX_EVICTED carrying adapter_id="" with
+// adapter_scoped=true drops ONLY the base ("") partition. The handler must
+// translate adapter_scoped into index.Event.AdapterScoped — reading the adapter_id
+// VALUE ("") instead would misclassify a base-scoped eviction as the legacy
+// wildcard and wrongly sweep the co-resident LoRA hint for the same hash. This
+// exercises the handler in-process (a real icpb.CacheEvent → index.Event); the
+// actual gRPC wire is covered end-to-end by the install-smoke adapter_scoped probe.
 func TestPublishEventBaseEvictionScopedSparesLoRA(t *testing.T) {
 	svc := newTestService()
 	for _, a := range []string{"", "sql-lora"} {
