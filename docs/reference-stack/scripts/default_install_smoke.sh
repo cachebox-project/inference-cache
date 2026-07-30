@@ -58,9 +58,9 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. CacheBackend.spec.resources defaults + threading: the CRD-schema
-#      default stamps spec.resources.limits.memory on every admitted
-#      CacheBackend (so the cache-server pod is bounded by the cgroup
+#   8b. CacheBackend.spec.resources defaults + threading: the mutating
+#      webhook stamps the legacy resource shape with bounded memory (so the
+#      cache-server pod is bounded by the cgroup
 #      rather than node-pressure OOM-killed by the kubelet under T2
 #      write load — the failure mode that surfaced in the Phase-2
 #      benchmark), and the controller threads the value into the
@@ -69,6 +69,11 @@
 #      CR's spec carries the default AND the rendered pod template's
 #      container shows the same limit — because either half-failing
 #      reintroduces the regression.
+#   8c. The canonical cache hierarchy keeps engine wiring and provider
+#      lifecycle independent: the committed SGLang host-only sample creates no
+#      Deployment/Service/HPA and publishes no endpoint, while the committed
+#      SGLang+Managed-Redis sample explicitly creates a redis-l2 Deployment +
+#      Service and publishes its RESP endpoint. No engine traffic is required.
 #   9. The External CacheBackend type end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
@@ -240,7 +245,8 @@
 #           PROMPT_TOPOLOGY_SMOKE_NS, SAMPLE_ENDPOINT_TIMEOUT,
 #           SAMPLE_MATCH_TIMEOUT, SAMPLE_DRIFT_TIMEOUT,
 #           SAMPLE_CASCADE_TIMEOUT, SAMPLE_ENGINE_IMAGE,
-#           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
+#           SAMPLE_CACHE_SERVER_IMAGE, CANONICAL_BACKEND_TIMEOUT,
+#           CANONICAL_SMOKE_NS, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
 #           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
 #           HICACHE_SMOKE_TIMEOUT, HICACHE_SMOKE_NS, HICACHE_SMOKE_CB_NAME,
@@ -272,6 +278,7 @@ LOG_DIR="${LOG_DIR:-/tmp/install-smoke-logs}"
 # lease the External-reconcile path inherits from the C2 reconciler loop.
 EXTERNAL_BACKEND_TIMEOUT="${EXTERNAL_BACKEND_TIMEOUT:-30}" # seconds
 EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
+CANONICAL_BACKEND_TIMEOUT="${CANONICAL_BACKEND_TIMEOUT:-30}" # seconds
 
 # Events-only smoke tunable. An events-only backend provisions no workload, so
 # the only wait is the reconciler latching status.firstAvailableAt and the
@@ -352,6 +359,12 @@ EXT_SMOKE_NS="${EXT_SMOKE_NS:-ic-smoke-external}"
 EXT_SMOKE_CB_NAME="cachebackend-external"
 EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 
+# Canonical hierarchy fixtures: one host-only and one explicitly managed
+# provider in the same disposable namespace.
+CANONICAL_SMOKE_NS="${CANONICAL_SMOKE_NS:-ic-smoke-canonical-cache}"
+CANONICAL_HOST_ONLY_CB="cachebackend-sglang-host-only"
+CANONICAL_REDIS_CB="cachebackend-sglang"
+
 # Events-only-backend smoke fixture identifiers. Declared up front so the
 # diagnostics helper can reference them even if the smoke aborts before the
 # events-only section creates the objects.
@@ -425,6 +438,10 @@ collect_diagnostics() {
     >"$LOG_DIR/sample-pods.yaml" 2>&1 || true
   kubectl -n "$SAMPLE_NS" get events.events.k8s.io -o yaml \
     >"$LOG_DIR/sample-events.yaml" 2>&1 || true
+  kubectl -n "$CANONICAL_SMOKE_NS" get cb -o yaml \
+    >"$LOG_DIR/canonical-cachebackends.yaml" 2>&1 || true
+  kubectl -n "$CANONICAL_SMOKE_NS" get deploy,svc,hpa -o yaml \
+    >"$LOG_DIR/canonical-provider-workloads.yaml" 2>&1 || true
   # External-backend smoke artefacts. Best-effort — the CR/pod may not
   # exist if the smoke aborted before that section.
   kubectl get cb -A -o wide \
@@ -1629,24 +1646,24 @@ fi
 log "status.matchedEnginePods=1"
 
 # --- spec.resources defaults + thread-through ------------------------------
-# The minimal paired-sample CacheBackend declares no spec.resources, so the
-# CRD-schema default must stamp limits.memory=8Gi (and the matching
+# The minimal paired-sample CacheBackend uses the legacy API and declares no
+# spec.resources, so the mutating webhook must stamp limits.memory=8Gi (and the matching
 # requests.memory=4Gi) on the persisted CR; the controller must then thread
 # that limit onto the rendered Deployment's lmcache-server container. Both
 # halves must hold — half-failing reintroduces the OOM-kill cliff that
 # motivated bounding the cache-server pod by the cgroup.
-log "asserting spec.resources defaults stamp on the CR and thread to the rendered Deployment"
+log "asserting legacy spec.resources webhook defaults stamp on the CR and thread to the rendered Deployment"
 cb_lim_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
   -o jsonpath='{.spec.resources.limits.memory}' 2>/dev/null || true)"
 if [ "$cb_lim_mem" != "8Gi" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources.limits.memory=$cb_lim_mem, want 8Gi (CRD schema default not applied)"
+  fail "cb.spec.resources.limits.memory=$cb_lim_mem, want 8Gi (legacy webhook default not applied)"
 fi
 cb_req_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
   -o jsonpath='{.spec.resources.requests.memory}' 2>/dev/null || true)"
 if [ "$cb_req_mem" != "4Gi" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources.requests.memory=$cb_req_mem, want 4Gi (CRD schema default not applied)"
+  fail "cb.spec.resources.requests.memory=$cb_req_mem, want 4Gi (legacy webhook default not applied)"
 fi
 dep_lim_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.limits.memory}' \
@@ -2115,6 +2132,83 @@ log "drift converged: status.matchedEnginePods=0 via the self-RequeueAfter caden
 # the namespace at the start of this phase, so this leaves the cluster
 # in the state the rest of the smoke produced.
 kubectl delete namespace "$SAMPLE_NS" \
+  --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
+
+# --- Canonical cache hierarchy ---------------------------------------------
+# Proves the API distinction this surface promises:
+#   * no remoteStorage => no provider workload or endpoint;
+#   * explicit Managed Redis => Redis workload + RESP Service endpoint.
+log "exercising canonical host-only and Managed Redis hierarchies in namespace $CANONICAL_SMOKE_NS"
+kubectl create namespace "$CANONICAL_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+kubectl -n "$CANONICAL_SMOKE_NS" apply \
+  -f config/samples/cachebackend-sglang-host-only.yaml >/dev/null \
+  || fail "canonical host-only CacheBackend sample failed to apply"
+
+deadline=$(($(date +%s) + CANONICAL_BACKEND_TIMEOUT))
+host_observed_generation=""
+while [ -z "$host_observed_generation" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+  host_observed_generation="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
+    -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  [ -n "$host_observed_generation" ] || sleep 1
+done
+host_runtime="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
+  -o jsonpath='{.spec.runtime}' 2>/dev/null || true)"
+host_compat_engine="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
+  -o jsonpath='{.spec.integration.engine}' 2>/dev/null || true)"
+host_remote_provider="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
+  -o jsonpath='{.spec.remoteStorage.provider}' 2>/dev/null || true)"
+host_endpoint="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
+  -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+if [ -z "$host_observed_generation" ] || [ "$host_runtime" != "SGLang" ] || \
+   [ "$host_compat_engine" != "sglang" ] || [ -n "$host_remote_provider" ] || \
+   [ -n "$host_endpoint" ]; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" -o yaml || true
+  fail "canonical host-only state is wrong: observedGeneration=$host_observed_generation runtime=$host_runtime integration.engine=$host_compat_engine provider=$host_remote_provider endpoint=$host_endpoint"
+fi
+for resource in deployment service horizontalpodautoscaler; do
+  if kubectl -n "$CANONICAL_SMOKE_NS" get "$resource" "$CANONICAL_HOST_ONLY_CB" >/dev/null 2>&1; then
+    kubectl -n "$CANONICAL_SMOKE_NS" get deploy,svc,hpa -o wide || true
+    fail "canonical host-only CacheBackend unexpectedly created $resource/$CANONICAL_HOST_ONLY_CB"
+  fi
+done
+log "canonical host-only hierarchy published no provider endpoint or workload"
+
+kubectl -n "$CANONICAL_SMOKE_NS" apply \
+  -f config/samples/cachebackend-sglang.yaml >/dev/null \
+  || fail "canonical Managed Redis CacheBackend sample failed to apply"
+
+deadline=$(($(date +%s) + CANONICAL_BACKEND_TIMEOUT))
+redis_endpoint=""
+until kubectl -n "$CANONICAL_SMOKE_NS" get deployment "$CANONICAL_REDIS_CB" >/dev/null 2>&1 && \
+      kubectl -n "$CANONICAL_SMOKE_NS" get service "$CANONICAL_REDIS_CB" >/dev/null 2>&1 && \
+      [ -n "$redis_endpoint" ]; do
+  redis_endpoint="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_REDIS_CB" \
+    -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$CANONICAL_SMOKE_NS" get cb,deploy,svc -o yaml || true
+    fail "canonical Managed Redis provider did not reconcile within ${CANONICAL_BACKEND_TIMEOUT}s"
+  fi
+  sleep 1
+done
+redis_provider="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_REDIS_CB" \
+  -o jsonpath='{.spec.remoteStorage.provider}' 2>/dev/null || true)"
+redis_ownership="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_REDIS_CB" \
+  -o jsonpath='{.spec.remoteStorage.ownership}' 2>/dev/null || true)"
+redis_container="$(kubectl -n "$CANONICAL_SMOKE_NS" get deployment "$CANONICAL_REDIS_CB" \
+  -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null || true)"
+redis_port="$(kubectl -n "$CANONICAL_SMOKE_NS" get service "$CANONICAL_REDIS_CB" \
+  -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+expected_redis_endpoint="$CANONICAL_REDIS_CB.$CANONICAL_SMOKE_NS.svc.cluster.local:6379"
+if [ "$redis_provider" != "Redis" ] || [ "$redis_ownership" != "Managed" ] || \
+   [ "$redis_container" != "redis-l2" ] || [ "$redis_port" != "6379" ] || \
+   [ "$redis_endpoint" != "$expected_redis_endpoint" ]; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get cb,deploy,svc -o yaml || true
+  fail "canonical Managed Redis state is wrong: provider=$redis_provider ownership=$redis_ownership container=$redis_container port=$redis_port endpoint=$redis_endpoint"
+fi
+log "canonical Managed Redis hierarchy rendered redis-l2 and endpoint=$redis_endpoint"
+
+kubectl delete namespace "$CANONICAL_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
 # --- External CacheBackend end-to-end ---------------------------------------

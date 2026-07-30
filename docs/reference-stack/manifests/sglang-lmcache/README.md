@@ -304,7 +304,7 @@ loopback, holds the L1 in `/dev/shm`, and offloads its shared tier to the Redis 
 the `resp` `--l2-adapter` (`lm://` is not a valid MP `--l2-adapter` type). The engine
 attaches to the local worker over CUDA-IPC + shared memory; because they speak the MP
 wire to each other, the worker defaults to the **same image** as the engine (same
-lmcache version) — `backendConfig.workerImage` overrides it, at which point keeping the
+lmcache version) — `spec.lmCache.workerImage` overrides it, at which point keeping the
 two lmcache versions aligned is yours. Authoritative design + GPU-validation evidence:
 [`docs/design/sglang-lmcache-mp-mode.md`](../../../design/sglang-lmcache-mp-mode.md);
 key/field reference: [`docs/design/cachebackend-api.md`](../../../design/cachebackend-api.md)

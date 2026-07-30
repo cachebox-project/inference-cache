@@ -2,8 +2,20 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// +kubebuilder:validation:Enum=VLLM;SGLang
+
+// CacheBackendRuntime identifies the inference runtime whose engine Pods are
+// wired to this cache hierarchy.
+type CacheBackendRuntime string
+
+const (
+	CacheBackendRuntimeVLLM   CacheBackendRuntime = "VLLM"
+	CacheBackendRuntimeSGLang CacheBackendRuntime = "SGLang"
 )
 
 // CacheBackendType identifies the backing cache implementation.
@@ -16,6 +28,29 @@ const (
 	CacheBackendTypeMooncake      CacheBackendType = "Mooncake"
 	CacheBackendTypeNIXL          CacheBackendType = "NIXL"
 	CacheBackendTypeExternal      CacheBackendType = "External"
+)
+
+// +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake
+
+// CacheBackendRemoteStorageProvider identifies the technology used for the
+// optional shared/remote cache tier.
+type CacheBackendRemoteStorageProvider string
+
+const (
+	CacheBackendRemoteStorageProviderRedis         CacheBackendRemoteStorageProvider = "Redis"
+	CacheBackendRemoteStorageProviderLMCacheServer CacheBackendRemoteStorageProvider = "LMCacheServer"
+	CacheBackendRemoteStorageProviderMooncake      CacheBackendRemoteStorageProvider = "Mooncake"
+)
+
+// +kubebuilder:validation:Enum=Managed;External
+
+// CacheBackendRemoteStorageOwnership identifies who owns the remote provider's
+// lifecycle.
+type CacheBackendRemoteStorageOwnership string
+
+const (
+	CacheBackendRemoteStorageOwnershipManaged  CacheBackendRemoteStorageOwnership = "Managed"
+	CacheBackendRemoteStorageOwnershipExternal CacheBackendRemoteStorageOwnership = "External"
 )
 
 // +kubebuilder:validation:Enum=Deployment;StatefulSet
@@ -129,11 +164,136 @@ type SGLangHiCacheSpec struct {
 	MemoryLayout SGLangHiCacheMemoryLayout `json:"memoryLayout,omitempty"`
 }
 
+// CacheBackendHostMemorySpec configures engine-side host memory. Capacity is
+// owned by the engine cache implementation and never sizes a remote provider.
+type CacheBackendHostMemorySpec struct {
+	// Capacity is the memory budget for the engine-side host cache.
+	// +optional
+	Capacity *resource.Quantity `json:"capacity,omitempty"`
+}
+
+// LMCacheEngineSpec configures the engine-side LMCache implementation. These
+// fields apply to the connector or node-local MP worker, not to a remote
+// storage provider.
+type LMCacheEngineSpec struct {
+	// ChunkSizeTokens is the number of tokens in an LMCache chunk.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	ChunkSizeTokens *int32 `json:"chunkSizeTokens,omitempty"`
+
+	// HostMemory configures LMCache's engine-local host-memory tier.
+	// +optional
+	HostMemory *CacheBackendHostMemorySpec `json:"hostMemory,omitempty"`
+
+	// WorkerImage overrides the node-local LMCache MP worker image when the
+	// selected runtime uses multiprocess mode.
+	// +optional
+	WorkerImage string `json:"workerImage,omitempty"`
+
+	// WorkerPort overrides the node-local LMCache MP worker port.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	WorkerPort *int32 `json:"workerPort,omitempty"`
+
+	// RemoteSerde selects LMCache's serializer for a remote binding.
+	// +optional
+	RemoteSerde string `json:"remoteSerde,omitempty"`
+}
+
+// RedisRemoteStorageSpec configures a Redis remote-storage provider.
+type RedisRemoteStorageSpec struct {
+	// Image is used only when ownership is Managed.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Resources are applied to the managed Redis container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// LMCacheServerRemoteStorageSpec configures a standalone lmcache-server
+// remote-storage provider.
+type LMCacheServerRemoteStorageSpec struct {
+	// Image is used only when ownership is Managed.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Command overrides the managed server command and arguments.
+	// +optional
+	Command []string `json:"command,omitempty"`
+
+	// Resources are applied to the managed lmcache-server container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// MooncakeRemoteStorageSpec configures a Mooncake remote-storage provider.
+type MooncakeRemoteStorageSpec struct {
+	// Image is used only when ownership is Managed.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Command overrides the managed Mooncake master command and arguments.
+	// +optional
+	Command []string `json:"command,omitempty"`
+
+	// Resources are applied to the managed Mooncake master container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// CacheBackendRemoteStorageSpec configures the optional shared/remote tier.
+// Omitting this object in the canonical API requests an engine-local,
+// host-only hierarchy and never implicitly provisions infrastructure.
+type CacheBackendRemoteStorageSpec struct {
+	// Provider identifies the remote-storage technology.
+	Provider CacheBackendRemoteStorageProvider `json:"provider"`
+
+	// Ownership identifies whether inference-cache manages the provider
+	// workload or connects to operator-managed infrastructure.
+	Ownership CacheBackendRemoteStorageOwnership `json:"ownership"`
+
+	// Endpoint is required for External ownership and rejected for Managed
+	// ownership, whose endpoint is controller-observed.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Redis contains Redis-owned configuration.
+	// +optional
+	Redis *RedisRemoteStorageSpec `json:"redis,omitempty"`
+
+	// LMCacheServer contains standalone lmcache-server-owned configuration.
+	// +optional
+	LMCacheServer *LMCacheServerRemoteStorageSpec `json:"lmCacheServer,omitempty"`
+
+	// Mooncake contains Mooncake-owned configuration.
+	// +optional
+	Mooncake *MooncakeRemoteStorageSpec `json:"mooncake,omitempty"`
+}
+
+// CacheBackendObservationSpec configures KV-event observation independently
+// from engine-cache wiring and remote-storage lifecycle.
+type CacheBackendObservationSpec struct {
+	// ModelID is attached to observed cache events.
+	// +optional
+	ModelID string `json:"modelID,omitempty"`
+
+	// FirstEventTimeout bounds how long readiness waits for the first KV event.
+	// +optional
+	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
+}
+
 // CacheBackendSpec defines the desired state of a cache backend.
 //
 // The autoscaling spec (spec.autoscaling) is reconciled into a
 // HorizontalPodAutoscaler for managed backends.
 type CacheBackendSpec struct {
+	// Runtime identifies the inference runtime. New resources should use this
+	// field; integration.engine remains as a deprecated compatibility input.
+	// +optional
+	Runtime CacheBackendRuntime `json:"runtime,omitempty"`
+
 	// Type identifies the backing cache implementation. Defaults to LMCache —
 	// the standalone lmcache-server workload Phase-1 ships; operators pick
 	// External (operator-supplied endpoint) or another type explicitly when
@@ -143,6 +303,22 @@ type CacheBackendSpec struct {
 	// +optional
 	// +kubebuilder:default=LMCache
 	Type CacheBackendType `json:"type,omitempty"`
+
+	// LMCache configures the engine-side LMCache implementation. It is valid
+	// only when type=LMCache.
+	// +optional
+	LMCache *LMCacheEngineSpec `json:"lmCache,omitempty"`
+
+	// RemoteStorage configures an optional shared/remote cache tier. Its
+	// provider and ownership are independent from runtime and type. When this
+	// field is omitted from the canonical API, no provider is provisioned.
+	// +optional
+	RemoteStorage *CacheBackendRemoteStorageSpec `json:"remoteStorage,omitempty"`
+
+	// Observation configures KV-event observation independently from cache
+	// offload and provider lifecycle.
+	// +optional
+	Observation *CacheBackendObservationSpec `json:"observation,omitempty"`
 
 	// DeploymentKind identifies whether a managed backend is reconciled as a
 	// Deployment or StatefulSet. Defaults to Deployment — the only kind the
@@ -232,7 +408,8 @@ type CacheBackendSpec struct {
 	// +optional
 	HiCache *SGLangHiCacheSpec `json:"hiCache,omitempty"`
 
-	// BackendConfig contains backend-specific string settings.
+	// BackendConfig contains deprecated compatibility settings. Canonical
+	// resources use the typed LMCache, RemoteStorage, and Observation blocks.
 	// +optional
 	BackendConfig map[string]string `json:"backendConfig,omitempty"`
 
@@ -240,19 +417,19 @@ type CacheBackendSpec struct {
 	// +optional
 	Template *CacheBackendPodSpecOverride `json:"template,omitempty"`
 
-	// Resources are the compute resources requested + limited on the cache
-	// server container of a managed backend workload (the lmcache-server
-	// container for a Type=LMCache backend). The runtime adapter passes
+	// Resources are the deprecated compatibility resources requested + limited
+	// on a legacy managed backend workload. Canonical resources configure this
+	// under remoteStorage.<provider>.resources. The provider adapter passes
 	// the admitted Requests/Limits maps through to Container.Resources;
-	// the kubebuilder default below stamps a conservative 4Gi request /
-	// 8Gi memory limit on the minimal-YAML path (when the field is
-	// OMITTED) so the cache server is bounded by the cgroup rather than
+	// the mutating webhook stamps a conservative 4Gi request / 8Gi memory
+	// limit on the legacy minimal-YAML path (when the field is OMITTED) so
+	// the cache server is bounded by the cgroup rather than
 	// node-pressure OOM-killed by the kubelet under heavy T2 write load —
 	// a cache-stress benchmark against an unlimited lmcache-server
 	// repeatedly OOM-killed the pod within minutes of T2 traffic, which
 	// the default limit eliminates. Operators tune per-deployment by
 	// overriding the field; an explicit empty `spec.resources: {}` is
-	// honored as suppression of the schema-stamped memory request/limit
+	// honored as suppression of the webhook-stamped memory request/limit
 	// (no memory request, no memory limit rendered). When spec.autoscaling
 	// is set the runtime adapter still fills in a CPU request fallback
 	// (the HPA-utilization denominator) on top of the empty struct —
@@ -292,11 +469,14 @@ type CacheBackendSpec struct {
 	// absent and replaced, because the HPA cannot use 0 as a
 	// denominator.
 	//
-	// External and SGLangHiCache backends provision no workload of their own,
-	// so the field is inert for those types.
+	// This deprecated field is accepted only by legacy resource shapes.
+	// Canonical resources must configure resources under the selected
+	// remoteStorage provider; admission rejects this field when runtime,
+	// lmCache, remoteStorage, or observation selects the canonical API.
+	// External and SGLangHiCache legacy backends provision no workload of
+	// their own, so the field remains inert for those legacy types.
 	//
 	// +optional
-	// +kubebuilder:default={requests: {memory: "4Gi"}, limits: {memory: "8Gi"}}
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
 	// Endpoint is the operator-supplied network address for an
@@ -374,18 +554,17 @@ type CacheBackendAutoscalingSpec struct {
 // CachePolicy.spec.lookupTimeoutMs and CachePolicy.spec.minimumPrefixTokens,
 // which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
-	// Engine identifies the inference engine integration, such as vllm or
-	// sglang. Defaults to vllm. Both vllm and sglang have shipping adapters
+	// Engine is the deprecated inference-runtime identity retained for legacy
+	// manifests. The mutating webhook derives it from spec.runtime for
+	// canonical resources and defaults it to vllm for legacy resources. Both
+	// vllm and sglang have shipping adapters
 	// (vllm+LMCache and sglang+LMCache); the supported (engine, type) pairs
 	// are whatever the installed runtime adapters accept, and admission lists
-	// them in its rejection message for an unsupported pair. The CRD-level
-	// default only applies when spec.integration is materialised on the
-	// submitted object; when integration is omitted entirely the
-	// [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback
-	// at read time, so the admission validator, reconciler, and pod webhook
-	// all converge on the same effective engine.
+	// them in its rejection message for an unsupported pair. Keeping this
+	// default in the webhook instead of the CRD schema prevents a canonical
+	// runtime=SGLang object with a partially populated integration block from
+	// being schema-defaulted into a conflicting engine=vllm value.
 	// +optional
-	// +kubebuilder:default=vllm
 	Engine string `json:"engine,omitempty"`
 
 	// Mode selects which cache tiers the engine is wired for. Defaults to

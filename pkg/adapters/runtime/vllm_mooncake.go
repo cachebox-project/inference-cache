@@ -208,24 +208,27 @@ func (vllmMooncakeAdapter) ReservedEnv() []string {
 // the same container [vllmMooncakeAdapter.InjectEngineConfig] modified.
 func (vllmMooncakeAdapter) EngineContainerName() string { return EngineContainerName }
 
-// ResolveCacheServer renders the standalone Mooncake master's container set and
-// the Service's port set. As with the LMCache adapter, the reconciler owns
-// ObjectMeta, the Service Selector, the workload kind, and owner references —
-// all of which depend on the CacheBackend identity, not on the adapter — so
-// this returns only PodSpec.Containers and Service.Spec.Ports/Type.
-//
-// The RPC port is rendered FIRST in both the container and the Service so the
-// reconciler's engine-agnostic serviceEndpoint helper (which formats
-// status.endpoint from the Service's first port) points the engine at the
-// master's mooncakestore:// RPC address, not the metadata port.
+// ResolveCacheServer is the pre-separation compatibility renderer. Production
+// provider lifecycle resolves through pkg/adapters/backend/provider.
 func (vllmMooncakeAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return ResolveMooncakeServer(cache)
+}
+
+// ResolveMooncakeServer renders the provider-owned Mooncake master workload.
+// Runtime adapters retain the method above for source compatibility, while the
+// controller resolves this function through the independent storage-provider
+// registry.
+func ResolveMooncakeServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
-	cfg := cache.Spec.BackendConfig
-	image := enginewire.ConfigOr(cfg, cfgKeyServerImage, defaultMooncakeMasterImage)
+	cfg := legacyProviderConfig(cache)
+	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, cfgKeyServerImage, defaultMooncakeMasterImage)
 
 	command, args := mooncakeMasterCommand(cfg)
+	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderMooncake); len(typed) > 0 {
+		command, args = typed[:1], typed[1:]
+	}
 	container := corev1.Container{
 		Name:            mooncakeMasterContainerName,
 		Image:           image,
@@ -251,9 +254,9 @@ func (vllmMooncakeAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend)
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// Resources come from spec.resources (CRD-defaulted to a 4Gi request /
-		// 8Gi limit) with the same autoscaling CPU-request fallback the LMCache
-		// server uses — shared helper, identical semantics.
+		// Resources come from the Mooncake provider block (or legacy
+		// spec.resources), with the same bounded default and autoscaling CPU
+		// request fallback the LMCache server uses.
 		Resources: defaultServerResources(cache),
 	}
 

@@ -7,7 +7,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 // SubscriberSidecarParams carries the per-adapter inputs to
@@ -51,8 +50,8 @@ type SubscriberSidecarParams struct {
 // dials the engine over 127.0.0.1 (the ZMQ PUB endpoint on EngineZMQPortStr);
 // identity flags are derived from Cache + Pod (--replica-id from pod.Name via the
 // downward API, --tenant-id from pod.Namespace ditto, --model-id from
-// cache.Spec.BackendConfig["model"], --hash-scheme from HashScheme) so the CR is
-// the single source of truth.
+// spec.observation.modelID (or legacy backendConfig.model), --hash-scheme from
+// HashScheme) so the CR is the single source of truth.
 //
 // The flag surface here is deliberately the intersection of what the shipped
 // kvevent-subscriber binary accepts: passing flags the binary doesn't know
@@ -66,7 +65,7 @@ type SubscriberSidecarParams struct {
 // posture exists to avoid) or when the served model id is not derivable from the
 // CR (the subscriber's --model-id flag is required, so emitting a container that
 // would CrashLoopBackOff is worse than skipping; the webhook logs the skip and
-// the next admission picks it up once the operator sets spec.backendConfig.model).
+// the next admission picks it up once the operator sets the observation model).
 // ServerAddr falls back to [DefaultPolicyServerGRPCAddress] when empty.
 func RenderSubscriberSidecar(p SubscriberSidecarParams) (*corev1.Container, error) {
 	if p.Cache == nil {
@@ -78,7 +77,7 @@ func RenderSubscriberSidecar(p SubscriberSidecarParams) (*corev1.Container, erro
 	if p.Image == "" {
 		return nil, nil
 	}
-	modelID := enginewire.ConfigOr(p.Cache.Spec.BackendConfig, modelBackendConfigKey, "")
+	modelID := p.Cache.Spec.EffectiveObservationModelID()
 	if modelID == "" {
 		return nil, nil
 	}

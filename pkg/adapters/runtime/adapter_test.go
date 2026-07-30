@@ -155,7 +155,7 @@ func TestReferenceAdapterResolveCacheServerIsNil(t *testing.T) {
 	a := NewReferenceAdapter()
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	pod, svc, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}

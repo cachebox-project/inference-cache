@@ -123,7 +123,9 @@ spec:
               backendConfig:
                 additionalProperties:
                   type: string
-                description: BackendConfig contains backend-specific string settings.
+                description: |-
+                  BackendConfig contains deprecated compatibility settings. Canonical
+                  resources use the typed LMCache, RemoteStorage, and Observation blocks.
                 type: object
               deploymentKind:
                 default: Deployment
@@ -259,18 +261,17 @@ spec:
                   the cache backend.
                 properties:
                   engine:
-                    default: vllm
                     description: |-
-                      Engine identifies the inference engine integration, such as vllm or
-                      sglang. Defaults to vllm. Both vllm and sglang have shipping adapters
+                      Engine is the deprecated inference-runtime identity retained for legacy
+                      manifests. The mutating webhook derives it from spec.runtime for
+                      canonical resources and defaults it to vllm for legacy resources. Both
+                      vllm and sglang have shipping adapters
                       (vllm+LMCache and sglang+LMCache); the supported (engine, type) pairs
                       are whatever the installed runtime adapters accept, and admission lists
-                      them in its rejection message for an unsupported pair. The CRD-level
-                      default only applies when spec.integration is materialised on the
-                      submitted object; when integration is omitted entirely the
-                      [adapterruntime.ResolveRuntimeID] helper applies the same vllm fallback
-                      at read time, so the admission validator, reconciler, and pod webhook
-                      all converge on the same effective engine.
+                      them in its rejection message for an unsupported pair. Keeping this
+                      default in the webhook instead of the CRD schema prevents a canonical
+                      runtime=SGLang object with a partially populated integration block from
+                      being schema-defaulted into a conflicting engine=vllm value.
                     type: string
                   engineHostNetwork:
                     description: |-
@@ -623,6 +624,303 @@ spec:
                     - ReadWrite
                     type: string
                 type: object
+              lmCache:
+                description: |-
+                  LMCache configures the engine-side LMCache implementation. It is valid
+                  only when type=LMCache.
+                properties:
+                  chunkSizeTokens:
+                    description: ChunkSizeTokens is the number of tokens in an LMCache
+                      chunk.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  hostMemory:
+                    description: HostMemory configures LMCache's engine-local host-memory
+                      tier.
+                    properties:
+                      capacity:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: Capacity is the memory budget for the engine-side
+                          host cache.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                  remoteSerde:
+                    description: RemoteSerde selects LMCache's serializer for a remote
+                      binding.
+                    type: string
+                  workerImage:
+                    description: |-
+                      WorkerImage overrides the node-local LMCache MP worker image when the
+                      selected runtime uses multiprocess mode.
+                    type: string
+                  workerPort:
+                    description: WorkerPort overrides the node-local LMCache MP worker
+                      port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                type: object
+              observation:
+                description: |-
+                  Observation configures KV-event observation independently from cache
+                  offload and provider lifecycle.
+                properties:
+                  firstEventTimeout:
+                    description: FirstEventTimeout bounds how long readiness waits
+                      for the first KV event.
+                    type: string
+                  modelID:
+                    description: ModelID is attached to observed cache events.
+                    type: string
+                type: object
+              remoteStorage:
+                description: |-
+                  RemoteStorage configures an optional shared/remote cache tier. Its
+                  provider and ownership are independent from runtime and type. When this
+                  field is omitted from the canonical API, no provider is provisioned.
+                properties:
+                  endpoint:
+                    description: |-
+                      Endpoint is required for External ownership and rejected for Managed
+                      ownership, whose endpoint is controller-observed.
+                    type: string
+                  lmCacheServer:
+                    description: LMCacheServer contains standalone lmcache-server-owned
+                      configuration.
+                    properties:
+                      command:
+                        description: Command overrides the managed server command
+                          and arguments.
+                        items:
+                          type: string
+                        type: array
+                      image:
+                        description: Image is used only when ownership is Managed.
+                        type: string
+                      resources:
+                        description: Resources are applied to the managed lmcache-server
+                          container.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    type: object
+                  mooncake:
+                    description: Mooncake contains Mooncake-owned configuration.
+                    properties:
+                      command:
+                        description: Command overrides the managed Mooncake master
+                          command and arguments.
+                        items:
+                          type: string
+                        type: array
+                      image:
+                        description: Image is used only when ownership is Managed.
+                        type: string
+                      resources:
+                        description: Resources are applied to the managed Mooncake
+                          master container.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    type: object
+                  ownership:
+                    description: |-
+                      Ownership identifies whether inference-cache manages the provider
+                      workload or connects to operator-managed infrastructure.
+                    enum:
+                    - Managed
+                    - External
+                    type: string
+                  provider:
+                    description: Provider identifies the remote-storage technology.
+                    enum:
+                    - Redis
+                    - LMCacheServer
+                    - Mooncake
+                    type: string
+                  redis:
+                    description: Redis contains Redis-owned configuration.
+                    properties:
+                      image:
+                        description: Image is used only when ownership is Managed.
+                        type: string
+                      resources:
+                        description: Resources are applied to the managed Redis container.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    type: object
+                required:
+                - ownership
+                - provider
+                type: object
               replicas:
                 default: 1
                 description: |-
@@ -643,25 +941,20 @@ spec:
                 minimum: 0
                 type: integer
               resources:
-                default:
-                  limits:
-                    memory: 8Gi
-                  requests:
-                    memory: 4Gi
                 description: |-
-                  Resources are the compute resources requested + limited on the cache
-                  server container of a managed backend workload (the lmcache-server
-                  container for a Type=LMCache backend). The runtime adapter passes
+                  Resources are the deprecated compatibility resources requested + limited
+                  on a legacy managed backend workload. Canonical resources configure this
+                  under remoteStorage.<provider>.resources. The provider adapter passes
                   the admitted Requests/Limits maps through to Container.Resources;
-                  the kubebuilder default below stamps a conservative 4Gi request /
-                  8Gi memory limit on the minimal-YAML path (when the field is
-                  OMITTED) so the cache server is bounded by the cgroup rather than
+                  the mutating webhook stamps a conservative 4Gi request / 8Gi memory
+                  limit on the legacy minimal-YAML path (when the field is OMITTED) so
+                  the cache server is bounded by the cgroup rather than
                   node-pressure OOM-killed by the kubelet under heavy T2 write load —
                   a cache-stress benchmark against an unlimited lmcache-server
                   repeatedly OOM-killed the pod within minutes of T2 traffic, which
                   the default limit eliminates. Operators tune per-deployment by
                   overriding the field; an explicit empty `spec.resources: {}` is
-                  honored as suppression of the schema-stamped memory request/limit
+                  honored as suppression of the webhook-stamped memory request/limit
                   (no memory request, no memory limit rendered). When spec.autoscaling
                   is set the runtime adapter still fills in a CPU request fallback
                   (the HPA-utilization denominator) on top of the empty struct —
@@ -701,8 +994,12 @@ spec:
                   absent and replaced, because the HPA cannot use 0 as a
                   denominator.
 
-                  External and SGLangHiCache backends provision no workload of their own,
-                  so the field is inert for those types.
+                  This deprecated field is accepted only by legacy resource shapes.
+                  Canonical resources must configure resources under the selected
+                  remoteStorage provider; admission rejects this field when runtime,
+                  lmCache, remoteStorage, or observation selects the canonical API.
+                  External and SGLangHiCache legacy backends provision no workload of
+                  their own, so the field remains inert for those legacy types.
                 properties:
                   claims:
                     description: |-
@@ -760,6 +1057,14 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              runtime:
+                description: |-
+                  Runtime identifies the inference runtime. New resources should use this
+                  field; integration.engine remains as a deprecated compatibility input.
+                enum:
+                - VLLM
+                - SGLang
+                type: string
               template:
                 description: Template provides pod-level overrides for managed backend
                   workloads.

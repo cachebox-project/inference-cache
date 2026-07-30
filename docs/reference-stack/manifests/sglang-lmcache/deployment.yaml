@@ -215,9 +215,9 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["python", "-m", "sglang.launch_server"]
           args:
-            # Matches config/samples/cachebackend-sglang.yaml's backendConfig.model
+            # Matches config/samples/cachebackend-sglang.yaml's observation.modelID
             # and the SGLang row in VERSIONS.md. In the managed path the served
-            # model, the CacheBackend's backendConfig.model, and the request's
+            # model, the CacheBackend's observation.modelID, and the request's
             # `model` must all agree — the index keys per-model, so a mismatch
             # silently misses on LookupRoute even while events flow.
             - "--model-path=meta-llama/Meta-Llama-3-8B-Instruct"

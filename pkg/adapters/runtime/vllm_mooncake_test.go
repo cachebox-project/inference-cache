@@ -62,7 +62,7 @@ func TestVLLMMooncakeResolveCacheServer(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
 	cb := newMooncakeBackend(nil)
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	pod, svc, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestVLLMMooncakeResolveCacheServer(t *testing.T) {
 //     the master's node IP with every port reachable.
 func TestVLLMMooncakeResolveCacheServerHostNetworkAndHeadless(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
-	pod, svc, err := a.ResolveCacheServer(newMooncakeBackend(nil))
+	pod, svc, err := ResolveLegacyCacheServer(a, newMooncakeBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestVLLMMooncakeResolveCacheServerCommandOverride(t *testing.T) {
 
 func TestVLLMMooncakeResolveCacheServerNilCache(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
-	if _, _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, _, err := ResolveLegacyCacheServer(a, nil); err == nil {
 		t.Fatalf("expected error for nil cache")
 	}
 }

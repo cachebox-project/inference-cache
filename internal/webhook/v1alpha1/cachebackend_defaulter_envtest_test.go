@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -25,7 +26,8 @@ import (
 // guess (engineSelector, backendConfig.model, and a name) must produce a
 // fully-defaulted CR with every Phase-1 default stamped — Type=LMCache,
 // DeploymentKind=Deployment, Replicas=1, Integration.Engine=vllm,
-// Integration.Role=ReadWrite, Integration.Mode=Offload, Integration.FailOpen=true,
+// Integration.Role=ReadWrite, Integration.Mode=Offload,
+// Integration.FailOpen=true, and bounded legacy Resources.
 // Integration.FirstEventTimeout=5m. The apiserver in the loop applies
 // `+kubebuilder:default=` markers; the webhook materialises
 // spec.integration solely to persist firstEventTimeout.
@@ -165,7 +167,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 		t.Fatalf("spec.integration was not materialised by the defaulter; got nil")
 	}
 	if want := "vllm"; got.Spec.Integration.Engine != want {
-		t.Errorf("spec.integration.engine = %q, want %q (kubebuilder default)", got.Spec.Integration.Engine, want)
+		t.Errorf("spec.integration.engine = %q, want %q (webhook default)", got.Spec.Integration.Engine, want)
 	}
 	if want := cachev1alpha1.CacheBackendIntegrationRoleReadWrite; got.Spec.Integration.Role != want {
 		t.Errorf("spec.integration.role = %q, want %q (kubebuilder default)", got.Spec.Integration.Role, want)
@@ -180,6 +182,46 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 		got.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
 		t.Errorf("spec.integration.firstEventTimeout = %v, want %s (defaulter-stamped)",
 			got.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
+	}
+	if got.Spec.Resources == nil {
+		t.Fatal("spec.resources was not materialised for the legacy resource")
+	}
+	if memory := got.Spec.Resources.Requests.Memory(); memory == nil || memory.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("spec.resources.requests.memory = %v, want 4Gi (webhook default)", memory)
+	}
+	if memory := got.Spec.Resources.Limits.Memory(); memory == nil || memory.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Errorf("spec.resources.limits.memory = %v, want 8Gi (webhook default)", memory)
+	}
+
+	// --- Canonical resources do not inherit legacy provider configuration ---
+	//
+	// A canonical SGLang + LMCache hierarchy without remoteStorage is
+	// engine-local. The apiserver and webhook must preserve the absence of
+	// deprecated top-level resources rather than claiming a provider workload
+	// this resource did not request.
+	canonicalCR := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "canonical-host-only", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+		},
+	}
+	if err := k8s.Create(ctx, canonicalCR); err != nil {
+		t.Fatalf("canonical host-only CacheBackend should be admitted: %v", err)
+	}
+
+	var canonical cachev1alpha1.CacheBackend
+	if err := live.Get(ctx, client.ObjectKey{Name: "canonical-host-only", Namespace: "team-a"}, &canonical); err != nil {
+		t.Fatalf("get back canonical host-only CR: %v", err)
+	}
+	if canonical.Spec.Resources != nil {
+		t.Errorf("canonical spec.resources = %+v, want nil", canonical.Spec.Resources)
+	}
+	if canonical.Spec.RemoteStorage != nil {
+		t.Errorf("canonical spec.remoteStorage = %+v, want nil host-only hierarchy", canonical.Spec.RemoteStorage)
+	}
+	if canonical.Spec.Integration == nil || canonical.Spec.Integration.Engine != "sglang" {
+		t.Errorf("canonical integration.engine = %v, want derived sglang compatibility value", canonical.Spec.Integration)
 	}
 
 	// --- Non-clobber pin: an explicit CR overrides every default ---

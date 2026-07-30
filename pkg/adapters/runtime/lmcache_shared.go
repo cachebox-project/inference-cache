@@ -136,10 +136,13 @@ func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
-	cfg := cache.Spec.BackendConfig
-	image := enginewire.ConfigOr(cfg, cfgKeyServerImage, defaultLMCacheServerImage)
+	cfg := legacyProviderConfig(cache)
+	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, cfgKeyServerImage, defaultLMCacheServerImage)
 
 	command, args := serverCommand(cfg)
+	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer); len(typed) > 0 {
+		command, args = typed[:1], typed[1:]
+	}
 	container := corev1.Container{
 		Name:            "lmcache-server",
 		Image:           image,
@@ -161,12 +164,10 @@ func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// Container resources come from spec.resources (CRD-defaulted to a
-		// 4Gi request / 8Gi memory limit so every CacheBackend is bounded
-		// by the cgroup rather than OOM-killed under T2 write load). When
-		// autoscaling is set, the helper additionally fills in a CPU
-		// request fallback so a CPU-utilization HPA has a denominator —
-		// never overwriting an operator-supplied CPU request.
+		// Container resources come from the selected provider's typed block,
+		// or from legacy spec.resources. Omitted canonical and legacy blocks
+		// receive the same 4Gi request / 8Gi limit. Autoscaling additionally
+		// fills in a CPU request fallback without overwriting an operator value.
 		Resources: defaultServerResources(cache),
 	}
 
@@ -191,9 +192,10 @@ func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 }
 
 // defaultServerResources resolves the Container.Resources block for the
-// lmcache-server. spec.resources (CRD-defaulted to a 4Gi memory request /
-// 8Gi memory limit) is the operator-owned baseline and is passed through
-// verbatim. When spec.autoscaling is set, the helper additionally fills in
+// lmcache-server. The selected provider resources (or legacy spec.resources)
+// are the operator-owned baseline and are passed through verbatim; an omitted
+// block receives the bounded 4Gi request / 8Gi limit. When spec.autoscaling is
+// set, the helper additionally fills in
 // a CPU request fallback (250m) so a CPU-utilization HPA has a denominator
 // — the fallback never overwrites an operator-supplied CPU request. The
 // returned ResourceRequirements is a fresh value so callers never alias
@@ -201,14 +203,14 @@ func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 // informer-cached object.
 func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRequirements {
 	var out corev1.ResourceRequirements
-	if cache != nil && cache.Spec.Resources != nil {
-		out = *cache.Spec.Resources.DeepCopy()
+	if resources := effectiveProviderResources(cache); resources != nil {
+		out = *resources.DeepCopy()
 	}
 	if cache == nil || cache.Spec.Autoscaling == nil {
 		return out
 	}
-	// nil-safe init: spec.resources may have been omitted (or carried
-	// only Limits), so Requests can be nil here even though we are
+	// Nil-safe init: provider resources may carry only Limits, so Requests can
+	// be nil here even though we are
 	// about to write into it for the HPA fallback below.
 	if out.Requests == nil {
 		out.Requests = corev1.ResourceList{}
@@ -223,10 +225,9 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 	// with the fallback. A positive operator-supplied value survives
 	// untouched.
 	//
-	// Memory is NOT auto-filled — spec.resources (carrying the
-	// CRD-stamped memory default) is the canonical source for memory,
-	// and synthesising a memory request here would override an
-	// operator-supplied limits-only shape.
+	// Memory is not filled here: effectiveProviderResources already resolves
+	// the typed/legacy block and its applicable default. Synthesising another
+	// request here would override an operator-supplied limits-only shape.
 	cpu, hasCPU := out.Requests[corev1.ResourceCPU]
 	if !hasCPU || cpu.Sign() <= 0 {
 		out.Requests[corev1.ResourceCPU] = resource.MustParse("250m")

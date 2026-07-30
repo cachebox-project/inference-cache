@@ -55,9 +55,10 @@ const (
 // crash them.
 const EngineContainerName = "vllm"
 
-// Defaults the engine env carries when the operator doesn't override them
-// via spec.backendConfig. The CPU-safe LMCACHE_REMOTE_SERDE is "naive";
-// "cachegen" is faster but pulls in CUDA-only codepaths.
+// Defaults the engine env carries when the operator does not override them
+// through typed LMCache config (or legacy backendConfig). The CPU-safe
+// LMCACHE_REMOTE_SERDE is "naive"; "cachegen" is faster but pulls in
+// CUDA-only codepaths.
 const (
 	defaultChunkSize   = "256"
 	defaultRemoteSerde = "naive"
@@ -97,6 +98,12 @@ func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha
 	return injectLMCacheConnector(pod, endpoint, LMCacheRemoteURL(endpoint), cache)
 }
 
+// InjectVLLMLMCacheHostOnly enables LMCache's engine-local host tier without a
+// remote URL. No network provider is selected or contacted.
+func InjectVLLMLMCacheHostOnly(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend) error {
+	return injectLMCacheConnector(pod, "", "", cache)
+}
+
 // InjectVLLMMooncake wires a vLLM engine to a Mooncake store. Mooncake
 // integrates with vLLM as an LMCache *remote backend*: the engine runs the
 // exact same LMCache connector (kv_connector=LMCacheConnectorV1) and reads the
@@ -133,19 +140,24 @@ func InjectVLLMMooncake(pod *corev1.PodSpec, endpoint string, cache *cachev1alph
 // container is treated as the engine); a multi-container pod with no `vllm`
 // container is rejected.
 func injectLMCacheConnector(pod *corev1.PodSpec, endpoint, remoteURL string, cache *cachev1alpha1.CacheBackend) error {
-	if err := ValidateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
+	if err := validateInjectPodCacheInputs(pod, cache, "engine"); err != nil {
 		return err
+	}
+	if remoteURL != "" && endpoint == "" {
+		return fmt.Errorf("inject engine config: endpoint is empty")
 	}
 	cfg := cache.Spec.BackendConfig
 	env := []corev1.EnvVar{
-		{Name: EnvLMCacheRemoteURL, Value: remoteURL},
-		{Name: EnvLMCacheRemoteSerde, Value: ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)},
-		{Name: EnvLMCacheChunkSize, Value: ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)},
-		{Name: EnvLMCacheLocalCPU, Value: ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)},
-		{Name: EnvLMCacheMaxLocalCPU, Value: ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)},
+		{Name: EnvLMCacheRemoteSerde, Value: effectiveRemoteSerde(cache, cfg)},
+		{Name: EnvLMCacheChunkSize, Value: effectiveChunkSize(cache, cfg)},
+		{Name: EnvLMCacheLocalCPU, Value: effectiveLocalCPU(cache, cfg)},
+		{Name: EnvLMCacheMaxLocalCPU, Value: effectiveHostMemoryGB(cache, cfg)},
 		{Name: EnvVLLMUseV1, Value: defaultVLLMUseV1},
 		{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)},
 		{Name: EnvPythonHashSeed, Value: defaultPythonHashSeed},
+	}
+	if remoteURL != "" {
+		env = append([]corev1.EnvVar{{Name: EnvLMCacheRemoteURL, Value: remoteURL}}, env...)
 	}
 	args := []string{kvTransferConfigArg, KVTransferConfig(IntegrationRole(cache))}
 
@@ -177,19 +189,72 @@ func UpsertFlag(args []string, flag string) []string {
 // The role tag flows into the error message so callers can tell which path
 // rejected the input ("engine", "router", ...).
 func ValidateInjectInputs(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend, role string) error {
+	if err := validateInjectPodCacheInputs(pod, cache, role); err != nil {
+		return err
+	}
+	if endpoint == "" {
+		return fmt.Errorf("inject %s config: endpoint is empty", role)
+	}
+	return nil
+}
+
+func validateInjectPodCacheInputs(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend, role string) error {
 	if pod == nil {
 		return fmt.Errorf("inject %s config: pod is nil", role)
 	}
 	if cache == nil {
 		return fmt.Errorf("inject %s config: cache is nil", role)
 	}
-	if endpoint == "" {
-		return fmt.Errorf("inject %s config: endpoint is empty", role)
-	}
 	if len(pod.Containers) == 0 {
 		return fmt.Errorf("inject %s config: pod has no containers", role)
 	}
 	return nil
+}
+
+func effectiveChunkSize(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.ChunkSizeTokens != nil {
+		return fmt.Sprintf("%d", *cache.Spec.LMCache.ChunkSizeTokens)
+	}
+	if cache.Spec.UsesCanonicalCacheHierarchy() {
+		return defaultChunkSize
+	}
+	return ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)
+}
+
+func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.RemoteSerde != "" {
+		return cache.Spec.LMCache.RemoteSerde
+	}
+	if cache.Spec.UsesCanonicalCacheHierarchy() {
+		return defaultRemoteSerde
+	}
+	return ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)
+}
+
+func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
+		cache.Spec.LMCache.HostMemory.Capacity != nil {
+		const gib = int64(1024 * 1024 * 1024)
+		bytes := cache.Spec.LMCache.HostMemory.Capacity.Value()
+		if bytes > 0 {
+			return fmt.Sprintf("%d", (bytes+gib-1)/gib)
+		}
+	}
+	if cache.Spec.UsesCanonicalCacheHierarchy() {
+		return defaultMaxLocalCPU
+	}
+	return ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)
+}
+
+func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
+		cache.Spec.LMCache.HostMemory.Capacity != nil {
+		return "True"
+	}
+	if cache.Spec.UsesCanonicalCacheHierarchy() {
+		return defaultLocalCPU
+	}
+	return ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)
 }
 
 // EngineContainerIndex returns the index of the vLLM engine container the

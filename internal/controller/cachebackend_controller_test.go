@@ -186,6 +186,32 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	}
 }
 
+func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("host-only", "ns1")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+		t.Fatalf("deployment lookup error = %v, want NotFound", err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("service lookup error = %v, want NotFound", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for host-only hierarchy", got.Status.Endpoint)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != conditionReasonHostOnlyActive {
+		t.Fatalf("Ready = %+v, want True/%s", ready, conditionReasonHostOnlyActive)
+	}
+}
+
 // mooncakeBackend is the managed-Mooncake fixture, mirroring lmcacheBackend:
 // it opts OUT of the KV-event readiness gate so the rollout-driven Ready
 // assertion is orthogonal to the gate.

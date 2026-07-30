@@ -62,6 +62,101 @@ func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
 	}
 }
 
+func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
+	validator := &CacheBackendValidator{}
+
+	t.Run("sglang host-only", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("sglang managed redis", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis:     &cachev1alpha1.RedisRemoteStorageSpec{Image: "redis:test"},
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("vllm rejects resp binding", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "does not accept") {
+			t.Fatalf("ValidateCreate error = %v, want binding compatibility rejection", err)
+		}
+	})
+
+	t.Run("external requires endpoint", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "remoteStorage.endpoint") {
+			t.Fatalf("ValidateCreate error = %v, want endpoint rejection", err)
+		}
+	})
+
+	t.Run("managed provider resources are validated at their typed path", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis: &cachev1alpha1.RedisRemoteStorageSpec{
+				Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("-1Gi"),
+					},
+				},
+			},
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "spec.remoteStorage.redis.resources.limits[memory]") {
+			t.Fatalf("ValidateCreate error = %v, want typed provider resource path", err)
+		}
+	})
+
+	t.Run("rejects legacy backendConfig", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.BackendConfig = map[string]string{"redisImage": "redis:test"}
+		requireInvalidWithCause(t, validator, cb, "spec.backendConfig",
+			"deprecated top-level configuration")
+	})
+
+	t.Run("typed observation rejects legacy backendConfig", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+		cb.Spec.BackendConfig = map[string]string{"model": "model-a"}
+		requireInvalidWithCause(t, validator, cb, "spec.backendConfig",
+			"deprecated top-level configuration")
+	})
+
+	t.Run("rejects legacy top-level resources", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Resources = &corev1.ResourceRequirements{}
+		requireInvalidWithCause(t, validator, cb, "spec.resources",
+			"deprecated top-level resources")
+	})
+}
+
 func TestValidator_SGLangHiCacheContract(t *testing.T) {
 	falseValue := false
 	size := int32(64)
@@ -158,7 +253,7 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	// it here.
 	//
 	// Other Phase-1 literal defaults (spec.replicas=1, spec.type=LMCache,
-	// spec.deploymentKind=Deployment, spec.integration.engine=vllm,
+	// spec.deploymentKind=Deployment,
 	// spec.integration.mode=Offload, spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
 	// stamped by the apiserver before this handler runs — they are NOT this
 	// defaulter's job, and a unit-level call to Default() on a raw struct
@@ -174,8 +269,50 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	if cb.Spec.Integration == nil {
 		t.Fatal("integration block not materialised")
 	}
+	if cb.Spec.Integration.Engine != "vllm" {
+		t.Errorf("integration.engine = %q, want legacy default vllm", cb.Spec.Integration.Engine)
+	}
 	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
 		t.Errorf("firstEventTimeout = %v, want %s", cb.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
+	}
+	if cb.Spec.Resources == nil {
+		t.Fatal("legacy spec.resources was not defaulted")
+	}
+	if got := cb.Spec.Resources.Requests.Memory(); got == nil || got.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("legacy resources.requests.memory = %v, want 4Gi", got)
+	}
+	if got := cb.Spec.Resources.Limits.Memory(); got == nil || got.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Errorf("legacy resources.limits.memory = %v, want 8Gi", got)
+	}
+}
+
+func TestDefaulter_DerivesLegacyEngineFieldFromCanonicalRuntime(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+	}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if cb.Spec.Integration.Engine != "sglang" {
+		t.Fatalf("integration.engine = %q, want sglang derived from spec.runtime", cb.Spec.Integration.Engine)
+	}
+	if cb.Spec.Resources != nil {
+		t.Fatalf("canonical spec.resources = %+v, want nil", cb.Spec.Resources)
+	}
+}
+
+func TestDefaulter_PreservesExplicitEmptyLegacyResources(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if len(cb.Spec.Resources.Requests) != 0 || len(cb.Spec.Resources.Limits) != 0 {
+		t.Fatalf("explicit empty resources were clobbered: %+v", cb.Spec.Resources)
 	}
 }
 

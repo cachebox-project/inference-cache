@@ -50,7 +50,7 @@ func TestHiCacheAdapterContract(t *testing.T) {
 	if !ok || requirement.RequiresEndpoint() {
 		t.Fatalf("EndpointRequirement = (%v, %v), want implemented and false", ok, requirement)
 	}
-	if pod, svc, err := adapter.ResolveCacheServer(newHiCacheBackend(
+	if pod, svc, err := runtimeadapter.ResolveLegacyCacheServer(adapter, newHiCacheBackend(
 		&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 	)); err != nil || pod != nil || svc != nil {
 		t.Fatalf("ResolveCacheServer = (%v, %v, %v), want (nil, nil, nil)", pod, svc, err)
@@ -285,7 +285,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			if len(pod.Containers[0].Args) != 0 {
 				t.Fatalf("invalid config partially injected args: %v", pod.Containers[0].Args)
 			}
-			if renderedPod, renderedService, err := NewHiCacheAdapter().ResolveCacheServer(cache); err == nil ||
+			if renderedPod, renderedService, err := runtimeadapter.ResolveLegacyCacheServer(NewHiCacheAdapter(), cache); err == nil ||
 				renderedPod != nil || renderedService != nil {
 				t.Fatalf("ResolveCacheServer = (%v, %v, %v), want invalid config rejected",
 					renderedPod, renderedService, err)

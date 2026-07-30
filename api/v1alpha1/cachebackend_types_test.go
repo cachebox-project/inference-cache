@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -21,7 +22,11 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireNotRequired(t, schema, "spec")
 
 	for _, field := range []string{
+		"runtime",
 		"type",
+		"lmCache",
+		"remoteStorage",
+		"observation",
 		"deploymentKind",
 		"replicas",
 		"autoscaling",
@@ -65,10 +70,31 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	}
 
 	requireNoEnum(t, mustProperty(t, specSchema, "type"))
+	requireEnum(t, mustProperty(t, specSchema, "runtime"), []string{"VLLM", "SGLang"})
 	requireEnum(t, mustProperty(t, specSchema, "deploymentKind"), []string{
 		"Deployment",
 		"StatefulSet",
 	})
+	lmCacheSchema := mustProperty(t, specSchema, "lmCache")
+	requireMinimum(t, mustProperty(t, lmCacheSchema, "chunkSizeTokens"), 1)
+	requireMinimum(t, mustProperty(t, lmCacheSchema, "workerPort"), 1)
+	requireMaximum(t, mustProperty(t, lmCacheSchema, "workerPort"), 65535)
+	remoteStorageSchema := mustProperty(t, specSchema, "remoteStorage")
+	requireRequired(t, remoteStorageSchema, "provider")
+	requireRequired(t, remoteStorageSchema, "ownership")
+	requireEnum(t, mustProperty(t, remoteStorageSchema, "provider"), []string{"Redis", "LMCacheServer", "Mooncake"})
+	requireEnum(t, mustProperty(t, remoteStorageSchema, "ownership"), []string{"Managed", "External"})
+	for _, field := range []string{"endpoint", "redis", "lmCacheServer", "mooncake"} {
+		if !hasProperty(remoteStorageSchema, field) {
+			t.Fatalf("spec.remoteStorage.%s is missing from CRD schema", field)
+		}
+	}
+	observationSchema := mustProperty(t, specSchema, "observation")
+	for _, field := range []string{"modelID", "firstEventTimeout"} {
+		if !hasProperty(observationSchema, field) {
+			t.Fatalf("spec.observation.%s is missing from CRD schema", field)
+		}
+	}
 	integrationSchema := mustProperty(t, specSchema, "integration")
 	requireEnum(t, mustPath[map[string]any](t, integrationSchema, "properties", "role"), []string{
 		"ReadOnly",
@@ -134,8 +160,11 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	if got, ok := mustProperty(t, specSchema, "replicas")["default"]; !ok || !reflect.DeepEqual(got, float64(1)) {
 		t.Fatalf("spec.replicas default = %v (type %T), want 1", mustProperty(t, specSchema, "replicas")["default"], mustProperty(t, specSchema, "replicas")["default"])
 	}
-	if got, ok := mustProperty(t, integrationSchema, "engine")["default"].(string); !ok || got != "vllm" {
-		t.Fatalf("spec.integration.engine default = %v, want \"vllm\"", mustProperty(t, integrationSchema, "engine")["default"])
+	if got, ok := mustProperty(t, integrationSchema, "engine")["default"]; ok {
+		t.Fatalf("spec.integration.engine has schema default %v; runtime-aware defaulting belongs to the webhook", got)
+	}
+	if got, ok := mustProperty(t, specSchema, "resources")["default"]; ok {
+		t.Fatalf("spec.resources has schema default %v; the legacy-only default belongs to the webhook", got)
 	}
 	if got, ok := mustProperty(t, integrationSchema, "role")["default"].(string); !ok || got != "ReadWrite" {
 		t.Fatalf("spec.integration.role default = %v, want \"ReadWrite\"", mustProperty(t, integrationSchema, "role")["default"])
@@ -212,12 +241,37 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	autoscalingMin := int32(2)
 	autoscalingTargetCPU := int32(70)
 	hiCacheSize := int32(64)
+	chunkSize := int32(128)
+	workerPort := int32(5555)
+	hostCapacity := resource.MustParse("6Gi")
+	providerMemory := resource.MustParse("2Gi")
+	observationTimeout := metav1.Duration{Duration: 3 * time.Minute}
 	backend := &CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: CacheBackendSpec{
+			Runtime:        CacheBackendRuntimeSGLang,
 			Type:           CacheBackendTypeLMCache,
 			DeploymentKind: CacheBackendDeploymentKindStatefulSet,
-			Replicas:       &replicas,
+			LMCache: &LMCacheEngineSpec{
+				ChunkSizeTokens: &chunkSize,
+				HostMemory:      &CacheBackendHostMemorySpec{Capacity: &hostCapacity},
+				WorkerPort:      &workerPort,
+			},
+			RemoteStorage: &CacheBackendRemoteStorageSpec{
+				Provider:  CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership: CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &LMCacheServerRemoteStorageSpec{
+					Command: []string{"lmcache_server", "--flag"},
+					Resources: &corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceMemory: providerMemory},
+					},
+				},
+			},
+			Observation: &CacheBackendObservationSpec{
+				ModelID:           "model-a",
+				FirstEventTimeout: &observationTimeout,
+			},
+			Replicas: &replicas,
 			Autoscaling: &CacheBackendAutoscalingSpec{
 				MinReplicas:                 &autoscalingMin,
 				MaxReplicas:                 5,
@@ -276,6 +330,14 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.Autoscaling.MinReplicas = 4
 	backend.Spec.Autoscaling.MaxReplicas = 9
 	*backend.Spec.Autoscaling.TargetCPUUtilizationPercent = 90
+	*backend.Spec.LMCache.ChunkSizeTokens = 256
+	changedHostCapacity := resource.MustParse("12Gi")
+	*backend.Spec.LMCache.HostMemory.Capacity = changedHostCapacity
+	*backend.Spec.LMCache.WorkerPort = 6666
+	backend.Spec.RemoteStorage.LMCacheServer.Command[0] = "changed"
+	backend.Spec.RemoteStorage.LMCacheServer.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("4Gi")
+	backend.Spec.Observation.ModelID = "changed"
+	backend.Spec.Observation.FirstEventTimeout.Duration = time.Hour
 	backend.Spec.Integration.FirstEventTimeout.Duration = time.Hour
 	*backend.Spec.HiCache.SizeGB = 128
 	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
@@ -307,6 +369,32 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	}
 	if copied.Spec.Autoscaling.TargetCPUUtilizationPercent == nil || *copied.Spec.Autoscaling.TargetCPUUtilizationPercent != 70 {
 		t.Fatalf("autoscaling.targetCPUUtilizationPercent was not deep-copied")
+	}
+	if copied.Spec.LMCache == nil ||
+		copied.Spec.LMCache.ChunkSizeTokens == nil ||
+		*copied.Spec.LMCache.ChunkSizeTokens != 128 ||
+		copied.Spec.LMCache.HostMemory == nil ||
+		copied.Spec.LMCache.HostMemory.Capacity == nil ||
+		copied.Spec.LMCache.HostMemory.Capacity.Cmp(resource.MustParse("6Gi")) != 0 ||
+		copied.Spec.LMCache.WorkerPort == nil ||
+		*copied.Spec.LMCache.WorkerPort != 5555 {
+		t.Fatalf("lmCache nested fields were not deep-copied")
+	}
+	if copied.Spec.RemoteStorage == nil ||
+		copied.Spec.RemoteStorage.LMCacheServer == nil ||
+		copied.Spec.RemoteStorage.LMCacheServer.Command[0] != "lmcache_server" ||
+		copied.Spec.RemoteStorage.LMCacheServer.Resources == nil {
+		t.Fatalf("remoteStorage.lmCacheServer nested fields were not deep-copied")
+	}
+	copiedProviderMemory := copied.Spec.RemoteStorage.LMCacheServer.Resources.Limits[corev1.ResourceMemory]
+	if copiedProviderMemory.Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Fatalf("remoteStorage.lmCacheServer resources were not deep-copied")
+	}
+	if copied.Spec.Observation == nil ||
+		copied.Spec.Observation.ModelID != "model-a" ||
+		copied.Spec.Observation.FirstEventTimeout == nil ||
+		copied.Spec.Observation.FirstEventTimeout.Duration != 3*time.Minute {
+		t.Fatalf("observation nested fields were not deep-copied")
 	}
 	if copied.Spec.Integration == nil {
 		t.Fatalf("integration was not deep-copied")

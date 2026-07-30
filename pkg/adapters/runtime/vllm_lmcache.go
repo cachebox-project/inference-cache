@@ -1,9 +1,12 @@
 package runtime
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
@@ -97,7 +100,9 @@ func (vllmLMCacheAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.Cache
 	if cache == nil {
 		return false
 	}
-	return runtime == RuntimeVLLM && cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+	return runtime == RuntimeVLLM &&
+		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
+		(cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache)
 }
 
 // SupportedPairs lets the registry expose this adapter's canonical pair to
@@ -155,10 +160,8 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 	}
 }
 
-// ResolveCacheServer renders the standalone LMCache server's container set
-// and the Service's port set, delegating to the engine-agnostic
-// [ResolveLMCacheServer] shared with the SGLang+LMCache adapter (the
-// lmcache-server is the same regardless of which engine connects).
+// ResolveCacheServer is the pre-separation compatibility renderer. Production
+// provider lifecycle resolves through pkg/adapters/backend/provider.
 func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	return ResolveLMCacheServer(cache)
 }
@@ -183,6 +186,29 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint strin
 		return nil
 	}
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
+}
+
+func (vllmLMCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+	return binding == nil ||
+		binding.Protocol == backendadapter.ProtocolLMCache ||
+		binding.Protocol == backendadapter.ProtocolMooncakeStore
+}
+
+func (vllmLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	if cache != nil && cache.Spec.IsEventsOnly() {
+		return nil
+	}
+	if binding == nil {
+		return enginewire.InjectVLLMLMCacheHostOnly(pod, cache)
+	}
+	switch binding.Protocol {
+	case backendadapter.ProtocolLMCache:
+		return enginewire.InjectVLLMLMCache(pod, binding.Endpoint, cache)
+	case backendadapter.ProtocolMooncakeStore:
+		return enginewire.InjectVLLMMooncake(pod, binding.Endpoint, cache)
+	default:
+		return fmt.Errorf("vLLM LMCache adapter does not support remote binding protocol %q", binding.Protocol)
+	}
 }
 
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no

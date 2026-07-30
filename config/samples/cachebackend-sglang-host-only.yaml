@@ -1,0 +1,22 @@
+# SGLang with LMCache's node-local host-memory tier and no remote provider.
+# Omitting spec.remoteStorage is intentional: the controller creates no
+# Deployment or Service, and the runtime adapter injects an LMCache MP worker
+# without an --l2-adapter.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: cachebackend-sglang-host-only
+spec:
+  runtime: SGLang
+  type: LMCache
+  lmCache:
+    chunkSizeTokens: 256
+    hostMemory:
+      capacity: 32Gi
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: sglang

@@ -1,9 +1,12 @@
 package sglang
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -30,16 +33,14 @@ const (
 	defaultEngineZMQPortStr = "5557"
 )
 
-// adapter wires SGLang engine pods to the managed LMCache backend a
-// CacheBackend{type: LMCache} provisions, for the (sglang, LMCache) pair. Unlike
-// the vLLM+LMCache adapter, SGLang drives LMCache in MULTIPROCESS (MP) mode, so the
-// two adapters diverge on both halves of the data plane:
+// adapter wires SGLang engine pods to LMCache for the (SGLang, LMCache)
+// pair. SGLang drives LMCache in MULTIPROCESS (MP) mode:
 //
-//   - ResolveCacheServer provisions a shared Redis L2 store, NOT the vLLM lm://
-//     lmcache-server — lm:// is not a valid MP --l2-adapter type; and
-//   - InjectEngineConfig renders the MP engine wire — a node-local MP-worker
+//   - InjectEngineConfigWithBinding renders a node-local MP-worker
 //     native sidecar + a config-file (mp_host/mp_port) the engine reads via
-//     --lmcache-config-file, offloading to that Redis L2. It turns LMCache on with
+//     --lmcache-config-file. A nil binding is host-only; an optional RESP
+//     binding offloads to independently selected Redis storage.
+//   - It turns LMCache on with
 //     --enable-lmcache + LMCACHE_USE_EXPERIMENTAL (not vLLM's --kv-transfer-config)
 //     and does NOT inject the lm:// LMCACHE_REMOTE_URL env, which MP mode ignores.
 //     See enginewire.InjectSGLangLMCache.
@@ -88,7 +89,9 @@ func (adapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.C
 	if cache == nil {
 		return false
 	}
-	return runtime == runtimeadapter.RuntimeSGLang && cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+	return runtime == runtimeadapter.RuntimeSGLang &&
+		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
+		(cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache)
 }
 
 // SupportedPairs lets the registry surface this adapter's canonical pair in the
@@ -101,15 +104,8 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}
 }
 
-// ResolveCacheServer renders the shared Redis L2 store the SGLang MP worker
-// offloads to via its resp --l2-adapter, delegating to
-// [runtimeadapter.ResolveRedisL2Server]. This replaces the standalone lm://
-// lmcache-server the adapter previously (mis)rendered for SGLang: lm:// is not a
-// valid MP --l2-adapter type, so SGLang cannot reuse it. The reconciler wraps the
-// returned pod + service into the managed Deployment + Service and publishes its
-// address as status.endpoint; the engine-side wire ([InjectEngineConfig]) points a
-// per-pod node-local MP worker's L2 at that Redis. See
-// docs/design/sglang-lmcache-mp-mode.md.
+// ResolveCacheServer is the pre-separation compatibility renderer. Production
+// provider lifecycle resolves through pkg/adapters/backend/provider instead.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	return runtimeadapter.ResolveRedisL2Server(cache)
 }
@@ -122,6 +118,21 @@ func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.Po
 // it). endpoint is the managed Redis L2 address the worker offloads to. See
 // enginewire.InjectSGLangLMCache for the full wire.
 func (adapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+	return enginewire.InjectSGLangLMCache(pod, endpoint, cache)
+}
+
+func (adapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+	return binding == nil || binding.Protocol == backendadapter.ProtocolRESP
+}
+
+func (adapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	endpoint := ""
+	if binding != nil {
+		if binding.Protocol != backendadapter.ProtocolRESP {
+			return fmt.Errorf("SGLang LMCache adapter does not support remote binding protocol %q", binding.Protocol)
+		}
+		endpoint = binding.Endpoint
+	}
 	return enginewire.InjectSGLangLMCache(pod, endpoint, cache)
 }
 
