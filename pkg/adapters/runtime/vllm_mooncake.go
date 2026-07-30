@@ -24,8 +24,9 @@ import (
 // mooncake_master process (RPC + an embedded HTTP metadata server) rather than
 // an lmcache-server.
 //
-// Defaults are overridable via CacheBackend.Spec.BackendConfig so a real
-// deployment can pin to digests without a code change.
+// Canonical resources override these defaults through the typed
+// remoteStorage.mooncake image, command, and resources fields. Deprecated
+// BackendConfig keys remain readable only for legacy resources.
 const (
 	// defaultMooncakeMasterImage is the upstream Mooncake image, pinned to a
 	// specific version rather than a floating :latest.
@@ -40,8 +41,8 @@ const (
 	// silently — the same failure class documented for LMCache in
 	// docs/design/cachebackend-api.md).
 	//
-	// Overridable via backendConfig.serverImage (production should pin to a
-	// digest there).
+	// Overridable via remoteStorage.mooncake.image (production should pin a
+	// digest there); legacy resources retain backendConfig.serverImage.
 	//
 	// The reference is FULLY QUALIFIED (docker.io/...) on purpose: a CRI-O node
 	// without short-name resolution configured (registry aliases or an
@@ -65,8 +66,9 @@ const (
 	// sees the breakage in `kubectl get cachebackend`, not a green-but-dead
 	// backend. And because the cache is fail-open, engines fall back to local
 	// prefill regardless, so a broken master is never a serving outage. An
-	// operator can repoint to a known-good image/digest via backendConfig
-	// .serverImage without a code change.
+	// operator can repoint to a known-good image/digest via
+	// remoteStorage.mooncake.image without a code change (or the deprecated
+	// backendConfig.serverImage on a legacy resource).
 	defaultMooncakeMasterImage = "docker.io/kvcacheai/mooncake:0.3.11.post1"
 
 	// defaultMooncakeMasterRPCPort is the Mooncake master's RPC port — the

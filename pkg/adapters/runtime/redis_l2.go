@@ -19,8 +19,8 @@ import (
 // fits the one-Service, engines-anywhere model exactly (a ClusterIP Service, no
 // hostNetwork/mesh — the opposite of Mooncake), it maps onto one Deployment +
 // Service, and it is proven end-to-end. The heavier tiers (`s3`, `mooncake_store`)
-// are durability/bandwidth opt-ins for a future backendConfig knob, not the
-// simple default. See docs/design/sglang-lmcache-mp-mode.md.
+// are future provider bindings, not the simple default. See
+// docs/design/sglang-lmcache-mp-mode.md.
 //
 // This render is the shared-store half of the MP data plane; the engine-side wire
 // (config-file + MP-worker sidecar pointed at this Redis) is injected by the
@@ -32,10 +32,11 @@ const (
 	// pins. A major.minor-alpine tag is more stable than :7 / :latest but still
 	// mutable within its patch line, so it is a sane default, NOT a reproducible
 	// pin: production MUST pin an exact release or @sha256 digest via
-	// backendConfig.redisImage, per the image-pin policy in
-	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what validation
-	// exercised against the pinned lmcache MP worker. Redis needs no lmcache
-	// version alignment (the MP worker speaks RESP), so this pin moves
+	// remoteStorage.redis.image (or deprecated backendConfig.redisImage on a
+	// legacy resource), per the image-pin policy in
+	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what
+	// validation exercised against the pinned lmcache MP worker. Redis needs no
+	// lmcache version alignment (the MP worker speaks RESP), so this pin moves
 	// independently of the engine/lmcache tuple.
 	defaultRedisImage = "docker.io/library/redis:7.4-alpine"
 	// defaultRedisPort is the canonical Redis port the `resp` L2 adapter dials.

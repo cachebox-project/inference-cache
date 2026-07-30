@@ -751,7 +751,11 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 			cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
 		}
 		if cb.Spec.Observation.FirstEventTimeout == nil {
-			cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
+			timeout := defaultFirstEventTimeout
+			if cb.Spec.Integration.FirstEventTimeout != nil {
+				timeout = cb.Spec.Integration.FirstEventTimeout.Duration
+			}
+			cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: timeout}
 		}
 	} else if cb.Spec.Integration.FirstEventTimeout == nil {
 		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}

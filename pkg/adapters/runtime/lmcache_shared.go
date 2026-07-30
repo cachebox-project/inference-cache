@@ -12,25 +12,21 @@ import (
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
-// This file holds the engine-agnostic LMCache rendering shared by every runtime
-// adapter that fronts a managed LMCache backend — the vLLM+LMCache adapter
-// (vllm_lmcache.go) and the SGLang+LMCache adapter (pkg/adapters/runtime/sglang)
-// today. The standalone lmcache-server is engine-agnostic at the server level
-// (engines connect via lm://<svc>:<port> regardless of engine family), and the
-// kvevent-subscriber sidecar binary is one binary parameterised per engine, so
-// both adapters render identical objects modulo the engine-specific knobs
-// (container name, hash scheme, ZMQ port). Centralising the render keeps the
-// two adapters from drifting; the engine-side wire differs and stays in each
-// adapter / the internal enginewire package.
+// This file holds shared LMCache rendering: the standalone LMCacheServer
+// provider selected by canonical remoteStorage (used by vLLM today) and the
+// kvevent-subscriber sidecar shared by LMCache-fronting runtime adapters.
+// SGLang MP selects the Redis provider instead and renders it through
+// ResolveRedisL2Server. The engine-side wire remains in each adapter and the
+// internal enginewire package.
 
 // LMCache standalone-server canonical defaults. These template a standalone
 // LMCache server pod that engines connect to via LMCACHE_REMOTE_URL=lm://<svc>:<port>,
 // matching the upstream "share KV across instances" topology
 // (https://docs.lmcache.ai/getting_started/quickstart/share_kv_cache.html and
 // the LMCache Dockerfile.standalone in
-// https://github.com/LMCache/LMCache/tree/dev/docker). Defaults are overridable
-// via CacheBackend.Spec.BackendConfig so a real deployment can pin to digests
-// without a code change.
+// https://github.com/LMCache/LMCache/tree/dev/docker). Canonical resources
+// override these defaults through remoteStorage.lmCacheServer; deprecated
+// BackendConfig keys remain readable only for legacy resources.
 const (
 	// defaultLMCacheServerImage is the upstream standalone LMCache server
 	// image, pinned to a specific version rather than a floating :latest.
@@ -45,12 +41,13 @@ const (
 	// This is NOT auto-aligned with the engine's client: IC has no source of
 	// truth for the engine image's lmcache client version (it is operator-
 	// supplied or pip-installed at runtime). Operators MUST keep the version
-	// here (or their backendConfig.serverImage override) wire-compatible with
-	// their engine's lmcache client — see the "LMCache server / client version
-	// alignment" section in docs/design/cachebackend-api.md.
+	// here (or their remoteStorage.lmCacheServer.image override) wire-compatible
+	// with their engine's lmcache client — see the "LMCache server / client
+	// version alignment" section in docs/design/cachebackend-api.md. Legacy
+	// resources retain backendConfig.serverImage.
 	//
-	// Overridable via backendConfig.serverImage (production should pin to a
-	// digest there).
+	// Overridable via remoteStorage.lmCacheServer.image (production should pin
+	// a digest there); legacy resources retain backendConfig.serverImage.
 	//
 	// TODO: wire-test and digest-pin before production. v0.4.7 is version-
 	// aligned (it exists upstream and matches the lmcache 0.4.7 client used in
@@ -70,9 +67,8 @@ const (
 	// the system can address by name without hard-coding the integer.
 	defaultLMCacheServerPortName = "lmcache"
 
-	// BackendConfig override keys. Keep them short, kebab-free, JSON-friendly
-	// since they round-trip through CacheBackend.Spec.BackendConfig (a
-	// map[string]string).
+	// Deprecated BackendConfig compatibility keys. Canonical resources use the
+	// typed remoteStorage.lmCacheServer fields instead.
 	// cfgKeyServerImage is the BackendConfig key that overrides the
 	// lmcache-server container image. The name is deliberately distinct from
 	// the legacy "image" key (which addressed the all-in-one vLLM container the

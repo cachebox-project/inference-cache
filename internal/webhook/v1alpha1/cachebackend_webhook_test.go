@@ -430,6 +430,24 @@ func TestDefaulter_DerivesLegacyEngineFieldFromCanonicalRuntime(t *testing.T) {
 	}
 }
 
+func TestDefaulter_CanonicalMigrationCarriesForwardLegacyObservationTimeout(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		FirstEventTimeout: &metav1.Duration{Duration: 90 * time.Second},
+	}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if cb.Spec.Observation == nil || cb.Spec.Observation.FirstEventTimeout == nil {
+		t.Fatalf("canonical observation timeout not materialised: %+v", cb.Spec.Observation)
+	}
+	if got := cb.Spec.Observation.FirstEventTimeout.Duration; got != 90*time.Second {
+		t.Fatalf("observation.firstEventTimeout = %s, want legacy 90s", got)
+	}
+}
+
 func TestDefaulter_PreservesExplicitEmptyLegacyResources(t *testing.T) {
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{}
