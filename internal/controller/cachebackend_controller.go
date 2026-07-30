@@ -698,16 +698,17 @@ func (r *CacheBackendReconciler) reconcileHostOnly(ctx context.Context, backend 
 
 func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backend *cachev1alpha1.CacheBackend, activeReason, activeMessage string) (ctrl.Result, error) {
 	now := time.Now()
-	// A backend flipping INTO events-only from a server-bearing mode (Offload or
-	// External) still carries that mode's status.endpoint / observedServerInstance
-	// at the top of this reconcile — events-only clears both below, so a non-empty
-	// value here uniquely marks the FIRST events-only reconcile after the flip.
+	// A backend flipping INTO a serverless mode (events-only or host-only) from a
+	// server-bearing mode still carries that mode's status.endpoint /
+	// observedServerInstance at the top of this reconcile. Serverless modes clear
+	// both below, so a non-empty value here uniquely marks the first reconcile
+	// after the flip.
 	// On that transition any latched firstAvailableAt reflects the OLD mode's
 	// availability (e.g. an Offload workload that went Available long ago), not the
-	// events-only "up" moment, so reusing it as the firstEventTimeout anchor could
-	// breach the window the instant we flip and strand the backend at
-	// NoKVEventsObserved/Degraded. Re-anchor to now so events-only gets a fresh
-	// first-event window from when it took effect (the documented contract).
+	// new serverless mode's "up" moment, so reusing it as the firstEventTimeout
+	// anchor could breach the window the instant we flip and strand the backend at
+	// NoKVEventsObserved/Degraded. Re-anchor to now so the new mode gets a fresh
+	// first-event window from when it took effect.
 	transitionedFromServerMode := backend.Status.Endpoint != "" || backend.Status.ObservedServerInstance != ""
 	// Base readiness is unconditionally True (no workload to gate on); the
 	// KV-event gate layers AwaitingFirstKVEvent → KVEventsObserved /
@@ -716,7 +717,7 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 	if backend.Status.FirstAvailableAt != nil && !transitionedFromServerMode {
 		anchor = backend.Status.FirstAvailableAt.Time
 	}
-	// On a server-mode→events-only transition the clock is re-anchored to now,
+	// On a server-bearing-to-serverless transition the clock is re-anchored to now,
 	// so also bypass any sticky NoKVEventsObserved carried over from the prior
 	// mode — otherwise the flip would inherit that timed-out verdict and stay
 	// Degraded despite the fresh window.

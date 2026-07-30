@@ -372,7 +372,8 @@ type CacheBackendSpec struct {
 	// mutating Pod admission webhook at pod CREATE time. Server-backed
 	// adapters require status.endpoint to be published first; the webhook
 	// fail-opens when it is empty. Engine-local adapters such as native
-	// SGLang HiCache explicitly require no endpoint and inject immediately.
+	// SGLang HiCache, and the LMCache host-only path, explicitly require no
+	// endpoint and inject immediately.
 	// Admission is CREATE-only; recovery or a configuration update requires
 	// recreating the pod (e.g. `kubectl rollout restart`), not editing its
 	// live labels.
