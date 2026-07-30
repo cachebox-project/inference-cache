@@ -163,6 +163,21 @@ func TestGRPCLoadsScraperErrorIsSurfaced(t *testing.T) {
 	}
 }
 
+func TestGRPCLoadsScraperEmptyResponseIsError(t *testing.T) {
+	// A successful RPC carrying no per-rank loads must surface as an error (so the
+	// StatsReporter skips the tick), NOT project into an all-zero "idle" sample that
+	// would overwrite the replica's last good pressure/hit-rate with zeros.
+	s := newGRPCLoadsScraperWithClient(&fakeLoadsClient{resp: &vpb.GetLoadsResponse{}},
+		GRPCLoadsScraperConfig{CacheSizeBytes: 1000, MaxConcurrencyCeiling: 8})
+	st, err := s.Scrape(context.Background())
+	if err == nil {
+		t.Fatal("want error for empty GetLoads response, got nil")
+	}
+	if st == nil {
+		t.Fatal("want zero ReplicaStats on empty response, got nil")
+	}
+}
+
 // blockUntilCtxDone models an engine that never answers within the deadline: it
 // returns only once the call's context is cancelled, echoing that context's error.
 type blockUntilCtxDone struct{}

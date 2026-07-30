@@ -87,6 +87,14 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 	if err != nil {
 		return &icpb.ReplicaStats{}, fmt.Errorf("getloads %s: %w", s.cfg.Addr, err)
 	}
+	// An empty/nil loads slice carries no per-rank sample. Treat it as a scrape
+	// failure (return an error) rather than projecting it into an all-zero "idle"
+	// ReplicaStats — delivering fabricated idle would overwrite the replica's last
+	// good pressure/hit-rate with zeros and make the ranker route TOWARD a replica
+	// whose data is merely missing. The StatsReporter skips the tick instead.
+	if len(resp.GetLoads()) == 0 {
+		return &icpb.ReplicaStats{}, fmt.Errorf("getloads %s: empty response (no per-rank loads)", s.cfg.Addr)
+	}
 
 	// Aggregate across DP ranks: request counts SUM (total in-flight across the
 	// engine), KV-cache usage is the MEAN, hit-rate is the mean over ranks that report
