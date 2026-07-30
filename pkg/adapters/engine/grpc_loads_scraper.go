@@ -39,8 +39,9 @@ type GRPCLoadsScraperConfig struct {
 //
 // Note: GetLoads carries no external-tier (T2/LMCache) token counters, so
 // T2HitTokens/T2QueryTokens are left 0 here — those remain HTTP `/metrics`-only.
-// The load signals the ranker actually uses (pressure, cache-usage, hit-rate)
-// are all provided.
+// The signals the ranker consumes (pressure and hit-rate) are both provided;
+// cache_memory_bytes is emitted too but is observational (snapshot / CR status),
+// not a ranking input.
 type GRPCLoadsScraper struct {
 	client vpb.VllmEngineClient
 	cfg    GRPCLoadsScraperConfig
@@ -102,6 +103,12 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 	// feeds its own mean, so a non-finite (unavailable) rank is EXCLUDED rather than counted
 	// as 0 — otherwise one garbage sample would drag the average down; finite-but-out-of-range
 	// values are clamped and kept.
+	//
+	// The hit-rate mean is UNWEIGHTED: GetLoads exposes only a per-rank ratio, not the raw
+	// hit/query counts the HTTP path aggregates, so this cannot reproduce that path's
+	// query-weighted rate. With uneven per-rank request volume the two can differ; treat this
+	// as a coarse soft signal (identical for the single-rank case, the common one), not a
+	// precise engine-wide hit rate.
 	var running, waiting int64
 	var usageSum, hitRateSum float64
 	var hitRateN int
