@@ -93,6 +93,12 @@
 #      gate as a managed backend. The managed-only conditions (FunctionalProbeOK
 #      / EngineKernelsHealthy / T2Degraded / EngineCompatibility) are absent.
 #      Also exercises the validating webhook's EventsOnly+External rejection.
+#   9c. Native SGLang HiCache end-to-end: applying the committed HiCache sample
+#      is observed by the controller without rendering a Deployment, Service, or
+#      HPA; status.endpoint stays empty and no synthetic Ready condition is
+#      published. A matching engine Pod sent through real server-side dry-run
+#      admission receives the complete native --hicache-* argument contract,
+#      proving the endpoint-free Pod webhook path without starting SGLang.
 #  10. The /snapshot endpoint rejects unauthenticated callers AT THE NETWORK
 #      LAYER: a side curl pod outside the controller's SA identity (and outside
 #      the NetworkPolicy allowlist) has its connection to :8081 DROPPED by the
@@ -237,6 +243,7 @@
 #           SAMPLE_CACHE_SERVER_IMAGE, EXTERNAL_BACKEND_TIMEOUT,
 #           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
 #           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
+#           HICACHE_SMOKE_TIMEOUT, HICACHE_SMOKE_NS, HICACHE_SMOKE_CB_NAME,
 #           KERNEL_CHECK_SMOKE_NS, KERNEL_CHECK_POD_TIMEOUT,
 #           KERNEL_CHECK_COND_TIMEOUT, MOONCAKE_SMOKE_NS, MOONCAKE_MASTER_IMAGE.
 
@@ -271,6 +278,7 @@ EXTERNAL_INJECT_TIMEOUT="${EXTERNAL_INJECT_TIMEOUT:-30}"  # seconds
 # KV-event gate publishing Ready=False/AwaitingFirstKVEvent — a sub-second
 # server-less reconcile; the budget covers APIReader warm-up + leader-election.
 EVENTSONLY_BACKEND_TIMEOUT="${EVENTSONLY_BACKEND_TIMEOUT:-30}" # seconds
+HICACHE_SMOKE_TIMEOUT="${HICACHE_SMOKE_TIMEOUT:-30}"           # seconds
 
 # Kernel-check smoke tunables (assertions 14 + 15).
 # KERNEL_CHECK_SMOKE_NS is a dedicated namespace created + deleted by those
@@ -349,6 +357,12 @@ EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 # events-only section creates the objects.
 EVENTSONLY_SMOKE_NS="${EVENTSONLY_SMOKE_NS:-ic-smoke-events-only}"
 EVENTSONLY_SMOKE_CB_NAME="${EVENTSONLY_SMOKE_CB_NAME:-cachebackend-events-only}"
+
+# Native SGLang HiCache fixture identifiers. This engine-local backend has no
+# endpoint or controller-owned workload, so its dedicated namespace should
+# contain only the persisted CacheBackend used by the smoke.
+HICACHE_SMOKE_NS="${HICACHE_SMOKE_NS:-ic-smoke-sglang-hicache}"
+HICACHE_SMOKE_CB_NAME="${HICACHE_SMOKE_CB_NAME:-sglang-hicache}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
@@ -429,6 +443,12 @@ collect_diagnostics() {
     >"$LOG_DIR/events-only-cb.yaml" 2>&1 || true
   kubectl get deploy,svc -n "$EVENTSONLY_SMOKE_NS" \
     >"$LOG_DIR/events-only-ns-workloads.txt" 2>&1 || true
+  # Native SGLang HiCache smoke artefacts. Best-effort — the CR may not exist
+  # if the smoke aborted before that section.
+  kubectl get cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" -o yaml \
+    >"$LOG_DIR/sglang-hicache-cb.yaml" 2>&1 || true
+  kubectl get deploy,svc,hpa -n "$HICACHE_SMOKE_NS" \
+    >"$LOG_DIR/sglang-hicache-ns-workloads.txt" 2>&1 || true
   # Kernel-check smoke artefacts. Best-effort — the objects may not
   # exist if the smoke aborted before that section.
   kubectl get cb -n "$KERNEL_CHECK_SMOKE_NS" -o yaml \
@@ -1339,6 +1359,118 @@ until has_reason_code "$policy_high_resp" "PREFIX_MATCH" \
   sleep 2
 done
 log "CachePolicy push adopted: above-threshold lookup hit; below-request-gate lookup returned AFFINITY_HINT; trivial-match (matched_tokens<floor) lookup returned AFFINITY_HINT — both minimum-token policy knobs enforced end-to-end (the non-PREFIX_MATCH outcomes prove the gates fired; the affinity fallback then surfaces the single known replica)"
+
+# --- adapter (LoRA) index-partition probe ----------------------------------
+# The content fingerprint is derived from token IDs ALONE, so two requests with
+# identical tokens under different LoRA adapters produce the SAME prefix_hash.
+# adapter_id partitions the INDEX so those identical keys cannot alias — without
+# it, a lookup for adapter A could be handed a replica holding only adapter B's
+# KV. This drives the gRPC surface the way an operator would and needs no engine
+# traffic: seed ONE prefix under adapter "smoke-lora-a" via ReportCacheState,
+# then look the identical hash up three ways.
+#
+#   - same adapter      → PREFIX_MATCH (the partition is a partition, not a
+#                         hash change — matching inside it is unaffected)
+#   - different adapter → NOT PREFIX_MATCH (the alias this partition prevents)
+#   - no adapter at all → NOT PREFIX_MATCH (the default partition, where this
+#                         adapter-scoped content was never ingested)
+#
+# The two negative cases land on AFFINITY_HINT rather than NO_HINT because
+# cachepolicy-sample leaves affinityRouting at its Enabled default and the
+# replica is known to the scope; the assertion is on "not PREFIX_MATCH", which
+# is the property that matters (no cross-adapter cache claim).
+log "seeding an adapter-scoped prefix and asserting LookupRoute cannot alias it across adapter_id"
+adapter_model="install-smoke-adapter"
+adapter_replica="adapter-smoke-replica"
+adapter_hash_b64="YWRhcHRlci1wcmVmaXg=" # base64("adapter-prefix") — stored at tokenCount=64, clears both policy gates
+
+# No stats in this update: a warm hit_rate would let the negative probes below
+# qualify for TENANT_HOT, making the expected fail-open code ambiguous between
+# TENANT_HOT and AFFINITY_HINT. Without stats the non-matching adapter partitions
+# fall straight through to the affinity fallback, so the expected code is
+# deterministically AFFINITY_HINT (the replica still SERVES the adapter-blind
+# scope via the prefix ingest, so affinity has a candidate). PREFIX_MATCH on the
+# same adapter needs only the prefix entry, not stats.
+adapter_report_payload="$(cat <<EOF
+{"replicaId":"$adapter_replica","modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixes":[{"prefixHash":"$adapter_hash_b64","tokenCount":64,"adapterId":"smoke-lora-a"}]}
+EOF
+)"
+adapter_report_resp="$(grpcurl_report_cache_state "$adapter_report_payload" "$LOG_DIR/grpcurl-adapter-report.err")" || {
+  cat "$LOG_DIR/grpcurl-adapter-report.err" >&2 || true
+  fail "grpcurl ReportCacheState did not accept the adapter-scoped smoke prefix"
+}
+log "ReportCacheState (adapter-scoped) response: $adapter_report_resp"
+
+adapter_same_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64,"adapterId":"smoke-lora-a"}
+EOF
+)"
+adapter_other_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64,"adapterId":"smoke-lora-b"}
+EOF
+)"
+adapter_none_payload="$(cat <<EOF
+{"modelId":"$adapter_model","tenantId":"$POLICY_SMOKE_NS","hashScheme":"vllm","prefixHash":"$adapter_hash_b64","prefixTokenCount":64}
+EOF
+)"
+
+deadline=$(($(date +%s) + POLICY_PUSH_TIMEOUT))
+adapter_same_resp=""
+until has_reason_code "$adapter_same_resp" "PREFIX_MATCH"; do
+  adapter_same_resp="$(grpcurl_lookup_route "$adapter_same_payload" "$LOG_DIR/grpcurl-adapter-same.err")" || true
+  if has_reason_code "$adapter_same_resp" "PREFIX_MATCH"; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "same-adapter LookupRoute response (want PREFIX_MATCH):" >&2
+    echo "$adapter_same_resp" >&2
+    if [ -s "$LOG_DIR/grpcurl-adapter-same.err" ]; then
+      cat "$LOG_DIR/grpcurl-adapter-same.err" >&2
+    fi
+    fail "LookupRoute with the ingesting adapter_id did not return PREFIX_MATCH within ${POLICY_PUSH_TIMEOUT}s — the adapter partition must not break matching inside it"
+  fi
+  sleep 2
+done
+
+# assert_adapter_no_alias runs one NEGATIVE adapter probe. The property under
+# test is "the identical prefix hash does NOT match in a different partition,"
+# but a transport error mustn't masquerade as that: grpcurl failing or returning
+# an empty body would leave has_reason_code false and silently pass. So require
+# the RPC to SUCCEED and return a non-empty body, then assert the expected
+# fail-open reason_code — AFFINITY_HINT, because affinityRouting is Enabled for
+# this tenant (the policy block above proved it) and the replica serves the
+# adapter-blind (tenant, model, hash_scheme) scope, so a non-matching adapter
+# partition downgrades to a stable affinity pick rather than a prefix hit. An
+# RPC error is therefore a red, not a green.
+assert_adapter_no_alias() {
+  local payload="$1" err_file="$2" label="$3" alias_msg="$4"
+  local resp
+  if ! resp="$(grpcurl_lookup_route "$payload" "$err_file")" || [ -z "$resp" ]; then
+    if [ -s "$err_file" ]; then
+      cat "$err_file" >&2
+    fi
+    echo "$label LookupRoute response: ${resp:-<empty>}" >&2
+    fail "$label LookupRoute returned no response — an RPC/transport error must fail the adapter-partition probe, not silently pass it as a non-match"
+  fi
+  if has_reason_code "$resp" "PREFIX_MATCH"; then
+    echo "$label LookupRoute response (want NOT PREFIX_MATCH):" >&2
+    echo "$resp" >&2
+    fail "$alias_msg"
+  fi
+  if ! has_reason_code "$resp" "AFFINITY_HINT"; then
+    echo "$label LookupRoute response (want fail-open AFFINITY_HINT):" >&2
+    echo "$resp" >&2
+    fail "$label LookupRoute did not return the expected fail-open AFFINITY_HINT — a non-matching adapter partition must downgrade to a stable affinity pick, never error and never PREFIX_MATCH"
+  fi
+}
+
+assert_adapter_no_alias "$adapter_other_payload" "$LOG_DIR/grpcurl-adapter-other.err" \
+  "different-adapter" \
+  "LookupRoute for adapter_id=smoke-lora-b matched a prefix ingested under smoke-lora-a — identical token content aliased across adapters, which would route to a replica holding a DIFFERENT adapter's KV"
+assert_adapter_no_alias "$adapter_none_payload" "$LOG_DIR/grpcurl-adapter-none.err" \
+  "no-adapter" \
+  "LookupRoute without adapter_id matched an adapter-scoped prefix — adapter-scoped ingest must stay out of the default partition"
+log "adapter partition enforced end-to-end: same adapter_id → PREFIX_MATCH; a different adapter_id and an absent adapter_id each returned the fail-open AFFINITY_HINT (RPC succeeded, off the prefix-match path) on the identical prefix hash"
 
 # --- routingFloorScore end-to-end probe ------------------------------------
 # Proves the new field flows CR → controller flatten → /policy push → server
@@ -2422,6 +2554,105 @@ log "admission rejected EventsOnly+External misconfiguration"
 kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$EVENTSONLY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
 
+# --- Native SGLang HiCache end-to-end --------------------------------------
+# This phase drives the new operator-facing surface through the real installed
+# CRD, validating webhook, controller, and Pod mutating webhook. HiCache is
+# engine-local, so the observable controller contract is deliberately negative:
+# no cache-server workload, no endpoint, and no synthetic Ready condition. The
+# Pod is server-side dry-run only; its admitted shape proves native argument
+# injection without pulling or starting a real SGLang image.
+log "exercising native SGLang HiCache end-to-end in namespace $HICACHE_SMOKE_NS"
+kubectl create namespace "$HICACHE_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Apply the committed sample rather than duplicating its CacheBackend contract
+# inline. Only the name is tunable; the sample remains namespace-less so -n
+# places it in the dedicated smoke namespace.
+hc_sample_tmp="$(mktemp "$tmpdir/sample-sglang-hicache.XXXXXX")"
+sed "s|^  name: sglang-hicache\$|  name: $HICACHE_SMOKE_CB_NAME|" \
+  config/samples/cachebackend-sglang-hicache.yaml > "$hc_sample_tmp"
+kubectl -n "$HICACHE_SMOKE_NS" apply -f "$hc_sample_tmp" >/dev/null \
+  || fail "kubectl apply native SGLang HiCache sample failed"
+
+# Wait until the controller has taken the engine-local path. observedGeneration
+# is the positive acknowledgement; endpoint/Ready/workload assertions below pin
+# what that path intentionally does not publish or provision.
+hc_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.metadata.generation}')"
+deadline=$(($(date +%s) + HICACHE_SMOKE_TIMEOUT))
+hc_observed_generation=""
+until [ "$hc_observed_generation" = "$hc_generation" ]; do
+  hc_observed_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+    fail "native HiCache CR was not observed within ${HICACHE_SMOKE_TIMEOUT}s: generation=$hc_generation observedGeneration=$hc_observed_generation"
+  fi
+  sleep 1
+done
+log "native HiCache CR observed at generation $hc_observed_generation"
+
+hc_endpoint="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+hc_ready="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].type}' 2>/dev/null || true)"
+if [ -n "$hc_endpoint" ] || [ -n "$hc_ready" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+  fail "native HiCache published server-backed status (endpoint=$hc_endpoint Ready=$hc_ready, want both absent)"
+fi
+
+hc_dep_count="$(kubectl -n "$HICACHE_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_svc_count="$(kubectl -n "$HICACHE_SMOKE_NS" get svc -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_hpa_count="$(kubectl -n "$HICACHE_SMOKE_NS" get hpa -o name 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$hc_dep_count" != "0" ] || [ "$hc_svc_count" != "0" ] || [ "$hc_hpa_count" != "0" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get deploy,svc,hpa || true
+  fail "native HiCache rendered controller-owned workload (deploy=$hc_dep_count svc=$hc_svc_count hpa=$hc_hpa_count, want 0/0/0)"
+fi
+log "native HiCache rendered no Deployment, Service, or HPA and published no endpoint/Ready condition"
+
+# Exercise the installed Pod mutating webhook with a matching, single-container
+# engine Pod. The dry-run response is the fully admitted Pod, including webhook
+# mutations, but nothing is persisted or started.
+hc_engine_fixture="$(mktemp "$tmpdir/pod-sglang-hicache.XXXXXX.yaml")"
+cat > "$hc_engine_fixture" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-hicache-engine
+  namespace: $HICACHE_SMOKE_NS
+  labels:
+    app: sglang
+spec:
+  containers:
+    - name: sglang
+      image: busybox:1.36
+      args:
+        - sleep
+        - "3600"
+EOF
+
+if ! hc_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{range (index .spec.containers 0).args}}{{println .}}{{end}}' 2>/dev/null)"; then
+  fail "matching SGLang Pod did not pass server-side dry-run admission"
+fi
+hc_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first'
+if [ "$hc_pod_args" != "$hc_expected_args" ]; then
+  printf '[install-smoke] admitted SGLang args:\n%s\n' "$hc_pod_args" >&2
+  fail "native HiCache Pod mutation did not produce the expected complete argument contract"
+fi
+
+hc_injected_by="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{index .metadata.annotations "inferencecache.io/injected-by"}}' 2>/dev/null)" \
+  || fail "could not read native HiCache injection annotation from dry-run Pod"
+if [ "$hc_injected_by" != "$HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME" ]; then
+  fail "native HiCache dry-run Pod injected-by=$hc_injected_by, want $HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME"
+fi
+log "native HiCache Pod webhook injected the complete CLI contract and backend identity"
+
+kubectl delete cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
+kubectl delete namespace "$HICACHE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true
+
 # --- /snapshot NetworkPolicy-drop assertion -------------------------------
 # The CacheIndex CR being populated above already proves the controller can
 # scrape /snapshot with its SA token (the bearer path). The complementary
@@ -3347,36 +3578,38 @@ while IFS= read -r f; do
     sample_fail=$((sample_fail + 1))
   fi
 done <<< "$sample_list"
-# Operator-facing admission signal: applying the (sglang, LMCache) sample MUST
-# warn that its LMCache offload is misconfigured — SGLang drives LMCache in MP
-# mode, so the shipped lm:// wiring caches nothing and must not be mistaken for a
-# working backend. --dry-run=server reaches admission (where the warning is
-# emitted on stderr) and persists nothing. The loop above only asserts the sample
-# applies cleanly; this asserts the warning actually fires through a real apply.
-# Runs in $SAMPLE_APPLY_NS (still fresh — the loop's dry-runs persisted nothing)
-# BEFORE its delete below, so this is a clean CREATE, not an update of a same-named
-# object that might exist in another namespace.
+# Operator-facing admission signal: the (sglang, LMCache) sample MUST now admit
+# CLEANLY under real server-side admission — the adapter renders the working
+# LMCache MP-mode data plane (node-local MP-worker sidecar + config-file wire → the
+# managed Redis L2), so the old "offload misconfigured (lm:// vs MP)" advisory is
+# gone. --dry-run=server reaches admission and persists nothing. The loop above only
+# asserts the sample parses/applies; this asserts it admits without the obsolete
+# warning through a real apply. Runs in $SAMPLE_APPLY_NS (still fresh — the loop's
+# dry-runs persisted nothing) BEFORE its delete below, so this is a clean CREATE.
 sglang_sample="config/samples/cachebackend-sglang.yaml"
 if [ -f "$sglang_sample" ]; then
-  # The `if cmd; then` form both keeps `set -e` from aborting on a rejected apply
-  # AND distinguishes the two failure modes: a NON-zero exit means the sample was
-  # rejected (fail with its output — the warning text alone must not mask that,
-  # since a rejection can print the warning before the error), a zero exit means it
-  # admitted and we then require the warning to be present.
+  # `if cmd; then` keeps `set -e` from aborting on a rejected apply AND distinguishes
+  # the failure modes: a NON-zero exit means admission rejected the sample; a zero
+  # exit means it admitted, and we then require the obsolete warning to be ABSENT
+  # (its presence would mean the working wire didn't remove it). Match the retired
+  # warning's EXACT text, not loose fragments like "misconfigured" / "MP mode": those
+  # appear in ordinary prose, so an unrelated future warning would fail this gate for
+  # the wrong reason.
+  sglang_retired_warn="SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server"
   if sglang_warn_out="$(kubectl apply --dry-run=server --request-timeout=30s -n "$SAMPLE_APPLY_NS" -f "$sglang_sample" 2>&1)"; then
     case "$sglang_warn_out" in
-      *"MP mode"*)
-        log "(sglang, LMCache) sample emits the LMCache MP-mode offload-misconfigured warning" ;;
-      *)
+      *"$sglang_retired_warn"*)
         printf '%s\n' "$sglang_warn_out"
-        fail "(sglang, LMCache) apply did not warn about the LMCache MP-mode mismatch — the shipped lm:// wiring must not look like a working cache" ;;
+        fail "(sglang, LMCache) still emits the obsolete offload-misconfigured warning — the MP-mode data plane should have removed it" ;;
+      *)
+        log "(sglang, LMCache) sample admits cleanly (working MP-mode data plane wired, no obsolete warning)" ;;
     esac
   else
     printf '%s\n' "$sglang_warn_out"
     fail "(sglang, LMCache) sample did not apply cleanly under --dry-run=server (admission rejected it)"
   fi
 else
-  fail "$sglang_sample missing — the SGLang MP-mode admission-warning assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
+  fail "$sglang_sample missing — the SGLang admission assertion cannot run; a rename/deletion must not silently drop this operator-facing gate"
 fi
 
 kubectl delete namespace "$SAMPLE_APPLY_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -3643,4 +3876,4 @@ log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, w
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"

@@ -240,10 +240,11 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	// Covers the production pod-webhook selection path for (sglang, LMCache):
 	// the nil-registry fallback now includes the SGLang adapter, so a SGLang
 	// engine pod matching a (sglang, LMCache) CacheBackend is injected with
-	// SGLang's LMCache wire (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL +
-	// LMCACHE_REMOTE_URL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
-	// PYTHONHASHSEED. Without the SGLang registration in the fallback, the
-	// webhook would fail-open and the pod would boot unwired.
+	// SGLang's LMCache MP wire (--enable-lmcache + --lmcache-config-file +
+	// LMCACHE_USE_EXPERIMENTAL), NOT vLLM's --kv-transfer-config / VLLM_USE_V1 /
+	// PYTHONHASHSEED — and NOT the lm:// LMCACHE_REMOTE_URL, which MP mode ignores.
+	// Without the SGLang registration in the fallback, the webhook would fail-open
+	// and the pod would boot unwired.
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
@@ -262,11 +263,12 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 	mustHaveArgFlag(t, mutated, "--enable-lmcache")
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveArgFlag(t, mutated, "--lmcache-config-file")
 	mustHaveEnv(t, mutated, "LMCACHE_USE_EXPERIMENTAL", "True")
 
-	// Proof it went through the SGLang path, not vLLM's: the vLLM-only connector
-	// arg and env must be absent.
+	// Proof it went through the SGLang MP path: the vLLM-only connector arg/env
+	// must be absent, the old lm:// env must NOT be injected, and the MP-worker
+	// native sidecar must be present.
 	for _, c := range mutated.Spec.Containers {
 		if c.Name != "sglang" {
 			continue
@@ -280,7 +282,83 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 			if e.Name == adapterruntime.EnvVLLMUseV1 || e.Name == adapterruntime.EnvPythonHashSeed {
 				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
 			}
+			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+				t.Fatalf("SGLang MP wire must not inject %s", adapterruntime.EnvLMCacheRemoteURL)
+			}
 		}
+	}
+	hasWorker := false
+	for _, ic := range mutated.Spec.InitContainers {
+		if ic.Name == "lmcache-mp-worker" {
+			hasWorker = true
+		}
+	}
+	if !hasWorker {
+		t.Fatalf("MP-worker sidecar not injected; initContainers = %+v", mutated.Spec.InitContainers)
+	}
+}
+
+func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration.Engine = "sglang"
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
+		Ratio:        "2.0",
+		WritePolicy:  cachev1alpha1.SGLangHiCacheWriteThrough,
+		IOBackend:    cachev1alpha1.SGLangHiCacheIOKernel,
+		MemoryLayout: cachev1alpha1.SGLangHiCacheMemoryPageFirst,
+	}
+	cb.Status.Endpoint = ""
+
+	h := newHandler(t, cb)
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("endpoint-free HiCache injection = Allowed %v, patches %d", resp.Allowed, len(resp.Patches))
+	}
+
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveArgFlag(t, mutated, "--enable-hierarchical-cache")
+	mustHaveArgPair(t, mutated, "--hicache-ratio", "2.0")
+	mustHaveArgPair(t, mutated, "--hicache-write-policy", "write_through")
+	mustHaveArgPair(t, mutated, "--hicache-io-backend", "kernel")
+	mustHaveArgPair(t, mutated, "--hicache-mem-layout", "page_first")
+	if got := mutated.Annotations[AnnotationInjectedBy]; got != ns+"/"+cb.Name {
+		t.Fatalf("%s = %q, want %q", AnnotationInjectedBy, got, ns+"/"+cb.Name)
+	}
+	for _, env := range mutated.Spec.Containers[0].Env {
+		if strings.HasPrefix(env.Name, "LMCACHE_") {
+			t.Fatalf("native HiCache injected LMCache env %q", env.Name)
+		}
+	}
+	if len(mutated.Spec.InitContainers) != 0 || len(mutated.Spec.Volumes) != 0 {
+		t.Fatalf("native HiCache injected LMCache sidecars/volumes: init=%v volumes=%v",
+			mutated.Spec.InitContainers, mutated.Spec.Volumes)
+	}
+}
+
+func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration.Engine = "sglang"
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
+		Ratio:       "2",
+		WritePolicy: cachev1alpha1.SGLangHiCacheWriteThrough,
+	}
+	cb.Status.Endpoint = ""
+
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--hicache-ratio=3")
+	req := newRequest(t, pod, ns)
+	resp := newHandler(t, cb).Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("conflict must fail open: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("conflict produced %d patches, want original Pod unchanged", len(resp.Patches))
 	}
 }
 

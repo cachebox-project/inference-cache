@@ -165,15 +165,14 @@ spec:
                   in MatchLabels must be present on the pod. The full
                   metav1.LabelSelector surface (matchExpressions, operator-based
                   selection) is NOT exposed today — only MatchLabels.
-                  Pods that match get LMCache engine wiring (env vars + CLI args)
-                  injected by the mutating Pod admission webhook at pod CREATE time,
-                  PROVIDED the matched CacheBackend's status.endpoint has been
-                  published by the time admission runs. The webhook fail-opens
-                  (admits the pod unmodified) when status.endpoint is empty — so a
-                  pod that loses the race against the reconciler is admitted
-                  uncached for its whole lifetime. Admission is CREATE-only;
-                  recovery is to recreate the pod (e.g. `kubectl rollout restart`),
-                  not to edit the live pod's labels.
+                  Pods that match get runtime-adapter engine wiring injected by the
+                  mutating Pod admission webhook at pod CREATE time. Server-backed
+                  adapters require status.endpoint to be published first; the webhook
+                  fail-opens when it is empty. Engine-local adapters such as native
+                  SGLang HiCache explicitly require no endpoint and inject immediately.
+                  Admission is CREATE-only; recovery or a configuration update requires
+                  recreating the pod (e.g. `kubectl rollout restart`), not editing its
+                  live labels.
 
                   This describes the default spec.integration.mode=Offload path. For
                   spec.integration.mode=EventsOnly no KV connector wiring (env vars +
@@ -209,6 +208,51 @@ spec:
                     description: MatchLabels is a map of labels that selected engines
                       must match.
                     type: object
+                type: object
+              hiCache:
+                description: |-
+                  HiCache configures SGLang's native, engine-local hierarchical cache. It
+                  is required for type=SGLangHiCache and rejected for other backend types.
+                  The selected engine Pods own the host-memory allocation; no cache-server
+                  workload or network endpoint is created.
+                properties:
+                  ioBackend:
+                    description: IOBackend maps to --hicache-io-backend.
+                    enum:
+                    - direct
+                    - kernel
+                    - kernel_ascend
+                    type: string
+                  memoryLayout:
+                    description: MemoryLayout maps to --hicache-mem-layout.
+                    enum:
+                    - layer_first
+                    - page_first
+                    - page_first_direct
+                    - page_first_kv_split
+                    - page_head
+                    type: string
+                  ratio:
+                    description: |-
+                      Ratio sets the host KV-cache pool size relative to the device KV-cache
+                      pool. It is a string because Kubernetes APIs avoid floating-point fields.
+                      Admission requires a finite number greater than zero.
+                      Mutually exclusive with SizeGB.
+                    type: string
+                  sizeGB:
+                    description: |-
+                      SizeGB sets the host KV-cache pool size in decimal gigabytes.
+                      Mutually exclusive with Ratio.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  writePolicy:
+                    description: WritePolicy maps to --hicache-write-policy.
+                    enum:
+                    - write_back
+                    - write_through
+                    - write_through_selective
+                    type: string
                 type: object
               integration:
                 description: Integration describes how inference engines should use
@@ -490,6 +534,8 @@ spec:
                       inject it). Per-request fail-open enforcement at the engine level is the
                       engine/connector's responsibility; the cache plane surfaces the bit so
                       the engine can honor it.
+                      SGLangHiCache accepts only the default true value and does not inject this
+                      env var because native HiCache exposes no equivalent fail-closed control.
                     type: boolean
                   firstEventTimeout:
                     default: 5m
@@ -526,6 +572,10 @@ spec:
                       default — the field carries no meaningful "wait forever" or "fail
                       immediately" semantics.
 
+                      The first SGLangHiCache implementation publishes no Ready condition, so
+                      this field is inert for that engine-local backend until its separate
+                      readiness contract is implemented.
+
                       The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
                       schema types it as a string; a malformed value is rejected when
                       admission decodes the object into this typed field, and if admission is
@@ -546,6 +596,7 @@ spec:
                       anyone who does not want an offload tier). Because EventsOnly provisions
                       no server, status.endpoint stays empty and the autoscaling spec is
                       rejected at admission; Ready is still gated on the first observed KV event.
+                      SGLangHiCache supports Offload only and is rejected with EventsOnly.
                       See the CacheBackendIntegrationMode godoc.
                     enum:
                     - Offload
@@ -650,8 +701,8 @@ spec:
                   absent and replaced, because the HPA cannot use 0 as a
                   denominator.
 
-                  External backends provision no workload of their own, so the field
-                  is inert for spec.type=External.
+                  External and SGLangHiCache backends provision no workload of their own,
+                  so the field is inert for those types.
                 properties:
                   claims:
                     description: |-

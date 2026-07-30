@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"time"
 
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
@@ -293,9 +294,13 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 
 	slo := req.GetSlo()
 	lookupReq := index.LookupRequest{
-		Model:            model,
-		Tenant:           tenant,
-		HashScheme:       req.GetHashScheme(),
+		Model:      model,
+		Tenant:     tenant,
+		HashScheme: req.GetHashScheme(),
+		// Adapter partition to match in. The content fingerprint is token-only,
+		// so this is what keeps two adapters' identical token content in disjoint
+		// keyspaces. Empty = the default partition (unchanged legacy behavior).
+		Adapter:          req.GetAdapterId(),
 		PrefixHash:       in.exactPrefixHash,
 		TokenCount:       in.exactTokenCount,
 		BlockHashes:      lookupBlockHashes,
@@ -613,6 +618,9 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 	// the same tokens this lookup was fingerprinted over. Empty on the
 	// token_ids / pre-fingerprinted paths (the caller already has the tokens).
 	resp.TokenIds = in.echoTokens
+	// Echo the adapter partition the index was consulted in, so a caller can
+	// confirm which partition answered without correlating back to its request.
+	resp.AdapterId = req.GetAdapterId()
 	resp.LookupLatencyUs = elapsed.Microseconds()
 	s.metrics.observeLookup(model, resp.ReasonCode, len(result.Scores) > 0, elapsed)
 	return resp
@@ -667,6 +675,9 @@ func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest
 		// when the routing hint is an affinity pick. Empty on the block_hashes /
 		// token_ids paths (the caller already holds the tokens).
 		TokenIds: in.echoTokens,
+		// Same partition echo as buildLookupResponse — the affinity pick was
+		// made after the index was consulted in this adapter's partition.
+		AdapterId: req.GetAdapterId(),
 	}
 	s.metrics.observeLookup(model, resp.ReasonCode, true, elapsed)
 	return resp
@@ -1023,7 +1034,10 @@ func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEv
 			Model:      ev.GetModelId(),
 			Tenant:     ev.GetTenantId(),
 			PrefixHash: ev.GetPrefixHash(),
-			Timestamp:  microsToTime(ev.GetTimestampUs()),
+			// Narrows a PREFIX_EVICTED to one adapter partition; empty keeps the
+			// conservative cross-partition removal (legacy producers).
+			Adapter:   ev.GetAdapterId(),
+			Timestamp: microsToTime(ev.GetTimestampUs()),
 		})
 	}
 	return &icpb.Ack{Accepted: true}, nil
@@ -1045,7 +1059,12 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 		Model:      u.GetModelId(),
 		Tenant:     u.GetTenantId(),
 		HashScheme: u.GetHashScheme(),
-		Timestamp:  microsToTime(u.GetTimestampUs()),
+		// Update-level adapter is only the DEFAULT for entries that set none —
+		// the index applies the per-entry override. A multi-adapter producer
+		// (the kvevent subscriber, which batches events across adapters into one
+		// update) stamps each entry instead and leaves this empty.
+		Adapter:   u.GetAdapterId(),
+		Timestamp: microsToTime(u.GetTimestampUs()),
 	}
 	for _, p := range u.GetPrefixes() {
 		out.Prefixes = append(out.Prefixes, index.PrefixRef{
@@ -1053,6 +1072,8 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 			TokenCount:       p.GetTokenCount(),
 			BlockHashes:      p.GetBlockHashes(),
 			BlockTokenCounts: p.GetBlockTokenCounts(),
+			Adapter:          p.GetAdapterId(),
+			Tier:             cacheTierFromProto(p.GetTier()),
 		})
 	}
 	if st := u.GetStats(); st != nil {
@@ -1069,6 +1090,53 @@ func updateFromProto(u *icpb.CacheStateUpdate) index.Update {
 	}
 	return out
 }
+
+// cacheTierFromProto maps the ingest wire enum onto the index's cache-tier tag.
+// It must keep two cases DISTINCT:
+//   - CACHE_TIER_UNSPECIFIED (0) — a legacy producer omitted the field — maps to
+//     TierUnspecified, which the index normalizes to T1 at ingest. So an older
+//     subscriber that never sets the tier still lands its stored prefixes at T1.
+//   - An unrecognized POSITIVE value — a future producer reporting a colder tier
+//     this server doesn't know yet — must NOT collapse to the T1 default (that
+//     would over-claim the hottest tier for a hold we know is colder). The raw
+//     value is retained (the index enum mirrors the proto values one-for-one), so
+//     it is carried honestly: worstTier ranks it colder than any known tier, and
+//     cacheTierToProto reports it back as UNSPECIFIED to old clients — never T1.
+//   - A NEGATIVE value is invalid: proto3 enums are open int32, but no valid tier
+//     is negative. It must NOT map to TierUnspecified: normalizeIngestTier turns
+//     TierUnspecified into T1 at ingest, so that would land corrupt input at the
+//     HOTTEST tier — the exact fail-hot we're guarding against. Nor can it be
+//     retained raw (it sorts below T1, so worstTier's max()-fold would rank it
+//     WARMER than T1). It's mapped to tierInvalidCold: a nonzero cold sentinel
+//     that (a) survives normalizeIngestTier untouched, (b) folds coldest in
+//     worstTier, and (c) reports back as UNSPECIFIED — an honest "no claim,"
+//     never a fabricated hot tier. Fail-safe, never fail-hot.
+//
+// Inverse of cacheTierToProto for the known values.
+func cacheTierFromProto(t icpb.CacheTier) index.CacheTier {
+	switch t {
+	case icpb.CacheTier_CACHE_TIER_UNSPECIFIED:
+		return index.TierUnspecified // legacy-unset → T1 at ingest
+	case icpb.CacheTier_CACHE_TIER_T1:
+		return index.TierT1
+	case icpb.CacheTier_CACHE_TIER_T2:
+		return index.TierT2
+	case icpb.CacheTier_CACHE_TIER_T3:
+		return index.TierT3
+	default:
+		if t < 0 {
+			return tierInvalidCold // invalid negative → coldest, honest no-claim (fail-safe)
+		}
+		return index.CacheTier(t) // future colder tier → retained, sorts coldest
+	}
+}
+
+// tierInvalidCold tags an entry whose reported tier was invalid (negative). It is
+// deliberately larger than any real or future tier so worstTier ranks it coldest
+// (never over-claiming a warm hold from corrupt input), stays nonzero so
+// normalizeIngestTier does not default it to T1, and — being an unrecognized
+// value — is reported back to clients as CACHE_TIER_UNSPECIFIED by cacheTierToProto.
+const tierInvalidCold = index.CacheTier(math.MaxInt32)
 
 // cacheTierToProto maps the index's cache-tier tag onto the wire enum. An
 // unknown/zero tier maps to CACHE_TIER_UNSPECIFIED so a non-prefix hint

@@ -31,25 +31,21 @@ const (
 )
 
 // adapter wires SGLang engine pods to the managed LMCache backend a
-// CacheBackend{type: LMCache} provisions, for the (sglang, LMCache) pair. It
-// mirrors the vLLM+LMCache adapter (pkg/adapters/runtime): the lmcache-server
-// and kvevent-subscriber sidecar rendering are shared engine-agnostically (the
-// server is the same lm:// server and the subscriber is one binary
-// parameterised per engine), and only the engine-side launch wire differs —
-// SGLang turns LMCache on with --enable-lmcache + LMCACHE_USE_EXPERIMENTAL,
-// not vLLM's --kv-transfer-config (see enginewire.InjectSGLangLMCache).
+// CacheBackend{type: LMCache} provisions, for the (sglang, LMCache) pair. Unlike
+// the vLLM+LMCache adapter, SGLang drives LMCache in MULTIPROCESS (MP) mode, so the
+// two adapters diverge on both halves of the data plane:
 //
-// KNOWN LIMITATION (surfaced by GPU validation, not yet fixed): this "mirror the
-// vLLM+LMCache adapter" model is WRONG for SGLang. SGLang drives LMCache through
-// its LMCacheLayerwiseConnector in MULTIPROCESS (MP) mode — config read from the
-// --lmcache-config-file flag (the LMCACHE_* env injected here is IGNORED),
-// node-local transfer via mp_host/mp_port + shared memory. It does not consume a
-// standalone lm:// server the way vLLM does; pointing SGLang at a bare remote
-// lm:// URL hangs the engine at startup. So a (sglang, LMCache) backend can
-// reconcile Ready while caching nothing — admission emits an advisory warning
-// (see the validator's sglangLMCacheDataPlaneWarning). Correcting this to the
-// MP-mode wire + a per-node worker is a GPU-validated follow-up. Full rationale:
-// docs/design/cachebackend-api.md, the SGLang engine support KNOWN LIMITATION note.
+//   - ResolveCacheServer provisions a shared Redis L2 store, NOT the vLLM lm://
+//     lmcache-server — lm:// is not a valid MP --l2-adapter type; and
+//   - InjectEngineConfig renders the MP engine wire — a node-local MP-worker
+//     native sidecar + a config-file (mp_host/mp_port) the engine reads via
+//     --lmcache-config-file, offloading to that Redis L2. It turns LMCache on with
+//     --enable-lmcache + LMCACHE_USE_EXPERIMENTAL (not vLLM's --kv-transfer-config)
+//     and does NOT inject the lm:// LMCACHE_REMOTE_URL env, which MP mode ignores.
+//     See enginewire.InjectSGLangLMCache.
+//
+// GPU-validated end-to-end; full design: docs/design/sglang-lmcache-mp-mode.md. The
+// kvevent-subscriber sidecar rendering is still shared engine-agnostically.
 type adapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
@@ -105,28 +101,26 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}
 }
 
-// ResolveCacheServer renders the standalone LMCache server, delegating to the
-// engine-agnostic [runtimeadapter.ResolveLMCacheServer] shared with the vLLM
-// adapter. NOTE: this is the CURRENTLY RENDERED, known-broken topology — see the
-// package KNOWN LIMITATION. For vLLM the engine reaches this server at
-// lm://<svc>:<port>; SGLang does NOT (it drives LMCache in MP mode and never
-// dials this server), so for (sglang, LMCache) this workload is provisioned but
-// unused until the MP-mode fix lands.
+// ResolveCacheServer renders the shared Redis L2 store the SGLang MP worker
+// offloads to via its resp --l2-adapter, delegating to
+// [runtimeadapter.ResolveRedisL2Server]. This replaces the standalone lm://
+// lmcache-server the adapter previously (mis)rendered for SGLang: lm:// is not a
+// valid MP --l2-adapter type, so SGLang cannot reuse it. The reconciler wraps the
+// returned pod + service into the managed Deployment + Service and publishes its
+// address as status.endpoint; the engine-side wire ([InjectEngineConfig]) points a
+// per-pod node-local MP worker's L2 at that Redis. See
+// docs/design/sglang-lmcache-mp-mode.md.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return runtimeadapter.ResolveLMCacheServer(cache)
+	return runtimeadapter.ResolveRedisL2Server(cache)
 }
 
-// InjectEngineConfig injects SGLang's LMCache launch surface (--enable-lmcache +
-// LMCACHE_* env), merging with the pod template's existing args/env. See
-// enginewire.InjectSGLangLMCache for why the env set differs from vLLM's (no
-// VLLM_USE_V1 / PYTHONHASHSEED).
-//
-// KNOWN LIMITATION (see the package doc): this does NOT produce a working cache
-// today. SGLang ignores the injected `LMCACHE_*` env — it reads config only from
-// the `--lmcache-config-file` flag and uses LMCache MP mode — so the injected
-// `LMCACHE_REMOTE_URL` is inert. The MP-mode wire (a config file + a per-node
-// worker) is the tracked follow-up; this method still injects the shipped
-// (non-functional) wiring.
+// InjectEngineConfig renders SGLang's LMCache MP-mode launch surface, merging with
+// the pod template's existing args/env: it adds the node-local MP-worker native
+// sidecar + shared /dev/shm/config volumes, and turns the connector on via
+// --enable-lmcache + --lmcache-config-file + LMCACHE_USE_EXPERIMENTAL (no
+// VLLM_USE_V1 / PYTHONHASHSEED, and no lm:// LMCACHE_REMOTE_URL — MP mode ignores
+// it). endpoint is the managed Redis L2 address the worker offloads to. See
+// enginewire.InjectSGLangLMCache for the full wire.
 func (adapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	return enginewire.InjectSGLangLMCache(pod, endpoint, cache)
 }
@@ -165,45 +159,38 @@ func (a adapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *core
 	})
 }
 
-// ReservedArgs returns the engine args this adapter injects that the LMCache
+// ReservedArgs returns the engine args this adapter injects that the LMCache MP
 // integration cannot function without. The validating webhook blocks an
 // spec.integration.engineOverrides entry that overrides or suppresses any of
 // these so the operator cannot silently un-wire the connector.
 //
-//   - "--enable-lmcache" is the SGLang flag that turns the LMCache connector on
-//     at startup; suppressing it means no LMCache wiring at all.
+//   - "--enable-lmcache" turns the LMCache connector on at startup; suppressing it
+//     means no LMCache wiring at all.
+//   - "--lmcache-config-file" points the engine at the MP config file the worker
+//     sidecar writes (mp_host/mp_port); without it SGLang's MP mode aborts at
+//     startup, so suppressing it breaks the engine, not just the cache.
 //
 // (Distinct from the vLLM adapter, which reserves --kv-transfer-config — the
 // two engines turn LMCache on through different launch surfaces.)
 func (adapter) ReservedArgs() []string {
-	return []string{enginewire.SGLangEnableLMCacheArg}
+	return []string{enginewire.SGLangEnableLMCacheArg, enginewire.SGLangConfigFileArg}
 }
 
 // ReservedEnv returns the env var names this adapter injects and blocks
-// engineOverrides from touching. NOTE (see the package KNOWN LIMITATION): not all
-// of these are load-bearing for SGLang today — the adapter injects the vLLM-style
-// wire, but SGLang uses LMCache MP mode, so some of it is inert. They are still
-// reserved (the operator must not silently mutate adapter-owned state), but the
-// rationale differs per var:
+// engineOverrides from touching. SGLang drives LMCache in MP mode (config-file +
+// node-local worker), so — unlike the old lm:// wire — LMCACHE_REMOTE_URL and the
+// serde/local-CPU tunables are NOT injected and NOT reserved. What remains:
 //
-//   - LMCACHE_REMOTE_URL is the rendered cache-server address for the vLLM path;
-//     SGLang IGNORES it (MP mode reads mp_host/mp_port from --lmcache-config-file),
-//     so it is currently inert — reserved to keep the shipped wire consistent, not
-//     because SGLang honors it. The MP-mode fix replaces it.
-//   - LMCACHE_USE_EXPERIMENTAL (set to "True") DOES matter — it gates SGLang's
-//     experimental LMCache path; without it, --enable-lmcache does not engage the
-//     connector at all.
+//   - LMCACHE_USE_EXPERIMENTAL (set to "True") gates SGLang's experimental LMCache
+//     path; without it, --enable-lmcache does not engage the connector at all.
 //   - INFERENCECACHE_FAIL_OPEN mirrors spec.integration.failOpen onto the pod;
 //     an override would silently desync the pod from the CR contract.
 //
-// Unlike the vLLM adapter, VLLM_USE_V1 and PYTHONHASHSEED are NOT reserved —
-// they are not injected for SGLang at all (no vLLM v1 codepath; SGLang's
-// sha256-based prefix hashing does not depend on PYTHONHASHSEED). The LMCACHE_*
-// perf/mode tunables (chunk size / serde / local-CPU knobs) are likewise NOT
-// reserved.
+// Unlike the vLLM adapter, VLLM_USE_V1 and PYTHONHASHSEED are NOT reserved — they
+// are not injected for SGLang at all (no vLLM v1 codepath; SGLang's sha256-based
+// prefix hashing does not depend on PYTHONHASHSEED).
 func (adapter) ReservedEnv() []string {
 	return []string{
-		enginewire.EnvLMCacheRemoteURL,
 		enginewire.EnvLMCacheUseExperimental,
 		enginewire.EnvInferenceCacheFailOpen,
 	}

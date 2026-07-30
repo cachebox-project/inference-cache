@@ -12,7 +12,7 @@ func testConfig() Config {
 }
 
 func TestEvictedEvent(t *testing.T) {
-	e := testConfig().EvictedEvent([]byte{0x01, 0x02}, 1.0)
+	e := testConfig().EvictedEvent([]byte{0x01, 0x02}, "", 1.0)
 	if e.Type != icpb.CacheEvent_PREFIX_EVICTED {
 		t.Errorf("type = %v, want PREFIX_EVICTED", e.Type)
 	}
@@ -21,6 +21,18 @@ func TestEvictedEvent(t *testing.T) {
 	}
 	if !bytes.Equal(e.PrefixHash, []byte{0x01, 0x02}) {
 		t.Errorf("prefix hash = %x, want 0102", e.PrefixHash)
+	}
+	if e.AdapterId != "" {
+		t.Errorf("adapter id = %q, want \"\" (no adapter)", e.AdapterId)
+	}
+}
+
+// An adapter-scoped eviction must name its partition, so the server drops the
+// prefix only there — the same hash can be live under another adapter.
+func TestEvictedEventCarriesAdapter(t *testing.T) {
+	e := testConfig().EvictedEvent([]byte{0x01}, "sql-lora", 1.0)
+	if e.AdapterId != "sql-lora" {
+		t.Errorf("adapter id = %q, want sql-lora", e.AdapterId)
 	}
 }
 

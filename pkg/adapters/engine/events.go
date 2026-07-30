@@ -23,7 +23,10 @@ import (
 // parent_block_hash. The subscriber uses those two LOCALLY, in-pod, to derive its
 // own deterministic content fingerprint for the index key (see positional.go) —
 // the token IDs are hashed and never leave the pod, so only hashes ever reach the
-// server and the control plane stays metadata-only. lora_id is still ignored.
+// server and the control plane stays metadata-only. lora_id IS decoded (see
+// BlockStored.LoRAID): the fingerprint is token-only, so two prompts with the
+// same tokens under different adapters hash identically and would alias in the
+// index — the id becomes the index PARTITION, never part of the hash.
 
 // Event is one decoded KV-cache event. The concrete types are BlockStored,
 // BlockRemoved, and AllBlocksCleared.
@@ -44,11 +47,18 @@ type Event interface{ isEvent() }
 // TokenIDs are the flat token IDs of this event's blocks (BlockSize tokens per
 // block, in block order). They are hashed in-pod to derive the fingerprint and
 // never leave the pod.
+//
+// LoRAID is the engine's LoRA adapter id for these blocks — nil when the event
+// carries no adapter (msgpack nil, a truncated 5-field tuple, or a base-model
+// request). It is the engine's INTERNAL integer id, assigned in adapter load
+// order, so Config.AdapterID maps it to the stable adapter identity that becomes
+// the index partition; it is never mixed into the content fingerprint.
 type BlockStored struct {
 	BlockHashes     [][]byte
 	ParentBlockHash []byte
 	TokenIDs        []uint32
 	BlockSize       int32
+	LoRAID          *int64
 }
 
 // BlockRemoved reports KV blocks that were evicted. BlockHashes are opaque bytes
@@ -148,11 +158,22 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 		if bs <= 0 {
 			return nil, fmt.Errorf("BlockStored.block_size must be positive, got %d", bs)
 		}
+		// lora_id is OPTIONAL on the wire: the 5-field tuple (no adapter field at
+		// all) and an explicit nil both mean "no adapter", so a truncated tuple is
+		// not an error here — only a present-but-undecodable value is.
+		var loraID *int64
+		if len(fields) >= 6 {
+			loraID, err = decodeLoRAID(fields[5])
+			if err != nil {
+				return nil, fmt.Errorf("BlockStored.lora_id: %w", err)
+			}
+		}
 		return BlockStored{
 			BlockHashes:     hashes,
 			ParentBlockHash: parent,
 			TokenIDs:        tokenIDs,
 			BlockSize:       bs,
+			LoRAID:          loraID,
 		}, nil
 	case "BlockRemoved":
 		// [tag, block_hashes]
@@ -238,6 +259,41 @@ func decodeParent(raw msgpack.RawMessage) ([]byte, error) {
 		return nil, nil
 	}
 	return hashToBytes(v)
+}
+
+// decodeLoRAID decodes the optional lora_id. A msgpack nil (or an absent field)
+// yields nil — no adapter. Anything present but not an integer is an error
+// rather than a silent "no adapter": treating an unrecognized adapter id as the
+// base model would put that adapter's blocks in the default partition, where
+// they alias against every other adapter's identical token content — the exact
+// failure this field exists to prevent. Dropping the batch loses a routing hint
+// (soft state, a cache miss at worst); aliasing returns a wrong hint.
+func decodeLoRAID(raw msgpack.RawMessage) (*int64, error) {
+	if len(raw) == 0 {
+		return nil, nil // a msgpack nil decodes to an empty RawMessage — no adapter
+	}
+	var v interface{}
+	if err := msgpack.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		id := rv.Int()
+		return &id, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		u := rv.Uint()
+		if u > math.MaxInt64 {
+			return nil, fmt.Errorf("lora id %d out of int64 range", u)
+		}
+		id := int64(u)
+		return &id, nil
+	default:
+		return nil, fmt.Errorf("unsupported lora_id type %T", v)
+	}
 }
 
 // decodeTokenIDs decodes the flat token_ids array to uint32 (vLLM token IDs fit in

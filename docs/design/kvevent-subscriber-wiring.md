@@ -112,18 +112,19 @@ Concretely:
   auto-injected sidecars keep the HTTP default. Deferred deliberately: `GetLoads` requires a
   newer engine floor (a gRPC server that implements `GetLoads`; vLLM ≥ 0.19) than the engine currently
   deployed, so auto-wiring it now would point every sidecar at an unimplemented RPC: every
-  scrape would fail, the `StatsReporter` would log and skip each tick, and the ranker would be
-  left with a stale (never-updated) load signal. It gets wired alongside the stats-path knobs
+  scrape would fail and the `StatsReporter` would escalate the loss loudly (its stale-load
+  path) while the ranker falls back to a stale (never-updated) load signal. It gets wired
+  alongside the stats-path knobs
   above once the engine floor moves; until then it is opt-in via the binary flag for
   gRPC-only engine deployments.
 * **TLS subscriber → policy-server** — separate ticket.
 * **HA / multi-server policy-server target** — separate ticket.
 * **Readiness gating on first KV event observed** — natural follow-up once this lands.
 
-## L2 cache tier semantics — `--ignore-block-removed`
+## L2 cache tier semantics — `--ignore-block-removed` and T1/T2 tier tagging
 
 vLLM's KV-event publisher emits `BlockRemoved` on every block eviction from the
-GPU pool. When the engine sits *alone* (no second-tier cache), that eviction is
+HBM pool. When the engine sits *alone* (no second-tier cache), that eviction is
 the prefix becoming unreachable and the cache plane must drop the routing hint
 promptly — the subscriber's default behavior, forwarding `BlockRemoved` as
 `PREFIX_EVICTED`, is exactly right.
@@ -131,27 +132,70 @@ promptly — the subscriber's default behavior, forwarding `BlockRemoved` as
 When the engine is paired with a separate **L2 cache tier** (e.g. LMCache via
 `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1",...}'`) the
 semantics invert. LMCache retains the block after the engine offloads it from
-GPU, so the replica can still serve the prefix cheaply from the L2 tier. The
+HBM, so the replica can still serve the prefix cheaply from the L2 tier. The
 vLLM-emitted `BlockRemoved` no longer means "the prefix is gone"; it means
 "the prefix moved tiers." Forwarding it as `PREFIX_EVICTED` would drop a
 routing hint the replica can still satisfy — the gateway then routes
-elsewhere and the L2 cache hit is wasted. The cache plane should keep the
-entry until its freshness TTL expires; a stale entry yields a cache miss
-(soft state), while a missing entry mis-routes warm traffic away.
+elsewhere and the L2 cache hit is wasted.
 
-The subscriber binary exposes `--ignore-block-removed` (default off, for
-backward compatibility with single-tier deployments). When set the reporter
-drops `BlockRemoved` events without forwarding them; `AllBlocksCleared` and
-`BlockStored` still flow normally. The shared `RenderSubscriberSidecar` helper
+### Tier detection from the block lifecycle (T1 / T2)
+
+The subscriber tags each reported prefix with a **cache tier** (`PrefixEntry.tier`,
+see `grpc-contract.md`) derived from the engine's block lifecycle. The available
+signals are only `BlockStored` / `BlockRemoved` / `AllBlocksCleared`: **vLLM's
+KV-event channel announces the T1 (HBM) lifecycle but emits nothing when
+LMCache offloads a block to L2** — the `LMCacheConnectorV1` offload is invisible
+to the KV-event surface. So T2 is not *directly observable*; it is *inferred*
+from a T1 eviction combined with knowledge that an L2 tier is configured:
+
+- **`BlockStored` → T1.** The block is resident in the engine KV cache (HBM).
+- **`BlockRemoved`, L2 tier present → T2 (downgrade).** The block left HBM but the
+  paired L2 store still holds it, so the subscriber **re-reports the same
+  content-fingerprint key at T2** (reload-able from L2) rather than deleting it.
+  The index applies last-write-wins on tier, moving the entry T1→T2; a later
+  `BlockStored` of the same content re-reports it at T1 (upgrade). The re-report
+  goes on the same additive `ReportCacheState` path as adds, but is flushed at the
+  eviction boundary as its **own** update carrying the eviction timestamp — a
+  `CacheStateUpdate` has a single `timestamp_us` for all its prefixes, so batching
+  the downgrade with a later store in the same debounce window would refresh the
+  T2 entry's freshness away from the eviction. Sending it separately keeps T2
+  freshness anchored at the eviction time (when reload-ability was last confirmed)
+  and preserves store→evict order.
+- **`BlockRemoved`, no L2 tier → delete.** Forward `PREFIX_EVICTED` (the prefix
+  is genuinely gone).
+- **T3 (remote / disaggregated) is out of scope** — no engine signal
+  distinguishes it today; a future ticket can add it if a signal appears.
+
+**A T2 tag is a *prediction of reload-ability*, not confirmation the block is
+actually resident in LMCache.** An offload can silently fail (the block was
+evicted from HBM but never made it to L2), in which case the T2 hint is wrong —
+but routing stays fail-open, so a wrong T2 hint just makes the engine recompute
+the prefix (a cache miss), never a wrong answer. Detecting a silently-degraded
+offload tier is a **separate health concern** (surfaced via the tier-2 reload
+counters `t2_hit_tokens` / `t2_query_tokens` on `ReplicaStats`, see
+`grpc-contract.md`), not this path. This is the deliberate "combine cold
+observation (`BlockRemoved`) with warm prediction (L2 retains it)" model: the
+cache plane keeps a *usable* hint through the HBM→L2 transition instead of going
+blind the moment a warm engine stops emitting `BlockStored`.
+
+### How the subscriber knows it has an L2 tier — `--ignore-block-removed`
+
+The subscriber binary exposes `--ignore-block-removed` (default off). It is the
+existing, least-invasive signal for "this replica has an L2 tier": the flag name
+predates the T2 downgrade (earlier this path simply suppressed the eviction and
+left the entry stale at T1) and is kept for backward compatibility, but the
+signal it carries is unchanged. When set, a `BlockRemoved` becomes a T2 downgrade;
+when unset, it forwards `PREFIX_EVICTED`. `AllBlocksCleared` and `BlockStored`
+flow normally in both modes. The shared `RenderSubscriberSidecar` helper
 (`pkg/adapters/runtime/kvevent_subscriber.go`) — which the vLLM/LMCache,
-vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per integration mode**, because
-the L2 tier is present only in one of them:
+vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per
+integration mode**, because the L2 tier is present only in one of them:
 
 - **`Offload` (default):** the adapter wires the LMCache KV connector (pointed at
   an `lm://` LMCache server or a `mooncakestore://` Mooncake store), so an L2
   tier retains the block after the engine offloads it — `BlockRemoved` means
-  "moved tiers," not "gone." The helper sets `--ignore-block-removed=true` so
-  the hint ages out on its freshness TTL instead of being dropped.
+  "moved tiers," not "gone." The helper sets `--ignore-block-removed=true` so the
+  hint is re-reported at T2 and ages out on its freshness TTL.
 - **`EventsOnly`:** no KV connector is injected, so there is **no** L2 tier
   holding the block. `BlockRemoved` genuinely means the prefix is gone and the
   hint MUST be pruned, so the helper **omits** the flag (subscriber default off,
@@ -161,7 +205,61 @@ the L2 tier is present only in one of them:
   always takes the Offload branch and sets the flag.
 
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
-the flag off for the same reason as `EventsOnly`.
+the flag off for the same reason as `EventsOnly` — their stored prefixes stay
+T1 and a `BlockRemoved` deletes them.
+
+## LoRA adapter identity — `--lora-adapter-names`
+
+The routing key is a **content fingerprint over token IDs only**, so two prompts
+with identical tokens under different LoRA adapters hash identically. The
+subscriber therefore reads `lora_id` off each `BlockStored` event and stamps the
+resolved adapter identity on every reported `PrefixEntry`, so the server can put
+them in disjoint **index partitions** rather than one aliased entry (see
+[`grpc-contract.md`](grpc-contract.md) "Update — adapter (LoRA) index
+partition"). The adapter never enters the hash.
+
+`lora_id` is vLLM's **internal load-order integer**, not a name: the same integer
+can mean different adapters on two replicas whose `--lora-modules` order differs,
+and the index is shared across replicas. `--lora-adapter-names` maps it to the
+stable identity the gateway sends as `LookupRouteRequest.adapter_id`:
+
+```
+--lora-adapter-names "1=sql-lora,2=chat-lora"
+```
+
+- **Unmapped id** → **dropped (fail-closed)**. A non-nil `lora_id` with no
+  mapping has only a replica-local load-order integer, which could alias
+  different adapters across replicas whose load order differs — so its blocks are
+  dropped (not indexed) rather than partitioned under a hazardous `lora:<id>`.
+  The adapter gets no routing hint (a cache miss, never a wrong replica) until it
+  is mapped; supply the map — for adapters **known at startup** — and make the
+  gateway send the matching `adapter_id`.
+- **No LoRA at all** (the default): every event carries a nil `lora_id`, so
+  every entry and eviction lands in the default (`""`) partition — byte-for-byte
+  the pre-adapter behavior. Nothing to configure.
+
+### Limitations of the static flag
+
+`--lora-adapter-names` is resolved once at **startup**, so an adapter it does not
+name is **fail-closed** — its blocks are dropped (uncached), never aliased. That
+trades cache benefit for safety in two cases, both a tracked follow-up:
+
+- **Runtime loads.** An adapter loaded or reloaded *after* the subscriber starts
+  whose id isn't in the map is dropped — a static list can't name it. Covering
+  arbitrary runtime loads needs the subscriber to resolve adapter identity
+  **dynamically** from the engine's adapter registry.
+- **Managed injection.** On the `CacheBackend`-driven path the subscriber
+  sidecar is **injected**, so operators cannot pass the flag on a container they
+  do not define; the explicit-set guidance below applies only to a
+  **self-managed** subscriber. Configuring the mapping through the managed path
+  needs a `CacheBackend` field the webhook forwards.
+
+Neither is a correctness regression — a dropped adapter gets no routing hint (a
+cache miss, never a wrong replica), strictly safer than the alias a replica-local
+`lora:<id>` fallback would risk. For a self-managed subscriber, set
+`--lora-adapter-names` on the container directly: the controller has no view of
+the engine's `--lora-modules` ordering, so multi-adapter engines must supply the
+map explicitly.
 
 ## What this unblocks
 

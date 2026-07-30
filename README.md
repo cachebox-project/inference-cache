@@ -1,6 +1,71 @@
 # inference-cache
 
-A Kubernetes-native cache plane for LLM inference.
+A **vendor-neutral, Kubernetes-native cache-policy control plane for LLM inference.**
+
+inference-cache makes routing **cache-aware**: it tracks which replica already holds a
+prompt's prefix warm and returns that as a routing *hint*, so a gateway can reuse
+KV/prefill instead of recomputing it — cutting time-to-first-token and cost. It
+**orchestrates** existing KV-cache technology (LMCache, Mooncake); it is **not** a new
+distributed cache and **not** the data-plane gateway. Guiding principle — **"we decide
+routing; the gateway follows"**: all routing intelligence lives in the server, and the
+gateway simply tokenizes → calls `LookupRoute` → routes to the returned replica →
+round-robins on `NO_HINT`.
+
+**One request, end to end:** an engine serves a prompt and emits KV-cache events → a
+subscriber sidecar reports them to the server → the in-memory index records
+`(tenant, model, hash_scheme, prefix_hash) → replica` → a later `LookupRoute` returns the
+ranked replicas holding that prefix warm. The plane moves *metadata about where the KV
+lives* — never KV tensors or prompt text. See [`docs/concepts/`](docs/concepts/) for depth.
+
+## Engines and backends
+
+The `(engine, backend)` pair selects a runtime adapter, so supporting a new engine or
+cache backend is adding an adapter — the core API and gRPC contract don't change.
+
+- **Supported today:** the **vLLM** engine with a managed **LMCache** backend (the
+  default; validated end-to-end), or an **External** backend (bring your own endpoint via
+  `spec.type: External` + `spec.externalEndpoint`).
+- **In active development:** the **SGLang** engine (LMCache multiprocess mode) and the
+  **Mooncake** backend (a peer-to-peer transfer-engine mesh).
+
+`spec.integration.engine` is the runtime id (`vllm` default, or `sglang`); `spec.type` is
+the backend (`LMCache` default, `External`, `Mooncake`, …).
+
+## What's Inference Cache?
+
+Inference Cache helps LLM serving systems reuse work that has already been
+computed. It observes which engine replicas hold reusable prompt-prefix KV
+blocks, maintains a cluster-wide view of that cache locality, and returns
+ranked routing hints so a gateway can send each request to a replica likely to
+have the best prefix match.
+
+It also gives operators a Kubernetes-native way to provision shared cache
+backends, connect them to inference engines, and define cache, tenant, and
+prompt policies through CRDs. Its cache index stores metadata rather than
+prompt text or KV tensors, and the cache plane never makes the final routing
+decision. When no useful hint is available, the gateway follows its normal
+routing policy: Inference Cache is designed to fail open.
+
+## Key Features
+
+- **Cache-aware routing hints** — ranks engine replicas by reusable prefix
+  locality, including longest-prefix block-chain matches and affinity fallback
+  for requests without an exact match.
+- **Event-driven cache index** — consumes KV-cache events from inference
+  engines and maintains a metadata-only, cluster-wide view of cached prefixes,
+  replicas, and tenants.
+- **Pluggable engine and backend integration** — adapter-based wiring connects
+  supported inference engines to managed or external cache backends without
+  coupling the core API to one implementation.
+- **Declarative cache policy** — Kubernetes CRDs configure backend lifecycle,
+  lookup behavior, tenant isolation and quotas, and expose observed cache state
+  through familiar status and condition surfaces.
+- **Fail-open request path** — returns advisory routing results that gateways
+  may ignore; missing, stale, timed-out, or unusable cache information never
+  prevents the gateway from following its default routing policy.
+- **Built-in operations surface** — provides health and readiness endpoints,
+  Prometheus metrics and alerts, Kubernetes events, functional probes, and the
+  `inferencecache doctor` diagnostic command.
 
 ## Repository layout
 
@@ -8,7 +73,7 @@ One operator, split across two control-plane binaries (controller + server) plus
 the operator CLI and the CRDs.
 
 **CRDs — the API**
-- `api/v1alpha1/` — Go types (`CacheBackend`; `CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex` as they land) + generated deepcopy
+- `api/v1alpha1/` — Go types for the six v1alpha1 CRDs (`CacheBackend`, `CachePolicy`, `CacheTenant`, `CacheIndex`, `PromptTemplate`, `PDTopology`) + generated deepcopy
 - `config/` — generated CRD, RBAC, and sample manifests
 
 **`inferencecache-controller`** (`cmd/controller`) — watches CRDs and provisions cache backends
@@ -64,9 +129,10 @@ an operator who forgets the flag from accidentally shipping unauthenticated
 ## Cluster Prerequisites
 
 The controller serves admission webhooks — defaulting + validation for
-`CacheBackend`, plus a mutating Pod webhook that auto-injects the LMCache
-engine configuration into pods labeled to match a `CacheBackend`'s
-`spec.engineSelector` — over TLS, so deploying it requires [cert-manager][cm]
+`CacheBackend`, plus a mutating Pod webhook that auto-injects the cache
+engine configuration (chosen by the matched runtime adapter) into pods
+labeled to match a `CacheBackend`'s `spec.engineSelector` — over TLS, so
+deploying it requires [cert-manager][cm]
 v1.0+ in the target cluster. The default install (`config/default`)
 provisions a self-signed `Issuer` plus a `Certificate` for the webhook
 serving cert, and relies on cert-manager's `cert-manager.io/inject-ca-from`
@@ -228,11 +294,14 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 
 ## Documentation
 
-Design docs live under [`docs/`](docs/):
+Docs live under [`docs/`](docs/):
 
-- [`docs/design/cachebackend-api.md`](docs/design/cachebackend-api.md) — the `CacheBackend` CRD contract
-- [`docs/design/grpc-contract.md`](docs/design/grpc-contract.md) — the `InferenceCache` gRPC service contract (B4)
-- [`docs/design/policy-crds.md`](docs/design/policy-crds.md) — policy CRDs (`CachePolicy`, `CacheTenant`, `PromptTemplate`, `PDTopology`, `CacheIndex`)
+- **Concepts** — [`docs/concepts/`](docs/concepts/): engine binding, engine overrides, policy tuning, tenant identity/quota, and the CacheIndex cluster aggregate.
+- **Design** — [`docs/design/`](docs/design/): the [`CacheBackend` CRD contract](docs/design/cachebackend-api.md), the [`InferenceCache` gRPC contract](docs/design/grpc-contract.md), [gRPC TLS](docs/design/grpc-tls.md), [policy CRDs](docs/design/policy-crds.md), [LookupRoute ranking](docs/design/lookuproute-ranking.md), and [KV-event subscriber wiring](docs/design/kvevent-subscriber-wiring.md).
+- **Reference** — [`docs/reference/`](docs/reference/): the [metric surface](docs/reference/metrics.md) and gRPC [reason codes](docs/reference/reason-codes.md).
+- **Operations & observability** — [`docs/operations/`](docs/operations/), the alert runbooks in [`docs/observability/`](docs/observability/), and the [`inferencecache doctor`](docs/cli/doctor.md) preflight CLI.
+- **Reference stack** — [`docs/reference-stack/`](docs/reference-stack/): runnable manifests + a GPU runbook for a full vLLM/LMCache stack.
+- **Quick start** — [`docs/quickstart.md`](docs/quickstart.md).
 
 Contributor guide: [`CONTRIBUTING.md`](CONTRIBUTING.md) (layout, naming rule, push/PR gates).
 

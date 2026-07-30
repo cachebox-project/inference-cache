@@ -5,6 +5,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
 // TestBuildDeploymentRecreateStrategyForHostNetwork covers the rollout strategy a
@@ -42,33 +44,54 @@ func TestBuildDeploymentRecreateStrategyForHostNetwork(t *testing.T) {
 	})
 }
 
-// TestClampHostNetworkToSingleton pins the reconciler's last line of defense.
-// Admission rejects spec.replicas>1 / spec.autoscaling for a host-network backend,
-// but ValidateUpdate only rejects violations an edit *introduces* — an object
-// written before the rule existed stays in etcd with replicas=3 and is never
-// re-validated. Rendering that faithfully would put several masters on the cluster:
-// contending for the same node ports, or splitting the store as independent
-// masters. So the reconciler clamps rather than obeys.
-func TestClampHostNetworkToSingleton(t *testing.T) {
+// TestClampSingletonReplicas pins the reconciler's last line of defense.
+// Admission rejects spec.replicas>1 / spec.autoscaling for a singleton backend, but
+// ValidateUpdate only rejects violations an edit *introduces* — an object written
+// before the rule existed stays in etcd with replicas=3 and is never re-validated.
+// Rendering that faithfully would put several servers on the cluster: host-network
+// masters contending for node ports or splitting the store, or several Redis pods
+// partitioning the (sglang, LMCache) L2 keyspace. So the reconciler clamps rather
+// than obeys — for BOTH singleton reasons.
+func TestClampSingletonReplicas(t *testing.T) {
 	i32 := func(v int32) *int32 { return &v }
+	// sglangLMCache / vllmLMCache: the pair drives singleton-ness on the pod network
+	// (no hostNetwork), so these isolate the (sglang, LMCache) trigger from the
+	// host-network one.
+	sglangLMCache := func() *cachev1alpha1.CacheBackend {
+		cb := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+			Type:        cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"},
+		}}
+		return cb
+	}
+	vllmLMCache := func() *cachev1alpha1.CacheBackend {
+		return &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+			Type:        cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"},
+		}}
+	}
 	for _, tc := range []struct {
 		name        string
+		backend     *cachev1alpha1.CacheBackend
 		hostNetwork bool
 		replicas    *int32
 		want        *int32
 	}{
-		{"GrandfatheredScaleOutIsClamped", true, i32(3), i32(1)},
-		{"SingletonUntouched", true, i32(1), i32(1)},
-		{"DisabledStaysDisabled", true, i32(0), i32(0)},
-		{"NilReplicasUntouched", true, nil, nil},
-		{"PodNetworkScalesFreely", false, i32(3), i32(3)},
+		{"HostNetworkGrandfatheredScaleOutClamped", vllmLMCache(), true, i32(3), i32(1)},
+		{"HostNetworkSingletonUntouched", vllmLMCache(), true, i32(1), i32(1)},
+		{"HostNetworkDisabledStaysDisabled", vllmLMCache(), true, i32(0), i32(0)},
+		{"HostNetworkNilReplicasUntouched", vllmLMCache(), true, nil, nil},
+		{"SGLangRedisGrandfatheredScaleOutClamped", sglangLMCache(), false, i32(3), i32(1)},
+		{"SGLangRedisSingletonUntouched", sglangLMCache(), false, i32(1), i32(1)},
+		{"SGLangRedisDisabledStaysDisabled", sglangLMCache(), false, i32(0), i32(0)},
+		{"VLLMLMCacheScalesFreely", vllmLMCache(), false, i32(3), i32(3)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := &appsv1.DeploymentSpec{
 				Replicas: tc.replicas,
 				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{HostNetwork: tc.hostNetwork}},
 			}
-			clampHostNetworkToSingleton(spec)
+			clampSingletonReplicas(spec, tc.backend)
 			switch {
 			case tc.want == nil && spec.Replicas != nil:
 				t.Fatalf("replicas = %d, want nil", *spec.Replicas)

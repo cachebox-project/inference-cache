@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,11 +106,11 @@ type CacheBackendValidator struct {
 	// at admission time. A nil Registry falls back to
 	// [defaultShippingRegistry], which mirrors the production cmd/controller
 	// wiring: [adapterruntime.DefaultRegistry] plus the External and
-	// SGLang+LMCache adapters (registered explicitly because those
+	// SGLang adapters (registered explicitly because those
 	// subpackages can't be imported by DefaultRegistry without a cycle). The
 	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
 	// (engine, backend) pair the running controller supports, including
-	// External and SGLang+LMCache — so admission doesn't silently reject an
+	// External and SGLang backends — so admission doesn't silently reject an
 	// otherwise-valid CR just because the caller forgot to pass a registry.
 	Registry *adapterruntime.Registry
 }
@@ -116,12 +118,13 @@ type CacheBackendValidator struct {
 // defaultShippingRegistry returns a Registry with every adapter the
 // production cmd/controller wiring installs: the in-package vLLM+LMCache
 // adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
-// External and SGLang+LMCache adapters. Centralised here so the validator's
+// External and SGLang adapters. Centralised here so the validator's
 // nil-Registry fallback admits the same set the running controller does.
 func defaultShippingRegistry() *adapterruntime.Registry {
 	r := adapterruntime.DefaultRegistry()
 	r.Register(externaladapter.NewAdapter())
 	r.Register(sglangadapter.NewAdapter())
+	r.Register(sglangadapter.NewHiCacheAdapter())
 	return r
 }
 
@@ -152,8 +155,178 @@ var DefaultValidationRules = []ValidationRule{
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
 	rejectEventsOnlyMisconfiguration,
+	validateSGLangHiCache,
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
+	rejectSGLangRedisL2ScaleOut,
+}
+
+func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	hiCachePath := field.NewPath("spec", "hiCache")
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
+		if cb.Spec.HiCache != nil {
+			return field.ErrorList{field.Forbidden(
+				hiCachePath,
+				fmt.Sprintf("spec.hiCache is only valid when spec.type=%q", cachev1alpha1.CacheBackendTypeSGLangHiCache),
+			)}
+		}
+		return nil
+	}
+
+	var errs field.ErrorList
+	if cb.Spec.HiCache == nil {
+		errs = append(errs, field.Required(hiCachePath,
+			fmt.Sprintf("required when spec.type=%q", cachev1alpha1.CacheBackendTypeSGLangHiCache)))
+	} else {
+		spec := cb.Spec.HiCache
+		sizePath := hiCachePath.Child("sizeGB")
+		ratioPath := hiCachePath.Child("ratio")
+		switch {
+		case spec.SizeGB == nil && spec.Ratio == "":
+			errs = append(errs, field.Required(hiCachePath,
+				"exactly one of sizeGB and ratio must be set"))
+		case spec.SizeGB != nil && spec.Ratio != "":
+			errs = append(errs, field.Invalid(hiCachePath, spec,
+				"sizeGB and ratio are mutually exclusive"))
+		}
+		if spec.SizeGB != nil && *spec.SizeGB < 1 {
+			errs = append(errs, field.Invalid(sizePath, *spec.SizeGB, "must be at least 1"))
+		}
+		if spec.Ratio != "" {
+			ratio, err := strconv.ParseFloat(spec.Ratio, 64)
+			if err != nil || ratio <= 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+				errs = append(errs, field.Invalid(ratioPath, spec.Ratio,
+					"must be a finite number greater than zero"))
+			}
+		}
+		if !validHiCacheWritePolicy(spec.WritePolicy) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("writePolicy"), spec.WritePolicy,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheWriteBack),
+					string(cachev1alpha1.SGLangHiCacheWriteThrough),
+					string(cachev1alpha1.SGLangHiCacheWriteThroughSelective),
+				},
+			))
+		}
+		if !validHiCacheIOBackend(spec.IOBackend) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("ioBackend"), spec.IOBackend,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheIODirect),
+					string(cachev1alpha1.SGLangHiCacheIOKernel),
+					string(cachev1alpha1.SGLangHiCacheIOKernelAscend),
+				},
+			))
+		}
+		if !validHiCacheMemoryLayout(spec.MemoryLayout) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("memoryLayout"), spec.MemoryLayout,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheMemoryLayerFirst),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirst),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirstDirect),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit),
+					string(cachev1alpha1.SGLangHiCacheMemoryPageHead),
+				},
+			))
+		}
+	}
+
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang {
+		value := ""
+		if cb.Spec.Integration != nil {
+			value = cb.Spec.Integration.Engine
+		}
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "integration", "engine"), value,
+			"SGLangHiCache requires integration.engine=sglang",
+		))
+	}
+	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+		errs = append(errs, field.Required(
+			field.NewPath("spec", "engineSelector", "matchLabels"),
+			"SGLangHiCache must select the engine Pods to inject",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "autoscaling"),
+			"SGLangHiCache is engine-local and has no backend workload to autoscale",
+		))
+	}
+	if cachev1alpha1.IntegrationMode(cb.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
+		errs = append(errs, field.NotSupported(
+			field.NewPath("spec", "integration", "mode"),
+			cb.Spec.Integration.Mode,
+			[]string{string(cachev1alpha1.CacheBackendIntegrationModeOffload)},
+		))
+	}
+	if cb.Spec.Integration != nil {
+		role := cb.Spec.Integration.Role
+		if role != "" && role != cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "integration", "role"),
+				role,
+				[]string{string(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)},
+			))
+		}
+		if !cachev1alpha1.IntegrationFailOpen(cb.Spec.Integration) {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "integration", "failOpen"),
+				false,
+				[]string{"true"},
+			))
+		}
+	}
+	for key := range cb.Spec.BackendConfig {
+		if key != "model" {
+			errs = append(errs, field.NotSupported(
+				field.NewPath("spec", "backendConfig").Key(key),
+				key,
+				[]string{"model"},
+			))
+		}
+	}
+	return errs
+}
+
+func validHiCacheWritePolicy(value cachev1alpha1.SGLangHiCacheWritePolicy) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheWriteBack,
+		cachev1alpha1.SGLangHiCacheWriteThrough,
+		cachev1alpha1.SGLangHiCacheWriteThroughSelective:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHiCacheIOBackend(value cachev1alpha1.SGLangHiCacheIOBackend) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheIODirect,
+		cachev1alpha1.SGLangHiCacheIOKernel,
+		cachev1alpha1.SGLangHiCacheIOKernelAscend:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHiCacheMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheMemoryLayerFirst,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirst,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirstDirect,
+		cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit,
+		cachev1alpha1.SGLangHiCacheMemoryPageHead:
+		return true
+	default:
+		return false
+	}
 }
 
 // rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
@@ -190,6 +363,52 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 	}
 }
 
+// rejectSGLangRedisL2ScaleOut hard-rejects a multi-replica or autoscaled
+// (sglang, LMCache) backend. That pair's managed cache-server is a single plain
+// Redis L2 store (the SGLang MP worker's --l2-adapter target), and a plain Redis is
+// not clustered: a second pod behind the one ClusterIP Service shards the keyspace
+// across independent instances, so a key stored via one is a miss via the other and
+// the L2 silently partitions. The failure looks like a healthy backend with a poor
+// hit rate, so reject at the door rather than warn — the same posture as
+// rejectMooncakeMasterScaleOut (a different singleton for a different reason).
+//
+// Scoped to (sglang, LMCache): vLLM's lm:// server is an ordinary pod-network
+// workload that scales, and other pairs are rejected on their own
+// (checkRuntimeAdapter). spec.replicas 0 (disabled) and 1 (the singleton) remain
+// valid, as is EventsOnly (which provisions no server at all — see the guard).
+// The reconciler's clampSingletonReplicas is the backstop for grandfathered
+// objects. If SGLang's shared tier gains a clustered store, lift this rule.
+func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
+		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	// EventsOnly provisions NO cache server at all (the reconciler sheds any owned
+	// workload and wires only the kvevent-subscriber sidecar), so there is no Redis
+	// L2 to partition and nothing this rule protects. Rejecting scale-out here would
+	// be both factually wrong — the message explains a Redis split that cannot happen
+	// — and gratuitously stricter than the otherwise-identical (vllm, LMCache)
+	// events-only backend. The rule applies to the Offload path, which is what
+	// renders the singleton Redis.
+	if cb.Spec.IsEventsOnly() {
+		return nil
+	}
+	var errs field.ErrorList
+	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
+			"the (sglang, LMCache) backend's Redis L2 store is a single non-clustered instance: a second replica behind the one Service shards the keyspace and silently partitions the cache. Set spec.replicas to 0 or 1.",
+		))
+	}
+	if cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
+			"spec.autoscaling is not supported for the (sglang, LMCache) backend: its Redis L2 store is a single non-clustered instance, so scaling it out partitions the cache across independent keyspaces. Remove spec.autoscaling.",
+		))
+	}
+	return errs
+}
+
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
 // inferencecache.io/lmcache-kernel-check annotation. The annotation is the
 // operator's opt-in surface for the engine-side kernel check (auto /
@@ -222,7 +441,7 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
 // [defaultShippingRegistry] (DefaultRegistry plus the External and
-// SGLang+LMCache adapters), mirroring cmd/controller's production wiring so a zero-value validator
+// SGLang adapters), mirroring cmd/controller's production wiring so a zero-value validator
 // sees the same adapter set the running controller does. cmd/controller
 // threads the same instance the reconciler + pod webhook receive so all
 // three layers agree on what's supported.
@@ -320,7 +539,6 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 	var w admission.Warnings
 	w = append(w, warnMooncakeEngineHostNetwork(cb)...)
-	w = append(w, warnSGLangLMCacheDataPlaneUnverified(cb)...)
 	return w
 }
 
@@ -357,42 +575,10 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 	return admission.Warnings{mooncakeEngineHostNetworkWarning}
 }
 
-// sglangLMCacheDataPlaneWarning flags the one thing GPU validation surfaced about
-// the (sglang, LMCache) pair: it is wired by analogy to (vllm, LMCache) — a
-// standalone lm:// server the engine reaches over LMCACHE_REMOTE_URL — but SGLang's
-// LMCache integration does NOT work that way. SGLang drives LMCache through its
-// LMCacheLayerwiseConnector in MULTIPROCESS (MP) mode: config is read from the
-// --lmcache-config-file flag (the LMCACHE_* env this adapter injects is ignored),
-// the transfer is node-local (mp_host/mp_port + pointer/shared-memory), and pointing
-// it at a bare remote lm:// URL leaves the engine hung at startup rather than
-// caching. So the pair can reconcile Ready while the data plane does nothing.
-//
-// This is advisory (not a reject) because the correct wiring — MP-mode config file,
-// per-node worker — is a follow-up that must be built and GPU-validated, and a hard
-// reject would strand operators who set up MP mode by hand. Say it out loud at apply
-// time so the lm:// wiring isn't mistaken for a working cache. Text stays within
-// [maxWarningLen]; the full rationale lives in docs/design/cachebackend-api.md
-// (the SGLang engine support section's KNOWN LIMITATION note).
-const sglangLMCacheDataPlaneWarning = "SGLang+LMCache offload misconfigured: SGLang needs LMCache MP mode, not this lm:// server (may hang or not cache)"
-
-// warnSGLangLMCacheDataPlaneUnverified fires for every (sglang, LMCache) backend
-// that actually wires an offload — i.e. all of them EXCEPT events-only, which
-// injects no LMCache connector at all (so there is no lm://-vs-MP mismatch to warn
-// about). Unlike the Mooncake warning there is no per-field opt-in that closes the
-// gap for an offload backend; the whole pairing is wired to the wrong LMCache mode.
-// Scoped by the same (runtime, type) test as [rejectUnsupportedSGLangRole].
-func warnSGLangLMCacheDataPlaneUnverified(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
-		return nil
-	}
-	if cb.Spec.IsEventsOnly() {
-		// Events-only (tier-1 routing) injects NO LMCache connector — it only wires
-		// the observation sidecar — so the lm://-vs-MP mismatch simply isn't present.
-		return nil
-	}
-	return admission.Warnings{sglangLMCacheDataPlaneWarning}
-}
+// The (sglang, LMCache) pair no longer needs an advisory warning: the adapter now
+// renders the working LMCache MP-mode data plane (a node-local MP-worker sidecar +
+// config-file wire offloading to the managed Redis L2), so there is no lm://-vs-MP
+// mismatch left to flag. See docs/design/sglang-lmcache-mp-mode.md.
 
 // rejectEngineHostNetworkOnBackendThatDoesNotNeedIt keeps
 // spec.integration.engineHostNetwork from sitting inert. Only Mooncake's
