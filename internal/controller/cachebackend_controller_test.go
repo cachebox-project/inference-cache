@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1279,7 +1280,41 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 			if ready.Reason != "ExternalEndpointInvalid" {
 				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
 			}
+			if !strings.Contains(ready.Message, "spec.endpoint") {
+				t.Fatalf("Ready message = %q, want legacy field spec.endpoint", ready.Message)
+			}
 		})
+	}
+}
+
+func TestReconcileCanonicalExternalInvalidEndpointNamesCanonicalField(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "canonical-ext-bad", Namespace: "default"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "https://cache.example.com:443/api",
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "ExternalEndpointInvalid" {
+		t.Fatalf("Ready condition = %+v, want False/ExternalEndpointInvalid", ready)
+	}
+	if !strings.Contains(ready.Message, "spec.remoteStorage.endpoint") {
+		t.Fatalf("Ready message = %q, want canonical field spec.remoteStorage.endpoint", ready.Message)
+	}
+	if strings.Contains(ready.Message, "spec.endpoint") {
+		t.Fatalf("Ready message = %q, must not name deprecated spec.endpoint", ready.Message)
 	}
 }
 

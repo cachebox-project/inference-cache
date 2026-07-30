@@ -603,14 +603,18 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			readyMsg = "the external remote-storage endpoint is empty"
 		default:
 			// Use the same shape validator the admission webhook
-			// uses; surface the helper's message verbatim so an
+			// uses; prefix the helper's message with the active API
+			// field so an
 			// operator running kubectl describe sees the same
 			// shape complaint they would get on a fresh kubectl
-			// apply. Pass the raw spec.Endpoint so the helper
-			// applies its own TrimSpace consistently.
+			// apply.
 			if err := adapterruntime.ValidateLMCacheEndpoint(endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
-				readyMsg = "spec." + err.Error()
+				fieldPrefix := "spec."
+				if backend.Spec.UsesCanonicalCacheHierarchy() {
+					fieldPrefix = "spec.remoteStorage."
+				}
+				readyMsg = fieldPrefix + err.Error()
 				break
 			}
 			readyStatus = metav1.ConditionTrue
