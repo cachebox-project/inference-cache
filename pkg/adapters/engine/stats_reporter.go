@@ -9,8 +9,8 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
-// statsScraper is the dependency a StatsReporter takes. *MetricsScraper
-// implements it; tests pass stubs.
+// statsScraper is the dependency a StatsReporter takes. *MetricsScraper and
+// *GRPCLoadsScraper implement it; tests pass stubs.
 type statsScraper interface {
 	Scrape(ctx context.Context) (*icpb.ReplicaStats, error)
 }

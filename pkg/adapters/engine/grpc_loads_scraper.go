@@ -154,8 +154,9 @@ func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, erro
 
 // finite01 clamps a raw engine-reported ratio into [0,1], mapping non-finite
 // (NaN / ±Inf) values to 0. clamp01 alone would pass NaN through (NaN compares
-// false against both bounds), so this guards the external GetLoads values that
-// feed cache_memory_bytes and hit_rate.
+// false against both bounds), so this guards the external token_usage value that
+// feeds cache_memory_bytes. (hit_rate is sanitized separately: a non-finite rank
+// is excluded from its mean rather than mapped to 0.)
 func finite01(v float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0
