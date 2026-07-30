@@ -208,9 +208,21 @@ Limits-only shapes admit unchanged for any resource — K8s auto-populates `requ
 
 ### backendConfig keys (managed LMCache)
 
-`spec.backendConfig` is a free-form string map. The two LMCache engines render **different** cache servers: the **vLLM** adapter renders the standalone `lm://` lmcache-server via the shared rendering (`pkg/adapters/runtime/lmcache_shared.go`), while **SGLang** (MP mode) renders a **Redis L2** store (`ResolveRedisL2Server`) — so the server-side keys below apply per engine, not to both. Each engine adapter (`pkg/adapters/runtime/vllm_lmcache.go` for vLLM, `pkg/adapters/runtime/sglang` for SGLang) also recognizes its own **engine-side wire** the [mutating Pod admission webhook](#mutating-pod-webhook-engine-wiring) injects. Defaults are overridable until they are promoted to first-class spec fields.
+`spec.backendConfig` is a **deprecated, legacy-only** free-form string map.
+Canonical resources must instead select the provider explicitly with
+`spec.remoteStorage` and configure it under `remoteStorage.redis`,
+`remoteStorage.lmCacheServer`, or `remoteStorage.mooncake`; engine-side LMCache
+settings live under `spec.lmCache`, and observation settings under
+`spec.observation`. Admission rejects `backendConfig` on canonical resources so
+the map cannot silently compete with those typed owners.
 
-Server-side (consumed by `ResolveCacheServer` when rendering the cache-server pod):
+The tables below document only the compatibility keys still read from legacy
+resources. Under that legacy shape, the vLLM adapter chooses the standalone
+`lm://` LMCache server and the SGLang MP adapter chooses Redis L2. Canonical
+resources make that ownership choice directly and do not inherit these map
+values.
+
+Legacy server-side keys (consumed while rendering the selected provider pod):
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -218,7 +230,7 @@ Server-side (consumed by `ResolveCacheServer` when rendering the cache-server po
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
 | `redisImage` | `docker.io/library/redis:7.4-alpine` *(versioned default, mutable within its patch line; digest-pin in prod)* | **SGLang only.** Container image for the managed **Redis L2 store** the SGLang LMCache MP worker offloads to (its `resp` `--l2-adapter`); rendered by `ResolveRedisL2Server` for the `(sglang, LMCache)` pair. `lm://` is not a valid MP `--l2-adapter` type, so SGLang cannot reuse the standalone lmcache-server. Production **must** pin an exact release or `@sha256:` digest. |
 
-Engine-side (consumed by `InjectEngineConfig` when the webhook wires a managed-LMCache engine pod to the cache). The `LMCACHE_*` tunables below are the **vLLM** engine-side env; **SGLang MP mode does not use them** — it tunes the MP worker via `chunkSize` / `l1SizeGB` / `mpPort` / `workerImage` instead (the numeric ones positive-integer-sanitized), see [SGLang engine support](#sglang-engine-support):
+Legacy engine-side keys (consumed by `InjectEngineConfig`). The `LMCACHE_*` tunables below are the **vLLM** engine-side env; **SGLang MP mode does not use them** — it tunes the MP worker via `chunkSize` / `l1SizeGB` / `mpPort` / `workerImage` instead (the numeric ones positive-integer-sanitized), see [SGLang engine support](#sglang-engine-support). Canonical equivalents belong under `spec.lmCache` or, for non-reserved environment tuning, `spec.integration.engineOverrides`:
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -774,7 +786,7 @@ The vLLM+Mooncake adapter (`pkg/adapters/runtime/vllm_mooncake.go`) reserves the
 
 The SGLang+LMCache adapter (`pkg/adapters/runtime/sglang`) reserves a **different** set, because SGLang's engine-side wire is the LMCache MP wire, not the `lm://` one (see [SGLang engine support](#sglang-engine-support)): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing `--lmcache-config-file` un-wires MP mode (the engine aborts at startup without it), hence its reservation. In MP mode the lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved, and `VLLM_USE_V1` / `PYTHONHASHSEED` are never injected for SGLang. Reservation is per-adapter precisely so each engine guards only the flags/env its own integration cannot function without.
 
-`LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. (`spec.backendConfig` already exposes them; `engineOverrides.env` is the engine-agnostic seam future engines without a per-key map will reach for.)
+`LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. Canonical chunk size, serializer, and host-memory capacity use `spec.lmCache`; `engineOverrides.env` remains the engine-agnostic seam for explicit environment-level tuning.
 
 #### Shape rationale (A vs. B)
 

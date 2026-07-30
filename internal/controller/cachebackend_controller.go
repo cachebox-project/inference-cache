@@ -389,10 +389,12 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return result, err
 }
 
-// dispatch routes a CacheBackend to the right reconcile path. External backends
-// only mirror their configured endpoint to status; unsupported / deferred kinds
-// shed any previously managed workload; LMCache (Phase 1) templates a
-// Deployment + Service.
+// dispatch routes a CacheBackend by integration mode and effective remote
+// storage ownership. EventsOnly and canonical host-only configurations shed
+// managed provider workloads; External storage mirrors its configured endpoint
+// to status; Managed Redis, LMCacheServer, and Mooncake storage is rendered by
+// the selected runtime/provider adapter. Unsupported combinations also shed any
+// previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	registry := r.Registry
 	if registry == nil {
