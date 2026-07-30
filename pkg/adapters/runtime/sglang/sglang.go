@@ -7,6 +7,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -107,7 +108,7 @@ func (adapter) SupportedPairs() []runtimeadapter.SupportedPair {
 // ResolveCacheServer is the pre-separation compatibility renderer. Production
 // provider lifecycle resolves through pkg/adapters/backend/provider instead.
 func (adapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return runtimeadapter.ResolveRedisL2Server(cache)
+	return provideradapter.ResolveRedisL2Server(cache)
 }
 
 // InjectEngineConfig renders SGLang's LMCache MP-mode launch surface, merging with

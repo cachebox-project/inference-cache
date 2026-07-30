@@ -186,10 +186,11 @@ with three constraints the design must honor:
   killer, reclaims space.
 
 It listens on ClusterIP `:6379` and `status.endpoint` becomes the Redis Service
-DNS. This replaces the `lm://` lmcache-server render (`ResolveLMCacheServer`) for
-the SGLang pair only — vLLM keeps `lm://`. Redis is a shared, network-addressable
-store that fits the one-Service, engines-anywhere model exactly (unlike Mooncake's
-mesh), so **no `hostNetwork` is required for the L2**.
+DNS. The provider-owned Redis renderer replaces the provider-owned `lm://`
+lmcache-server renderer for the SGLang pair only — vLLM keeps `lm://`. Redis is
+a shared, network-addressable store that fits the one-Service, engines-anywhere
+model exactly (unlike Mooncake's mesh), so **no `hostNetwork` is required for
+the L2**.
 
 ### `InjectEngineConfig` → MP-worker native sidecar (writes its own config) + engine wire
 

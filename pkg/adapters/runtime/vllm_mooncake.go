@@ -1,111 +1,17 @@
 package runtime
 
 import (
-	"fmt"
-	"strings"
-
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
-// vLLM+Mooncake canonical defaults. These template a standalone Mooncake store
-// "master" pod that vLLM engines connect to via
-// LMCACHE_REMOTE_URL=mooncakestore://<svc>:<rpc-port>. Mooncake is integrated
-// as an LMCache *remote backend* (the durable, network-addressable store the
-// project designates the shared/scalable path — see
-// docs/design/lmcache-server-persistence.md): the engine runs the
-// ordinary LMCache connector — see [enginewire.InjectVLLMMooncake] — pointed at
-// the mooncakestore:// scheme, so the only thing that distinguishes this
-// adapter from the vLLM+LMCache adapter on the engine side is the remote-URL
-// scheme. The server side, by contrast, is entirely Mooncake's own: a
-// mooncake_master process (RPC + an embedded HTTP metadata server) rather than
-// an lmcache-server.
-//
-// Canonical resources override these defaults through the typed
-// remoteStorage.mooncake image, command, and resources fields. Deprecated
-// BackendConfig keys remain readable only for legacy resources.
-const (
-	// defaultMooncakeMasterImage is the upstream Mooncake image, pinned to a
-	// specific version rather than a floating :latest.
-	//
-	// kvcacheai/mooncake:0.3.11.post1 is the only version tag published on
-	// Docker Hub (https://hub.docker.com/r/kvcacheai/mooncake) and matches the
-	// mooncake-transfer-engine 0.3.11.post1 release on PyPI, so the master and
-	// the engine-side transfer-engine client are version-aligned when the
-	// operator pins the engine's pip package to the same release. Pinning off
-	// :latest removes the silent-drift risk a floating tag carries between the
-	// master and the client (a mismatched wire protocol disables tier-2 offload
-	// silently — the same failure class documented for LMCache in
-	// docs/design/cachebackend-api.md).
-	//
-	// Overridable via remoteStorage.mooncake.image (production should pin a
-	// digest there); legacy resources retain backendConfig.serverImage.
-	//
-	// The reference is FULLY QUALIFIED (docker.io/...) on purpose: a CRI-O node
-	// without short-name resolution configured (registry aliases or an
-	// unqualified-search-registries list — the common default) rejects a bare
-	// short name ("short-name … did not resolve to an alias, and no
-	// containers-registries.conf was found"), so an unqualified default
-	// ImagePullBackOffs there. containerd resolves short names against
-	// docker.io by default, but the explicit registry is safe on both.
-	//
-	// TODO(cachebox): digest-pin before production. That `mooncake_master` is on
-	// PATH and the RPC / metadata / metrics ports (50051 / 8080 / 9003) match
-	// what this adapter renders are confirmed against the real image on a live
-	// cluster (the master boots and reaches serving); the remaining hardening is
-	// an @sha256: digest here. Do not substitute an invented digest.
-	//
-	// This default fails SAFE, not silently: if the image is wrong (no
-	// `mooncake_master` on PATH, different flags/ports) the master pod
-	// CrashLoops / ImagePullBackOffs, the managed Deployment never reports
-	// Available, and the RPC-port readiness probe below keeps the CacheBackend
-	// at Ready=False (RolloutInProgress / ReplicasUnavailable) — the operator
-	// sees the breakage in `kubectl get cachebackend`, not a green-but-dead
-	// backend. And because the cache is fail-open, engines fall back to local
-	// prefill regardless, so a broken master is never a serving outage. An
-	// operator can repoint to a known-good image/digest via
-	// remoteStorage.mooncake.image without a code change (or the deprecated
-	// backendConfig.serverImage on a legacy resource).
-	defaultMooncakeMasterImage = "docker.io/kvcacheai/mooncake:0.3.11.post1"
-
-	// defaultMooncakeMasterRPCPort is the Mooncake master's RPC port — the
-	// address vLLM's LMCache connector dials via the mooncakestore:// URL.
-	// 50051 is the master's documented default (--rpc_port).
-	defaultMooncakeMasterRPCPort = int32(50051)
-	// defaultMooncakeMetadataPort is the master's embedded HTTP metadata
-	// server port (--http_metadata_server_port). The Mooncake transfer engine
-	// can use this instead of an external etcd/redis metadata service.
-	defaultMooncakeMetadataPort = int32(8080)
-	// defaultMooncakeMetricsPort is the master's Prometheus metrics port
-	// (--metrics_port default 9003). Exposed as a container port for scraping;
-	// not part of the engine wire.
-	defaultMooncakeMetricsPort = int32(9003)
-	// defaultMooncakeMasterHost is the bind address inside the pod for the
-	// embedded HTTP metadata server.
-	defaultMooncakeMasterHost = "0.0.0.0"
-
-	// Port names other parts of the system can address without hard-coding the
-	// integer. The RPC port name is the readiness-probe + Service-endpoint
-	// target. K8s caps container/Service port names at 15 characters, so the
-	// metrics port drops the "mooncake-" prefix to stay within the limit.
-	mooncakeRPCPortName      = "mooncake-rpc"
-	mooncakeMetadataPortName = "mooncake-meta"
-	mooncakeMetricsPortName  = "metrics"
-
-	// mooncakeMasterContainerName is the canonical name of the master
-	// container the adapter renders.
-	mooncakeMasterContainerName = "mooncake-master"
-)
-
 // vllmMooncakeAdapter wires vLLM engine pods to the Mooncake store that
-// CacheBackend (type=Mooncake) provisions. ResolveCacheServer renders a
-// standalone mooncake_master pod + Service (the engine connects to it via
-// LMCACHE_REMOTE_URL=mooncakestore://<svc>:50051); InjectEngineConfig adds the
-// --kv-transfer-config arg and the LMCACHE_* env vars to the vLLM container via
-// the shared LMCache-connector wire (merging, never clobbering);
+// a provider adapter resolves. InjectEngineConfig adds the --kv-transfer-config
+// arg and LMCACHE_* env vars to the vLLM container via the shared
+// LMCache-connector wire (merging, never clobbering);
 // ObservationSidecar returns the same kvevent-subscriber container the LMCache
 // adapter does (the KV-event stream is engine-side, so the sidecar shape is
 // identical) so the engine pod auto-attaches to the policy server with no
@@ -213,105 +119,7 @@ func (vllmMooncakeAdapter) EngineContainerName() string { return EngineContainer
 // ResolveCacheServer is the pre-separation compatibility renderer. Production
 // provider lifecycle resolves through pkg/adapters/backend/provider.
 func (vllmMooncakeAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return ResolveMooncakeServer(cache)
-}
-
-// ResolveMooncakeServer renders the provider-owned Mooncake master workload.
-// Runtime adapters retain the method above for source compatibility, while the
-// controller resolves this function through the independent storage-provider
-// registry.
-func ResolveMooncakeServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	if cache == nil {
-		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
-	}
-	cfg := legacyProviderConfig(cache)
-	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, cfgKeyServerImage, defaultMooncakeMasterImage)
-
-	command, args := mooncakeMasterCommand(cfg)
-	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderMooncake); len(typed) > 0 {
-		command, args = typed[:1], typed[1:]
-	}
-	container := corev1.Container{
-		Name:            mooncakeMasterContainerName,
-		Image:           image,
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         command,
-		Args:            args,
-		Ports: []corev1.ContainerPort{
-			// RPC first — it is the mooncakestore:// endpoint the engine dials
-			// and the port serviceEndpoint publishes into status.endpoint.
-			{Name: mooncakeRPCPortName, ContainerPort: defaultMooncakeMasterRPCPort, Protocol: corev1.ProtocolTCP},
-			{Name: mooncakeMetadataPortName, ContainerPort: defaultMooncakeMetadataPort, Protocol: corev1.ProtocolTCP},
-			{Name: mooncakeMetricsPortName, ContainerPort: defaultMooncakeMetricsPort, Protocol: corev1.ProtocolTCP},
-		},
-		// A TCP-socket readiness probe on the RPC port gates AvailableReplicas
-		// (and therefore the CacheBackend's Ready condition, via managedReadiness)
-		// on the Mooncake master actually accepting connections — otherwise
-		// status could flip Ready before the store is reachable.
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(mooncakeRPCPortName)},
-			},
-			InitialDelaySeconds: 5,
-			PeriodSeconds:       10,
-			FailureThreshold:    6,
-		},
-		// Resources come from the Mooncake provider block (or legacy
-		// spec.resources), with the same bounded default and autoscaling CPU
-		// request fallback the LMCache server uses.
-		Resources: defaultServerResources(cache),
-	}
-
-	// Mooncake's transfer engine is a peer-to-peer MESH, not a single-endpoint
-	// server like LMCache's lm://. The master on :50051 returns only a directory
-	// pointer ("block X lives on node B:<dynamic port>"); the engine then dials
-	// that node's real IP on a dynamically negotiated port to move the KV bytes.
-	// A ClusterIP Service forwards only the ports declared on it, and CNI overlay
-	// pod IPs are not reachable for the mesh — so an overlay+ClusterIP master
-	// transfers ZERO KV while the CacheBackend still reports Ready (the master's
-	// key count never leaves 0). The master therefore runs on the host network,
-	// and the Service below is headless so its DNS name resolves straight to the
-	// node IP with every mooncake port reachable.
-	//
-	// The cost is inherent to Mooncake, not a choice this adapter can avoid:
-	// hostNetwork needs a namespace that permits it (Pod Security "restricted"
-	// forbids it) and reserves the master's ports on its node.
-	pod := &corev1.PodSpec{
-		Containers:  []corev1.Container{container},
-		HostNetwork: true,
-		// hostNetwork pods otherwise inherit the node's resolver; keep cluster DNS
-		// so in-cluster names still resolve from the master.
-		DNSPolicy: corev1.DNSClusterFirstWithHostNet,
-	}
-
-	svc := &corev1.Service{
-		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeClusterIP,
-			// HEADLESS (clusterIP: None). A ClusterIP virtual IP forwards only the
-			// ports declared below, stranding mooncake's dynamically negotiated data
-			// ports. Headless makes this Service's DNS name resolve directly to the
-			// (hostNetwork) master pod's IP — i.e. the node IP — with all ports
-			// reachable. serviceEndpoint() already publishes that DNS name into
-			// status.endpoint, so the engine's mooncakestore:// URL needs no
-			// special-casing, and the endpoint survives a master reschedule.
-			ClusterIP: corev1.ClusterIPNone,
-			Ports: []corev1.ServicePort{
-				{
-					Name:       mooncakeRPCPortName,
-					Port:       defaultMooncakeMasterRPCPort,
-					TargetPort: intstr.FromString(mooncakeRPCPortName),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       mooncakeMetadataPortName,
-					Port:       defaultMooncakeMetadataPort,
-					TargetPort: intstr.FromString(mooncakeMetadataPortName),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-		},
-	}
-	return pod, svc, nil
+	return provideradapter.ResolveMooncakeServer(cache)
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
@@ -385,42 +193,6 @@ func (a vllmMooncakeAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBacken
 		HashScheme:       subscriberHashScheme,
 		EngineZMQPortStr: defaultEngineZMQPortStr,
 	})
-}
-
-// mooncakeMasterCommand returns the Mooncake master command + args, with a
-// single BackendConfig override hook (cfgKeyServerCommand) for operators who
-// need to change the master's flags (a different metadata backend, HA mode,
-// etc.). The default launches the master with its RPC port, Prometheus metrics
-// port, and the embedded HTTP metadata server so the simplest deployment needs
-// no external etcd/redis.
-//
-// PORT CONSTRAINT: the override MUST keep the RPC port at
-// [defaultMooncakeMasterRPCPort] (50051) and the HTTP metadata port at
-// [defaultMooncakeMetadataPort] (8080). [ResolveCacheServer] pins the Service
-// ports, the container ports, the readiness probe, and (via the reconciler's
-// serviceEndpoint) status.endpoint to those two values — they are NOT derived
-// from this command string, because a free-form command can't be reliably
-// parsed for flag values. So an override that changes `--rpc_port` or
-// `--http_metadata_server_port` desyncs the master from the Service: the
-// readiness probe and engine wire would target dead ports and the backend
-// would stay Ready=False. Change the metadata backend / HA flags here freely;
-// do NOT change the ports. (Synchronized port config — backendConfig keys that
-// drive both the command and the Service — is a deliberate non-goal for
-// v1alpha1; the LMCache adapter's serverCommand carries the same constraint.)
-func mooncakeMasterCommand(cfg map[string]string) (command, args []string) {
-	if raw := enginewire.ConfigOr(cfg, cfgKeyServerCommand, ""); raw != "" {
-		fields := strings.Fields(raw)
-		if len(fields) > 0 {
-			return []string{fields[0]}, fields[1:]
-		}
-	}
-	return []string{"mooncake_master"}, []string{
-		fmt.Sprintf("--rpc_port=%d", defaultMooncakeMasterRPCPort),
-		fmt.Sprintf("--metrics_port=%d", defaultMooncakeMetricsPort),
-		"--enable_http_metadata_server=true",
-		"--http_metadata_server_host=" + defaultMooncakeMasterHost,
-		fmt.Sprintf("--http_metadata_server_port=%d", defaultMooncakeMetadataPort),
-	}
 }
 
 // Compile-time assertion: the adapter implements the full C5 interface.

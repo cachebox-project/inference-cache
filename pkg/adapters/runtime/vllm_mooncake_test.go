@@ -73,11 +73,11 @@ func TestVLLMMooncakeResolveCacheServer(t *testing.T) {
 		t.Fatalf("pod containers = %d, want 1", len(pod.Containers))
 	}
 	c := pod.Containers[0]
-	if c.Name != mooncakeMasterContainerName {
-		t.Fatalf("container name = %q, want %q", c.Name, mooncakeMasterContainerName)
+	if c.Name != "mooncake-master" {
+		t.Fatalf("container name = %q, want mooncake-master", c.Name)
 	}
-	if c.Image != defaultMooncakeMasterImage {
-		t.Fatalf("image = %q, want %q", c.Image, defaultMooncakeMasterImage)
+	if c.Image != "docker.io/kvcacheai/mooncake:0.3.11.post1" {
+		t.Fatalf("image = %q, want pinned Mooncake default", c.Image)
 	}
 	if len(c.Command) != 1 || c.Command[0] != "mooncake_master" {
 		t.Fatalf("command = %v, want [mooncake_master]", c.Command)
@@ -98,31 +98,31 @@ func TestVLLMMooncakeResolveCacheServer(t *testing.T) {
 	// the reconciler's serviceEndpoint helper formats status.endpoint from the
 	// Service's first port, and the engine must dial the master's RPC port
 	// (mooncakestore://), not the metadata port.
-	if len(c.Ports) == 0 || c.Ports[0].Name != mooncakeRPCPortName || c.Ports[0].ContainerPort != defaultMooncakeMasterRPCPort {
-		t.Fatalf("first container port = %+v, want %s/%d", c.Ports, mooncakeRPCPortName, defaultMooncakeMasterRPCPort)
+	if len(c.Ports) == 0 || c.Ports[0].Name != "mooncake-rpc" || c.Ports[0].ContainerPort != 50051 {
+		t.Fatalf("first container port = %+v, want mooncake-rpc/50051", c.Ports)
 	}
-	if !hasContainerPort(c.Ports, mooncakeMetadataPortName, defaultMooncakeMetadataPort) {
+	if !hasContainerPort(c.Ports, "mooncake-meta", 8080) {
 		t.Fatalf("metadata container port missing; ports = %+v", c.Ports)
 	}
-	if !hasContainerPort(c.Ports, mooncakeMetricsPortName, defaultMooncakeMetricsPort) {
+	if !hasContainerPort(c.Ports, "metrics", 9003) {
 		t.Fatalf("metrics container port missing; ports = %+v", c.Ports)
 	}
 
 	if c.ReadinessProbe == nil || c.ReadinessProbe.TCPSocket == nil ||
-		c.ReadinessProbe.TCPSocket.Port.StrVal != mooncakeRPCPortName {
-		t.Fatalf("readiness probe = %+v, want TCPSocket on %q", c.ReadinessProbe, mooncakeRPCPortName)
+		c.ReadinessProbe.TCPSocket.Port.StrVal != "mooncake-rpc" {
+		t.Fatalf("readiness probe = %+v, want TCPSocket on mooncake-rpc", c.ReadinessProbe)
 	}
 
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
 	}
-	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Name != mooncakeRPCPortName ||
-		svc.Spec.Ports[0].Port != defaultMooncakeMasterRPCPort {
-		t.Fatalf("first service port = %+v, want %s/%d (serviceEndpoint uses Ports[0])",
-			svc.Spec.Ports, mooncakeRPCPortName, defaultMooncakeMasterRPCPort)
+	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Name != "mooncake-rpc" ||
+		svc.Spec.Ports[0].Port != 50051 {
+		t.Fatalf("first service port = %+v, want mooncake-rpc/50051 (serviceEndpoint uses Ports[0])",
+			svc.Spec.Ports)
 	}
-	if svc.Spec.Ports[0].TargetPort.StrVal != mooncakeRPCPortName {
-		t.Fatalf("first service targetPort = %v, want %q", svc.Spec.Ports[0].TargetPort, mooncakeRPCPortName)
+	if svc.Spec.Ports[0].TargetPort.StrVal != "mooncake-rpc" {
+		t.Fatalf("first service targetPort = %v, want mooncake-rpc", svc.Spec.Ports[0].TargetPort)
 	}
 }
 
@@ -171,7 +171,7 @@ func hasContainerPort(ports []corev1.ContainerPort, name string, port int32) boo
 
 func TestVLLMMooncakeResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMMooncakeAdapter()
-	cb := newMooncakeBackend(map[string]string{cfgKeyServerImage: "registry.example.com/mooncake@sha256:abc"})
+	cb := newMooncakeBackend(map[string]string{"serverImage": "registry.example.com/mooncake@sha256:abc"})
 	pod := resolvePod(t, a, cb)
 	if got := pod.Containers[0].Image; got != "registry.example.com/mooncake@sha256:abc" {
 		t.Fatalf("image override ignored: got %q", got)
@@ -179,22 +179,24 @@ func TestVLLMMooncakeResolveCacheServerImageOverride(t *testing.T) {
 }
 
 // TestVLLMMooncakeDefaultImageFullyQualified guards against a regression to a
-// bare short name in defaultMooncakeMasterImage. A CRI-O node without short-name
+// bare short name in the default Mooncake image. A CRI-O node without short-name
 // resolution configured rejects short names ("short-name … did not resolve to an
 // alias"), so the default MUST carry an explicit registry host (e.g.
 // docker.io/...). containerd resolves short names by default, but a
 // fully-qualified reference is safe on both.
 func TestVLLMMooncakeDefaultImageFullyQualified(t *testing.T) {
-	registry, rest, ok := strings.Cut(defaultMooncakeMasterImage, "/")
+	pod := resolvePod(t, NewVLLMMooncakeAdapter(), newMooncakeBackend(nil))
+	defaultImage := pod.Containers[0].Image
+	registry, rest, ok := strings.Cut(defaultImage, "/")
 	if !ok {
-		t.Fatalf("default image %q has no registry host (no %q separator)", defaultMooncakeMasterImage, "/")
+		t.Fatalf("default image %q has no registry host (no %q separator)", defaultImage, "/")
 	}
 	// A reference is fully qualified when the segment before the first slash is a
 	// registry host: it contains a '.' or ':' (host[:port]) or is "localhost".
 	if !strings.ContainsAny(registry, ".:") && registry != "localhost" {
 		t.Fatalf("default image %q is a short name (registry segment %q is not a host, path %q); "+
 			"CRI-O without short-name resolution configured rejects it — fully-qualify it (e.g. docker.io/...)",
-			defaultMooncakeMasterImage, registry, rest)
+			defaultImage, registry, rest)
 	}
 }
 
@@ -204,7 +206,7 @@ func TestVLLMMooncakeResolveCacheServerCommandOverride(t *testing.T) {
 	// to change the pinned RPC/metadata ports via serverCommand (the Service +
 	// status.endpoint are fixed to them), so the test must not normalize that
 	// footgun. A verbosity flag is a harmless, representative override.
-	cb := newMooncakeBackend(map[string]string{cfgKeyServerCommand: "mooncake_master --v=1"})
+	cb := newMooncakeBackend(map[string]string{"serverCommand": "mooncake_master --v=1"})
 	pod := resolvePod(t, a, cb)
 	c := pod.Containers[0]
 	if len(c.Command) != 1 || c.Command[0] != "mooncake_master" {

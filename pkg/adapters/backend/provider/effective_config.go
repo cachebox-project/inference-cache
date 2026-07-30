@@ -1,11 +1,10 @@
-package runtime
+package provider
 
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 func defaultCanonicalProviderResources() *corev1.ResourceRequirements {
@@ -70,7 +69,7 @@ func effectiveProviderImage(cache *cachev1alpha1.CacheBackend, provider cachev1a
 	if cache.Spec.UsesCanonicalCacheHierarchy() {
 		return fallback
 	}
-	return enginewire.ConfigOr(cache.Spec.BackendConfig, legacyKey, fallback)
+	return configOr(cache.Spec.BackendConfig, legacyKey, fallback)
 }
 
 func effectiveProviderCommand(cache *cachev1alpha1.CacheBackend, provider cachev1alpha1.CacheBackendRemoteStorageProvider) []string {
@@ -99,4 +98,11 @@ func legacyProviderConfig(cache *cachev1alpha1.CacheBackend) map[string]string {
 		return nil
 	}
 	return cache.Spec.BackendConfig
+}
+
+func configOr(cfg map[string]string, key, fallback string) string {
+	if value := cfg[key]; value != "" {
+		return value
+	}
+	return fallback
 }

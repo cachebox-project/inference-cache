@@ -1,4 +1,4 @@
-package runtime
+package provider
 
 import (
 	"strconv"
@@ -6,9 +6,21 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
+
+func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1alpha1.CacheBackend {
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: t},
+	}
+	if engine != "" {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	}
+	return cb
+}
 
 // argVal returns the value following flag in an args slice (two-arg form), or ""
 // if flag is absent or trails with no value.

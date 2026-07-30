@@ -8,7 +8,6 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 type managedProvider struct {
@@ -51,21 +50,21 @@ func DefaultRegistry() *backendadapter.Registry {
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := adapterruntime.ResolveRedisL2Server(cache)
+			pod, service, err := ResolveRedisL2Server(cache)
 			return rendered(pod, service, backendadapter.ProtocolRESP, err)
 		},
 	})
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
 		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := adapterruntime.ResolveLMCacheServer(cache)
+			pod, service, err := ResolveLMCacheServer(cache)
 			return rendered(pod, service, backendadapter.ProtocolLMCache, err)
 		},
 	})
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
 		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := adapterruntime.ResolveMooncakeServer(cache)
+			pod, service, err := ResolveMooncakeServer(cache)
 			return rendered(pod, service, backendadapter.ProtocolMooncakeStore, err)
 		},
 	})

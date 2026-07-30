@@ -228,7 +228,7 @@ Legacy server-side keys (consumed while rendering the selected provider pod):
 |---|---|---|
 | `serverImage` | `lmcache/standalone:v0.4.7` *(pinned, non-floating; see version-alignment note below)* | Container image for the standalone lmcache-server. The default is pinned to a specific version — **not** a floating `:latest` — because the server's wire protocol must match the lmcache *client* compiled into the engine; a drifting `:latest` silently breaks tier-2 offload (see [LMCache server / client version alignment](#lmcache-server--client-version-alignment)). Pin to a digest for non-local runs. Deliberately distinct from a bare `image` key (which previously addressed the all-in-one vLLM+LMCache container the prior reconciler rendered): an existing CR carrying `backendConfig.image: vllm/vllm-openai:…` is therefore silently ignored rather than rendering an lmcache-server pod with the wrong image. |
 | `serverCommand` | `lmcache_server 0.0.0.0 65432 cpu` | Server command line. Override to switch to the newer `python3 -m lmcache.v1.multiprocess.server` form once it stabilises. The default targets the older `lmcache_server <host> <port> <storage>` form because it has a documented port (65432, the canonical `lm://` port) and arg layout. |
-| `redisImage` | `docker.io/library/redis:7.4-alpine` *(versioned default, mutable within its patch line; digest-pin in prod)* | **SGLang only.** Container image for the managed **Redis L2 store** the SGLang LMCache MP worker offloads to (its `resp` `--l2-adapter`); rendered by `ResolveRedisL2Server` for the `(sglang, LMCache)` pair. `lm://` is not a valid MP `--l2-adapter` type, so SGLang cannot reuse the standalone lmcache-server. Production **must** pin an exact release or `@sha256:` digest. |
+| `redisImage` | `docker.io/library/redis:7.4-alpine` *(versioned default, mutable within its patch line; digest-pin in prod)* | **SGLang only.** Container image for the managed **Redis L2 store** the SGLang LMCache MP worker offloads to (its `resp` `--l2-adapter`); rendered by the provider-owned `ResolveRedisL2Server` for the `(sglang, LMCache)` pair. `lm://` is not a valid MP `--l2-adapter` type, so SGLang cannot reuse the standalone lmcache-server. Production **must** pin an exact release or `@sha256:` digest. |
 
 Legacy engine-side keys (consumed by `InjectEngineConfig`). The `LMCACHE_*` tunables below are the **vLLM** engine-side env; **SGLang MP mode does not use them** — it tunes the MP worker via `chunkSize` / `l1SizeGB` / `mpPort` / `workerImage` instead (the numeric ones positive-integer-sanitized), see [SGLang engine support](#sglang-engine-support). Canonical equivalents belong under `spec.lmCache` or, for non-reserved environment tuning, `spec.integration.engineOverrides`:
 
@@ -426,7 +426,7 @@ The **same silent store-failure signature can also come from an under-provisione
 
 Because of this:
 
-- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `pkg/adapters/runtime/lmcache_shared.go`.)
+- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `pkg/adapters/backend/provider/lmcache_server.go`.)
 - **Pin both sides.** When an operator overrides `serverImage`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest on `serverImage`.
 - IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus the pinned default; runtime detection / a tier-2 health signal is a separate follow-up.
 
@@ -516,7 +516,16 @@ that the round-trip probe cannot see.
 
 ### backendConfig keys (managed Mooncake)
 
-`spec.type: Mooncake` selects the `(vLLM, Mooncake)` runtime adapter (`pkg/adapters/runtime/vllm_mooncake.go`). Mooncake is the durable / shared cache path — the backend-type expression of the persistence decision in [`docs/design/lmcache-server-persistence.md`](lmcache-server-persistence.md) (the in-memory `lm://` lmcache-server is the simple default; Mooncake is the scalable one — durability is a backend choice, not a generic volume knob). It reconciles a standalone **Mooncake master** workload, and wires engine pods to it.
+Canonical `spec.remoteStorage.mooncake` selects the Mooncake provider adapter
+(`pkg/adapters/backend/provider/mooncake.go`) to reconcile the standalone
+**Mooncake master** workload. The vLLM runtime adapter
+(`pkg/adapters/runtime/vllm_mooncake.go`) separately wires engine pods to it;
+legacy `spec.type: Mooncake` maps to the same provider/runtime pair. Mooncake is
+the durable / shared cache path — the backend-type expression of the persistence
+decision in
+[`docs/design/lmcache-server-persistence.md`](lmcache-server-persistence.md)
+(the in-memory `lm://` lmcache-server is the simple default; Mooncake is the
+scalable one — durability is a backend choice, not a generic volume knob).
 
 > **Operator requirement — the Mooncake master runs on the host network.** Unlike LMCache's `lm://` (one server, one port, one connection — a virtual ClusterIP suffices), Mooncake is a **peer-to-peer transfer-engine mesh**: the master on `:50051` returns only a directory pointer ("this block lives on node B"), and the engine then dials that node's real IP on a **dynamically negotiated port** to move the KV bytes. A ClusterIP Service forwards only the ports declared on it, and CNI overlay pod IPs are not reachable for the mesh — so the adapter renders the master with `hostNetwork: true` behind a **headless** Service (`clusterIP: None`), whose DNS name (published as `status.endpoint`) therefore resolves straight to the master's node IP with every port reachable. Consequences you must plan for:
 >

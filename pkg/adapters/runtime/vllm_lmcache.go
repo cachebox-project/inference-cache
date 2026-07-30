@@ -10,6 +10,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
@@ -35,9 +36,8 @@ const (
 	EngineContainerName = enginewire.EngineContainerName
 )
 
-// vLLM-specific kvevent-subscriber wiring. The subscriber image + policy-server
-// address defaults and the shared sidecar/LMCache-server rendering live in
-// lmcache_shared.go (engine-agnostic, also used by the SGLang+LMCache adapter).
+// vLLM-specific kvevent-subscriber wiring. The subscriber image and
+// policy-server address defaults live in lmcache_shared.go.
 const (
 	// vLLM engine convention: the KV-event ZMQ PUB endpoint binds on :5557 by
 	// default (the reference stack's --kv-events-config sets
@@ -53,21 +53,17 @@ const (
 	subscriberHashScheme = "vllm"
 )
 
-// vllmLMCacheAdapter wires vLLM engine pods to the LMCache backend that
-// CacheBackend (type=LMCache) provisions. ResolveCacheServer renders a
-// standalone lmcache-server pod + Service (the engine connects to it via
-// LMCACHE_REMOTE_URL=lm://<svc>:65432); InjectEngineConfig adds the
-// --kv-transfer-config arg and the LMCACHE_* env vars to the vLLM container,
-// merging with what the pod template already carries; ObservationSidecar
-// returns the kvevent-subscriber container the webhook appends so the engine
-// pod auto-attaches to the policy server with no out-of-band steps.
+// vllmLMCacheAdapter wires vLLM engine pods to an LMCache engine cache and an
+// optional remote binding resolved independently by a provider adapter.
+// InjectEngineConfig adds the --kv-transfer-config arg and LMCACHE_* env vars
+// to the vLLM container, merging with what the pod template already carries;
+// ObservationSidecar returns the kvevent-subscriber container the webhook
+// appends so the engine pod auto-attaches to the policy server.
 //
-// This adapter wires vLLM+LMCache. It has two siblings that reuse the shared
-// helpers here: the vLLM+Mooncake adapter (vllm_mooncake.go) reuses the same
-// LMCache connector wire via a mooncakestore:// remote, and the SGLang+LMCache
-// adapter (pkg/adapters/runtime/sglang) reuses the lmcache-server rendering
-// (ResolveLMCacheServer) + the subscriber sidecar (RenderSubscriberSidecar) and
-// differs only in the engine-side wire.
+// This adapter wires vLLM+LMCache. The vLLM+Mooncake sibling reuses the same
+// LMCache connector wire via a mooncakestore:// remote. SGLang+LMCache shares
+// the observation sidecar but uses its own MP engine wire and a Redis provider
+// binding rather than the standalone lmcache-server.
 type vllmLMCacheAdapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
@@ -166,7 +162,7 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 // ResolveCacheServer is the pre-separation compatibility renderer. Production
 // provider lifecycle resolves through pkg/adapters/backend/provider.
 func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return ResolveLMCacheServer(cache)
+	return provideradapter.ResolveLMCacheServer(cache)
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the

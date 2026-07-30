@@ -657,11 +657,11 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// tier-2 (if any) is operator-managed and not evaluated here --
 		// clear any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
-		// EngineCompatibility is likewise a managed-only advisory (set only in
-		// updateManagedStatus from an injected engine pod's crash-loop). An
-		// External backend injects no connector and is not evaluated here, so
-		// clear any left over from a prior managed state rather than leave a
-		// stale incompatibility warning the External contract never updates.
+		// EngineCompatibility is likewise evaluated only by the managed and
+		// host-only status paths. External storage still receives runtime-side
+		// connector injection, but this reconcile path does not inspect those
+		// engine pods, so clear any condition left over from a prior mode rather
+		// than leave a stale warning the External contract never updates.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
 	})
 }
