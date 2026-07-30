@@ -163,6 +163,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
+	rejectNonPositiveHostMemoryCapacity,
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
@@ -171,6 +172,22 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
 	rejectSGLangRedisL2ScaleOut,
+}
+
+func rejectNonPositiveHostMemoryCapacity(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.LMCache == nil || cb.Spec.LMCache.HostMemory == nil ||
+		cb.Spec.LMCache.HostMemory.Capacity == nil ||
+		cb.Spec.LMCache.HostMemory.Capacity.Sign() > 0 {
+		return nil
+	}
+
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "lmCache", "hostMemory", "capacity"),
+			cb.Spec.LMCache.HostMemory.Capacity.String(),
+			"must be greater than zero",
+		),
+	}
 }
 
 func validateCanonicalProviderResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {

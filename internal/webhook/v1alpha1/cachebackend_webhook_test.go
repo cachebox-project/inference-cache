@@ -81,6 +81,33 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 			"canonical host-only backends")
 	})
 
+	t.Run("host memory capacity must be positive", func(t *testing.T) {
+		for _, capacity := range []string{"0", "-1Gi"} {
+			t.Run(capacity, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				quantity := resource.MustParse(capacity)
+				cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+					HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &quantity},
+				}
+				requireInvalidWithCause(t, validator, cb, "spec.lmCache.hostMemory.capacity",
+					"must be greater than zero")
+			})
+		}
+	})
+
+	t.Run("positive host memory capacity is admitted", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		quantity := resource.MustParse("1Gi")
+		cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+			HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &quantity},
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
 	t.Run("sglang managed redis", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang

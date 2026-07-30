@@ -234,16 +234,24 @@ func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend, cfg map[string]stri
 func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
 		cache.Spec.LMCache.HostMemory.Capacity != nil {
-		const gib = int64(1024 * 1024 * 1024)
 		bytes := cache.Spec.LMCache.HostMemory.Capacity.Value()
 		if bytes > 0 {
-			return fmt.Sprintf("%d", (bytes+gib-1)/gib)
+			return fmt.Sprintf("%d", ceilPositiveBytesToGiB(bytes))
 		}
 	}
 	if cache.Spec.UsesCanonicalCacheHierarchy() {
 		return defaultMaxLocalCPU
 	}
 	return ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)
+}
+
+func ceilPositiveBytesToGiB(bytes int64) int64 {
+	const gib = int64(1024 * 1024 * 1024)
+	gibibytes := bytes / gib
+	if bytes%gib != 0 {
+		gibibytes++
+	}
+	return gibibytes
 }
 
 func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {

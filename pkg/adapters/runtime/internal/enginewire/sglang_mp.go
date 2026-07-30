@@ -479,8 +479,7 @@ func effectiveSGLangLMCacheConfig(cache *cachev1alpha1.CacheBackend) map[string]
 		cfg[cfgKeyMPPort] = strconv.FormatInt(int64(*cache.Spec.LMCache.WorkerPort), 10)
 	}
 	if host := cache.Spec.LMCache.HostMemory; host != nil && host.Capacity != nil && host.Capacity.Value() > 0 {
-		const gib = int64(1024 * 1024 * 1024)
-		cfg[cfgKeyL1SizeGB] = strconv.FormatInt((host.Capacity.Value()+gib-1)/gib, 10)
+		cfg[cfgKeyL1SizeGB] = strconv.FormatInt(ceilPositiveBytesToGiB(host.Capacity.Value()), 10)
 	}
 	return cfg
 }

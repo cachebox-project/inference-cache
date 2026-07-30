@@ -1,9 +1,11 @@
 package enginewire
 
 import (
+	"math"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -72,6 +74,38 @@ func TestInjectVLLMLMCache_InjectsEnv(t *testing.T) {
 	// with exactly "0" so every engine process derives the same NONE_HASH.
 	if v, ok := lookupInjectedEnv(env, EnvPythonHashSeed); !ok || v != "0" {
 		t.Fatalf("%s = (%q, %v), want 0", EnvPythonHashSeed, v, ok)
+	}
+}
+
+func TestEffectiveHostMemoryGBRoundsWithoutOverflow(t *testing.T) {
+	tests := []struct {
+		name  string
+		bytes int64
+		want  string
+	}{
+		{name: "one byte", bytes: 1, want: "1"},
+		{name: "exact GiB", bytes: 1024 * 1024 * 1024, want: "1"},
+		{name: "one byte over GiB", bytes: 1024*1024*1024 + 1, want: "2"},
+		{name: "maximum quantity value", bytes: math.MaxInt64, want: "8589934592"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capacity := *resource.NewQuantity(tt.bytes, resource.DecimalSI)
+			cache := &cachev1alpha1.CacheBackend{
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+					LMCache: &cachev1alpha1.LMCacheEngineSpec{
+						HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{
+							Capacity: &capacity,
+						},
+					},
+				},
+			}
+			if got := effectiveHostMemoryGB(cache, nil); got != tt.want {
+				t.Fatalf("effectiveHostMemoryGB(%d) = %q, want %q", tt.bytes, got, tt.want)
+			}
+		})
 	}
 }
 

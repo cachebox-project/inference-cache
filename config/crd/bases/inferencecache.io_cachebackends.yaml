@@ -647,6 +647,9 @@ spec:
                           host cache.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: capacity must be greater than zero
+                          rule: quantity(string(self)).isGreaterThan(quantity('0'))
                     type: object
                   remoteSerde:
                     description: RemoteSerde selects LMCache's serializer for a remote

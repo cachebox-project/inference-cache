@@ -169,6 +169,7 @@ type SGLangHiCacheSpec struct {
 type CacheBackendHostMemorySpec struct {
 	// Capacity is the memory budget for the engine-side host cache.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="capacity must be greater than zero"
 	Capacity *resource.Quantity `json:"capacity,omitempty"`
 }
 
