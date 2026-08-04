@@ -146,13 +146,17 @@ func (vllmMooncakeAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint stri
 	if err := enginewire.InjectVLLMMooncake(pod, endpoint, cache); err != nil {
 		return err
 	}
+	injectMooncakeEngineHostNetwork(pod, cache)
+	return nil
+}
+
+func injectMooncakeEngineHostNetwork(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend) {
 	if EngineHostNetworkRequested(cache) {
 		pod.HostNetwork = true
 		// A hostNetwork pod otherwise inherits the node's resolver; keep cluster DNS
 		// so the master's Service name still resolves from the engine.
 		pod.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
-	return nil
 }
 
 // EngineHostNetworkRequested reports whether the operator opted engine pods bound

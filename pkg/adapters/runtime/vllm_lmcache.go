@@ -204,7 +204,11 @@ func (vllmLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, bin
 	case backendadapter.ProtocolLMCache:
 		return enginewire.InjectVLLMLMCache(pod, binding.Endpoint, cache)
 	case backendadapter.ProtocolMooncakeStore:
-		return enginewire.InjectVLLMMooncake(pod, binding.Endpoint, cache)
+		if err := enginewire.InjectVLLMMooncake(pod, binding.Endpoint, cache); err != nil {
+			return err
+		}
+		injectMooncakeEngineHostNetwork(pod, cache)
+		return nil
 	default:
 		return fmt.Errorf("vLLM LMCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}

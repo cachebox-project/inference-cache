@@ -859,10 +859,14 @@ func rejectEngineHostNetworkOnBackendThatDoesNotNeedIt(cb *cachev1alpha1.CacheBa
 		usesMooncakeStorage(cb) {
 		return nil
 	}
+	provider := "none (host-only)"
+	if storage := cb.Spec.EffectiveRemoteStorage(); storage != nil {
+		provider = string(storage.Provider)
+	}
 	return field.ErrorList{field.Invalid(
 		field.NewPath("spec", "integration", "engineHostNetwork"), true,
-		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful for spec.type=Mooncake, whose transfer engine dials engine pods "+
-			"on real node IPs; spec.type=%s does not need it and the flag would do nothing. Remove it.", cb.Spec.Type),
+		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful when the effective remote storage provider is Mooncake, whose transfer engine dials engine pods "+
+			"on real node IPs; provider=%s does not need it and the flag would do nothing. Remove it.", provider),
 	)}
 }
 

@@ -1602,9 +1602,14 @@ rm -f "${sample_tmp_engine}.bak"
 
 build_sample_cache_server_image
 escaped_sample_cache_server_image="$(printf '%s' "$SAMPLE_CACHE_SERVER_IMAGE" | sed 's/[&|\\]/\\&/g')"
-sed -i.bak "s|serverImage: lmcache/standalone:v0.4.7|serverImage: $escaped_sample_cache_server_image|g" \
-  "$sample_tmp_cb"
+if ! grep -q '^      image: lmcache/standalone:v0.4.7$' "$sample_tmp_cb"; then
+  fail "fixture: cachebackend-with-engine.yaml no longer carries the pinned canonical remoteStorage.lmCacheServer.image"
+fi
+sed -i.bak "s|^      image: lmcache/standalone:v0.4.7$|      image: $escaped_sample_cache_server_image|g" "$sample_tmp_cb"
 rm -f "${sample_tmp_cb}.bak"
+if ! grep -Fq "      image: $SAMPLE_CACHE_SERVER_IMAGE" "$sample_tmp_cb"; then
+  fail "fixture: failed to replace canonical remoteStorage.lmCacheServer.image with the smoke stand-in"
+fi
 
 log "applying CacheBackend"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_cb" >/dev/null
@@ -1645,41 +1650,40 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
-# --- spec.resources defaults + thread-through ------------------------------
-# The minimal paired-sample CacheBackend uses the legacy API and declares no
-# spec.resources, so the mutating webhook must stamp limits.memory=8Gi (and the matching
-# requests.memory=4Gi) on the persisted CR; the controller must then thread
-# that limit onto the rendered Deployment's lmcache-server container. Both
-# halves must hold — half-failing reintroduces the OOM-kill cliff that
-# motivated bounding the cache-server pod by the cgroup.
-log "asserting legacy spec.resources webhook defaults stamp on the CR and thread to the rendered Deployment"
-cb_lim_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.resources.limits.memory}' 2>/dev/null || true)"
-if [ "$cb_lim_mem" != "8Gi" ]; then
+# --- canonical provider resource fallback ---------------------------------
+# The paired sample uses canonical remoteStorage.lmCacheServer and omits its
+# resources. Canonical defaulting stays renderer-local: admission must not
+# repopulate deprecated spec.resources, while the provider renderer still puts
+# a bounded 4Gi request / 8Gi limit on the lmcache-server container. This keeps
+# the cgroup OOM guard without reviving the retired top-level API field.
+log "asserting canonical provider resources stay out of the CR and default onto the rendered Deployment"
+cb_legacy_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.resources}' 2>/dev/null || true)"
+if [ -n "$cb_legacy_resources" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources.limits.memory=$cb_lim_mem, want 8Gi (legacy webhook default not applied)"
+  fail "cb.spec.resources=$cb_legacy_resources, want absent for a canonical CacheBackend"
 fi
-cb_req_mem="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.resources.requests.memory}' 2>/dev/null || true)"
-if [ "$cb_req_mem" != "4Gi" ]; then
+cb_provider_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.remoteStorage.lmCacheServer.resources}' 2>/dev/null || true)"
+if [ -n "$cb_provider_resources" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources.requests.memory=$cb_req_mem, want 4Gi (legacy webhook default not applied)"
+  fail "cb.spec.remoteStorage.lmCacheServer.resources=$cb_provider_resources, want absent when the sample omits it"
 fi
 dep_lim_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.limits.memory}' \
   2>/dev/null || true)"
 if [ "$dep_lim_mem" != "8Gi" ]; then
   kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
-  fail "deploy.lmcache-server.resources.limits.memory=$dep_lim_mem, want 8Gi (controller did not thread spec.resources)"
+  fail "deploy.lmcache-server.resources.limits.memory=$dep_lim_mem, want 8Gi (canonical provider fallback not applied)"
 fi
 dep_req_mem="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].resources.requests.memory}' \
   2>/dev/null || true)"
 if [ "$dep_req_mem" != "4Gi" ]; then
   kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
-  fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (controller did not thread spec.resources)"
+  fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (canonical provider fallback not applied)"
 fi
-log "spec.resources defaults stamped + threaded: requests.memory=4Gi limits.memory=8Gi"
+log "canonical provider resources defaulted on the workload only: requests.memory=4Gi limits.memory=8Gi"
 
 # --- KV-event readiness gate assertion (operator-facing) --------------------
 # The managed backend has an engine pod attached (matchedEnginePods=1), but the
@@ -3786,16 +3790,18 @@ fi
 log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
 
 # --- managed Mooncake backend smoke ----------------------------------------
-# CacheBackend{type: Mooncake} is a new operator-facing surface, so it needs a
-# real-install assertion, not just unit/envtest. The kvcacheai/mooncake image
+# Canonical CacheBackend{runtime: VLLM, type: LMCache,
+# remoteStorage.provider: Mooncake} is an operator-facing surface, so it needs
+# a real-install assertion, not just unit/envtest. The kvcacheai/mooncake image
 # is intentionally NOT pulled here (heavy, and its entrypoint/ports are pending
 # reference-stack validation); instead a busybox stand-in named `mooncake_master`
 # accepts TCP on the RPC port so the controller-rendered readiness probe passes
 # and the managed Deployment reaches Available. That proves the REAL installed
-# controller reconciles type:Mooncake through ResolveCacheServer into a healthy
-# workload + the mooncakestore:// RPC endpoint in status — the operator-visible
-# contract envtest can't fully exercise (real install bundle + real controller
-# image). The real engine-over-mooncakestore:// path stays for the reference stack.
+# controller reconciles the canonical provider through ResolveCacheServer into
+# a healthy workload + the mooncakestore:// RPC endpoint in status — the
+# operator-visible contract envtest can't fully exercise (real install bundle +
+# real controller image). The real engine-over-mooncakestore:// path stays for
+# the reference stack.
 MOONCAKE_SMOKE_NS="${MOONCAKE_SMOKE_NS:-mooncake-smoke}"
 MOONCAKE_MASTER_IMAGE="${MOONCAKE_MASTER_IMAGE:-install-smoke-mooncake-master:$TAG}"
 MOONCAKE_CB_NAME="cachebackend-mooncake"
@@ -3824,8 +3830,14 @@ kubectl create namespace "$MOONCAKE_SMOKE_NS" --dry-run=client -o yaml | kubectl
 mc_cb_tmp="$(mktemp "$tmpdir/mooncake-cb.XXXXXX")"
 cp config/samples/cachebackend-mooncake.yaml "$mc_cb_tmp"
 mc_escaped_image="$(printf '%s' "$MOONCAKE_MASTER_IMAGE" | sed 's/[&|\\]/\\&/g')"
-sed -i.bak "s|serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1|serverImage: $mc_escaped_image|g" "$mc_cb_tmp"
+if ! grep -q '^      image: docker.io/kvcacheai/mooncake:0.3.11.post1$' "$mc_cb_tmp"; then
+  fail "fixture: cachebackend-mooncake.yaml no longer carries the pinned canonical remoteStorage.mooncake.image"
+fi
+sed -i.bak "s|^      image: docker.io/kvcacheai/mooncake:0.3.11.post1$|      image: $mc_escaped_image|g" "$mc_cb_tmp"
 rm -f "${mc_cb_tmp}.bak"
+if ! grep -Fq "      image: $MOONCAKE_MASTER_IMAGE" "$mc_cb_tmp"; then
+  fail "fixture: failed to replace canonical remoteStorage.mooncake.image with the smoke stand-in"
+fi
 
 log "applying Mooncake CacheBackend"
 # Mooncake's transfer engine is a peer-to-peer mesh, so ENGINE pods must run with
@@ -3864,6 +3876,17 @@ case "$mc_apply_out" in
   *)
     log "Mooncake with the opt-in applies without the engine-hostNetwork warning" ;;
 esac
+
+# Pin the fixture to the canonical hierarchy. This keeps the real-install smoke
+# from silently falling back to the legacy spec.type=Mooncake adapter path.
+mc_runtime="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.runtime}')"
+mc_type="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.type}')"
+mc_provider="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.remoteStorage.provider}')"
+if [ "$mc_runtime" != "VLLM" ] || [ "$mc_type" != "LMCache" ] || [ "$mc_provider" != "Mooncake" ]; then
+  kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o yaml || true
+  fail "Mooncake smoke fixture is not canonical: runtime=$mc_runtime type=$mc_type remoteStorage.provider=$mc_provider"
+fi
+log "canonical Mooncake CacheBackend admitted (runtime=VLLM, type=LMCache, provider=Mooncake)"
 
 # Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
 # latency is a per-managed-backend property (the reconciler publishes it from
@@ -3939,7 +3962,7 @@ if ! kubectl -n "$MOONCAKE_SMOKE_NS" wait --for=condition=Available --timeout="$
   kubectl -n "$MOONCAKE_SMOKE_NS" get pods -o wide || true
   fail "Mooncake master Deployment did not reach Available within ${READY_TIMEOUT}"
 fi
-log "Mooncake master Deployment Available; managed type:Mooncake reconcile verified end-to-end"
+log "Mooncake master Deployment Available; canonical managed Mooncake reconcile verified end-to-end"
 
 # The operator-facing half of the Mooncake data plane: spec.integration.engineHostNetwork
 # moves matched ENGINE pods onto the host network. Assert it against the real

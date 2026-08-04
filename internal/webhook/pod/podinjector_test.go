@@ -469,11 +469,15 @@ func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
 		return &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type: cachev1alpha1.CacheBackendTypeMooncake,
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Engine:            "vllm",
 					Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 					EngineHostNetwork: optIn,
+				},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 				},
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 					MatchLabels: map[string]string{"app": "vllm"},
@@ -543,11 +547,15 @@ func TestHandle_MooncakeBackend_HostNetworkNeverGrantedToAnUnwiredPod(t *testing
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine:            "vllm",
 				Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 				EngineHostNetwork: true,
+			},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},

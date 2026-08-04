@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
@@ -700,6 +701,47 @@ func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
 	}
 	if got, ok := lookupEnv(env, "KEEP_ME"); !ok || got != "preserved" {
 		t.Fatalf("unrelated env was disturbed: KEEP_ME = %q, present=%v", got, ok)
+	}
+}
+
+func TestVLLMLMCacheCanonicalMooncakeBindingHonorsEngineHostNetwork(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in=%t", optIn), func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+					EngineHostNetwork: optIn,
+				},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				},
+			}}
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+			binding := &backendadapter.Binding{
+				Protocol: backendadapter.ProtocolMooncakeStore,
+				Endpoint: "mooncake.engines.svc.cluster.local:50051",
+			}
+			adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
+			if err := adapter.InjectEngineConfigWithBinding(pod, binding, cb); err != nil {
+				t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+			}
+
+			if pod.HostNetwork != optIn {
+				t.Fatalf("pod.HostNetwork = %t, want %t", pod.HostNetwork, optIn)
+			}
+			wantDNS := corev1.DNSPolicy("")
+			if optIn {
+				wantDNS = corev1.DNSClusterFirstWithHostNet
+			}
+			if pod.DNSPolicy != wantDNS {
+				t.Fatalf("pod.DNSPolicy = %q, want %q", pod.DNSPolicy, wantDNS)
+			}
+			if got, _ := lookupEnv(pod.Containers[0].Env, EnvLMCacheRemoteURL); got != "mooncakestore://"+binding.Endpoint {
+				t.Fatalf("%s = %q, want mooncakestore://%s", EnvLMCacheRemoteURL, got, binding.Endpoint)
+			}
+		})
 	}
 }
 

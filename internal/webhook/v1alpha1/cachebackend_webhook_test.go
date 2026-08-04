@@ -770,46 +770,70 @@ func mooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBacken
 	return cb
 }
 
+func canonicalMooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBackend {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+		EngineHostNetwork: optIn,
+	}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+	}
+	return cb
+}
+
 func TestValidator_MooncakeWarnsUntilEngineHostNetworkOptIn(t *testing.T) {
 	// Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run with
 	// hostNetwork or the backend reports Ready and moves zero KV. That move rewrites
 	// a pod the operator owns, so it is opt-in rather than injected. Until they opt
 	// in, say so at apply time and name the exact field — otherwise the failure is
 	// discoverable only from a flat cache-hit graph.
-	v := &CacheBackendValidator{}
-	cb := mooncakeBackendWithEngineHostNetwork(false)
+	for name, cb := range map[string]*cachev1alpha1.CacheBackend{
+		"legacy":    mooncakeBackendWithEngineHostNetwork(false),
+		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			warnings, err := v.ValidateCreate(context.Background(), cb)
+			if err != nil {
+				t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.engineHostNetwork=true") {
+				t.Fatalf("create warnings = %v, want one warning naming the opt-in field", warnings)
+			}
 
-	warnings, err := v.ValidateCreate(context.Background(), cb)
-	if err != nil {
-		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
-	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.engineHostNetwork=true") {
-		t.Fatalf("create warnings = %v, want one warning naming the opt-in field", warnings)
-	}
-
-	// It must persist across updates, not only on first apply — an operator who
-	// edits the CR later should still be told.
-	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
-	if err != nil {
-		t.Fatalf("a Mooncake update must still be admitted: %v", err)
-	}
-	if len(warnings) != 1 {
-		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+			// It must persist across updates, not only on first apply — an operator who
+			// edits the CR later should still be told.
+			warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
+			if err != nil {
+				t.Fatalf("a Mooncake update must still be admitted: %v", err)
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+			}
+		})
 	}
 }
 
 func TestValidator_MooncakeOptInSilencesTheWarning(t *testing.T) {
 	// Once the operator opts in, the pod webhook completes the data plane. A warning
 	// that keeps firing after the gap is closed trains operators to ignore warnings.
-	v := &CacheBackendValidator{}
-	cb := mooncakeBackendWithEngineHostNetwork(true)
-
-	warnings, err := v.ValidateCreate(context.Background(), cb)
-	if err != nil {
-		t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
-	}
-	if len(warnings) != 0 {
-		t.Fatalf("warnings = %v, want none once engineHostNetwork is set", warnings)
+	for name, cb := range map[string]*cachev1alpha1.CacheBackend{
+		"legacy":    mooncakeBackendWithEngineHostNetwork(true),
+		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			warnings, err := v.ValidateCreate(context.Background(), cb)
+			if err != nil {
+				t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
+			}
+			if len(warnings) != 0 {
+				t.Fatalf("warnings = %v, want none once engineHostNetwork is set", warnings)
+			}
+		})
 	}
 }
 
@@ -821,7 +845,7 @@ func TestValidator_EngineHostNetworkRejectedOnBackendThatDoesNotNeedIt(t *testin
 	cb := mooncakeBackendWithEngineHostNetwork(true)
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	requireInvalidWithCause(t, v, cb, "spec.integration.engineHostNetwork",
-		"only meaningful for spec.type=Mooncake")
+		"only meaningful when the effective remote storage provider is Mooncake")
 }
 
 func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *testing.T) {
@@ -838,7 +862,7 @@ func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *te
 	newCB := mooncakeBackendWithEngineHostNetwork(true)
 	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	requireUpdateInvalidWithCause(t, v, old, newCB, "spec.integration.engineHostNetwork",
-		"only meaningful for spec.type=Mooncake")
+		"only meaningful when the effective remote storage provider is Mooncake")
 }
 
 func TestValidator_DroppingEngineHostNetworkWithTheTypeFlipIsAccepted(t *testing.T) {
