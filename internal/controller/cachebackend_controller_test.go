@@ -214,6 +214,37 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	}
 }
 
+func TestReconcileCanonicalSGLangHiCacheWithRemoteStorageIsUnmanaged(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache-remote", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+		t.Fatalf("deployment lookup error = %v, want NotFound", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for unsupported binding", got.Status.Endpoint)
+	}
+	if ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("unsupported binding published Ready condition: %+v", ready)
+	}
+}
+
 func TestReconcileCanonicalHostOnlyCacheReportsEngineDiagnostics(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("host-only-kernel", "ns1")
@@ -350,6 +381,29 @@ func TestReconcileManagedMooncake(t *testing.T) {
 	}
 	if updated.Status.ObservedGeneration != 1 {
 		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
+	}
+}
+
+func TestReconcileCanonicalManagedMooncake(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("canonical-mooncake", "ns1")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Mooncake:  &cachev1alpha1.MooncakeRemoteStorageSpec{},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	dep := getDeployment(t, r, cb.Name, cb.Namespace)
+	if got := dep.Spec.Template.Spec.Containers[0].Name; got != "mooncake-master" {
+		t.Fatalf("container name = %q, want mooncake-master", got)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if want := "canonical-mooncake.ns1.svc.cluster.local:50051"; got.Status.Endpoint != want {
+		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, want)
 	}
 }
 

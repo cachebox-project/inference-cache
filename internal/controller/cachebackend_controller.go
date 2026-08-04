@@ -492,6 +492,11 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 				"namespace", backend.Namespace, "name", backend.Name)
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
+		// Native HiCache remains endpoint-free and intentionally publishes no
+		// Ready condition until its separate readiness contract is implemented.
+		if backend.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeSGLangHiCache {
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
 		return r.reconcileHostOnly(ctx, backend)
 	}
 
@@ -511,10 +516,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, fmt.Errorf("render remote storage for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
-	if bindingAware, ok := adapter.(adapterruntime.RemoteBindingAdapter); ok && !bindingAware.SupportsRemoteBinding(binding) {
+	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
 		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
 			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
-			"namespace", backend.Namespace, "name", backend.Name)
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 

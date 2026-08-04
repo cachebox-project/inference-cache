@@ -57,21 +57,25 @@ kind: CacheBackend
 metadata:
   name: cpu-dev-cache
 spec:
+  runtime: VLLM
   type: LMCache
   replicas: 1
   integration:
-    engine: vllm
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: cpu-dev               # <-- binding label (1 of 2)
-  backendConfig:
+  observation:
     # Served model the engine pods load. Plumbed to the kvevent-subscriber
     # sidecar so the index keys per-replica entries by model. Tiny + ungated
     # so it runs on CPU with no auth token.
-    model: Qwen/Qwen2.5-0.5B-Instruct
-    # Managed lmcache-server image. Pin to a digest for non-local runs.
-    serverImage: lmcache/standalone:v0.4.7
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      # Managed lmcache-server image. Pin to a digest for non-local runs.
+      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

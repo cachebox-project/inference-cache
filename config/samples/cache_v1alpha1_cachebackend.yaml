@@ -2,15 +2,10 @@
 # applies cleanly against the current schema + admission webhook. Hand-curated,
 # scenario-specific recipes live in the sibling cachebackend-*.yaml files.
 #
-# Only the three fields the substrate genuinely cannot guess for you must
-# appear in the YAML — engineSelector (which engine pods to wire),
-# backendConfig.model (which served model identifier to record in the index),
-# and a name. Everything else (type=LMCache, deploymentKind=Deployment,
-# replicas=1, integration.engine=vllm, integration.role=ReadWrite,
-# integration.failOpen=true, integration.firstEventTimeout=5m) is defaulted
-# at admission via `+kubebuilder:default=` markers + the CacheBackend
-# defaulter webhook. Override any field by setting it explicitly; the
-# defaulter never clobbers operator-set values.
+# The runtime, engine cache, and remote provider are explicit so this minimum
+# sample also demonstrates the canonical API hierarchy. Admission still
+# defaults deploymentKind=Deployment, replicas=1, integration.role=ReadWrite,
+# integration.failOpen=true, and integration.firstEventTimeout=5m.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -19,8 +14,14 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: cachebackend-sample
 spec:
+  runtime: VLLM
+  type: LMCache
   engineSelector:
     matchLabels:
       inferencecache.io/cache-enabled: "true"
-  backendConfig:
-    model: meta-llama/Meta-Llama-3-8B-Instruct
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer: {}

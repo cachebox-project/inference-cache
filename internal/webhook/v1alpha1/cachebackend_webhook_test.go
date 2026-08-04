@@ -62,6 +62,21 @@ func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
 	}
 }
 
+func TestValidator_CanonicalSGLangHiCacheRejectsRemoteStorage(t *testing.T) {
+	cb := newHiCacheBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.BackendConfig = nil
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	requireInvalidWithCause(t, &CacheBackendValidator{}, cb, "spec.remoteStorage.provider",
+		"does not accept remote binding protocol")
+}
+
 func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 	validator := &CacheBackendValidator{}
 

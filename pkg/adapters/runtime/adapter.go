@@ -151,14 +151,32 @@ func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backenda
 	return AdapterRequiresEndpoint(adapter)
 }
 
+// ValidateRemoteBinding verifies that adapter explicitly accepts binding for a
+// canonical cache hierarchy. Legacy resources retain the endpoint-based
+// fallback while out-of-tree adapters migrate to [RemoteBindingAdapter].
+func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	bindingAware, ok := adapter.(RemoteBindingAdapter)
+	if !ok {
+		if cache != nil && cache.Spec.UsesCanonicalCacheHierarchy() {
+			return fmt.Errorf("runtime adapter does not implement the canonical remote-binding contract")
+		}
+		return nil
+	}
+	if !bindingAware.SupportsRemoteBinding(binding) {
+		return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
+	}
+	return nil
+}
+
 // InjectEngineConfigWithBinding routes canonical resources through the
 // structured binding contract and falls back to the legacy endpoint method for
-// adapters that have not migrated yet.
+// adapters that have not migrated yet only when the resource itself uses the
+// legacy hierarchy.
 func InjectEngineConfigWithBinding(adapter KVCacheRuntimeAdapter, pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	if err := ValidateRemoteBinding(adapter, binding, cache); err != nil {
+		return err
+	}
 	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		if !bindingAware.SupportsRemoteBinding(binding) {
-			return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
-		}
 		return bindingAware.InjectEngineConfigWithBinding(pod, binding, cache)
 	}
 	endpoint := ""

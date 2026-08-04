@@ -2457,7 +2457,32 @@ EOF
 if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_output"; then
   fail "admission did not reject non-External + endpoint as expected; got: $reject_output"
 fi
-log "admission rejected External+missing-endpoint, External+https, External+empty-host, and non-External+endpoint"
+
+# Canonical runtime/cache adapters must explicitly accept their remote binding.
+# Native SGLang HiCache is engine-local and accepts only a nil binding, so a
+# Redis provider must be rejected before the controller could provision an
+# unused remote tier.
+reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: smoke-reject-hicache-redis
+  namespace: $EXT_SMOKE_NS
+spec:
+  runtime: SGLang
+  type: SGLangHiCache
+  hiCache:
+    ratio: "2"
+  remoteStorage:
+    provider: Redis
+    ownership: Managed
+    redis: {}
+EOF
+)"
+if ! grep -q 'does not accept remote binding protocol "resp"' <<<"$reject_output"; then
+  fail "admission did not reject canonical SGLangHiCache + Redis as expected; got: $reject_output"
+fi
+log "admission rejected invalid legacy endpoint shapes and canonical SGLangHiCache + Redis"
 
 # --- CacheBackend admission: scale-to-zero + autoscaling + nil minReplicas ---
 # The installed validating webhook must reject the combination

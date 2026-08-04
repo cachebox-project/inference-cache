@@ -17,8 +17,4 @@ const (
 	// DefaultPolicyServerGRPCAddress is the in-cluster Service DNS the
 	// kvevent-subscriber sidecar dials by default.
 	DefaultPolicyServerGRPCAddress = "inference-cache-server.inference-cache-system.svc.cluster.local:9090"
-
-	// modelBackendConfigKey is the deprecated BackendConfig compatibility key
-	// used when observation.modelID is absent on a legacy resource.
-	modelBackendConfigKey = "model"
 )

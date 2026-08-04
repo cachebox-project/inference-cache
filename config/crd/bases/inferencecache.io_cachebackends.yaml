@@ -593,6 +593,9 @@ spec:
                       (tier-2), with a controller-provisioned backend server. EventsOnly wires
                       routing only: the kvevent-subscriber sidecar is injected, but no KV
                       connector is loaded into the engine and no backend server is provisioned.
+                      Mode takes precedence over engine-cache configuration: when EventsOnly is
+                      selected, spec.lmCache and other host-tier settings are not injected into
+                      the engine. Operators should omit them to avoid implying an active tier.
                       EventsOnly is the supported integration for hybrid-attention models that
                       cannot take a vLLM KV connector (and a lighter routing-only deployment for
                       anyone who does not want an offload tier). Because EventsOnly provisions

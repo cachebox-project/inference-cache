@@ -82,3 +82,22 @@ func TestCanonicalProviderDoesNotInheritLegacyWorkloadConfig(t *testing.T) {
 		t.Fatalf("canonical default memory limit = %s, want %s", got.String(), wantMemory.String())
 	}
 }
+
+func TestLegacyProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
+	cache := &cachev1alpha1.CacheBackend{
+		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeLMCache},
+	}
+	rendered, _, err := ResolveLMCacheServer(cache)
+	if err != nil {
+		t.Fatalf("ResolveLMCacheServer: %v", err)
+	}
+	wantLimit := resource.MustParse("8Gi")
+	wantRequest := resource.MustParse("4Gi")
+	resources := rendered.Containers[0].Resources
+	if got := resources.Limits[corev1.ResourceMemory]; got.Cmp(wantLimit) != 0 {
+		t.Fatalf("legacy fallback memory limit = %s, want %s", got.String(), wantLimit.String())
+	}
+	if got := resources.Requests[corev1.ResourceMemory]; got.Cmp(wantRequest) != 0 {
+		t.Fatalf("legacy fallback memory request = %s, want %s", got.String(), wantRequest.String())
+	}
+}

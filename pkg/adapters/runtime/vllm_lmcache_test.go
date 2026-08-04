@@ -155,24 +155,20 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerNoRequestsForRawNilResourcesNoAutoscaling(t *testing.T) {
-	// Renderer baseline for the RAW-STRUCT path (no apiserver in the
-	// loop): spec.resources is nil and spec.autoscaling is nil, so the
-	// adapter renders zero Requests on the container. On a live cluster
-	// the same minimal CacheBackend arrives at the reconciler with the
-	// CRD-stamped memory default already applied to spec.resources — the
-	// reconciler-against-real-apiserver behavior is asserted end-to-end
-	// in TestIntegrationCacheBackendResources/DefaultStampsMemoryLimits…
-	// This test pins the no-default-stamp invariant the unit-test path
-	// relies on so future contributors don't accidentally inject defaults
-	// in the renderer itself.
+func TestVLLMLMCacheResolveCacheServerBoundsRawNilResources(t *testing.T) {
+	// The renderer keeps the 4Gi/8Gi safety bounds even when an object bypasses
+	// the mutating webhook and reaches the raw-struct path with nil resources.
 	a := NewVLLMLMCacheAdapter()
 	pod, _, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if len(pod.Containers[0].Resources.Requests) != 0 {
-		t.Fatalf("container Requests = %v, want empty when spec.resources is nil and autoscaling is unset (raw-struct path)", pod.Containers[0].Resources.Requests)
+	resources := pod.Containers[0].Resources
+	if got := resources.Requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Fatalf("requests.memory = %s, want 4Gi fallback", got.String())
+	}
+	if got := resources.Limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Fatalf("limits.memory = %s, want 8Gi fallback", got.String())
 	}
 }
 
@@ -181,10 +177,8 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 	// as the utilization denominator, so without one the autoscaler
 	// never gets a usable metric. The adapter must therefore declare
 	// a CPU request on the lmcache-server container when spec.autoscaling
-	// is set. Memory is NOT auto-filled — spec.resources is the
-	// canonical source (and on the apiserver path the CRD-stamped
-	// default carries it); synthesising a second memory request here
-	// would silently override an operator-supplied limits-only shape.
+	// is set. A completely omitted resource block receives the bounded memory
+	// fallback; an explicitly supplied limits-only block remains limits-only.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
@@ -197,8 +191,8 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 	if !hasCPU || cpu.IsZero() {
 		t.Fatalf("container Resources.Requests missing a CPU request under autoscaling: %v", reqs)
 	}
-	if _, hasMem := reqs[corev1.ResourceMemory]; hasMem {
-		t.Fatalf("container Resources.Requests[memory] = %v, want unset (memory is not auto-filled — spec.resources is the canonical source)", reqs[corev1.ResourceMemory])
+	if memory := reqs[corev1.ResourceMemory]; memory.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Fatalf("container Resources.Requests[memory] = %s, want 4Gi fallback", memory.String())
 	}
 }
 

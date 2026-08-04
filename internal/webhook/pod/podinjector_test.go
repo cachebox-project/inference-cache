@@ -339,6 +339,30 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+	resp := newHandler(t, cb).Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("unsupported cache binding must fail open: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("unsupported cache binding produced %d patches, want original Pod unchanged", len(resp.Patches))
+	}
+}
+
 func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})

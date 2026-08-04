@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -54,6 +55,16 @@ func TestHiCacheAdapterContract(t *testing.T) {
 		&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 	)); err != nil || pod != nil || svc != nil {
 		t.Fatalf("ResolveCacheServer = (%v, %v, %v), want (nil, nil, nil)", pod, svc, err)
+	}
+	bindingAware, ok := adapter.(runtimeadapter.RemoteBindingAdapter)
+	if !ok {
+		t.Fatal("SGLangHiCache adapter does not implement RemoteBindingAdapter")
+	}
+	if !bindingAware.SupportsRemoteBinding(nil) {
+		t.Fatal("SGLangHiCache adapter must accept a nil host-only binding")
+	}
+	if bindingAware.SupportsRemoteBinding(&backendadapter.Binding{Protocol: backendadapter.ProtocolRESP}) {
+		t.Fatal("SGLangHiCache adapter unexpectedly accepts remote storage")
 	}
 }
 

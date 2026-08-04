@@ -151,7 +151,8 @@ run it after changing the subscriber.
 
 [`scripts/canary_c2_reconcile.sh`](scripts/canary_c2_reconcile.sh) is a GPU-free,
 on-demand canary for the **C2 reconciler**: it brings up a kind cluster, runs the
-controller, applies a `CacheBackend` with `backendConfig.profile: cpu`, and asserts
+controller, applies a legacy compatibility `CacheBackend` with
+`backendConfig.profile: cpu`, and asserts
 the controller stands up a healthy serving backend (Ready condition True, endpoint
 published) and owner-ref garbage collection when the CR is deleted. It exercises
 the reconciler against real pods — the gap the envtest unit tests can't cover.
@@ -177,7 +178,8 @@ When the controller is installed in a cluster **and the operator passes
 digest in production), the pod-mutating webhook auto-attaches the
 `kvevent-subscriber` as a sidecar to every engine pod whose labels match a
 `CacheBackend.spec.engineSelector` and whose backend sets
-`backendConfig.model`. The subscriber's identity flags (`--replica-id`,
+`spec.observation.modelID` (or the deprecated `backendConfig.model` fallback).
+The subscriber's identity flags (`--replica-id`,
 `--tenant-id`, `--model-id`, `--hash-scheme`) are derived from the CR + pod
 — no operator-supplied flags, no out-of-band `kubectl port-forward` + manual
 binary launch on the demo path.

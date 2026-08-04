@@ -42,7 +42,10 @@ func effectiveProviderResources(cache *cachev1alpha1.CacheBackend) *corev1.Resou
 	if cache.Spec.UsesCanonicalCacheHierarchy() {
 		return defaultCanonicalProviderResources()
 	}
-	return cache.Spec.Resources
+	if cache.Spec.Resources != nil {
+		return cache.Spec.Resources
+	}
+	return defaultCanonicalProviderResources()
 }
 
 func effectiveProviderImage(cache *cachev1alpha1.CacheBackend, provider cachev1alpha1.CacheBackendRemoteStorageProvider, legacyKey, fallback string) string {
