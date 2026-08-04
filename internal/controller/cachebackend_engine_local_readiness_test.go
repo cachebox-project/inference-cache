@@ -122,6 +122,15 @@ func TestEvaluateEngineLocalReadiness(t *testing.T) {
 			messageHas:  "missing-generation",
 		},
 		{
+			name:        "missing receipt takes precedence over mismatched receipt",
+			pods:        []corev1.Pod{wrongOwner, missingUID},
+			ready:       metav1.ConditionFalse,
+			readyReason: reasonEnginePodsNotInjected,
+			progressing: metav1.ConditionFalse,
+			degraded:    metav1.ConditionTrue,
+			messageHas:  "missing-uid",
+		},
+		{
 			name:        "wrong owner degrades",
 			pods:        []corev1.Pod{wrongOwner},
 			ready:       metav1.ConditionFalse,

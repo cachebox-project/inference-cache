@@ -178,14 +178,14 @@ func evaluateEngineLocalReadiness(
 
 	total := len(participants)
 	switch {
-	case len(mismatched) > 0:
-		return engineLocalDegraded(reasonEnginePodsInjectionMismatch,
-			podDiagnostic("%d/%d engine Pods carry an injection receipt for a different CacheBackend identity or future generation: %s",
-				mismatched, total))
 	case len(missing) > 0:
 		return engineLocalDegraded(reasonEnginePodsNotInjected,
 			podDiagnostic("%d/%d engine Pods are missing a valid CacheBackend injection receipt and must be recreated: %s",
 				missing, total))
+	case len(mismatched) > 0:
+		return engineLocalDegraded(reasonEnginePodsInjectionMismatch,
+			podDiagnostic("%d/%d engine Pods carry an injection receipt for a different CacheBackend identity or future generation: %s",
+				mismatched, total))
 	case len(stale) > 0:
 		return engineLocalProgressing(reasonEnginePodsRolloutInProgress,
 			podDiagnostic("%d/%d engine Pods carry an older CacheBackend generation and must be rolled out: %s",
