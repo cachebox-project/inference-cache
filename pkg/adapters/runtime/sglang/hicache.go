@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -54,6 +55,17 @@ func (hiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
 }
 
 func (hiCacheAdapter) RequiresEndpoint() bool { return false }
+
+func (hiCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+	return binding == nil
+}
+
+func (a hiCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	if binding != nil {
+		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
+	}
+	return a.InjectEngineConfig(pod, "", cache)
+}
 
 func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if err := ValidateHiCacheBackend(cache); err != nil {

@@ -1,4 +1,4 @@
-package runtime
+package provider
 
 import (
 	"fmt"
@@ -7,7 +7,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 // Redis L2 render for the SGLang LMCache MP-mode data plane.
@@ -20,8 +19,8 @@ import (
 // fits the one-Service, engines-anywhere model exactly (a ClusterIP Service, no
 // hostNetwork/mesh — the opposite of Mooncake), it maps onto one Deployment +
 // Service, and it is proven end-to-end. The heavier tiers (`s3`, `mooncake_store`)
-// are durability/bandwidth opt-ins for a future backendConfig knob, not the
-// simple default. See docs/design/sglang-lmcache-mp-mode.md.
+// are future provider bindings, not the simple default. See
+// docs/design/sglang-lmcache-mp-mode.md.
 //
 // This render is the shared-store half of the MP data plane; the engine-side wire
 // (config-file + MP-worker sidecar pointed at this Redis) is injected by the
@@ -33,10 +32,11 @@ const (
 	// pins. A major.minor-alpine tag is more stable than :7 / :latest but still
 	// mutable within its patch line, so it is a sane default, NOT a reproducible
 	// pin: production MUST pin an exact release or @sha256 digest via
-	// backendConfig.redisImage, per the image-pin policy in
-	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what validation
-	// exercised against the pinned lmcache MP worker. Redis needs no lmcache
-	// version alignment (the MP worker speaks RESP), so this pin moves
+	// remoteStorage.redis.image (or deprecated backendConfig.redisImage on a
+	// legacy resource), per the image-pin policy in
+	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what
+	// validation exercised against the pinned lmcache MP worker. Redis needs no
+	// lmcache version alignment (the MP worker speaks RESP), so this pin moves
 	// independently of the engine/lmcache tuple.
 	defaultRedisImage = "docker.io/library/redis:7.4-alpine"
 	// defaultRedisPort is the canonical Redis port the `resp` L2 adapter dials.
@@ -45,9 +45,9 @@ const (
 	// it by name without hard-coding the integer.
 	defaultRedisPortName = "redis"
 
-	// redisMaxmemoryDefaultBytes is the memory sizing assumed when spec.resources
-	// carries none (pre-defaulting paths); the derived --maxmemory is a fraction
-	// of it. Matches the CRD's 8Gi memory default.
+	// redisMaxmemoryDefaultBytes is the memory sizing assumed when provider
+	// resources carry no limit; the derived --maxmemory is a fraction of it.
+	// It matches the provider/legacy 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
 
 	// cfgKeyRedisImage overrides the Redis image (production should pin a digest).
@@ -78,8 +78,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve redis L2: cache is nil")
 	}
-	cfg := cache.Spec.BackendConfig
-	image := enginewire.ConfigOr(cfg, cfgKeyRedisImage, defaultRedisImage)
+	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderRedis, cfgKeyRedisImage, defaultRedisImage)
 
 	container := corev1.Container{
 		Name:            "redis-l2",
@@ -123,9 +122,8 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// Reuse the shared server-resources helper: spec.resources (CRD-defaulted)
-		// is the operator-owned baseline, plus the CPU-request fallback when
-		// autoscaling is set. The memory limit here is also what --maxmemory is
+		// Reuse the shared provider-resources helper plus the autoscaling CPU
+		// request fallback. The memory limit here is also what --maxmemory is
 		// derived from, so the two stay consistent.
 		Resources: defaultServerResources(cache),
 	}
@@ -164,8 +162,8 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 // backlog all live outside it), so a pathological workload can still exceed the cgroup.
 func redisMaxmemoryBytes(cache *cachev1alpha1.CacheBackend) int64 {
 	base := redisMaxmemoryDefaultBytes
-	if cache != nil && cache.Spec.Resources != nil {
-		if q, ok := cache.Spec.Resources.Limits[corev1.ResourceMemory]; ok && q.Value() > 0 {
+	if resources := effectiveProviderResources(cache); resources != nil {
+		if q, ok := resources.Limits[corev1.ResourceMemory]; ok && q.Value() > 0 {
 			base = q.Value()
 		}
 	}

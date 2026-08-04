@@ -19,11 +19,11 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachebackend-cpu-override
 spec:
+  runtime: VLLM
   type: LMCache
   deploymentKind: Deployment
   replicas: 1
   integration:
-    engine: vllm
     role: ReadWrite
     # Per-engine overrides applied AFTER the runtime adapter produces its
     # canonical injection. Reserved entries (above) cannot be overridden or
@@ -51,7 +51,11 @@ spec:
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
-  backendConfig:
+  observation:
     # Served model identifier the matched engine pods are loaded with.
-    model: Qwen/Qwen2.5-0.5B-Instruct
-    serverImage: lmcache/standalone:v0.4.7
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: lmcache/standalone:v0.4.7

@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -91,7 +92,7 @@ func TestSGLangSupportedPairs(t *testing.T) {
 
 func TestSGLangResolveCacheServer(t *testing.T) {
 	a := NewAdapter()
-	pod, svc, err := a.ResolveCacheServer(newSGLangBackend(nil))
+	pod, svc, err := runtimeadapter.ResolveLegacyCacheServer(a, newSGLangBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -113,7 +114,7 @@ func TestSGLangResolveCacheServer(t *testing.T) {
 func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 	a := NewAdapter()
 	cb := newSGLangBackend(map[string]string{"redisImage": "registry.example.com/redis:pinned"})
-	pod, _, err := a.ResolveCacheServer(cb)
+	pod, _, err := runtimeadapter.ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -123,8 +124,52 @@ func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 }
 
 func TestSGLangResolveCacheServerNilCache(t *testing.T) {
-	if _, _, err := NewAdapter().ResolveCacheServer(nil); err == nil {
+	if _, _, err := runtimeadapter.ResolveLegacyCacheServer(NewAdapter(), nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
+	}
+}
+
+func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
+	chunkSize := int32(128)
+	capacity := resource.MustParse("6Gi")
+	cache := &cachev1alpha1.CacheBackend{
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			BackendConfig: map[string]string{
+				"chunkSize":   "999",
+				"l1SizeGB":    "99",
+				"workerImage": "legacy.example/worker:wrong",
+			},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				ChunkSizeTokens: &chunkSize,
+				HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{
+					Capacity: &capacity,
+				},
+			},
+		},
+	}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang", Image: "sglang:test"}}}
+	adapter := NewAdapter().(runtimeadapter.RemoteBindingAdapter)
+	if !adapter.SupportsRemoteBinding(nil) {
+		t.Fatal("SGLang LMCache adapter rejected host-only binding")
+	}
+	if err := adapter.InjectEngineConfigWithBinding(pod, (*backendadapter.Binding)(nil), cache); err != nil {
+		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+	}
+	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
+	if worker == nil {
+		t.Fatal("LMCache MP worker was not injected")
+	}
+	script := worker.Args[0]
+	if strings.Contains(script, "--l2-adapter") || strings.Contains(script, "redis") {
+		t.Fatalf("host-only worker command selected remote storage: %q", script)
+	}
+	if !strings.Contains(script, "--chunk-size 128") || !strings.Contains(script, "--l1-size-gb 6") {
+		t.Fatalf("worker command did not consume typed LMCache config: %q", script)
+	}
+	if worker.Image == "legacy.example/worker:wrong" {
+		t.Fatal("canonical engine config inherited legacy backendConfig.workerImage")
 	}
 }
 

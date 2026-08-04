@@ -12,8 +12,8 @@ multi-tenant, Namespaces):
 - **`cache_v1alpha1_*.yaml`** — kubebuilder-generated minimum-viable samples,
   one per CRD kind. Useful as a starting point or for the first
   `kubectl apply` after a fresh install.
-- **`cachebackend-*.yaml`** — earlier hand-curated CacheBackend shapes, retained
-  for back-compat, plus the focused
+- **`cachebackend-*.yaml`** — focused hand-curated canonical CacheBackend
+  examples, including the
   [`cachebackend-sglang-hicache.yaml`](cachebackend-sglang-hicache.yaml)
   engine-local example. The `recipe-*.yaml` catalog is the maintained entry
   point for LMCache scenarios.
@@ -30,7 +30,7 @@ before applying. All but `recipe-gpu-production` run without a GPU.
 | --- | --- |
 | [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Fastest path on a laptop / kind — tiny ungated model, no GPU, single replica, no quotas. |
 | [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Typical production — real model on GPU engine pods, managed-backend autoscaling, a CachePolicy with production TTLs. |
-| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | `type: External` — point the operator at a cache server you manage yourself; the controller provisions nothing. |
+| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | External `LMCacheServer` ownership — point the operator at a cache server you manage yourself; the controller provisions nothing. |
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
 | [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
 
@@ -43,13 +43,13 @@ into two namespaces of its own.
 **Apply + observability.** Each recipe's `kubectl apply` wires matching engine
 pods to the cache. For *managed* backends the wiring becomes available once the
 controller publishes `status.endpoint`, so a pod admitted before then races past
-injection and runs unwired until recreated (see each recipe's header); `External`
-backends wire straight from the `spec.endpoint` you provide and have no such
+injection and runs unwired until recreated (see each recipe's header); externally
+owned backends wire straight from `spec.remoteStorage.endpoint` and have no such
 race. KV reuse then works, but a *managed* backend only reaches `Ready=True`
 and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
 (empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
-degrades to `NoKVEventsObserved`. `External` backends are exempt from that gate —
+degrades to `NoKVEventsObserved`. Externally owned backends are exempt from that gate —
 they go `Ready` as soon as admission accepts the endpoint. See the
 [quickstart](../../docs/quickstart.md).
 

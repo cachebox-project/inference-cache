@@ -97,14 +97,18 @@ const (
 // Note: unlike the old lm:// wire, this does NOT inject LMCACHE_REMOTE_URL / serde
 // / local-CPU env — SGLang MP mode ignores it.
 func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	if err := ValidateInjectInputs(pod, endpoint, cache, "engine"); err != nil {
+	if err := validateInjectPodCacheInputs(pod, cache, "engine"); err != nil {
 		return err
+	}
+	if endpoint == "" &&
+		(!cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.EffectiveRemoteStorage() != nil) {
+		return fmt.Errorf("inject engine config: endpoint is empty")
 	}
 	i, err := EngineContainerIndexNamed(pod, SGLangEngineContainerName)
 	if err != nil {
 		return err
 	}
-	cfg := cache.Spec.BackendConfig
+	cfg := effectiveSGLangLMCacheConfig(cache)
 	// SECURITY: chunkSize/mpPort/l1SizeGB are substituted into the worker's `sh -c`
 	// command and into resource sizing, so they MUST be plain positive integers — a
 	// non-integer (typo or a shell-metacharacter injection attempt) falls back to
@@ -114,9 +118,12 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	mpPort := sglangIntInRangeOr(cfg, cfgKeyMPPort, sglangDefaultMPPort, sglangMaxTCPPort)
 	l1SizeGB := sglangIntInRangeOr(cfg, cfgKeyL1SizeGB, sglangDefaultL1SizeGB, sglangMaxL1SizeGB)
 
-	l2Adapter, err := sglangL2AdapterJSON(endpoint)
-	if err != nil {
-		return err
+	l2Adapter := ""
+	if endpoint != "" {
+		l2Adapter, err = sglangL2AdapterJSON(endpoint)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Mutate a COPY and commit it only on success, so injection is all-or-nothing.
@@ -227,7 +234,8 @@ func mountAtPath(ms []corev1.VolumeMount, path string) *corev1.VolumeMount {
 // server — both in this container so, gated by the startupProbe, the config exists
 // and the server listens before the engine starts. The worker image defaults to
 // the engine image (guaranteeing the same lmcache version — the two speak the MP
-// wire) and is overridable via backendConfig.workerImage.
+// wire) and is overridable via lmCache.workerImage (or legacy
+// backendConfig.workerImage).
 func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContext, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string, shmMount corev1.VolumeMount) corev1.Container {
 	image := ConfigOr(cfg, cfgKeyWorkerImage, engineImage)
 	configPath := sglangConfigMountPath + "/" + sglangConfigFileName
@@ -237,8 +245,11 @@ func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContex
 	script := fmt.Sprintf(
 		"set -e; printf 'chunk_size: %s\\nmp_host: \"127.0.0.1\"\\nmp_port: %s\\n' > %s; "+
 			"exec python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port %s "+
-			"--chunk-size %s --l1-size-gb %s --eviction-policy LRU --l2-adapter %s",
-		chunkSize, mpPort, configPath, mpPort, chunkSize, l1SizeGB, shellSingleQuote(l2Adapter))
+			"--chunk-size %s --l1-size-gb %s --eviction-policy LRU",
+		chunkSize, mpPort, configPath, mpPort, chunkSize, l1SizeGB)
+	if l2Adapter != "" {
+		script += " --l2-adapter " + shellSingleQuote(l2Adapter)
+	}
 
 	// The worker holds the L1 in a memory-backed tmpfs charged to its own cgroup, so
 	// it MUST carry a matching memory request+limit — otherwise the L1 is invisible
@@ -373,14 +384,11 @@ func sglangWorkerSecurityContext(engineSC *corev1.SecurityContext) *corev1.Secur
 }
 
 // sglangL2AdapterJSON returns the worker's --l2-adapter config: the resp adapter
-// pointed at the managed Redis endpoint (host:port).
+// pointed at the resolved Redis endpoint (host:port).
 //
-// Operator-supplied ("bring your own") L2 stores are deliberately NOT supported
-// yet: skipping the managed Redis clears status.endpoint, and the pod webhook's
-// empty-endpoint gate then skips injection entirely, so a BYO backend would cache
-// nothing. Supporting it needs that gate to become adapter-aware first — the gate
-// exists only to protect vLLM's lm:// dial target, which SGLang MP does not have.
-// See the tracking issue linked from the package doc.
+// The endpoint may come from a controller-managed Redis Service or a canonical
+// External Redis binding. Admission keeps both shapes at bare host:port because
+// the RESP adapter takes host and numeric port as separate fields.
 func sglangL2AdapterJSON(endpoint string) (string, error) {
 	host, port, ok := splitLMCacheHostPort(strings.TrimSpace(endpoint))
 	if !ok || host == "" || port == "" {
@@ -446,6 +454,31 @@ func sglangIntInRangeOr(cfg map[string]string, key, fallback string, max int) st
 		return v
 	}
 	return fallback
+}
+
+func effectiveSGLangLMCacheConfig(cache *cachev1alpha1.CacheBackend) map[string]string {
+	cfg := make(map[string]string, len(cache.Spec.BackendConfig)+4)
+	if !cache.Spec.UsesCanonicalCacheHierarchy() {
+		for key, value := range cache.Spec.BackendConfig {
+			cfg[key] = value
+		}
+	}
+	if cache.Spec.LMCache == nil {
+		return cfg
+	}
+	if cache.Spec.LMCache.ChunkSizeTokens != nil {
+		cfg[cfgKeyChunkSize] = strconv.FormatInt(int64(*cache.Spec.LMCache.ChunkSizeTokens), 10)
+	}
+	if cache.Spec.LMCache.WorkerImage != "" {
+		cfg[cfgKeyWorkerImage] = cache.Spec.LMCache.WorkerImage
+	}
+	if cache.Spec.LMCache.WorkerPort != nil {
+		cfg[cfgKeyMPPort] = strconv.FormatInt(int64(*cache.Spec.LMCache.WorkerPort), 10)
+	}
+	if host := cache.Spec.LMCache.HostMemory; host != nil && host.Capacity != nil && host.Capacity.Value() > 0 {
+		cfg[cfgKeyL1SizeGB] = strconv.FormatInt(ceilPositiveBytesToGiB(host.Capacity.Value()), 10)
+	}
+	return cfg
 }
 
 // shellSingleQuote wraps s in single quotes for safe use in a `sh -c` script,

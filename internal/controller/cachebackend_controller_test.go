@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
@@ -186,6 +188,130 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	}
 }
 
+func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("host-only", "ns1")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+		t.Fatalf("deployment lookup error = %v, want NotFound", err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("service lookup error = %v, want NotFound", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for host-only hierarchy", got.Status.Endpoint)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != conditionReasonHostOnlyActive {
+		t.Fatalf("Ready = %+v, want True/%s", ready, conditionReasonHostOnlyActive)
+	}
+}
+
+func TestReconcileCanonicalSGLangHiCacheWithRemoteStorageIsUnmanaged(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache-remote", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+		t.Fatalf("deployment lookup error = %v, want NotFound", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for unsupported binding", got.Status.Endpoint)
+	}
+	if ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("unsupported binding published Ready condition: %+v", ready)
+	}
+}
+
+func TestReconcileCanonicalHostOnlyCacheReportsEngineDiagnostics(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("host-only-kernel", "ns1")
+	cb.UID = types.UID("host-only-kernel-uid")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "engine"},
+	}
+	pod := strictPodWithKernelStatus(termed(1, adapterruntime.KernelCheckMsgFailPrefix+" lmcache c_ops failed"))
+	pod.ObjectMeta = metav1.ObjectMeta{
+		Name:      "engine",
+		Namespace: cb.Namespace,
+		Labels:    map[string]string{"app": "engine"},
+		Annotations: map[string]string{
+			podwebhook.AnnotationInjectedBy:    cb.Namespace + "/" + cb.Name,
+			podwebhook.AnnotationInjectedByUID: string(cb.UID),
+		},
+	}
+	pod.Spec.Containers = []corev1.Container{{Name: "vllm"}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "vllm",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason: crashLoopBackOffReason,
+		}},
+	}}
+	r := newReconciler(scheme, cb, &pod)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	kernels := meta.FindStatusCondition(got.Status.Conditions, conditionTypeEngineKernelsHealthy)
+	if kernels == nil || kernels.Status != metav1.ConditionFalse || kernels.Reason != reasonKernelLoadFailed {
+		t.Fatalf("EngineKernelsHealthy = %+v, want False/%s", kernels, reasonKernelLoadFailed)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != reasonEngineKernelDegraded {
+		t.Fatalf("Ready = %+v, want False/%s", ready, reasonEngineKernelDegraded)
+	}
+	compatibility := meta.FindStatusCondition(got.Status.Conditions, conditionTypeEngineCompatibility)
+	if compatibility == nil || compatibility.Status != metav1.ConditionFalse ||
+		compatibility.Reason != reasonInjectedEngineCrashLooping {
+		t.Fatalf("EngineCompatibility = %+v, want False/%s", compatibility, reasonInjectedEngineCrashLooping)
+	}
+}
+
+func TestReconcileLegacyCacheWithTypedObservationRetainsProviderWorkload(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("legacy-observed", "ns1")
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); err != nil {
+		t.Fatalf("managed deployment was not retained: %v", err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}, &service); err != nil {
+		t.Fatalf("managed service was not retained: %v", err)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	wantEndpoint := "legacy-observed.ns1.svc.cluster.local:65432"
+	if got.Status.Endpoint != wantEndpoint {
+		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, wantEndpoint)
+	}
+}
+
 // mooncakeBackend is the managed-Mooncake fixture, mirroring lmcacheBackend:
 // it opts OUT of the KV-event readiness gate so the rollout-driven Ready
 // assertion is orthogonal to the gate.
@@ -255,6 +381,29 @@ func TestReconcileManagedMooncake(t *testing.T) {
 	}
 	if updated.Status.ObservedGeneration != 1 {
 		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
+	}
+}
+
+func TestReconcileCanonicalManagedMooncake(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("canonical-mooncake", "ns1")
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Mooncake:  &cachev1alpha1.MooncakeRemoteStorageSpec{},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	dep := getDeployment(t, r, cb.Name, cb.Namespace)
+	if got := dep.Spec.Template.Spec.Containers[0].Name; got != "mooncake-master" {
+		t.Fatalf("container name = %q, want mooncake-master", got)
+	}
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if want := "canonical-mooncake.ns1.svc.cluster.local:50051"; got.Status.Endpoint != want {
+		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, want)
 	}
 }
 
@@ -1231,7 +1380,132 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 			if ready.Reason != "ExternalEndpointInvalid" {
 				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
 			}
+			if !strings.Contains(ready.Message, "spec.endpoint") {
+				t.Fatalf("Ready message = %q, want legacy field spec.endpoint", ready.Message)
+			}
 		})
+	}
+}
+
+func TestReconcileCanonicalExternalInvalidEndpointNamesCanonicalField(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "canonical-ext-bad", Namespace: "default"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "https://cache.example.com:443/api",
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	ready := findCondition(got.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "ExternalEndpointInvalid" {
+		t.Fatalf("Ready condition = %+v, want False/ExternalEndpointInvalid", ready)
+	}
+	if !strings.Contains(ready.Message, "spec.remoteStorage.endpoint") {
+		t.Fatalf("Ready message = %q, want canonical field spec.remoteStorage.endpoint", ready.Message)
+	}
+	if strings.Contains(ready.Message, "spec.endpoint") {
+		t.Fatalf("Ready message = %q, must not name deprecated spec.endpoint", ready.Message)
+	}
+}
+
+func TestReconcileCanonicalExternalEndpointUsesProviderProtocol(t *testing.T) {
+	scheme := newScheme(t)
+	tests := []struct {
+		name       string
+		runtime    cachev1alpha1.CacheBackendRuntime
+		provider   cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint   string
+		wantStatus metav1.ConditionStatus
+		wantReason string
+	}{
+		{
+			name:       "redis rejects lm scheme",
+			runtime:    cachev1alpha1.CacheBackendRuntimeSGLang,
+			provider:   cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			endpoint:   "lm://redis.example:6379",
+			wantStatus: metav1.ConditionFalse,
+			wantReason: conditionReasonExternalEndpointInvalid,
+		},
+		{
+			name:       "mooncake accepts explicit scheme",
+			runtime:    cachev1alpha1.CacheBackendRuntimeVLLM,
+			provider:   cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+			endpoint:   "mooncakestore://cache.example:50051",
+			wantStatus: metav1.ConditionTrue,
+			wantReason: conditionReasonExternalEndpointAccepted,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "external", Namespace: "default"},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Runtime: tt.runtime,
+					Type:    cachev1alpha1.CacheBackendTypeLMCache,
+					RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+						Provider:  tt.provider,
+						Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+						Endpoint:  tt.endpoint,
+					},
+				},
+			}
+			r := newReconciler(scheme, cb)
+			reconcile(t, r, cb.Name, cb.Namespace)
+
+			ready := findCondition(getBackend(t, r, cb.Name, cb.Namespace).Status.Conditions, conditionTypeReady)
+			if ready == nil || ready.Status != tt.wantStatus || ready.Reason != tt.wantReason {
+				t.Fatalf("Ready = %+v, want %s/%s", ready, tt.wantStatus, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestReconcileCanonicalExternalUnsupportedBindingStaysUnmanaged(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-redis", Namespace: "default", Generation: 2},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "redis.example:6379",
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{
+			Endpoint: "stale.example:6379",
+			Conditions: []metav1.Condition{{
+				Type:   conditionTypeReady,
+				Status: metav1.ConditionTrue,
+				Reason: conditionReasonExternalEndpointAccepted,
+			}},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared for unsupported external binding", got.Status.Endpoint)
+	}
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("Ready = %+v, want absent for unmanaged unsupported external binding", ready)
+	}
+	if got.Status.ObservedGeneration != cb.Generation {
+		t.Fatalf("status.observedGeneration = %d, want %d", got.Status.ObservedGeneration, cb.Generation)
 	}
 }
 

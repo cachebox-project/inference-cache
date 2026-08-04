@@ -339,6 +339,30 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+	resp := newHandler(t, cb).Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("unsupported cache binding must fail open: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("unsupported cache binding produced %d patches, want original Pod unchanged", len(resp.Patches))
+	}
+}
+
 func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
@@ -445,11 +469,15 @@ func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
 		return &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type: cachev1alpha1.CacheBackendTypeMooncake,
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Engine:            "vllm",
 					Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 					EngineHostNetwork: optIn,
+				},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 				},
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 					MatchLabels: map[string]string{"app": "vllm"},
@@ -519,11 +547,15 @@ func TestHandle_MooncakeBackend_HostNetworkNeverGrantedToAnUnwiredPod(t *testing
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine:            "vllm",
 				Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 				EngineHostNetwork: true,
+			},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1133,6 +1165,30 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 				t.Fatalf("fail-open reason should mention spec.endpoint for External; got %q", msg)
 			}
 		})
+	}
+}
+
+func TestEffectiveEndpointCanonicalExternalUsesProviderProtocol(t *testing.T) {
+	cache := &cachev1alpha1.CacheBackend{
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "mooncakestore://cache.example:50051",
+			},
+		},
+	}
+	if got := effectiveEndpoint(cache); got != cache.Spec.RemoteStorage.Endpoint {
+		t.Fatalf("effectiveEndpoint(Mooncake) = %q, want %q", got, cache.Spec.RemoteStorage.Endpoint)
+	}
+
+	cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cache.Spec.RemoteStorage.Provider = cachev1alpha1.CacheBackendRemoteStorageProviderRedis
+	cache.Spec.RemoteStorage.Endpoint = "lm://redis.example:6379"
+	if got := effectiveEndpoint(cache); got != "" {
+		t.Fatalf("effectiveEndpoint(Redis with lm scheme) = %q, want empty fail-open endpoint", got)
 	}
 }
 

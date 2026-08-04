@@ -46,8 +46,9 @@ Concretely:
   The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
   container spec (via the shared `RenderSubscriberSidecar` — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
-  `--hash-scheme` tag + ZMQ port); the reference adapter and any adapter for
-  `type: External` return `(nil, nil)`.
+  `--hash-scheme` tag + ZMQ port); the reference adapter and the deprecated
+  legacy `type: External` adapter return `(nil, nil)`. Canonical external
+  ownership stays on the runtime/cache adapter and can attach observation.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
@@ -61,9 +62,10 @@ Concretely:
   cluster; operators turn it on when they're ready to ship a subscriber image alongside.
 * Sidecar identity flags are derived from the CR + pod: `--replica-id` ← `pod.Name`
   (via the downward API so `generateName` pods work), `--tenant-id` ← `pod.Namespace`
-  (downward API likewise), `--model-id` ← `spec.backendConfig.model` (single source;
-  when unset, the adapter returns no sidecar — the binary requires the flag, the next
-  admission picks it up once the operator sets the key), `--hash-scheme` ← the
+  (downward API likewise), `--model-id` ← canonical `spec.observation.modelID`
+  (with deprecated `spec.backendConfig.model` as a legacy read fallback; when
+  unset, the adapter returns no sidecar — the binary requires the flag, and the next
+  admission picks it up once the operator sets the field), `--hash-scheme` ← the
   adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),
   `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags

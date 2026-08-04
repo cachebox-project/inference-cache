@@ -26,7 +26,7 @@
 #
 # IMAGES ARE PLACEHOLDERS — replace before production. The engine image below
 # uses a moving `:latest` tag so the recipe stays self-contained; the managed
-# cache-server `serverImage` is pinned to a version (not `:latest`). Pin each to
+# cache-server image is pinned to a version (not `:latest`). Pin each to
 # an immutable digest for a real deployment.
 #
 # READY/OBSERVABILITY PREREQUISITE: the backend reaches Ready=True and reports
@@ -53,6 +53,7 @@ kind: CacheBackend
 metadata:
   name: prod-llm-cache
 spec:
+  runtime: VLLM
   type: LMCache
   # Baseline replica count for the managed lmcache-server. The autoscaling
   # block below takes over once the HPA is reconciled.
@@ -62,7 +63,7 @@ spec:
     maxReplicas: 6
     targetCPUUtilizationPercent: 70
   # Per-replica resource budget for the lmcache-server container. Omit
-  # spec.resources entirely and the CRD-schema default supplies
+  # remoteStorage.lmCacheServer.resources and the provider fallback supplies
   # `requests.memory=4Gi`, `limits.memory=8Gi` — adequate for a small
   # workload, conservative enough that the kubelet does not OOM-kill the
   # cache pod from node-level memory pressure. The cgroup memory limit
@@ -78,22 +79,25 @@ spec:
   # CPU request fallback automatically (an HPA needs a CPU request as
   # its utilization denominator). Add `cpu: …` under requests below to
   # pin the denominator explicitly if you want a different baseline.
-  resources:
-    requests:
-      memory: "16Gi"
-    limits:
-      memory: "24Gi"
   integration:
-    engine: vllm
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: prod-llm
-  backendConfig:
+  observation:
     # Real, ungated model (Apache-2.0) — no auth token required.
-    model: Qwen/Qwen2.5-7B-Instruct
-    # PLACEHOLDER — replace with a digest-pinned reference before production.
-    serverImage: lmcache/standalone:v0.4.7
+    modelID: Qwen/Qwen2.5-7B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      # PLACEHOLDER — replace with a digest-pinned reference before production.
+      image: lmcache/standalone:v0.4.7
+      resources:
+        requests:
+          memory: "16Gi"
+        limits:
+          memory: "24Gi"
 ---
 apiVersion: inferencecache.io/v1alpha1
 kind: CachePolicy

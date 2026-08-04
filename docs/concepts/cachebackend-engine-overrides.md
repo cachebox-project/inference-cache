@@ -74,8 +74,8 @@ Drop to 64.
 
 ```yaml
 spec:
+  runtime: VLLM
   integration:
-    engine: vllm
     engineOverrides:
       env:
         - name: LMCACHE_CHUNK_SIZE
@@ -110,8 +110,8 @@ sidecar can collect it. Neither variable is in the adapter's canonical set
 
 ```yaml
 spec:
+  runtime: VLLM
   integration:
-    engine: vllm
     engineOverrides:
       env:
         - name: LMCACHE_LOG_LEVEL
@@ -154,8 +154,8 @@ audit tooling see the minimal set.
 
 ```yaml
 spec:
+  runtime: VLLM
   integration:
-    engine: vllm
     engineOverrides:
       suppressEnv:
         - LMCACHE_LOCAL_CPU
@@ -191,8 +191,8 @@ the same flag is a silent no-op; edit the pod template instead, since
 
 ```yaml
 spec:
+  runtime: VLLM
   integration:
-    engine: vllm
     engineOverrides:
       args:
         - --max-model-len
@@ -228,8 +228,8 @@ following:
 
 ```yaml
 spec:
+  runtime: VLLM
   integration:
-    engine: vllm
     engineOverrides:
       env:
         - name: LMCACHE_REMOTE_URL

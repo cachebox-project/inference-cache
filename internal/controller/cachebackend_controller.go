@@ -26,7 +26,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
@@ -203,6 +206,9 @@ type CacheBackendReconciler struct {
 	// short-circuited before Select, so it is not in the fallback). Set
 	// explicitly only in tests that need a custom adapter set.
 	Registry *adapterruntime.Registry
+	// BackendRegistry resolves remote provider lifecycle independently from
+	// engine/runtime wiring. Nil uses the shipping provider registry.
+	BackendRegistry *backendadapter.Registry
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
 	// triggers. Zero means "use [DefaultMatchedEnginePodsRequeueInterval]".
@@ -384,25 +390,27 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return result, err
 }
 
-// dispatch routes a CacheBackend to the right reconcile path. External backends
-// only mirror their configured endpoint to status; unsupported / deferred kinds
-// shed any previously managed workload; LMCache (Phase 1) templates a
-// Deployment + Service.
+// dispatch routes a CacheBackend by integration mode and effective remote
+// storage ownership. EventsOnly and canonical host-only configurations shed
+// managed provider workloads; External storage mirrors its configured endpoint
+// to status; Managed Redis, LMCacheServer, and Mooncake storage is rendered by
+// the selected runtime/provider adapter. Unsupported combinations also shed any
+// previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	registry := r.Registry
 	if registry == nil {
 		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
 		// nil-fallback manages the same backends the validator + pod webhook
 		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
-		// plus the SGLang adapters (a subpackage DefaultRegistry can't
-		// import without a cycle). External is intentionally absent — a
-		// type==External backend short-circuits to the unmanaged External path
-		// before ever reaching Select, so registering it here would be dead code.
+		// plus the External and SGLang adapters (subpackages DefaultRegistry
+		// can't import without a cycle).
 		registry = adapterruntime.DefaultRegistry()
+		registry.Register(externaladapter.NewAdapter())
 		registry.Register(sglangadapter.NewAdapter())
 		registry.Register(sglangadapter.NewHiCacheAdapter())
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
+	storage := backend.Spec.EffectiveRemoteStorage()
 
 	// Events-only (tier-1 routing) provisions no backend server: the engine is
 	// wired for cache-aware routing via the kvevent-subscriber alone, with no KV
@@ -443,7 +451,33 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return r.reconcileEventsOnly(ctx, backend)
 	}
 
-	if backend.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
+	adapter, err := registry.Select(runtimeID, backend)
+	if err != nil {
+		// No adapter knows how to wire this (runtime, backend) pair. The
+		// admission validator rejects this at write time, so reaching this branch
+		// means a CR already in etcd from before the webhook was installed (or
+		// with a registry that has since shrunk).
+		logger.V(1).Info("no runtime adapter for backend",
+			"runtime", runtimeID, "type", backend.Spec.Type,
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+
+	if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		protocol, err := backendadapter.ProtocolFor(storage)
+		if err != nil {
+			logger.V(1).Info("external storage has no supported binding protocol; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "provider", storage.Provider,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		binding := backendadapter.BindingFor(storage, protocol, storage.Endpoint)
+		if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
 		// A backend switched from a managed type to External must shed its workload.
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
@@ -455,26 +489,54 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// module. Phase 1 manages a Deployment only. SGLangHiCache is engine-local,
 	// so the schema-defaulted deploymentKind is inert for it.
 	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet &&
-		backend.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
+		storage != nil {
 		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	adapter, err := registry.Select(runtimeID, backend)
+	if storage == nil {
+		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+		if bindingAware, ok := adapter.(adapterruntime.RemoteBindingAdapter); !ok || !bindingAware.SupportsRemoteBinding(nil) {
+			logger.V(1).Info("runtime adapter does not support host-only caching; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(),
+				"namespace", backend.Namespace, "name", backend.Name)
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		// Native HiCache remains endpoint-free and intentionally publishes no
+		// Ready condition until its separate readiness contract is implemented.
+		if backend.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeSGLangHiCache {
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		return r.reconcileHostOnly(ctx, backend)
+	}
+
+	backendRegistry := r.BackendRegistry
+	if backendRegistry == nil {
+		backendRegistry = backendprovider.DefaultRegistry()
+	}
+	provider, err := backendRegistry.Select(storage)
 	if err != nil {
-		// No adapter knows how to wire this (runtime, backend) pair. The
-		// admission validator (M6/C7) rejects this at write time, so
-		// reaching this branch means a CR already in etcd from before the
-		// webhook was installed (or with a registry that has since
-		// shrunk). Shed any previously managed workload and log.
-		logger.V(1).Info("no runtime adapter for backend",
-			"runtime", runtimeID, "type", backend.Spec.Type,
+		logger.V(1).Info("no remote-storage provider for backend; treating as unmanaged",
+			"provider", storage.Provider, "ownership", storage.Ownership,
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+	rendered, err := provider.Render(backend)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("render remote storage for %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
+	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
+			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
-	return r.reconcileManaged(ctx, logger, backend, adapter)
+	return r.reconcileManaged(ctx, logger, backend, rendered)
 }
 
 // reconcileExternal mirrors a pre-existing backend's configured endpoint to
@@ -488,20 +550,19 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
 // honest about CRs that were stored under a laxer rule set:
 //
-//   - spec.endpoint empty                  → Ready=False/ExternalEndpointMissing
-//   - spec.endpoint set but malformed      → Ready=False/ExternalEndpointInvalid
-//   - spec.endpoint set and well-formed    → Ready=True/ExternalEndpointAccepted
+//   - external endpoint empty             → Ready=False/ExternalEndpointMissing
+//   - endpoint malformed for its provider → Ready=False/ExternalEndpointInvalid
+//   - endpoint valid for its provider     → Ready=True/ExternalEndpointAccepted
 //
 // The "invalid" branch matters because admission's shape rule tightened
 // over the life of the CRD (added port-required, bracket-required-IPv6,
 // no-embedded-whitespace, etc. as we learned what the engine connector
 // rejects). A pre-existing stored CR carrying e.g. `https://...` or a
 // portless host would otherwise be marked Ready=True/ExternalEndpointAccepted
-// here; the pod webhook would then read spec.endpoint, prepend `lm://`,
-// and inject a URL the engine can't parse — turning a cache
-// misconfiguration into a serving outage. Publishing Ready=False with a
-// specific reason names the gap, and the pod webhook short-circuits on
-// the same check (returns no-injection, fail-open).
+// here; the pod webhook would then hand the value to a provider wire that
+// cannot parse it, turning a cache misconfiguration into a serving outage.
+// Publishing Ready=False with a specific reason names the gap, and the pod
+// webhook short-circuits on the same check (returns no-injection, fail-open).
 //
 // External backends never enter the KV-event readiness gate, so the
 // managed-only Degraded condition is cleared here. Two status fields are
@@ -535,7 +596,11 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// means the pod webhook's `endpoint == ""` short-circuit
 		// naturally catches whitespace too without a second TrimSpace
 		// at the consumer.
-		endpoint := strings.TrimSpace(backend.Spec.Endpoint)
+		storage := backend.Spec.EffectiveRemoteStorage()
+		endpoint := ""
+		if storage != nil {
+			endpoint = strings.TrimSpace(storage.Endpoint)
+		}
 		backend.Status.Endpoint = endpoint
 		// Clear the cache-server-instance latch — External backends
 		// have no controller-managed cache-server pods, and
@@ -555,17 +620,21 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		switch {
 		case endpoint == "":
 			readyReason = conditionReasonExternalEndpointMissing
-			readyMsg = "spec.endpoint is empty; set it to the address of the pre-existing backend"
+			readyMsg = "the external remote-storage endpoint is empty"
 		default:
 			// Use the same shape validator the admission webhook
-			// uses; surface the helper's message verbatim so an
+			// uses; prefix the helper's message with the active API
+			// field so an
 			// operator running kubectl describe sees the same
 			// shape complaint they would get on a fresh kubectl
-			// apply. Pass the raw spec.Endpoint so the helper
-			// applies its own TrimSpace consistently.
-			if err := adapterruntime.ValidateLMCacheEndpoint(backend.Spec.Endpoint); err != nil {
+			// apply.
+			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
-				readyMsg = "spec." + err.Error()
+				fieldPrefix := "spec."
+				if backend.Spec.UsesCanonicalCacheHierarchy() {
+					fieldPrefix = "spec.remoteStorage."
+				}
+				readyMsg = fieldPrefix + err.Error()
 				break
 			}
 			readyStatus = metav1.ConditionTrue
@@ -606,11 +675,11 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// tier-2 (if any) is operator-managed and not evaluated here --
 		// clear any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
-		// EngineCompatibility is likewise a managed-only advisory (set only in
-		// updateManagedStatus from an injected engine pod's crash-loop). An
-		// External backend injects no connector and is not evaluated here, so
-		// clear any left over from a prior managed state rather than leave a
-		// stale incompatibility warning the External contract never updates.
+		// EngineCompatibility is likewise evaluated only by the managed and
+		// host-only status paths. External storage still receives runtime-side
+		// connector injection, but this reconcile path does not inspect those
+		// engine pods, so clear any condition left over from a prior mode rather
+		// than leave a stale warning the External contract never updates.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
 	})
 }
@@ -626,8 +695,9 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 //
 // Like reconcileExternal it clears the in-memory cascade shadow and the
 // functional-probe rate-limit entry (there is no server to cascade-restart or
-// probe) and clears the managed-only FunctionalProbeOK / EngineKernelsHealthy /
-// T2Degraded / EngineCompatibility conditions.
+// probe) and clears the managed-only FunctionalProbeOK / T2Degraded conditions.
+// Events-only also clears EngineKernelsHealthy / EngineCompatibility because it
+// loads no connector; host-only evaluates both engine-side diagnostics normally.
 // The firstEventTimeout window is anchored on status.firstAvailableAt, latched
 // here on the first reconcile — an events-only backend is "up" the moment it
 // exists (no workload to wait on), so the gate starts its clock immediately and
@@ -635,17 +705,28 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 // flipping in from a server-bearing mode re-anchors the latch to the flip moment
 // rather than inheriting that mode's (workload-)availability time.
 func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	return r.reconcileServerless(ctx, backend, conditionReasonEventsOnlyActive,
+		"events-only backend active; routing tier wired with no offload server")
+}
+
+func (r *CacheBackendReconciler) reconcileHostOnly(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	return r.reconcileServerless(ctx, backend, conditionReasonHostOnlyActive,
+		"host-only cache active; engine-local cache wired with no remote provider")
+}
+
+func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backend *cachev1alpha1.CacheBackend, activeReason, activeMessage string) (ctrl.Result, error) {
 	now := time.Now()
-	// A backend flipping INTO events-only from a server-bearing mode (Offload or
-	// External) still carries that mode's status.endpoint / observedServerInstance
-	// at the top of this reconcile — events-only clears both below, so a non-empty
-	// value here uniquely marks the FIRST events-only reconcile after the flip.
+	// A backend flipping INTO a serverless mode (events-only or host-only) from a
+	// server-bearing mode still carries that mode's status.endpoint /
+	// observedServerInstance at the top of this reconcile. Serverless modes clear
+	// both below, so a non-empty value here uniquely marks the first reconcile
+	// after the flip.
 	// On that transition any latched firstAvailableAt reflects the OLD mode's
 	// availability (e.g. an Offload workload that went Available long ago), not the
-	// events-only "up" moment, so reusing it as the firstEventTimeout anchor could
-	// breach the window the instant we flip and strand the backend at
-	// NoKVEventsObserved/Degraded. Re-anchor to now so events-only gets a fresh
-	// first-event window from when it took effect (the documented contract).
+	// new serverless mode's "up" moment, so reusing it as the firstEventTimeout
+	// anchor could breach the window the instant we flip and strand the backend at
+	// NoKVEventsObserved/Degraded. Re-anchor to now so the new mode gets a fresh
+	// first-event window from when it took effect.
 	transitionedFromServerMode := backend.Status.Endpoint != "" || backend.Status.ObservedServerInstance != ""
 	// Base readiness is unconditionally True (no workload to gate on); the
 	// KV-event gate layers AwaitingFirstKVEvent → KVEventsObserved /
@@ -654,14 +735,30 @@ func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backen
 	if backend.Status.FirstAvailableAt != nil && !transitionedFromServerMode {
 		anchor = backend.Status.FirstAvailableAt.Time
 	}
-	// On a server-mode→events-only transition the clock is re-anchored to now,
+	// On a server-bearing-to-serverless transition the clock is re-anchored to now,
 	// so also bypass any sticky NoKVEventsObserved carried over from the prior
 	// mode — otherwise the flip would inherit that timed-out verdict and stay
 	// Degraded despite the fresh window.
 	gate := evaluateKVEventReadiness(backend, metav1.ConditionTrue,
-		conditionReasonEventsOnlyActive,
-		"events-only backend active; routing tier wired with no offload server",
+		activeReason,
+		activeMessage,
 		anchor, now, transitionedFromServerMode)
+	kernelVerdict := kernelHealthVerdict{}
+	engineCompatMsg := ""
+	engineCompatObserved := false
+	previousEngineIncompatible := false
+	eventsOnly := backend.Spec.IsEventsOnly()
+	if !eventsOnly {
+		kernelReader := client.Reader(r.APIReader)
+		if kernelReader == nil {
+			kernelReader = r.Client
+		}
+		kernelPods, kernelListedOK := listMatchedEnginePods(ctx, kernelReader, backend)
+		kernelVerdict = evaluateEngineKernelHealth(backend, gate, kernelPods, kernelListedOK)
+		gate = downgradeKernelReadyVerdict(gate, kernelVerdict)
+		engineCompatMsg, engineCompatObserved = r.detectEngineConnectorCrashLoop(ctx, backend)
+		previousEngineIncompatible = meta.IsStatusConditionFalse(backend.Status.Conditions, conditionTypeEngineCompatibility)
+	}
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 
 	// No server to cascade-restart or functionally probe — drop both in-memory
@@ -713,20 +810,42 @@ func (r *CacheBackendReconciler) reconcileEventsOnly(ctx context.Context, backen
 		})
 		// Managed-only advisories never apply to a server-less backend.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
-		// EngineKernelsHealthy is a managed-path-only condition (events-only
-		// loads no LMCache connector, so the kernel-check init container is
-		// never injected). Clear any left over from a prior Offload generation
-		// so an Offload→EventsOnly flip doesn't strand a stale kernel verdict —
-		// events-only publishes only Ready/Degraded/Progressing.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		if eventsOnly {
+			// Events-only loads no LMCache connector, so the kernel-check init
+			// container is never injected. Clear any prior Offload verdict.
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+		} else {
+			switch {
+			case kernelVerdict.shouldWriteCondition:
+				condition := kernelVerdict.condition
+				condition.ObservedGeneration = backend.Generation
+				meta.SetStatusCondition(&backend.Status.Conditions, condition)
+			case kernelVerdict.removeCondition:
+				meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
+			}
+		}
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
-		// EngineCompatibility is likewise managed-path-only: it flags an injected
-		// engine crash-looping after the cache plane wired a KV connector, but
-		// events-only injects no connector, so the advisory can never apply.
-		// Clear any verdict left over from a prior Offload generation so an
-		// Offload→EventsOnly flip doesn't strand a stale incompatibility.
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		if eventsOnly {
+			// Events-only injects no connector, so the advisory cannot apply.
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		} else if engineCompatObserved {
+			if engineCompatMsg != "" {
+				meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+					Type:               conditionTypeEngineCompatibility,
+					Status:             metav1.ConditionFalse,
+					Reason:             reasonInjectedEngineCrashLooping,
+					Message:            engineCompatMsg,
+					ObservedGeneration: backend.Generation,
+				})
+			} else {
+				meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+			}
+		}
 	})
+	if err == nil && engineCompatObserved && engineCompatMsg != "" && !previousEngineIncompatible && r.Recorder != nil {
+		r.Recorder.Eventf(backend, nil, corev1.EventTypeWarning,
+			reasonInjectedEngineCrashLooping, reasonInjectedEngineCrashLooping, "%s", engineCompatMsg)
+	}
 	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
 }
 
@@ -796,11 +915,8 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 // live Deployment reports, so the user-visible CR field is never held hostage
 // to apply churn. Any apply error is surfaced after the status pass so
 // controller-runtime requeues.
-func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, adapter adapterruntime.KVCacheRuntimeAdapter) (ctrl.Result, error) {
-	podSpec, svcSpec, err := adapter.ResolveCacheServer(backend)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolve cache server for %s/%s: %w", backend.Namespace, backend.Name, err)
-	}
+func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, rendered *backendadapter.RenderedStorage) (ctrl.Result, error) {
+	podSpec, svcSpec := rendered.PodSpec, rendered.Service
 	if podSpec == nil || svcSpec == nil {
 		// Engine-local adapters such as native SGLang HiCache intentionally
 		// render no cache-server. Reuse the unmanaged lifecycle to shed any
@@ -1874,8 +1990,8 @@ func currentLastEventAt(backend *cachev1alpha1.CacheBackend) *metav1.Time {
 // (the API-server applies the 5m kubebuilder default in production; the
 // fallback covers fake-client tests and defensively rejects a zero value).
 func firstEventTimeout(backend *cachev1alpha1.CacheBackend) time.Duration {
-	if i := backend.Spec.Integration; i != nil && i.FirstEventTimeout != nil && i.FirstEventTimeout.Duration > 0 {
-		return i.FirstEventTimeout.Duration
+	if timeout := backend.Spec.EffectiveFirstEventTimeout(); timeout != nil && timeout.Duration > 0 {
+		return timeout.Duration
 	}
 	return defaultFirstEventTimeout
 }
@@ -1895,6 +2011,7 @@ const (
 	// as events arrive or time out); it surfaces verbatim only when the gate is
 	// opted out via inferencecache.io/require-kv-events: "false".
 	conditionReasonEventsOnlyActive    = "EventsOnlyActive"
+	conditionReasonHostOnlyActive      = "HostOnlyActive"
 	conditionReasonReplicasUnavailable = "ReplicasUnavailable"
 )
 

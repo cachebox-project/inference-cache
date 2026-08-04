@@ -89,10 +89,14 @@ Notes:
   `lastEventAt` has been cleared by the poller. `CB004` fires only when
   `lastEventAt` IS present but has gone stale — an idle backend with a fresh
   event is healthy (`CB006`).
-- **External backends** (`spec.type=External`) are checked for `Ready` and
+- **Externally owned remote storage** (`spec.remoteStorage.ownership=External`,
+  including the legacy `spec.type=External` shape) is checked for `Ready` and
   endpoint reachability only. Engine-pod matching (`CB002`) and index
   participation (`CB003`/`CB004`) are managed-backend concerns and are skipped,
-  so a valid External config is not spuriously flagged.
+  so a valid external config is not spuriously flagged.
+- **Host-only backends** (no `spec.remoteStorage`) retain the managed engine
+  and index checks but skip endpoint reachability (`CB005`), because they have
+  no provider endpoint to publish or dial.
 - **`OP001` is forward-looking.** No controller emits the `NoMatchingCacheBackend`
   Event yet, so this check is a no-op against today's clusters; it begins
   reporting automatically once the engine-pod binding work adds the emitter.

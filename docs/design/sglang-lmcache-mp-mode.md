@@ -23,6 +23,15 @@ is **retired** — it existed only because the shipped `lm://` wiring cached not
 which this design replaced. What remains open is tracked in
 [Phased delivery](#phased-delivery).
 
+> **API ownership update.** The MP worker is still the validated engine-side
+> wire, but Redis is no longer selected by that runtime adapter. Canonical
+> resources use `spec.runtime: SGLang`, `spec.type: LMCache`, and optionally
+> `spec.remoteStorage{provider: Redis, ownership: Managed}`. Without
+> `remoteStorage`, the same worker starts without `--l2-adapter` and provides a
+> host-only LMCache tier. The storage-provider registry owns Redis rendering and
+> gives the engine adapter an optional RESP binding. Historical descriptions of
+> `ResolveCacheServer` below document the pre-separation implementation.
+
 ## TL;DR
 
 - Both engines can drive LMCache in **multiprocess (MP) mode** (upstream-
@@ -36,10 +45,12 @@ which this design replaced. What remains open is tracked in
 - Cross-node KV sharing is a **networked L2 store behind the MP worker**
   (`--l2-adapter` = `resp`/Redis, `s3`, `mooncake_store`, or `p2p`) — **not** the
   `lm://` server, which is not even a valid MP `--l2-adapter` type.
-- The design fits the existing `KVCacheRuntimeAdapter` interface with **no new
-  methods**: `ResolveCacheServer` renders the **shared L2 (Redis)**;
-  `InjectEngineConfig` adds a **node-local MP-worker native sidecar (which writes
-  the config file it then serves) + the engine wire** to the engine pod. `mp_host=127.0.0.1` (worker co-located in
+- Runtime and provider capabilities resolve independently: the Managed Redis
+  provider renders the shared L2 and produces a RESP binding; the SGLang
+  runtime adapter accepts that binding or nil for host-only operation.
+  Engine injection adds a **node-local MP-worker native sidecar (which writes
+  the config file it then serves) + the engine wire** to the engine pod.
+  `mp_host=127.0.0.1` (worker co-located in
   the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. The
   packaging question (a **GPU-less sidecar** vs. a single container) is **resolved
   in favour of the GPU-less native sidecar** — spiked, then GPU-validated end to end;
@@ -175,10 +186,11 @@ with three constraints the design must honor:
   killer, reclaims space.
 
 It listens on ClusterIP `:6379` and `status.endpoint` becomes the Redis Service
-DNS. This replaces the `lm://` lmcache-server render (`ResolveLMCacheServer`) for
-the SGLang pair only — vLLM keeps `lm://`. Redis is a shared, network-addressable
-store that fits the one-Service, engines-anywhere model exactly (unlike Mooncake's
-mesh), so **no `hostNetwork` is required for the L2**.
+DNS. The provider-owned Redis renderer replaces the provider-owned `lm://`
+lmcache-server renderer for the SGLang pair only — vLLM keeps `lm://`. Redis is
+a shared, network-addressable store that fits the one-Service, engines-anywhere
+model exactly (unlike Mooncake's mesh), so **no `hostNetwork` is required for
+the L2**.
 
 ### `InjectEngineConfig` → MP-worker native sidecar (writes its own config) + engine wire
 
@@ -206,7 +218,7 @@ containers to engine pods. For SGLang it adds, to the engine pod:
   production)**, keeping it version-aligned with the engine's LMCache connector —
   the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew between
   worker and engine is a correctness hazard, and defaulting to the same image makes
-  the aligned case the zero-config one. `backendConfig.workerImage` overrides it, at
+  the aligned case the zero-config one. `spec.lmCache.workerImage` overrides it, at
   which point the alignment (and the digest pin) is the operator's to maintain; the
   tuple is tracked in
   `VERSIONS.md` alongside the engine image (validation used the engine's own
@@ -393,7 +405,7 @@ data plane), different resolution because the data planes differ:
 | Real data plane | P2P transfer-engine mesh (master returns a directory pointer; engine dials node IPs on dynamic ports) | Node-local MP worker + shared L2 store |
 | Engine `hostNetwork` | **Required** (mesh needs real host IP + all ports) | **Not required** (worker is a same-pod sidecar; loopback + shared `/dev/shm`) |
 | Shared/cross-node tier | The mesh itself | Networked L2 (`resp`/Redis, `s3`, `mooncake_store`, `p2p`) |
-| `ResolveCacheServer` renders | Mooncake master (hostNetwork, node-IP endpoint) | Shared Redis L2 (ClusterIP) |
+| Provider adapter renders | Mooncake master (hostNetwork, node-IP endpoint) | Shared Redis L2 (ClusterIP) |
 | Determinism knob | `PYTHONHASHSEED=0` (vLLM builtin-hash) | none needed (SGLang sha256) |
 
 ## Phased delivery

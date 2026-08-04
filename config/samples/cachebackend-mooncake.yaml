@@ -54,12 +54,11 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachebackend-mooncake
 spec:
-  type: Mooncake
+  runtime: VLLM
+  type: LMCache
   deploymentKind: Deployment
   replicas: 1
   integration:
-    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
-    engine: vllm
     role: ReadWrite
     # REQUIRED for a working Mooncake data plane. Moves matched engine pods onto
     # the host network so they can dial the mesh's real node IPs; an overlay pod
@@ -76,25 +75,29 @@ spec:
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
-  backendConfig:
+  observation:
     # Served model identifier the matched engine pods are loaded with.
     # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
     # so the index keys per-replica entries by model. Omit (or set empty)
     # to skip the subscriber sidecar (engine wiring still happens).
-    model: meta-llama/Meta-Llama-3-8B-Instruct
-    # Matches the pinned adapter default. Fully qualified (docker.io/...) so
-    # CRI-O nodes without short-name resolution configured don't reject it;
-    # version-aligned with mooncake-transfer-engine 0.3.11.post1 on PyPI. The
-    # master entrypoint + RPC/metadata/metrics ports are confirmed against the
-    # real image on a live cluster; digest-pinning is the remaining hardening.
-    # A wrong image surfaces as the CacheBackend staying Ready=False (the RPC
-    # readiness probe never passes), never a silent miss, and the cache is
-    # fail-open regardless. Pin to an `@sha256:` digest for non-local runs.
-    serverImage: docker.io/kvcacheai/mooncake:0.3.11.post1
-    # Override `serverCommand` to change the master's flags (a different
-    # metadata backend, HA mode, etc.). The default launches the master with
-    # its RPC port, Prometheus metrics port, and the embedded HTTP metadata
-    # server so the simplest deployment needs no external etcd/redis. Keep the
-    # RPC port (50051) and HTTP metadata port (8080) as-is: the Service,
-    # readiness probe, and status.endpoint are pinned to them, so changing the
-    # ports here would leave the engine wire pointing at dead ports.
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+  remoteStorage:
+    provider: Mooncake
+    ownership: Managed
+    mooncake:
+      # Matches the pinned adapter default. Fully qualified (docker.io/...) so
+      # CRI-O nodes without short-name resolution configured don't reject it;
+      # version-aligned with mooncake-transfer-engine 0.3.11.post1 on PyPI. The
+      # master entrypoint + RPC/metadata/metrics ports are confirmed against the
+      # real image on a live cluster; digest-pinning is the remaining hardening.
+      # A wrong image surfaces as the CacheBackend staying Ready=False (the RPC
+      # readiness probe never passes), never a silent miss, and the cache is
+      # fail-open regardless. Pin to an `@sha256:` digest for non-local runs.
+      image: docker.io/kvcacheai/mooncake:0.3.11.post1
+      # Override `command` to change the master's flags (a different
+      # metadata backend, HA mode, etc.). The default launches the master with
+      # its RPC port, Prometheus metrics port, and the embedded HTTP metadata
+      # server so the simplest deployment needs no external etcd/redis. Keep the
+      # RPC port (50051) and HTTP metadata port (8080) as-is: the Service,
+      # readiness probe, and status.endpoint are pinned to them, so changing the
+      # ports here would leave the engine wire pointing at dead ports.

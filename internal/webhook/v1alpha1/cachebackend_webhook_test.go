@@ -62,6 +62,285 @@ func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
 	}
 }
 
+func TestValidator_CanonicalSGLangHiCacheRejectsRemoteStorage(t *testing.T) {
+	cb := newHiCacheBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.BackendConfig = nil
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	requireInvalidWithCause(t, &CacheBackendValidator{}, cb, "spec.remoteStorage.provider",
+		"does not accept remote binding protocol")
+}
+
+func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
+	validator := &CacheBackendValidator{}
+
+	t.Run("sglang host-only", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("host-only rejects autoscaling", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
+		requireInvalidWithCause(t, validator, cb, "spec.autoscaling",
+			"canonical host-only backends")
+	})
+
+	t.Run("host memory capacity must be positive", func(t *testing.T) {
+		for _, capacity := range []string{"0", "-1Gi"} {
+			t.Run(capacity, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				quantity := resource.MustParse(capacity)
+				cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+					HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &quantity},
+				}
+				requireInvalidWithCause(t, validator, cb, "spec.lmCache.hostMemory.capacity",
+					"must be greater than zero")
+			})
+		}
+	})
+
+	t.Run("positive host memory capacity is admitted", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		quantity := resource.MustParse("1Gi")
+		cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+			HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &quantity},
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("sglang managed redis", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis:     &cachev1alpha1.RedisRemoteStorageSpec{Image: "redis:test"},
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("vllm rejects resp binding", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "does not accept") {
+			t.Fatalf("ValidateCreate error = %v, want binding compatibility rejection", err)
+		}
+	})
+
+	t.Run("external requires endpoint", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "remoteStorage.endpoint") {
+			t.Fatalf("ValidateCreate error = %v, want endpoint rejection", err)
+		}
+	})
+
+	t.Run("external endpoint scheme follows provider protocol", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			runtime  cachev1alpha1.CacheBackendRuntime
+			provider cachev1alpha1.CacheBackendRemoteStorageProvider
+			endpoint string
+			wantErr  bool
+		}{
+			{name: "redis bare", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
+			{name: "redis rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
+			{name: "redis rejects named port", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+			{name: "lmcache bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
+			{name: "lmcache explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
+			{name: "lmcache rejects mooncake scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+			{name: "mooncake bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncake.example:50051"},
+			{name: "mooncake explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:50051"},
+			{name: "mooncake rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://mooncake.example:50051", wantErr: true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = tt.runtime
+				cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  tt.provider,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+					Endpoint:  tt.endpoint,
+				}
+				if tt.wantErr {
+					requireInvalidWithCause(t, validator, cb, "spec.remoteStorage.endpoint", "")
+					return
+				}
+				if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+					t.Fatalf("ValidateCreate: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("managed provider resources are validated at their typed path", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis: &cachev1alpha1.RedisRemoteStorageSpec{
+				Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("-1Gi"),
+					},
+				},
+			},
+		}
+		_, err := validator.ValidateCreate(context.Background(), cb)
+		if err == nil || !strings.Contains(err.Error(), "spec.remoteStorage.redis.resources.limits[memory]") {
+			t.Fatalf("ValidateCreate error = %v, want typed provider resource path", err)
+		}
+	})
+
+	t.Run("managed provider command requires non-empty entries", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			command []string
+			path    string
+		}{
+			{name: "empty command", command: []string{}, path: "spec.remoteStorage.lmCacheServer.command"},
+			{name: "empty executable", command: []string{""}, path: "spec.remoteStorage.lmCacheServer.command[0]"},
+			{name: "blank argument", command: []string{"cache-server", " "}, path: "spec.remoteStorage.lmCacheServer.command[1]"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cb := newBackend()
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+						Command: tt.command,
+					},
+				}
+				requireInvalidWithCause(t, validator, cb, tt.path, "must")
+			})
+		}
+
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Mooncake: &cachev1alpha1.MooncakeRemoteStorageSpec{
+				Command: []string{""},
+			},
+		}
+		requireInvalidWithCause(t, validator, cb, "spec.remoteStorage.mooncake.command[0]", "must not be empty")
+	})
+
+	t.Run("rejects legacy backendConfig", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.BackendConfig = map[string]string{"redisImage": "redis:test"}
+		requireInvalidWithCause(t, validator, cb, "spec.backendConfig",
+			"deprecated top-level configuration")
+	})
+
+	t.Run("typed observation preserves legacy provider mapping", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+		cb.Spec.BackendConfig = map[string]string{"model": "model-a"}
+		if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+		storage := cb.Spec.EffectiveRemoteStorage()
+		if storage == nil ||
+			storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer ||
+			storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
+			t.Fatalf("EffectiveRemoteStorage() = %+v, want legacy Managed LMCacheServer", storage)
+		}
+	})
+
+	t.Run("typed observation rejects conflicting legacy model", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+		cb.Spec.BackendConfig = map[string]string{"model": "model-b"}
+		requireInvalidWithCause(t, validator, cb, "spec.backendConfig[model]",
+			"conflicts with spec.observation.modelID")
+	})
+
+	t.Run("rejects legacy top-level resources", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Resources = &corev1.ResourceRequirements{}
+		requireInvalidWithCause(t, validator, cb, "spec.resources",
+			"deprecated top-level resources")
+	})
+}
+
+func TestValidator_LegacyToCanonicalMigrationIsAtomic(t *testing.T) {
+	validator := &CacheBackendValidator{}
+	old := newBackend()
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	old.Spec.BackendConfig = map[string]string{
+		"model":       "Qwen/Qwen2.5-0.5B-Instruct",
+		"serverImage": "lmcache/standalone:v0.4.7",
+	}
+	old.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+	}
+
+	partial := old.DeepCopy()
+	partial.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	requireUpdateInvalidWithCause(t, validator, old, partial, "spec.backendConfig",
+		"deprecated top-level configuration")
+	requireUpdateInvalidWithCause(t, validator, old, partial, "spec.resources",
+		"deprecated top-level resources")
+
+	canonical := old.DeepCopy()
+	canonical.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	// The mutating webhook derives this compatibility value from runtime before
+	// ValidateUpdate sees the object, even though the canonical manifest omits it.
+	canonical.Spec.Integration.Engine = "vllm"
+	canonical.Spec.BackendConfig = nil
+	canonical.Spec.Resources = nil
+	canonical.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
+		ModelID: "Qwen/Qwen2.5-0.5B-Instruct",
+	}
+	canonical.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+			Image:     "lmcache/standalone:v0.4.7",
+			Resources: old.Spec.Resources.DeepCopy(),
+		},
+	}
+	if _, err := validator.ValidateUpdate(context.Background(), old, canonical); err != nil {
+		t.Fatalf("complete legacy-to-canonical migration rejected: %v", err)
+	}
+}
+
 func TestValidator_SGLangHiCacheContract(t *testing.T) {
 	falseValue := false
 	size := int32(64)
@@ -158,7 +437,7 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	// it here.
 	//
 	// Other Phase-1 literal defaults (spec.replicas=1, spec.type=LMCache,
-	// spec.deploymentKind=Deployment, spec.integration.engine=vllm,
+	// spec.deploymentKind=Deployment,
 	// spec.integration.mode=Offload, spec.integration.role=ReadWrite) ride on `+kubebuilder:default=` markers
 	// stamped by the apiserver before this handler runs — they are NOT this
 	// defaulter's job, and a unit-level call to Default() on a raw struct
@@ -174,8 +453,68 @@ func TestDefaulter_MaterialisesIntegrationForFirstEventTimeout(t *testing.T) {
 	if cb.Spec.Integration == nil {
 		t.Fatal("integration block not materialised")
 	}
+	if cb.Spec.Integration.Engine != "vllm" {
+		t.Errorf("integration.engine = %q, want legacy default vllm", cb.Spec.Integration.Engine)
+	}
 	if cb.Spec.Integration.FirstEventTimeout == nil || cb.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
 		t.Errorf("firstEventTimeout = %v, want %s", cb.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
+	}
+	if cb.Spec.Resources == nil {
+		t.Fatal("legacy spec.resources was not defaulted")
+	}
+	if got := cb.Spec.Resources.Requests.Memory(); got == nil || got.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("legacy resources.requests.memory = %v, want 4Gi", got)
+	}
+	if got := cb.Spec.Resources.Limits.Memory(); got == nil || got.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Errorf("legacy resources.limits.memory = %v, want 8Gi", got)
+	}
+}
+
+func TestDefaulter_DerivesLegacyEngineFieldFromCanonicalRuntime(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+	}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if cb.Spec.Integration.Engine != "sglang" {
+		t.Fatalf("integration.engine = %q, want sglang derived from spec.runtime", cb.Spec.Integration.Engine)
+	}
+	if cb.Spec.Resources != nil {
+		t.Fatalf("canonical spec.resources = %+v, want nil", cb.Spec.Resources)
+	}
+}
+
+func TestDefaulter_CanonicalMigrationCarriesForwardLegacyObservationTimeout(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		FirstEventTimeout: &metav1.Duration{Duration: 90 * time.Second},
+	}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if cb.Spec.Observation == nil || cb.Spec.Observation.FirstEventTimeout == nil {
+		t.Fatalf("canonical observation timeout not materialised: %+v", cb.Spec.Observation)
+	}
+	if got := cb.Spec.Observation.FirstEventTimeout.Duration; got != 90*time.Second {
+		t.Fatalf("observation.firstEventTimeout = %s, want legacy 90s", got)
+	}
+}
+
+func TestDefaulter_PreservesExplicitEmptyLegacyResources(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Resources = &corev1.ResourceRequirements{}
+
+	if err := (&CacheBackendDefaulter{}).Default(context.Background(), cb); err != nil {
+		t.Fatalf("Default returned error: %v", err)
+	}
+	if len(cb.Spec.Resources.Requests) != 0 || len(cb.Spec.Resources.Limits) != 0 {
+		t.Fatalf("explicit empty resources were clobbered: %+v", cb.Spec.Resources)
 	}
 }
 
@@ -431,46 +770,70 @@ func mooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBacken
 	return cb
 }
 
+func canonicalMooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBackend {
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+		EngineHostNetwork: optIn,
+	}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+	}
+	return cb
+}
+
 func TestValidator_MooncakeWarnsUntilEngineHostNetworkOptIn(t *testing.T) {
 	// Mooncake's transfer engine is a peer-to-peer mesh: engine pods must run with
 	// hostNetwork or the backend reports Ready and moves zero KV. That move rewrites
 	// a pod the operator owns, so it is opt-in rather than injected. Until they opt
 	// in, say so at apply time and name the exact field — otherwise the failure is
 	// discoverable only from a flat cache-hit graph.
-	v := &CacheBackendValidator{}
-	cb := mooncakeBackendWithEngineHostNetwork(false)
+	for name, cb := range map[string]*cachev1alpha1.CacheBackend{
+		"legacy":    mooncakeBackendWithEngineHostNetwork(false),
+		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			warnings, err := v.ValidateCreate(context.Background(), cb)
+			if err != nil {
+				t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.engineHostNetwork=true") {
+				t.Fatalf("create warnings = %v, want one warning naming the opt-in field", warnings)
+			}
 
-	warnings, err := v.ValidateCreate(context.Background(), cb)
-	if err != nil {
-		t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
-	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.engineHostNetwork=true") {
-		t.Fatalf("create warnings = %v, want one warning naming the opt-in field", warnings)
-	}
-
-	// It must persist across updates, not only on first apply — an operator who
-	// edits the CR later should still be told.
-	warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
-	if err != nil {
-		t.Fatalf("a Mooncake update must still be admitted: %v", err)
-	}
-	if len(warnings) != 1 {
-		t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+			// It must persist across updates, not only on first apply — an operator who
+			// edits the CR later should still be told.
+			warnings, err = v.ValidateUpdate(context.Background(), cb, cb)
+			if err != nil {
+				t.Fatalf("a Mooncake update must still be admitted: %v", err)
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("update warnings = %v, want the engine-hostNetwork warning", warnings)
+			}
+		})
 	}
 }
 
 func TestValidator_MooncakeOptInSilencesTheWarning(t *testing.T) {
 	// Once the operator opts in, the pod webhook completes the data plane. A warning
 	// that keeps firing after the gap is closed trains operators to ignore warnings.
-	v := &CacheBackendValidator{}
-	cb := mooncakeBackendWithEngineHostNetwork(true)
-
-	warnings, err := v.ValidateCreate(context.Background(), cb)
-	if err != nil {
-		t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
-	}
-	if len(warnings) != 0 {
-		t.Fatalf("warnings = %v, want none once engineHostNetwork is set", warnings)
+	for name, cb := range map[string]*cachev1alpha1.CacheBackend{
+		"legacy":    mooncakeBackendWithEngineHostNetwork(true),
+		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &CacheBackendValidator{}
+			warnings, err := v.ValidateCreate(context.Background(), cb)
+			if err != nil {
+				t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
+			}
+			if len(warnings) != 0 {
+				t.Fatalf("warnings = %v, want none once engineHostNetwork is set", warnings)
+			}
+		})
 	}
 }
 
@@ -482,7 +845,7 @@ func TestValidator_EngineHostNetworkRejectedOnBackendThatDoesNotNeedIt(t *testin
 	cb := mooncakeBackendWithEngineHostNetwork(true)
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	requireInvalidWithCause(t, v, cb, "spec.integration.engineHostNetwork",
-		"only meaningful for spec.type=Mooncake")
+		"only meaningful when the effective remote storage provider is Mooncake")
 }
 
 func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *testing.T) {
@@ -499,7 +862,7 @@ func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *te
 	newCB := mooncakeBackendWithEngineHostNetwork(true)
 	newCB.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	requireUpdateInvalidWithCause(t, v, old, newCB, "spec.integration.engineHostNetwork",
-		"only meaningful for spec.type=Mooncake")
+		"only meaningful when the effective remote storage provider is Mooncake")
 }
 
 func TestValidator_DroppingEngineHostNetworkWithTheTypeFlipIsAccepted(t *testing.T) {
@@ -1461,6 +1824,34 @@ func TestValidator_CrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("External cross-namespace endpoint with opt-in rejected: %v", err)
+	}
+}
+
+func TestValidator_CanonicalCrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  "shared-cache.team-b.svc.cluster.local:9000",
+	}
+	requireInvalidWithCause(t, v, cb, "spec.remoteStorage.endpoint",
+		"references namespace \"team-b\"")
+}
+
+func TestValidator_CanonicalCrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  "shared-cache.team-b.svc.cluster.local:9000",
+	}
+	cb.Spec.AllowCrossNamespace = true
+	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("canonical cross-namespace endpoint with opt-in rejected: %v", err)
 	}
 }
 
@@ -2780,6 +3171,22 @@ func TestValidator_EventsOnly_AutoscalingRejected(t *testing.T) {
 	}
 	requireInvalidWithCause(t, v, cb, "spec.autoscaling",
 		"nothing to autoscale")
+}
+
+func TestValidator_EventsOnly_RemoteStorageRejected(t *testing.T) {
+	v := &CacheBackendValidator{}
+	cb := newBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = eventsOnlyIntegration()
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+			Image: "cache-server:test",
+		},
+	}
+	requireInvalidWithCause(t, v, cb, "spec.remoteStorage",
+		"provision no remote-storage provider")
 }
 
 func TestValidator_EventsOnly_LMCacheAdmitted(t *testing.T) {

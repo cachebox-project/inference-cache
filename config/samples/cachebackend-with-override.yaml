@@ -39,12 +39,11 @@ metadata:
   labels:
     app.kubernetes.io/name: inference-cache
 spec:
+  runtime: VLLM
   type: LMCache
   deploymentKind: Deployment
   replicas: 1
   integration:
-    # Case-insensitive; "vLLM" / "VLLM" / "vllm" all route to the same adapter.
-    engine: vllm
     role: ReadWrite
     # Amend the engine container the mutating Pod webhook injects.
     # Reserved entries (--kv-transfer-config, LMCACHE_REMOTE_URL,
@@ -66,13 +65,17 @@ spec:
   engineSelector:
     matchLabels:
       app: qwen-demo
-  backendConfig:
+  observation:
     # Served model identifier the matched engine pods are loaded with.
     # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
     # so the index keys per-replica entries by model.
-    model: Qwen/Qwen2.5-0.5B-Instruct
-    # Pin to a real digest for non-local runs.
-    serverImage: lmcache/standalone:v0.4.7
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      # Pin to a real digest for non-local runs.
+      image: lmcache/standalone:v0.4.7
 ---
 # Engine Deployment. Apply this alongside the CacheBackend above; the
 # order matters (see the top-of-file comment). Pod injection is

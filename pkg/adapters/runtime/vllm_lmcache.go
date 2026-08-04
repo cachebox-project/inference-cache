@@ -1,9 +1,16 @@
 package runtime
 
 import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
@@ -29,9 +36,8 @@ const (
 	EngineContainerName = enginewire.EngineContainerName
 )
 
-// vLLM-specific kvevent-subscriber wiring. The subscriber image + policy-server
-// address defaults and the shared sidecar/LMCache-server rendering live in
-// lmcache_shared.go (engine-agnostic, also used by the SGLang+LMCache adapter).
+// vLLM-specific kvevent-subscriber wiring. The subscriber image and
+// policy-server address defaults live in lmcache_shared.go.
 const (
 	// vLLM engine convention: the KV-event ZMQ PUB endpoint binds on :5557 by
 	// default (the reference stack's --kv-events-config sets
@@ -47,21 +53,17 @@ const (
 	subscriberHashScheme = "vllm"
 )
 
-// vllmLMCacheAdapter wires vLLM engine pods to the LMCache backend that
-// CacheBackend (type=LMCache) provisions. ResolveCacheServer renders a
-// standalone lmcache-server pod + Service (the engine connects to it via
-// LMCACHE_REMOTE_URL=lm://<svc>:65432); InjectEngineConfig adds the
-// --kv-transfer-config arg and the LMCACHE_* env vars to the vLLM container,
-// merging with what the pod template already carries; ObservationSidecar
-// returns the kvevent-subscriber container the webhook appends so the engine
-// pod auto-attaches to the policy server with no out-of-band steps.
+// vllmLMCacheAdapter wires vLLM engine pods to an LMCache engine cache and an
+// optional remote binding resolved independently by a provider adapter.
+// InjectEngineConfig adds the --kv-transfer-config arg and LMCACHE_* env vars
+// to the vLLM container, merging with what the pod template already carries;
+// ObservationSidecar returns the kvevent-subscriber container the webhook
+// appends so the engine pod auto-attaches to the policy server.
 //
-// This adapter wires vLLM+LMCache. It has two siblings that reuse the shared
-// helpers here: the vLLM+Mooncake adapter (vllm_mooncake.go) reuses the same
-// LMCache connector wire via a mooncakestore:// remote, and the SGLang+LMCache
-// adapter (pkg/adapters/runtime/sglang) reuses the lmcache-server rendering
-// (ResolveLMCacheServer) + the subscriber sidecar (RenderSubscriberSidecar) and
-// differs only in the engine-side wire.
+// This adapter wires vLLM+LMCache. The vLLM+Mooncake sibling reuses the same
+// LMCache connector wire via a mooncakestore:// remote. SGLang+LMCache shares
+// the observation sidecar but uses its own MP engine wire and a Redis provider
+// binding rather than the standalone lmcache-server.
 type vllmLMCacheAdapter struct {
 	// subscriberImage is the image the kvevent-subscriber sidecar runs.
 	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
@@ -97,7 +99,9 @@ func (vllmLMCacheAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.Cache
 	if cache == nil {
 		return false
 	}
-	return runtime == RuntimeVLLM && cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
+	return runtime == RuntimeVLLM &&
+		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
+		(cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache)
 }
 
 // SupportedPairs lets the registry expose this adapter's canonical pair to
@@ -155,12 +159,10 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 	}
 }
 
-// ResolveCacheServer renders the standalone LMCache server's container set
-// and the Service's port set, delegating to the engine-agnostic
-// [ResolveLMCacheServer] shared with the SGLang+LMCache adapter (the
-// lmcache-server is the same regardless of which engine connects).
+// ResolveCacheServer is the pre-separation compatibility renderer. Production
+// provider lifecycle resolves through pkg/adapters/backend/provider.
 func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return ResolveLMCacheServer(cache)
+	return provideradapter.ResolveLMCacheServer(cache)
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
@@ -183,6 +185,33 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint strin
 		return nil
 	}
 	return enginewire.InjectVLLMLMCache(pod, endpoint, cache)
+}
+
+func (vllmLMCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+	return binding == nil ||
+		binding.Protocol == backendadapter.ProtocolLMCache ||
+		binding.Protocol == backendadapter.ProtocolMooncakeStore
+}
+
+func (vllmLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	if cache != nil && cache.Spec.IsEventsOnly() {
+		return nil
+	}
+	if binding == nil {
+		return enginewire.InjectVLLMLMCacheHostOnly(pod, cache)
+	}
+	switch binding.Protocol {
+	case backendadapter.ProtocolLMCache:
+		return enginewire.InjectVLLMLMCache(pod, binding.Endpoint, cache)
+	case backendadapter.ProtocolMooncakeStore:
+		if err := enginewire.InjectVLLMMooncake(pod, binding.Endpoint, cache); err != nil {
+			return err
+		}
+		injectMooncakeEngineHostNetwork(pod, cache)
+		return nil
+	default:
+		return fmt.Errorf("vLLM LMCache adapter does not support remote binding protocol %q", binding.Protocol)
+	}
 }
 
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no
@@ -232,17 +261,55 @@ var (
 	upsertArgPair    = enginewire.UpsertArgPair
 )
 
-// ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint]
-// so consumers outside pkg/adapters/runtime — the validating webhook in
-// internal/webhook/v1alpha1, the C2 reconciler in internal/controller,
-// and the pod webhook in internal/webhook/pod — can call the same
-// endpoint-shape check that admission uses. Go's internal-package rule
-// keeps the enginewire subpackage adapter-scoped; this re-export is the
-// public seam those layers reach for. Returns nil when s is a valid
-// LMCache endpoint, otherwise an error whose message describes the
-// shape problem (kubectl admission paths wrap it in field.Invalid;
-// reconciler/pod-webhook paths surface the message in a status reason
-// or fail-open log).
+// ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint] for
+// the legacy External API and LMCache-specific callers. Canonical
+// remoteStorage callers use [ValidateExternalEndpoint], which dispatches this
+// same host/port shape check according to the selected provider.
 func ValidateLMCacheEndpoint(s string) error {
 	return enginewire.ValidateLMCacheEndpoint(s)
+}
+
+// ValidateExternalEndpoint is the shared canonical endpoint seam used by
+// admission, reconciliation, and pod injection. It validates an
+// operator-supplied endpoint against the selected remote provider's wire
+// protocol. Bare host:port is portable across providers; explicit schemes are
+// accepted only when the provider's engine wire consumes them.
+func ValidateExternalEndpoint(provider cachev1alpha1.CacheBackendRemoteStorageProvider, endpoint string) error {
+	trimmed := strings.TrimSpace(endpoint)
+	switch provider {
+	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
+		return enginewire.ValidateLMCacheEndpoint(trimmed)
+	case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
+		if scheme, _, ok := strings.Cut(trimmed, "://"); ok {
+			return fmt.Errorf("scheme %q is not supported for remoteStorage.provider=%s; use bare host:port",
+				scheme, provider)
+		}
+		if err := enginewire.ValidateLMCacheEndpoint(trimmed); err != nil {
+			return err
+		}
+		_, port, err := net.SplitHostPort(trimmed)
+		if err != nil {
+			return fmt.Errorf("Redis endpoint must be a bare host:port: %w", err)
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("Redis endpoint port %q must be an integer in 1-65535", port)
+		}
+		return nil
+	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
+		if scheme, address, ok := strings.Cut(trimmed, "://"); ok {
+			if !strings.EqualFold(scheme, "mooncakestore") {
+				return fmt.Errorf("scheme %q is not supported for remoteStorage.provider=%s; use bare host:port or mooncakestore://host:port",
+					scheme, provider)
+			}
+			if strings.Contains(address, "://") {
+				return fmt.Errorf("nested endpoint schemes are not supported for remoteStorage.provider=%s; use mooncakestore://host:port",
+					provider)
+			}
+			trimmed = address
+		}
+		return enginewire.ValidateLMCacheEndpoint(trimmed)
+	default:
+		return fmt.Errorf("remote-storage provider %q has no endpoint protocol", provider)
+	}
 }

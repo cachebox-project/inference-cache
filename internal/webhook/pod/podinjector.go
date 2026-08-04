@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
@@ -179,6 +180,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	endpoint := effectiveEndpoint(cache)
+	storage := cache.Spec.EffectiveRemoteStorage()
+	protocol, protocolErr := backendadapter.ProtocolFor(storage)
+	if protocolErr != nil {
+		log.V(1).Info("fail-open: remote-storage protocol is unsupported", "error", protocolErr.Error())
+		return failOpen(req, &pod, fmt.Sprintf("unsupported remote-storage provider (fail-open): %v", protocolErr))
+	}
+	binding := backendadapter.BindingFor(storage, protocol, endpoint)
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
 	// endpoint gate exists ONLY because the connector requires a dial target
@@ -187,20 +195,20 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// is a no-op in this mode), so bypass the gate and inject without one.
 	// Engine-local adapters such as native SGLang HiCache also bypass this
 	// gate through the optional EndpointRequirement capability.
-	if endpoint == "" && !cache.Spec.IsEventsOnly() && adapterruntime.AdapterRequiresEndpoint(adapter) {
+	if endpoint == "" && !cache.Spec.IsEventsOnly() && adapterruntime.AdapterRequiresEndpointFor(adapter, binding) {
 		// The endpoint source is type-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
 		//     yet (steady-state during initial rollout).
-		//   - External CR: spec.endpoint is empty (admission rejects
+		//   - External CR: its spec endpoint is empty (admission rejects
 		//     this on fresh CRs; only reachable from a pre-existing
 		//     stored value).
-		//   - External CR: spec.endpoint is set but fails the shared
-		//     shape check (also pre-existing-only; current admission
+		//   - External CR: its endpoint fails the selected provider's
+		//     shared shape check (also pre-existing-only; current admission
 		//     rejects malformed values). effectiveEndpoint deliberately
 		//     returns "" for this case so the engine pod admits
-		//     un-wired rather than receiving an LMCACHE_REMOTE_URL the
-		//     connector refuses at startup.
+		//     un-wired rather than receiving an endpoint its connector
+		//     refuses at startup.
 		// Surface the field name (and the shape error when applicable)
 		// so the operator looks at the right place. Route through
 		// failOpen so any pre-supplied injected-by annotations on the
@@ -209,9 +217,12 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// webhook bailed out without injecting.
 		missingField := "status.endpoint"
 		extra := ""
-		if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-			missingField = "spec.endpoint"
-			if err := adapterruntime.ValidateLMCacheEndpoint(cache.Spec.Endpoint); err != nil {
+		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			missingField = "spec.remoteStorage.endpoint"
+			if !cache.Spec.UsesCanonicalCacheHierarchy() {
+				missingField = "spec.endpoint"
+			}
+			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 				extra = ": " + err.Error()
 			}
 		}
@@ -263,7 +274,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// The observation-sidecar append and the wired/injected-by logic below stay
 	// as-is (events-only's only wiring is the subscriber sidecar).
 	if !cache.Spec.IsEventsOnly() {
-		if err := adapter.InjectEngineConfig(&mutated.Spec, endpoint, cache); err != nil {
+		if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &mutated.Spec, binding, cache); err != nil {
 			log.V(1).Info("fail-open: adapter rejected pod",
 				"runtime", string(runtimeID), "error", err.Error())
 			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
@@ -605,24 +616,24 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
 		return ""
 	}
-	if cache.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		// For External, re-apply the admission-time shape check on
-		// the stored spec.endpoint. The validating webhook already
+	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
+		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		// For External, re-apply the provider-specific admission-time shape
+		// check on the stored spec endpoint. The validating webhook already
 		// rejects malformed values at write time, but a pre-existing
 		// CR in etcd from before the shape rule shipped (or stored
 		// when an earlier, laxer rule set was in effect) can still
 		// carry e.g. `https://...`, a portless host, or embedded
-		// whitespace. Returning the malformed value would let the
-		// adapter prepend `lm://` and inject an URL the engine
-		// connector refuses at startup — turning a cache
-		// misconfiguration into a serving outage. Treat invalid the
+		// whitespace. Returning the malformed value would let the adapter
+		// inject an endpoint its provider connector refuses at startup,
+		// turning a cache misconfiguration into a serving outage. Treat invalid the
 		// same way we treat empty: return "" and let the caller's
 		// existing fail-open branch admit the pod un-wired.
-		ep := strings.TrimSpace(cache.Spec.Endpoint)
+		ep := strings.TrimSpace(storage.Endpoint)
 		if ep == "" {
 			return ""
 		}
-		if err := adapterruntime.ValidateLMCacheEndpoint(cache.Spec.Endpoint); err != nil {
+		if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			return ""
 		}
 		return ep

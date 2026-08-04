@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
@@ -24,7 +25,7 @@ func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 // rendered pod, failing on error or a nil result.
 func resolvePod(t *testing.T, a KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) *corev1.PodSpec {
 	t.Helper()
-	pod, _, err := a.ResolveCacheServer(cb)
+	pod, _, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -63,7 +64,7 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	pod, svc, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 // whose data plane genuinely cannot work without it.
 func TestVLLMLMCacheResolveCacheServerStaysPodNetworkAndVirtualIP(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	pod, svc, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	pod, svc, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	// adapter must render a TCP probe targeting the named lmcache port so
 	// Ready waits on the real accept loop.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	pod, _, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -155,24 +156,20 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerNoRequestsForRawNilResourcesNoAutoscaling(t *testing.T) {
-	// Renderer baseline for the RAW-STRUCT path (no apiserver in the
-	// loop): spec.resources is nil and spec.autoscaling is nil, so the
-	// adapter renders zero Requests on the container. On a live cluster
-	// the same minimal CacheBackend arrives at the reconciler with the
-	// CRD-stamped memory default already applied to spec.resources — the
-	// reconciler-against-real-apiserver behavior is asserted end-to-end
-	// in TestIntegrationCacheBackendResources/DefaultStampsMemoryLimits…
-	// This test pins the no-default-stamp invariant the unit-test path
-	// relies on so future contributors don't accidentally inject defaults
-	// in the renderer itself.
+func TestVLLMLMCacheResolveCacheServerBoundsRawNilResources(t *testing.T) {
+	// The renderer keeps the 4Gi/8Gi safety bounds even when an object bypasses
+	// the mutating webhook and reaches the raw-struct path with nil resources.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := a.ResolveCacheServer(newLMCacheBackend(nil))
+	pod, _, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
-	if len(pod.Containers[0].Resources.Requests) != 0 {
-		t.Fatalf("container Requests = %v, want empty when spec.resources is nil and autoscaling is unset (raw-struct path)", pod.Containers[0].Resources.Requests)
+	resources := pod.Containers[0].Resources
+	if got := resources.Requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Fatalf("requests.memory = %s, want 4Gi fallback", got.String())
+	}
+	if got := resources.Limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Fatalf("limits.memory = %s, want 8Gi fallback", got.String())
 	}
 }
 
@@ -181,14 +178,12 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 	// as the utilization denominator, so without one the autoscaler
 	// never gets a usable metric. The adapter must therefore declare
 	// a CPU request on the lmcache-server container when spec.autoscaling
-	// is set. Memory is NOT auto-filled — spec.resources is the
-	// canonical source (and on the apiserver path the CRD-stamped
-	// default carries it); synthesising a second memory request here
-	// would silently override an operator-supplied limits-only shape.
+	// is set. A completely omitted resource block receives the bounded memory
+	// fallback; an explicitly supplied limits-only block remains limits-only.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	pod, _, err := a.ResolveCacheServer(cb)
+	pod, _, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -197,8 +192,8 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 	if !hasCPU || cpu.IsZero() {
 		t.Fatalf("container Resources.Requests missing a CPU request under autoscaling: %v", reqs)
 	}
-	if _, hasMem := reqs[corev1.ResourceMemory]; hasMem {
-		t.Fatalf("container Resources.Requests[memory] = %v, want unset (memory is not auto-filled — spec.resources is the canonical source)", reqs[corev1.ResourceMemory])
+	if memory := reqs[corev1.ResourceMemory]; memory.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Fatalf("container Resources.Requests[memory] = %s, want 4Gi fallback", memory.String())
 	}
 }
 
@@ -385,7 +380,7 @@ func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
 
-	pod, _, err := a.ResolveCacheServer(cb)
+	pod, _, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -400,7 +395,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 		"serverCommand": "python3 -m lmcache.v1.multiprocess.server --cpu-buffer-size 60",
 	})
 
-	pod, _, err := a.ResolveCacheServer(cb)
+	pod, _, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -421,7 +416,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 
 func TestVLLMLMCacheResolveCacheServerNilCache(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	if _, _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, _, err := ResolveLegacyCacheServer(a, nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
 	}
 }
@@ -663,6 +658,93 @@ func TestVLLMLMCacheInjectEngineConfigConfigOverrides(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
+	chunkSize := int32(128)
+	cb := &cachev1alpha1.CacheBackend{
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{ChunkSizeTokens: &chunkSize},
+			BackendConfig: map[string]string{
+				"chunkSize":   "999",
+				"remoteSerde": "legacy-serde",
+				"localCPU":    "True",
+				"maxLocalCPU": "99",
+			},
+		},
+	}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: EngineContainerName,
+		Env: []corev1.EnvVar{
+			{Name: EnvLMCacheRemoteURL, Value: "lm://stale-provider:8200"},
+			{Name: "KEEP_ME", Value: "preserved"},
+		},
+	}}}
+	adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
+	if err := adapter.InjectEngineConfigWithBinding(pod, nil, cb); err != nil {
+		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+	}
+	env := pod.Containers[0].Env
+	checks := map[string]string{
+		EnvLMCacheChunkSize:   "128",
+		EnvLMCacheRemoteSerde: "naive",
+		EnvLMCacheLocalCPU:    "True",
+		EnvLMCacheMaxLocalCPU: "20",
+	}
+	for name, want := range checks {
+		if got, _ := lookupEnv(env, name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if _, ok := lookupEnv(env, EnvLMCacheRemoteURL); ok {
+		t.Fatalf("%s survived host-only injection", EnvLMCacheRemoteURL)
+	}
+	if got, ok := lookupEnv(env, "KEEP_ME"); !ok || got != "preserved" {
+		t.Fatalf("unrelated env was disturbed: KEEP_ME = %q, present=%v", got, ok)
+	}
+}
+
+func TestVLLMLMCacheCanonicalMooncakeBindingHonorsEngineHostNetwork(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in=%t", optIn), func(t *testing.T) {
+			cb := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+					EngineHostNetwork: optIn,
+				},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				},
+			}}
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
+			binding := &backendadapter.Binding{
+				Protocol: backendadapter.ProtocolMooncakeStore,
+				Endpoint: "mooncake.engines.svc.cluster.local:50051",
+			}
+			adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
+			if err := adapter.InjectEngineConfigWithBinding(pod, binding, cb); err != nil {
+				t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+			}
+
+			if pod.HostNetwork != optIn {
+				t.Fatalf("pod.HostNetwork = %t, want %t", pod.HostNetwork, optIn)
+			}
+			wantDNS := corev1.DNSPolicy("")
+			if optIn {
+				wantDNS = corev1.DNSClusterFirstWithHostNet
+			}
+			if pod.DNSPolicy != wantDNS {
+				t.Fatalf("pod.DNSPolicy = %q, want %q", pod.DNSPolicy, wantDNS)
+			}
+			if got, _ := lookupEnv(pod.Containers[0].Env, EnvLMCacheRemoteURL); got != "mooncakestore://"+binding.Endpoint {
+				t.Fatalf("%s = %q, want mooncakestore://%s", EnvLMCacheRemoteURL, got, binding.Endpoint)
+			}
+		})
+	}
+}
+
 func TestVLLMLMCacheInjectEngineConfigPassesThroughLMScheme(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
@@ -783,6 +865,38 @@ func TestVLLMLMCacheReservedEnv(t *testing.T) {
 		if tunable[name] {
 			t.Errorf("env %q is documented as tunable and MUST NOT be reserved", name)
 		}
+	}
+}
+
+func TestValidateExternalEndpointProviderSchemes(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint string
+		wantErr  bool
+	}{
+		{name: "redis bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
+		{name: "redis rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
+		{name: "redis rejects named port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+		{name: "lmcache bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
+		{name: "lmcache explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
+		{name: "lmcache rejects mooncake", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+		{name: "mooncake bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "cache.example:50051"},
+		{name: "mooncake explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:50051"},
+		{name: "mooncake rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://cache.example:50051", wantErr: true},
+		{name: "mooncake rejects nested scheme", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://lm://cache.example:50051", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateExternalEndpoint(tt.provider, tt.endpoint)
+			if tt.wantErr && err == nil {
+				t.Fatalf("ValidateExternalEndpoint(%s, %q) succeeded, want error", tt.provider, tt.endpoint)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateExternalEndpoint(%s, %q): %v", tt.provider, tt.endpoint, err)
+			}
+		})
 	}
 }
 

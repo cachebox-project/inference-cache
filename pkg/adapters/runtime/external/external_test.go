@@ -71,7 +71,7 @@ func TestSupports_NilCache(t *testing.T) {
 func TestResolveCacheServer_ReturnsNilTriple(t *testing.T) {
 	a := external.NewAdapter()
 	cb := externalBackend("lm://x:1")
-	pod, svc, err := a.ResolveCacheServer(cb)
+	pod, svc, err := runtimeadapter.ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer must not error for a valid External CR: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestResolveCacheServer_ReturnsNilTriple(t *testing.T) {
 
 func TestResolveCacheServer_NilCacheErrors(t *testing.T) {
 	a := external.NewAdapter()
-	if _, _, err := a.ResolveCacheServer(nil); err == nil {
+	if _, _, err := runtimeadapter.ResolveLegacyCacheServer(a, nil); err == nil {
 		t.Fatalf("ResolveCacheServer must error on nil cache")
 	}
 }

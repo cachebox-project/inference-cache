@@ -1,17 +1,19 @@
 # Recipe: External cache — point the operator at a cache you manage yourself.
 #
 # Scenario: you already run an lmcache-server (or share one across clusters)
-# and don't want the controller to provision a new one. `spec.type: External`
+# and don't want the controller to provision a new one. External ownership
 # makes the controller skip all provisioning (no Deployment, no Service, no
-# HPA); it only mirrors `spec.endpoint` into `status.endpoint` and marks the CR
-# Ready as soon as admission accepts the spec. The pod webhook then wires
+# HPA); it mirrors `spec.remoteStorage.endpoint` into `status.endpoint` and
+# marks the CR Ready as soon as admission accepts the spec. The pod webhook
+# then wires
 # engine pods matching `spec.engineSelector` to that endpoint with the same
 # LMCache wire format a managed backend uses — the engine can't tell the
 # difference.
 #
-# Admission rules for External:
-#   * spec.endpoint is REQUIRED for type External and REJECTED on any other
-#     type. Accepted shapes: bare `host:port` (canonical) or `lm://host:port`.
+# Admission rules for External ownership:
+#   * remoteStorage.endpoint is REQUIRED for External ownership and REJECTED
+#     for Managed ownership. Accepted shapes are bare `host:port` or
+#     `lm://host:port`.
 #     A non-empty port is required; IPv6 literals must be bracketed ([::1]:8200).
 #   * If the endpoint resolves to an in-cluster Service in a DIFFERENT namespace
 #     than this CR, set `spec.allowCrossNamespace: true` to acknowledge the
@@ -38,20 +40,23 @@ kind: CacheBackend
 metadata:
   name: external-cache
 spec:
-  type: External
-  # Address of the pre-existing cache server you manage. Swap for your own.
-  # Bare host:port shown; `lm://host:port` is also accepted.
-  endpoint: my-cache.example.com:8200
+  runtime: VLLM
+  type: LMCache
   integration:
-    engine: vllm
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: external-demo
-  backendConfig:
+  observation:
     # Model the engine pods load — keys per-replica index entries when the
     # subscriber sidecar is attached (see the prerequisite note above).
-    model: Qwen/Qwen2.5-0.5B-Instruct
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    # Address of the pre-existing cache server you manage. Swap for your own.
+    # Bare host:port shown; `lm://host:port` is also accepted.
+    endpoint: my-cache.example.com:8200
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -16,22 +16,23 @@ kind: CacheBackend
 metadata:
   name: my-cache
 spec:
-  type: LMCache                 # backing cache implementation
-  integration:
-    engine: vllm                # optional — defaults to vllm
+  runtime: VLLM                # inference runtime
+  type: LMCache                # engine-local cache integration
   engineSelector:
     matchLabels:
       app: my-engine            # must match your engine pods' labels
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer: {}
 ```
 
-That is the whole CacheBackend. Everything else is defaulted: `spec.replicas`
-becomes `1`, the readiness gate's `firstEventTimeout` becomes `5m`, and
-`integration.failOpen` is treated as `true` (the cache is an optimization,
-never a serving dependency). Field-by-field defaulting work in progress will
-shrink this further over time; for now `type` and the three keys above are what
-you set.
+That is the whole CacheBackend. The runtime/cache pair, matching labels, model
+identity, and remote provider are explicit; `spec.replicas` defaults to `1`,
+the readiness gate's `firstEventTimeout` defaults to `5m`, and
+`integration.failOpen` defaults to `true`.
 
 > **One label does the binding.** The value under
 > `engineSelector.matchLabels` must also appear on your engine pods'
@@ -65,7 +66,7 @@ at the top of the recipe.)
 > (`AwaitingFirstKVEvent`) and then, once the `firstEventTimeout` window
 > (default `5m`) elapses, flips to `Ready=False` (`NoKVEventsObserved`) with
 > `Degraded=True`; `PREFIXES` stays `0` throughout. Set that flag on the
-> controller to get the Ready/observability surface below. (External backends
+> controller to get the Ready/observability surface below. (Externally owned backends
 > are exempt from this gate — they go Ready as soon as admission accepts the
 > endpoint.)
 
@@ -84,7 +85,7 @@ at the top of the recipe.)
 > upstream readiness is not `Ready=True` (KV-event-pending, rollout in
 > progress, replicas unavailable, scaled-to-zero, …). Disabled by passing
 > `--server-probe-url=""` to the controller (the condition then never
-> appears); External backends are exempt from this gate too. See
+> appears); externally owned backends are exempt from this gate too. See
 > [Troubleshooting](#troubleshooting) for the per-reason runbook.
 
 ## What you get
@@ -191,7 +192,7 @@ stage-specific diagnostic. By `.reason`:
 | `.reason` | Stage | What it means | First-response |
 |---|---|---|---|
 | `ProbeIngestFailed` | ingest | The server's in-process index `Ingest` path is dropping writes. Does **not** indicate a subscriber problem — that path isn't exercised by the probe (the gRPC `PublishEvent` / `ReportCacheState` subscriber surface is bypassed by design; see the stage description at the top of this section). | Read the `FunctionalProbeOK` condition's `.message` for the server's stage diagnostic; check `inferencecache_backend_probe_result_total{backend="<namespace>/<name>", stage="ingest", result="failed"}` for the trend. The server-side `inferencecache_index_entries` gauge is fine as background index-health context but cannot confirm whether the synthetic probe entry landed — probe entries live under the reserved `inferencecache.io/probe` tenant, which is excluded from the cap-accounting gauge by design. Inspect server logs for `pkg/index` errors. Confirm `inferencecache_server_up == 1`. |
-| `ProbeRoutingFailed` | lookup | `LookupRoute` did not return a clean `PREFIX_MATCH` for the probe's reserved replica. Two failure modes share this reason and are disambiguated by the condition `.message`: (a) the lookup returned a non-`PREFIX_MATCH` index strategy — `NO_HINT` (the cleanly-missing case), `TENANT_HOT`, `UNKNOWN_TENANT`, `UNKNOWN_MODEL`, or `UNKNOWN_HASH_SCHEME` — likely an internal `hash_scheme` regression that dropped the probe's scheme on ingest (an empty scheme fails open and produces `NO_HINT`) or a lookup-filter regression in `pkg/index`/`pkg/server`; (b) the lookup did return `PREFIX_MATCH` but the probe's reserved replica isn't among the scored replicas — a probe-id-derivation or reserved-replica-collision regression. (Note: `TIMEOUT` is produced by the gRPC `LookupRoute` handler's deadline path and is NOT reachable here — the probe calls `index.LookupRoute` directly through an in-process seam.) The probe's `hashScheme` derives from `spec.integration.engine` (admission rejects unknown runtime IDs, so a typo never reaches this stage). | Read the `FunctionalProbeOK` condition's `.message` first — the server names which failure mode hit. Check `inferencecache_backend_probe_result_total{backend="<namespace>/<name>", stage="routing", result="failed"}` for the trend. (The server-side `inferencecache_lookup_route_calls_total` is NOT the right surface here — same reason: the probe bypasses the gRPC handler that emits that metric.) Inspect server logs for `pkg/index` lookup-path errors. |
+| `ProbeRoutingFailed` | lookup | `LookupRoute` did not return a clean `PREFIX_MATCH` for the probe's reserved replica. Two failure modes share this reason and are disambiguated by the condition `.message`: (a) the lookup returned a non-`PREFIX_MATCH` index strategy — `NO_HINT` (the cleanly-missing case), `TENANT_HOT`, `UNKNOWN_TENANT`, `UNKNOWN_MODEL`, or `UNKNOWN_HASH_SCHEME` — likely an internal `hash_scheme` regression that dropped the probe's scheme on ingest (an empty scheme fails open and produces `NO_HINT`) or a lookup-filter regression in `pkg/index`/`pkg/server`; (b) the lookup did return `PREFIX_MATCH` but the probe's reserved replica isn't among the scored replicas — a probe-id-derivation or reserved-replica-collision regression. (Note: `TIMEOUT` is produced by the gRPC `LookupRoute` handler's deadline path and is NOT reachable here — the probe calls `index.LookupRoute` directly through an in-process seam.) The probe's `hashScheme` derives from `spec.runtime` for canonical resources (admission rejects unsupported runtime/cache pairs). | Read the `FunctionalProbeOK` condition's `.message` first — the server names which failure mode hit. Check `inferencecache_backend_probe_result_total{backend="<namespace>/<name>", stage="routing", result="failed"}` for the trend. (The server-side `inferencecache_lookup_route_calls_total` is NOT the right surface here — same reason: the probe bypasses the gRPC handler that emits that metric.) Inspect server logs for `pkg/index` lookup-path errors. |
 | `ProbeT2Failed` | tier-2 | The tier-2 put/get cycle failed (LMCache, today). Only reachable when a `T2Prober` is wired into the server — none is registered in the current revision, so this condition does **not** appear on a clean install. | Will be applicable once a `T2Prober` ships; not actionable today. |
 
 ### `FunctionalProbeOK=Unknown` / `ProbeError`
@@ -240,7 +241,7 @@ install:
   `--server-probe-url=""` flag turns the gate off entirely. Any
   stale `FunctionalProbeOK` left over from a previous wiring is also
   cleared on the next reconcile in this mode.
-- **The CR is `spec.type: External`.** External backends are wholly
+- **The CR uses `spec.remoteStorage.ownership: External`.** Externally owned backends are wholly
   exempt from the probe gate — the controller never drives a
   round-trip against a cache it does not manage.
 - **The CR is on an Unmanaged path** (unsupported runtime, deferred

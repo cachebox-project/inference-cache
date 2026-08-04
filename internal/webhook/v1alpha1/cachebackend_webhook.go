@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
@@ -32,13 +33,17 @@ import (
 // tests pin the same constants the handler uses.
 //
 // Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
-// spec.replicas=1, spec.integration.engine=vllm, spec.integration.mode=Offload,
-// spec.integration.role=ReadWrite, spec.integration.failOpen=true,
-// spec.resources={requests:{memory:4Gi}, limits:{memory:8Gi}}) are expressed
-// via `+kubebuilder:default=` markers on the API types and stamped by the
-// apiserver before this webhook runs. The webhook only handles defaults the
-// schema cannot express:
+// spec.replicas=1, spec.integration.mode=Offload,
+// spec.integration.role=ReadWrite, spec.integration.failOpen=true) are
+// expressed via `+kubebuilder:default=` markers on the API types and stamped
+// by the apiserver before this webhook runs. The webhook handles
+// context-sensitive defaults and defaults the schema cannot express:
 //
+//   - spec.integration.engine: derived from spec.runtime for canonical
+//     resources; defaults to vllm for legacy resources.
+//   - spec.resources: legacy resources only retain the historical bounded
+//     4Gi request / 8Gi limit. Canonical resources leave this deprecated field
+//     absent and configure resources under spec.remoteStorage.<provider>.
 //   - spec.integration.firstEventTimeout: the CRD-schema default only fires
 //     when spec.integration is present in the submitted object; when the
 //     operator omits integration entirely the webhook materialises it here
@@ -62,11 +67,16 @@ const (
 
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
-// defaults (spec.type, deploymentKind, replicas, integration.engine,
-// integration.mode, integration.role, integration.failOpen, resources) ride on
-// schema markers and are stamped by the apiserver before this handler runs;
-// the webhook only handles the schema-inexpressible ones:
+// defaults (spec.type, deploymentKind, replicas,
+// integration.mode, integration.role, integration.failOpen) ride on schema
+// markers and are stamped by the apiserver before this handler runs;
+// the webhook handles context-sensitive and schema-inexpressible defaults:
 //
+//   - Defaults spec.integration.engine from spec.runtime, or to vllm for
+//     legacy resources.
+//   - Defaults deprecated spec.resources only for legacy resources, preserving
+//     the historical bounded provider workload without polluting canonical
+//     resources with a field they do not own.
 //   - Materialises spec.integration solely to persist
 //     spec.integration.firstEventTimeout when the operator omits the
 //     integration block entirely (a CRD-schema default only applies when
@@ -140,6 +150,8 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // [CacheBackendValidator.Rules]) to extend admission; no other code in the
 // handler changes.
 var DefaultValidationRules = []ValidationRule{
+	validateCanonicalCacheHierarchy,
+	validateCanonicalProviderResources,
 	requireEndpointForExternal,
 	rejectEndpointOnNonExternal,
 	rejectInvalidExternalEndpoint,
@@ -151,6 +163,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
+	rejectNonPositiveHostMemoryCapacity,
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
@@ -159,6 +172,227 @@ var DefaultValidationRules = []ValidationRule{
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedSGLangRole,
 	rejectSGLangRedisL2ScaleOut,
+}
+
+func rejectNonPositiveHostMemoryCapacity(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.LMCache == nil || cb.Spec.LMCache.HostMemory == nil ||
+		cb.Spec.LMCache.HostMemory.Capacity == nil ||
+		cb.Spec.LMCache.HostMemory.Capacity.Sign() > 0 {
+		return nil
+	}
+
+	return field.ErrorList{
+		field.Invalid(
+			field.NewPath("spec", "lmCache", "hostMemory", "capacity"),
+			cb.Spec.LMCache.HostMemory.Capacity.String(),
+			"must be greater than zero",
+		),
+	}
+}
+
+func validateCanonicalProviderResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb == nil || cb.Spec.RemoteStorage == nil {
+		return nil
+	}
+
+	var (
+		resources *corev1.ResourceRequirements
+		path      string
+	)
+	switch storage := cb.Spec.RemoteStorage; storage.Provider {
+	case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
+		if storage.Redis != nil {
+			resources = storage.Redis.Resources
+			path = "spec.remoteStorage.redis.resources"
+		}
+	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
+		if storage.LMCacheServer != nil {
+			resources = storage.LMCacheServer.Resources
+			path = "spec.remoteStorage.lmCacheServer.resources"
+		}
+	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
+		if storage.Mooncake != nil {
+			resources = storage.Mooncake.Resources
+			path = "spec.remoteStorage.mooncake.resources"
+		}
+	}
+	if resources == nil {
+		return nil
+	}
+
+	// Reuse the mature ResourceRequirements validators by presenting the
+	// provider-owned block through their legacy input seam, then rewrite the
+	// reported field path back to the canonical owner.
+	probe := cb.DeepCopy()
+	probe.Spec.Resources = resources
+	rules := []ValidationRule{
+		rejectResourceLimitsBelowRequests,
+		rejectRequestsOnlyForNonOvercommittableResources,
+		rejectResourceClaims,
+		rejectNegativeResourceQuantities,
+		rejectInvalidResourceNames,
+		rejectFractionalExtendedResources,
+		rejectMisalignedHugepageQuantities,
+	}
+	var errs field.ErrorList
+	for _, rule := range rules {
+		for _, err := range rule(probe) {
+			err.Field = strings.Replace(err.Field, "spec.resources", path, 1)
+			err.Detail = strings.ReplaceAll(err.Detail, "spec.resources", path)
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	var errs field.ErrorList
+	specPath := field.NewPath("spec")
+	canonical := cb.Spec.UsesCanonicalCacheHierarchy()
+
+	if cb.Spec.Runtime != "" && cb.Spec.Integration != nil && cb.Spec.Integration.Engine != "" {
+		legacySpec := cachev1alpha1.CacheBackendSpec{
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: cb.Spec.Integration.Engine},
+		}
+		legacy := legacySpec.EffectiveRuntime()
+		if legacy != cb.Spec.EffectiveRuntime() {
+			errs = append(errs, field.Invalid(
+				specPath.Child("integration", "engine"), cb.Spec.Integration.Engine,
+				"conflicts with spec.runtime; use spec.runtime as the runtime identity",
+			))
+		}
+	}
+
+	if canonical {
+		switch cb.Spec.Type {
+		case cachev1alpha1.CacheBackendTypeMooncake, cachev1alpha1.CacheBackendTypeExternal:
+			errs = append(errs, field.Invalid(
+				specPath.Child("type"), cb.Spec.Type,
+				"the canonical API uses spec.type only for the engine-side cache; move provider and ownership to spec.remoteStorage",
+			))
+		}
+		if len(cb.Spec.BackendConfig) > 0 {
+			errs = append(errs, field.Forbidden(
+				specPath.Child("backendConfig"),
+				"deprecated top-level configuration is not valid in the canonical API; use spec.lmCache, spec.remoteStorage.<provider>, or spec.observation",
+			))
+		}
+		if cb.Spec.Resources != nil {
+			errs = append(errs, field.Forbidden(
+				specPath.Child("resources"),
+				"deprecated top-level resources are not valid in the canonical API; use spec.remoteStorage.<provider>.resources",
+			))
+		}
+		if cb.Spec.RemoteStorage == nil && cb.Spec.Autoscaling != nil {
+			errs = append(errs, field.Forbidden(
+				specPath.Child("autoscaling"),
+				"canonical host-only backends omit spec.remoteStorage and provision no provider workload, so there is nothing to autoscale",
+			))
+		}
+	}
+
+	if !canonical &&
+		cb.Spec.Observation != nil &&
+		cb.Spec.Observation.ModelID != "" &&
+		cb.Spec.BackendConfig["model"] != "" &&
+		cb.Spec.Observation.ModelID != cb.Spec.BackendConfig["model"] {
+		errs = append(errs, field.Invalid(
+			specPath.Child("backendConfig").Key("model"),
+			cb.Spec.BackendConfig["model"],
+			"conflicts with spec.observation.modelID",
+		))
+	}
+
+	if cb.Spec.LMCache != nil && cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
+		errs = append(errs, field.Forbidden(
+			specPath.Child("lmCache"),
+			"spec.lmCache is valid only when spec.type=LMCache",
+		))
+	}
+
+	storage := cb.Spec.RemoteStorage
+	if storage == nil {
+		return errs
+	}
+	storagePath := specPath.Child("remoteStorage")
+	if storage.Provider == "" {
+		errs = append(errs, field.Required(storagePath.Child("provider"), "select a remote-storage provider"))
+	}
+	if storage.Ownership == "" {
+		errs = append(errs, field.Required(storagePath.Child("ownership"), "select Managed or External ownership"))
+	}
+	switch storage.Ownership {
+	case cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged:
+		if strings.TrimSpace(storage.Endpoint) != "" {
+			errs = append(errs, field.Forbidden(storagePath.Child("endpoint"),
+				"managed providers publish their observed endpoint in status.endpoint"))
+		}
+	case cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal:
+		if strings.TrimSpace(storage.Endpoint) == "" {
+			errs = append(errs, field.Required(storagePath.Child("endpoint"),
+				"required when remoteStorage.ownership=External"))
+		} else if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
+			errs = append(errs, field.Invalid(storagePath.Child("endpoint"), storage.Endpoint, err.Error()))
+		}
+	}
+
+	type providerConfig struct {
+		provider cachev1alpha1.CacheBackendRemoteStorageProvider
+		set      bool
+		path     *field.Path
+	}
+	configs := []providerConfig{
+		{cachev1alpha1.CacheBackendRemoteStorageProviderRedis, storage.Redis != nil, storagePath.Child("redis")},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, storage.LMCacheServer != nil, storagePath.Child("lmCacheServer")},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, storage.Mooncake != nil, storagePath.Child("mooncake")},
+	}
+	for _, config := range configs {
+		if config.set && storage.Provider != config.provider {
+			errs = append(errs, field.Forbidden(config.path,
+				fmt.Sprintf("configuration belongs to provider %s, but remoteStorage.provider=%s", config.provider, storage.Provider)))
+		}
+		if config.set && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			errs = append(errs, field.Forbidden(config.path,
+				"provider workload configuration is valid only with Managed ownership"))
+		}
+	}
+	if storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
+		switch storage.Provider {
+		case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
+			if storage.LMCacheServer != nil {
+				errs = append(errs, validateManagedProviderCommand(
+					storagePath.Child("lmCacheServer", "command"),
+					storage.LMCacheServer.Command,
+				)...)
+			}
+		case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
+			if storage.Mooncake != nil {
+				errs = append(errs, validateManagedProviderCommand(
+					storagePath.Child("mooncake", "command"),
+					storage.Mooncake.Command,
+				)...)
+			}
+		}
+	}
+
+	return errs
+}
+
+func validateManagedProviderCommand(path *field.Path, command []string) field.ErrorList {
+	if command == nil {
+		return nil
+	}
+	if len(command) == 0 {
+		return field.ErrorList{field.Invalid(path, command, "must contain an executable")}
+	}
+
+	var errs field.ErrorList
+	for i, part := range command {
+		if strings.TrimSpace(part) == "" {
+			errs = append(errs, field.Invalid(path.Index(i), part, "must not be empty"))
+		}
+	}
+	return errs
 }
 
 func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
@@ -379,8 +613,12 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // The reconciler's clampSingletonReplicas is the backstop for grandfathered
 // objects. If SGLang's shared tier gains a clustered store, lift this rule.
 func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	storage := cb.Spec.EffectiveRemoteStorage()
 	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+		cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache ||
+		storage == nil ||
+		storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderRedis ||
+		storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
 		return nil
 	}
 	// EventsOnly provisions NO cache server at all (the reconciler sheds any owned
@@ -460,6 +698,8 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //   - Materialises spec.integration when omitted so spec.integration.
 //     firstEventTimeout carries the readiness-gate deadline (the
 //     `+kubebuilder:default` only fires when the parent object is present).
+//   - Stamps the historical bounded spec.resources default on legacy
+//     resources only; canonical resources use provider-owned resource blocks.
 //   - Computes spec.autoscaling.minReplicas from spec.replicas when
 //     autoscaling is opted in and minReplicas is left unset.
 //
@@ -468,9 +708,8 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 //
 //	integration.role=ReadWrite,
 //
-// integration.failOpen=true, resources={requests:{memory:4Gi},
-// limits:{memory:8Gi}}) rides on a `+kubebuilder:default=` marker and
-// is stamped by the apiserver before this handler runs. Note that the nested
+// integration.failOpen=true) rides on a `+kubebuilder:default=` marker and is
+// stamped by the apiserver before this handler runs. Note that the nested
 // integration.* markers only fire when spec.integration is already present
 // in the submitted object — when the operator omits the integration block
 // entirely the apiserver has nothing to apply nested defaults to, which is
@@ -486,10 +725,39 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)
 
+	canonical := cb.Spec.UsesCanonicalCacheHierarchy()
+	if !canonical && cb.Spec.Resources == nil {
+		cb.Spec.Resources = &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("4Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+		}
+	}
 	if cb.Spec.Integration == nil {
 		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 	}
-	if cb.Spec.Integration.FirstEventTimeout == nil {
+	if cb.Spec.Integration.Engine == "" {
+		if cb.Spec.Runtime != "" {
+			cb.Spec.Integration.Engine = strings.ToLower(string(cb.Spec.EffectiveRuntime()))
+		} else {
+			cb.Spec.Integration.Engine = "vllm"
+		}
+	}
+	if canonical {
+		if cb.Spec.Observation == nil {
+			cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
+		}
+		if cb.Spec.Observation.FirstEventTimeout == nil {
+			timeout := defaultFirstEventTimeout
+			if cb.Spec.Integration.FirstEventTimeout != nil {
+				timeout = cb.Spec.Integration.FirstEventTimeout.Duration
+			}
+			cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: timeout}
+		}
+	} else if cb.Spec.Integration.FirstEventTimeout == nil {
 		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
 	}
 
@@ -564,7 +832,7 @@ const mooncakeEngineHostNetworkWarning = "Mooncake: set spec.integration.engineH
 const maxWarningLen = 120
 
 func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+	if !usesMooncakeStorage(cb) {
 		return nil
 	}
 	if adapterruntime.EngineHostNetworkRequested(cb) {
@@ -588,14 +856,26 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 // like it granted one is worse than a rejection, so reject at the door.
 func rejectEngineHostNetworkOnBackendThatDoesNotNeedIt(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if !adapterruntime.EngineHostNetworkRequested(cb) ||
-		cb.Spec.Type == cachev1alpha1.CacheBackendTypeMooncake {
+		usesMooncakeStorage(cb) {
 		return nil
+	}
+	provider := "none (host-only)"
+	if storage := cb.Spec.EffectiveRemoteStorage(); storage != nil {
+		provider = string(storage.Provider)
 	}
 	return field.ErrorList{field.Invalid(
 		field.NewPath("spec", "integration", "engineHostNetwork"), true,
-		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful for spec.type=Mooncake, whose transfer engine dials engine pods "+
-			"on real node IPs; spec.type=%s does not need it and the flag would do nothing. Remove it.", cb.Spec.Type),
+		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful when the effective remote storage provider is Mooncake, whose transfer engine dials engine pods "+
+			"on real node IPs; provider=%s does not need it and the flag would do nothing. Remove it.", provider),
 	)}
+}
+
+func usesMooncakeStorage(cb *cachev1alpha1.CacheBackend) bool {
+	if cb == nil {
+		return false
+	}
+	storage := cb.Spec.EffectiveRemoteStorage()
+	return storage != nil && storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderMooncake
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject
@@ -757,7 +1037,8 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 		registry = defaultShippingRegistry()
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
-	if _, err := registry.Select(runtimeID, cb); err != nil {
+	adapter, err := registry.Select(runtimeID, cb)
+	if err != nil {
 		if !errors.Is(err, adapterruntime.ErrNoAdapter) {
 			// Registry currently only returns ErrNoAdapter from Select; a
 			// future error class should surface as-is rather than be
@@ -782,6 +1063,30 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 				unsupportedPairMessage(runtimeID, cb.Spec.Type, registry),
 			),
 		}
+	}
+	storage := cb.Spec.EffectiveRemoteStorage()
+	protocol, err := backendadapter.ProtocolFor(storage)
+	if err != nil {
+		return field.ErrorList{field.Invalid(
+			field.NewPath("spec", "remoteStorage", "provider"),
+			storage.Provider,
+			err.Error(),
+		)}
+	}
+	binding := backendadapter.BindingFor(storage, protocol, "")
+	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, cb); err != nil {
+		storagePath := field.NewPath("spec", "remoteStorage")
+		var rejectedValue any
+		if storage != nil {
+			storagePath = storagePath.Child("provider")
+			rejectedValue = storage.Provider
+		}
+		return field.ErrorList{field.Invalid(
+			storagePath,
+			rejectedValue,
+			fmt.Sprintf("runtime %s with cache type %s does not accept this remote-storage binding: %v",
+				runtimeID, cb.Spec.EffectiveCacheType(), err),
+		)}
 	}
 	return nil
 }
@@ -1181,6 +1486,8 @@ func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorLi
 //     adapter (vLLM, Mooncake) is registered: before it shipped, non-LMCache
 //     managed types were caught by the runtime-adapter check, but Mooncake now
 //     passes that check and would otherwise be admitted in events-only mode.
+//   - spec.remoteStorage requests an offload provider that the controller
+//     deliberately removes in events-only mode.
 //   - spec.autoscaling has no workload to scale — the controller deploys
 //     nothing for an events-only backend.
 //
@@ -1219,18 +1526,33 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
 		))
 	}
+	if cb.Spec.RemoteStorage != nil {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("spec", "remoteStorage"),
+			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no remote-storage provider; remove spec.remoteStorage",
+				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
+		))
+	}
 	return errs
 }
 
-// rejectCrossNamespaceEndpointWithoutOptIn rejects an Endpoint that
+// rejectCrossNamespaceEndpointWithoutOptIn rejects an external endpoint that
 // resolves into a Service in a namespace other than the CacheBackend's
 // own, unless spec.allowCrossNamespace is true. Crossing a namespace is
 // a tenancy boundary the operator should explicitly acknowledge; the
-// rule fires only when the Endpoint is a recognisable in-cluster Service
-// DNS — external hostnames and IPs pass through (we have no namespace to
-// compare against).
+// rule covers both canonical spec.remoteStorage.endpoint and deprecated
+// spec.endpoint, and fires only when the endpoint is a recognisable in-cluster
+// Service DNS. External hostnames and IPs pass through because they expose no
+// namespace to compare against.
 func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	ns, ok := serviceDNSNamespace(cb.Spec.Endpoint)
+	endpoint := cb.Spec.Endpoint
+	endpointPath := field.NewPath("spec", "endpoint")
+	if cb.Spec.RemoteStorage != nil && strings.TrimSpace(cb.Spec.RemoteStorage.Endpoint) != "" {
+		endpoint = cb.Spec.RemoteStorage.Endpoint
+		endpointPath = field.NewPath("spec", "remoteStorage", "endpoint")
+	}
+
+	ns, ok := serviceDNSNamespace(endpoint)
 	if !ok {
 		return nil
 	}
@@ -1242,10 +1564,10 @@ func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) fi
 	}
 	return field.ErrorList{
 		field.Forbidden(
-			field.NewPath("spec", "endpoint"),
-			fmt.Sprintf("spec.endpoint references namespace %q but CacheBackend is in namespace %q; "+
+			endpointPath,
+			fmt.Sprintf("%s references namespace %q but CacheBackend is in namespace %q; "+
 				"set spec.allowCrossNamespace=true to opt in to the cross-namespace reference",
-				ns, cb.Namespace),
+				endpointPath.String(), ns, cb.Namespace),
 		),
 	}
 }
@@ -1296,7 +1618,10 @@ func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.Ca
 // spec.replicas 0 (disabled) and 1 (the singleton) remain valid. type=LMCache is
 // unaffected: its lm:// server is an ordinary pod-network workload that scales.
 func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeMooncake {
+	storage := cb.Spec.EffectiveRemoteStorage()
+	if storage == nil ||
+		storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderMooncake ||
+		storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
 		return nil
 	}
 	var errs field.ErrorList

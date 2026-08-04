@@ -33,10 +33,10 @@ kind: CacheBackend
 metadata:
   name: tuning-cache
 spec:
+  runtime: VLLM
   type: LMCache
   replicas: 1
   integration:
-    engine: vllm
     role: ReadWrite
     engineOverrides:
       env:
@@ -49,9 +49,13 @@ spec:
   engineSelector:
     matchLabels:
       app: tuning-demo
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
-    serverImage: lmcache/standalone:v0.4.7
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

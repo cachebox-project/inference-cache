@@ -21,6 +21,7 @@
 // prefix bytes). The engine-side LMCache *launch* surface differs from vLLM
 // (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL rather than
 // --kv-transfer-config), and that wire lives in the internal enginewire
-// package; the lmcache-server and subscriber-sidecar rendering is shared with
-// the vLLM adapter (pkg/adapters/runtime/lmcache_shared.go).
+// package. Managed cache-server rendering belongs to
+// pkg/adapters/backend/provider; subscriber-sidecar helpers remain shared with
+// the vLLM adapter in pkg/adapters/runtime/lmcache_shared.go.
 package sglang

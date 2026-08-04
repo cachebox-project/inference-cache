@@ -6,16 +6,20 @@ Status: locked · Scope: managed-backend durability (`CacheBackend`)
 
 `CacheBackend.spec.storage` — and the nested `storage.pvc.*` plus the
 `status.capacity` field — is **retired at `v1alpha1`**. Durability of a managed
-cache backend is expressed as a **backend-type choice**, not as a generic
+cache backend is expressed as a **remote-provider choice**, not as a generic
 per-`CacheBackend` volume knob:
 
-- The **in-memory `lm://` LMCache server** (`spec.type: LMCache`) is the simple
-  default. It keeps KV in process memory; it is not durable and does not persist
-  across pod restarts.
-- The **Mooncake backend** (`spec.type: Mooncake`) is the durable / shared /
-  scalable path: a network-addressable store the engine reaches over the
-  `mooncakestore://` RemoteBackend wire (the analog of `lm://`). See
-  [backendConfig keys (managed Mooncake)](cachebackend-api.md#backendconfig-keys-managed-mooncake).
+- Omitting canonical `spec.remoteStorage` selects an engine-local host tier and
+  provisions no provider workload.
+- The managed **in-memory `lm://` LMCache server**
+  (`spec.remoteStorage.provider: LMCacheServer`) is the simple shared tier. It
+  keeps KV in process memory; it is not durable and does not persist across pod
+  restarts.
+- The managed **Mooncake provider**
+  (`spec.remoteStorage.provider: Mooncake`) is the durable / shared / scalable
+  path: a network-addressable store the engine reaches over the
+  `mooncakestore://` remote wire. See
+  [Mooncake provider configuration](cachebackend-api.md#mooncake-provider-configuration).
 
 ## Why a local PVC cannot honestly back the `lm://` server
 
@@ -44,9 +48,10 @@ ClusterIP, engines-anywhere model.
 - `spec.storage{,.pvc}` + `status.capacity` were removed as a category error:
   the Kubernetes-side PVC plumbing could be provisioned, but could never
   honestly back the in-memory server.
-- The recommended durable / shared topology is the **Mooncake backend**, now
-  implemented as the `(vLLM, Mooncake)` runtime adapter
-  (`pkg/adapters/runtime/vllm_mooncake.go`).
+- The recommended durable / shared topology is the **Mooncake backend**. Its
+  managed workload lifecycle lives in the provider adapter
+  (`pkg/adapters/backend/provider/mooncake.go`), while the vLLM runtime adapter
+  (`pkg/adapters/runtime/vllm_mooncake.go`) owns engine wiring.
 - **Generalizable rule:** surface a `max*` / storage / quota field on a CRD only
   when the cache plane **authoritatively owns** the resource being limited. When
   it does not, omit the field or express the capability as a backend choice

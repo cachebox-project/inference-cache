@@ -1,10 +1,8 @@
-# A managed LMCache backend fronting SGLang engine pods — the (sglang, LMCache)
-# pair, the second engine the cache plane supports alongside vLLM. SGLang drives
-# LMCache in MULTIPROCESS (MP) mode, so this pair's data plane differs from
-# vLLM+LMCache on BOTH halves:
-#   - the controller provisions a managed Redis L2 store (NOT the standalone
-#     lm:// lmcache-server vLLM uses — lm:// is not a valid MP --l2-adapter type),
-#     published as status.endpoint; and
+# SGLang with an engine-side LMCache host tier and an explicitly selected
+# Managed Redis remote tier. SGLang drives LMCache in MULTIPROCESS (MP) mode:
+#   - spec.runtime + spec.type select only the SGLang/LMCache engine wire;
+#   - spec.remoteStorage independently selects Managed Redis, published as
+#     status.endpoint; and
 #   - the mutating Pod webhook renders the MP engine wire on each matched pod: a
 #     node-local MP-worker native sidecar that writes an --lmcache-config-file
 #     (mp_host/mp_port) and offloads to that Redis, plus --enable-lmcache and
@@ -48,31 +46,37 @@ metadata:
     app.kubernetes.io/name: inference-cache
   name: cachebackend-sglang
 spec:
+  runtime: SGLang
   type: LMCache
   deploymentKind: Deployment
   replicas: 1
   integration:
-    # The runtime id, not the adapter name. Case-insensitive; "SGLang" / "sglang"
-    # both route to the SGLang+LMCache adapter via ResolveRuntimeID.
-    engine: sglang
     # Only ReadWrite is supported for (sglang, LMCache): SGLang's --enable-lmcache
     # has no producer/consumer split, so admission rejects ReadOnly / WriteOnly.
     role: ReadWrite
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: sglang
-  backendConfig:
+  lmCache:
+    chunkSizeTokens: 256
+    hostMemory:
+      capacity: 4Gi
+  observation:
     # Served model identifier the matched SGLang pods are loaded with. Plumbed to
     # the auto-attached kvevent-subscriber sidecar's --model-id so the index keys
     # per-replica entries by model. Omit (or set empty) to skip the subscriber
     # sidecar (engine wiring still happens).
-    model: meta-llama/Meta-Llama-3-8B-Instruct
-    # Image for the managed Redis L2 store the MP worker offloads to (the worker's
-    # `resp` --l2-adapter). Defaults to docker.io/library/redis:7.4-alpine; pin to
-    # an `@sha256:` digest for non-local runs.
-    redisImage: docker.io/library/redis:7.4-alpine
-    # Optional MP-worker tunables — all have defaults; shown here for reference:
-    #   workerImage: <engine image>   # the LMCache MP server; defaults to the engine image
-    #   chunkSize:   "256"            # LMCache chunk size
-    #   mpPort:      "5555"           # loopback ZMQ port the engine <-> worker use
-    #   l1SizeGB:    "4"              # /dev/shm L1 budget (GiB); also sizes the shared shm emptyDir
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+  remoteStorage:
+    provider: Redis
+    ownership: Managed
+    redis:
+      # Image for the managed Redis L2 store the MP worker offloads to (the
+      # worker's `resp` --l2-adapter). Pin to an `@sha256:` digest for
+      # non-local runs.
+      image: docker.io/library/redis:7.4-alpine
+      resources:
+        requests:
+          memory: 4Gi
+        limits:
+          memory: 8Gi

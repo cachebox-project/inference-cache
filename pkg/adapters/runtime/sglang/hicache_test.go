@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -50,10 +51,20 @@ func TestHiCacheAdapterContract(t *testing.T) {
 	if !ok || requirement.RequiresEndpoint() {
 		t.Fatalf("EndpointRequirement = (%v, %v), want implemented and false", ok, requirement)
 	}
-	if pod, svc, err := adapter.ResolveCacheServer(newHiCacheBackend(
+	if pod, svc, err := runtimeadapter.ResolveLegacyCacheServer(adapter, newHiCacheBackend(
 		&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 	)); err != nil || pod != nil || svc != nil {
 		t.Fatalf("ResolveCacheServer = (%v, %v, %v), want (nil, nil, nil)", pod, svc, err)
+	}
+	bindingAware, ok := adapter.(runtimeadapter.RemoteBindingAdapter)
+	if !ok {
+		t.Fatal("SGLangHiCache adapter does not implement RemoteBindingAdapter")
+	}
+	if !bindingAware.SupportsRemoteBinding(nil) {
+		t.Fatal("SGLangHiCache adapter must accept a nil host-only binding")
+	}
+	if bindingAware.SupportsRemoteBinding(&backendadapter.Binding{Protocol: backendadapter.ProtocolRESP}) {
+		t.Fatal("SGLangHiCache adapter unexpectedly accepts remote storage")
 	}
 }
 
@@ -285,7 +296,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			if len(pod.Containers[0].Args) != 0 {
 				t.Fatalf("invalid config partially injected args: %v", pod.Containers[0].Args)
 			}
-			if renderedPod, renderedService, err := NewHiCacheAdapter().ResolveCacheServer(cache); err == nil ||
+			if renderedPod, renderedService, err := runtimeadapter.ResolveLegacyCacheServer(NewHiCacheAdapter(), cache); err == nil ||
 				renderedPod != nil || renderedService != nil {
 				t.Fatalf("ResolveCacheServer = (%v, %v, %v), want invalid config rejected",
 					renderedPod, renderedService, err)

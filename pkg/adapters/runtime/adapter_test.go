@@ -2,12 +2,14 @@ package runtime
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 // stubAdapter is a minimal in-test adapter for exercising Registry selection
@@ -155,7 +157,7 @@ func TestReferenceAdapterResolveCacheServerIsNil(t *testing.T) {
 	a := NewReferenceAdapter()
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
 
-	pod, svc, err := a.ResolveCacheServer(cb)
+	pod, svc, err := ResolveLegacyCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -300,6 +302,30 @@ func TestAdapterRequiresEndpointDefaultsTrue(t *testing.T) {
 	}
 	if AdapterRequiresEndpoint(endpointFreeStub{stubAdapter: base}) {
 		t.Fatal("endpoint-free adapter was treated as endpoint-bearing")
+	}
+}
+
+func TestCanonicalBindingRequiresExplicitAdapterCapability(t *testing.T) {
+	adapter := endpointFreeStub{stubAdapter: stubAdapter{}}
+	canonical := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
+	canonical.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	binding := &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: "cache:65432"}
+
+	if err := ValidateRemoteBinding(adapter, binding, canonical); err == nil ||
+		!strings.Contains(err.Error(), "canonical remote-binding contract") {
+		t.Fatalf("ValidateRemoteBinding error = %v, want missing canonical capability", err)
+	}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
+	if err := InjectEngineConfigWithBinding(adapter, pod, binding, canonical); err == nil {
+		t.Fatal("canonical injection unexpectedly used the legacy endpoint fallback")
+	}
+
+	legacy := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
+	if err := ValidateRemoteBinding(adapter, binding, legacy); err != nil {
+		t.Fatalf("legacy binding compatibility rejected: %v", err)
+	}
+	if err := InjectEngineConfigWithBinding(adapter, pod, binding, legacy); err != nil {
+		t.Fatalf("legacy endpoint fallback rejected: %v", err)
 	}
 }
 

@@ -19,17 +19,22 @@ lives* — never KV tensors or prompt text. See [`docs/concepts/`](docs/concepts
 
 ## Engines and backends
 
-The `(engine, backend)` pair selects a runtime adapter, so supporting a new engine or
-cache backend is adding an adapter — the core API and gRPC contract don't change.
+The API separates three choices: `spec.runtime` selects the inference runtime,
+`spec.type` selects its engine-local cache integration, and
+`spec.remoteStorage` optionally selects a managed or externally owned remote
+provider. Supporting another combination is an adapter addition; the core gRPC
+contract stays stable.
 
-- **Supported today:** the **vLLM** engine with a managed **LMCache** backend (the
-  default; validated end-to-end), or an **External** backend (bring your own endpoint via
-  `spec.type: External` + `spec.externalEndpoint`).
-- **In active development:** the **SGLang** engine (LMCache multiprocess mode) and the
-  **Mooncake** backend (a peer-to-peer transfer-engine mesh).
+- **vLLM + LMCache** supports host-only caching, a managed or external
+  `LMCacheServer`, and managed or external `Mooncake` storage.
+- **SGLang + LMCache** supports host-only caching or a managed/external Redis
+  remote store.
+- **SGLang + SGLangHiCache** uses SGLang's native host tier and does not accept
+  a remote-storage binding.
 
-`spec.integration.engine` is the runtime id (`vllm` default, or `sglang`); `spec.type` is
-the backend (`LMCache` default, `External`, `Mooncake`, …).
+See [`config/samples/`](config/samples/) for canonical manifests and
+[`docs/design/cachebackend-api.md`](docs/design/cachebackend-api.md) for the
+compatibility rules retained for older v1alpha1 resources.
 
 ## What's Inference Cache?
 

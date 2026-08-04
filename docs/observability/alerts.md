@@ -315,8 +315,8 @@ does not trip it.
    but `put`/`get` opcodes diverge: `put` succeeds at the client and
    returns silently, `get` returns empty at the server. The cache reports
    "stored N tokens" in the engine logs and nothing ever comes back.
-2. **External backend down or unreachable** for an `External`-type
-   CacheBackend with a wrong endpoint configured.
+2. **Externally owned backend down or unreachable** for a CacheBackend with
+   `spec.remoteStorage.ownership: External` and a wrong endpoint configured.
 3. **Authentication mismatch** between the offload client and server
    (when the offload backend supports auth — most offload backends
    today do not).
@@ -594,7 +594,7 @@ Service-endpoint probe and Ready gate cannot catch:
 | `stage` label | What `failed` means |
 |---|---|
 | `ingest` | The probe wrote a synthetic prefix entry through the server's **in-process** `index.Ingest` path and the entry did not land. This pins the index ingest path; it does **NOT** exercise the gRPC `ReportCacheState` handler nor the `kvevent-subscriber` sidecar (subscriber wire bugs are invisible to Stage A by design — see the design doc and `pkg/server/probe.go` lead-in). A failure here means the index itself is dropping writes — a regression in `pkg/index` keying, scheme handling, or eviction. |
-| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from `spec.integration.engine`; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `pkg/server`. |
+| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from canonical `spec.runtime`, with the deprecated engine field retained for legacy resources; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `pkg/server`. |
 | `t2` | (When a `T2Prober` is wired into the server.) The tier-2 put/get cycle against the configured external backend (LMCache today) failed. No `T2Prober` is wired in this revision, so this stage reports `skipped` on every install — an alert here only fires once a follow-up registers a real `T2Prober`. |
 
 The alert uses `increase(...{result="failed"}[5m]) >= 2 for: 5m` — a
@@ -627,7 +627,8 @@ By `stage` label:
   `kvevent-subscriber` pod logs + gRPC `:9090` reachability instead.)
 - `routing` — the index recorded the probe entry but lookup can't find
   it. The probe's `hashScheme` is derived from the backend's
-  `spec.integration.engine` (default `"vllm"`); verify it's not being
+  canonical `spec.runtime` (or deprecated `spec.integration.engine` for legacy
+  resources); verify it is not being
   silently dropped on ingest (an empty scheme fails open and produces
   `NO_HINT` on lookup). Check the server-side lookup-filter logs for
   `reason_code=NO_HINT` on calls that should match.

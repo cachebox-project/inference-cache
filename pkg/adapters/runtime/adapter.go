@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 // RuntimeID identifies an inference-engine family that a runtime adapter
@@ -40,22 +41,6 @@ type KVCacheRuntimeAdapter interface {
 	// (runtime, backend) pair; cache is never nil at the call site.
 	Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 
-	// ResolveCacheServer renders the desired cache-server pod and service for
-	// this backend, when one is required. Returning (nil, nil, nil) is valid
-	// for backends that colocate with the engine (e.g. an in-process
-	// connector) and need no separate cache-server.
-	//
-	// The split between adapter and reconciler is deliberate:
-	//   - The adapter fills PodSpec.Containers / PodSpec.Volumes and
-	//     Service.Spec.Ports / Service.Spec.Type — the backend-specific
-	//     details that don't depend on the CacheBackend's identity.
-	//   - The reconciler fills ObjectMeta (name, namespace, labels, owner
-	//     refs), Service.Spec.Selector, replicas, and the workload kind
-	//     (Deployment vs StatefulSet) — the identity-dependent fields.
-	// An adapter rendering the same containers for two CacheBackends in
-	// different namespaces should not have to learn about names.
-	ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
-
 	// InjectEngineConfig mutates pod so the engine talks to the cache at
 	// endpoint. Implementations MUST merge: preserve existing containers,
 	// env, args, and volumes; only add or update what they own. Safe to call
@@ -71,9 +56,9 @@ type KVCacheRuntimeAdapter interface {
 	// ObservationSidecar returns the container that observes the engine pod
 	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
 	// (nil, nil) when no sidecar is needed for this (engine, backend) pair
-	// — for example, an External backend whose lifecycle the controller
-	// does not manage, or a future backend that exports observation data
-	// some other way. Returning a container does not by itself mutate pod;
+	// — for example, the deprecated legacy External adapter, or a future
+	// backend that exports observation data some other way. Returning a
+	// container does not by itself mutate pod;
 	// the Pod webhook appends it after [InjectEngineConfig] (idempotent: if
 	// a container with the same Name is already present, the caller skips
 	// the append). Identity flags MUST be derived from cache + pod so the
@@ -117,6 +102,24 @@ type KVCacheRuntimeAdapter interface {
 	EngineContainerName() string
 }
 
+// LegacyCacheServerRenderer is the pre-separation provider-rendering seam.
+// Shipping provider adapters call the standalone Resolve*Server functions
+// directly; this interface remains only so legacy tests and out-of-tree
+// adapters can migrate without keeping provider lifecycle on
+// KVCacheRuntimeAdapter.
+type LegacyCacheServerRenderer interface {
+	ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
+}
+
+// ResolveLegacyCacheServer invokes the pre-separation rendering seam.
+func ResolveLegacyCacheServer(adapter KVCacheRuntimeAdapter, cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	renderer, ok := adapter.(LegacyCacheServerRenderer)
+	if !ok {
+		return nil, nil, fmt.Errorf("runtime adapter has no legacy cache-server renderer")
+	}
+	return renderer.ResolveCacheServer(cache)
+}
+
 // EndpointRequirement is an optional adapter capability for engine-local
 // integrations that do not dial a separate cache server. Adapters that do not
 // implement it require an endpoint by default, preserving the existing
@@ -125,11 +128,69 @@ type EndpointRequirement interface {
 	RequiresEndpoint() bool
 }
 
+// RemoteBindingAdapter is the canonical engine-side capability. It accepts an
+// optional structured remote binding and owns no provider lifecycle.
+type RemoteBindingAdapter interface {
+	SupportsRemoteBinding(*backendadapter.Binding) bool
+	InjectEngineConfigWithBinding(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error
+}
+
 // AdapterRequiresEndpoint returns the endpoint requirement declared by
 // adapter, defaulting to true for adapters that predate EndpointRequirement.
 func AdapterRequiresEndpoint(adapter KVCacheRuntimeAdapter) bool {
 	requirement, ok := adapter.(EndpointRequirement)
 	return !ok || requirement.RequiresEndpoint()
+}
+
+// AdapterRequiresEndpointFor evaluates endpoint need for a concrete cache
+// hierarchy. Binding-aware adapters accept nil for host-only operation.
+func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding) bool {
+	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
+		return !bindingAware.SupportsRemoteBinding(binding) || binding != nil
+	}
+	return AdapterRequiresEndpoint(adapter)
+}
+
+// ValidateRemoteBinding verifies that adapter explicitly accepts binding for a
+// canonical cache hierarchy. Legacy resources retain the endpoint-based
+// fallback while out-of-tree adapters migrate to [RemoteBindingAdapter].
+func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	bindingAware, ok := adapter.(RemoteBindingAdapter)
+	if !ok {
+		if cache != nil && cache.Spec.UsesCanonicalCacheHierarchy() {
+			return fmt.Errorf("runtime adapter does not implement the canonical remote-binding contract")
+		}
+		return nil
+	}
+	if !bindingAware.SupportsRemoteBinding(binding) {
+		return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
+	}
+	return nil
+}
+
+// InjectEngineConfigWithBinding routes canonical resources through the
+// structured binding contract and falls back to the legacy endpoint method for
+// adapters that have not migrated yet only when the resource itself uses the
+// legacy hierarchy.
+func InjectEngineConfigWithBinding(adapter KVCacheRuntimeAdapter, pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	if err := ValidateRemoteBinding(adapter, binding, cache); err != nil {
+		return err
+	}
+	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
+		return bindingAware.InjectEngineConfigWithBinding(pod, binding, cache)
+	}
+	endpoint := ""
+	if binding != nil {
+		endpoint = binding.Endpoint
+	}
+	return adapter.InjectEngineConfig(pod, endpoint, cache)
+}
+
+func bindingProtocol(binding *backendadapter.Binding) backendadapter.Protocol {
+	if binding == nil {
+		return ""
+	}
+	return binding.Protocol
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
@@ -245,10 +306,10 @@ func (r *Registry) SupportedPairs() []SupportedPair {
 // "SGLang") route to the canonical [RuntimeID] constants ([RuntimeVLLM]
 // etc.).
 func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
-	if cache == nil || cache.Spec.Integration == nil || cache.Spec.Integration.Engine == "" {
+	if cache == nil {
 		return RuntimeVLLM
 	}
-	return RuntimeID(strings.ToLower(cache.Spec.Integration.Engine))
+	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
 }
 
 // Options configures the runtime adapters [DefaultRegistry] constructs.

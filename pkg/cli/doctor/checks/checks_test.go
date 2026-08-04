@@ -603,6 +603,49 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("canonical External backend skips managed axes", func(t *testing.T) {
+		cb := &cachev1alpha1.CacheBackend{
+			ObjectMeta: metav1.ObjectMeta{Name: "canonical-ext", Namespace: "ns1"},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+					Endpoint:  "cache.example.com:8200",
+				},
+			},
+			Status: cachev1alpha1.CacheBackendStatus{
+				Endpoint:   "cache.example.com:8200",
+				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+			},
+		}
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("canonical External backend should be CB006, got %v", codesOf(fs))
+		}
+		if !strings.Contains(fs[0].Message, "External backend") {
+			t.Fatalf("healthy message = %q, want External classification", fs[0].Message)
+		}
+	})
+
+	t.Run("canonical host-only backend skips endpoint axis", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Name = "host-only"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Status.Endpoint = ""
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("canonical host-only backend should be CB006, got %v", codesOf(fs))
+		}
+		if !strings.Contains(fs[0].Message, "host-only") {
+			t.Fatalf("healthy message = %q, want host-only classification", fs[0].Message)
+		}
+		if hasCode(fs, doctor.CodeBackendEndpointUnreachable) != nil {
+			t.Fatalf("host-only backend must not report CB005, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("selectorless managed backend skips the matched-pods axis", func(t *testing.T) {
 		cb := healthyBackend(now)
 		cb.Spec.EngineSelector = nil
