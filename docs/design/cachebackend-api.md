@@ -448,19 +448,23 @@ The controller evaluates selector-matched Pods with this contract:
 | Pod set | `Ready` | `Progressing` | `Degraded` | Reason |
 |---|---|---|---|---|
 | No active matching Pods | `False` | `True` | `False` | `AwaitingEnginePods` |
-| Every active matching Pod explicitly opted out with the verified skip marker | `True` | `False` | `False` | `AllEnginePodsSkipped` |
+| Every active matching Pod explicitly opts out with `inferencecache.io/skip-inject` | `True` | `False` | `False` | `AllEnginePodsSkipped` |
 | Any participating Pod lacks a complete injection receipt | `False` | `False` | `True` | `EnginePodsNotInjected` |
 | Any receipt names another CacheBackend identity or a future generation | `False` | `False` | `True` | `EnginePodsInjectionMismatch` |
 | At least one receipt carries an older generation | `False` | `True` | `False` | `EnginePodsRolloutInProgress` |
+| All receipts are current, but at least one Pod does not contain the engine configuration the HiCache adapter would inject | `False` | `False` | `True` | `EnginePodsNotInjected` |
 | All receipts are current, but at least one Pod is not Kubernetes Ready | `False` | `False` | `True` | `EnginePodsUnavailable` |
-| All participating Pods carry the current receipt and are Kubernetes Ready | `True` | `False` | `False` | `EnginePodsReady` |
+| All participating Pods carry the current receipt, contain the current adapter configuration, and are Kubernetes Ready | `True` | `False` | `False` | `EnginePodsReady` |
 
 Terminating Pods and terminal `Succeeded`/`Failed` Pods are excluded. A Pod
-with both a truthy `inferencecache.io/skip-inject` and
-`inferencecache.io/inject-skipped: skip-inject-annotation` explicitly opts out
-and does not block the remaining participants. The controller does not parse
-the SGLang arguments a second time: the name/UID/generation annotations are the
-webhook's operational receipt, not a security boundary.
+with a truthy `inferencecache.io/skip-inject` explicitly opts out and does not
+block the remaining participants; this is a public operator control, not a
+webhook-authenticated decision. For every participant with a current receipt,
+the controller runs the HiCache adapter against an in-memory PodSpec copy and
+requires the idempotent injection to produce no change. The receipt remains
+operational metadata rather than a security boundary: actual adapter
+convergence prevents a forged current receipt from proving that absent or
+conflicting HiCache configuration was injected.
 
 The controller does not restart user-owned engine workloads. After a
 CacheBackend spec update, old-generation Pods keep the backend at

@@ -811,6 +811,17 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	}
 	injectedOwner := managed.DeepCopy()
 	injectedOwner.Generation = 2
+	injectedOwner.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	injectedOwner.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		Engine: "sglang",
+		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
+		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+	}
+	injectedOwner.Spec.Autoscaling = nil
+	injectedOwner.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
+		MatchLabels: map[string]string{"app": "sglang"},
+	}
+	injectedOwner.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
 	pod0 := engineLocalPodFixture("sglang-0", injectedOwner, injectedOwner.Generation, true)
 	pod1 := engineLocalPodFixture("sglang-1", injectedOwner, injectedOwner.Generation, true)
 	r := newReconciler(

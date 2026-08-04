@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 const (
@@ -47,6 +49,7 @@ type engineLocalReadiness struct {
 func (r *CacheBackendReconciler) reconcileEngineLocal(
 	ctx context.Context,
 	backend *cachev1alpha1.CacheBackend,
+	adapter adapterruntime.KVCacheRuntimeAdapter,
 ) (ctrl.Result, error) {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return ctrl.Result{}, err
@@ -69,7 +72,7 @@ func (r *CacheBackendReconciler) reconcileEngineLocal(
 			backend.Namespace, backend.Name, err)
 	}
 
-	readiness := evaluateEngineLocalReadiness(backend, pods.Items)
+	readiness := evaluateEngineLocalReadiness(backend, pods.Items, adapter)
 	r.clearServerInstanceLatchShadow(backend)
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 
@@ -119,10 +122,13 @@ func (r *CacheBackendReconciler) reconcileEngineLocal(
 // evaluateEngineLocalReadiness applies the engine-local readiness contract to
 // one live selector result. Terminating and terminal Pods are historical and
 // ignored. Explicitly skipped Pods opt out. Every remaining Pod must carry the
-// current CacheBackend name/UID/generation receipt and be Kubernetes Ready.
+// current CacheBackend name/UID/generation receipt, already contain the engine
+// config the adapter would inject for that CacheBackend, and be Kubernetes
+// Ready.
 func evaluateEngineLocalReadiness(
 	backend *cachev1alpha1.CacheBackend,
 	pods []corev1.Pod,
+	adapter adapterruntime.KVCacheRuntimeAdapter,
 ) engineLocalReadiness {
 	var (
 		activeCount  int
@@ -137,8 +143,7 @@ func evaluateEngineLocalReadiness(
 			continue
 		}
 		activeCount++
-		if podwebhook.SkipAnnotationOptsOut(pod.Annotations[podwebhook.AnnotationSkip]) &&
-			pod.Annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation {
+		if podwebhook.SkipAnnotationOptsOut(pod.Annotations[podwebhook.AnnotationSkip]) {
 			skipped = append(skipped, pod.Name)
 			continue
 		}
@@ -156,7 +161,7 @@ func evaluateEngineLocalReadiness(
 
 	wantBy := backend.Namespace + "/" + backend.Name
 	wantUID := string(backend.UID)
-	var missing, mismatched, stale, unavailable []string
+	var missing, mismatched, stale, unconfigured, unavailable []string
 	for i := range participants {
 		pod := &participants[i]
 		injectedBy := pod.Annotations[podwebhook.AnnotationInjectedBy]
@@ -171,6 +176,8 @@ func evaluateEngineLocalReadiness(
 			mismatched = append(mismatched, pod.Name)
 		case generation < backend.Generation:
 			stale = append(stale, pod.Name)
+		case !engineConfigConverged(adapter, pod, backend):
+			unconfigured = append(unconfigured, pod.Name)
 		case !podIsReady(pod):
 			unavailable = append(unavailable, pod.Name)
 		}
@@ -190,6 +197,10 @@ func evaluateEngineLocalReadiness(
 		return engineLocalProgressing(reasonEnginePodsRolloutInProgress,
 			podDiagnostic("%d/%d engine Pods carry an older CacheBackend generation and must be rolled out: %s",
 				stale, total))
+	case len(unconfigured) > 0:
+		return engineLocalDegraded(reasonEnginePodsNotInjected,
+			podDiagnostic("%d/%d engine Pods do not contain the current CacheBackend engine configuration and must be recreated: %s",
+				unconfigured, total))
 	case len(unavailable) > 0:
 		return engineLocalDegraded(reasonEnginePodsUnavailable,
 			podDiagnostic("%d/%d current-generation engine Pods are not Ready: %s",
@@ -202,6 +213,26 @@ func evaluateEngineLocalReadiness(
 		}
 		return engineLocalReady(reasonEnginePodsReady, message)
 	}
+}
+
+// engineConfigConverged uses the adapter's idempotent injection contract as a
+// read-only verifier. A converged PodSpec is unchanged when the current
+// CacheBackend configuration is applied to an in-memory copy. This verifies
+// the actual engine configuration instead of trusting user-writable receipt
+// annotations as proof that the mutating webhook ran.
+func engineConfigConverged(
+	adapter adapterruntime.KVCacheRuntimeAdapter,
+	pod *corev1.Pod,
+	backend *cachev1alpha1.CacheBackend,
+) bool {
+	if adapter == nil {
+		return false
+	}
+	want := pod.Spec.DeepCopy()
+	if err := adapter.InjectEngineConfig(want, "", backend); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(*want, pod.Spec)
 }
 
 func engineLocalReady(reason, message string) engineLocalReadiness {

@@ -926,7 +926,7 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 		// but unlike an unsupported backend it has a real lifecycle to report
 		// from the selector-matched engine Pods.
 		if backend.Spec.Type == cachev1alpha1.CacheBackendTypeSGLangHiCache {
-			return r.reconcileEngineLocal(ctx, backend)
+			return r.reconcileEngineLocal(ctx, backend, adapter)
 		}
 		// Other nil renders remain unmanaged: shed any previously owned
 		// workload and clear server-backed status.
