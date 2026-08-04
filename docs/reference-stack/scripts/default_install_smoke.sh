@@ -58,30 +58,25 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. CacheBackend.spec.resources defaults + threading: the mutating
-#      webhook stamps the legacy resource shape with bounded memory (so the
-#      cache-server pod is bounded by the cgroup
-#      rather than node-pressure OOM-killed by the kubelet under T2
-#      write load — the failure mode that surfaced in the Phase-2
-#      benchmark), and the controller threads the value into the
-#      rendered Deployment container. The smoke asserts BOTH ends of
-#      the contract against the real kubectl-installed bundle — the
-#      CR's spec carries the default AND the rendered pod template's
-#      container shows the same limit — because either half-failing
-#      reintroduces the regression.
+#   8b. Canonical provider resource fallback: the paired sample leaves both
+#      deprecated spec.resources and remoteStorage.lmCacheServer.resources
+#      unset, while the provider renderer gives the cache-server container a
+#      4Gi request / 8Gi limit. The smoke asserts the CR remains canonical and
+#      the rendered pod is still bounded against the T2-write OOM failure mode.
 #   8c. The canonical cache hierarchy keeps engine wiring and provider
 #      lifecycle independent: the committed SGLang host-only sample creates no
 #      Deployment/Service/HPA and publishes no endpoint, while the committed
 #      SGLang+Managed-Redis sample explicitly creates a redis-l2 Deployment +
 #      Service and publishes its RESP endpoint. No engine traffic is required.
-#   9. The External CacheBackend type end-to-end: applying the committed
+#   9. Canonical External ownership end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
 #      Deployment/Service in its namespace, status.endpoint mirrors
-#      spec.endpoint, observedGeneration is set, the CR goes
+#      spec.remoteStorage.endpoint, observedGeneration is set, the CR goes
 #      Ready=True/ExternalEndpointAccepted, and
 #      `kubectl get cb` renders the CacheBackend printer columns. A matching
-#      engine pod is admitted with `LMCACHE_REMOTE_URL=lm://<spec.endpoint>`
+#      engine pod is admitted with
+#      `LMCACHE_REMOTE_URL=lm://<spec.remoteStorage.endpoint>`
 #      injected by the pod-mutating webhook. Also exercises admission
 #      validation rules (External with no endpoint, External with bad
 #      endpoint shape, and non-External + endpoint are rejected at write time),
@@ -2218,7 +2213,8 @@ kubectl delete namespace "$CANONICAL_SMOKE_NS" \
 # --- External CacheBackend end-to-end ---------------------------------------
 # Exercises the committed External passthrough sample on the running cluster:
 # the mutating webhook should stamp spec.replicas, the reconciler should NOT
-# render a Deployment/Service, status.endpoint should mirror spec.endpoint,
+# render a Deployment/Service, status.endpoint should mirror
+# spec.remoteStorage.endpoint,
 # observedGeneration should advance, Ready should be True with reason
 # ExternalEndpointAccepted, and a matching engine pod should come out of
 # admission with LMCACHE_REMOTE_URL pointing at the operator-supplied
@@ -2236,13 +2232,13 @@ kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/
 defaulted_replicas="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
 external_spec_endpoint="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
-  -o jsonpath='{.spec.endpoint}' 2>/dev/null || true)"
+  -o jsonpath='{.spec.remoteStorage.endpoint}' 2>/dev/null || true)"
 external_pod_labels="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o go-template='{{range $k, $v := .spec.engineSelector.matchLabels}}{{printf "    %s: %s\n" $k $v}}{{end}}' \
   2>/dev/null || true)"
 if [ -z "$external_spec_endpoint" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
-  fail "External sample did not create spec.endpoint on $EXT_SMOKE_CB_NAME"
+  fail "External sample did not create spec.remoteStorage.endpoint on $EXT_SMOKE_CB_NAME"
 fi
 if [ -z "$external_pod_labels" ]; then
   kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" -o yaml || true
@@ -2304,11 +2300,11 @@ for column in TYPE READY MATCHED ENDPOINT PREFIXES LASTEVENT; do
   fi
 done
 if ! grep -Fq "$EXT_SMOKE_CB_NAME" <<<"$cb_table" || \
-   ! grep -Fq "External" <<<"$cb_table" || \
+   ! grep -Fq "LMCache" <<<"$cb_table" || \
    ! grep -Fq "True" <<<"$cb_table" || \
    ! grep -Fq "$external_spec_endpoint" <<<"$cb_table"; then
   echo "$cb_table"
-  fail "expected CacheBackend printer row to include name/type/Ready=True/endpoint"
+  fail "expected CacheBackend printer row to include name/type=LMCache/Ready=True/endpoint"
 fi
 log "CacheBackend printer columns render Type/Ready/Matched/Endpoint/Prefixes/LastEvent"
 
@@ -2368,7 +2364,7 @@ case "$(printf '%s' "$external_spec_endpoint" | tr '[:upper:]' '[:lower:]')" in
   *)      expected_url="lm://$external_spec_endpoint" ;;
 esac
 if [ "$injected" != "$expected_url" ]; then
-  fail "LMCACHE_REMOTE_URL=$injected, want $expected_url (pod webhook should wire to spec.endpoint via the LMCache wire format)"
+  fail "LMCACHE_REMOTE_URL=$injected, want $expected_url (pod webhook should wire to spec.remoteStorage.endpoint via the LMCache wire format)"
 fi
 log "pod webhook injected LMCACHE_REMOTE_URL=$injected"
 
@@ -2387,7 +2383,8 @@ fi
 log "non-Mooncake engine pod stays on the pod network (hostNetwork carve-out is Mooncake-scoped)"
 
 # Verify the --kv-transfer-config arg is also present — pins the full
-# engine wire contract the External adapter shares with the LMCache adapter.
+# engine wire contract canonical External ownership uses through the LMCache
+# runtime adapter.
 kv_arg="$(kubectl -n "$EXT_SMOKE_NS" get pod "$EXT_SMOKE_POD_NAME" \
   -o jsonpath='{.spec.containers[?(@.name=="vllm")].args}' 2>/dev/null || true)"
 if ! grep -q -- "--kv-transfer-config" <<<"$kv_arg"; then

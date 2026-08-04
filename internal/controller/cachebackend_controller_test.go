@@ -1471,6 +1471,44 @@ func TestReconcileCanonicalExternalEndpointUsesProviderProtocol(t *testing.T) {
 	}
 }
 
+func TestReconcileCanonicalExternalUnsupportedBindingStaysUnmanaged(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-redis", Namespace: "default", Generation: 2},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "redis.example:6379",
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{
+			Endpoint: "stale.example:6379",
+			Conditions: []metav1.Condition{{
+				Type:   conditionTypeReady,
+				Status: metav1.ConditionTrue,
+				Reason: conditionReasonExternalEndpointAccepted,
+			}},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want cleared for unsupported external binding", got.Status.Endpoint)
+	}
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("Ready = %+v, want absent for unmanaged unsupported external binding", ready)
+	}
+	if got.Status.ObservedGeneration != cb.Generation {
+		t.Fatalf("status.observedGeneration = %d, want %d", got.Status.ObservedGeneration, cb.Generation)
+	}
+}
+
 func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	// Admission rejects this case at the webhook, but a CR already in etcd
 	// from before the webhook was installed must still publish a visible

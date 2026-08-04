@@ -29,6 +29,7 @@ import (
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
@@ -401,11 +402,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
 		// nil-fallback manages the same backends the validator + pod webhook
 		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
-		// plus the SGLang adapters (a subpackage DefaultRegistry can't
-		// import without a cycle). External is intentionally absent — a
-		// type==External backend short-circuits to the unmanaged External path
-		// before ever reaching Select, so registering it here would be dead code.
+		// plus the External and SGLang adapters (subpackages DefaultRegistry
+		// can't import without a cycle).
 		registry = adapterruntime.DefaultRegistry()
+		registry.Register(externaladapter.NewAdapter())
 		registry.Register(sglangadapter.NewAdapter())
 		registry.Register(sglangadapter.NewHiCacheAdapter())
 	}
@@ -451,7 +451,33 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return r.reconcileEventsOnly(ctx, backend)
 	}
 
+	adapter, err := registry.Select(runtimeID, backend)
+	if err != nil {
+		// No adapter knows how to wire this (runtime, backend) pair. The
+		// admission validator rejects this at write time, so reaching this branch
+		// means a CR already in etcd from before the webhook was installed (or
+		// with a registry that has since shrunk).
+		logger.V(1).Info("no runtime adapter for backend",
+			"runtime", runtimeID, "type", backend.Spec.Type,
+			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+
 	if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		protocol, err := backendadapter.ProtocolFor(storage)
+		if err != nil {
+			logger.V(1).Info("external storage has no supported binding protocol; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "provider", storage.Provider,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		binding := backendadapter.BindingFor(storage, protocol, storage.Endpoint)
+		if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
 		// A backend switched from a managed type to External must shed its workload.
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
@@ -466,19 +492,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		storage != nil {
 		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
 			"namespace", backend.Namespace, "name", backend.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
-	}
-
-	adapter, err := registry.Select(runtimeID, backend)
-	if err != nil {
-		// No adapter knows how to wire this (runtime, backend) pair. The
-		// admission validator (M6/C7) rejects this at write time, so
-		// reaching this branch means a CR already in etcd from before the
-		// webhook was installed (or with a registry that has since
-		// shrunk). Shed any previously managed workload and log.
-		logger.V(1).Info("no runtime adapter for backend",
-			"runtime", runtimeID, "type", backend.Spec.Type,
-			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
