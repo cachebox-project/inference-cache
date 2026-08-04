@@ -401,7 +401,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// which is skipped when the subscriber image / backendConfig.model is unset
 	// (nothing injected) OR when a same-named container already exists (operator-
 	// authored, unverified). In those cases the webhook added/verified no wiring,
-	// so stamping injected-by/injected-by-uid would trip the downstream
+	// so stamping the injected-by/injected-by-uid/injected-generation receipt
+	// would trip the downstream
 	// InjectedByCacheBackend event controller on a non-existent injection and
 	// report "wired" while no usable events may flow. Route that case through the
 	// fail-open no-injection path (which strips any forged injection annotations
@@ -517,21 +518,21 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 }
 
 // failOpen builds the admission response for any fail-open return path
-// AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
-// "the webhook successfully made this decision" — those are what the
-// engine-pod-events controller keys `InjectedByCacheBackend` and
+// AFTER the pod has been decoded. The webhook's contract is that the complete
+// name/UID/generation injection receipt, or AnnotationInjectSkipped, on the
+// persisted pod means "the webhook successfully made this decision" — those
+// are what the engine-pod-events controller keys `InjectedByCacheBackend` and
 // `SkippedByOperator` off of. The annotations are user-controllable (anyone
 // with pod-create RBAC can set them) and the webhook does not overwrite them
 // on fail-open paths, so a copy/paste from a mutated pod's metadata, or an
 // attacker forging the annotations, would otherwise trip the controller into
 // emitting an event for a pod the webhook never touched.
 //
-// Fix: on every fail-open return, strip the annotation if it was
-// preset. Steady-state cost stays at zero patches per pod for the common
-// no-match case (the vast majority of pods cluster-wide), because the
-// helper short-circuits to admission.Allowed when the annotation is
-// absent.
+// Fix: on every fail-open return, strip any injection-receipt or verified-skip
+// annotations that were preset. Steady-state cost stays at zero patches per
+// pod for the common no-match case (the vast majority of pods cluster-wide),
+// because the helper short-circuits to admission.Allowed when the annotations
+// are absent.
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
