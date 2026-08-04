@@ -56,9 +56,9 @@ type KVCacheRuntimeAdapter interface {
 	// ObservationSidecar returns the container that observes the engine pod
 	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
 	// (nil, nil) when no sidecar is needed for this (engine, backend) pair
-	// — for example, an External backend whose lifecycle the controller
-	// does not manage, or a future backend that exports observation data
-	// some other way. Returning a container does not by itself mutate pod;
+	// — for example, the deprecated legacy External adapter, or a future
+	// backend that exports observation data some other way. Returning a
+	// container does not by itself mutate pod;
 	// the Pod webhook appends it after [InjectEngineConfig] (idempotent: if
 	// a container with the same Name is already present, the caller skips
 	// the append). Identity flags MUST be derived from cache + pod so the

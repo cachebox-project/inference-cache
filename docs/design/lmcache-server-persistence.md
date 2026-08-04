@@ -19,7 +19,7 @@ per-`CacheBackend` volume knob:
   (`spec.remoteStorage.provider: Mooncake`) is the durable / shared / scalable
   path: a network-addressable store the engine reaches over the
   `mooncakestore://` remote wire. See
-  [backendConfig keys (managed Mooncake)](cachebackend-api.md#backendconfig-keys-managed-mooncake).
+  [Mooncake provider configuration](cachebackend-api.md#mooncake-provider-configuration).
 
 ## Why a local PVC cannot honestly back the `lm://` server
 
