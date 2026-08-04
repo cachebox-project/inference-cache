@@ -101,11 +101,53 @@ New manifests should use the canonical fields. In particular, setting
 `runtime: SGLang` plus `type: LMCache` no longer implies Redis; a
 `remoteStorage` block must request it explicitly.
 
+### Migrating a legacy resource
+
+Migration is an all-at-once spec replacement, not a field-by-field transition.
+Adding `runtime`, `lmCache`, or `remoteStorage` selects the canonical hierarchy;
+that same update must remove deprecated `backendConfig` and top-level
+`resources`, move the model ID to `observation.modelID`, and express provider
+ownership under `remoteStorage`. A partial update is rejected at admission so
+the controller never has to interpret a mixed ownership model.
+
+For example, migrate a legacy managed LMCache backend from:
+
+```yaml
+spec:
+  type: LMCache
+  integration:
+    engine: vllm
+  backendConfig:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    serverImage: lmcache/standalone:v0.4.7
+```
+
+to this complete canonical shape in one `kubectl apply`:
+
+```yaml
+spec:
+  runtime: VLLM
+  type: LMCache
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: lmcache/standalone:v0.4.7
+```
+
+`runtime` enum values are case-sensitive (`VLLM` and `SGLang`); the old
+`integration.engine` field alone remains case-insensitive. Converted External
+and Mooncake examples are available in
+[`config/samples/cachebackend-external.yaml`](../../config/samples/cachebackend-external.yaml)
+and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cachebackend-mooncake.yaml).
+
 ## Spec
 
 | Field | Type | Purpose |
 |---|---|---|
-| `runtime` | enum | Inference runtime: `VLLM` or `SGLang`. New manifests use this instead of `integration.engine`. |
+| `runtime` | enum | Inference runtime: `VLLM` or `SGLang`. Values are case-sensitive. New manifests use this instead of `integration.engine`, whose legacy reader remains case-insensitive. |
 | `type` | string | Engine-side cache implementation identifier. Defaults to `LMCache`. `Mooncake` and `External` remain accepted only as legacy compatibility values. |
 | `lmCache` | object | Typed LMCache engine configuration: chunk size, host-memory capacity, MP-worker image/port, and remote serde. |
 | `remoteStorage` | object | Optional remote tier. Omitting it means host-only and provisions no provider workload. |
@@ -607,6 +649,7 @@ Engine-side: the adapter injects the same `--kv-transfer-config '{"kv_connector"
 The set of published condition types depends on the backend's integration mode and type:
 
 - **Offload-managed backends** (`spec.integration.mode=Offload` on a managed type, where the controller renders a Deployment + Service) publish up to seven: `Ready`, `Degraded`, `Progressing`, `FunctionalProbeOK`, `EngineKernelsHealthy` (when a matched engine pod runs the lmcache kernel-check), `T2Degraded` (once a tier-2/LMCache backend has been exercised), and `EngineCompatibility` (when an injected engine pod is observed crash-looping after connector injection).
+- **Host-only backends** (canonical resources with no `spec.remoteStorage`) publish `Ready`, `Degraded`, and `Progressing`, plus the engine-side advisory conditions when applicable. Their endpoint stays empty. `HostOnlyActive` is the base `Ready=True` reason before the KV-event gate overlays `AwaitingFirstKVEvent`, `KVEventsObserved`, or `NoKVEventsObserved`.
 - **Events-only backends** (`spec.integration.mode=EventsOnly`) publish exactly three: `Ready`, `Degraded`, `Progressing`. `FunctionalProbeOK`, `T2Degraded`, `EngineKernelsHealthy`, and `EngineCompatibility` are **Offload-managed-only** and are **never** published on an events-only backend — there is no provisioned server to functionally probe, no tier-2 offload to mark degraded, no LMCache native kernels to check, and no injected KV connector that could be incompatible (events-only injects none); an Offload→EventsOnly flip clears all four (see [Events-only mode](#events-only-mode-specintegrationmode--eventsonly)).
 - **Externally owned remote storage** publishes `Ready` + `Progressing` only (there is no rollout to degrade and no probe to drive; the operator manages the provider out-of-band and the controller only validates and mirrors the endpoint).
 

@@ -296,6 +296,8 @@ type CacheBackendObservationSpec struct {
 type CacheBackendSpec struct {
 	// Runtime identifies the inference runtime. New resources should use this
 	// field; integration.engine remains as a deprecated compatibility input.
+	// Values are case-sensitive: use VLLM or SGLang. Lowercase normalization
+	// applies only to the deprecated integration.engine field.
 	// +optional
 	Runtime CacheBackendRuntime `json:"runtime,omitempty"`
 

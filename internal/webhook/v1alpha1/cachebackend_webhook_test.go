@@ -298,6 +298,49 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 	})
 }
 
+func TestValidator_LegacyToCanonicalMigrationIsAtomic(t *testing.T) {
+	validator := &CacheBackendValidator{}
+	old := newBackend()
+	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+	old.Spec.BackendConfig = map[string]string{
+		"model":       "Qwen/Qwen2.5-0.5B-Instruct",
+		"serverImage": "lmcache/standalone:v0.4.7",
+	}
+	old.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+	}
+
+	partial := old.DeepCopy()
+	partial.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	requireUpdateInvalidWithCause(t, validator, old, partial, "spec.backendConfig",
+		"deprecated top-level configuration")
+	requireUpdateInvalidWithCause(t, validator, old, partial, "spec.resources",
+		"deprecated top-level resources")
+
+	canonical := old.DeepCopy()
+	canonical.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	// The mutating webhook derives this compatibility value from runtime before
+	// ValidateUpdate sees the object, even though the canonical manifest omits it.
+	canonical.Spec.Integration.Engine = "vllm"
+	canonical.Spec.BackendConfig = nil
+	canonical.Spec.Resources = nil
+	canonical.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
+		ModelID: "Qwen/Qwen2.5-0.5B-Instruct",
+	}
+	canonical.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+			Image:     "lmcache/standalone:v0.4.7",
+			Resources: old.Spec.Resources.DeepCopy(),
+		},
+	}
+	if _, err := validator.ValidateUpdate(context.Background(), old, canonical); err != nil {
+		t.Fatalf("complete legacy-to-canonical migration rejected: %v", err)
+	}
+}
+
 func TestValidator_SGLangHiCacheContract(t *testing.T) {
 	falseValue := false
 	size := int32(64)
