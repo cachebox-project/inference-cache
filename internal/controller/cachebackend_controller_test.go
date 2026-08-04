@@ -811,11 +811,11 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	}
 	injectedOwner := managed.DeepCopy()
 	injectedOwner.Generation = 2
+	injectedOwner.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	injectedOwner.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
 	injectedOwner.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		Engine: "sglang",
-		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
-		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+		Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
+		Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 	}
 	injectedOwner.Spec.Autoscaling = nil
 	injectedOwner.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
@@ -853,12 +853,12 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 
 	switching := getBackend(t, r, "cache", "ns1")
 	switching.Generation = 2
+	switching.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	switching.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
 	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
 	switching.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		Engine: "sglang",
-		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
-		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+		Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
+		Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 	}
 	switching.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "sglang"},

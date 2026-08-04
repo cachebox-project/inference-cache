@@ -397,9 +397,10 @@ directly. It does not create a cache-server Deployment, Service, HPA, or
 endpoint. Its `Ready` condition reports configuration rollout and serving
 availability, not a HiCache data-plane probe: `Ready=True` means every
 participating engine Pod carries the current CacheBackend name, UID, and
-generation receipt written by the webhook and has Kubernetes `Ready=True`.
-It does not prove a host-tier write/read round trip or distinguish a GPU hit
-from a host-tier read.
+generation receipt, already contains the configuration that the current
+HiCache adapter would inject, and has Kubernetes `Ready=True`. It does not
+prove a host-tier write/read round trip or distinguish a GPU hit from a
+host-tier read.
 
 The required integration shape is:
 

@@ -643,9 +643,10 @@ type CacheBackendIntegrationSpec struct {
 	// default — the field carries no meaningful "wait forever" or "fail
 	// immediately" semantics.
 	//
-	// SGLangHiCache readiness is derived from engine Pod injection receipts and
-	// Kubernetes Pod readiness rather than KV events, so this field is inert
-	// for that engine-local backend.
+	// SGLangHiCache readiness is derived from engine Pod injection receipts,
+	// convergence with the current adapter configuration, and Kubernetes Pod
+	// readiness rather than KV events, so this field is inert for that
+	// engine-local backend.
 	//
 	// The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
 	// schema types it as a string; a malformed value is rejected when

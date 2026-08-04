@@ -18,6 +18,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
@@ -275,9 +276,9 @@ func engineLocalBackendFixture() *cachev1alpha1.CacheBackend {
 			Generation: 3,
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine:   "sglang",
 				Mode:     cachev1alpha1.CacheBackendIntegrationModeOffload,
 				Role:     cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 				FailOpen: ptrBool(true),
@@ -322,7 +323,8 @@ func engineLocalPodFixture(
 			}},
 		},
 	}
-	if err := sglangadapter.NewHiCacheAdapter().InjectEngineConfig(&pod.Spec, "", backend); err != nil {
+	adapter := sglangadapter.NewHiCacheAdapter()
+	if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &pod.Spec, nil, backend); err != nil {
 		panic(err)
 	}
 	return pod

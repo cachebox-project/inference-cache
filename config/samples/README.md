@@ -55,9 +55,11 @@ they go `Ready` as soon as admission accepts the endpoint. See the
 
 `SGLangHiCache` is endpoint-free and has no endpoint publication race. Its
 `Ready` condition is derived from matching engine Pods: all participating Pods
-must carry the current CacheBackend name, UID, and generation receipt and be
-Kubernetes Ready. This confirms that the current configuration reached serving
-Pods; it does not claim a successful HiCache host-tier write/read round trip.
+must carry the current CacheBackend name, UID, and generation receipt, already
+contain the configuration that the current HiCache adapter would inject, and
+be Kubernetes Ready. This confirms that the current configuration reached
+serving Pods; it does not claim a successful HiCache host-tier write/read round
+trip.
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
 `# verify-samples: skip` marker — server-side dry-run can't create the

@@ -42,7 +42,9 @@ type engineLocalReadiness struct {
 	degradedMessage    string
 }
 
-// reconcileEngineLocal reports readiness from the user-owned engine Pods.
+// reconcileEngineLocal reports readiness from user-owned engine Pods. Dispatch
+// currently scopes this stronger contract to native SGLang HiCache; other
+// host-only combinations retain reconcileHostOnly's serverless contract.
 // It never creates, patches, or restarts an engine workload. CacheBackend spec
 // changes therefore remain Progressing until the workload owner replaces the
 // stale-generation Pods and they pass CREATE admission again.
@@ -104,7 +106,7 @@ func (r *CacheBackendReconciler) reconcileEngineLocal(
 			ObservedGeneration: backend.Generation,
 		})
 
-		// Server-backed health signals do not apply to an engine-local cache.
+		// Server-backed health signals do not apply to native SGLang HiCache.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineKernelsHealthy)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeT2Degraded)
@@ -119,12 +121,12 @@ func (r *CacheBackendReconciler) reconcileEngineLocal(
 	return ctrl.Result{}, nil
 }
 
-// evaluateEngineLocalReadiness applies the engine-local readiness contract to
-// one live selector result. Terminating and terminal Pods are historical and
-// ignored. Explicitly skipped Pods opt out. Every remaining Pod must carry the
-// current CacheBackend name/UID/generation receipt, already contain the engine
-// config the adapter would inject for that CacheBackend, and be Kubernetes
-// Ready.
+// evaluateEngineLocalReadiness applies the native SGLang HiCache readiness
+// contract to one live selector result. Terminating and terminal Pods are
+// historical and ignored. Explicitly skipped Pods opt out. Every remaining Pod
+// must carry the current CacheBackend name/UID/generation receipt, already
+// contain the engine config the adapter would inject for that CacheBackend, and
+// be Kubernetes Ready.
 func evaluateEngineLocalReadiness(
 	backend *cachev1alpha1.CacheBackend,
 	pods []corev1.Pod,
@@ -229,7 +231,7 @@ func engineConfigConverged(
 		return false
 	}
 	want := pod.Spec.DeepCopy()
-	if err := adapter.InjectEngineConfig(want, "", backend); err != nil {
+	if err := adapterruntime.InjectEngineConfigWithBinding(adapter, want, nil, backend); err != nil {
 		return false
 	}
 	return reflect.DeepEqual(*want, pod.Spec)
