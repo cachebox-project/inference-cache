@@ -112,15 +112,36 @@ for i in "${!targets[@]}"; do
   active_container=""
   tar -tf "$archive" | sed -e 's#^\./##' -e 's#/$##' >"$paths"
 
-  if ! grep -Fxq "${entrypoint#/}" "$paths"; then
-    echo "minimal-image check: $target image is missing entrypoint payload $entrypoint" >&2
+  payload="${entrypoint#/}"
+  payload_modes="$(tar -tvf "$archive" | awk -v payload="$payload" '
+    {
+      for (i = 2; i <= NF; i++) {
+        path = $i
+        sub(/^\.\//, "", path)
+        sub(/\/$/, "", path)
+        if (path == payload) {
+          print $1
+        }
+      }
+    }
+  ')"
+  payload_count="$(printf '%s\n' "$payload_modes" | awk 'NF { count++ } END { print count + 0 }')"
+  if [ "$payload_count" -ne 1 ]; then
+    echo "minimal-image check: $target image must contain exactly one payload at $entrypoint" >&2
+    exit 1
+  fi
+  if [[ "$payload_modes" != -* || "$payload_modes" != *x* ]]; then
+    echo "minimal-image check: $target payload $entrypoint must be a regular executable file (mode: $payload_modes)" >&2
     exit 1
   fi
 
   forbidden_paths=(
-    bin/sh bin/bash usr/bin/sh usr/bin/bash
-    sbin/apk usr/bin/apt usr/bin/apt-get usr/bin/dpkg
-    usr/bin/dnf usr/bin/yum
+    bin/sh bin/bash bin/ash bin/dash bin/zsh bin/ksh bin/busybox
+    usr/bin/sh usr/bin/bash usr/bin/ash usr/bin/dash usr/bin/zsh usr/bin/ksh usr/bin/busybox
+    busybox/sh busybox/busybox
+    bin/apk sbin/apk usr/bin/apk usr/sbin/apk
+    usr/bin/apt usr/bin/apt-get usr/bin/dpkg usr/bin/dpkg-deb usr/bin/dpkg-query
+    bin/rpm usr/bin/rpm usr/bin/rpm2cpio usr/bin/dnf usr/bin/microdnf usr/bin/yum
   )
   for forbidden in "${forbidden_paths[@]}"; do
     if grep -Fxq "$forbidden" "$paths"; then

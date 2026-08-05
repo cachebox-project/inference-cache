@@ -48,6 +48,9 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   shift 2
   if [ "${1:-}" != "--format" ]; then
+    if [ "${FAKE_MISSING_IMAGE:-0}" = "1" ]; then
+      exit 1
+    fi
     exit 0
   fi
   format="$2"
@@ -88,11 +91,23 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
   rm -rf "$root"
   mkdir -p "$root"
   case "$component" in
-    controller) touch "$root/controller" ;;
-    server) touch "$root/server" ;;
-    subscriber) touch "$root/kvevent-subscriber" ;;
+    controller) payload="$root/controller" ;;
+    server) payload="$root/server" ;;
+    subscriber) payload="$root/kvevent-subscriber" ;;
     *) echo "unexpected container: $4" >&2; exit 2 ;;
   esac
+  if [ "${FAKE_MISSING_PAYLOAD:-0}" != "1" ]; then
+    if [ "${FAKE_DIRECTORY_PAYLOAD:-0}" = "1" ]; then
+      mkdir -p "$payload"
+    elif [ "${FAKE_SYMLINK_PAYLOAD:-0}" = "1" ]; then
+      ln -s /missing-target "$payload"
+    else
+      touch "$payload"
+      if [ "${FAKE_NON_EXECUTABLE_PAYLOAD:-0}" != "1" ]; then
+        chmod +x "$payload"
+      fi
+    fi
+  fi
   if [ "${FAKE_INCLUDE_SHELL:-0}" = "1" ]; then
     mkdir -p "$root/bin"
     touch "$root/bin/sh"
@@ -100,6 +115,10 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
   if [ "${FAKE_INCLUDE_APT:-0}" = "1" ]; then
     mkdir -p "$root/usr/bin"
     touch "$root/usr/bin/apt-get"
+  fi
+  if [ -n "${FAKE_EXTRA_PATH:-}" ]; then
+    mkdir -p "$(dirname "$root/$FAKE_EXTRA_PATH")"
+    touch "$root/$FAKE_EXTRA_PATH"
   fi
   tar -cf "$archive" -C "$root" .
   exit 0
@@ -131,7 +150,20 @@ DOCKER_OVERRIDE="$fake_docker --test-wrapper" run_runtime_check >/dev/null
 echo "  ok   Docker command arguments are preserved"
 expect_failure root-user run_runtime_check FAKE_IMAGE_USER=0:0
 expect_failure wrong-entrypoint run_runtime_check FAKE_BAD_ENTRYPOINT=1
+expect_failure missing-image run_runtime_check FAKE_MISSING_IMAGE=1
+expect_failure missing-payload run_runtime_check FAKE_MISSING_PAYLOAD=1
+expect_failure non-executable-payload run_runtime_check FAKE_NON_EXECUTABLE_PAYLOAD=1
+expect_failure directory-payload run_runtime_check FAKE_DIRECTORY_PAYLOAD=1
+expect_failure symlink-payload run_runtime_check FAKE_SYMLINK_PAYLOAD=1
 expect_failure shell-present run_runtime_check FAKE_INCLUDE_SHELL=1
 expect_failure package-manager-present run_runtime_check FAKE_INCLUDE_APT=1
+expect_failure ash-present run_runtime_check FAKE_EXTRA_PATH=bin/ash
+expect_failure microdnf-present run_runtime_check FAKE_EXTRA_PATH=usr/bin/microdnf
+expect_failure docker-unavailable env \
+  DOCKER="$workdir/missing-docker" \
+  IMG=controller:test \
+  SERVER_IMG=server:test \
+  SUBSCRIBER_IMG=subscriber:test \
+  "$verifier" "$valid_dockerfile"
 
 echo "All minimal-image verifier tests passed."
