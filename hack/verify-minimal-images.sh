@@ -130,15 +130,15 @@ for i in "${!targets[@]}"; do
     echo "minimal-image check: $target image must contain exactly one payload at $entrypoint" >&2
     exit 1
   fi
-  if [[ "$payload_modes" != -* || "$payload_modes" != *x* ]]; then
-    echo "minimal-image check: $target payload $entrypoint must be a regular executable file (mode: $payload_modes)" >&2
+  if [[ "$payload_modes" != -* || "${payload_modes:9:1}" != [xt] ]]; then
+    echo "minimal-image check: $target payload $entrypoint must be a regular file executable by the declared non-root user (mode: $payload_modes)" >&2
     exit 1
   fi
 
   forbidden_names=(
-    sh bash ash dash zsh ksh busybox
+    sh bash ash dash zsh ksh fish csh tcsh pwsh powershell busybox
     apk apt apt-get dpkg dpkg-deb dpkg-query
-    rpm rpm2cpio dnf microdnf yum
+    rpm rpm2cpio dnf microdnf yum zypper pacman
   )
   while IFS= read -r member; do
     path="${member#./}"
