@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 func tenant(name, ns, tenantID string) *cachev1alpha1.CacheTenant {
@@ -123,7 +124,7 @@ func TestCacheTenantValidateCreate_NilReaderFailsClosed(t *testing.T) {
 // clear "this id is reserved" diagnostic instead of a silent quota bypass.
 func TestCacheTenantValidateCreate_RejectsReservedProbeTenantID(t *testing.T) {
 	v := &CacheTenantValidator{Reader: fakeReaderWith(t)}
-	_, err := v.ValidateCreate(context.Background(), tenant("conflict", "team-a", "inferencecache.io/probe"))
+	_, err := v.ValidateCreate(context.Background(), tenant("conflict", "team-a", controlplaneapi.ProbeTenantID))
 	if err == nil {
 		t.Fatalf("expected rejection for reserved probe tenant id")
 	}
@@ -215,7 +216,7 @@ func TestCacheTenantValidateUpdate(t *testing.T) {
 		// admission rule applies to creates only — and the CR could drift
 		// onto the reserved scope via an UPDATE that bypasses the create path.
 		old := tenant("t1", "team-a", "team-vision")
-		updated := tenant("t1", "team-a", "inferencecache.io/probe")
+		updated := tenant("t1", "team-a", controlplaneapi.ProbeTenantID)
 		_, err := v.ValidateUpdate(context.Background(), old, updated)
 		if err == nil || !apierrors.IsInvalid(err) {
 			t.Fatalf("expected Invalid rejection on UPDATE flipping tenantID to reserved probe id, got %v", err)
@@ -230,8 +231,8 @@ func TestCacheTenantValidateUpdate(t *testing.T) {
 		// state) and edits some unrelated field must still admit — the
 		// filterIntroducedErrors logic only blocks NEW violations on update.
 		// Reflects the v1alpha1 tightening seam.
-		old := tenant("legacy", "team-a", "inferencecache.io/probe")
-		updated := tenant("legacy", "team-a", "inferencecache.io/probe")
+		old := tenant("legacy", "team-a", controlplaneapi.ProbeTenantID)
+		updated := tenant("legacy", "team-a", controlplaneapi.ProbeTenantID)
 		updated.Labels = map[string]string{"unrelated": "true"}
 		if _, err := v.ValidateUpdate(context.Background(), old, updated); err != nil {
 			t.Fatalf("an unchanged reserved-tenantID with unrelated edits must admit, got %v", err)

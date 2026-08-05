@@ -18,9 +18,20 @@ func TestControllerProductionImportsRespectBoundaries(t *testing.T) {
 	t.Parallel()
 
 	root := repositoryRoot(t)
-	files, err := filepath.Glob(filepath.Join(root, "internal", "controller", "*.go"))
+	controllerRoot := filepath.Join(root, "internal", "controller")
+	var files []string
+	err := filepath.WalkDir(controllerRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("glob controller files: %v", err)
+		t.Fatalf("walk controller files: %v", err)
 	}
 	banned := map[string]struct{}{
 		modulePath + "/pkg/server":       {},
