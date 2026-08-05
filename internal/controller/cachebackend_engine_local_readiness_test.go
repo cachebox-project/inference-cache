@@ -18,7 +18,6 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
@@ -224,6 +223,69 @@ func TestEvaluateEngineLocalReadiness(t *testing.T) {
 	}
 }
 
+func TestEvaluateEngineLocalReadinessRequiresEngineOverrides(t *testing.T) {
+	backend := engineLocalBackendFixture()
+	backend.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		Args: []string{"--custom-hicache-mode=enabled"},
+		Env:  []corev1.EnvVar{{Name: "HICACHE_CUSTOM_MODE", Value: "enabled"}},
+	}
+	adapter := sglangadapter.NewHiCacheAdapter()
+
+	configured := engineLocalPodFixture("configured", backend, backend.Generation, true)
+	missingArg := configured.DeepCopy()
+	missingArg.Name = "missing-override-arg"
+	missingArg.Spec.Containers[0].Args = nil
+	for _, arg := range configured.Spec.Containers[0].Args {
+		if arg != "--custom-hicache-mode=enabled" {
+			missingArg.Spec.Containers[0].Args = append(missingArg.Spec.Containers[0].Args, arg)
+		}
+	}
+	missingEnv := configured.DeepCopy()
+	missingEnv.Name = "missing-override-env"
+	missingEnv.Spec.Containers[0].Env = nil
+	for _, env := range configured.Spec.Containers[0].Env {
+		if env.Name != "HICACHE_CUSTOM_MODE" {
+			missingEnv.Spec.Containers[0].Env = append(missingEnv.Spec.Containers[0].Env, env)
+		}
+	}
+
+	tests := []struct {
+		name        string
+		pod         corev1.Pod
+		ready       metav1.ConditionStatus
+		readyReason string
+	}{
+		{
+			name:        "complete overrides are ready",
+			pod:         configured,
+			ready:       metav1.ConditionTrue,
+			readyReason: reasonEnginePodsReady,
+		},
+		{
+			name:        "missing override arg is not injected",
+			pod:         *missingArg,
+			ready:       metav1.ConditionFalse,
+			readyReason: reasonEnginePodsNotInjected,
+		},
+		{
+			name:        "missing override env is not injected",
+			pod:         *missingEnv,
+			ready:       metav1.ConditionFalse,
+			readyReason: reasonEnginePodsNotInjected,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evaluateEngineLocalReadiness(backend, []corev1.Pod{tc.pod}, adapter)
+			if got.readyStatus != tc.ready || got.readyReason != tc.readyReason {
+				t.Fatalf("Ready = %s/%s, want %s/%s; verdict=%+v",
+					got.readyStatus, got.readyReason, tc.ready, tc.readyReason, got)
+			}
+		})
+	}
+}
+
 func TestReconcileEngineLocalPreservesReadinessOnPodListError(t *testing.T) {
 	scheme := newScheme(t)
 	backend := engineLocalBackendFixture()
@@ -324,7 +386,7 @@ func engineLocalPodFixture(
 		},
 	}
 	adapter := sglangadapter.NewHiCacheAdapter()
-	if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &pod.Spec, nil, backend); err != nil {
+	if err := podwebhook.ApplyEngineConfigWithOverrides(adapter, &pod.Spec, nil, backend); err != nil {
 		panic(err)
 	}
 	return pod

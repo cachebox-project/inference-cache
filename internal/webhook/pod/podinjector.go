@@ -251,65 +251,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// free at the apiserver.
 	mutated := pod.DeepCopy()
 
-	// Snapshot the engine container's pre-injection args/env so the
-	// override merge below can scope itself to the adapter-owned set. The
-	// override surface mutates only what InjectEngineConfig contributes;
-	// user pod-template args/env that the adapter does not touch stay
-	// protected. We snapshot before the adapter call (rather than re-deriving
-	// the canonical set afterwards) so this works for any adapter without
-	// changing the [adapterruntime.KVCacheRuntimeAdapter] contract.
-	overrides := engineOverridesFor(cache)
-	overrideIdx := -1
-	var preArgs []string
-	var preEnv []corev1.EnvVar
-	if overrides != nil {
-		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
-			overrideIdx = idx
-			preArgs = append([]string(nil), mutated.Spec.Containers[idx].Args...)
-			preEnv = append([]corev1.EnvVar(nil), mutated.Spec.Containers[idx].Env...)
-		}
-	}
-
-	// Events-only (tier-1 routing) wires NO KV connector regardless of
-	// spec.type: the engine container is left untouched so a hybrid-attention
-	// model's KV-cache manager is not disabled by a connector it cannot load.
-	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
-	// adapter's own no-op: the connector no-op currently lives ONLY in the
-	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
-	// mode=EventsOnly object would otherwise select the External adapter and
-	// inject the LMCache connector — violating the events-only "no connector"
-	// contract. Gating here makes the no-connector guarantee adapter-independent.
-	// The observation-sidecar append and the wired/injected-by logic below stay
-	// as-is (events-only's only wiring is the subscriber sidecar).
-	if !cache.Spec.IsEventsOnly() {
-		if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &mutated.Spec, binding, cache); err != nil {
-			log.V(1).Info("fail-open: adapter rejected pod",
-				"runtime", string(runtimeID), "error", err.Error())
-			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
-		}
-	}
-
-	// Apply spec.integration.engineOverrides scoped to the adapter-owned
-	// args/env derived from the pre/post diff. Admission has already
-	// hard-rejected overrides that overlap the adapter's reserved
-	// declarations, so the entries surviving to this point are safe to
-	// merge. Adapters with no canonical engine container (the reference
-	// adapter) return EngineContainerName() == "" and overrideIdx stays
-	// -1, so the merge is skipped — the override surface is for production
-	// adapters that target a specific engine container.
-	//
-	// Skip the merge entirely for events-only: InjectEngineConfig injected
-	// nothing in this mode (it is a no-op), so the engine container is left
-	// untouched by contract. Running the override merge here would let the
-	// override surface append non-adapter-owned args/env to the engine
-	// container even though the canonical injection contributed none —
-	// contradicting "the engine container is left otherwise untouched".
-	if overrides != nil && overrideIdx >= 0 && !cache.Spec.IsEventsOnly() {
-		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
-			preArgs, mutated.Spec.Containers[overrideIdx].Args,
-			preEnv, mutated.Spec.Containers[overrideIdx].Env,
-			overrides,
-		)
+	// Apply the same complete engine-container mutation pipeline that the
+	// readiness controller later replays as an idempotence check. The helper
+	// keeps canonical adapter injection and engineOverrides inseparable and
+	// preserves the EventsOnly no-connector/no-override contract.
+	if err := ApplyEngineConfigWithOverrides(adapter, &mutated.Spec, binding, cache); err != nil {
+		log.V(1).Info("fail-open: adapter rejected pod",
+			"runtime", string(runtimeID), "error", err.Error())
+		return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
 
 	// Inject the kernel-check init container (adapters that opt in via the

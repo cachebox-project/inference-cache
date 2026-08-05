@@ -460,12 +460,16 @@ The controller evaluates selector-matched Pods with this contract:
 Terminating Pods and terminal `Succeeded`/`Failed` Pods are excluded. A Pod
 with a truthy `inferencecache.io/skip-inject` explicitly opts out and does not
 block the remaining participants; this is a public operator control, not a
-webhook-authenticated decision. For every participant with a current receipt,
-the controller runs the HiCache adapter against an in-memory PodSpec copy and
-requires the idempotent injection to produce no change. The receipt remains
-operational metadata rather than a security boundary: actual adapter
-convergence prevents a forged current receipt from proving that absent or
-conflicting HiCache configuration was injected.
+webhook-authenticated decision. Readiness deliberately does not require the
+`inferencecache.io/inject-skipped` audit marker because both annotations are
+user-writable and the marker is not an authentication boundary. For every
+participant with a current receipt, the controller runs the complete webhook
+engine mutation pipeline — canonical HiCache adapter injection followed by
+`spec.integration.engineOverrides` — against an in-memory PodSpec copy and
+requires it to produce no change. The receipt remains operational metadata
+rather than a security boundary: actual configuration convergence prevents a
+forged current receipt from proving that absent or conflicting HiCache
+configuration was injected.
 
 The controller does not restart user-owned engine workloads. After a
 CacheBackend spec update, old-generation Pods keep the backend at

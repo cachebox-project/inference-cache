@@ -7,7 +7,54 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
+
+// ApplyEngineConfigWithOverrides applies the complete engine-container
+// mutation contract shared by Pod admission and readiness verification:
+// canonical runtime-adapter injection followed by
+// spec.integration.engineOverrides. Keeping the two stages together prevents
+// a readiness check from declaring a Pod converged after validating only the
+// adapter's canonical args/env.
+//
+// EventsOnly deliberately leaves the engine container untouched, including
+// engineOverrides, because that mode wires observation only and no KV
+// connector.
+func ApplyEngineConfigWithOverrides(
+	adapter adapterruntime.KVCacheRuntimeAdapter,
+	pod *corev1.PodSpec,
+	binding *backendadapter.Binding,
+	cache *cachev1alpha1.CacheBackend,
+) error {
+	if cache.Spec.IsEventsOnly() {
+		return nil
+	}
+
+	overrides := engineOverridesFor(cache)
+	overrideIdx := -1
+	var preArgs []string
+	var preEnv []corev1.EnvVar
+	if overrides != nil {
+		if idx, ok := overrideTargetIndex(pod.Containers, adapter.EngineContainerName()); ok {
+			overrideIdx = idx
+			preArgs = append([]string(nil), pod.Containers[idx].Args...)
+			preEnv = append([]corev1.EnvVar(nil), pod.Containers[idx].Env...)
+		}
+	}
+
+	if err := adapterruntime.InjectEngineConfigWithBinding(adapter, pod, binding, cache); err != nil {
+		return err
+	}
+	if overrides != nil && overrideIdx >= 0 {
+		pod.Containers[overrideIdx].Args, pod.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
+			preArgs, pod.Containers[overrideIdx].Args,
+			preEnv, pod.Containers[overrideIdx].Env,
+			overrides,
+		)
+	}
+	return nil
+}
 
 // applyEngineInjectionOverrides amends the engine container's args/env
 // produced by the runtime adapter, scoped to the entries the adapter

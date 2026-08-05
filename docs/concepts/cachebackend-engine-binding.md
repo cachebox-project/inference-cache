@@ -50,9 +50,11 @@ The match is evaluated **once at pod CREATE** by the mutating webhook. The wirin
 > not wait for `status.endpoint`. It injects the typed `spec.hiCache` launch
 > flags directly into matching SGLang Pods. Its readiness is engine-side:
 > every participating Pod must carry the current CacheBackend name, UID, and
-> generation receipt and be Kubernetes Ready. This reports rollout and serving
-> availability, not a proven HiCache host-tier read/write. The LMCache lifecycle
-> below remains the endpoint-bearing path.
+> generation receipt, already contain the current adapter configuration
+> including `spec.integration.engineOverrides`, and be Kubernetes Ready. This
+> reports configuration rollout and serving availability, not a proven HiCache
+> host-tier read/write. The LMCache lifecycle below remains the endpoint-bearing
+> path.
 
 ## Lifecycle
 

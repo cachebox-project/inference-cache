@@ -146,6 +146,11 @@ func evaluateEngineLocalReadiness(
 		}
 		activeCount++
 		if podwebhook.SkipAnnotationOptsOut(pod.Annotations[podwebhook.AnnotationSkip]) {
+			// AnnotationSkip is the authoritative public operator opt-out.
+			// AnnotationInjectSkipped is webhook-written audit metadata, not an
+			// authenticated receipt, so readiness deliberately does not require
+			// it here. Both annotations are user-writable; failurePolicy=Ignore
+			// means their presence cannot authenticate webhook execution.
 			skipped = append(skipped, pod.Name)
 			continue
 		}
@@ -217,11 +222,12 @@ func evaluateEngineLocalReadiness(
 	}
 }
 
-// engineConfigConverged uses the adapter's idempotent injection contract as a
-// read-only verifier. A converged PodSpec is unchanged when the current
-// CacheBackend configuration is applied to an in-memory copy. This verifies
-// the actual engine configuration instead of trusting user-writable receipt
-// annotations as proof that the mutating webhook ran.
+// engineConfigConverged uses the Pod webhook's complete idempotent engine
+// mutation contract as a read-only verifier. A converged PodSpec is unchanged
+// when the current adapter configuration and engineOverrides are applied to an
+// in-memory copy. This verifies the actual engine configuration instead of
+// trusting user-writable receipt annotations as proof that the mutating
+// webhook ran.
 func engineConfigConverged(
 	adapter adapterruntime.KVCacheRuntimeAdapter,
 	pod *corev1.Pod,
@@ -231,7 +237,7 @@ func engineConfigConverged(
 		return false
 	}
 	want := pod.Spec.DeepCopy()
-	if err := adapterruntime.InjectEngineConfigWithBinding(adapter, want, nil, backend); err != nil {
+	if err := podwebhook.ApplyEngineConfigWithOverrides(adapter, want, nil, backend); err != nil {
 		return false
 	}
 	return reflect.DeepEqual(*want, pod.Spec)
