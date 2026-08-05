@@ -249,6 +249,15 @@ spec:
                     format: int32
                     minimum: 1
                     type: integer
+                  storagePrefetchPolicy:
+                    description: |-
+                      StoragePrefetchPolicy maps to --hicache-storage-prefetch-policy when
+                      remoteStorage.provider=NFS. It is rejected without that storage tier.
+                    enum:
+                    - best_effort
+                    - wait_complete
+                    - timeout
+                    type: string
                   writePolicy:
                     description: WritePolicy maps to --hicache-write-policy.
                     enum:
@@ -693,8 +702,9 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is required for External ownership and rejected for Managed
-                      ownership, whose endpoint is controller-observed.
+                      Endpoint is required for network providers with External ownership and
+                      rejected for Managed ownership, whose endpoint is controller-observed.
+                      NFS is mounted from its typed server/path fields and has no endpoint.
                     type: string
                   lmCacheServer:
                     description: LMCacheServer contains standalone lmcache-server-owned
@@ -847,6 +857,32 @@ spec:
                             type: object
                         type: object
                     type: object
+                  nfs:
+                    description: |-
+                      NFS identifies an externally owned NFS export and its engine-container
+                      mount path. It is valid only with provider=NFS and ownership=External.
+                    properties:
+                      mountPath:
+                        description: |-
+                          MountPath is the absolute path at which the export is mounted in the
+                          engine container.
+                        minLength: 1
+                        type: string
+                      path:
+                        description: Path is the absolute path exported by the NFS
+                          server.
+                        minLength: 1
+                        type: string
+                      server:
+                        description: Server is the NFS mount-target hostname or IP
+                          address.
+                        minLength: 1
+                        type: string
+                    required:
+                    - mountPath
+                    - path
+                    - server
+                    type: object
                   ownership:
                     description: |-
                       Ownership identifies whether inference-cache manages the provider
@@ -861,6 +897,7 @@ spec:
                     - Redis
                     - LMCacheServer
                     - Mooncake
+                    - NFS
                     type: string
                   redis:
                     description: Redis contains Redis-owned configuration.

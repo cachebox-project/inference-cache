@@ -15,8 +15,10 @@ multi-tenant, Namespaces):
 - **`cachebackend-*.yaml`** — focused hand-curated canonical CacheBackend
   examples, including the
   [`cachebackend-sglang-hicache.yaml`](cachebackend-sglang-hicache.yaml)
-  engine-local example. The `recipe-*.yaml` catalog is the maintained entry
-  point for LMCache scenarios.
+  engine-local example and the
+  [`cachebackend-sglang-hicache-l3-nfs.yaml`](cachebackend-sglang-hicache-l3-nfs.yaml)
+  externally owned NFS L3 example. The `recipe-*.yaml` catalog is the
+  maintained entry point for LMCache scenarios.
 
 ## Recipe catalog
 
@@ -44,19 +46,26 @@ into two namespaces of its own.
 pods to the cache. For *managed* backends the wiring becomes available once the
 controller publishes `status.endpoint`, so a pod admitted before then races past
 injection and runs unwired until recreated (see each recipe's header); externally
-owned backends wire straight from `spec.remoteStorage.endpoint` and have no such
-race. KV reuse then works, but a *managed* backend only reaches `Ready=True`
+owned network backends wire straight from `spec.remoteStorage.endpoint` and
+have no such race. NFS is mounted directly into the engine Pod and therefore
+has no endpoint. KV reuse then works, but a *managed* backend only reaches `Ready=True`
 and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
 (empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
-degrades to `NoKVEventsObserved`. Externally owned backends are exempt from that gate —
-they go `Ready` as soon as admission accepts the endpoint. See the
+degrades to `NoKVEventsObserved`. Externally owned endpoint backends are exempt
+from that gate — they go `Ready` as soon as admission accepts the endpoint.
+SGLang HiCache with NFS is endpoint-free and follows the lifecycle described
+below.
+See the
 [quickstart](../../docs/quickstart.md).
 
 `SGLangHiCache` is endpoint-free and has no endpoint publication race. Its
 first implementation intentionally publishes no `Ready` condition; the
 matching Pod's injection annotations are the available wiring signal until the
-separate HiCache readiness contract ships.
+separate HiCache readiness contract ships. With `remoteStorage.provider: NFS`,
+the admitted Pod shape also carries the `file` storage arguments,
+storage-directory environment variable, NFS volume, and engine-container
+mount.
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
 `# verify-samples: skip` marker — server-side dry-run can't create the

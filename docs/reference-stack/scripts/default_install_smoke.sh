@@ -97,8 +97,10 @@
 #      is observed by the controller without rendering a Deployment, Service, or
 #      HPA; status.endpoint stays empty and no synthetic Ready condition is
 #      published. A matching engine Pod sent through real server-side dry-run
-#      admission receives the complete native --hicache-* argument contract,
-#      proving the endpoint-free Pod webhook path without starting SGLang.
+#      admission receives the complete native --hicache-* argument contract.
+#      Updating the CR from the committed NFS sample remains endpoint-free and
+#      dry-run admission additionally proves the file-storage args, env, inline
+#      NFS volume, and mount without starting SGLang or mounting the fake export.
 #  10. The /snapshot endpoint rejects unauthenticated callers AT THE NETWORK
 #      LAYER: a side curl pod outside the controller's SA identity (and outside
 #      the NetworkPolicy allowlist) has its connection to :8081 DROPPED by the
@@ -2460,8 +2462,8 @@ if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_o
 fi
 
 # Canonical runtime/cache adapters must explicitly accept their remote binding.
-# Native SGLang HiCache is engine-local and accepts only a nil binding, so a
-# Redis provider must be rejected before the controller could provision an
+# Native SGLang HiCache accepts host-only and file/NFS bindings; a RESP/Redis
+# provider must still be rejected before the controller could provision an
 # unused remote tier.
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
 apiVersion: inferencecache.io/v1alpha1
@@ -2769,6 +2771,109 @@ if [ "$hc_injected_by" != "$HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME" ]; then
   fail "native HiCache dry-run Pod injected-by=$hc_injected_by, want $HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME"
 fi
 log "native HiCache Pod webhook injected the complete CLI contract and backend identity"
+
+# Update the same CacheBackend to the committed canonical NFS L3 shape. NFS is
+# endpoint-free and controller-unmanaged, just like host-only native HiCache.
+hc_l3_sample_tmp="$(mktemp "$tmpdir/sample-sglang-hicache-l3-nfs.XXXXXX")"
+sed "s|^  name: sglang-hicache-l3-nfs\$|  name: $HICACHE_SMOKE_CB_NAME|" \
+  config/samples/cachebackend-sglang-hicache-l3-nfs.yaml > "$hc_l3_sample_tmp"
+kubectl -n "$HICACHE_SMOKE_NS" apply -f "$hc_l3_sample_tmp" >/dev/null \
+  || fail "kubectl apply native SGLang HiCache NFS L3 sample failed"
+
+hc_l3_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.metadata.generation}')"
+if [ "$hc_l3_generation" = "$hc_generation" ]; then
+  fail "native HiCache NFS update did not advance metadata.generation"
+fi
+deadline=$(($(date +%s) + HICACHE_SMOKE_TIMEOUT))
+hc_l3_observed_generation=""
+until [ "$hc_l3_observed_generation" = "$hc_l3_generation" ]; do
+  hc_l3_observed_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+    fail "controller did not observe native HiCache NFS generation $hc_l3_generation within ${HICACHE_SMOKE_TIMEOUT}s (observed $hc_l3_observed_generation)"
+  fi
+  sleep 1
+done
+hc_l3_endpoint="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
+hc_l3_ready="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+if [ -n "$hc_l3_endpoint" ] || [ -n "$hc_l3_ready" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+  fail "native HiCache NFS published server-backed status (endpoint=$hc_l3_endpoint Ready=$hc_l3_ready, want both absent)"
+fi
+
+hc_l3_dep_count="$(kubectl -n "$HICACHE_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_l3_svc_count="$(kubectl -n "$HICACHE_SMOKE_NS" get svc -o name 2>/dev/null | wc -l | tr -d ' ')"
+hc_l3_hpa_count="$(kubectl -n "$HICACHE_SMOKE_NS" get hpa -o name 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$hc_l3_dep_count" != "0" ] || [ "$hc_l3_svc_count" != "0" ] || [ "$hc_l3_hpa_count" != "0" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get deploy,svc,hpa || true
+  fail "native HiCache NFS rendered controller-owned workload (deploy=$hc_l3_dep_count svc=$hc_l3_svc_count hpa=$hc_l3_hpa_count, want 0/0/0)"
+fi
+
+# Render an engine Pod through real server-side CREATE admission, but do not
+# persist it: the documentation-only NFS server must never be mounted by the
+# kind smoke node. This covers the real CRD and webhook wiring without claiming
+# an SGLang or NFS data-plane test.
+hc_l3_engine_fixture="$(mktemp "$tmpdir/pod-sglang-hicache-l3.XXXXXX.yaml")"
+cat > "$hc_l3_engine_fixture" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-hicache-engine-l3
+  namespace: $HICACHE_SMOKE_NS
+  labels:
+    app: sglang
+spec:
+  containers:
+    - name: sglang
+      image: busybox:1.36
+      args:
+        - sleep
+        - "3600"
+EOF
+
+if ! hc_l3_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o go-template='{{range (index .spec.containers 0).args}}{{println .}}{{end}}' 2>/dev/null)"; then
+  fail "matching SGLang Pod did not pass NFS L3 server-side dry-run admission"
+fi
+hc_l3_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-storage-backend\nfile\n--hicache-storage-prefetch-policy\nwait_complete'
+if [ "$hc_l3_pod_args" != "$hc_l3_expected_args" ]; then
+  printf '[install-smoke] admitted SGLang NFS L3 args:\n%s\n' "$hc_l3_pod_args" >&2
+  fail "native HiCache NFS L3 mutation did not produce the expected complete argument contract"
+fi
+
+hc_l3_storage_dir="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o go-template='{{range (index .spec.containers 0).env}}{{if eq .name "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"}}{{.value}}{{end}}{{end}}' 2>/dev/null)" \
+  || fail "could not read native HiCache NFS storage-directory env"
+hc_l3_nfs_server="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o jsonpath='{.spec.volumes[?(@.name=="inferencecache-hicache-l3")].nfs.server}' 2>/dev/null)" \
+  || fail "could not read native HiCache NFS volume server"
+hc_l3_nfs_path="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o jsonpath='{.spec.volumes[?(@.name=="inferencecache-hicache-l3")].nfs.path}' 2>/dev/null)" \
+  || fail "could not read native HiCache NFS volume path"
+hc_l3_mount_path="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o jsonpath='{.spec.containers[0].volumeMounts[?(@.name=="inferencecache-hicache-l3")].mountPath}' 2>/dev/null)" \
+  || fail "could not read native HiCache NFS mount path"
+hc_l3_injected_by="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_l3_engine_fixture" \
+  -o go-template='{{index .metadata.annotations "inferencecache.io/injected-by"}}' 2>/dev/null)" \
+  || fail "could not read native HiCache NFS injection annotation"
+if [ "$hc_l3_storage_dir" != "/mnt/hicache" ] || \
+   [ "$hc_l3_nfs_server" != "192.0.2.10" ] || \
+   [ "$hc_l3_nfs_path" != "/hicache" ] || \
+   [ "$hc_l3_mount_path" != "/mnt/hicache" ] || \
+   [ "$hc_l3_injected_by" != "$HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME" ]; then
+  fail "native HiCache NFS render env=$hc_l3_storage_dir server=$hc_l3_nfs_server export=$hc_l3_nfs_path mount=$hc_l3_mount_path injected-by=$hc_l3_injected_by; want /mnt/hicache, 192.0.2.10, /hicache, /mnt/hicache, $HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME"
+fi
+log "native HiCache NFS L3 stayed endpoint-free, rendered no managed workload, and dry-run admission injected the complete file/NFS contract"
 
 kubectl delete cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$HICACHE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true

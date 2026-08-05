@@ -32,6 +32,21 @@ func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.Cac
 	}
 }
 
+func addHiCacheNFSBinding(cache *cachev1alpha1.CacheBackend) *backendadapter.Binding {
+	cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cache.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+			Server:    "10.0.0.25",
+			Path:      "/hicache",
+			MountPath: "/mnt/hicache",
+		},
+	}
+	cache.Spec.HiCache.StoragePrefetchPolicy = cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete
+	return backendadapter.BindingFor(cache.Spec.RemoteStorage, backendadapter.ProtocolFile, "")
+}
+
 func TestHiCacheAdapterContract(t *testing.T) {
 	adapter := NewHiCacheAdapter()
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
@@ -64,7 +79,85 @@ func TestHiCacheAdapterContract(t *testing.T) {
 		t.Fatal("SGLangHiCache adapter must accept a nil host-only binding")
 	}
 	if bindingAware.SupportsRemoteBinding(&backendadapter.Binding{Protocol: backendadapter.ProtocolRESP}) {
-		t.Fatal("SGLangHiCache adapter unexpectedly accepts remote storage")
+		t.Fatal("SGLangHiCache adapter unexpectedly accepts a RESP binding")
+	}
+	nfsCache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
+	if binding := addHiCacheNFSBinding(nfsCache); !bindingAware.SupportsRemoteBinding(binding) {
+		t.Fatal("SGLangHiCache adapter must accept a file/NFS binding")
+	}
+}
+
+func TestHiCacheInjectsFileNFSBindingAtomicallyAndIdempotently(t *testing.T) {
+	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{
+		Ratio:       "2",
+		WritePolicy: cachev1alpha1.SGLangHiCacheWriteThrough,
+	})
+	binding := addHiCacheNFSBinding(cache)
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "sglang",
+		Args: []string{"--model-path", "model"},
+	}}}
+	adapter := NewHiCacheAdapter().(runtimeadapter.RemoteBindingAdapter)
+	if err := adapter.InjectEngineConfigWithBinding(pod, binding, cache); err != nil {
+		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+	}
+
+	for flag, want := range map[string]string{
+		SGLangHiCacheStorageBackendArg:        "file",
+		SGLangHiCacheStoragePrefetchPolicyArg: "wait_complete",
+	} {
+		if got, ok := testArgValue(pod.Containers[0].Args, flag); !ok || got != want {
+			t.Errorf("%s = (%q, %v), want %q", flag, got, ok, want)
+		}
+	}
+	if got := pod.Containers[0].Env; len(got) != 1 || got[0].Name != SGLangHiCacheFileStorageDirectoryEnv || got[0].Value != "/mnt/hicache" {
+		t.Fatalf("storage env = %+v", got)
+	}
+	if got := pod.Volumes; len(got) != 1 || got[0].Name != SGLangHiCacheStorageVolumeName ||
+		got[0].NFS == nil || got[0].NFS.Server != "10.0.0.25" || got[0].NFS.Path != "/hicache" {
+		t.Fatalf("NFS volume = %+v", got)
+	}
+	if got := pod.Containers[0].VolumeMounts; len(got) != 1 || got[0].Name != SGLangHiCacheStorageVolumeName || got[0].MountPath != "/mnt/hicache" {
+		t.Fatalf("storage mount = %+v", got)
+	}
+	afterFirst := pod.DeepCopy()
+	if err := adapter.InjectEngineConfigWithBinding(pod, binding, cache); err != nil {
+		t.Fatalf("second InjectEngineConfigWithBinding: %v", err)
+	}
+	if !reflect.DeepEqual(pod, afterFirst) {
+		t.Fatalf("second injection changed pod:\nfirst=%+v\nsecond=%+v", afterFirst, pod)
+	}
+}
+
+func TestHiCacheFileNFSBindingConflictsFailAtomically(t *testing.T) {
+	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
+	binding := addHiCacheNFSBinding(cache)
+	adapter := NewHiCacheAdapter().(runtimeadapter.RemoteBindingAdapter)
+	cases := []struct {
+		name   string
+		mutate func(*corev1.PodSpec)
+	}{
+		{"storage arg", func(p *corev1.PodSpec) { p.Containers[0].Args = []string{SGLangHiCacheStorageBackendArg, "mooncake"} }},
+		{"storage env", func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: SGLangHiCacheFileStorageDirectoryEnv, Value: "/other"}}
+		}},
+		{"storage volume", func(p *corev1.PodSpec) { p.Volumes = []corev1.Volume{{Name: SGLangHiCacheStorageVolumeName}} }},
+		{"storage mount", func(p *corev1.PodSpec) {
+			p.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: SGLangHiCacheStorageVolumeName, MountPath: "/other"}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang"}}}
+			tc.mutate(pod)
+			before := pod.DeepCopy()
+			if err := adapter.InjectEngineConfigWithBinding(pod, binding, cache); err == nil {
+				t.Fatal("InjectEngineConfigWithBinding returned no error")
+			}
+			if !reflect.DeepEqual(pod, before) {
+				t.Fatalf("failed injection partially mutated pod:\nbefore=%+v\nafter=%+v", before, pod)
+			}
+		})
 	}
 }
 
@@ -326,12 +419,14 @@ func TestHiCacheReservedArgs(t *testing.T) {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangHiCacheStorageBackendArg,
+		SGLangHiCacheStoragePrefetchPolicyArg,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReservedArgs = %v, want %v", got, want)
 	}
-	if got := NewHiCacheAdapter().ReservedEnv(); len(got) != 0 {
-		t.Fatalf("ReservedEnv = %v, want empty", got)
+	if got := NewHiCacheAdapter().ReservedEnv(); !reflect.DeepEqual(got, []string{SGLangHiCacheFileStorageDirectoryEnv}) {
+		t.Fatalf("ReservedEnv = %v, want storage directory env", got)
 	}
 }
 

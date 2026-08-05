@@ -245,6 +245,64 @@ func TestReconcileCanonicalSGLangHiCacheWithRemoteStorageIsUnmanaged(t *testing.
 	}
 }
 
+func TestReconcileCanonicalSGLangHiCacheExternalNFSIsEndpointFree(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache-nfs", Namespace: "ns1", Generation: 3},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "sglang"},
+			},
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{
+				Ratio:                 "2.0",
+				StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+			},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+					Server:    "192.0.2.10",
+					Path:      "/hicache",
+					MountPath: "/mnt/hicache",
+				},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	var deployments appsv1.DeploymentList
+	if err := r.List(context.Background(), &deployments, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list Deployments: %v", err)
+	}
+	var services corev1.ServiceList
+	if err := r.List(context.Background(), &services, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list Services: %v", err)
+	}
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(deployments.Items) != 0 || len(services.Items) != 0 || len(hpas.Items) != 0 {
+		t.Fatalf("endpoint-free NFS rendered managed workload: deployments=%d services=%d hpas=%d",
+			len(deployments.Items), len(services.Items), len(hpas.Items))
+	}
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for NFS", got.Status.Endpoint)
+	}
+	if len(got.Status.Conditions) != 0 {
+		t.Fatalf("endpoint-free NFS published conditions: %v", got.Status.Conditions)
+	}
+	if got.Status.ObservedGeneration != got.Generation {
+		t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
 func TestReconcileCanonicalHostOnlyCacheReportsEngineDiagnostics(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("host-only-kernel", "ns1")

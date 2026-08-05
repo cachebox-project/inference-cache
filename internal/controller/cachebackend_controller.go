@@ -298,12 +298,14 @@ func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Du
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile drives a CacheBackend toward its desired state. External backends
-// only mirror their configured endpoint to status; managed backends (LMCache
-// in Phase 1) ask the registered runtime adapter for the cache-server pod
-// spec + service spec, wrap them into a Deployment + Service the controller
-// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
-// resolved endpoint.
+// Reconcile drives a CacheBackend toward its desired state. External network
+// backends mirror their configured endpoint to status; endpoint-free External
+// bindings such as NFS are consumed directly by selected engine Pods and are
+// acknowledged without publishing an endpoint or synthetic Ready condition.
+// Managed backends ask the registered runtime adapter for the cache-server pod spec +
+// service spec, wrap them into a Deployment + Service the controller owns,
+// optionally reconcile an HPA from spec.autoscaling, and publish the resolved
+// endpoint.
 //
 // On every reconcile — including ones that return an apply error — transitions
 // in the observed Ready condition (entering/leaving Ready=False/
@@ -392,10 +394,11 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // dispatch routes a CacheBackend by integration mode and effective remote
 // storage ownership. EventsOnly and canonical host-only configurations shed
-// managed provider workloads; External storage mirrors its configured endpoint
-// to status; Managed Redis, LMCacheServer, and Mooncake storage is rendered by
-// the selected runtime/provider adapter. Unsupported combinations also shed any
-// previously managed workload.
+// managed provider workloads; External network storage mirrors its configured
+// endpoint to status; endpoint-free External storage is acknowledged without
+// rendering a workload or publishing endpoint readiness; Managed Redis,
+// LMCacheServer, and Mooncake storage is rendered by the selected runtime/provider
+// adapter. Unsupported combinations also shed any previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	registry := r.Registry
 	if registry == nil {
@@ -476,6 +479,13 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		// Endpoint-free external bindings are mounted into or otherwise consumed
+		// directly by engine Pods. They have no provider workload or endpoint to
+		// reconcile. Adapter compatibility above decides which runtime/cache pairs
+		// currently support such a binding; controller dispatch stays generic.
+		if !backendadapter.BindingRequiresEndpoint(binding) {
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		// A backend switched from a managed type to External must shed its workload.

@@ -19,13 +19,24 @@ const (
 	ProtocolLMCache       Protocol = "lm"
 	ProtocolRESP          Protocol = "resp"
 	ProtocolMooncakeStore Protocol = "mooncakestore"
+	ProtocolFile          Protocol = "file"
 )
+
+// NFSBinding is the mount contract exposed by an externally owned NFS
+// provider. Runtime adapters translate it into their engine-specific file
+// storage wiring.
+type NFSBinding struct {
+	Server    string
+	Path      string
+	MountPath string
+}
 
 // Binding is the structured connection information an engine adapter accepts.
 // A nil binding means the requested hierarchy is host-only.
 type Binding struct {
 	Protocol Protocol
 	Endpoint string
+	NFS      *NFSBinding
 }
 
 // RenderedStorage is the provider-owned workload shape. PodSpec and Service are
@@ -83,7 +94,22 @@ func BindingFor(storage *cachev1alpha1.CacheBackendRemoteStorageSpec, protocol P
 	if storage == nil {
 		return nil
 	}
-	return &Binding{Protocol: protocol, Endpoint: resolvedEndpoint}
+	binding := &Binding{Protocol: protocol, Endpoint: resolvedEndpoint}
+	if storage.NFS != nil {
+		binding.NFS = &NFSBinding{
+			Server:    storage.NFS.Server,
+			Path:      storage.NFS.Path,
+			MountPath: storage.NFS.MountPath,
+		}
+	}
+	return binding
+}
+
+// BindingRequiresEndpoint reports whether the engine wire dials a network
+// endpoint. File-backed NFS is mounted into the Pod and therefore carries no
+// status/spec endpoint.
+func BindingRequiresEndpoint(binding *Binding) bool {
+	return binding != nil && binding.Protocol != ProtocolFile
 }
 
 // ProtocolFor returns the connection protocol associated with a provider.
@@ -98,6 +124,8 @@ func ProtocolFor(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) (Protocol
 		return ProtocolLMCache, nil
 	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
 		return ProtocolMooncakeStore, nil
+	case cachev1alpha1.CacheBackendRemoteStorageProviderNFS:
+		return ProtocolFile, nil
 	default:
 		return "", fmt.Errorf("%w: unknown provider=%q", ErrNoProvider, storage.Provider)
 	}

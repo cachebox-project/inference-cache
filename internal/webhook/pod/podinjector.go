@@ -575,9 +575,9 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // effectiveEndpoint returns the address the engine pod should be wired
 // to for the given CacheBackend. The source is type-scoped:
 //
-//   - External: spec.endpoint is authoritative — the operator owns it,
-//     admission validates it, status.endpoint is just a reconciler
-//     mirror that may briefly lag during an update. If a new pod
+//   - External network providers: spec.endpoint is authoritative — the
+//     operator owns it, admission validates it, and status.endpoint is just a
+//     reconciler mirror that may briefly lag during an update. If a new pod
 //     admits between an operator's spec.endpoint update and the
 //     status patch, status would still hold the OLD value and the
 //     pod would boot wired to the stale address; pod admission is
@@ -589,9 +589,10 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 //     provisions, and spec.endpoint is admission-rejected for these
 //     types (see rejectEndpointOnNonExternal), so there's nothing
 //     else to fall back on. The webhook must wait for status.
-//   - Engine-local types (SGLangHiCache): no endpoint is required. The
-//     selected adapter's EndpointRequirement capability bypasses the gate
-//     before this empty result is consumed.
+//   - Engine-local types (SGLangHiCache): no endpoint is required. External
+//     NFS carries its server/export/mount contract in a structured file
+//     binding rather than an endpoint. The selected adapter and concrete
+//     binding bypass the endpoint gate before this empty result is consumed.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
 //
@@ -618,6 +619,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	}
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
 		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+			return ""
+		}
 		// For External, re-apply the provider-specific admission-time shape
 		// check on the stored spec endpoint. The validating webhook already
 		// rejects malformed values at write time, but a pre-existing

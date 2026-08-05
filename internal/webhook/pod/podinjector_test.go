@@ -339,6 +339,47 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandle_MatchAndInject_CanonicalSGLangHiCacheNFS(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("hicache-nfs", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
+		Ratio:                 "2.0",
+		StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+	}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+			Server:    "10.0.0.25",
+			Path:      "/hicache",
+			MountPath: "/mnt/hicache",
+		},
+	}
+	cb.Status.Endpoint = ""
+
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+	resp := newHandler(t, cb).Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("HiCache NFS injection = Allowed %v, patches %d", resp.Allowed, len(resp.Patches))
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveArgPair(t, mutated, "--hicache-storage-backend", "file")
+	mustHaveArgPair(t, mutated, "--hicache-storage-prefetch-policy", "wait_complete")
+	mustHaveEnv(t, mutated, "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", "/mnt/hicache")
+	if len(mutated.Spec.Volumes) != 1 || mutated.Spec.Volumes[0].NFS == nil ||
+		mutated.Spec.Volumes[0].NFS.Server != "10.0.0.25" || mutated.Spec.Volumes[0].NFS.Path != "/hicache" {
+		t.Fatalf("NFS volume = %+v", mutated.Spec.Volumes)
+	}
+	mounts := mutated.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 || mounts[0].Name != "inferencecache-hicache-l3" || mounts[0].MountPath != "/mnt/hicache" {
+		t.Fatalf("HiCache NFS mount = %+v", mounts)
+	}
+}
+
 func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})

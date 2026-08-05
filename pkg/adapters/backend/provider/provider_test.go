@@ -48,6 +48,29 @@ func TestManagedRedisProviderOwnsTypedWorkloadConfig(t *testing.T) {
 	}
 }
 
+func TestExternalNFSProviderHasFileProtocolAndNoWorkload(t *testing.T) {
+	cache := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+		RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+				Server: "10.0.0.25", Path: "/hicache", MountPath: "/mnt/hicache",
+			},
+		},
+	}}
+	selected, err := DefaultRegistry().Select(cache.Spec.RemoteStorage)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	rendered, err := selected.Render(cache)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if rendered.Protocol != "file" || rendered.PodSpec != nil || rendered.Service != nil {
+		t.Fatalf("rendered NFS storage = %+v, want file protocol without workload", rendered)
+	}
+}
+
 func TestCanonicalProviderDoesNotInheritLegacyWorkloadConfig(t *testing.T) {
 	cache := &cachev1alpha1.CacheBackend{
 		Spec: cachev1alpha1.CacheBackendSpec{

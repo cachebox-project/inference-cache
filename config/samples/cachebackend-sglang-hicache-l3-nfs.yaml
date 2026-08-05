@@ -1,0 +1,27 @@
+# SGLang HiCache with an externally owned NFS L3 tier.
+# Replace the documentation-only server address and export path with the VCN
+# mount target before applying this sample to a runtime cluster.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: sglang-hicache-l3-nfs
+spec:
+  runtime: SGLang
+  type: SGLangHiCache
+  engineSelector:
+    matchLabels:
+      app: sglang
+  hiCache:
+    ratio: "2.0"
+    storagePrefetchPolicy: wait_complete
+  remoteStorage:
+    provider: NFS
+    ownership: External
+    nfs:
+      server: 192.0.2.10
+      path: /hicache
+      mountPath: /mnt/hicache
+  # Optional: enables the KV-event subscriber when the controller was started
+  # with --kvevent-subscriber-image.
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct

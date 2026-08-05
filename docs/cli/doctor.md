@@ -89,11 +89,12 @@ Notes:
   `lastEventAt` has been cleared by the poller. `CB004` fires only when
   `lastEventAt` IS present but has gone stale — an idle backend with a fresh
   event is healthy (`CB006`).
-- **Externally owned remote storage** (`spec.remoteStorage.ownership=External`,
+- **Externally owned network storage** (`spec.remoteStorage.ownership=External`,
   including the legacy `spec.type=External` shape) is checked for `Ready` and
   endpoint reachability only. Engine-pod matching (`CB002`) and index
-  participation (`CB003`/`CB004`) are managed-backend concerns and are skipped,
-  so a valid external config is not spuriously flagged.
+  participation (`CB003`/`CB004`) are skipped. External NFS is the exception:
+  it has no endpoint and is diagnosed through the same engine-pod and index
+  axes as host-only caching.
 - **Host-only backends** (no `spec.remoteStorage`) retain the managed engine
   and index checks but skip endpoint reachability (`CB005`), because they have
   no provider endpoint to publish or dial.

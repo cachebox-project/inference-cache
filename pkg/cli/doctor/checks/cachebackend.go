@@ -21,11 +21,13 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 // axis emits its own finding so the operator sees exactly what is wrong; a
 // backend that passes every applicable axis emits a single OK.
 //
-// Three health models coexist, derived from EffectiveRemoteStorage so canonical
+// Four health models coexist, derived from EffectiveRemoteStorage so canonical
 // and legacy resources are classified identically:
 //   - Managed remote storage: every axis applies.
-//   - External remote storage: only Ready + endpoint reachability apply.
+//   - External network storage: only Ready + endpoint reachability apply.
 //   - Host-only caching: engine/index axes apply, but endpoint checks do not.
+//   - External NFS: engine/index axes apply like host-only caching, but
+//     endpoint checks do not because the provider is mounted, not dialed.
 //
 // The matched-engine-pod axis prefers the controller-written
 // status.matchedEnginePods (its authoritative snapshot) but falls back to a
@@ -64,9 +66,12 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		}
 
 		storage := cb.Spec.EffectiveRemoteStorage()
-		external := storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal
-		managed := !external
-		if managed {
+		nfsBacked := storage != nil && storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
+		externalEndpoint := storage != nil &&
+			storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal &&
+			!nfsBacked
+		endpointBacked := storage != nil && !nfsBacked
+		if !externalEndpoint {
 			// Matched engine pods — only meaningful when a selector is declared.
 			if hasEngineSelector(cb) {
 				count, err := matchedEnginePodCount(ctx, c, cb)
@@ -107,7 +112,7 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 
 		// Endpoint presence + reachability applies only when a remote provider
 		// exists. Host-only caches intentionally publish no endpoint.
-		if storage != nil {
+		if endpointBacked {
 			if f, ok := endpointFinding(ctx, cb, ref, dial); ok {
 				note(f)
 			}
@@ -116,7 +121,7 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		if healthy {
 			findings = append(findings, doctor.Finding{
 				Code: doctor.CodeBackendHealthy, Status: doctor.StatusOK,
-				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, managed, storage != nil, dial != nil),
+				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, externalEndpoint, endpointBacked, nfsBacked, dial != nil),
 			})
 		}
 	}
@@ -216,7 +221,7 @@ func staleMessage(lastEventAt *metav1.Time, now time.Time, staleWindow time.Dura
 	return fmt.Sprintf("status.indexParticipation.lastEventAt is %s old (EngineStale): exceeds the %s freshness window — KV events have stopped flowing", age, staleWindow)
 }
 
-func healthyMessage(cb *cachev1alpha1.CacheBackend, managed, hasRemoteStorage, dialed bool) string {
+func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBacked, nfsBacked, dialed bool) string {
 	// Only claim "reachable" when an actual TCP probe ran; with no dialer
 	// (e.g. --config-only) doctor verified the endpoint is published, not that
 	// it answers.
@@ -224,10 +229,12 @@ func healthyMessage(cb *cachev1alpha1.CacheBackend, managed, hasRemoteStorage, d
 	if dialed {
 		endpoint = "endpoint reachable"
 	}
-	if !managed {
+	if externalEndpoint {
 		return "External backend: Ready, " + endpoint
 	}
-	if !hasRemoteStorage {
+	if nfsBacked {
+		endpoint = "NFS-backed (endpoint not applicable)"
+	} else if !endpointBacked {
 		endpoint = "host-only (endpoint not applicable)"
 	}
 	matched := "engine pods matched"

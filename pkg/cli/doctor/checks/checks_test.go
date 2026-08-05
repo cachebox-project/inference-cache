@@ -646,6 +646,33 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("canonical NFS-backed HiCache uses engine axes and skips endpoint axis", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Name = "hicache-nfs"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+				Server:    "192.0.2.10",
+				Path:      "/hicache",
+				MountPath: "/mnt/hicache",
+			},
+		}
+		cb.Status.Endpoint = ""
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, badDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
+			t.Fatalf("canonical NFS-backed HiCache should be CB006, got %v", codesOf(fs))
+		}
+		if !strings.Contains(fs[0].Message, "NFS-backed") {
+			t.Fatalf("healthy message = %q, want NFS-backed classification", fs[0].Message)
+		}
+		if hasCode(fs, doctor.CodeBackendEndpointUnreachable) != nil {
+			t.Fatalf("NFS-backed HiCache must not report CB005, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("selectorless managed backend skips the matched-pods axis", func(t *testing.T) {
 		cb := healthyBackend(now)
 		cb.Spec.EngineSelector = nil

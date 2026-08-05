@@ -30,7 +30,7 @@ const (
 	CacheBackendTypeExternal      CacheBackendType = "External"
 )
 
-// +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake
+// +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake;NFS
 
 // CacheBackendRemoteStorageProvider identifies the technology used for the
 // optional shared/remote cache tier.
@@ -40,6 +40,7 @@ const (
 	CacheBackendRemoteStorageProviderRedis         CacheBackendRemoteStorageProvider = "Redis"
 	CacheBackendRemoteStorageProviderLMCacheServer CacheBackendRemoteStorageProvider = "LMCacheServer"
 	CacheBackendRemoteStorageProviderMooncake      CacheBackendRemoteStorageProvider = "Mooncake"
+	CacheBackendRemoteStorageProviderNFS           CacheBackendRemoteStorageProvider = "NFS"
 )
 
 // +kubebuilder:validation:Enum=Managed;External
@@ -133,6 +134,18 @@ const (
 	SGLangHiCacheMemoryPageHead         SGLangHiCacheMemoryLayout = "page_head"
 )
 
+// +kubebuilder:validation:Enum=best_effort;wait_complete;timeout
+
+// SGLangHiCacheStoragePrefetchPolicy controls when a storage-tier prefetch
+// stops before request execution continues.
+type SGLangHiCacheStoragePrefetchPolicy string
+
+const (
+	SGLangHiCacheStoragePrefetchBestEffort   SGLangHiCacheStoragePrefetchPolicy = "best_effort"
+	SGLangHiCacheStoragePrefetchWaitComplete SGLangHiCacheStoragePrefetchPolicy = "wait_complete"
+	SGLangHiCacheStoragePrefetchTimeout      SGLangHiCacheStoragePrefetchPolicy = "timeout"
+)
+
 // SGLangHiCacheSpec configures SGLang's native, engine-local host-memory cache.
 // Exactly one of SizeGB and Ratio must be set. Optional tuning fields are
 // passed to SGLang only when explicitly configured, so the engine version owns
@@ -162,6 +175,11 @@ type SGLangHiCacheSpec struct {
 	// MemoryLayout maps to --hicache-mem-layout.
 	// +optional
 	MemoryLayout SGLangHiCacheMemoryLayout `json:"memoryLayout,omitempty"`
+
+	// StoragePrefetchPolicy maps to --hicache-storage-prefetch-policy when
+	// remoteStorage.provider=NFS. It is rejected without that storage tier.
+	// +optional
+	StoragePrefetchPolicy SGLangHiCacheStoragePrefetchPolicy `json:"storagePrefetchPolicy,omitempty"`
 }
 
 // CacheBackendHostMemorySpec configures engine-side host memory. Capacity is
@@ -248,6 +266,24 @@ type MooncakeRemoteStorageSpec struct {
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
+// NFSRemoteStorageSpec identifies an existing NFS export mounted into each
+// selected engine Pod. NFS is externally owned; inference-cache creates no
+// mount target, export, PV, PVC, or StorageClass.
+type NFSRemoteStorageSpec struct {
+	// Server is the NFS mount-target hostname or IP address.
+	// +kubebuilder:validation:MinLength=1
+	Server string `json:"server"`
+
+	// Path is the absolute path exported by the NFS server.
+	// +kubebuilder:validation:MinLength=1
+	Path string `json:"path"`
+
+	// MountPath is the absolute path at which the export is mounted in the
+	// engine container.
+	// +kubebuilder:validation:MinLength=1
+	MountPath string `json:"mountPath"`
+}
+
 // CacheBackendRemoteStorageSpec configures the optional shared/remote tier.
 // Omitting this object in the canonical API requests an engine-local,
 // host-only hierarchy and never implicitly provisions infrastructure.
@@ -259,8 +295,9 @@ type CacheBackendRemoteStorageSpec struct {
 	// workload or connects to operator-managed infrastructure.
 	Ownership CacheBackendRemoteStorageOwnership `json:"ownership"`
 
-	// Endpoint is required for External ownership and rejected for Managed
-	// ownership, whose endpoint is controller-observed.
+	// Endpoint is required for network providers with External ownership and
+	// rejected for Managed ownership, whose endpoint is controller-observed.
+	// NFS is mounted from its typed server/path fields and has no endpoint.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
@@ -275,6 +312,11 @@ type CacheBackendRemoteStorageSpec struct {
 	// Mooncake contains Mooncake-owned configuration.
 	// +optional
 	Mooncake *MooncakeRemoteStorageSpec `json:"mooncake,omitempty"`
+
+	// NFS identifies an externally owned NFS export and its engine-container
+	// mount path. It is valid only with provider=NFS and ownership=External.
+	// +optional
+	NFS *NFSRemoteStorageSpec `json:"nfs,omitempty"`
 }
 
 // CacheBackendObservationSpec configures KV-event observation independently

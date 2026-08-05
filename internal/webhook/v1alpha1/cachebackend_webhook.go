@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	pathpkg "path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -98,8 +99,9 @@ const (
 type CacheBackendDefaulter struct{}
 
 // CacheBackendValidator rejects CacheBackend specs that are structurally
-// broken — External without an endpoint, cross-namespace endpoints without
-// explicit opt-in, runtime/backend pairs no installed adapter supports —
+// broken — External network storage without an endpoint, NFS without a typed
+// mount declaration, cross-namespace endpoints without explicit opt-in,
+// runtime/backend pairs no installed adapter supports —
 // before the reconciler ever sees them. It implements [admission.Validator]
 // over CacheBackend.
 //
@@ -328,7 +330,12 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 				"managed providers publish their observed endpoint in status.endpoint"))
 		}
 	case cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal:
-		if strings.TrimSpace(storage.Endpoint) == "" {
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+			if strings.TrimSpace(storage.Endpoint) != "" {
+				errs = append(errs, field.Forbidden(storagePath.Child("endpoint"),
+					"NFS uses remoteStorage.nfs.server and path instead of an endpoint"))
+			}
+		} else if strings.TrimSpace(storage.Endpoint) == "" {
 			errs = append(errs, field.Required(storagePath.Child("endpoint"),
 				"required when remoteStorage.ownership=External"))
 		} else if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
@@ -337,23 +344,39 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 	}
 
 	type providerConfig struct {
-		provider cachev1alpha1.CacheBackendRemoteStorageProvider
-		set      bool
-		path     *field.Path
+		provider       cachev1alpha1.CacheBackendRemoteStorageProvider
+		set            bool
+		path           *field.Path
+		allowsExternal bool
 	}
 	configs := []providerConfig{
-		{cachev1alpha1.CacheBackendRemoteStorageProviderRedis, storage.Redis != nil, storagePath.Child("redis")},
-		{cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, storage.LMCacheServer != nil, storagePath.Child("lmCacheServer")},
-		{cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, storage.Mooncake != nil, storagePath.Child("mooncake")},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderRedis, storage.Redis != nil, storagePath.Child("redis"), false},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, storage.LMCacheServer != nil, storagePath.Child("lmCacheServer"), false},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, storage.Mooncake != nil, storagePath.Child("mooncake"), false},
+		{cachev1alpha1.CacheBackendRemoteStorageProviderNFS, storage.NFS != nil, storagePath.Child("nfs"), true},
 	}
 	for _, config := range configs {
 		if config.set && storage.Provider != config.provider {
 			errs = append(errs, field.Forbidden(config.path,
 				fmt.Sprintf("configuration belongs to provider %s, but remoteStorage.provider=%s", config.provider, storage.Provider)))
 		}
-		if config.set && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		if config.set && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal && !config.allowsExternal {
 			errs = append(errs, field.Forbidden(config.path,
 				"provider workload configuration is valid only with Managed ownership"))
+		}
+	}
+	if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+		if storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			errs = append(errs, field.NotSupported(
+				storagePath.Child("ownership"), storage.Ownership,
+				[]string{string(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)},
+			))
+		}
+		if storage.NFS == nil {
+			errs = append(errs, field.Required(storagePath.Child("nfs"),
+				"required when remoteStorage.provider=NFS"))
+		} else {
+			errs = append(errs, validateNFSRemoteStorage(storage.NFS, storagePath.Child("nfs"))...)
 		}
 	}
 	if storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
@@ -376,6 +399,37 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 	}
 
 	return errs
+}
+
+func validateNFSRemoteStorage(storage *cachev1alpha1.NFSRemoteStorageSpec, storagePath *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	server := storage.Server
+	switch {
+	case strings.TrimSpace(server) == "":
+		errs = append(errs, field.Required(storagePath.Child("server"),
+			"NFS mount-target hostname or IP address is required"))
+	case server != strings.TrimSpace(server) || strings.ContainsAny(server, "/ \t\r\n") || strings.Contains(server, "://"):
+		errs = append(errs, field.Invalid(storagePath.Child("server"), server,
+			"must be a hostname or IP address without a scheme, path, or whitespace"))
+	}
+	errs = append(errs, validateCleanAbsolutePath(storage.Path, storagePath.Child("path"), true)...)
+	errs = append(errs, validateCleanAbsolutePath(storage.MountPath, storagePath.Child("mountPath"), false)...)
+	return errs
+}
+
+func validateCleanAbsolutePath(value string, valuePath *field.Path, allowRoot bool) field.ErrorList {
+	if strings.TrimSpace(value) == "" {
+		return field.ErrorList{field.Required(valuePath, "absolute path is required")}
+	}
+	if value != strings.TrimSpace(value) || !pathpkg.IsAbs(value) || pathpkg.Clean(value) != value {
+		return field.ErrorList{field.Invalid(valuePath, value,
+			"must be a clean absolute path without surrounding whitespace")}
+	}
+	if !allowRoot && value == "/" {
+		return field.ErrorList{field.Invalid(valuePath, value,
+			"must not mount remote storage over the container root")}
+	}
+	return nil
 }
 
 func validateManagedProviderCommand(path *field.Path, command []string) field.ErrorList {
@@ -463,6 +517,28 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 					string(cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit),
 					string(cachev1alpha1.SGLangHiCacheMemoryPageHead),
 				},
+			))
+		}
+		nfsStorage := cb.Spec.RemoteStorage != nil &&
+			cb.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
+		if !validHiCacheStoragePrefetchPolicy(spec.StoragePrefetchPolicy) {
+			errs = append(errs, field.NotSupported(
+				hiCachePath.Child("storagePrefetchPolicy"), spec.StoragePrefetchPolicy,
+				[]string{
+					string(cachev1alpha1.SGLangHiCacheStoragePrefetchBestEffort),
+					string(cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete),
+					string(cachev1alpha1.SGLangHiCacheStoragePrefetchTimeout),
+				},
+			))
+		} else if nfsStorage && spec.StoragePrefetchPolicy == "" {
+			errs = append(errs, field.Required(
+				hiCachePath.Child("storagePrefetchPolicy"),
+				"required when remoteStorage.provider=NFS",
+			))
+		} else if !nfsStorage && spec.StoragePrefetchPolicy != "" {
+			errs = append(errs, field.Forbidden(
+				hiCachePath.Child("storagePrefetchPolicy"),
+				"valid only when remoteStorage.provider=NFS",
 			))
 		}
 	}
@@ -557,6 +633,18 @@ func validHiCacheMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) boo
 		cachev1alpha1.SGLangHiCacheMemoryPageFirstDirect,
 		cachev1alpha1.SGLangHiCacheMemoryPageFirstKVSplit,
 		cachev1alpha1.SGLangHiCacheMemoryPageHead:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHiCacheStoragePrefetchPolicy(value cachev1alpha1.SGLangHiCacheStoragePrefetchPolicy) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheStoragePrefetchBestEffort,
+		cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+		cachev1alpha1.SGLangHiCacheStoragePrefetchTimeout:
 		return true
 	default:
 		return false
