@@ -101,7 +101,7 @@ var rejectReservedProbeTenantID = func(ct *cachev1alpha1.CacheTenant) field.Erro
 	return field.ErrorList{field.Invalid(
 		field.NewPath("spec", "tenantID"),
 		ct.Spec.TenantID,
-		"tenantID is reserved for the server's functional self-test (see pkg/server/probe.go); choose a different tenantID",
+		"tenantID is reserved for the control plane's functional self-test (see internal/controlplaneapi/probe.go); choose a different tenantID",
 	)}
 }
 

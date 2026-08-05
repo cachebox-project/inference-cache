@@ -38,9 +38,6 @@ func TestControllerProductionImportsRespectBoundaries(t *testing.T) {
 		modulePath + "/internal/webhook": {},
 	}
 	for _, path := range files {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
-		}
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
