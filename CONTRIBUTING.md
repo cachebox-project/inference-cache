@@ -22,6 +22,7 @@ make test-race
 make build
 make cover-check # fail if logic-package coverage drops below COVER_MIN (90%)
 make vulncheck   # vulnerability scan (needs network); blocking in CI
+make verify-minimal-base test-minimal-images
 ```
 
 `make test-race` runs the unit tests under the race detector — it's what the
@@ -37,6 +38,11 @@ a ratchet: raise it as coverage improves.
 `make ci-lint` runs the golangci-lint configuration used by CI.
 `make proto-lint` lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
+`make verify-minimal-base` and `make test-minimal-images` enforce the shipped
+Distroless runtime-stage policy without requiring Docker. After `make
+image-build`, `make verify-minimal-images` also inspects each image's effective
+user, entrypoint, and filesystem; see
+[`docs/operations/container-images.md`](docs/operations/container-images.md).
 
 ## Optional coding-agent tooling
 

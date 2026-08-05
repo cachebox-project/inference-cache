@@ -32,6 +32,8 @@ SBOM_DOCKERFILE ?= dockerfiles/Dockerfile
 SBOM_REGISTRY_PUBLISH_MISSING ?= 0
 SBOM_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
 SBOM_TAG := $(subst /,_,$(TAG))
+MINIMAL_IMAGE_DOCKERFILE ?= dockerfiles/Dockerfile
+MINIMAL_RUNTIME_BASE ?= gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
 version_pkg = $(MODULE)/pkg/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
@@ -336,6 +338,24 @@ server-image: ## Build the server container image.
 subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
 	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t "$(SUBSCRIBER_IMG)" .
 
+.PHONY: verify-minimal-base
+verify-minimal-base: ## Verify every shipped runtime stage uses the approved Distroless non-root base.
+	@MINIMAL_IMAGE_DOCKERFILE="$(MINIMAL_IMAGE_DOCKERFILE)" \
+		MINIMAL_RUNTIME_BASE="$(MINIMAL_RUNTIME_BASE)" \
+		bash hack/verify-minimal-images.sh --dockerfile-only
+
+.PHONY: test-minimal-images
+test-minimal-images: ## Test the minimal-image policy verifier without Docker.
+	@bash hack/verify-minimal-images_test.sh
+
+.PHONY: verify-minimal-images
+verify-minimal-images: verify-minimal-base ## Inspect built images for non-root metadata and the absence of shells/package managers.
+	@DOCKER="$(DOCKER_BUILD_CMD)" \
+		MINIMAL_IMAGE_DOCKERFILE="$(MINIMAL_IMAGE_DOCKERFILE)" \
+		MINIMAL_RUNTIME_BASE="$(MINIMAL_RUNTIME_BASE)" \
+		IMG="$(IMG)" SERVER_IMG="$(SERVER_IMG)" SUBSCRIBER_IMG="$(SUBSCRIBER_IMG)" \
+		bash hack/verify-minimal-images.sh
+
 .PHONY: syft-check
 syft-check: ## Fail fast when Syft is unavailable.
 	@command -v "$(SYFT)" >/dev/null || { echo "ERROR: syft missing. Install syft $(SYFT_VERSION) or set SYFT=/path/to/syft"; exit 1; }
@@ -547,7 +567,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-syft-pin fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft pin drift + fmt + vet + lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft/minimal-image policy + fmt + vet + lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

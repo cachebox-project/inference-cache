@@ -54,6 +54,9 @@ jobs:
     - name: Verify Syft pin drift
       run: make verify-syft-pin
 
+    - name: Verify minimal runtime image policy
+      run: make verify-minimal-base test-minimal-images
+
     - name: Test docs-sync gate
       run: make test-docs-sync
 
@@ -396,6 +399,9 @@ jobs:
 
     - name: Build images
       run: make image-build TAG=${IMAGE_TAG}
+
+    - name: Verify minimal runtime images
+      run: make verify-minimal-images TAG=${IMAGE_TAG}
 
     - name: Generate image SBOM smoke
       run: make sbom-images TAG=${IMAGE_TAG} SBOM_IMAGE_BUILD=0 SBOM_DIR="$RUNNER_TEMP/sbom-image-smoke"
