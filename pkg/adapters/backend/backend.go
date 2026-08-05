@@ -39,6 +39,15 @@ type NFSBinding struct {
 // binding contract. Admission and runtime adapters both call this helper so a
 // stored or admission-bypassed CacheBackend cannot reach pod injection with a
 // server value the validating webhook would reject.
+//
+// IPv6 is intentionally accepted only as a raw literal (for example
+// "2001:db8::25"), not an already-bracketed URI authority. Kubernetes stores
+// that raw value in corev1.NFSVolumeSource.Server; kubelet's in-tree NFS plugin
+// detects it with netutil.IsIPv6String and adds brackets in
+// getServerFromSource before constructing the mount source as
+// "[2001:db8::25]:/export". Keeping that boundary explicit avoids rejecting a
+// Kubernetes-supported input or moving kubelet-owned formatting into this
+// controller.
 func ValidateNFSServer(server string) error {
 	switch {
 	case strings.TrimSpace(server) == "":

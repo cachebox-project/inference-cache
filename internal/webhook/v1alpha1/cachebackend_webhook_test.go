@@ -110,7 +110,9 @@ func TestValidator_CanonicalHiCacheNFSServerAccepted(t *testing.T) {
 		server string
 	}{
 		{"IPv4", "10.0.0.25"},
-		{"IPv6", "2001:db8::25"},
+		// NFSVolumeSource.Server stores raw IPv6; kubelet brackets it when
+		// constructing the mount source. See backend.ValidateNFSServer.
+		{"raw IPv6 (kubelet formats mount source)", "2001:db8::25"},
 		{"DNS hostname", "nfs.example.com"},
 		{"single-label DNS hostname", "nfs-server"},
 	}

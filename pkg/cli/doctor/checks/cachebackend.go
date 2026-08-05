@@ -34,11 +34,11 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 //
 // The matched-engine-pod axis prefers the controller-written
 // status.matchedEnginePods (its authoritative snapshot) but falls back to a
-// live label match when status is absent — so doctor flags a selector mismatch
-// even before the controller has reconciled, which is exactly the freshly-
-// misconfigured state operators run doctor in. It fires only when the backend
-// actually declares an engineSelector: a selectorless backend has nothing to
-// mismatch.
+// live label match when status is absent or belongs to an older generation —
+// so doctor flags a selector mismatch even before the controller has reconciled,
+// which is exactly the freshly-misconfigured state operators run doctor in. It
+// fires only when the backend actually declares an engineSelector: a
+// selectorless backend has nothing to mismatch.
 //
 // The index-participation axis keys off lastEventAt, not the prefix count: zero
 // warm prefixes is a VALID state for an up-but-idle backend (PROJECT_CONTEXT),
@@ -60,6 +60,36 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 			findings = append(findings, f)
 		}
 
+		// Status-derived health axes are usable only after the controller has
+		// processed the current spec generation; otherwise an old Ready=True,
+		// endpoint, matched-pod count, or index observation could make a just-edited
+		// backend look healthy. Real API objects start at generation 1, so
+		// generation 0 is also unobserved (it occurs only in synthetic clients/tests).
+		statusCurrent := cb.Generation > 0 && cb.Status.ObservedGeneration == cb.Generation
+		ready := findCondition(cb.Status.Conditions, conditionReady)
+		readyCurrent := ready == nil || ready.ObservedGeneration == cb.Generation
+		switch {
+		case !statusCurrent:
+			note(doctor.Finding{
+				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
+				Check: checkCacheBackendHealth, Resource: ref,
+				Message: fmt.Sprintf(
+					"controller has not observed the current CacheBackend generation: metadata.generation=%d, status.observedGeneration=%d",
+					cb.Generation, cb.Status.ObservedGeneration,
+				),
+			})
+		case !readyCurrent:
+			note(doctor.Finding{
+				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
+				Check: checkCacheBackendHealth, Resource: ref,
+				Message: fmt.Sprintf(
+					"Ready condition is stale for the current CacheBackend generation: metadata.generation=%d, Ready.observedGeneration=%d",
+					cb.Generation, ready.ObservedGeneration,
+				),
+			})
+		}
+		statusUsable := statusCurrent && readyCurrent
+
 		storage := cb.Spec.EffectiveRemoteStorage()
 		nfsBacked := storage != nil && storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 		externalEndpoint := storage != nil &&
@@ -73,8 +103,7 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		// adapter/provider capability failures for stored or admission-bypassed
 		// resources, and doctor consumes that status instead of duplicating the
 		// compatibility table.
-		ready := findCondition(cb.Status.Conditions, conditionReady)
-		if (ready != nil && ready.Status != metav1.ConditionTrue) || (ready == nil && !nfsBacked) {
+		if statusUsable && ((ready != nil && ready.Status != metav1.ConditionTrue) || (ready == nil && !nfsBacked)) {
 			note(doctor.Finding{
 				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
 				Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
@@ -84,7 +113,7 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 		if !externalEndpoint {
 			// Matched engine pods — only meaningful when a selector is declared.
 			if hasEngineSelector(cb) {
-				count, err := matchedEnginePodCount(ctx, c, cb)
+				count, err := matchedEnginePodCount(ctx, c, cb, statusUsable)
 				switch {
 				case err != nil:
 					note(doctor.Finding{
@@ -101,28 +130,30 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 				}
 			}
 
-			// Index participation: keyed off KV-event observation, not prefix count.
-			if f, ok := participationFinding(cb.Status.IndexParticipation, cb.Status.FirstKVEventObservedAt, ref, now, staleWindow); ok {
-				note(f)
-			}
+			if statusUsable {
+				// Index participation: keyed off KV-event observation, not prefix count.
+				if f, ok := participationFinding(cb.Status.IndexParticipation, cb.Status.FirstKVEventObservedAt, ref, now, staleWindow); ok {
+					note(f)
+				}
 
-			// Functional self-test gate: the controller writes FunctionalProbeOK
-			// only once the backend is otherwise eligible, so its absence is not a
-			// problem (Ready/CB003 already cover the not-yet-ready state). A
-			// present-but-not-True condition is the silent-failure signal the bare
-			// Ready bit does not explain — surface its reason/message.
-			if fp := findCondition(cb.Status.Conditions, conditionFunctionalProbeOK); fp != nil && fp.Status != metav1.ConditionTrue {
-				note(doctor.Finding{
-					Code: doctor.CodeBackendFunctionalProbeFailing, Status: doctor.StatusWarn,
-					Check: checkCacheBackendHealth, Resource: ref,
-					Message: fmt.Sprintf("FunctionalProbeOK=%s (reason %s): the controller's end-to-end functional self-test is failing for this backend — %s", fp.Status, fp.Reason, fp.Message),
-				})
+				// Functional self-test gate: the controller writes FunctionalProbeOK
+				// only once the backend is otherwise eligible, so its absence is not a
+				// problem (Ready/CB003 already cover the not-yet-ready state). A
+				// present-but-not-True condition is the silent-failure signal the bare
+				// Ready bit does not explain — surface its reason/message.
+				if fp := findCondition(cb.Status.Conditions, conditionFunctionalProbeOK); fp != nil && fp.Status != metav1.ConditionTrue {
+					note(doctor.Finding{
+						Code: doctor.CodeBackendFunctionalProbeFailing, Status: doctor.StatusWarn,
+						Check: checkCacheBackendHealth, Resource: ref,
+						Message: fmt.Sprintf("FunctionalProbeOK=%s (reason %s): the controller's end-to-end functional self-test is failing for this backend — %s", fp.Status, fp.Reason, fp.Message),
+					})
+				}
 			}
 		}
 
 		// Endpoint presence + reachability applies only when a remote provider
 		// exists. Host-only caches intentionally publish no endpoint.
-		if endpointBacked {
+		if statusUsable && endpointBacked {
 			if f, ok := endpointFinding(ctx, cb, ref, dial); ok {
 				note(f)
 			}
@@ -187,8 +218,8 @@ func participationFinding(ip *cachev1alpha1.CacheBackendIndexParticipation, firs
 // when present, else a live label-match count against the backend's namespace.
 // A pod-list failure is returned as an error (not silently coerced to 0) so the
 // caller can report it as inconclusive rather than as a selector mismatch.
-func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alpha1.CacheBackend) (int, error) {
-	if cb.Status.MatchedEnginePods != nil {
+func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alpha1.CacheBackend, statusUsable bool) (int, error) {
+	if statusUsable && cb.Status.MatchedEnginePods != nil {
 		return int(*cb.Status.MatchedEnginePods), nil
 	}
 	var pods corev1.PodList
@@ -230,7 +261,7 @@ func endpointFinding(ctx context.Context, cb *cachev1alpha1.CacheBackend, ref st
 
 func notReadyMessage(ready *metav1.Condition) string {
 	if ready == nil {
-		return "Ready condition is not set yet — the controller has not reconciled this backend, or it has never observed a KV event"
+		return "Ready condition is not set for the current observed generation"
 	}
 	return fmt.Sprintf("Ready=%s (reason %s): %s", ready.Status, ready.Reason, ready.Message)
 }

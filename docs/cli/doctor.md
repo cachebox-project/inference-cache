@@ -61,7 +61,7 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `PB001` | FAIL | `/probe` route not wired (connection refused, or HTTP 404 = route not mounted) |
 | `PB002` | OK | `/probe` route is wired (2xx / 401 / 403 / 405) |
 | `PB003` | WARN | `/probe` mounted but answered an unexpected status (e.g. 5xx) |
-| `CB001` | WARN | CacheBackend `Ready` is not `True` |
+| `CB001` | WARN | controller has not observed the current CacheBackend generation, or its current `Ready` condition is missing/not `True` |
 | `CB002` | WARN | managed backend with a selector matches 0 engine pods (LikelySelectorMismatch) |
 | `CB003` | WARN | no KV event ever observed for the backend (EngineNotReportingState) |
 | `CB004` | WARN | last KV event is stale (EngineStale) |
@@ -80,6 +80,14 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 
 Notes:
 
+- **CacheBackend status must be current before health is interpreted.** Doctor
+  first requires `status.observedGeneration == metadata.generation`; when a
+  `Ready` condition is present, its own `observedGeneration` must also match.
+  Otherwise it emits `CB001` and does not interpret controller-owned endpoint,
+  matched-pod, index, or condition values that may describe the previous spec
+  generation. The selector check can still list live Pods against the current
+  spec, preserving useful pre-reconcile diagnostics without trusting stale
+  status.
 - **`CB003` keys off KV-event observation, not prefix count.** Zero warm prefixes
   is a valid state for an up-but-idle backend, so doctor flags "engine not
   reporting" only when *no* KV event has ever been observed — which means BOTH
@@ -97,10 +105,12 @@ Notes:
   it has no endpoint and is diagnosed through the same engine-pod and index
   axes as host-only caching. Passing those observable axes emits `CB008` INFO,
   not `CB006` OK, because inference-cache does not probe the NFS mount or the
-  HiCache L3 store/read data path. An explicit non-`True` `Ready` condition
-  still wins and is reported as `CB001`; the controller uses that condition to
-  expose adapter/provider capability rejection for stored or admission-bypassed
-  resources, so doctor does not maintain its own combination whitelist.
+  HiCache L3 store/read data path. The missing-`Ready` exception applies only
+  after the controller has observed the current generation. An explicit
+  non-`True` `Ready` condition still wins and is reported as `CB001`; the
+  controller uses that condition to expose adapter/provider capability
+  rejection for stored or admission-bypassed resources, so doctor does not
+  maintain its own combination whitelist.
 - **Host-only backends** (no `spec.remoteStorage`) retain the managed engine
   and index checks but skip endpoint reachability (`CB005`), because they have
   no provider endpoint to publish or dial.

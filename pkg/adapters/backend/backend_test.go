@@ -7,6 +7,18 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
+func TestValidateNFSServerIPv6UsesKubeletLiteralContract(t *testing.T) {
+	// corev1.NFSVolumeSource.Server carries the raw literal. Kubelet's in-tree
+	// NFS plugin recognizes it with netutil.IsIPv6String, adds brackets in
+	// getServerFromSource, and only then builds "[server]:path" for mount.nfs.
+	if err := ValidateNFSServer("2001:db8::25"); err != nil {
+		t.Fatalf("raw IPv6 literal rejected: %v", err)
+	}
+	if err := ValidateNFSServer("[2001:db8::25]"); err == nil {
+		t.Fatal("bracketed IPv6 must be rejected at the NFSVolumeSource.Server boundary")
+	}
+}
+
 func TestValidateInlineNFSBinding(t *testing.T) {
 	valid := func() *cachev1alpha1.CacheBackendRemoteStorageSpec {
 		return &cachev1alpha1.CacheBackendRemoteStorageSpec{
