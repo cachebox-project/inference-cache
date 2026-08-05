@@ -44,7 +44,7 @@ type vllmMooncakeAdapter struct {
 // NewVLLMMooncakeAdapter returns the adapter that wires vLLM engine pods to a
 // Mooncake CacheBackend. The optional [Option] helpers let the controller pin
 // the subscriber sidecar's image + policy-server target (shared with the
-// vLLM+LMCache adapter via [DefaultRegistry]); the no-arg form reproduces the
+// vLLM+LMCache adapter via [NewCoreRegistry]); the no-arg form reproduces the
 // package defaults and keeps tests + the nil-Registry fallback paths working.
 func NewVLLMMooncakeAdapter(opts ...Option) KVCacheRuntimeAdapter {
 	var cfg Options

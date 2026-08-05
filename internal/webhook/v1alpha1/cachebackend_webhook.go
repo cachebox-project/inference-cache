@@ -670,11 +670,11 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
-// [defaultShippingRegistry] (DefaultRegistry plus the External and
-// SGLang adapters), mirroring cmd/controller's production wiring so a zero-value validator
-// sees the same adapter set the running controller does. cmd/controller
-// threads the same instance the reconciler + pod webhook receive so all
-// three layers agree on what's supported.
+// [defaultShippingRegistry] (the complete internal/adapters/builtin
+// composition), mirroring cmd/controller's production wiring so a zero-value
+// validator sees the same adapter set the running controller does.
+// cmd/controller threads the same instance the reconciler + pod webhook
+// receive so all three layers agree on what's supported.
 func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterruntime.Registry) error {
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).

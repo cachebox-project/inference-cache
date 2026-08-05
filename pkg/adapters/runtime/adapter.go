@@ -312,10 +312,11 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
 }
 
-// Options configures the runtime adapters [DefaultRegistry] constructs.
-// Zero values are valid: empty PolicyServerGRPCAddress falls back to the
-// package default, and empty SubscriberImage disables sidecar auto-attach
-// (see the field doc for why).
+// Options configures the runtime adapters [NewCoreRegistry] constructs and is
+// passed through by the built-in production composition. Zero values are
+// valid: empty PolicyServerGRPCAddress falls back to the package default, and
+// empty SubscriberImage disables sidecar auto-attach (see the field doc for
+// why).
 type Options struct {
 	// SubscriberImage is the image reference the vLLM/LMCache and
 	// vLLM/Mooncake adapters use for the kvevent-subscriber sidecar (both

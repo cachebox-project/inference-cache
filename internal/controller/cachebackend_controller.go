@@ -199,9 +199,8 @@ type CacheBackendReconciler struct {
 	// client.Client so existing fake-client tests still work).
 	APIReader client.Reader
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
-	// falls back to [adapterruntime.DefaultRegistry] plus the SGLang+LMCache
-	// adapter (the managed adapters the shipping controller wires; External is
-	// short-circuited before Select, so it is not in the fallback). Set
+	// falls back to the complete built-in runtime registry assembled by
+	// internal/adapters/builtin, matching the shipping controller. Set
 	// explicitly only in tests that need a custom adapter set.
 	Registry *adapterruntime.Registry
 	// BackendRegistry resolves remote provider lifecycle independently from

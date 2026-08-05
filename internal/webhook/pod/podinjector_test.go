@@ -248,7 +248,7 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
-	h := newHandler(t, cb)                // nil registry → DefaultRegistry + External + SGLang fallback
+	h := newHandler(t, cb)                // nil registry uses the complete built-in composition
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
 	req := newRequest(t, pod, ns)
 
@@ -388,7 +388,7 @@ func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing
 
 func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 	// End-to-end pod-webhook path for a managed Mooncake backend: the handler
-	// lists the CacheBackend, the shipping DefaultRegistry selects the
+	// lists the CacheBackend, the built-in shipping registry selects the
 	// vLLM+Mooncake adapter, and the engine container comes out wired to the
 	// Mooncake master via the LMCache connector with the mooncakestore://
 	// scheme (the lm:// analog) — plus the kvevent-subscriber sidecar. This is
@@ -666,9 +666,9 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 	// SGLang counterpart of TestHandle_AppendsObservationSidecar: a matched
 	// SGLang engine pod must get the kvevent-subscriber sidecar tagged
 	// --hash-scheme=sglang (the load-bearing scheme tag) + --ignore-block-removed
-	// (LMCache is an L2 tier). Builds the registry the way cmd/controller does —
-	// DefaultRegistry + External + SGLang, all carrying the subscriber image —
-	// because the no-arg nil-fallback renders no sidecar (auto-attach opt-in).
+	// (LMCache is an L2 tier). Builds the relevant adapters with the subscriber
+	// image option used by cmd/controller because the no-arg nil fallback
+	// renders no sidecar (auto-attach opt-in).
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Integration.Engine = "sglang"
@@ -872,8 +872,8 @@ func TestHandle_EventsOnly_NoSubscriberImage_InjectsNothingNoStamp(t *testing.T)
 	// injected-by stamped.
 	const ns = "engines"
 	cb := eventsOnlyCacheBackend("routing-only", ns, map[string]string{"app": "vllm"})
-	// newHandler uses the nil-Registry fallback (DefaultRegistry + External)
-	// with NO subscriber image configured — so ObservationSidecar returns nil.
+	// newHandler uses the complete built-in nil-Registry fallback with NO
+	// subscriber image configured, so ObservationSidecar returns nil.
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1074,8 +1074,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	// Mirror what cmd/controller wires: DefaultRegistry + the External
-	// adapter registered on top. Without External in the registry the
+	// Build the relevant subset of the built-in composition: the core registry
+	// plus External. Without External in the registry the
 	// webhook would fail-open with "no adapter" and leave the engine
 	// unwired — that's the very gap the External adapter closes.
 	reg := adapterruntime.NewCoreRegistry()
@@ -1466,7 +1466,7 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
-	h := newHandler(t, cb) // default DefaultRegistry — no subscriber image
+	h := newHandler(t, cb) // built-in nil fallback, with no subscriber image
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
@@ -1872,7 +1872,7 @@ func TestHandle_DecodeError_FailOpen(t *testing.T) {
 func TestHandle_NoBackendForRuntime_FailOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix // no adapter in DefaultRegistry
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix // no built-in adapter
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -2613,8 +2613,8 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	// Mirror cmd/controller wiring: DefaultRegistry + the External adapter +
-	// the subscriber image configured (so the events-only sidecar path is live).
+	// Build the relevant subset of the built-in composition with External and
+	// the subscriber image configured, so the events-only sidecar path is live.
 	reg := adapterruntime.NewCoreRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
