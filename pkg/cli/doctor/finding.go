@@ -159,6 +159,10 @@ const (
 	// why Ready may be downgraded. Surfaces the underlying reason the bare Ready
 	// bit does not.
 	CodeBackendFunctionalProbeFailing = "CB007"
+	// CodeBackendNFSUnverified: the NFS-backed CacheBackend passed every
+	// observable engine and index check, but inference-cache does not verify the
+	// NFS mount or HiCache L3 store/read data path, so overall health is unknown.
+	CodeBackendNFSUnverified = "CB008"
 
 	// CodeEnginePodNotInjected: a pod matching a CacheBackend's engineSelector
 	// carries no injection marker — neither a validated

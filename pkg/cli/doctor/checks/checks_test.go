@@ -646,7 +646,7 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("canonical NFS-backed HiCache uses engine axes and skips Ready and endpoint axes", func(t *testing.T) {
+	t.Run("canonical NFS-backed HiCache reports unverified after observable axes pass", func(t *testing.T) {
 		cb := healthyBackend(now)
 		cb.Name = "hicache-nfs"
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
@@ -665,14 +665,14 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		// Ready rather than publishing a synthetic readiness verdict.
 		cb.Status.Conditions = nil
 		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, badDial)
-		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
-			t.Fatalf("canonical NFS-backed HiCache should be CB006, got %v", codesOf(fs))
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendNFSUnverified || fs[0].Status != doctor.StatusInfo {
+			t.Fatalf("canonical NFS-backed HiCache should be CB008 INFO, got %v", fs)
 		}
-		if !strings.Contains(fs[0].Message, "NFS-backed") {
-			t.Fatalf("healthy message = %q, want NFS-backed classification", fs[0].Message)
+		if !strings.Contains(fs[0].Message, "not verified") {
+			t.Fatalf("CB008 message = %q, want explicit unverified data-path scope", fs[0].Message)
 		}
-		if strings.Contains(fs[0].Message, "Ready") {
-			t.Fatalf("healthy message = %q, must not claim controller readiness for NFS", fs[0].Message)
+		if hasCode(fs, doctor.CodeBackendHealthy) != nil {
+			t.Fatalf("NFS-backed HiCache must not report synthetic CB006 health, got %v", codesOf(fs))
 		}
 		if hasCode(fs, doctor.CodeBackendNotReady) != nil {
 			t.Fatalf("NFS-backed HiCache must not report CB001 when Ready is absent, got %v", codesOf(fs))

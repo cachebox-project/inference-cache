@@ -68,6 +68,7 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `CB005` | WARN | `status.endpoint` empty or unreachable |
 | `CB006` | OK | CacheBackend healthy on every applicable axis |
 | `CB007` | WARN | `FunctionalProbeOK` condition present but not `True` — the controller's functional self-test is failing for this backend (explains a Ready downgrade) |
+| `CB008` | INFO | NFS-backed CacheBackend passed observable engine/index checks, but NFS mount and HiCache L3 store/read readiness were not verified |
 | `EP001` | WARN | matched engine pod missing an injection marker (no `inferencecache.io/injected-by` annotation and no Event) |
 | `EP002` | OK | matched engine pod is injected (annotation or Event) |
 | `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend; forward-looking — see note below) |
@@ -94,7 +95,9 @@ Notes:
   endpoint reachability only. Engine-pod matching (`CB002`) and index
   participation (`CB003`/`CB004`) are skipped. External NFS is the exception:
   it has no endpoint and is diagnosed through the same engine-pod and index
-  axes as host-only caching.
+  axes as host-only caching. Passing those observable axes emits `CB008` INFO,
+  not `CB006` OK, because inference-cache does not probe the NFS mount or the
+  HiCache L3 store/read data path.
 - **Host-only backends** (no `spec.remoteStorage`) retain the managed engine
   and index checks but skip endpoint reachability (`CB005`), because they have
   no provider endpoint to publish or dial.

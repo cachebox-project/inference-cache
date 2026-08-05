@@ -19,7 +19,8 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 // the controller surfaces on status: Ready (where published), matched engine
 // pods, index participation (KV-event freshness), and endpoint reachability.
 // Every failing axis emits its own finding so the operator sees exactly what is
-// wrong; a backend that passes every applicable axis emits a single OK.
+// wrong. A backend that passes every applicable axis emits a single OK, except
+// NFS, whose unprobed mount and L3 data path keep the aggregate result at INFO.
 //
 // Four health models coexist, derived from EffectiveRemoteStorage so canonical
 // and legacy resources are classified identically:
@@ -28,7 +29,8 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 //   - Host-only caching: engine/index axes apply, but endpoint checks do not.
 //   - External NFS: engine/index axes apply like host-only caching, but Ready
 //     and endpoint checks do not because the controller publishes neither for
-//     endpoint-free mounted storage.
+//     endpoint-free mounted storage. Passing those observable axes yields INFO,
+//     not a synthetic healthy verdict for the unprobed NFS data path.
 //
 // The matched-engine-pod axis prefers the controller-written
 // status.matchedEnginePods (its authoritative snapshot) but falls back to a
@@ -124,12 +126,21 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 			}
 		}
 
-		if healthy {
-			findings = append(findings, doctor.Finding{
-				Code: doctor.CodeBackendHealthy, Status: doctor.StatusOK,
-				Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, externalEndpoint, endpointBacked, nfsBacked, dial != nil),
-			})
+		if !healthy {
+			continue
 		}
+		if nfsBacked {
+			findings = append(findings, doctor.Finding{
+				Code: doctor.CodeBackendNFSUnverified, Status: doctor.StatusInfo,
+				Check: checkCacheBackendHealth, Resource: ref,
+				Message: "NFS-backed backend passed all observable engine and index checks, but the NFS mount and HiCache L3 store/read data path were not verified",
+			})
+			continue
+		}
+		findings = append(findings, doctor.Finding{
+			Code: doctor.CodeBackendHealthy, Status: doctor.StatusOK,
+			Check: checkCacheBackendHealth, Resource: ref, Message: healthyMessage(cb, externalEndpoint, endpointBacked, dial != nil),
+		})
 	}
 	return findings
 }
@@ -227,7 +238,7 @@ func staleMessage(lastEventAt *metav1.Time, now time.Time, staleWindow time.Dura
 	return fmt.Sprintf("status.indexParticipation.lastEventAt is %s old (EngineStale): exceeds the %s freshness window — KV events have stopped flowing", age, staleWindow)
 }
 
-func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBacked, nfsBacked, dialed bool) string {
+func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBacked, dialed bool) string {
 	// Only claim "reachable" when an actual TCP probe ran; with no dialer
 	// (e.g. --config-only) doctor verified the endpoint is published, not that
 	// it answers.
@@ -238,18 +249,14 @@ func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBa
 	if externalEndpoint {
 		return "External backend: Ready, " + endpoint
 	}
-	readiness := "Ready"
-	if nfsBacked {
-		readiness = "NFS-backed"
-		endpoint = "endpoint not applicable"
-	} else if !endpointBacked {
+	if !endpointBacked {
 		endpoint = "host-only (endpoint not applicable)"
 	}
 	matched := "engine pods matched"
 	if !hasEngineSelector(cb) {
 		matched = "no engineSelector (engine-pod matching not applicable)"
 	}
-	return fmt.Sprintf("%s, %s, %d prefix(es) indexed, %s", readiness, matched, prefixCount(cb.Status.IndexParticipation), endpoint)
+	return fmt.Sprintf("Ready, %s, %d prefix(es) indexed, %s", matched, prefixCount(cb.Status.IndexParticipation), endpoint)
 }
 
 func prefixCount(ip *cachev1alpha1.CacheBackendIndexParticipation) int64 {
