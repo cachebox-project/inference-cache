@@ -10,9 +10,9 @@ trap 'rm -rf "$workdir"' EXIT
 valid_dockerfile="$workdir/Dockerfile.valid"
 cat >"$valid_dockerfile" <<'EOF'
 FROM golang:1.26.5 AS builder
-FROM gcr.io/distroless/static-debian13:nonroot AS controller
-FROM gcr.io/distroless/static-debian13:nonroot AS server
-FROM gcr.io/distroless/static-debian13:nonroot AS subscriber
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS controller
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS server
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS subscriber
 EOF
 
 expect_failure() {
@@ -121,6 +121,9 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
   if [ -n "${FAKE_EXTRA_PATH:-}" ]; then
     mkdir -p "$(dirname "$root/$FAKE_EXTRA_PATH")"
     touch "$root/$FAKE_EXTRA_PATH"
+    if [ "${FAKE_EXTRA_PATH_EXECUTABLE:-0}" = "1" ]; then
+      chmod +x "$root/$FAKE_EXTRA_PATH"
+    fi
   fi
   if [ -n "${FAKE_EXTRA_DIRECTORY:-}" ]; then
     mkdir -p "$root/$FAKE_EXTRA_DIRECTORY"
@@ -162,6 +165,10 @@ expect_failure root-user run_runtime_check FAKE_IMAGE_USER=0:0
 expect_failure wrong-entrypoint run_runtime_check FAKE_BAD_ENTRYPOINT=1
 expect_failure missing-image run_runtime_check FAKE_MISSING_IMAGE=1
 expect_failure missing-payload run_runtime_check FAKE_MISSING_PAYLOAD=1
+expect_failure payload-name-as-field run_runtime_check \
+  FAKE_MISSING_PAYLOAD=1 \
+  FAKE_EXTRA_PATH_EXECUTABLE=1 \
+  "FAKE_EXTRA_PATH=opt/foo controller server kvevent-subscriber"
 expect_failure non-executable-payload run_runtime_check FAKE_NON_EXECUTABLE_PAYLOAD=1
 expect_failure owner-only-executable-payload run_runtime_check FAKE_OWNER_ONLY_EXECUTABLE_PAYLOAD=1
 expect_failure directory-payload run_runtime_check FAKE_DIRECTORY_PAYLOAD=1

@@ -33,7 +33,7 @@ SBOM_REGISTRY_PUBLISH_MISSING ?= 0
 SBOM_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
 SBOM_TAG := $(subst /,_,$(TAG))
 MINIMAL_IMAGE_DOCKERFILE ?= dockerfiles/Dockerfile
-MINIMAL_RUNTIME_BASE ?= gcr.io/distroless/static-debian13:nonroot
+MINIMAL_RUNTIME_BASE ?= gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
 version_pkg = $(MODULE)/pkg/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'

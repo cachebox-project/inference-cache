@@ -6,12 +6,14 @@ at `dockerfiles/Dockerfile`.
 
 ## Runtime Base
 
-Every shipped target uses
-`gcr.io/distroless/static-debian13:nonroot`. The explicit Debian version avoids
-silently moving to a new distribution when Distroless changes its unversioned
-alias. The `static` variant is sufficient because all three binaries are built
-with `CGO_ENABLED=0`; it contains neither a shell nor a package manager. Each
-target also declares `USER 65532:65532` and a vector-form entrypoint.
+Every shipped target uses `gcr.io/distroless/static-debian13:nonroot`, pinned to
+the multi-architecture index digest
+`sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6`.
+The explicit Debian version and immutable digest prevent upstream aliases or
+tags from silently changing the runtime. The `static` variant is sufficient
+because all three binaries are built with `CGO_ENABLED=0`; it contains neither
+a shell nor a package manager. Each target also declares `USER 65532:65532`
+and a vector-form entrypoint.
 
 The `golang` image appears only in the builder stage. It is not present in any
 shipped runtime image. BusyBox images created by reference-stack smoke scripts

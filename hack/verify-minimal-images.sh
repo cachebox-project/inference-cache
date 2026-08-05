@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 dockerfile="${MINIMAL_IMAGE_DOCKERFILE:-dockerfiles/Dockerfile}"
-expected_base="${MINIMAL_RUNTIME_BASE:-gcr.io/distroless/static-debian13:nonroot}"
+expected_base="${MINIMAL_RUNTIME_BASE:-gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6}"
 docker_cmd_string="${DOCKER:-docker}"
 read -r -a docker_cmd <<<"$docker_cmd_string"
 dockerfile_only=0
@@ -107,39 +107,36 @@ for i in "${!targets[@]}"; do
   active_container="$("${docker_cmd[@]}" create "$image")"
   archive="$workdir/$target.tar"
   members="$workdir/$target.members"
-  member_types="$workdir/$target.member-types"
+  member_modes="$workdir/$target.member-modes"
   "${docker_cmd[@]}" export -o "$archive" "$active_container"
   "${docker_cmd[@]}" rm "$active_container" >/dev/null
   active_container=""
   tar -tf "$archive" >"$members"
-  tar -tvf "$archive" | awk '{ print substr($1, 1, 1) }' >"$member_types"
+  tar -tvf "$archive" | awk '{ print $1 }' >"$member_modes"
   member_count="$(wc -l <"$members")"
-  member_type_count="$(wc -l <"$member_types")"
-  if [ "$member_count" -ne "$member_type_count" ]; then
-    echo "minimal-image check: could not map $target archive members to entry types" >&2
+  member_mode_count="$(wc -l <"$member_modes")"
+  if [ "$member_count" -ne "$member_mode_count" ]; then
+    echo "minimal-image check: could not map $target archive members to modes" >&2
     exit 1
   fi
 
   payload="${entrypoint#/}"
-  payload_modes="$(tar -tvf "$archive" | awk -v payload="$payload" '
-    {
-      for (i = 2; i <= NF; i++) {
-        path = $i
-        sub(/^\.\//, "", path)
-        sub(/\/$/, "", path)
-        if (path == payload) {
-          print $1
-        }
-      }
-    }
-  ')"
-  payload_count="$(printf '%s\n' "$payload_modes" | awk 'NF { count++ } END { print count + 0 }')"
+  payload_count=0
+  payload_mode=""
+  while IFS= read -r member && IFS= read -r entry_mode <&3; do
+    path="${member#./}"
+    path="${path%/}"
+    if [ "$path" = "$payload" ]; then
+      payload_count=$((payload_count + 1))
+      payload_mode="$entry_mode"
+    fi
+  done 3<"$member_modes" <"$members"
   if [ "$payload_count" -ne 1 ]; then
     echo "minimal-image check: $target image must contain exactly one payload at $entrypoint" >&2
     exit 1
   fi
-  if [[ "$payload_modes" != -* || "${payload_modes:9:1}" != [xt] ]]; then
-    echo "minimal-image check: $target payload $entrypoint must be a regular file executable by the declared non-root user (mode: $payload_modes)" >&2
+  if [[ "$payload_mode" != -* || "${payload_mode:9:1}" != [xt] ]]; then
+    echo "minimal-image check: $target payload $entrypoint must be a regular file executable by the declared non-root user (mode: $payload_mode)" >&2
     exit 1
   fi
 
@@ -149,10 +146,11 @@ for i in "${!targets[@]}"; do
     rpm rpm2cpio dnf microdnf yum zypper pacman
   )
   # Pair the two tar listings by archive order so member names can contain spaces.
-  while IFS= read -r member && IFS= read -r entry_type <&3; do
+  while IFS= read -r member && IFS= read -r entry_mode <&3; do
     path="${member#./}"
     path="${path%/}"
     basename="${path##*/}"
+    entry_type="${entry_mode:0:1}"
     for forbidden in "${forbidden_names[@]}"; do
       if [ "$basename" = "$forbidden" ]; then
         case "$entry_type" in
@@ -163,7 +161,7 @@ for i in "${!targets[@]}"; do
         esac
       fi
     done
-  done 3<"$member_types" <"$members"
+  done 3<"$member_modes" <"$members"
 
   echo "minimal-image check: $target is non-root and contains no shell or package manager"
 done
