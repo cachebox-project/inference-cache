@@ -106,11 +106,11 @@ for i in "${!targets[@]}"; do
 
   active_container="$("${docker_cmd[@]}" create "$image")"
   archive="$workdir/$target.tar"
-  paths="$workdir/$target.paths"
+  members="$workdir/$target.members"
   "${docker_cmd[@]}" export -o "$archive" "$active_container"
   "${docker_cmd[@]}" rm "$active_container" >/dev/null
   active_container=""
-  tar -tf "$archive" | sed -e 's#^\./##' -e 's#/$##' >"$paths"
+  tar -tf "$archive" >"$members"
 
   payload="${entrypoint#/}"
   payload_modes="$(tar -tvf "$archive" | awk -v payload="$payload" '
@@ -140,15 +140,23 @@ for i in "${!targets[@]}"; do
     apk apt apt-get dpkg dpkg-deb dpkg-query
     rpm rpm2cpio dnf microdnf yum
   )
-  while IFS= read -r path; do
+  while IFS= read -r member; do
+    path="${member#./}"
+    path="${path%/}"
     basename="${path##*/}"
     for forbidden in "${forbidden_names[@]}"; do
       if [ "$basename" = "$forbidden" ]; then
-        echo "minimal-image check: $target image contains forbidden runtime tool /$path" >&2
-        exit 1
+        while IFS= read -r entry_type; do
+          case "$entry_type" in
+            -|l|h)
+              echo "minimal-image check: $target image contains forbidden runtime tool /$path" >&2
+              exit 1
+              ;;
+          esac
+        done < <(tar -tvf "$archive" "$member" | awk '{ print substr($1, 1, 1) }')
       fi
     done
-  done <"$paths"
+  done <"$members"
 
   echo "minimal-image check: $target is non-root and contains no shell or package manager"
 done

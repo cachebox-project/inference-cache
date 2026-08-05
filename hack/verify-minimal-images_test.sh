@@ -120,6 +120,13 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
     mkdir -p "$(dirname "$root/$FAKE_EXTRA_PATH")"
     touch "$root/$FAKE_EXTRA_PATH"
   fi
+  if [ -n "${FAKE_EXTRA_DIRECTORY:-}" ]; then
+    mkdir -p "$root/$FAKE_EXTRA_DIRECTORY"
+  fi
+  if [ -n "${FAKE_EXTRA_SYMLINK:-}" ]; then
+    mkdir -p "$(dirname "$root/$FAKE_EXTRA_SYMLINK")"
+    ln -s /missing-target "$root/$FAKE_EXTRA_SYMLINK"
+  fi
   tar -cf "$archive" -C "$root" .
   exit 0
 fi
@@ -161,6 +168,9 @@ expect_failure ash-present run_runtime_check FAKE_EXTRA_PATH=bin/ash
 expect_failure microdnf-present run_runtime_check FAKE_EXTRA_PATH=usr/bin/microdnf
 expect_failure alternate-shell-path run_runtime_check FAKE_EXTRA_PATH=usr/local/bin/sh
 expect_failure alternate-package-manager-path run_runtime_check FAKE_EXTRA_PATH=usr/local/bin/apt-get
+run_runtime_check FAKE_EXTRA_DIRECTORY=etc/dpkg >/dev/null
+echo "  ok   package metadata directories pass"
+expect_failure alternate-shell-symlink run_runtime_check FAKE_EXTRA_SYMLINK=usr/local/bin/sh
 expect_failure docker-unavailable env \
   DOCKER="$workdir/missing-docker" \
   IMG=controller:test \
