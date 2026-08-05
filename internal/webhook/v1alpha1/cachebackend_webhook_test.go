@@ -2271,7 +2271,7 @@ func (stubExternalAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 
 // stubRegistry returns a Registry with the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
-// adapterruntime.DefaultRegistry() composition, so they keep passing if a
+// builtin adapter composition, so they keep passing if a
 // future adapter joins or leaves the default set. An External-specific
 // runtime adapter is added by stubRegistryWithExternal so tests that
 // exercise admission of External CRs run against both adapters the
@@ -2301,7 +2301,7 @@ func TestValidator_RuntimeAdapter_VLLMPlusLMCacheAdmitted(t *testing.T) {
 	// regression doesn't silently start rejecting it. (vLLM+LMCache is one of
 	// the shipping pairs; vLLM+Mooncake is the other — see
 	// TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry,
-	// which checks it against the real DefaultRegistry rather than this stub.)
+	// which checks it against the real built-in registry rather than this stub.)
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := newBackend() // type=LMCache
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
@@ -2548,12 +2548,11 @@ func TestValidator_RuntimeAdapter_DeleteSkipsCheck(t *testing.T) {
 
 func TestValidator_RuntimeAdapter_NilRegistry_AdmitsExternal(t *testing.T) {
 	// The nil-Registry fallback mirrors production cmd/controller wiring
-	// — DefaultRegistry PLUS the External adapter — so a bare
-	// `CacheBackendValidator{}` admits the same set the running
-	// controller does. Without the explicit External registration in
-	// the fallback, this CR would be rejected for "no adapter supports
-	// (vllm, External)" even though the production webhook wires it
-	// just fine.
+	// through the complete built-in composition, so a bare
+	// `CacheBackendValidator{}` admits the same set the running controller does.
+	// Without External in the fallback, this CR would be rejected for "no
+	// adapter supports (vllm, External)" even though the production webhook
+	// wires it just fine.
 	v := &CacheBackendValidator{}
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
@@ -2566,9 +2565,9 @@ func TestValidator_RuntimeAdapter_NilRegistry_AdmitsExternal(t *testing.T) {
 
 func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 	// A zero-value validator (Registry nil) must still run the C7 check
-	// against [adapterruntime.DefaultRegistry] — the production safety
-	// net for cmd/controller wiring drift. The default registry ships
-	// the vLLM+LMCache adapter, so the happy pair admits.
+	// against the complete built-in registry — the production safety net for
+	// cmd/controller wiring drift. The built-in registry ships the vLLM+LMCache
+	// adapter, so the happy pair admits.
 	v := &CacheBackendValidator{}
 	cb := newBackend() // type=LMCache
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
@@ -2579,10 +2578,10 @@ func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 
 func TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry(t *testing.T) {
 	// The Mooncake admission contract: with the Mooncake adapter registered in
-	// DefaultRegistry, the registry-driven C7 check must ADMIT (vLLM,
-	// Mooncake). A zero-value validator (Registry nil) falls back to the real
-	// shipping registry (DefaultRegistry + External), so this exercises the
-	// same adapter set the running controller installs — not a stub. (The
+	// the built-in registry, the registry-driven C7 check must ADMIT (vLLM,
+	// Mooncake). A zero-value validator (Registry nil) falls back to that real
+	// shipping registry, so this exercises the same adapter set the running
+	// controller installs — not a stub. (The
 	// stub-registry rejection tests above use AIBrix as their unsupported
 	// example — a type no shipping adapter handles — since Mooncake is now
 	// supported; this test is the real-registry counterpart proving Mooncake
@@ -3048,8 +3047,8 @@ func TestValidator_EngineOverrides_MooncakeBackendChecksReservedSet(t *testing.T
 	// LMCache connector wire (pointed at a mooncakestore:// remote), so it
 	// declares the SAME reserved args/env. An operator must not be able to
 	// un-wire it via engineOverrides any more than on LMCache/External. Use the
-	// shipping registry (nil → DefaultRegistry + External, which now includes
-	// the real Mooncake adapter) so the adapter's own ReservedArgs/ReservedEnv
+	// built-in shipping registry (via the nil fallback) so the Mooncake
+	// adapter's own ReservedArgs/ReservedEnv
 	// drive the admission check — this pins the new registered pair's
 	// reserved-override enforcement on the admission surface, not just the
 	// adapter's returned slice (which the adapter unit test already covers).
@@ -3209,8 +3208,8 @@ func TestValidator_EventsOnly_MooncakeRejected(t *testing.T) {
 	// (vLLM, Mooncake) adapter is registered: the runtime-adapter check ADMITS
 	// the pair (Mooncake is supported), so without the events-only rule's
 	// type check the CR would slip through and reconcile as active events-only.
-	// Use the shipping registry (nil → DefaultRegistry + External, which
-	// includes the Mooncake adapter) so the runtime-adapter check passes and
+	// Use the built-in shipping registry via the nil fallback so the
+	// runtime-adapter check passes and
 	// the events-only rule is the one that fires, on spec.integration.mode.
 	v := &CacheBackendValidator{}
 	cb := newBackend()

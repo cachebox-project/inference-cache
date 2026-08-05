@@ -19,7 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // Engine-pod Event reasons.
@@ -40,13 +40,13 @@ const (
 )
 
 // EnginePodEventsReconciler watches engine pods that the mutating Pod
-// webhook stamped with [podwebhook.AnnotationInjectedBy] or with the explicit
-// operator opt-out pair ([podwebhook.AnnotationSkip] plus
-// [podwebhook.AnnotationInjectSkipped]) and emits a describe-visible
+// webhook stamped with [enginebinding.AnnotationInjectedBy] or with the explicit
+// operator opt-out pair ([enginebinding.AnnotationSkip] plus
+// [enginebinding.AnnotationInjectSkipped]) and emits a describe-visible
 // Kubernetes Event keyed by the live pod's UID.
 //
 // Out of scope on purpose:
-//   - No-match events. A pod with no podwebhook.AnnotationInjectedBy could be (a)
+//   - No-match events. A pod with no enginebinding.AnnotationInjectedBy could be (a)
 //     unrelated to this cache plane or (b) an engine whose labels missed
 //     every selector. The controller can't reliably distinguish without
 //     re-running the webhook's selector logic, and the cluster-wide noise
@@ -119,16 +119,16 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	cbRef := pod.Annotations[podwebhook.AnnotationInjectedBy]
+	cbRef := pod.Annotations[enginebinding.AnnotationInjectedBy]
 	if cbRef == "" {
-		if podwebhook.SkipAnnotationOptsOut(pod.Annotations[podwebhook.AnnotationSkip]) &&
-			pod.Annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation {
+		if enginebinding.SkipAnnotationOptsOut(pod.Annotations[enginebinding.AnnotationSkip]) &&
+			pod.Annotations[enginebinding.AnnotationInjectSkipped] == enginebinding.InjectSkippedReasonSkipAnnotation {
 			if r.Recorder == nil {
 				return ctrl.Result{}, nil
 			}
 			r.Recorder.Eventf(&pod, nil, corev1.EventTypeNormal,
 				eventReasonSkippedByOperator, eventReasonSkippedByOperator,
-				"Skipped cache injection: %s", podwebhook.InjectSkippedReasonSkipAnnotation)
+				"Skipped cache injection: %s", enginebinding.InjectSkippedReasonSkipAnnotation)
 			logger.V(1).Info("emitted SkippedByOperator event",
 				"namespace", pod.Namespace, "name", pod.Name)
 			return ctrl.Result{}, nil
@@ -169,7 +169,7 @@ func (r *EnginePodEventsReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	//
 	// Require BOTH: a successful CR lookup AND a UID match against the
 	// live CR.
-	uidRef := pod.Annotations[podwebhook.AnnotationInjectedByUID]
+	uidRef := pod.Annotations[enginebinding.AnnotationInjectedByUID]
 	if uidRef == "" {
 		logger.V(1).Info("skipping InjectedByCacheBackend event: injected-by-uid annotation missing",
 			"namespace", pod.Namespace, "name", pod.Name, "cachebackend", cbRef)
@@ -312,13 +312,13 @@ func (r *EnginePodEventsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func enginePodEventCandidate(obj client.Object) bool {
 	annotations := obj.GetAnnotations()
-	return annotations[podwebhook.AnnotationInjectedBy] != "" ||
-		(podwebhook.SkipAnnotationOptsOut(annotations[podwebhook.AnnotationSkip]) &&
-			annotations[podwebhook.AnnotationInjectSkipped] == podwebhook.InjectSkippedReasonSkipAnnotation)
+	return annotations[enginebinding.AnnotationInjectedBy] != "" ||
+		(enginebinding.SkipAnnotationOptsOut(annotations[enginebinding.AnnotationSkip]) &&
+			annotations[enginebinding.AnnotationInjectSkipped] == enginebinding.InjectSkippedReasonSkipAnnotation)
 }
 
 // createOnlyPredicate enqueues a Pod only on CREATE. UPDATE/DELETE/GENERIC
-// are dropped: the podwebhook.AnnotationInjectedBy stamp is set at admission time and
+// are dropped: the enginebinding.AnnotationInjectedBy stamp is set at admission time and
 // never changes over a pod's life, so updates carry no new injection
 // signal worth a fresh event.
 type createOnlyPredicate struct{ predicate.Funcs }

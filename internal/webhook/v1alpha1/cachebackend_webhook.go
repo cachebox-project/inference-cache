@@ -23,10 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
@@ -114,10 +113,8 @@ type CacheBackendValidator struct {
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair
 	// at admission time. A nil Registry falls back to
-	// [defaultShippingRegistry], which mirrors the production cmd/controller
-	// wiring: [adapterruntime.DefaultRegistry] plus the External and
-	// SGLang adapters (registered explicitly because those
-	// subpackages can't be imported by DefaultRegistry without a cycle). The
+	// [defaultShippingRegistry], which uses the same complete built-in
+	// composition as cmd/controller. The
 	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
 	// (engine, backend) pair the running controller supports, including
 	// External and SGLang backends — so admission doesn't silently reject an
@@ -126,16 +123,11 @@ type CacheBackendValidator struct {
 }
 
 // defaultShippingRegistry returns a Registry with every adapter the
-// production cmd/controller wiring installs: the in-package vLLM+LMCache
-// adapter (via [adapterruntime.DefaultRegistry]) and the subpackage
-// External and SGLang adapters. Centralised here so the validator's
-// nil-Registry fallback admits the same set the running controller does.
+// production cmd/controller wiring installs. Centralised in
+// internal/adapters/builtin so every nil fallback admits the same set the
+// running controller does.
 func defaultShippingRegistry() *adapterruntime.Registry {
-	r := adapterruntime.DefaultRegistry()
-	r.Register(externaladapter.NewAdapter())
-	r.Register(sglangadapter.NewAdapter())
-	r.Register(sglangadapter.NewHiCacheAdapter())
-	return r
+	return builtinadapters.New().Runtime
 }
 
 // ValidationRule is the seam plugged-in admission rules implement. It
@@ -678,11 +670,11 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
 // consults for the (engine, backend) compatibility check AND for the
 // engineOverrides reserved-args/env check; passing nil falls back to
-// [defaultShippingRegistry] (DefaultRegistry plus the External and
-// SGLang adapters), mirroring cmd/controller's production wiring so a zero-value validator
-// sees the same adapter set the running controller does. cmd/controller
-// threads the same instance the reconciler + pod webhook receive so all
-// three layers agree on what's supported.
+// [defaultShippingRegistry] (the complete internal/adapters/builtin
+// composition), mirroring cmd/controller's production wiring so a zero-value
+// validator sees the same adapter set the running controller does.
+// cmd/controller threads the same instance the reconciler + pod webhook
+// receive so all three layers agree on what's supported.
 func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterruntime.Registry) error {
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).

@@ -460,7 +460,7 @@ The wire schema's `version` is integer-valued and explicit. New fields
 that the server can ignore safely (additive, non-load-bearing) ship at
 the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
-constant in `pkg/server.PolicyPropagationVersion` on every request.
+constant in `internal/controlplaneapi.PolicyPropagationVersion` on every request.
 
 `version` is `7`: `2` added the `tenants` slice; `3` added
 `policies[].eviction` (the per-namespace cap-eviction algorithm); `4` added

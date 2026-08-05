@@ -158,14 +158,21 @@ See the README's "Repository layout" for the full map. In short:
 |---|---|
 | A CRD field / new API type | `api/v1alpha1/` → then `make manifests generate` |
 | Controller / reconciler logic | `internal/controller/` |
+| Controller ↔ server HTTP wire type | `internal/controlplaneapi/` |
+| Pod-binding annotation / metadata contract | `internal/enginebinding/` |
 | gRPC handlers, server wiring | `pkg/server/` |
 | Cache-state index logic | `pkg/index/` |
 | Mutable-slot rendering (the wedge) | `pkg/render/` |
-| Engine / runtime adapters (KV-event ingest, config injection) | `pkg/adapters/{engine,runtime}/` |
+| Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
+| Shipping adapter implementation / registration | `internal/adapters/builtin/` |
+| Engine KV-event ingest implementation | `pkg/adapters/engine/` (pending the documented `internal/subscriber/` move) |
 | Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/adapters/engineclient/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
-Each package's `doc.go` (or package comment) states which binary (`inferencecache-controller` or `inferencecache-server`) it belongs to — or, for harness / egress libraries such as `pkg/adapters/engineclient`, that it belongs to no binary.
+Each package's `doc.go` (or package comment) states which binary owns it or why
+it is a supported external Go API. Follow
+[`docs/design/repository-boundaries.md`](docs/design/repository-boundaries.md)
+for dependency direction and the staged internal-package migration.
 
 **Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
 

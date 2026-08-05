@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -16,10 +15,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // WebhookPath is the URL the kubebuilder marker below registers with the
@@ -31,7 +30,7 @@ const WebhookPath = "/mutate--v1-pod"
 // Set the annotation to any non-empty value on a pod that the user has
 // already pre-wired (e.g. a hand-crafted reference-stack pod) so the webhook
 // does not double-inject or fight a hand-tuned spec.
-const AnnotationSkip = "inferencecache.io/skip-inject"
+const AnnotationSkip = enginebinding.AnnotationSkip
 
 // AnnotationInjectedBy is stamped on a pod whenever the handler patched it,
 // recording which CacheBackend the engine was wired to. The webhook itself
@@ -49,7 +48,7 @@ const AnnotationSkip = "inferencecache.io/skip-inject"
 // the apiserver assigns metadata.uid AFTER mutating admission, so any
 // event recorded here would land with involvedObject.uid="" and be
 // invisible to `kubectl describe pod`.
-const AnnotationInjectedBy = "inferencecache.io/injected-by"
+const AnnotationInjectedBy = enginebinding.AnnotationInjectedBy
 
 // AnnotationInjectedByUID is stamped alongside [AnnotationInjectedBy] on every
 // successful injection and carries the matched CacheBackend's metadata.uid as
@@ -65,16 +64,16 @@ const AnnotationInjectedBy = "inferencecache.io/injected-by"
 // persist with a user-supplied AnnotationInjectedBy, but the UID annotation
 // (which only the webhook writes) is absent or stale, so the controller skips
 // the event.
-const AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
+const AnnotationInjectedByUID = enginebinding.AnnotationInjectedByUID
 
 // AnnotationInjectSkipped is stamped when the webhook intentionally skips
 // injection because the operator set [AnnotationSkip]. It lets a persisted pod
 // distinguish an explicit opt-out from selector drift or fail-open admission.
-const AnnotationInjectSkipped = "inferencecache.io/inject-skipped"
+const AnnotationInjectSkipped = enginebinding.AnnotationInjectSkipped
 
 // InjectSkippedReasonSkipAnnotation is the stable value written to
 // [AnnotationInjectSkipped] when [AnnotationSkip] opts the pod out.
-const InjectSkippedReasonSkipAnnotation = "skip-inject-annotation"
+const InjectSkippedReasonSkipAnnotation = enginebinding.InjectSkippedReasonSkipAnnotation
 
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=ignore,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod.inferencecache.io,admissionReviewVersions=v1
 
@@ -98,9 +97,7 @@ type EngineInjector struct {
 	Reader client.Reader
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
-	// nil falls back to [adapterruntime.DefaultRegistry] plus the External
-	// and SGLang adapters (registered explicitly because those
-	// subpackages can't be imported by DefaultRegistry without a cycle).
+	// nil falls back to the complete internal/adapters/builtin composition.
 	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
 	// doesn't silently fail-open on External CRs that the running webhook
 	// would have wired.
@@ -164,12 +161,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	runtimeID := adapterruntime.ResolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
-		// Mirror production cmd/controller wiring: DefaultRegistry plus the
-		// import-cycle-bound External and SGLang adapters.
-		registry = adapterruntime.DefaultRegistry()
-		registry.Register(externaladapter.NewAdapter())
-		registry.Register(sglangadapter.NewAdapter())
-		registry.Register(sglangadapter.NewHiCacheAdapter())
+		registry = builtinadapters.New().Runtime
 	}
 	adapter, err := registry.Select(runtimeID, cache)
 	if err != nil {
@@ -481,20 +473,7 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 // Explicitly falsey values ("false", "0", "f", "no") leave injection
 // enabled, so `inferencecache.io/skip-inject: "false"` does NOT disable.
 func SkipAnnotationOptsOut(value string) bool {
-	if value == "" {
-		return false
-	}
-	if b, err := strconv.ParseBool(value); err == nil {
-		return b
-	}
-	// strconv.ParseBool accepts a small set ("1","t","T","true","TRUE",
-	// "True","0","f","F","false","FALSE","False"). Treat other free-form
-	// values as opt-out unless the user explicitly typed a false synonym.
-	switch strings.ToLower(value) {
-	case "no", "off", "disable", "disabled":
-		return false
-	}
-	return true
+	return enginebinding.SkipAnnotationOptsOut(value)
 }
 
 // logger returns the handler's configured logger if set, otherwise the

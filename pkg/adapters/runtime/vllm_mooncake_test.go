@@ -650,19 +650,19 @@ func TestVLLMMooncakeObservationSidecarArgsParseAgainstSubscriberFlagSet(t *test
 	}
 }
 
-func TestDefaultRegistryResolvesVLLMMooncake(t *testing.T) {
-	r := DefaultRegistry()
+func TestNewCoreRegistryResolvesVLLMMooncake(t *testing.T) {
+	r := NewCoreRegistry()
 	// Mooncake resolves to the Mooncake adapter.
 	a, err := r.Select(RuntimeVLLM, newMooncakeBackend(nil))
 	if err != nil {
-		t.Fatalf("DefaultRegistry().Select(vllm, Mooncake): %v", err)
+		t.Fatalf("NewCoreRegistry().Select(vllm, Mooncake): %v", err)
 	}
 	if !a.Supports(RuntimeVLLM, newMooncakeBackend(nil)) {
 		t.Fatalf("resolved adapter does not Support (vllm, Mooncake)")
 	}
 	// Registering Mooncake must not have displaced LMCache.
 	if _, err := r.Select(RuntimeVLLM, newLMCacheBackend(nil)); err != nil {
-		t.Fatalf("DefaultRegistry().Select(vllm, LMCache) regressed: %v", err)
+		t.Fatalf("NewCoreRegistry().Select(vllm, LMCache) regressed: %v", err)
 	}
 	// Mooncake must surface in the supported-pairs list (admission messages).
 	found := false
@@ -672,6 +672,6 @@ func TestDefaultRegistryResolvesVLLMMooncake(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("DefaultRegistry().SupportedPairs() missing vllm/Mooncake: %v", r.SupportedPairs())
+		t.Fatalf("NewCoreRegistry().SupportedPairs() missing vllm/Mooncake: %v", r.SupportedPairs())
 	}
 }

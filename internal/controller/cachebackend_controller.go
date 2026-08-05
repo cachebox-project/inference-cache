@@ -26,11 +26,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Status condition types published on a managed CacheBackend.
@@ -201,9 +199,8 @@ type CacheBackendReconciler struct {
 	// client.Client so existing fake-client tests still work).
 	APIReader client.Reader
 	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
-	// falls back to [adapterruntime.DefaultRegistry] plus the SGLang+LMCache
-	// adapter (the managed adapters the shipping controller wires; External is
-	// short-circuited before Select, so it is not in the fallback). Set
+	// falls back to the complete built-in runtime registry assembled by
+	// internal/adapters/builtin, matching the shipping controller. Set
 	// explicitly only in tests that need a custom adapter set.
 	Registry *adapterruntime.Registry
 	// BackendRegistry resolves remote provider lifecycle independently from
@@ -397,17 +394,13 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // the selected runtime/provider adapter. Unsupported combinations also shed any
 // previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	var shippingRegistries builtinadapters.Registries
+	if r.Registry == nil || r.BackendRegistry == nil {
+		shippingRegistries = builtinadapters.New()
+	}
 	registry := r.Registry
 	if registry == nil {
-		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
-		// nil-fallback manages the same backends the validator + pod webhook
-		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
-		// plus the External and SGLang adapters (subpackages DefaultRegistry
-		// can't import without a cycle).
-		registry = adapterruntime.DefaultRegistry()
-		registry.Register(externaladapter.NewAdapter())
-		registry.Register(sglangadapter.NewAdapter())
-		registry.Register(sglangadapter.NewHiCacheAdapter())
+		registry = shippingRegistries.Runtime
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	storage := backend.Spec.EffectiveRemoteStorage()
@@ -515,7 +508,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 
 	backendRegistry := r.BackendRegistry
 	if backendRegistry == nil {
-		backendRegistry = backendprovider.DefaultRegistry()
+		backendRegistry = shippingRegistries.Storage
 	}
 	provider, err := backendRegistry.Select(storage)
 	if err != nil {

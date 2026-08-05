@@ -9,7 +9,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -72,10 +73,10 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 	engineContainer := r.engineContainerName(backend)
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Annotations[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
+		if p.Annotations[enginebinding.AnnotationInjectedBy] != wantInjectedBy {
 			continue
 		}
-		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
+		if wantInjectedByUID == "" || p.Annotations[enginebinding.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
 		cs := engineContainerStatus(p, engineContainer)
@@ -103,7 +104,7 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 func (r *CacheBackendReconciler) engineContainerName(backend *cachev1alpha1.CacheBackend) string {
 	registry := r.Registry
 	if registry == nil {
-		registry = adapterruntime.DefaultRegistry()
+		registry = builtinadapters.New().Runtime
 	}
 	adapter, err := registry.Select(adapterruntime.ResolveRuntimeID(backend), backend)
 	if err != nil {

@@ -1236,12 +1236,12 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 		},
 	}
 	r := newReconciler(scheme, cb)
-	// Mirror cmd/controller wiring: the External adapter is registered on the
-	// reconciler's registry (DefaultRegistry doesn't include it to avoid an
-	// import cycle). Without it the (vllm, External) pair is unselectable and the
-	// events-only branch falls to reconcileUnmanaged — masking the precedence we
-	// want to assert.
-	reg := adapterruntime.DefaultRegistry()
+	// Build the relevant subset of the built-in composition: the External
+	// adapter is registered on the core registry because it cannot live in its
+	// parent package without an import cycle. Without it the (vllm, External)
+	// pair is unselectable and the events-only branch falls to
+	// reconcileUnmanaged — masking the precedence we want to assert.
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	r.Registry = reg
 

@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // PolicyPropagationVersion identifies the schema of the /policy snapshot the
@@ -47,7 +49,7 @@ import (
 //     check below catches it with `unsupported policy snapshot version`.
 //     Both diagnostics are fail-loud; the operator sees one specific message,
 //     not silent state loss.
-const PolicyPropagationVersion = 7
+const PolicyPropagationVersion = controlplaneapi.PolicyPropagationVersion
 
 // PolicyMinimumAcceptedVersion is the oldest /policy schema this server
 // understands. Bodies below this version are rejected outright; bodies at
@@ -55,7 +57,7 @@ const PolicyPropagationVersion = 7
 // PolicyPropagationVersion. Bump this in lockstep with PolicyPropagationVersion
 // whenever a schema change is NOT additive-defaultable — anything load-bearing
 // for a tenant, anything whose missing value cannot be safely synthesized.
-const PolicyMinimumAcceptedVersion = 3
+const PolicyMinimumAcceptedVersion = controlplaneapi.PolicyMinimumAcceptedVersion
 
 // DefaultMinimumMatchedTokens is the server-side fallback floor on
 // MATCHED prefix tokens applied when a tenant has no CachePolicy at all.
@@ -65,7 +67,7 @@ const PolicyMinimumAcceptedVersion = 3
 // the typical 16-token block size: substantially above the chat-template
 // framing tokens identical across every replica, well below any
 // useful real-prompt overlap.
-const DefaultMinimumMatchedTokens int32 = 64
+const DefaultMinimumMatchedTokens = controlplaneapi.DefaultMinimumMatchedTokens
 
 // DefaultRoutingFloorScore is the server-wide fallback the LookupRoute
 // handler applies to PREFIX_MATCH responses when no CachePolicy is installed
@@ -81,12 +83,12 @@ const DefaultMinimumMatchedTokens int32 = 64
 // PREFIX_MATCH bug would persist for every namespace that has not
 // installed a policy CR. Tunable per-namespace via
 // CachePolicy.spec.routingFloorScore.
-const DefaultRoutingFloorScore float32 = 0.1
+const DefaultRoutingFloorScore = controlplaneapi.DefaultRoutingFloorScore
 
 const (
-	DefaultEnableChainMatching = true
-	DefaultRequireChain        = false
-	DefaultEnableTenantHot     = true
+	DefaultEnableChainMatching = controlplaneapi.DefaultEnableChainMatching
+	DefaultRequireChain        = controlplaneapi.DefaultRequireChain
+	DefaultEnableTenantHot     = controlplaneapi.DefaultEnableTenantHot
 )
 
 // DefaultAffinityRoutingEnabled is the server-wide fallback applied when a
@@ -100,7 +102,7 @@ const (
 // near-free, so default ON is the correct safety posture. Operators
 // can disable explicitly via affinityRouting: Disabled when they want
 // pure round-robin (raw-recall benchmarking, gateway debugging).
-const DefaultAffinityRoutingEnabled = true
+const DefaultAffinityRoutingEnabled = controlplaneapi.DefaultAffinityRoutingEnabled
 
 // ResolvedPolicy is the slice of CachePolicy the server actually enforces:
 // only the fields the policy server needs at lookup/sweep time. The CRD
@@ -134,58 +136,11 @@ const DefaultAffinityRoutingEnabled = true
 // kubebuilder-defaulted value was overridden to "0" by the operator would
 // be indistinguishable from a hand-crafted body that simply omitted the
 // field — the safe interpretation differs between those two cases.
-type ResolvedPolicy struct {
-	// Namespace identifies the CachePolicy's namespace, which in phase-1 is
-	// the tenant boundary: a LookupRoute carrying tenant_id="foo" resolves
-	// against the CachePolicy in namespace "foo".
-	Namespace string `json:"namespace"`
-
-	EvictionTTL          time.Duration `json:"evictionTTL,omitempty"`
-	MinimumPrefixTokens  int32         `json:"minimumPrefixTokens,omitempty"`
-	MinimumMatchedTokens int32         `json:"minimumMatchedTokens,omitempty"`
-	// RoutingFloorScore is the per-namespace post-score floor: a PREFIX_MATCH
-	// whose best replica score falls below this threshold downgrades to
-	// StrategyNone, which surfaces as AFFINITY_HINT under affinityRouting:
-	// Enabled (the default) with a usable seed + serving replica or as
-	// NO_HINT under affinityRouting: Disabled. Pointer because the wire schema must distinguish "field
-	// omitted" (nil — server uses DefaultRoutingFloorScore for safety)
-	// from "operator explicitly set 0" (&0 — opt-out for this namespace).
-	// With a CachePolicy installed AND the field present, the configured
-	// value wins (including an explicit 0). Negative values clamp to 0 in
-	// the resolver. Wired inline in inferenceCacheService.buildLookupResponse
-	// via the PolicyStore.RoutingFloorScore resolver.
-	RoutingFloorScore *float32 `json:"routingFloorScore,omitempty"`
-	LookupTimeoutMs   int32    `json:"lookupTimeoutMs,omitempty"`
-	// AffinityRouting is the per-namespace consistent-hash fallback toggle
-	// applied on the LookupRoute NO_HINT path. Pointer because the wire
-	// schema distinguishes "field omitted" (nil — server uses
-	// DefaultAffinityRoutingEnabled, currently true) from "operator
-	// explicitly set" (&true / &false). The server consults this only
-	// after the existing ranker (matched-tokens floor + routing floor)
-	// has already chosen StrategyNone — never preempts a real
-	// PREFIX_MATCH or TENANT_HOT. See PolicyStore.AffinityRoutingEnabled.
-	AffinityRouting *bool `json:"affinityRouting,omitempty"`
-	// Eviction is the eviction algorithm in lower-case canonical form
-	// ("lru" / "lfu"). The controller lower-cases the CRD's upper-case enum when
-	// flattening. Empty means the server default (LRU). The index consults it on
-	// the cap-based sweep (to order victims) and, for LFU, on the lookup path (to
-	// capture which entries a delivered hint credits); the TTL sweep is
-	// algorithm-independent.
-	Eviction string `json:"eviction,omitempty"`
-
-	// Strategy gates the LookupRoute strategy family at the server boundary.
-	// Pointer booleans preserve the distinction between "field omitted by an
-	// older controller / hand-written body" and "operator explicitly set false".
-	Strategy *ResolvedLookupStrategy `json:"strategy,omitempty"`
-}
+type ResolvedPolicy = controlplaneapi.ResolvedPolicy
 
 // ResolvedLookupStrategy carries the server-enforced LookupRoute strategy
 // gates flattened from CachePolicy.spec.strategy.
-type ResolvedLookupStrategy struct {
-	EnableChainMatching *bool `json:"enableChainMatching,omitempty"`
-	RequireChain        *bool `json:"requireChain,omitempty"`
-	EnableTenantHot     *bool `json:"enableTenantHot,omitempty"`
-}
+type ResolvedLookupStrategy = controlplaneapi.ResolvedLookupStrategy
 
 // ResolvedTenant is the slice of a CacheTenant the server enforces at ingest
 // time: the tenant's external identity plus its index-entry budget. The CRD
@@ -200,14 +155,7 @@ type ResolvedLookupStrategy struct {
 // tenant-unaware pool, so the control plane can neither enforce nor honestly
 // attribute bytes per tenant. Only the index entry table — which the server
 // owns — is enforceable.
-type ResolvedTenant struct {
-	TenantID        string `json:"tenantID"`
-	MaxIndexEntries int64  `json:"maxIndexEntries"`
-	// IsolationMode is carried for forward-compat / observability. Phase-1 only
-	// implements Fairness (evict the tenant's own oldest entries); other modes
-	// are a separate effort.
-	IsolationMode string `json:"isolationMode,omitempty"`
-}
+type ResolvedTenant = controlplaneapi.ResolvedTenant
 
 // PolicySnapshot is the full set of CachePolicies + CacheTenants the controller
 // pushes on each reconcile. Pushed via POST to /policy (PUT is accepted too for
@@ -215,11 +163,7 @@ type ResolvedTenant struct {
 // truth, so the server discards its prior state and adopts the new snapshot. A
 // CachePolicy/CacheTenant that disappears between snapshots reverts that
 // namespace/tenant to the server default (no policy / no quota).
-type PolicySnapshot struct {
-	Version  int              `json:"version"`
-	Policies []ResolvedPolicy `json:"policies"`
-	Tenants  []ResolvedTenant `json:"tenants,omitempty"`
-}
+type PolicySnapshot = controlplaneapi.PolicySnapshot
 
 // PolicyStore is the server-side cache of resolved policies (indexed by
 // namespace) and resolved tenant quotas (indexed by tenant ID). Reads take

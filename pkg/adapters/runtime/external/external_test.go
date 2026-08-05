@@ -105,10 +105,10 @@ func TestInjectEngineConfig_MatchesLMCacheWire(t *testing.T) {
 	}
 
 	// Build the same pod via the managed adapter to compare.
-	lmReg := runtimeadapter.DefaultRegistry()
+	lmReg := runtimeadapter.NewCoreRegistry()
 	lmAdapter, err := lmReg.Select(runtimeadapter.RuntimeVLLM, cbLM)
 	if err != nil {
-		t.Fatalf("DefaultRegistry must select an adapter for vllm/LMCache: %v", err)
+		t.Fatalf("NewCoreRegistry must select an adapter for vllm/LMCache: %v", err)
 	}
 	lmPod := singleEnginePod()
 	if err := lmAdapter.InjectEngineConfig(&lmPod.Spec, endpoint, cbLM); err != nil {

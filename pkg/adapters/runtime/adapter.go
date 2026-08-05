@@ -312,10 +312,11 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
 }
 
-// Options configures the runtime adapters [DefaultRegistry] constructs.
-// Zero values are valid: empty PolicyServerGRPCAddress falls back to the
-// package default, and empty SubscriberImage disables sidecar auto-attach
-// (see the field doc for why).
+// Options configures the runtime adapters [NewCoreRegistry] constructs and is
+// passed through by the built-in production composition. Zero values are
+// valid: empty PolicyServerGRPCAddress falls back to the package default, and
+// empty SubscriberImage disables sidecar auto-attach (see the field doc for
+// why).
 type Options struct {
 	// SubscriberImage is the image reference the vLLM/LMCache and
 	// vLLM/Mooncake adapters use for the kvevent-subscriber sidecar (both
@@ -352,17 +353,16 @@ func WithPolicyServerGRPCAddress(addr string) Option {
 	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
 }
 
-// DefaultRegistry returns a Registry pre-populated with the runtime adapters
-// this package can install without an import cycle — currently the
-// vLLM+LMCache and vLLM+Mooncake adapters. It deliberately does NOT include
+// NewCoreRegistry returns a Registry containing only the runtime adapters
+// implemented in this package — currently vLLM+LMCache and vLLM+Mooncake. It
+// deliberately does NOT include
 // the External passthrough adapter under pkg/adapters/runtime/external/: that
 // package imports this one (for the [KVCacheRuntimeAdapter] interface and the
 // [RuntimeID] constants), so registering it here would cycle. The
-// production wiring in cmd/controller and both webhook handlers'
-// nil-Registry fallbacks explicitly add the External adapter on top, so
-// the shipping admission/injection paths agree on the full supported
-// set; only direct uses of DefaultRegistry (e.g. some hermetic unit
-// tests) see the in-package-only view (LMCache + Mooncake).
+// complete shipping composition lives in internal/adapters/builtin, so
+// production and nil-fallback paths agree on one supported set. Direct uses of
+// NewCoreRegistry or the deprecated DefaultRegistry intentionally see only the
+// in-package view (LMCache + Mooncake).
 //
 // Adapter order does not affect selection — [Registry.Select] matches on the
 // (runtime, spec.type) pair and the in-package adapters cover disjoint pairs
@@ -372,11 +372,20 @@ func WithPolicyServerGRPCAddress(addr string) Option {
 // Options the controller cares about (subscriber sidecar image, policy-server
 // address) are passed in via the variadic [Option] helpers and shared by both
 // adapters (the kvevent-subscriber sidecar is identical for either L2 store);
-// the no-arg form preserves the original Phase-1 behaviour and is still used by
-// the reconciler/webhook nil-Registry fallback paths.
-func DefaultRegistry(opts ...Option) *Registry {
+// the no-arg form preserves the original Phase-1 behavior.
+func NewCoreRegistry(opts ...Option) *Registry {
 	r := NewRegistry()
 	r.Register(NewVLLMLMCacheAdapter(opts...))
 	r.Register(NewVLLMMooncakeAdapter(opts...))
 	return r
+}
+
+// DefaultRegistry is retained for source compatibility with existing
+// extension tests. In-repository binaries and nil fallbacks use the complete
+// composition root in internal/adapters/builtin.
+//
+// Deprecated: use NewCoreRegistry when intentionally testing only adapters
+// implemented by this package.
+func DefaultRegistry(opts ...Option) *Registry {
+	return NewCoreRegistry(opts...)
 }

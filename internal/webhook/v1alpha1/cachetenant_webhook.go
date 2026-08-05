@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // CacheTenantDefaulter is a no-op defaulter for CacheTenant. Its only default
@@ -67,16 +68,13 @@ type CacheTenantValidator struct {
 // implement, mirroring the CachePolicy/CacheBackend pattern.
 type CacheTenantValidationRule func(ct *cachev1alpha1.CacheTenant) field.ErrorList
 
-// reservedProbeTenantID is the tenant id the server uses for its own
-// functional self-test (see ProbeTenantID in pkg/server/probe.go). A real
+// controlplaneapi.ProbeTenantID is the tenant id the server uses for its own
+// functional self-test. A real
 // CacheTenant claiming this id would (a) bypass quota enforcement at the
 // PolicyStore layer — the server unconditionally exempts the probe tenant
 // to defend the probe from operator-configured quotas — and (b) share the
 // reserved scope with the probe's synthetic state. Reject at admission so
 // the reservation lives at both layers (server policy + admission).
-// MUST stay in lockstep with pkg/server.ProbeTenantID; the constant is
-// duplicated rather than imported to keep internal/webhook free of a
-// pkg/server dependency.
 //
 // Schema-evolution note: adding this rule is an admission TIGHTENING that
 // shrinks the set of accepted CacheTenant.spec.tenantID values. Under the
@@ -90,22 +88,20 @@ type CacheTenantValidationRule func(ct *cachev1alpha1.CacheTenant) field.ErrorLi
 // operator can migrate by changing tenantID OR by deleting the legacy CR.
 // Post-v1beta1, this carve-out expires and any further tightening would
 // require a K8s-standard deprecation cycle.
-const reservedProbeTenantID = "inferencecache.io/probe"
-
 // rejectReservedProbeTenantID rejects CacheTenants whose spec.tenantID
 // equals the server-reserved probe tenant id. The probe scope is
 // server-internal state; operator-supplied CacheTenants must not govern it.
 // On CREATE: fires unconditionally. On UPDATE: fires only when the change
 // newly introduces the reserved id (filterIntroducedErrors handles the
-// "unchanged legacy id" carve-out — see reservedProbeTenantID's doc).
+// "unchanged legacy id" carve-out described above).
 var rejectReservedProbeTenantID = func(ct *cachev1alpha1.CacheTenant) field.ErrorList {
-	if ct.Spec.TenantID != reservedProbeTenantID {
+	if ct.Spec.TenantID != controlplaneapi.ProbeTenantID {
 		return nil
 	}
 	return field.ErrorList{field.Invalid(
 		field.NewPath("spec", "tenantID"),
 		ct.Spec.TenantID,
-		"tenantID is reserved for the server's functional self-test (see pkg/server/probe.go); choose a different tenantID",
+		"tenantID is reserved for the control plane's functional self-test (see internal/controlplaneapi/probe.go); choose a different tenantID",
 	)}
 }
 

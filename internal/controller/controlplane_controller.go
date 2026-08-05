@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // Defaults for the ControlPlaneReconciler.
@@ -199,8 +199,8 @@ func (r *ControlPlaneReconciler) pushSnapshot(ctx context.Context) error {
 		// CacheTenant CRD not installed — push policies only, no tenant quotas.
 	}
 
-	snap := cacheserver.PolicySnapshot{
-		Version:  cacheserver.PolicyPropagationVersion,
+	snap := controlplaneapi.PolicySnapshot{
+		Version:  controlplaneapi.PolicyPropagationVersion,
 		Policies: resolvePolicies(policies.Items),
 		Tenants:  resolveTenants(tenants.Items),
 	}
@@ -274,9 +274,9 @@ func (r *ControlPlaneReconciler) bearerToken() (string, error) {
 // per namespace — i.e. the alphabetically smallest name wins, deterministically,
 // regardless of Kubernetes list order. This remains the authoritative tie-break;
 // the webhook is fast operator feedback layered on top, not a replacement.
-func resolvePolicies(items []cachev1alpha1.CachePolicy) []cacheserver.ResolvedPolicy {
+func resolvePolicies(items []cachev1alpha1.CachePolicy) []controlplaneapi.ResolvedPolicy {
 	if len(items) == 0 {
-		return []cacheserver.ResolvedPolicy{}
+		return []controlplaneapi.ResolvedPolicy{}
 	}
 	sorted := make([]cachev1alpha1.CachePolicy, len(items))
 	copy(sorted, items)
@@ -286,7 +286,7 @@ func resolvePolicies(items []cachev1alpha1.CachePolicy) []cacheserver.ResolvedPo
 		}
 		return sorted[a].Name < sorted[b].Name
 	})
-	out := make([]cacheserver.ResolvedPolicy, 0, len(sorted))
+	out := make([]controlplaneapi.ResolvedPolicy, 0, len(sorted))
 	for i := range sorted {
 		// First entry per namespace wins; skip the rest of the namespace's run.
 		if i > 0 && sorted[i].Namespace == sorted[i-1].Namespace {
@@ -300,8 +300,8 @@ func resolvePolicies(items []cachev1alpha1.CachePolicy) []cacheserver.ResolvedPo
 // resolveOnePolicy maps one CR into the server's enforcement shape. Phase-1
 // namespace == tenant boundary: the resolved entry is keyed by the CR's
 // namespace, which the server matches against LookupRoute's tenant_id.
-func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy {
-	rp := cacheserver.ResolvedPolicy{Namespace: cp.Namespace}
+func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) controlplaneapi.ResolvedPolicy {
+	rp := controlplaneapi.ResolvedPolicy{Namespace: cp.Namespace}
 	if cp.Spec.EvictionTTL != nil {
 		rp.EvictionTTL = cp.Spec.EvictionTTL.Duration
 	}
@@ -330,7 +330,7 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 		var v float32
 		switch {
 		case err != nil, math.IsInf(f, 0), math.IsNaN(f), f < 0:
-			v = cacheserver.DefaultRoutingFloorScore
+			v = controlplaneapi.DefaultRoutingFloorScore
 		default:
 			v = float32(f)
 		}
@@ -340,7 +340,7 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}
 	if cp.Spec.Strategy != nil {
-		rp.Strategy = &cacheserver.ResolvedLookupStrategy{
+		rp.Strategy = &controlplaneapi.ResolvedLookupStrategy{
 			EnableChainMatching: cp.Spec.Strategy.EnableChainMatching,
 			RequireChain:        cp.Spec.Strategy.RequireChain,
 			EnableTenantHot:     cp.Spec.Strategy.EnableTenantHot,
@@ -388,7 +388,7 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) cacheserver.ResolvedPolicy 
 // Identity: the emitted key is spec.tenantID (the value an ingest carries in
 // CacheStateUpdate.tenant_id), NOT the CR's metadata.name. That is the join the
 // index uses to match an ingest against a quota.
-func resolveTenants(items []cachev1alpha1.CacheTenant) []cacheserver.ResolvedTenant {
+func resolveTenants(items []cachev1alpha1.CacheTenant) []controlplaneapi.ResolvedTenant {
 	if len(items) == 0 {
 		return nil
 	}
@@ -400,7 +400,7 @@ func resolveTenants(items []cachev1alpha1.CacheTenant) []cacheserver.ResolvedTen
 		}
 		return sorted[a].Name < sorted[b].Name
 	})
-	out := make([]cacheserver.ResolvedTenant, 0, len(sorted))
+	out := make([]controlplaneapi.ResolvedTenant, 0, len(sorted))
 	seen := make(map[string]struct{}, len(sorted))
 	for i := range sorted {
 		rt, ok := resolveOneTenant(&sorted[i])
@@ -423,14 +423,14 @@ func resolveTenants(items []cachev1alpha1.CacheTenant) []cacheserver.ResolvedTen
 // returning ok=false when the tenant has no enforceable budget (no tenantID, or
 // no quota.maxIndexEntries) so the caller omits it (fail open). A budget of 0 is
 // a valid enforceable cap and IS emitted.
-func resolveOneTenant(ct *cachev1alpha1.CacheTenant) (cacheserver.ResolvedTenant, bool) {
+func resolveOneTenant(ct *cachev1alpha1.CacheTenant) (controlplaneapi.ResolvedTenant, bool) {
 	if ct.Spec.TenantID == "" {
-		return cacheserver.ResolvedTenant{}, false
+		return controlplaneapi.ResolvedTenant{}, false
 	}
 	if ct.Spec.Quota == nil || ct.Spec.Quota.MaxIndexEntries == nil {
-		return cacheserver.ResolvedTenant{}, false
+		return controlplaneapi.ResolvedTenant{}, false
 	}
-	return cacheserver.ResolvedTenant{
+	return controlplaneapi.ResolvedTenant{
 		TenantID:        ct.Spec.TenantID,
 		MaxIndexEntries: *ct.Spec.Quota.MaxIndexEntries,
 		IsolationMode:   string(ct.Spec.IsolationMode),

@@ -63,14 +63,13 @@ type adapter struct {
 // NewAdapter returns the runtime adapter for the (sglang, LMCache) pair. The
 // optional [runtimeadapter.Option] helpers let the controller pin the
 // subscriber sidecar's image + policy-server target — the same options
-// cmd/controller passes to runtime.DefaultRegistry for the vLLM adapter, so
+// the built-in composition passes to [runtimeadapter.NewCoreRegistry], so
 // the SGLang subscriber sidecar auto-attaches with identical operator wiring.
 //
-// Wire it into the shared [runtimeadapter.Registry] in cmd/controller and both
-// webhook handlers' nil-Registry fallbacks alongside the vLLM+LMCache and
-// External adapters: this package imports its parent pkg/adapters/runtime, so
-// it cannot live inside runtime.DefaultRegistry without an import cycle (same
-// reason as the External adapter).
+// The internal/adapters/builtin composition wires it into the shared
+// [runtimeadapter.Registry] alongside the core and External adapters. This
+// package imports its parent pkg/adapters/runtime, so it cannot be registered
+// by [runtimeadapter.NewCoreRegistry] without an import cycle.
 func NewAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
 	var cfg runtimeadapter.Options
 	for _, o := range opts {

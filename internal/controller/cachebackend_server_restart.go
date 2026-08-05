@@ -21,7 +21,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // AnnotationCacheServerRestartTrigger is patched onto an engine Deployment's
@@ -1068,7 +1068,7 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 	targets := map[string]targetRef{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Annotations[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
+		if p.Annotations[enginebinding.AnnotationInjectedBy] != wantInjectedBy {
 			continue
 		}
 		// Require the matching injected-by-uid. The webhook always
@@ -1079,7 +1079,7 @@ func (r *CacheBackendReconciler) cascadeRestartEngineDeployments(ctx context.Con
 		// no longer wired to THIS CR's cache-server, so cascading
 		// would either roll an unrelated workload or do nothing —
 		// neither is helpful.
-		if wantInjectedByUID == "" || p.Annotations[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
+		if wantInjectedByUID == "" || p.Annotations[enginebinding.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
 		depName, depUID, ok, err := r.podOwningDeployment(ctx, reader, p)

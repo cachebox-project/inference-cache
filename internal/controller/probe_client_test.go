@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // TestProbeClientRunHappyPath drives the client end-to-end against an
@@ -24,7 +24,7 @@ import (
 // shares the same definition of "well-formed" as the server tests.
 func TestProbeClientRunHappyPath(t *testing.T) {
 	const wantToken = "the-projected-sa-token"
-	wantBody := cacheserver.ProbeRequest{
+	wantBody := controlplaneapi.ProbeRequest{
 		Backend: "team-a/cb-1", Model: "functional-self-test", HashScheme: "vllm",
 		BackendType: "LMCache",
 	}
@@ -39,7 +39,7 @@ func TestProbeClientRunHappyPath(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Errorf("Content-Type = %q, want application/json", got)
 		}
-		var req cacheserver.ProbeRequest
+		var req controlplaneapi.ProbeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode body: %v", err)
 		}
@@ -47,11 +47,11 @@ func TestProbeClientRunHappyPath(t *testing.T) {
 			t.Errorf("request body = %+v, want %+v", req, wantBody)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{
+		_ = json.NewEncoder(w).Encode(controlplaneapi.ProbeResult{
 			Backend: "team-a/cb-1",
-			Ingest:  cacheserver.ProbeStageOK,
-			Routing: cacheserver.ProbeStageOK,
-			T2:      cacheserver.ProbeStageSkipped,
+			Ingest:  controlplaneapi.ProbeStageOK,
+			Routing: controlplaneapi.ProbeStageOK,
+			T2:      controlplaneapi.ProbeStageSkipped,
 		})
 	}))
 	defer srv.Close()
@@ -85,9 +85,9 @@ func TestProbeClientRunNoTokenFile(t *testing.T) {
 			t.Errorf("Authorization should be empty when no token file is mounted; got %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{
-			Backend: "x", Ingest: cacheserver.ProbeStageOK,
-			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+		_ = json.NewEncoder(w).Encode(controlplaneapi.ProbeResult{
+			Backend: "x", Ingest: controlplaneapi.ProbeStageOK,
+			Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped,
 		})
 	}))
 	defer srv.Close()
@@ -97,7 +97,7 @@ func TestProbeClientRunNoTokenFile(t *testing.T) {
 		BearerTokenPath: filepath.Join(t.TempDir(), "does-not-exist"),
 		HTTPClient:      srv.Client(),
 	}
-	if _, err := client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err != nil {
+	if _, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err != nil {
 		t.Fatalf("Run with no token file should succeed; got: %v", err)
 	}
 }
@@ -116,7 +116,7 @@ func TestProbeClientRunDisabled(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := tc.client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
+			_, err := tc.client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
 			if !errors.Is(err, ErrProbeClientDisabled) {
 				t.Fatalf("err = %v, want ErrProbeClientDisabled", err)
 			}
@@ -135,7 +135,7 @@ func TestProbeClientRunRejectsNon2xx(t *testing.T) {
 	defer srv.Close()
 
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
-	_, err := client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
+	_, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
 	if err == nil {
 		t.Fatalf("expected non-2xx to surface as error")
 	}
@@ -157,7 +157,7 @@ func TestProbeClientRunBadJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
-	if _, err := client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err == nil {
+	if _, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err == nil {
 		t.Fatalf("expected decode error on invalid JSON body")
 	}
 }
@@ -172,7 +172,7 @@ func TestProbeClientRunTransportError(t *testing.T) {
 	srv.Close() // hang up first
 
 	client := &ProbeClient{ProbeURL: addr, HTTPClient: &http.Client{Timeout: time.Second}}
-	if _, err := client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err == nil {
+	if _, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"}); err == nil {
 		t.Fatalf("expected transport error against a closed server")
 	}
 }
@@ -202,7 +202,7 @@ func TestProbeClientRunTokenFileUnreadable(t *testing.T) {
 	defer srv.Close()
 
 	client := &ProbeClient{ProbeURL: srv.URL, BearerTokenPath: tokenPath, HTTPClient: srv.Client()}
-	_, err := client.Run(context.Background(), cacheserver.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
+	_, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{Backend: "x", Model: "m", HashScheme: "vllm"})
 	if err == nil {
 		t.Fatalf("expected token-IO error to surface")
 	}
@@ -226,17 +226,17 @@ func TestProbeClientRunRejectsBackendMismatch(t *testing.T) {
 		// Respond with a backend echo that DOES NOT match the request.
 		// All per-stage outcomes are healthy to ensure the test fails
 		// for the right reason (mismatch detection, not stage failure).
-		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{
+		_ = json.NewEncoder(w).Encode(controlplaneapi.ProbeResult{
 			Backend: "team-b/other",
-			Ingest:  cacheserver.ProbeStageOK,
-			Routing: cacheserver.ProbeStageOK,
-			T2:      cacheserver.ProbeStageSkipped,
+			Ingest:  controlplaneapi.ProbeStageOK,
+			Routing: controlplaneapi.ProbeStageOK,
+			T2:      controlplaneapi.ProbeStageSkipped,
 		})
 	}))
 	t.Cleanup(srv.Close)
 
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
-	_, err := client.Run(context.Background(), cacheserver.ProbeRequest{
+	_, err := client.Run(context.Background(), controlplaneapi.ProbeRequest{
 		Backend: "team-a/cache", Model: "m", HashScheme: "vllm",
 	})
 	if err == nil {

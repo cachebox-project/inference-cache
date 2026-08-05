@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -283,10 +283,10 @@ func listMatchedEnginePods(ctx context.Context, reader client.Reader, backend *c
 	owned := make([]corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
 		ann := pods.Items[i].Annotations
-		if ann[podwebhook.AnnotationInjectedBy] != wantInjectedBy {
+		if ann[enginebinding.AnnotationInjectedBy] != wantInjectedBy {
 			continue
 		}
-		if wantInjectedByUID == "" || ann[podwebhook.AnnotationInjectedByUID] != wantInjectedByUID {
+		if wantInjectedByUID == "" || ann[enginebinding.AnnotationInjectedByUID] != wantInjectedByUID {
 			continue
 		}
 		owned = append(owned, pods.Items[i])

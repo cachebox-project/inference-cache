@@ -84,8 +84,8 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
-	// Nil registry → defaultShippingRegistry (DefaultRegistry + External),
-	// matching the production cmd/controller wiring.
+	// A nil registry uses defaultShippingRegistry, the same complete built-in
+	// composition as production cmd/controller wiring.
 	if err := SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
 		t.Fatalf("SetupCacheBackendWebhookWithManager: %v", err)
 	}

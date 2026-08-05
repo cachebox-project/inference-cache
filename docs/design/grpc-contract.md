@@ -15,6 +15,10 @@ This is the public API gateways and engines integrate against — the load-beari
 | service | `InferenceCache` |
 | Go package | `github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1` |
 
+The generated Go import currently remains under `pkg/server` for compatibility.
+Its staged move to the neutral `gen/inferencecache/v1alpha1` path is documented
+in [Repository boundaries](repository-boundaries.md#generated-protobuf-migration).
+
 Versioned `v1alpha1` → `v1beta1` → `v1`. No vendor tokens in the package or service (see CONTRIBUTING.md).
 
 ## Service
