@@ -17,6 +17,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
@@ -85,7 +86,9 @@ const InjectSkippedReasonSkipAnnotation = "skip-inject-annotation"
 // MutatingWebhookConfiguration AND a fail-open posture in the handler give a
 // belt-and-suspenders guarantee: even if the controller is unreachable or
 // the handler returns an error response, pod admission is never blocked.
-// The cache is always an optimization, never a serving dependency.
+// This describes admission failure only. A successfully injected backend can
+// still be an intentional data-plane serving dependency when its contract
+// requires spec.integration.failOpen=false, as External NFS does.
 type EngineInjector struct {
 	// Reader lists CacheBackends in the pod's namespace. Production wiring
 	// passes the manager's APIReader (an uncached live client) — pod
@@ -105,6 +108,13 @@ type EngineInjector struct {
 	// doesn't silently fail-open on External CRs that the running webhook
 	// would have wired.
 	Registry *adapterruntime.Registry
+
+	// BackendRegistry resolves the supported (remote-storage provider,
+	// ownership) capabilities. nil uses the shipping provider registry. The
+	// pod webhook consults the same capability boundary as the controller so
+	// an admission-bypassed object cannot be unsupported in status but still
+	// mutate engine Pods.
+	BackendRegistry *backendadapter.Registry
 
 	// Log is the handler's logger. nil falls back to logf.FromContext at
 	// call time; tests typically inject logr.Discard().
@@ -179,8 +189,32 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			runtimeID, cache.Spec.Type, err))
 	}
 
-	endpoint := effectiveEndpoint(cache)
 	storage := cache.Spec.EffectiveRemoteStorage()
+	if storage != nil {
+		backendRegistry := h.BackendRegistry
+		if backendRegistry == nil {
+			backendRegistry = backendprovider.DefaultRegistry()
+		}
+		if _, err := backendRegistry.Select(storage); err != nil {
+			log.V(1).Info("fail-open: remote-storage capability is unsupported",
+				"provider", storage.Provider, "ownership", storage.Ownership, "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf(
+				"unsupported remote-storage provider=%q ownership=%q (fail-open): %v",
+				storage.Provider, storage.Ownership, err))
+		}
+		// Inline NFS is the current External binding shape. A future Managed
+		// NFS provider will expose a separate PVC-backed binding and must not
+		// inherit these server/path rules.
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS &&
+			storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			if err := backendadapter.ValidateInlineNFSBinding(storage); err != nil {
+				log.V(1).Info("fail-open: inline NFS binding is invalid", "error", err.Error())
+				return failOpen(req, &pod, fmt.Sprintf("invalid inline NFS binding (fail-open): %v", err))
+			}
+		}
+	}
+
+	endpoint := effectiveEndpoint(cache)
 	protocol, protocolErr := backendadapter.ProtocolFor(storage)
 	if protocolErr != nil {
 		log.V(1).Info("fail-open: remote-storage protocol is unsupported", "error", protocolErr.Error())
@@ -575,9 +609,9 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // effectiveEndpoint returns the address the engine pod should be wired
 // to for the given CacheBackend. The source is type-scoped:
 //
-//   - External: spec.endpoint is authoritative — the operator owns it,
-//     admission validates it, status.endpoint is just a reconciler
-//     mirror that may briefly lag during an update. If a new pod
+//   - External network providers: spec.endpoint is authoritative — the
+//     operator owns it, admission validates it, and status.endpoint is just a
+//     reconciler mirror that may briefly lag during an update. If a new pod
 //     admits between an operator's spec.endpoint update and the
 //     status patch, status would still hold the OLD value and the
 //     pod would boot wired to the stale address; pod admission is
@@ -589,9 +623,10 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 //     provisions, and spec.endpoint is admission-rejected for these
 //     types (see rejectEndpointOnNonExternal), so there's nothing
 //     else to fall back on. The webhook must wait for status.
-//   - Engine-local types (SGLangHiCache): no endpoint is required. The
-//     selected adapter's EndpointRequirement capability bypasses the gate
-//     before this empty result is consumed.
+//   - Engine-local types (SGLangHiCache): no endpoint is required. External
+//     NFS carries its server/export/mount contract in a structured file
+//     binding rather than an endpoint. The selected adapter and concrete
+//     binding bypass the endpoint gate before this empty result is consumed.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
 //
@@ -618,6 +653,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	}
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
 		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+			return ""
+		}
 		// For External, re-apply the provider-specific admission-time shape
 		// check on the stored spec endpoint. The validating webhook already
 		// rejects malformed values at write time, but a pre-existing

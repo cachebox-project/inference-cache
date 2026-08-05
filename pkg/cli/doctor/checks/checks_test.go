@@ -84,25 +84,53 @@ func ptr[T any](v T) *T { return &v }
 // --- fixtures ---------------------------------------------------------------
 
 func readyCond(status metav1.ConditionStatus, reason, msg string) metav1.Condition {
-	return metav1.Condition{Type: conditionReady, Status: status, Reason: reason, Message: msg}
+	return metav1.Condition{
+		Type: conditionReady, Status: status, Reason: reason, Message: msg,
+		ObservedGeneration: 1,
+	}
 }
 
 func healthyBackend(now time.Time) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "good", Namespace: "ns1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "good", Namespace: "ns1", Generation: 1},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}},
 		},
 		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint:          "10.0.0.5:8200",
-			MatchedEnginePods: ptr(int32(2)),
-			Conditions:        []metav1.Condition{readyCond(metav1.ConditionTrue, "KVEventObserved", "ready")},
+			ObservedGeneration: 1,
+			Endpoint:           "10.0.0.5:8200",
+			MatchedEnginePods:  ptr(int32(2)),
+			Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "KVEventObserved", "ready")},
 			IndexParticipation: &cachev1alpha1.CacheBackendIndexParticipation{
 				PrefixCount: 5,
 				LastEventAt: &metav1.Time{Time: now.Add(-10 * time.Second)},
 			},
 		},
 	}
+}
+
+func observedNFSBackend(now time.Time) *cachev1alpha1.CacheBackend {
+	cb := healthyBackend(now)
+	falseValue := false
+	cb.Name = "hicache-nfs"
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: &falseValue}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+			Server:    "192.0.2.10",
+			Path:      "/hicache",
+			MountPath: "/mnt/hicache",
+		},
+	}
+	cb.Status.Endpoint = ""
+	// Valid endpoint-free NFS is reconciled as unmanaged: the controller
+	// acknowledges the current generation but intentionally publishes no Ready
+	// condition because it cannot verify the mounted L3 data path.
+	cb.Status.Conditions = nil
+	return cb
 }
 
 // --- ServerReachability -----------------------------------------------------
@@ -386,22 +414,58 @@ func TestCacheBackendHealth(t *testing.T) {
 		}
 	})
 
+	t.Run("stale controller status cannot preserve old healthy verdict", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Generation = 2
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "engine", Namespace: cb.Namespace, Labels: map[string]string{"app": "engine"},
+		}}
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb, pod), "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendNotReady ||
+			!strings.Contains(fs[0].Message, "status.observedGeneration=1") {
+			t.Fatalf("stale controller status should produce one generation-specific CB001, got %v", fs)
+		}
+		if hasCode(fs, doctor.CodeBackendHealthy) != nil {
+			t.Fatalf("stale Ready=True must not preserve CB006, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("stale Ready condition cannot preserve old healthy verdict", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Generation = 2
+		cb.Status.ObservedGeneration = 2
+		// The overall status claims generation 2, but Ready still describes
+		// generation 1. Treat the specific verdict as stale as well.
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "engine", Namespace: cb.Namespace, Labels: map[string]string{"app": "engine"},
+		}}
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb, pod), "", now, DefaultStaleWindow, okDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendNotReady ||
+			!strings.Contains(fs[0].Message, "Ready.observedGeneration=1") {
+			t.Fatalf("stale Ready condition should produce one generation-specific CB001, got %v", fs)
+		}
+	})
+
 	t.Run("fresh misconfigured backend, no status", func(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns1", Generation: 1},
 			Spec: cachev1alpha1.CacheBackendSpec{
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "missing"}},
 			},
 		}
 		c := fakeClient(t, cb)
 		fs := CacheBackendHealth(ctx, c, "ns1", now, DefaultStaleWindow, okDial)
-		for _, want := range []string{doctor.CodeBackendNotReady, doctor.CodeBackendSelectorMismatch, doctor.CodeBackendNotReportingState, doctor.CodeBackendEndpointUnreachable} {
-			if hasCode(fs, want) == nil {
-				t.Errorf("want %s, got %v", want, codesOf(fs))
-			}
+		if hasCode(fs, doctor.CodeBackendNotReady) == nil ||
+			!strings.Contains(fs[0].Message, "has not observed the current") {
+			t.Fatalf("fresh unreconciled backend should report generation-specific CB001, got %v", fs)
 		}
-		if hasCode(fs, doctor.CodeBackendHealthy) != nil {
-			t.Errorf("did not expect CB006 for a broken backend")
+		if hasCode(fs, doctor.CodeBackendSelectorMismatch) == nil {
+			t.Fatalf("fresh unreconciled backend should retain live selector diagnostics, got %v", fs)
+		}
+		for _, staleCode := range []string{doctor.CodeBackendNotReportingState, doctor.CodeBackendEndpointUnreachable, doctor.CodeBackendHealthy} {
+			if hasCode(fs, staleCode) != nil {
+				t.Fatalf("fresh unreconciled backend must not interpret stale status as %s, got %v", staleCode, codesOf(fs))
+			}
 		}
 	})
 
@@ -409,9 +473,13 @@ func TestCacheBackendHealth(t *testing.T) {
 		// No status.matchedEnginePods, but a live pod matches the selector =>
 		// no mismatch finding.
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "ns1", Generation: 1},
 			Spec: cachev1alpha1.CacheBackendSpec{
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}},
+			},
+			Status: cachev1alpha1.CacheBackendStatus{
+				ObservedGeneration: 1,
+				Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "Ready", "ready")},
 			},
 		}
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns1", Labels: map[string]string{"app": "engine"}}}
@@ -509,11 +577,12 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 	t.Run("FunctionalProbeOK absent on External backend is ignored", func(t *testing.T) {
 		// External backends skip the managed axes entirely, including the probe.
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1", Generation: 1},
 			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal, Endpoint: "h:1"},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "h:1",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ok")},
+				ObservedGeneration: 1,
+				Endpoint:           "h:1",
+				Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ok")},
 			},
 		}
 		c := fakeClient(t, cb)
@@ -568,8 +637,12 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 
 	t.Run("pod-list error is inconclusive (API001), not a selector mismatch", func(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns1", Generation: 1},
 			Spec:       cachev1alpha1.CacheBackendSpec{EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}}},
+			Status: cachev1alpha1.CacheBackendStatus{
+				ObservedGeneration: 1,
+				Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "Ready", "ready")},
+			},
 		}
 		c := listErrClient{Client: fakeClient(t, cb), failOn: func(l client.ObjectList) bool {
 			_, ok := l.(*corev1.PodList)
@@ -586,14 +659,15 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 
 	t.Run("External backend skips pod-match and index-participation axes", func(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1", Generation: 1},
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Type:     cachev1alpha1.CacheBackendTypeExternal,
 				Endpoint: "cache.example.com:8200",
 			},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "cache.example.com:8200",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+				ObservedGeneration: 1,
+				Endpoint:           "cache.example.com:8200",
+				Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
 			},
 		}
 		c := fakeClient(t, cb)
@@ -605,7 +679,7 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 
 	t.Run("canonical External backend skips managed axes", func(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "canonical-ext", Namespace: "ns1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "canonical-ext", Namespace: "ns1", Generation: 1},
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
@@ -616,8 +690,9 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 				},
 			},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "cache.example.com:8200",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+				ObservedGeneration: 1,
+				Endpoint:           "cache.example.com:8200",
+				Conditions:         []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
 			},
 		}
 		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, okDial)
@@ -643,6 +718,70 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 		if hasCode(fs, doctor.CodeBackendEndpointUnreachable) != nil {
 			t.Fatalf("host-only backend must not report CB005, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("canonical NFS-backed HiCache reports unverified after observable axes pass", func(t *testing.T) {
+		cb := observedNFSBackend(now)
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, badDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendNFSUnverified || fs[0].Status != doctor.StatusInfo {
+			t.Fatalf("canonical NFS-backed HiCache should be CB008 INFO, got %v", fs)
+		}
+		if !strings.Contains(fs[0].Message, "not verified") {
+			t.Fatalf("CB008 message = %q, want explicit unverified data-path scope", fs[0].Message)
+		}
+		if hasCode(fs, doctor.CodeBackendHealthy) != nil {
+			t.Fatalf("NFS-backed HiCache must not report synthetic CB006 health, got %v", codesOf(fs))
+		}
+		if hasCode(fs, doctor.CodeBackendNotReady) != nil {
+			t.Fatalf("NFS-backed HiCache must not report CB001 when Ready is absent, got %v", codesOf(fs))
+		}
+		if hasCode(fs, doctor.CodeBackendEndpointUnreachable) != nil {
+			t.Fatalf("NFS-backed HiCache must not report CB005, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("unobserved NFS generation reports not ready instead of unverified", func(t *testing.T) {
+		cb := observedNFSBackend(now)
+		cb.Generation = 2
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "engine", Namespace: cb.Namespace, Labels: map[string]string{"app": "engine"},
+		}}
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb, pod), "", now, DefaultStaleWindow, badDial)
+		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendNotReady ||
+			!strings.Contains(fs[0].Message, "status.observedGeneration=1") {
+			t.Fatalf("unobserved NFS generation should produce generation-specific CB001, got %v", fs)
+		}
+		if hasCode(fs, doctor.CodeBackendNFSUnverified) != nil {
+			t.Fatalf("unobserved NFS generation must not produce CB008, got %v", codesOf(fs))
+		}
+	})
+
+	t.Run("controller-rejected NFS binding reports Ready failure instead of unverified", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Name = "unsupported-nfs"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+				Server:    "192.0.2.10",
+				Path:      "/lmcache",
+				MountPath: "/mnt/lmcache",
+			},
+		}
+		cb.Status.Endpoint = ""
+		cb.Status.Conditions = []metav1.Condition{
+			readyCond(metav1.ConditionFalse, "UnsupportedRemoteBinding", "vLLM LMCache does not accept file binding"),
+		}
+
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, badDial)
+		if f := hasCode(fs, doctor.CodeBackendNotReady); f == nil || !strings.Contains(f.Message, "UnsupportedRemoteBinding") {
+			t.Fatalf("controller-rejected NFS should surface CB001 with controller reason, got %v", fs)
+		}
+		if hasCode(fs, doctor.CodeBackendNFSUnverified) != nil {
+			t.Fatalf("controller-rejected NFS must not report CB008, got %v", codesOf(fs))
 		}
 	})
 

@@ -21,6 +21,7 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/controller"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
+	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
@@ -160,6 +161,10 @@ func main() {
 		adapterruntime.WithSubscriberImage(opts.subscriberImage),
 		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
 	))
+	// Keep the controller and pod webhook on the same remote-provider
+	// capability registry, just as they share the runtime-adapter registry.
+	// Today it contains External NFS but no Managed NFS implementation.
+	backendRegistry := backendprovider.DefaultRegistry()
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
 	// An empty ProbeURL disables the gate — useful for local-dev runs that
@@ -169,13 +174,14 @@ func main() {
 	probeClient := &controller.ProbeClient{ProbeURL: opts.serverProbeURL}
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Log:         ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder:    mgr.GetEventRecorder("cachebackend-controller"),
-		APIReader:   mgr.GetAPIReader(),
-		Registry:    adapterRegistry,
-		ProbeClient: probeClient,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Log:             ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:        mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader:       mgr.GetAPIReader(),
+		Registry:        adapterRegistry,
+		BackendRegistry: backendRegistry,
+		ProbeClient:     probeClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -241,9 +247,10 @@ func main() {
 	// avoid a cold-cache window on controller startup.
 	mgr.GetWebhookServer().Register(podwebhook.WebhookPath, &webhook.Admission{
 		Handler: &podwebhook.EngineInjector{
-			Reader:   mgr.GetAPIReader(),
-			Registry: adapterRegistry,
-			Log:      ctrl.Log.WithName("webhooks").WithName("pod-injector"),
+			Reader:          mgr.GetAPIReader(),
+			Registry:        adapterRegistry,
+			BackendRegistry: backendRegistry,
+			Log:             ctrl.Log.WithName("webhooks").WithName("pod-injector"),
 		},
 	})
 

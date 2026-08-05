@@ -214,7 +214,7 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	}
 }
 
-func TestReconcileCanonicalSGLangHiCacheWithRemoteStorageIsUnmanaged(t *testing.T) {
+func TestReconcileCanonicalSGLangHiCacheWithUnsupportedRemoteStorageIsDegraded(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hicache-remote", Namespace: "ns1", Generation: 1},
@@ -240,8 +240,244 @@ func TestReconcileCanonicalSGLangHiCacheWithRemoteStorageIsUnmanaged(t *testing.
 	if got.Status.Endpoint != "" {
 		t.Fatalf("status.endpoint = %q, want empty for unsupported binding", got.Status.Endpoint)
 	}
-	if ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
-		t.Fatalf("unsupported binding published Ready condition: %+v", ready)
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteBinding {
+		t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteBinding)
+	}
+	if degraded := meta.FindStatusCondition(got.Status.Conditions, conditionTypeDegraded); degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonUnsupportedRemoteBinding {
+		t.Fatalf("Degraded = %+v, want True/%s", degraded, conditionReasonUnsupportedRemoteBinding)
+	}
+}
+
+func TestReconcileCanonicalSGLangHiCacheExternalNFSIsEndpointFree(t *testing.T) {
+	scheme := newScheme(t)
+	falseValue := false
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache-nfs", Namespace: "ns1", Generation: 3},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				FailOpen: &falseValue,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
+				MatchLabels: map[string]string{"app": "sglang"},
+			},
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{
+				Ratio:                 "2.0",
+				StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+			},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+					Server:    "192.0.2.10",
+					Path:      "/hicache",
+					MountPath: "/mnt/hicache",
+				},
+			},
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Conditions: []metav1.Condition{
+			{Type: conditionTypeReady, Status: metav1.ConditionFalse, Reason: conditionReasonUnsupportedRemoteBinding},
+			{Type: conditionTypeProgressing, Status: metav1.ConditionFalse, Reason: conditionReasonUnsupportedRemoteBinding},
+			{Type: conditionTypeDegraded, Status: metav1.ConditionTrue, Reason: conditionReasonUnsupportedRemoteBinding},
+		}},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	var deployments appsv1.DeploymentList
+	if err := r.List(context.Background(), &deployments, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list Deployments: %v", err)
+	}
+	var services corev1.ServiceList
+	if err := r.List(context.Background(), &services, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list Services: %v", err)
+	}
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.List(context.Background(), &hpas, client.InNamespace(cb.Namespace)); err != nil {
+		t.Fatalf("list HPAs: %v", err)
+	}
+	if len(deployments.Items) != 0 || len(services.Items) != 0 || len(hpas.Items) != 0 {
+		t.Fatalf("endpoint-free NFS rendered managed workload: deployments=%d services=%d hpas=%d",
+			len(deployments.Items), len(services.Items), len(hpas.Items))
+	}
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for NFS", got.Status.Endpoint)
+	}
+	if len(got.Status.Conditions) != 0 {
+		t.Fatalf("endpoint-free NFS published conditions: %v", got.Status.Conditions)
+	}
+	if got.Status.ObservedGeneration != got.Generation {
+		t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
+func TestReconcileCanonicalSGLangHiCacheManagedNFSIsUnsupported(t *testing.T) {
+	scheme := newScheme(t)
+	falseValue := false
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache-managed-nfs", Namespace: "ns1", Generation: 5},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				FailOpen: &falseValue,
+			},
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+					Server:    "192.0.2.10",
+					Path:      "/hicache",
+					MountPath: "/mnt/hicache",
+				},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteStorage {
+		t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteStorage)
+	}
+	if !strings.Contains(ready.Message, "ownership Managed is unsupported") {
+		t.Fatalf("Ready message = %q, want unsupported Managed ownership", ready.Message)
+	}
+}
+
+func TestReconcileCanonicalSGLangHiCacheInvalidStoredNFSIsUnsupported(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*cachev1alpha1.CacheBackendRemoteStorageSpec)
+		wantMessage string
+	}{
+		{
+			name: "invalid server",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.Server = "@"
+			},
+			wantMessage: "remoteStorage.nfs.server",
+		},
+		{
+			name: "relative export path",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.Path = "hicache"
+			},
+			wantMessage: "remoteStorage.nfs.path",
+		},
+		{
+			name: "root mount path",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.MountPath = "/"
+			},
+			wantMessage: "remoteStorage.nfs.mountPath",
+		},
+		{
+			name: "forbidden endpoint",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.Endpoint = "nfs.example.com:2049"
+			},
+			wantMessage: "remoteStorage.endpoint",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			falseValue := false
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-hicache-nfs", Namespace: "ns1", Generation: 7},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+					Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+						FailOpen: &falseValue,
+					},
+					HiCache: &cachev1alpha1.SGLangHiCacheSpec{
+						Ratio:                 "2.0",
+						StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+					},
+					RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+						Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+						Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+						NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+							Server:    "192.0.2.10",
+							Path:      "/hicache",
+							MountPath: "/mnt/hicache",
+						},
+					},
+				},
+			}
+			tt.mutate(cb.Spec.RemoteStorage)
+			r := newReconciler(scheme, cb)
+
+			reconcile(t, r, cb.Name, cb.Namespace)
+
+			got := getBackend(t, r, cb.Name, cb.Namespace)
+			ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteStorage {
+				t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteStorage)
+			}
+			if !strings.Contains(ready.Message, tt.wantMessage) {
+				t.Fatalf("Ready message = %q, want %q", ready.Message, tt.wantMessage)
+			}
+			degraded := meta.FindStatusCondition(got.Status.Conditions, conditionTypeDegraded)
+			if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonUnsupportedRemoteStorage {
+				t.Fatalf("Degraded = %+v, want True/%s", degraded, conditionReasonUnsupportedRemoteStorage)
+			}
+			if got.Status.ObservedGeneration != got.Generation {
+				t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
+			}
+			if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+				t.Fatalf("invalid stored NFS rendered Deployment: %v", err)
+			}
+		})
+	}
+}
+
+func TestReconcileCanonicalVLLMLMCacheExternalNFSIsUnsupported(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-lmcache-nfs", Namespace: "ns1", Generation: 4},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+					Server:    "192.0.2.10",
+					Path:      "/lmcache",
+					MountPath: "/mnt/lmcache",
+				},
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, cb.Name, cb.Namespace)
+
+	got := getBackend(t, r, cb.Name, cb.Namespace)
+	ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteBinding {
+		t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteBinding)
+	}
+	if !strings.Contains(ready.Message, "does not accept remote-storage binding file") {
+		t.Fatalf("Ready message = %q, want rejected file binding", ready.Message)
+	}
+	if got.Status.Endpoint != "" {
+		t.Fatalf("status.endpoint = %q, want empty for unsupported NFS binding", got.Status.Endpoint)
+	}
+	if got.Status.ObservedGeneration != got.Generation {
+		t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
 	}
 }
 
@@ -1140,10 +1376,10 @@ func TestReconcileExternalAdvancesObservedGeneration(t *testing.T) {
 	}
 }
 
-func TestReconcileUnmanagedTypeNoop(t *testing.T) {
+func TestReconcileUnsupportedTypePublishesStatus(t *testing.T) {
 	scheme := newScheme(t)
 	// AIBrix has no registered runtime adapter, so it exercises the
-	// "unsupported managed type → reconcileUnmanaged" path. (Mooncake is no
+	// "unsupported managed type → reconcileUnsupported" path. (Mooncake is no
 	// longer a stand-in for an unsupported type — it has an adapter now and
 	// reconciles managed; see TestReconcileManagedMooncake.)
 	cb := &cachev1alpha1.CacheBackend{
@@ -1159,11 +1395,16 @@ func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 		t.Fatalf("list deployments: %v", err)
 	}
 	if len(deps.Items) != 0 {
-		t.Fatalf("deployments = %d, want 0 for unmanaged type", len(deps.Items))
+		t.Fatalf("deployments = %d, want 0 for unsupported type", len(deps.Items))
+	}
+	got := getBackend(t, r, "cache", "ns1")
+	ready := findCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRuntimeBackend {
+		t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRuntimeBackend)
 	}
 }
 
-func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
+func TestReconcileEventsOnlyUnsupportedPairPublishesStatus(t *testing.T) {
 	// An EventsOnly backend whose (engine, type) pair has no registered
 	// adapter must reconcile as UNMANAGED, NOT as active events-only.
 	// Admission rejects an unsupported pair at write time, but a
@@ -1172,7 +1413,7 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 	// adapter for an unsupported pair, so it could never inject the
 	// kvevent-subscriber and no KV event would ever flow. dispatch confirms an
 	// adapter is selectable before routing to reconcileEventsOnly; on failure it
-	// falls to reconcileUnmanaged. AIBrix has no shipping adapter (the default
+	// publishes an unsupported status. AIBrix has no shipping adapter (the default
 	// registry supports (vllm, LMCache) + (vllm, Mooncake) + External), so it
 	// is the unsupported-type fixture here — Mooncake is no longer unsupported.
 	scheme := newScheme(t)
@@ -1191,15 +1432,13 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	got := getBackend(t, r, "cache", "ns1")
-	// reconcileUnmanaged removes the Ready / Progressing conditions; the
-	// events-only path (reconcileEventsOnly) would have PUBLISHED them. Their
-	// absence is the discriminator between "reconciled as unmanaged" and
-	// "reconciled as active events-only".
-	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
-		t.Fatalf("unsupported-pair events-only must NOT publish Ready (unmanaged path); got %+v", ready)
+	// The unsupported path publishes a terminal condition; the events-only path
+	// would instead publish its normal AwaitingFirstKVEvent/active status.
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRuntimeBackend {
+		t.Fatalf("unsupported-pair Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRuntimeBackend)
 	}
-	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog != nil {
-		t.Fatalf("unsupported-pair events-only must NOT publish Progressing (unmanaged path); got %+v", prog)
+	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != conditionReasonUnsupportedRuntimeBackend {
+		t.Fatalf("unsupported-pair Progressing = %+v, want False/%s", prog, conditionReasonUnsupportedRuntimeBackend)
 	}
 	// And no workload is provisioned (unmanaged sheds everything).
 	var deps appsv1.DeploymentList
@@ -1471,7 +1710,7 @@ func TestReconcileCanonicalExternalEndpointUsesProviderProtocol(t *testing.T) {
 	}
 }
 
-func TestReconcileCanonicalExternalUnsupportedBindingStaysUnmanaged(t *testing.T) {
+func TestReconcileCanonicalExternalUnsupportedBindingPublishesStatus(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-redis", Namespace: "default", Generation: 2},
@@ -1501,8 +1740,12 @@ func TestReconcileCanonicalExternalUnsupportedBindingStaysUnmanaged(t *testing.T
 	if got.Status.Endpoint != "" {
 		t.Fatalf("status.endpoint = %q, want cleared for unsupported external binding", got.Status.Endpoint)
 	}
-	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
-		t.Fatalf("Ready = %+v, want absent for unmanaged unsupported external binding", ready)
+	ready := findCondition(got.Status.Conditions, conditionTypeReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteBinding {
+		t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteBinding)
+	}
+	if !strings.Contains(ready.Message, "does not accept remote-storage binding resp") {
+		t.Fatalf("Ready message = %q, want rejected RESP binding", ready.Message)
 	}
 	if got.Status.ObservedGeneration != cb.Generation {
 		t.Fatalf("status.observedGeneration = %d, want %d", got.Status.ObservedGeneration, cb.Generation)

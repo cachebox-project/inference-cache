@@ -72,6 +72,7 @@ func DefaultRegistry() *backendadapter.Registry {
 		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, protocol: backendadapter.ProtocolRESP},
 		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, protocol: backendadapter.ProtocolLMCache},
 		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, protocol: backendadapter.ProtocolMooncakeStore},
+		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderNFS, protocol: backendadapter.ProtocolFile},
 	} {
 		registry.Register(provider)
 	}

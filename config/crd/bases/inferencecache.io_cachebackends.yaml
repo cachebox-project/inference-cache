@@ -249,6 +249,15 @@ spec:
                     format: int32
                     minimum: 1
                     type: integer
+                  storagePrefetchPolicy:
+                    description: |-
+                      StoragePrefetchPolicy maps to --hicache-storage-prefetch-policy when
+                      remoteStorage.provider=NFS. It is rejected without that storage tier.
+                    enum:
+                    - best_effort
+                    - wait_complete
+                    - timeout
+                    type: string
                   writePolicy:
                     description: WritePolicy maps to --hicache-write-policy.
                     enum:
@@ -523,21 +532,23 @@ spec:
                     default: true
                     description: |-
                       FailOpen controls whether the engine treats cache lookups as a soft
-                      dependency. When true (the default), an unreachable or degraded cache
-                      backend MUST fall back to local prefill and never fail a serving
-                      request — the cache is an optimization, not a serving dependency. When
-                      explicitly set to false the engine fails requests on cache
-                      unreachability ("fail-closed"); the cache becomes a serving
-                      dependency, which is loud and visible via a Warning Event on the
-                      owning CacheBackend.
+                      dependency. For integrations admitted with true (the default), an
+                      unreachable or degraded cache backend MUST fall back to local prefill
+                      and never fail a serving request — the cache is an optimization, not a
+                      serving dependency. When explicitly set to false the cache becomes a
+                      fail-closed serving dependency, which is loud and visible via a Warning
+                      Event on the owning CacheBackend.
 
                       The flag is plumbed by the engine adapter as INFERENCECACHE_FAIL_OPEN
                       (both shipping LMCache adapters — vLLM+LMCache and SGLang+LMCache —
                       inject it). Per-request fail-open enforcement at the engine level is the
                       engine/connector's responsibility; the cache plane surfaces the bit so
                       the engine can honor it.
-                      SGLangHiCache accepts only the default true value and does not inject this
-                      env var because native HiCache exposes no equivalent fail-closed control.
+                      Host-only SGLangHiCache accepts the default true value and does not inject
+                      this env var because native HiCache exposes no equivalent control.
+                      NFS-backed SGLangHiCache instead requires an explicit false value: kubelet
+                      mounts the inline NFS volume before containers start, so export
+                      availability is inherently a serving dependency.
                     type: boolean
                   firstEventTimeout:
                     default: 5m
@@ -693,8 +704,9 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is required for External ownership and rejected for Managed
-                      ownership, whose endpoint is controller-observed.
+                      Endpoint is required for network providers with External ownership and
+                      rejected for Managed ownership, whose endpoint is controller-observed.
+                      NFS is mounted from its typed server/path fields and has no endpoint.
                     type: string
                   lmCacheServer:
                     description: LMCacheServer contains standalone lmcache-server-owned
@@ -847,6 +859,32 @@ spec:
                             type: object
                         type: object
                     type: object
+                  nfs:
+                    description: |-
+                      NFS identifies an externally owned NFS export and its engine-container
+                      mount path. It is valid only with provider=NFS and ownership=External.
+                    properties:
+                      mountPath:
+                        description: |-
+                          MountPath is the absolute path at which the export is mounted in the
+                          engine container.
+                        minLength: 1
+                        type: string
+                      path:
+                        description: Path is the absolute path exported by the NFS
+                          server.
+                        minLength: 1
+                        type: string
+                      server:
+                        description: Server is the NFS mount-target hostname or IP
+                          address.
+                        minLength: 1
+                        type: string
+                    required:
+                    - mountPath
+                    - path
+                    - server
+                    type: object
                   ownership:
                     description: |-
                       Ownership identifies whether inference-cache manages the provider
@@ -861,6 +899,7 @@ spec:
                     - Redis
                     - LMCacheServer
                     - Mooncake
+                    - NFS
                     type: string
                   redis:
                     description: Redis contains Redis-owned configuration.

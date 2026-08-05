@@ -82,12 +82,16 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	remoteStorageSchema := mustProperty(t, specSchema, "remoteStorage")
 	requireRequired(t, remoteStorageSchema, "provider")
 	requireRequired(t, remoteStorageSchema, "ownership")
-	requireEnum(t, mustProperty(t, remoteStorageSchema, "provider"), []string{"Redis", "LMCacheServer", "Mooncake"})
+	requireEnum(t, mustProperty(t, remoteStorageSchema, "provider"), []string{"Redis", "LMCacheServer", "Mooncake", "NFS"})
 	requireEnum(t, mustProperty(t, remoteStorageSchema, "ownership"), []string{"Managed", "External"})
-	for _, field := range []string{"endpoint", "redis", "lmCacheServer", "mooncake"} {
+	for _, field := range []string{"endpoint", "redis", "lmCacheServer", "mooncake", "nfs"} {
 		if !hasProperty(remoteStorageSchema, field) {
 			t.Fatalf("spec.remoteStorage.%s is missing from CRD schema", field)
 		}
+	}
+	nfsSchema := mustProperty(t, remoteStorageSchema, "nfs")
+	for _, field := range []string{"server", "path", "mountPath"} {
+		requireRequired(t, nfsSchema, field)
 	}
 	observationSchema := mustProperty(t, specSchema, "observation")
 	for _, field := range []string{"modelID", "firstEventTimeout"} {
@@ -140,6 +144,11 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"page_first_direct",
 		"page_first_kv_split",
 		"page_head",
+	})
+	requireEnum(t, mustProperty(t, hiCacheSchema, "storagePrefetchPolicy"), []string{
+		"best_effort",
+		"wait_complete",
+		"timeout",
 	})
 	firstEventTimeoutSchema := mustPath[map[string]any](t, integrationSchema, "properties", "firstEventTimeout")
 	if got, ok := firstEventTimeoutSchema["default"].(string); !ok || got != "5m" {
@@ -266,6 +275,11 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 						Limits: corev1.ResourceList{corev1.ResourceMemory: providerMemory},
 					},
 				},
+				NFS: &NFSRemoteStorageSpec{
+					Server:    "10.0.0.25",
+					Path:      "/hicache",
+					MountPath: "/mnt/hicache",
+				},
 			},
 			Observation: &CacheBackendObservationSpec{
 				ModelID:           "model-a",
@@ -286,8 +300,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
 			},
 			HiCache: &SGLangHiCacheSpec{
-				SizeGB:      &hiCacheSize,
-				WritePolicy: SGLangHiCacheWriteThrough,
+				SizeGB:                &hiCacheSize,
+				WritePolicy:           SGLangHiCacheWriteThrough,
+				StoragePrefetchPolicy: SGLangHiCacheStoragePrefetchWaitComplete,
 			},
 			BackendConfig: map[string]string{"evictionPolicy": "LRU"},
 			Template: &CacheBackendPodSpecOverride{
@@ -336,6 +351,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	*backend.Spec.LMCache.WorkerPort = 6666
 	backend.Spec.RemoteStorage.LMCacheServer.Command[0] = "changed"
 	backend.Spec.RemoteStorage.LMCacheServer.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("4Gi")
+	backend.Spec.RemoteStorage.NFS.Server = "changed"
 	backend.Spec.Observation.ModelID = "changed"
 	backend.Spec.Observation.FirstEventTimeout.Duration = time.Hour
 	backend.Spec.Integration.FirstEventTimeout.Duration = time.Hour
@@ -385,6 +401,9 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 		copied.Spec.RemoteStorage.LMCacheServer.Command[0] != "lmcache_server" ||
 		copied.Spec.RemoteStorage.LMCacheServer.Resources == nil {
 		t.Fatalf("remoteStorage.lmCacheServer nested fields were not deep-copied")
+	}
+	if copied.Spec.RemoteStorage.NFS == nil || copied.Spec.RemoteStorage.NFS.Server != "10.0.0.25" {
+		t.Fatalf("copied NFS storage = %+v, want independent original values", copied.Spec.RemoteStorage.NFS)
 	}
 	copiedProviderMemory := copied.Spec.RemoteStorage.LMCacheServer.Resources.Limits[corev1.ResourceMemory]
 	if copiedProviderMemory.Cmp(resource.MustParse("2Gi")) != 0 {

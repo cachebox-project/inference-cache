@@ -3,6 +3,8 @@ package sglang
 import (
 	"fmt"
 	"math"
+	"path"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -15,12 +17,17 @@ import (
 )
 
 const (
-	SGLangEnableHiCacheArg       = "--enable-hierarchical-cache"
-	SGLangHiCacheSizeArg         = "--hicache-size"
-	SGLangHiCacheRatioArg        = "--hicache-ratio"
-	SGLangHiCacheWritePolicyArg  = "--hicache-write-policy"
-	SGLangHiCacheIOBackendArg    = "--hicache-io-backend"
-	SGLangHiCacheMemoryLayoutArg = "--hicache-mem-layout"
+	SGLangEnableHiCacheArg                = "--enable-hierarchical-cache"
+	SGLangHiCacheSizeArg                  = "--hicache-size"
+	SGLangHiCacheRatioArg                 = "--hicache-ratio"
+	SGLangHiCacheWritePolicyArg           = "--hicache-write-policy"
+	SGLangHiCacheIOBackendArg             = "--hicache-io-backend"
+	SGLangHiCacheMemoryLayoutArg          = "--hicache-mem-layout"
+	SGLangHiCacheStorageBackendArg        = "--hicache-storage-backend"
+	SGLangHiCacheStoragePrefetchPolicyArg = "--hicache-storage-prefetch-policy"
+
+	SGLangHiCacheFileStorageDirectoryEnv = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
+	SGLangHiCacheStorageVolumeName       = "inferencecache-hicache-l3"
 )
 
 type hiCacheAdapter struct {
@@ -29,7 +36,7 @@ type hiCacheAdapter struct {
 }
 
 // NewHiCacheAdapter returns the endpoint-free adapter for SGLang's native
-// host-memory hierarchical cache.
+// hierarchical cache, including its optional file-backed NFS storage tier.
 func NewHiCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
 	var cfg runtimeadapter.Options
 	for _, option := range opts {
@@ -57,14 +64,15 @@ func (hiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
 func (hiCacheAdapter) RequiresEndpoint() bool { return false }
 
 func (hiCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
-	return binding == nil
+	return binding == nil ||
+		(binding.Protocol == backendadapter.ProtocolFile && binding.NFS != nil)
 }
 
 func (a hiCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	if binding != nil {
+	if !a.SupportsRemoteBinding(binding) {
 		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}
-	return a.InjectEngineConfig(pod, "", cache)
+	return injectHiCacheEngineConfig(pod, binding, cache)
 }
 
 func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
@@ -75,9 +83,18 @@ func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*co
 }
 
 func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *cachev1alpha1.CacheBackend) error {
+	return injectHiCacheEngineConfig(pod, nil, cache)
+}
+
+func injectHiCacheEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	cfg, err := resolveHiCacheConfig(cache)
 	if err != nil {
 		return err
+	}
+	nfsConfigured := cache.Spec.RemoteStorage != nil &&
+		cache.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
+	if nfsConfigured != (binding != nil) {
+		return fmt.Errorf("inject SGLang HiCache config: remoteStorage.provider=NFS and the file binding must be configured together")
 	}
 	if pod == nil {
 		return fmt.Errorf("inject SGLang HiCache config: pod is nil")
@@ -104,6 +121,8 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangHiCacheStorageBackendArg,
+		SGLangHiCacheStoragePrefetchPolicyArg,
 	} {
 		values, malformed := argValues(args, flag)
 		if malformed || len(values) > 1 {
@@ -116,7 +135,7 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 		value      string
 		equivalent func(string, string) bool
 	}
-	desired := make([]desiredArg, 0, 4)
+	desired := make([]desiredArg, 0, 6)
 	if cfg.sizeGB != nil {
 		desired = append(desired, desiredArg{
 			flag:       SGLangHiCacheSizeArg,
@@ -157,6 +176,22 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 			equivalent: equivalentExact,
 		})
 	}
+	if binding == nil {
+		for _, flag := range []string{SGLangHiCacheStorageBackendArg, SGLangHiCacheStoragePrefetchPolicyArg} {
+			if err := rejectPresentArg(args, flag, "requires remoteStorage.provider=NFS"); err != nil {
+				return err
+			}
+		}
+	} else {
+		desired = append(desired,
+			desiredArg{flag: SGLangHiCacheStorageBackendArg, value: "file", equivalent: equivalentExact},
+			desiredArg{
+				flag:       SGLangHiCacheStoragePrefetchPolicyArg,
+				value:      string(cfg.storagePrefetchPolicy),
+				equivalent: equivalentExact,
+			},
+		)
+	}
 
 	present := make(map[string]bool, len(desired))
 	for _, want := range desired {
@@ -174,6 +209,11 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 		present[want.flag] = true
 	}
 
+	storagePlan, err := planHiCacheNFSWiring(pod, engineIndex, binding)
+	if err != nil {
+		return err
+	}
+
 	work := pod.DeepCopy()
 	updated := append([]string(nil), work.Containers[engineIndex].Args...)
 	if !hasExactArg(updated, SGLangEnableHiCacheArg) {
@@ -185,6 +225,15 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 		}
 	}
 	work.Containers[engineIndex].Args = updated
+	if storagePlan.addEnv {
+		work.Containers[engineIndex].Env = append(work.Containers[engineIndex].Env, storagePlan.env)
+	}
+	if storagePlan.addVolumeMount {
+		work.Containers[engineIndex].VolumeMounts = append(work.Containers[engineIndex].VolumeMounts, storagePlan.volumeMount)
+	}
+	if storagePlan.addVolume {
+		work.Volumes = append(work.Volumes, storagePlan.volume)
+	}
 	*pod = *work
 	return nil
 }
@@ -216,21 +265,26 @@ func hiCacheReservedArgs() []string {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangHiCacheStorageBackendArg,
+		SGLangHiCacheStoragePrefetchPolicyArg,
 	}
 }
 
-func (hiCacheAdapter) ReservedEnv() []string { return nil }
+func (hiCacheAdapter) ReservedEnv() []string {
+	return []string{SGLangHiCacheFileStorageDirectoryEnv}
+}
 
 func (hiCacheAdapter) EngineContainerName() string {
 	return enginewire.SGLangEngineContainerName
 }
 
 type resolvedHiCacheConfig struct {
-	sizeGB       *int32
-	ratio        string
-	writePolicy  cachev1alpha1.SGLangHiCacheWritePolicy
-	ioBackend    cachev1alpha1.SGLangHiCacheIOBackend
-	memoryLayout cachev1alpha1.SGLangHiCacheMemoryLayout
+	sizeGB                *int32
+	ratio                 string
+	writePolicy           cachev1alpha1.SGLangHiCacheWritePolicy
+	ioBackend             cachev1alpha1.SGLangHiCacheIOBackend
+	memoryLayout          cachev1alpha1.SGLangHiCacheMemoryLayout
+	storagePrefetchPolicy cachev1alpha1.SGLangHiCacheStoragePrefetchPolicy
 }
 
 // ValidateHiCacheBackend validates the contract again at the adapter boundary.
@@ -255,14 +309,20 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if cachev1alpha1.IntegrationMode(cache.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.mode must be Offload")
 	}
+	nfsStorage := cache.Spec.RemoteStorage != nil &&
+		cache.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 	if cache.Spec.Integration != nil {
 		role := cache.Spec.Integration.Role
 		if role != "" && role != cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
 			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.role must be ReadWrite")
 		}
-		if !cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration) {
-			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
-		}
+	}
+	failOpen := cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration)
+	if nfsStorage && failOpen {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be false with remoteStorage.provider=NFS because the inline NFS volume is a Pod startup dependency")
+	}
+	if !nfsStorage && !failOpen {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
 	}
 	if cache.Spec.Autoscaling != nil {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
@@ -288,6 +348,16 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 		for _, flag := range overrides.SuppressArgs {
 			if isHiCacheReservedArg(flag) {
 				return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: suppression of reserved argument %q is unsupported", flag)
+			}
+		}
+		for _, env := range overrides.Env {
+			if env.Name == SGLangHiCacheFileStorageDirectoryEnv {
+				return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: engine override for reserved environment variable %q is unsupported", env.Name)
+			}
+		}
+		for _, name := range overrides.SuppressEnv {
+			if name == SGLangHiCacheFileStorageDirectoryEnv {
+				return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: suppression of reserved environment variable %q is unsupported", name)
 			}
 		}
 	}
@@ -316,13 +386,152 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if !validMemoryLayout(spec.MemoryLayout) {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: unsupported memoryLayout %q", spec.MemoryLayout)
 	}
+	if !validStoragePrefetchPolicy(spec.StoragePrefetchPolicy) {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: unsupported storagePrefetchPolicy %q", spec.StoragePrefetchPolicy)
+	}
+	if nfsStorage && spec.StoragePrefetchPolicy == "" {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: storagePrefetchPolicy is required with remoteStorage.provider=NFS")
+	}
+	if !nfsStorage && spec.StoragePrefetchPolicy != "" {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: storagePrefetchPolicy requires remoteStorage.provider=NFS")
+	}
 	return resolvedHiCacheConfig{
-		sizeGB:       spec.SizeGB,
-		ratio:        spec.Ratio,
-		writePolicy:  spec.WritePolicy,
-		ioBackend:    spec.IOBackend,
-		memoryLayout: spec.MemoryLayout,
+		sizeGB:                spec.SizeGB,
+		ratio:                 spec.Ratio,
+		writePolicy:           spec.WritePolicy,
+		ioBackend:             spec.IOBackend,
+		memoryLayout:          spec.MemoryLayout,
+		storagePrefetchPolicy: spec.StoragePrefetchPolicy,
 	}, nil
+}
+
+func validStoragePrefetchPolicy(value cachev1alpha1.SGLangHiCacheStoragePrefetchPolicy) bool {
+	switch value {
+	case "",
+		cachev1alpha1.SGLangHiCacheStoragePrefetchBestEffort,
+		cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+		cachev1alpha1.SGLangHiCacheStoragePrefetchTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+type hiCacheNFSWiringPlan struct {
+	addEnv         bool
+	env            corev1.EnvVar
+	addVolume      bool
+	volume         corev1.Volume
+	addVolumeMount bool
+	volumeMount    corev1.VolumeMount
+}
+
+func planHiCacheNFSWiring(
+	pod *corev1.PodSpec,
+	engineIndex int,
+	binding *backendadapter.Binding,
+) (hiCacheNFSWiringPlan, error) {
+	if binding == nil {
+		return hiCacheNFSWiringPlan{}, nil
+	}
+	if binding.Protocol != backendadapter.ProtocolFile || binding.NFS == nil {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: file binding requires NFS mount configuration")
+	}
+	nfs := binding.NFS
+	if err := backendadapter.ValidateNFSServer(nfs.Server); err != nil {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: %w", err)
+	}
+	if err := validateHiCachePath(nfs.Path, "remoteStorage.nfs.path", true); err != nil {
+		return hiCacheNFSWiringPlan{}, err
+	}
+	if err := validateHiCachePath(nfs.MountPath, "remoteStorage.nfs.mountPath", false); err != nil {
+		return hiCacheNFSWiringPlan{}, err
+	}
+
+	plan := hiCacheNFSWiringPlan{
+		env: corev1.EnvVar{
+			Name:  SGLangHiCacheFileStorageDirectoryEnv,
+			Value: nfs.MountPath,
+		},
+		volume: corev1.Volume{
+			Name: SGLangHiCacheStorageVolumeName,
+			VolumeSource: corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{
+				Server: nfs.Server,
+				Path:   nfs.Path,
+			}},
+		},
+		volumeMount: corev1.VolumeMount{
+			Name:      SGLangHiCacheStorageVolumeName,
+			MountPath: nfs.MountPath,
+		},
+	}
+
+	envCount := 0
+	for _, env := range pod.Containers[engineIndex].Env {
+		if env.Name != plan.env.Name {
+			continue
+		}
+		envCount++
+		if !reflect.DeepEqual(env, plan.env) {
+			return hiCacheNFSWiringPlan{}, fmt.Errorf(
+				"inject SGLang HiCache config: existing env %s conflicts with remoteStorage.nfs.mountPath",
+				plan.env.Name,
+			)
+		}
+	}
+	if envCount > 1 {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: env %s is duplicated", plan.env.Name)
+	}
+	plan.addEnv = envCount == 0
+
+	volumeCount := 0
+	for _, volume := range pod.Volumes {
+		if volume.Name != plan.volume.Name {
+			continue
+		}
+		volumeCount++
+		if !reflect.DeepEqual(volume, plan.volume) {
+			return hiCacheNFSWiringPlan{}, fmt.Errorf(
+				"inject SGLang HiCache config: volume %q conflicts with remoteStorage.nfs",
+				plan.volume.Name,
+			)
+		}
+	}
+	if volumeCount > 1 {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: volume %q is duplicated", plan.volume.Name)
+	}
+	plan.addVolume = volumeCount == 0
+
+	mountCount := 0
+	for _, mount := range pod.Containers[engineIndex].VolumeMounts {
+		if mount.Name != plan.volumeMount.Name && mount.MountPath != plan.volumeMount.MountPath {
+			continue
+		}
+		mountCount++
+		if !reflect.DeepEqual(mount, plan.volumeMount) {
+			return hiCacheNFSWiringPlan{}, fmt.Errorf(
+				"inject SGLang HiCache config: volume mount name %q or path %q conflicts with remoteStorage.nfs",
+				plan.volumeMount.Name,
+				plan.volumeMount.MountPath,
+			)
+		}
+	}
+	if mountCount > 1 {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: volume mount %q is duplicated", plan.volumeMount.Name)
+	}
+	plan.addVolumeMount = mountCount == 0
+	return plan, nil
+}
+
+func validateHiCachePath(value, fieldName string, allowRoot bool) error {
+	if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) ||
+		!path.IsAbs(value) || path.Clean(value) != value {
+		return fmt.Errorf("inject SGLang HiCache config: %s must be a clean absolute path", fieldName)
+	}
+	if !allowRoot && value == "/" {
+		return fmt.Errorf("inject SGLang HiCache config: %s must not be the container root", fieldName)
+	}
+	return nil
 }
 
 func validWritePolicy(value cachev1alpha1.SGLangHiCacheWritePolicy) bool {

@@ -56,6 +56,27 @@ func newHiCacheBackend() *cachev1alpha1.CacheBackend {
 	}
 }
 
+func newCanonicalHiCacheNFSBackend() *cachev1alpha1.CacheBackend {
+	cb := newHiCacheBackend()
+	falseValue := false
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration.Engine = ""
+	cb.Spec.Integration.FailOpen = &falseValue
+	cb.Spec.BackendConfig = nil
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
+	cb.Spec.HiCache.StoragePrefetchPolicy = cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+			Server:    "10.0.0.25",
+			Path:      "/hicache",
+			MountPath: "/mnt/hicache",
+		},
+	}
+	return cb
+}
+
 func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
 	if _, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), newHiCacheBackend()); err != nil {
 		t.Fatalf("valid SGLangHiCache rejected: %v", err)
@@ -75,6 +96,78 @@ func TestValidator_CanonicalSGLangHiCacheRejectsRemoteStorage(t *testing.T) {
 	}
 	requireInvalidWithCause(t, &CacheBackendValidator{}, cb, "spec.remoteStorage.provider",
 		"does not accept remote binding protocol")
+}
+
+func TestValidator_CanonicalSGLangHiCacheAcceptsExternalNFS(t *testing.T) {
+	if _, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), newCanonicalHiCacheNFSBackend()); err != nil {
+		t.Fatalf("valid canonical HiCache+NFS rejected: %v", err)
+	}
+}
+
+func TestValidator_CanonicalHiCacheNFSServerAccepted(t *testing.T) {
+	servers := []struct {
+		name   string
+		server string
+	}{
+		{"IPv4", "10.0.0.25"},
+		// NFSVolumeSource.Server stores raw IPv6; kubelet brackets it when
+		// constructing the mount source. See backend.ValidateNFSServer.
+		{"raw IPv6 (kubelet formats mount source)", "2001:db8::25"},
+		{"DNS hostname", "nfs.example.com"},
+		{"single-label DNS hostname", "nfs-server"},
+	}
+	validator := &CacheBackendValidator{}
+	for _, tc := range servers {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newCanonicalHiCacheNFSBackend()
+			cb.Spec.RemoteStorage.NFS.Server = tc.server
+			if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("valid NFS server %q rejected: %v", tc.server, err)
+			}
+		})
+	}
+}
+
+func TestValidator_CanonicalHiCacheNFSContract(t *testing.T) {
+	trueValue := true
+	cases := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackend)
+		want   string
+	}{
+		{"managed ownership", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.RemoteStorage.Ownership = cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged
+		}, "remoteStorage.ownership"},
+		{"fail open", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.FailOpen = &trueValue
+		}, "integration.failOpen"},
+		{"omitted failOpen", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.FailOpen = nil
+		}, "integration.failOpen"},
+		{"endpoint", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.Endpoint = "10.0.0.25:2049" }, "remoteStorage.endpoint"},
+		{"missing NFS block", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS = nil }, "remoteStorage.nfs"},
+		{"server with scheme", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs://10.0.0.25" }, "remoteStorage.nfs.server"},
+		{"server with invalid character", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "@" }, "remoteStorage.nfs.server"},
+		{"server with query", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "host?query" }, "remoteStorage.nfs.server"},
+		{"option-like server", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "-option" }, "remoteStorage.nfs.server"},
+		{"server with port", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs.example.com:2049" }, "remoteStorage.nfs.server"},
+		{"bracketed IPv6 server", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "[2001:db8::25]" }, "remoteStorage.nfs.server"},
+		{"relative export path", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Path = "hicache" }, "remoteStorage.nfs.path"},
+		{"root mount", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.MountPath = "/" }, "remoteStorage.nfs.mountPath"},
+		{"missing prefetch policy", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.StoragePrefetchPolicy = "" }, "hiCache.storagePrefetchPolicy"},
+		{"invalid prefetch policy", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.StoragePrefetchPolicy = "forever" }, "hiCache.storagePrefetchPolicy"},
+	}
+	validator := &CacheBackendValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newCanonicalHiCacheNFSBackend()
+			tc.mutate(cb)
+			_, err := validator.ValidateCreate(context.Background(), cb)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateCreate error = %v, want field %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
@@ -415,6 +508,8 @@ func TestValidator_SGLangHiCacheArgsAreReserved(t *testing.T) {
 		"--hicache-write-policy",
 		"--hicache-io-backend",
 		"--hicache-mem-layout",
+		"--hicache-storage-backend",
+		"--hicache-storage-prefetch-policy",
 	} {
 		t.Run(flag, func(t *testing.T) {
 			cb := newHiCacheBackend()
@@ -426,6 +521,21 @@ func TestValidator_SGLangHiCacheArgsAreReserved(t *testing.T) {
 				t.Fatalf("ValidateCreate error = %v, want reserved %s", err, flag)
 			}
 		})
+	}
+}
+
+func TestValidator_SGLangHiCacheStorageDirectoryEnvIsReserved(t *testing.T) {
+	cb := newCanonicalHiCacheNFSBackend()
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		Env: []corev1.EnvVar{{
+			Name:  "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
+			Value: "/other",
+		}},
+	}
+	_, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), cb)
+	if err == nil || !strings.Contains(err.Error(), "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR") ||
+		!strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("ValidateCreate error = %v, want reserved storage env", err)
 	}
 }
 

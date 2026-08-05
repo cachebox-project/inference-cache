@@ -146,7 +146,7 @@ func AdapterRequiresEndpoint(adapter KVCacheRuntimeAdapter) bool {
 // hierarchy. Binding-aware adapters accept nil for host-only operation.
 func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding) bool {
 	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		return !bindingAware.SupportsRemoteBinding(binding) || binding != nil
+		return !bindingAware.SupportsRemoteBinding(binding) || backendadapter.BindingRequiresEndpoint(binding)
 	}
 	return AdapterRequiresEndpoint(adapter)
 }
