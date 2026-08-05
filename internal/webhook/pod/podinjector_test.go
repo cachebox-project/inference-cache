@@ -382,6 +382,63 @@ func TestHandle_MatchAndInject_CanonicalSGLangHiCacheNFS(t *testing.T) {
 	}
 }
 
+func TestHandle_CanonicalSGLangHiCacheNFSInvalidStoredSourceFailsOpen(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*cachev1alpha1.CacheBackendRemoteStorageSpec)
+	}{
+		{
+			name: "unsupported managed ownership",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.Ownership = cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged
+			},
+		},
+		{
+			name: "forbidden endpoint",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.Endpoint = "nfs.example.com:2049"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const ns = "engines"
+			falseValue := false
+			cb := readyCacheBackend("hicache-nfs", ns, map[string]string{"app": "sglang"})
+			cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+			cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+			cb.Spec.Integration.Engine = ""
+			cb.Spec.Integration.FailOpen = &falseValue
+			cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
+				Ratio:                 "2.0",
+				StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+			}
+			cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+					Server:    "10.0.0.25",
+					Path:      "/hicache",
+					MountPath: "/mnt/hicache",
+				},
+			}
+			tt.mutate(cb.Spec.RemoteStorage)
+			cb.Status.Endpoint = ""
+
+			pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+			req := newRequest(t, pod, ns)
+			resp := newHandler(t, cb).Handle(context.Background(), req)
+			if !resp.Allowed {
+				t.Fatalf("invalid stored NFS source must fail open: %+v", resp.Result)
+			}
+			if len(resp.Patches) != 0 {
+				t.Fatalf("invalid stored NFS source produced %d patches, want original Pod unchanged", len(resp.Patches))
+			}
+		})
+	}
+}
+
 func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})

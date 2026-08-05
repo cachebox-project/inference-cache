@@ -17,6 +17,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
@@ -106,6 +107,13 @@ type EngineInjector struct {
 	// would have wired.
 	Registry *adapterruntime.Registry
 
+	// BackendRegistry resolves the supported (remote-storage provider,
+	// ownership) capabilities. nil uses the shipping provider registry. The
+	// pod webhook consults the same capability boundary as the controller so
+	// an admission-bypassed object cannot be unsupported in status but still
+	// mutate engine Pods.
+	BackendRegistry *backendadapter.Registry
+
 	// Log is the handler's logger. nil falls back to logf.FromContext at
 	// call time; tests typically inject logr.Discard().
 	Log logr.Logger
@@ -179,8 +187,32 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			runtimeID, cache.Spec.Type, err))
 	}
 
-	endpoint := effectiveEndpoint(cache)
 	storage := cache.Spec.EffectiveRemoteStorage()
+	if storage != nil {
+		backendRegistry := h.BackendRegistry
+		if backendRegistry == nil {
+			backendRegistry = backendprovider.DefaultRegistry()
+		}
+		if _, err := backendRegistry.Select(storage); err != nil {
+			log.V(1).Info("fail-open: remote-storage capability is unsupported",
+				"provider", storage.Provider, "ownership", storage.Ownership, "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf(
+				"unsupported remote-storage provider=%q ownership=%q (fail-open): %v",
+				storage.Provider, storage.Ownership, err))
+		}
+		// Inline NFS is the current External binding shape. A future Managed
+		// NFS provider will expose a separate PVC-backed binding and must not
+		// inherit these server/path rules.
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS &&
+			storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			if err := backendadapter.ValidateInlineNFSBinding(storage); err != nil {
+				log.V(1).Info("fail-open: inline NFS binding is invalid", "error", err.Error())
+				return failOpen(req, &pod, fmt.Sprintf("invalid inline NFS binding (fail-open): %v", err))
+			}
+		}
+	}
+
+	endpoint := effectiveEndpoint(cache)
 	protocol, protocolErr := backendadapter.ProtocolFor(storage)
 	if protocolErr != nil {
 		log.V(1).Info("fail-open: remote-storage protocol is unsupported", "error", protocolErr.Error())

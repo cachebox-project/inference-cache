@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,46 @@ func ValidateNFSServer(server string) error {
 	default:
 		return nil
 	}
+}
+
+// ValidateInlineNFSBinding validates the source fields used by today's
+// externally owned, inline NFS Pod volume. Managed NFS must use a distinct
+// provider/binding contract (for example a controller-managed PVC) rather
+// than reusing this server/path shape.
+func ValidateInlineNFSBinding(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) error {
+	if storage == nil {
+		return errors.New("remoteStorage must not be nil for an inline NFS binding")
+	}
+	if storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+		return fmt.Errorf("remoteStorage.provider must be NFS for an inline NFS binding, got %q", storage.Provider)
+	}
+	if storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		return fmt.Errorf("remoteStorage.ownership must be External for an inline NFS binding, got %q", storage.Ownership)
+	}
+	if strings.TrimSpace(storage.Endpoint) != "" {
+		return errors.New("remoteStorage.endpoint must be empty for an inline NFS binding")
+	}
+	if storage.NFS == nil {
+		return errors.New("remoteStorage.nfs is required for an inline NFS binding")
+	}
+	if err := ValidateNFSServer(storage.NFS.Server); err != nil {
+		return fmt.Errorf("remoteStorage.nfs.server: %w", err)
+	}
+	if err := validateNFSPath(storage.NFS.Path, "remoteStorage.nfs.path", true); err != nil {
+		return err
+	}
+	return validateNFSPath(storage.NFS.MountPath, "remoteStorage.nfs.mountPath", false)
+}
+
+func validateNFSPath(value, fieldName string, allowRoot bool) error {
+	if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) ||
+		!path.IsAbs(value) || path.Clean(value) != value {
+		return fmt.Errorf("%s must be a clean absolute path without surrounding whitespace", fieldName)
+	}
+	if !allowRoot && value == "/" {
+		return fmt.Errorf("%s must not mount remote storage over the container root", fieldName)
+	}
+	return nil
 }
 
 // Binding is the structured connection information an engine adapter accepts.

@@ -353,6 +353,96 @@ func TestReconcileCanonicalSGLangHiCacheManagedNFSIsUnsupported(t *testing.T) {
 	}
 }
 
+func TestReconcileCanonicalSGLangHiCacheInvalidStoredNFSIsUnsupported(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*cachev1alpha1.CacheBackendRemoteStorageSpec)
+		wantMessage string
+	}{
+		{
+			name: "invalid server",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.Server = "@"
+			},
+			wantMessage: "remoteStorage.nfs.server",
+		},
+		{
+			name: "relative export path",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.Path = "hicache"
+			},
+			wantMessage: "remoteStorage.nfs.path",
+		},
+		{
+			name: "root mount path",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.NFS.MountPath = "/"
+			},
+			wantMessage: "remoteStorage.nfs.mountPath",
+		},
+		{
+			name: "forbidden endpoint",
+			mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+				storage.Endpoint = "nfs.example.com:2049"
+			},
+			wantMessage: "remoteStorage.endpoint",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			falseValue := false
+			cb := &cachev1alpha1.CacheBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-hicache-nfs", Namespace: "ns1", Generation: 7},
+				Spec: cachev1alpha1.CacheBackendSpec{
+					Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+					Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+						FailOpen: &falseValue,
+					},
+					HiCache: &cachev1alpha1.SGLangHiCacheSpec{
+						Ratio:                 "2.0",
+						StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,
+					},
+					RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+						Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+						Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+						NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+							Server:    "192.0.2.10",
+							Path:      "/hicache",
+							MountPath: "/mnt/hicache",
+						},
+					},
+				},
+			}
+			tt.mutate(cb.Spec.RemoteStorage)
+			r := newReconciler(scheme, cb)
+
+			reconcile(t, r, cb.Name, cb.Namespace)
+
+			got := getBackend(t, r, cb.Name, cb.Namespace)
+			ready := meta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonUnsupportedRemoteStorage {
+				t.Fatalf("Ready = %+v, want False/%s", ready, conditionReasonUnsupportedRemoteStorage)
+			}
+			if !strings.Contains(ready.Message, tt.wantMessage) {
+				t.Fatalf("Ready message = %q, want %q", ready.Message, tt.wantMessage)
+			}
+			degraded := meta.FindStatusCondition(got.Status.Conditions, conditionTypeDegraded)
+			if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonUnsupportedRemoteStorage {
+				t.Fatalf("Degraded = %+v, want True/%s", degraded, conditionReasonUnsupportedRemoteStorage)
+			}
+			if got.Status.ObservedGeneration != got.Generation {
+				t.Fatalf("observedGeneration = %d, want generation %d", got.Status.ObservedGeneration, got.Generation)
+			}
+			if _, err := getOptionalDeployment(t, r, cb.Name, cb.Namespace); !apierrors.IsNotFound(err) {
+				t.Fatalf("invalid stored NFS rendered Deployment: %v", err)
+			}
+		})
+	}
+}
+
 func TestReconcileCanonicalVLLMLMCacheExternalNFSIsUnsupported(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{

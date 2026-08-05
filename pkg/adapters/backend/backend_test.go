@@ -1,10 +1,70 @@
 package backend
 
 import (
+	"strings"
 	"testing"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
+
+func TestValidateInlineNFSBinding(t *testing.T) {
+	valid := func() *cachev1alpha1.CacheBackendRemoteStorageSpec {
+		return &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+				Server:    "10.0.0.25",
+				Path:      "/hicache",
+				MountPath: "/mnt/hicache",
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*cachev1alpha1.CacheBackendRemoteStorageSpec)
+		wantErr string
+	}{
+		{name: "valid"},
+		{name: "managed ownership", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.Ownership = cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged
+		}, wantErr: "ownership must be External"},
+		{name: "endpoint", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.Endpoint = "nfs.example.com:2049"
+		}, wantErr: "endpoint must be empty"},
+		{name: "missing NFS", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.NFS = nil
+		}, wantErr: "remoteStorage.nfs is required"},
+		{name: "invalid server", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.NFS.Server = "@"
+		}, wantErr: "remoteStorage.nfs.server"},
+		{name: "relative export path", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.NFS.Path = "hicache"
+		}, wantErr: "remoteStorage.nfs.path"},
+		{name: "root mount", mutate: func(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) {
+			storage.NFS.MountPath = "/"
+		}, wantErr: "must not mount remote storage over the container root"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			storage := valid()
+			if tt.mutate != nil {
+				tt.mutate(storage)
+			}
+			err := ValidateInlineNFSBinding(storage)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateInlineNFSBinding: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ValidateInlineNFSBinding error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestBindingForKeepsResolvedExternalEndpoint(t *testing.T) {
 	storage := &cachev1alpha1.CacheBackendRemoteStorageSpec{

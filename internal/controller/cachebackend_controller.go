@@ -479,6 +479,30 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	}
 
 	if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+		backendRegistry := r.BackendRegistry
+		if backendRegistry == nil {
+			backendRegistry = backendprovider.DefaultRegistry()
+		}
+		if _, err := backendRegistry.Select(storage); err != nil {
+			logger.V(1).Info("no external remote-storage provider for backend; marking unsupported",
+				"provider", storage.Provider, "ownership", storage.Ownership,
+				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			message := fmt.Sprintf("remote storage provider %s with ownership %s is unsupported: %v",
+				storage.Provider, storage.Ownership, err)
+			return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteStorage, message)
+		}
+		// The provider registry decides whether External NFS is a supported
+		// capability. This separate validator checks only today's inline
+		// server/path binding; a future Managed NFS/PVC provider will bypass it
+		// and supply its own binding contract.
+		if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS {
+			if err := backendadapter.ValidateInlineNFSBinding(storage); err != nil {
+				logger.V(1).Info("external NFS binding is invalid; marking unsupported",
+					"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+				message := fmt.Sprintf("inline NFS binding is invalid: %v", err)
+				return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteStorage, message)
+			}
+		}
 		protocol, err := backendadapter.ProtocolFor(storage)
 		if err != nil {
 			logger.V(1).Info("external storage has no supported binding protocol; marking unsupported",
