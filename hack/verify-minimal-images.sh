@@ -107,10 +107,18 @@ for i in "${!targets[@]}"; do
   active_container="$("${docker_cmd[@]}" create "$image")"
   archive="$workdir/$target.tar"
   members="$workdir/$target.members"
+  member_types="$workdir/$target.member-types"
   "${docker_cmd[@]}" export -o "$archive" "$active_container"
   "${docker_cmd[@]}" rm "$active_container" >/dev/null
   active_container=""
   tar -tf "$archive" >"$members"
+  tar -tvf "$archive" | awk '{ print substr($1, 1, 1) }' >"$member_types"
+  member_count="$(wc -l <"$members")"
+  member_type_count="$(wc -l <"$member_types")"
+  if [ "$member_count" -ne "$member_type_count" ]; then
+    echo "minimal-image check: could not map $target archive members to entry types" >&2
+    exit 1
+  fi
 
   payload="${entrypoint#/}"
   payload_modes="$(tar -tvf "$archive" | awk -v payload="$payload" '
@@ -140,23 +148,22 @@ for i in "${!targets[@]}"; do
     apk apt apt-get dpkg dpkg-deb dpkg-query
     rpm rpm2cpio dnf microdnf yum zypper pacman
   )
-  while IFS= read -r member; do
+  # Pair the two tar listings by archive order so member names can contain spaces.
+  while IFS= read -r member && IFS= read -r entry_type <&3; do
     path="${member#./}"
     path="${path%/}"
     basename="${path##*/}"
     for forbidden in "${forbidden_names[@]}"; do
       if [ "$basename" = "$forbidden" ]; then
-        while IFS= read -r entry_type; do
-          case "$entry_type" in
-            -|l|h)
-              echo "minimal-image check: $target image contains forbidden runtime tool /$path" >&2
-              exit 1
-              ;;
-          esac
-        done < <(tar -tvf "$archive" "$member" | awk '{ print substr($1, 1, 1) }')
+        case "$entry_type" in
+          -|l|h)
+            echo "minimal-image check: $target image contains forbidden runtime tool /$path" >&2
+            exit 1
+            ;;
+        esac
       fi
     done
-  done <"$members"
+  done 3<"$member_types" <"$members"
 
   echo "minimal-image check: $target is non-root and contains no shell or package manager"
 done

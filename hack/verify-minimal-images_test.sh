@@ -124,6 +124,7 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
   fi
   if [ -n "${FAKE_EXTRA_DIRECTORY:-}" ]; then
     mkdir -p "$root/$FAKE_EXTRA_DIRECTORY"
+    touch "$root/$FAKE_EXTRA_DIRECTORY/metadata"
   fi
   if [ -n "${FAKE_EXTRA_SYMLINK:-}" ]; then
     mkdir -p "$(dirname "$root/$FAKE_EXTRA_SYMLINK")"
