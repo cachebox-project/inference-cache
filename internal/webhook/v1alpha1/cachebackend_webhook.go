@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	pathpkg "path"
 	"reflect"
 	"sort"
@@ -408,9 +409,12 @@ func validateNFSRemoteStorage(storage *cachev1alpha1.NFSRemoteStorageSpec, stora
 	case strings.TrimSpace(server) == "":
 		errs = append(errs, field.Required(storagePath.Child("server"),
 			"NFS mount-target hostname or IP address is required"))
-	case server != strings.TrimSpace(server) || strings.ContainsAny(server, "/ \t\r\n") || strings.Contains(server, "://"):
+	case server != strings.TrimSpace(server):
 		errs = append(errs, field.Invalid(storagePath.Child("server"), server,
-			"must be a hostname or IP address without a scheme, path, or whitespace"))
+			"must not contain surrounding whitespace"))
+	case net.ParseIP(server) == nil && len(validation.IsDNS1123Subdomain(server)) != 0:
+		errs = append(errs, field.Invalid(storagePath.Child("server"), server,
+			"must be a valid IPv4 address, IPv6 address, or DNS-1123 hostname"))
 	}
 	errs = append(errs, validateCleanAbsolutePath(storage.Path, storagePath.Child("path"), true)...)
 	errs = append(errs, validateCleanAbsolutePath(storage.MountPath, storagePath.Child("mountPath"), false)...)

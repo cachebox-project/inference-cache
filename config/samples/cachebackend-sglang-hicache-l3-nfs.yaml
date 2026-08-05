@@ -1,6 +1,6 @@
 # SGLang HiCache with an externally owned NFS L3 tier.
-# Replace the documentation-only server address and export path with the VCN
-# mount target before applying this sample to a runtime cluster.
+# Replace the documentation-only values with your NFS server address and export
+# path before applying this sample to a runtime cluster.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

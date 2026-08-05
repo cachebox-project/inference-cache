@@ -102,6 +102,28 @@ func TestValidator_CanonicalSGLangHiCacheAcceptsExternalNFS(t *testing.T) {
 	}
 }
 
+func TestValidator_CanonicalHiCacheNFSServerAccepted(t *testing.T) {
+	servers := []struct {
+		name   string
+		server string
+	}{
+		{"IPv4", "10.0.0.25"},
+		{"IPv6", "2001:db8::25"},
+		{"DNS hostname", "nfs.example.com"},
+		{"single-label DNS hostname", "nfs-server"},
+	}
+	validator := &CacheBackendValidator{}
+	for _, tc := range servers {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newCanonicalHiCacheNFSBackend()
+			cb.Spec.RemoteStorage.NFS.Server = tc.server
+			if _, err := validator.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("valid NFS server %q rejected: %v", tc.server, err)
+			}
+		})
+	}
+}
+
 func TestValidator_CanonicalHiCacheNFSContract(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -113,7 +135,12 @@ func TestValidator_CanonicalHiCacheNFSContract(t *testing.T) {
 		}, "remoteStorage.ownership"},
 		{"endpoint", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.Endpoint = "10.0.0.25:2049" }, "remoteStorage.endpoint"},
 		{"missing NFS block", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS = nil }, "remoteStorage.nfs"},
-		{"invalid server", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs://10.0.0.25" }, "remoteStorage.nfs.server"},
+		{"server with scheme", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs://10.0.0.25" }, "remoteStorage.nfs.server"},
+		{"server with invalid character", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "@" }, "remoteStorage.nfs.server"},
+		{"server with query", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "host?query" }, "remoteStorage.nfs.server"},
+		{"option-like server", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "-option" }, "remoteStorage.nfs.server"},
+		{"server with port", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs.example.com:2049" }, "remoteStorage.nfs.server"},
+		{"bracketed IPv6 server", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "[2001:db8::25]" }, "remoteStorage.nfs.server"},
 		{"relative export path", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Path = "hicache" }, "remoteStorage.nfs.path"},
 		{"root mount", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.MountPath = "/" }, "remoteStorage.nfs.mountPath"},
 		{"missing prefetch policy", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.HiCache.StoragePrefetchPolicy = "" }, "hiCache.storagePrefetchPolicy"},
