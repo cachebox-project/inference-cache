@@ -16,18 +16,19 @@ import (
 const checkCacheBackendHealth = "CacheBackendHealth"
 
 // CacheBackendHealth inspects each CacheBackend in scope across the dimensions
-// the controller surfaces on status: Ready, matched engine pods, index
-// participation (KV-event freshness), and endpoint reachability. Every failing
-// axis emits its own finding so the operator sees exactly what is wrong; a
-// backend that passes every applicable axis emits a single OK.
+// the controller surfaces on status: Ready (where published), matched engine
+// pods, index participation (KV-event freshness), and endpoint reachability.
+// Every failing axis emits its own finding so the operator sees exactly what is
+// wrong; a backend that passes every applicable axis emits a single OK.
 //
 // Four health models coexist, derived from EffectiveRemoteStorage so canonical
 // and legacy resources are classified identically:
 //   - Managed remote storage: every axis applies.
 //   - External network storage: only Ready + endpoint reachability apply.
 //   - Host-only caching: engine/index axes apply, but endpoint checks do not.
-//   - External NFS: engine/index axes apply like host-only caching, but
-//     endpoint checks do not because the provider is mounted, not dialed.
+//   - External NFS: engine/index axes apply like host-only caching, but Ready
+//     and endpoint checks do not because the controller publishes neither for
+//     endpoint-free mounted storage.
 //
 // The matched-engine-pod axis prefers the controller-written
 // status.matchedEnginePods (its authoritative snapshot) but falls back to a
@@ -57,20 +58,25 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 			findings = append(findings, f)
 		}
 
-		// Ready condition (all backends).
-		if ready := findCondition(cb.Status.Conditions, conditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
-			note(doctor.Finding{
-				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
-				Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
-			})
-		}
-
 		storage := cb.Spec.EffectiveRemoteStorage()
 		nfsBacked := storage != nil && storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 		externalEndpoint := storage != nil &&
 			storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal &&
 			!nfsBacked
 		endpointBacked := storage != nil && !nfsBacked
+
+		// Endpoint-free NFS bindings are reconciled as unmanaged: the controller
+		// deliberately removes Ready rather than claiming data-plane readiness it
+		// cannot verify. Treat that condition as not applicable instead of CB001.
+		if !nfsBacked {
+			if ready := findCondition(cb.Status.Conditions, conditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
+				note(doctor.Finding{
+					Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
+					Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
+				})
+			}
+		}
+
 		if !externalEndpoint {
 			// Matched engine pods — only meaningful when a selector is declared.
 			if hasEngineSelector(cb) {
@@ -232,8 +238,10 @@ func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBa
 	if externalEndpoint {
 		return "External backend: Ready, " + endpoint
 	}
+	readiness := "Ready"
 	if nfsBacked {
-		endpoint = "NFS-backed (endpoint not applicable)"
+		readiness = "NFS-backed"
+		endpoint = "endpoint not applicable"
 	} else if !endpointBacked {
 		endpoint = "host-only (endpoint not applicable)"
 	}
@@ -241,7 +249,7 @@ func healthyMessage(cb *cachev1alpha1.CacheBackend, externalEndpoint, endpointBa
 	if !hasEngineSelector(cb) {
 		matched = "no engineSelector (engine-pod matching not applicable)"
 	}
-	return fmt.Sprintf("Ready, %s, %d prefix(es) indexed, %s", matched, prefixCount(cb.Status.IndexParticipation), endpoint)
+	return fmt.Sprintf("%s, %s, %d prefix(es) indexed, %s", readiness, matched, prefixCount(cb.Status.IndexParticipation), endpoint)
 }
 
 func prefixCount(ip *cachev1alpha1.CacheBackendIndexParticipation) int64 {
