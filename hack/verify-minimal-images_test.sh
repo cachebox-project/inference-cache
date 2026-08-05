@@ -159,6 +159,8 @@ expect_failure shell-present run_runtime_check FAKE_INCLUDE_SHELL=1
 expect_failure package-manager-present run_runtime_check FAKE_INCLUDE_APT=1
 expect_failure ash-present run_runtime_check FAKE_EXTRA_PATH=bin/ash
 expect_failure microdnf-present run_runtime_check FAKE_EXTRA_PATH=usr/bin/microdnf
+expect_failure alternate-shell-path run_runtime_check FAKE_EXTRA_PATH=usr/local/bin/sh
+expect_failure alternate-package-manager-path run_runtime_check FAKE_EXTRA_PATH=usr/local/bin/apt-get
 expect_failure docker-unavailable env \
   DOCKER="$workdir/missing-docker" \
   IMG=controller:test \

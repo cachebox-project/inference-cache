@@ -135,20 +135,20 @@ for i in "${!targets[@]}"; do
     exit 1
   fi
 
-  forbidden_paths=(
-    bin/sh bin/bash bin/ash bin/dash bin/zsh bin/ksh bin/busybox
-    usr/bin/sh usr/bin/bash usr/bin/ash usr/bin/dash usr/bin/zsh usr/bin/ksh usr/bin/busybox
-    busybox/sh busybox/busybox
-    bin/apk sbin/apk usr/bin/apk usr/sbin/apk
-    usr/bin/apt usr/bin/apt-get usr/bin/dpkg usr/bin/dpkg-deb usr/bin/dpkg-query
-    bin/rpm usr/bin/rpm usr/bin/rpm2cpio usr/bin/dnf usr/bin/microdnf usr/bin/yum
+  forbidden_names=(
+    sh bash ash dash zsh ksh busybox
+    apk apt apt-get dpkg dpkg-deb dpkg-query
+    rpm rpm2cpio dnf microdnf yum
   )
-  for forbidden in "${forbidden_paths[@]}"; do
-    if grep -Fxq "$forbidden" "$paths"; then
-      echo "minimal-image check: $target image contains forbidden runtime tool /$forbidden" >&2
-      exit 1
-    fi
-  done
+  while IFS= read -r path; do
+    basename="${path##*/}"
+    for forbidden in "${forbidden_names[@]}"; do
+      if [ "$basename" = "$forbidden" ]; then
+        echo "minimal-image check: $target image contains forbidden runtime tool /$path" >&2
+        exit 1
+      fi
+    done
+  done <"$paths"
 
   echo "minimal-image check: $target is non-root and contains no shell or package manager"
 done
