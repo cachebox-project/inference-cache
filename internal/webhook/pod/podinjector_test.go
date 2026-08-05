@@ -192,7 +192,7 @@ func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInject
 	t.Helper()
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
-	reg := adapterruntime.DefaultRegistry(
+	reg := adapterruntime.NewCoreRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
 	return &EngineInjector{
@@ -676,7 +676,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.DefaultRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
+	reg := adapterruntime.NewCoreRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
 	reg.Register(externaladapter.NewAdapter())
 	reg.Register(sglangadapter.NewAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
@@ -1078,7 +1078,7 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	// adapter registered on top. Without External in the registry the
 	// webhook would fail-open with "no adapter" and leave the engine
 	// unwired — that's the very gap the External adapter closes.
-	reg := adapterruntime.DefaultRegistry()
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
@@ -1146,7 +1146,7 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 			}
 			s := newScheme(t)
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-			reg := adapterruntime.DefaultRegistry()
+			reg := adapterruntime.NewCoreRegistry()
 			reg.Register(externaladapter.NewAdapter())
 			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
@@ -1226,7 +1226,7 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.DefaultRegistry()
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
@@ -1270,7 +1270,7 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.DefaultRegistry()
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
@@ -1319,7 +1319,7 @@ func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.DefaultRegistry()
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
@@ -2615,7 +2615,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	// Mirror cmd/controller wiring: DefaultRegistry + the External adapter +
 	// the subscriber image configured (so the events-only sidecar path is live).
-	reg := adapterruntime.DefaultRegistry(
+	reg := adapterruntime.NewCoreRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
 	reg.Register(externaladapter.NewAdapter())

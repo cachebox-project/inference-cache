@@ -1241,7 +1241,7 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 	// import cycle). Without it the (vllm, External) pair is unselectable and the
 	// events-only branch falls to reconcileUnmanaged — masking the precedence we
 	// want to assert.
-	reg := adapterruntime.DefaultRegistry()
+	reg := adapterruntime.NewCoreRegistry()
 	reg.Register(externaladapter.NewAdapter())
 	r.Registry = reg
 

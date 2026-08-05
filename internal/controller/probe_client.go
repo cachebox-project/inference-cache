@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // ProbeClient is the controller's POST /probe wrapper. It shares the
@@ -79,19 +79,19 @@ var ErrProbeClientDisabled = errors.New("probe client: ProbeURL not configured")
 // is NOT an error — the request goes out unauthenticated and the server's 401
 // surfaces as a "non-2xx" failure, matching the other controller↔server HTTP
 // channels.
-func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (cacheserver.ProbeResult, error) {
+func (c *ProbeClient) Run(ctx context.Context, req controlplaneapi.ProbeRequest) (controlplaneapi.ProbeResult, error) {
 	if c == nil || c.ProbeURL == "" {
-		return cacheserver.ProbeResult{}, ErrProbeClientDisabled
+		return controlplaneapi.ProbeResult{}, ErrProbeClientDisabled
 	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: marshal request: %w", err)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ProbeURL, bytes.NewReader(body))
 	if err != nil {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: build request: %w", err)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -102,7 +102,7 @@ func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (ca
 	// unauthenticated. Matches CacheIndexPoller.bearerToken's posture.
 	token, tokenErr := c.bearerToken()
 	if tokenErr != nil {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: bearer token: %w", tokenErr)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: bearer token: %w", tokenErr)
 	}
 	if token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
@@ -110,7 +110,7 @@ func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (ca
 
 	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: POST %s: %w", c.ProbeURL, err)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: POST %s: %w", c.ProbeURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
@@ -118,15 +118,15 @@ func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (ca
 		// JSON error responses are bounded (a few hundred bytes), so 1 KiB
 		// is plenty of context without risking unbounded reads.
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: %s: unexpected status %d: %s",
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: %s: unexpected status %d: %s",
 			c.ProbeURL, resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
-	var result cacheserver.ProbeResult
+	var result controlplaneapi.ProbeResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: decode response: %w", err)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: decode response: %w", err)
 	}
 	// Verify the backend echo matches the request. The wire contract
-	// (pkg/server/probe.go ProbeResult) says the server echoes the
+	// (controlplaneapi.ProbeResult) says the server echoes the
 	// caller-supplied backend in the response. Without this check a
 	// miswired endpoint (operator pointed --server-probe-url at a
 	// different cluster's server, or a hand-edited proxy in the way)
@@ -136,7 +136,7 @@ func (c *ProbeClient) Run(ctx context.Context, req cacheserver.ProbeRequest) (ca
 	// per-stage outcomes. Defence in depth: HTTP succeeded, but the
 	// payload IS NOT the answer we asked about.
 	if result.Backend != req.Backend {
-		return cacheserver.ProbeResult{}, fmt.Errorf("probe client: backend mismatch — requested %q, server returned %q", req.Backend, result.Backend)
+		return controlplaneapi.ProbeResult{}, fmt.Errorf("probe client: backend mismatch — requested %q, server returned %q", req.Backend, result.Backend)
 	}
 	return result, nil
 }

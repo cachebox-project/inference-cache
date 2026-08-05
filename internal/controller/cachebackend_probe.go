@@ -14,7 +14,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // Functional-probe gate: the controller composes the in-process functional-
@@ -363,7 +363,7 @@ func evaluateFunctionalProbe(
 	// probe lands under the same engine domain a real KV event from this
 	// backend would; backendType is spec.type so the server's Stage C gate
 	// fires correctly (T2 runs only for LMCache).
-	req := cacheserver.ProbeRequest{
+	req := controlplaneapi.ProbeRequest{
 		Backend:     key,
 		Model:       probeFixedModel,
 		HashScheme:  probeHashSchemeForBackend(backend),
@@ -494,14 +494,14 @@ func requeueUntilNextProbe(lastAt time.Time, rateLimit time.Duration, now time.T
 // the order of the checks doesn't matter for correctness; ordering them
 // upstream→downstream just makes the result deterministic across releases
 // even if cascade prevention is ever loosened.
-func stageReasonAndMessage(result cacheserver.ProbeResult) (string, string) {
+func stageReasonAndMessage(result controlplaneapi.ProbeResult) (string, string) {
 	switch {
-	case result.Ingest == cacheserver.ProbeStageFailed:
-		return reasonProbeIngestFailed, errorMessageForStage(result, cacheserver.ProbeStageIngest, "in-process index ingest path is broken")
-	case result.Routing == cacheserver.ProbeStageFailed:
-		return reasonProbeRoutingFailed, errorMessageForStage(result, cacheserver.ProbeStageRouting, "index routing/key-derivation regression")
-	case result.T2 == cacheserver.ProbeStageFailed:
-		return reasonProbeT2Failed, errorMessageForStage(result, cacheserver.ProbeStageT2, "tier-2 put/get cycle failed")
+	case result.Ingest == controlplaneapi.ProbeStageFailed:
+		return reasonProbeIngestFailed, errorMessageForStage(result, controlplaneapi.ProbeStageIngest, "in-process index ingest path is broken")
+	case result.Routing == controlplaneapi.ProbeStageFailed:
+		return reasonProbeRoutingFailed, errorMessageForStage(result, controlplaneapi.ProbeStageRouting, "index routing/key-derivation regression")
+	case result.T2 == controlplaneapi.ProbeStageFailed:
+		return reasonProbeT2Failed, errorMessageForStage(result, controlplaneapi.ProbeStageT2, "tier-2 put/get cycle failed")
 	}
 	// Defensive: AllPassed already returned false but no individual stage
 	// is `failed`. Two ways this happens in practice:
@@ -514,7 +514,7 @@ func stageReasonAndMessage(result cacheserver.ProbeResult) (string, string) {
 	// pages, but the operator-visible message needs the raw per-stage
 	// strings — those are the only diagnostic the controller has when
 	// the server didn't populate the Errors slice. Format mirrors the
-	// stage-name ordering in cacheserver.ProbeResult.
+	// stage-name ordering in controlplaneapi.ProbeResult.
 	return reasonProbeError, fmt.Sprintf(
 		"probe returned an unrecognized stage outcome (ingest=%q routing=%q t2=%q); upgrade the controller if a newer server has added stages",
 		string(result.Ingest), string(result.Routing), string(result.T2),
@@ -525,7 +525,7 @@ func stageReasonAndMessage(result cacheserver.ProbeResult) (string, string) {
 // ProbeResult.Errors slice; falls back to the supplied default when the
 // server didn't populate one. The fallback is operator-actionable on its
 // own.
-func errorMessageForStage(result cacheserver.ProbeResult, stage string, fallback string) string {
+func errorMessageForStage(result controlplaneapi.ProbeResult, stage string, fallback string) string {
 	for _, e := range result.Errors {
 		if e.Stage == stage && strings.TrimSpace(e.Message) != "" {
 			return truncateMessage(e.Message)
@@ -541,7 +541,7 @@ func errorMessageForStage(result cacheserver.ProbeResult, stage string, fallback
 // body's stage names.
 //
 // Empty AND unknown stage values are coerced to "failed" — the alerting
-// contract MUST match what `cacheserver.ProbeResult.AllPassed` /
+// contract MUST match what `controlplaneapi.ProbeResult.AllPassed` /
 // `stagePassed` consider non-passing. If a malformed `{}` body, a future
 // server emitting a stage name this controller hasn't learned yet, or any
 // other non-"ok"/non-"skipped" value reaches us, `AllPassed` returns false
@@ -551,22 +551,22 @@ func errorMessageForStage(result cacheserver.ProbeResult, stage string, fallback
 // The forward-compat info (the actual wire string) is preserved in the
 // `FunctionalProbeOK` condition message, not in the metric label set
 // (keeping metric cardinality bounded).
-func recordProbeResult(backendKey string, result cacheserver.ProbeResult) {
+func recordProbeResult(backendKey string, result controlplaneapi.ProbeResult) {
 	for _, s := range []struct {
 		stage  string
-		result cacheserver.ProbeStageResult
+		result controlplaneapi.ProbeStageResult
 	}{
-		{cacheserver.ProbeStageIngest, result.Ingest},
-		{cacheserver.ProbeStageRouting, result.Routing},
-		{cacheserver.ProbeStageT2, result.T2},
+		{controlplaneapi.ProbeStageIngest, result.Ingest},
+		{controlplaneapi.ProbeStageRouting, result.Routing},
+		{controlplaneapi.ProbeStageT2, result.T2},
 	} {
 		switch s.result {
-		case cacheserver.ProbeStageOK, cacheserver.ProbeStageSkipped, cacheserver.ProbeStageFailed:
+		case controlplaneapi.ProbeStageOK, controlplaneapi.ProbeStageSkipped, controlplaneapi.ProbeStageFailed:
 			// Recognized value — emit verbatim.
 		default:
 			// Empty wire value OR a future/unknown outcome — coerce to
 			// "failed" so the alert path is honest about the unknown state.
-			s.result = cacheserver.ProbeStageFailed
+			s.result = controlplaneapi.ProbeStageFailed
 		}
 		probeResultMetric.WithLabelValues(backendKey, s.stage, string(s.result)).Inc()
 	}

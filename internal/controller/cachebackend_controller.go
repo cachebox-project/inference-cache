@@ -26,11 +26,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
 // Status condition types published on a managed CacheBackend.
@@ -397,17 +395,13 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // the selected runtime/provider adapter. Unsupported combinations also shed any
 // previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	var shippingRegistries builtinadapters.Registries
+	if r.Registry == nil || r.BackendRegistry == nil {
+		shippingRegistries = builtinadapters.New()
+	}
 	registry := r.Registry
 	if registry == nil {
-		// Mirror the MANAGED adapters the shipping cmd/controller wires so the
-		// nil-fallback manages the same backends the validator + pod webhook
-		// admit/inject: the in-package vLLM+LMCache adapter (DefaultRegistry)
-		// plus the External and SGLang adapters (subpackages DefaultRegistry
-		// can't import without a cycle).
-		registry = adapterruntime.DefaultRegistry()
-		registry.Register(externaladapter.NewAdapter())
-		registry.Register(sglangadapter.NewAdapter())
-		registry.Register(sglangadapter.NewHiCacheAdapter())
+		registry = shippingRegistries.Runtime
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	storage := backend.Spec.EffectiveRemoteStorage()
@@ -515,7 +509,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 
 	backendRegistry := r.BackendRegistry
 	if backendRegistry == nil {
-		backendRegistry = backendprovider.DefaultRegistry()
+		backendRegistry = shippingRegistries.Storage
 	}
 	provider, err := backendRegistry.Select(storage)
 	if err != nil {

@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // kvReadinessTrue is the "everything upstream said Ready=True" baseline
@@ -53,7 +53,7 @@ type fakeProbeServer struct {
 	calls atomic.Int64
 }
 
-func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest) cacheserver.ProbeResult) *fakeProbeServer {
+func newFakeProbeServer(t *testing.T, respond func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult) *fakeProbeServer {
 	t.Helper()
 	if respond == nil {
 		t.Fatalf("newFakeProbeServer: respond callback must be non-nil")
@@ -61,7 +61,7 @@ func newFakeProbeServer(t *testing.T, respond func(req cacheserver.ProbeRequest)
 	f := &fakeProbeServer{}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.calls.Add(1)
-		var req cacheserver.ProbeRequest
+		var req controlplaneapi.ProbeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -117,8 +117,8 @@ func TestProbeRateLimiterForgetDropsKey(t *testing.T) {
 // and bombarding the server for backends that can't be Ready anyway is
 // pure noise.
 func TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -142,9 +142,9 @@ func TestEvaluateFunctionalProbeUpstreamNotReadyShortCircuits(t *testing.T) {
 // FunctionalProbeOK=True with reason=ProbeBypassed and short-circuits the
 // HTTP call, so the Ready gate is unaffected and the server isn't probed.
 func TestEvaluateFunctionalProbeBypassAnnotation(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 		t.Fatalf("probe call should be skipped when bypassed")
-		return cacheserver.ProbeResult{}
+		return controlplaneapi.ProbeResult{}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -167,8 +167,8 @@ func TestEvaluateFunctionalProbeBypassAnnotation(t *testing.T) {
 // (capitalized, whitespace, "1", "yes") leaves the gate enabled, so a
 // fat-fingered annotation can't quietly disable the gate.
 func TestEvaluateFunctionalProbeBypassParserIsStrict(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -200,8 +200,8 @@ func TestEvaluateFunctionalProbeNilClientDisabled(t *testing.T) {
 // rate-limit: a successful call records a timestamp; a second invocation
 // inside the window skips the HTTP call and inherits the condition.
 func TestEvaluateFunctionalProbeRateLimit(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{Backend: "team-a/cb", Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{Backend: "team-a/cb", Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 	limiter := &probeRateLimiter{}
@@ -253,10 +253,10 @@ func TestEvaluateFunctionalProbeRateLimit(t *testing.T) {
 // upstream KV gate's Ready=True/KVEventsObserved, and the operator-visible
 // signal would mislead.
 func TestEvaluateFunctionalProbeRateLimitedFailurePreservesDowngrade(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{
-			Ingest: cacheserver.ProbeStageFailed, Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
-			Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "broken"}},
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{
+			Ingest: controlplaneapi.ProbeStageFailed, Routing: controlplaneapi.ProbeStageSkipped, T2: controlplaneapi.ProbeStageSkipped,
+			Errors: []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageIngest, Message: "broken"}},
 		}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
@@ -419,40 +419,40 @@ func TestEvaluateFunctionalProbeDisabledCleansEvenWhenUpstreamNotReady(t *testin
 func TestEvaluateFunctionalProbeStageFailureDowngradesReady(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
-		result     cacheserver.ProbeResult
+		result     controlplaneapi.ProbeResult
 		wantReason string
 		wantMsg    string
 	}{
 		{
 			name: "ingest failed",
-			result: cacheserver.ProbeResult{
-				Ingest: cacheserver.ProbeStageFailed, Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
-				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "synthesized event did not land"}},
+			result: controlplaneapi.ProbeResult{
+				Ingest: controlplaneapi.ProbeStageFailed, Routing: controlplaneapi.ProbeStageSkipped, T2: controlplaneapi.ProbeStageSkipped,
+				Errors: []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageIngest, Message: "synthesized event did not land"}},
 			},
 			wantReason: reasonProbeIngestFailed,
 			wantMsg:    "synthesized event did not land",
 		},
 		{
 			name: "routing failed",
-			result: cacheserver.ProbeResult{
-				Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageFailed, T2: cacheserver.ProbeStageSkipped,
-				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageRouting, Message: "LookupRoute returned NO_HINT"}},
+			result: controlplaneapi.ProbeResult{
+				Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageFailed, T2: controlplaneapi.ProbeStageSkipped,
+				Errors: []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageRouting, Message: "LookupRoute returned NO_HINT"}},
 			},
 			wantReason: reasonProbeRoutingFailed,
 			wantMsg:    "LookupRoute returned NO_HINT",
 		},
 		{
 			name: "t2 failed",
-			result: cacheserver.ProbeResult{
-				Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageFailed,
-				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageT2, Message: "put failed: connection refused"}},
+			result: controlplaneapi.ProbeResult{
+				Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageFailed,
+				Errors: []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageT2, Message: "put failed: connection refused"}},
 			},
 			wantReason: reasonProbeT2Failed,
 			wantMsg:    "put failed: connection refused",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult { return tc.result })
+			srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult { return tc.result })
 			client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
 			v := evaluateFunctionalProbe(context.Background(), newProbeBackend("cb"), kvReadinessTrue,
@@ -477,10 +477,10 @@ func TestEvaluateFunctionalProbeStageFailureDowngradesReady(t *testing.T) {
 // stage `ok` (or `skipped`) → FunctionalProbeOK=True with reason=ProbeOK
 // and no Ready downgrade.
 func TestEvaluateFunctionalProbeAllPassedWritesOK(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{
-			Backend: "team-a/cb", Ingest: cacheserver.ProbeStageOK,
-			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{
+			Backend: "team-a/cb", Ingest: controlplaneapi.ProbeStageOK,
+			Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped,
 		}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
@@ -536,13 +536,13 @@ func TestEvaluateFunctionalProbeHTTPErrorDoesNotRateLimit(t *testing.T) {
 		// helper enforces. Inline httptest server here (not the
 		// helper) because the test toggles between failing and
 		// succeeding responses across probe calls.
-		var req cacheserver.ProbeRequest
+		var req controlplaneapi.ProbeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cacheserver.ProbeResult{Backend: req.Backend, Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped})
+		_ = json.NewEncoder(w).Encode(controlplaneapi.ProbeResult{Backend: req.Backend, Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped})
 	}))
 	defer srv.Close()
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
@@ -566,10 +566,10 @@ func TestEvaluateFunctionalProbeHTTPErrorDoesNotRateLimit(t *testing.T) {
 // the lowercased engine value with vllm as the default; backendType is
 // the spec.type string.
 func TestEvaluateFunctionalProbeRequestShape(t *testing.T) {
-	var seen cacheserver.ProbeRequest
-	srv := newFakeProbeServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
+	var seen controlplaneapi.ProbeRequest
+	srv := newFakeProbeServer(t, func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 		seen = req
-		return cacheserver.ProbeResult{Backend: req.Backend, Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+		return controlplaneapi.ProbeResult{Backend: req.Backend, Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
@@ -635,10 +635,10 @@ func stringPtr(s string) *string { return &s }
 // tuple, must NOT cause a spurious failure.
 func TestProbeResultMetricEmitsPerStage(t *testing.T) {
 	const backendKey = "team-a/cb-metric"
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
-		return cacheserver.ProbeResult{
-			Backend: backendKey, Ingest: cacheserver.ProbeStageOK,
-			Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+		return controlplaneapi.ProbeResult{
+			Backend: backendKey, Ingest: controlplaneapi.ProbeStageOK,
+			Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped,
 		}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
@@ -651,9 +651,9 @@ func TestProbeResultMetricEmitsPerStage(t *testing.T) {
 		stage, result string
 	}
 	stages := []stageCheck{
-		{cacheserver.ProbeStageIngest, "ok"},
-		{cacheserver.ProbeStageRouting, "ok"},
-		{cacheserver.ProbeStageT2, "skipped"},
+		{controlplaneapi.ProbeStageIngest, "ok"},
+		{controlplaneapi.ProbeStageRouting, "ok"},
+		{controlplaneapi.ProbeStageT2, "skipped"},
 	}
 	before := make(map[stageCheck]float64, len(stages))
 	for _, s := range stages {
@@ -690,7 +690,7 @@ func metricCounter(t *testing.T, backend, stage, result string) float64 {
 
 // TestRecordProbeResultCoercesEmptyAndUnknownToFailed pins the
 // alerting-contract invariant: any stage value that
-// cacheserver.ProbeResult.AllPassed considers non-passing (empty wire
+// controlplaneapi.ProbeResult.AllPassed considers non-passing (empty wire
 // value, or an unrecognized future outcome) MUST land on the metric as
 // result="failed", NOT result="skipped". A malformed 200 {} response
 // would otherwise be invisible to ServerProbeFail even though
@@ -702,9 +702,9 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 	cases := []struct {
 		name     string
 		backend  string
-		ingest   cacheserver.ProbeStageResult
-		routing  cacheserver.ProbeStageResult
-		t2       cacheserver.ProbeStageResult
+		ingest   controlplaneapi.ProbeStageResult
+		routing  controlplaneapi.ProbeStageResult
+		t2       controlplaneapi.ProbeStageResult
 		expected map[string]string // stage → recorded result label
 	}{
 		{
@@ -712,29 +712,29 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 			backend: "team-a/cb-empty-coerce",
 			ingest:  "", routing: "", t2: "",
 			expected: map[string]string{
-				cacheserver.ProbeStageIngest:  "failed",
-				cacheserver.ProbeStageRouting: "failed",
-				cacheserver.ProbeStageT2:      "failed",
+				controlplaneapi.ProbeStageIngest:  "failed",
+				controlplaneapi.ProbeStageRouting: "failed",
+				controlplaneapi.ProbeStageT2:      "failed",
 			},
 		},
 		{
 			name:    "unknown future outcome coerces to failed",
 			backend: "team-a/cb-unknown-coerce",
-			ingest:  cacheserver.ProbeStageResult("throttled"), routing: cacheserver.ProbeStageOK, t2: cacheserver.ProbeStageSkipped,
+			ingest:  controlplaneapi.ProbeStageResult("throttled"), routing: controlplaneapi.ProbeStageOK, t2: controlplaneapi.ProbeStageSkipped,
 			expected: map[string]string{
-				cacheserver.ProbeStageIngest:  "failed", // coerced
-				cacheserver.ProbeStageRouting: "ok",
-				cacheserver.ProbeStageT2:      "skipped",
+				controlplaneapi.ProbeStageIngest:  "failed", // coerced
+				controlplaneapi.ProbeStageRouting: "ok",
+				controlplaneapi.ProbeStageT2:      "skipped",
 			},
 		},
 		{
 			name:    "recognized failed passes through verbatim",
 			backend: "team-a/cb-failed-passthrough",
-			ingest:  cacheserver.ProbeStageOK, routing: cacheserver.ProbeStageFailed, t2: cacheserver.ProbeStageSkipped,
+			ingest:  controlplaneapi.ProbeStageOK, routing: controlplaneapi.ProbeStageFailed, t2: controlplaneapi.ProbeStageSkipped,
 			expected: map[string]string{
-				cacheserver.ProbeStageIngest:  "ok",
-				cacheserver.ProbeStageRouting: "failed",
-				cacheserver.ProbeStageT2:      "skipped",
+				controlplaneapi.ProbeStageIngest:  "ok",
+				controlplaneapi.ProbeStageRouting: "failed",
+				controlplaneapi.ProbeStageT2:      "skipped",
 			},
 		},
 	}
@@ -744,7 +744,7 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 			// can assert both "the expected label incremented by 1" AND
 			// "the other two labels did NOT" — the regression Codex
 			// flagged was the wrong label increment, not a missed one.
-			stages := []string{cacheserver.ProbeStageIngest, cacheserver.ProbeStageRouting, cacheserver.ProbeStageT2}
+			stages := []string{controlplaneapi.ProbeStageIngest, controlplaneapi.ProbeStageRouting, controlplaneapi.ProbeStageT2}
 			results := []string{"ok", "skipped", "failed"}
 			before := make(map[string]float64, len(stages)*len(results))
 			for _, stg := range stages {
@@ -753,7 +753,7 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 				}
 			}
 
-			recordProbeResult(tc.backend, cacheserver.ProbeResult{
+			recordProbeResult(tc.backend, controlplaneapi.ProbeResult{
 				Ingest: tc.ingest, Routing: tc.routing, T2: tc.t2,
 			})
 
@@ -784,9 +784,9 @@ func TestRecordProbeResultCoercesEmptyAndUnknownToFailed(t *testing.T) {
 func TestStageReasonAndMessageUnrecognizedIncludesRawValues(t *testing.T) {
 	cases := []struct {
 		name           string
-		ingest         cacheserver.ProbeStageResult
-		routing        cacheserver.ProbeStageResult
-		t2             cacheserver.ProbeStageResult
+		ingest         controlplaneapi.ProbeStageResult
+		routing        controlplaneapi.ProbeStageResult
+		t2             controlplaneapi.ProbeStageResult
 		expectContains []string // substrings the operator-facing message MUST include
 	}{
 		{
@@ -796,13 +796,13 @@ func TestStageReasonAndMessageUnrecognizedIncludesRawValues(t *testing.T) {
 		},
 		{
 			name:   "unrecognized future outcome on one stage",
-			ingest: cacheserver.ProbeStageResult("throttled"), routing: cacheserver.ProbeStageOK, t2: cacheserver.ProbeStageSkipped,
+			ingest: controlplaneapi.ProbeStageResult("throttled"), routing: controlplaneapi.ProbeStageOK, t2: controlplaneapi.ProbeStageSkipped,
 			expectContains: []string{`ingest="throttled"`, `routing="ok"`, `t2="skipped"`, "unrecognized"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, msg := stageReasonAndMessage(cacheserver.ProbeResult{
+			reason, msg := stageReasonAndMessage(controlplaneapi.ProbeResult{
 				Ingest: tc.ingest, Routing: tc.routing, T2: tc.t2,
 			})
 			if reason != reasonProbeError {
@@ -821,9 +821,9 @@ func TestStageReasonAndMessageUnrecognizedIncludesRawValues(t *testing.T) {
 // cancelled context surfaces as an HTTP error (Unknown), not a panic or a
 // silent True.
 func TestEvaluateFunctionalProbeContextCancellation(t *testing.T) {
-	srv := newFakeProbeServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+	srv := newFakeProbeServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 		time.Sleep(50 * time.Millisecond)
-		return cacheserver.ProbeResult{Ingest: cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped}
+		return controlplaneapi.ProbeResult{Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	})
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 

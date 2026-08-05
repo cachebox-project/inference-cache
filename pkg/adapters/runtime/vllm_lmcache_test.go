@@ -909,10 +909,10 @@ func TestVLLMLMCacheEngineContainerName(t *testing.T) {
 	}
 }
 
-func TestDefaultRegistryResolvesVLLMLMCache(t *testing.T) {
-	r := DefaultRegistry()
+func TestNewCoreRegistryResolvesVLLMLMCache(t *testing.T) {
+	r := NewCoreRegistry()
 	if r.Len() == 0 {
-		t.Fatalf("DefaultRegistry has no adapters")
+		t.Fatalf("NewCoreRegistry has no adapters")
 	}
 	got, err := r.Select(RuntimeVLLM, newLMCacheBackend(nil))
 	if err != nil {

@@ -13,9 +13,8 @@
 // bearing one: without this adapter the webhook fail-opens an unwired
 // engine pod and the External cache never receives traffic.
 //
-// To keep cmd/controller's single Registry the source of truth for "which
-// adapters this build ships", cmd/controller registers this adapter on top
-// of runtime.DefaultRegistry(). It deliberately is NOT registered by
-// DefaultRegistry itself — DefaultRegistry lives in package runtime and
-// this package imports runtime, so a reciprocal import would cycle.
+// internal/adapters/builtin is the composition root for the shipping registry.
+// This adapter cannot register itself in package runtime because this package
+// imports runtime for the extension contract, so a reciprocal import would
+// cycle.
 package external

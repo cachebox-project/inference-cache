@@ -3,14 +3,14 @@
 // It is the SGLang sibling of the in-tree vLLM+LMCache adapter
 // (pkg/adapters/runtime) and the External passthrough adapter
 // (pkg/adapters/runtime/external): a separate package, gated on the SGLang
-// runtime id, registered alongside the others in cmd/controller and both
-// admission/pod webhooks.
+// runtime id, registered alongside the others by internal/adapters/builtin.
 //
 // Owner: the controller. Like external, this package imports its parent
 // pkg/adapters/runtime for the [runtime.KVCacheRuntimeAdapter] interface and
 // the [runtime.RuntimeID] constants, so it cannot be registered inside
-// runtime.DefaultRegistry without an import cycle — the three production wiring
-// sites add them explicitly (see [NewAdapter] and [NewHiCacheAdapter]).
+// runtime.NewCoreRegistry without an import cycle. The built-in composition
+// root adds them once for every production and nil-fallback path (see
+// [NewAdapter] and [NewHiCacheAdapter]).
 //
 // SGLang adopted vLLM's KV-event wire wholesale: --kv-events-config drives a
 // ZmqEventPublisher emitting the same msgspec array-like BlockStored /

@@ -25,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
@@ -506,7 +506,7 @@ func matchLabelsSelects(want, have map[string]string) bool {
 //     mirroring the webhook's first-match rule but ordered deterministically
 //     by name so the poller is stable across restarts.
 func (p *CacheIndexPoller) attributePod(pod *corev1.Pod, nsBackends []int, byNSName map[types.NamespacedName]int, items []cachev1alpha1.CacheBackend) int {
-	if raw := pod.Annotations[podwebhook.AnnotationInjectedBy]; raw != "" {
+	if raw := pod.Annotations[enginebinding.AnnotationInjectedBy]; raw != "" {
 		ns, name, ok := strings.Cut(raw, "/")
 		if ok && ns == pod.Namespace {
 			if idx, found := byNSName[types.NamespacedName{Namespace: ns, Name: name}]; found {

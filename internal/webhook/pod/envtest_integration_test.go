@@ -96,7 +96,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
 		Handler: &EngineInjector{
 			Reader: mgr.GetAPIReader(),
-			Registry: adapterruntime.DefaultRegistry(
+			Registry: adapterruntime.NewCoreRegistry(
 				adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 			),
 		},

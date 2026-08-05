@@ -84,7 +84,8 @@ the operator CLI and the CRDs.
 **`inferencecache-controller`** (`cmd/controller`) — watches CRDs and provisions cache backends
 - `cmd/controller/` — controller-runtime manager entrypoint
 - `internal/controller/` — reconcilers
-- `pkg/adapters/runtime/` — `KVCacheRuntimeAdapter`s render the cache-server pod/service and inject engine/router pod config; the reconciler drives them through the in-package `Registry`
+- `internal/adapters/builtin/` — the complete shipping adapter composition used by the controller and webhooks
+- `pkg/adapters/{backend,runtime}/` — extension contracts; built-in implementations are being migrated under `internal/adapters/`
 
 **`inferencecache-server`** (`cmd/server`) — gRPC policy server + cache-state index + metrics
 - `cmd/server/` — gRPC + HTTP server entrypoint
@@ -99,6 +100,11 @@ the operator CLI and the CRDs.
 - `pkg/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
 
 **Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
+
+Private cross-binary HTTP DTOs live in `internal/controlplaneapi/`; pod-binding
+metadata shared by admission and reconcilers lives in `internal/enginebinding/`.
+See [Repository boundaries](docs/design/repository-boundaries.md) for the
+dependency rules and staged migration map.
 
 ## Quick Start
 

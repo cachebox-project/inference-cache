@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
@@ -78,7 +79,7 @@ import (
 // supplied tenant — the reservation is enforced server-side, never trusted
 // from the request — so a real workload cannot read or write probe entries by
 // spoofing the tenant id.
-const ProbeTenantID = "inferencecache.io/probe"
+const ProbeTenantID = controlplaneapi.ProbeTenantID
 
 // ProbeReplicaPrefix is the literal prefix every probe replica id starts with.
 // Real subscribers set replica_id = pod-name; Kubernetes pod names are RFC
@@ -87,28 +88,28 @@ const ProbeTenantID = "inferencecache.io/probe"
 // legitimate replica id. Cleanup keys on this prefix (and the probe tenant +
 // backend-derived suffix) to wipe ONLY the probe's own state on each Run,
 // never a real replica's entries.
-const ProbeReplicaPrefix = "__probe-"
+const ProbeReplicaPrefix = controlplaneapi.ProbeReplicaPrefix
 
 // ProbeTokenCount is the per-block token count carried by the synthesized
 // BlockStored. 16 is the smallest unit a vLLM-class engine reports
 // (one KV block) — small enough that the probe payload stays trivial in the
 // index even if cleanup is somehow skipped, but non-zero so the LookupRoute
 // ranker treats it as a real prefix hit.
-const ProbeTokenCount = int32(16)
+const ProbeTokenCount = controlplaneapi.ProbeTokenCount
 
 // ProbeStageResult is the per-stage outcome encoded in the JSON ProbeResult
 // the controller reads. Strings (not enums) so the wire stays stable when
 // new outcomes appear — same forward-compat reasoning as gRPC reason_code.
-type ProbeStageResult string
+type ProbeStageResult = controlplaneapi.ProbeStageResult
 
 // Possible per-stage outcomes. "skipped" applies to a stage the probe chose
 // not to run (T2 on a non-LMCache backend, or any downstream stage when an
 // upstream stage failed — running them would surface a cascade of false
 // failures that masks the real one).
 const (
-	ProbeStageOK      ProbeStageResult = "ok"
-	ProbeStageFailed  ProbeStageResult = "failed"
-	ProbeStageSkipped ProbeStageResult = "skipped"
+	ProbeStageOK      = controlplaneapi.ProbeStageOK
+	ProbeStageFailed  = controlplaneapi.ProbeStageFailed
+	ProbeStageSkipped = controlplaneapi.ProbeStageSkipped
 )
 
 // Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
@@ -118,9 +119,9 @@ const (
 // probe-tenant messages by design). See the file-top doc for what a Stage
 // A pass/fail does and does not prove.
 const (
-	ProbeStageIngest  = "ingest"
-	ProbeStageRouting = "routing"
-	ProbeStageT2      = "t2"
+	ProbeStageIngest  = controlplaneapi.ProbeStageIngest
+	ProbeStageRouting = controlplaneapi.ProbeStageRouting
+	ProbeStageT2      = controlplaneapi.ProbeStageT2
 )
 
 // BackendTypeLMCache is the spec.type value that gates Stage C. The probe
@@ -136,7 +137,7 @@ const (
 // kubebuilder marker). Operators who run the probe by hand against a non-
 // LMCache backend must set BackendType explicitly; the CacheBackend
 // reconciler always reads spec.type from the CR and never sends empty.
-const BackendTypeLMCache = "LMCache"
+const BackendTypeLMCache = controlplaneapi.BackendTypeLMCache
 
 // ProbeRequest carries the parameters the probe needs to synthesize a
 // deterministic round-trip. The tenant_id is NOT a request field — it is
@@ -157,12 +158,7 @@ const BackendTypeLMCache = "LMCache"
 // under (so a probe for the vllm adapter cannot collide with a probe for
 // the sglang adapter on the same backend). BackendType decides whether
 // Stage C runs.
-type ProbeRequest struct {
-	Backend     string `json:"backend"`
-	Model       string `json:"model"`
-	HashScheme  string `json:"hashScheme"`
-	BackendType string `json:"backendType,omitempty"`
-}
+type ProbeRequest = controlplaneapi.ProbeRequest
 
 // ProbeResult is the per-stage outcome returned to the controller. The
 // CacheBackend reconciler maps a stage's failed result onto the
@@ -174,46 +170,11 @@ type ProbeRequest struct {
 //
 // Errors carries a stage-keyed message so the operator-visible condition
 // surfaces a concrete diagnostic, not just "something failed".
-type ProbeResult struct {
-	Backend string            `json:"backend"`
-	Ingest  ProbeStageResult  `json:"ingest"`
-	Routing ProbeStageResult  `json:"routing"`
-	T2      ProbeStageResult  `json:"t2"`
-	Errors  []ProbeStageError `json:"errors,omitempty"`
-}
+type ProbeResult = controlplaneapi.ProbeResult
 
 // ProbeStageError names one stage's failure mode in operator-readable form.
 // Stage is one of ProbeStageIngest / ProbeStageRouting / ProbeStageT2.
-type ProbeStageError struct {
-	Stage   string `json:"stage"`
-	Message string `json:"message"`
-}
-
-// AllPassed reports whether every stage either passed or was intentionally
-// skipped (every stage has an explicit ok|skipped value, none is failed and
-// none is the zero-value empty string). The HTTP /probe handler ALWAYS
-// returns the full ProbeResult as JSON (HTTP 200 — the call itself
-// succeeded), and the CacheBackend reconciler reads AllPassed to flip the
-// FunctionalProbeOK condition (see
-// internal/controller/cachebackend_probe.go). The predicate is exported
-// so the caller doesn't have to re-derive the "passed?" definition from
-// the per-stage fields — keeping the definition single-sourced here means
-// a future stage rename can't drift between server and controller.
-//
-// The zero-value-fails-closed property matters: a partially-decoded result
-// (the JSON envelope was truncated, a future field was renamed, the caller
-// constructed a ProbeResult{} without running anything) MUST NOT pass —
-// "no information" is not the same as "all three stages passed."
-func (r ProbeResult) AllPassed() bool {
-	return stagePassed(r.Ingest) && stagePassed(r.Routing) && stagePassed(r.T2)
-}
-
-// stagePassed returns true only for an explicit ok or skipped — empty
-// string (zero value, unrecognized future outcome) AND failed both return
-// false. Keeps AllPassed's three-stage check readable as one predicate.
-func stagePassed(s ProbeStageResult) bool {
-	return s == ProbeStageOK || s == ProbeStageSkipped
-}
+type ProbeStageError = controlplaneapi.ProbeStageError
 
 // T2Prober drives a put/get round trip against an external tier-2 backend
 // (today: LMCache). The controller-side caller is already wired (see

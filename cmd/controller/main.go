@@ -18,12 +18,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/controller"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
@@ -122,44 +121,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// One Registry shared by the reconciler, the pod-mutating webhook,
-	// and the CacheBackend validating webhook. Building it here keeps the
-	// three call sites in agreement: whatever pair the validator admits,
-	// the reconciler will be able to render and the pod webhook will be
-	// able to inject. Adding a new adapter is a registry change in this
-	// one place, not three separate registrations across the call sites
-	// (import-cycle-bound adapters like External and SGLang below still
-	// take their own Register call here rather than living in DefaultRegistry).
+	// One complete built-in composition shared by the reconciler and both
+	// webhooks. Whatever admission accepts is therefore renderable and
+	// injectable without each caller remembering extra registrations.
 	//
 	// The kvevent-subscriber sidecar image + policy-server gRPC
 	// address are operator-supplied: pinning the image to a digest in
 	// production and pointing the sidecar at the right Service DNS are
 	// deployment concerns, not CR-level knobs.
-	adapterRegistry := adapterruntime.DefaultRegistry(
+	adapterRegistries := builtinadapters.New(
 		adapterruntime.WithSubscriberImage(opts.subscriberImage),
 		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
 	)
-	// External backends point at a pre-existing remote cache the operator
-	// manages themselves; the adapter wires engine pods to spec.endpoint
-	// via the LMCache wire format without provisioning a cache server.
-	// Registered here (not inside DefaultRegistry) because the package
-	// lives under pkg/adapters/runtime/external — runtime importing it
-	// would cycle. See pkg/adapters/runtime/external/doc.go.
-	adapterRegistry.Register(externaladapter.NewAdapter())
-	// SGLang+LMCache: the second-engine sibling of the vLLM+LMCache adapter.
-	// Registered here (not inside DefaultRegistry) for the same import-cycle
-	// reason as External. It needs the same subscriber-image + policy-server
-	// options the vLLM adapter got so its auto-attached kvevent-subscriber
-	// sidecar (tagged --hash-scheme=sglang) reaches the policy server with the
-	// operator's deployment wiring. See pkg/adapters/runtime/sglang/doc.go.
-	adapterRegistry.Register(sglangadapter.NewAdapter(
-		adapterruntime.WithSubscriberImage(opts.subscriberImage),
-		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
-	))
-	adapterRegistry.Register(sglangadapter.NewHiCacheAdapter(
-		adapterruntime.WithSubscriberImage(opts.subscriberImage),
-		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
-	))
+	adapterRegistry := adapterRegistries.Runtime
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.
 	// An empty ProbeURL disables the gate — useful for local-dev runs that
@@ -169,13 +143,14 @@ func main() {
 	probeClient := &controller.ProbeClient{ProbeURL: opts.serverProbeURL}
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Log:         ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder:    mgr.GetEventRecorder("cachebackend-controller"),
-		APIReader:   mgr.GetAPIReader(),
-		Registry:    adapterRegistry,
-		ProbeClient: probeClient,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Log:             ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:        mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader:       mgr.GetAPIReader(),
+		Registry:        adapterRegistry,
+		BackendRegistry: adapterRegistries.Storage,
+		ProbeClient:     probeClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)

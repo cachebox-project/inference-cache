@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // TestIntegrationFunctionalProbeGate exercises the controller-side probe
@@ -36,13 +36,13 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 
 	t.Run("happy path writes ProbeOK and keeps Ready=True", func(t *testing.T) {
 		var calls atomic.Int64
-		srv := newProbeIntegrationServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		srv := newProbeIntegrationServer(t, func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 			calls.Add(1)
-			return cacheserver.ProbeResult{
+			return controlplaneapi.ProbeResult{
 				Backend: req.Backend,
-				Ingest:  cacheserver.ProbeStageOK,
-				Routing: cacheserver.ProbeStageOK,
-				T2:      cacheserver.ProbeStageSkipped,
+				Ingest:  controlplaneapi.ProbeStageOK,
+				Routing: controlplaneapi.ProbeStageOK,
+				T2:      controlplaneapi.ProbeStageSkipped,
 			}
 		})
 		r := &CacheBackendReconciler{
@@ -74,13 +74,13 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 	})
 
 	t.Run("ingest failure downgrades Ready with ProbeIngestFailed", func(t *testing.T) {
-		srv := newProbeIntegrationServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
-			return cacheserver.ProbeResult{
+		srv := newProbeIntegrationServer(t, func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+			return controlplaneapi.ProbeResult{
 				Backend: req.Backend,
-				Ingest:  cacheserver.ProbeStageFailed,
-				Routing: cacheserver.ProbeStageSkipped,
-				T2:      cacheserver.ProbeStageSkipped,
-				Errors:  []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "synthesized event not in index"}},
+				Ingest:  controlplaneapi.ProbeStageFailed,
+				Routing: controlplaneapi.ProbeStageSkipped,
+				T2:      controlplaneapi.ProbeStageSkipped,
+				Errors:  []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageIngest, Message: "synthesized event not in index"}},
 			}
 		})
 		r := &CacheBackendReconciler{
@@ -119,12 +119,12 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 		// re-apply the Ready downgrade — otherwise the upstream KV gate's
 		// Ready=True silently overwrites the failure verdict.
 		var calls atomic.Int64
-		srv := newProbeIntegrationServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		srv := newProbeIntegrationServer(t, func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 			calls.Add(1)
-			return cacheserver.ProbeResult{
-				Backend: req.Backend, Ingest: cacheserver.ProbeStageFailed,
-				Routing: cacheserver.ProbeStageSkipped, T2: cacheserver.ProbeStageSkipped,
-				Errors: []cacheserver.ProbeStageError{{Stage: cacheserver.ProbeStageIngest, Message: "synthesized event not in index"}},
+			return controlplaneapi.ProbeResult{
+				Backend: req.Backend, Ingest: controlplaneapi.ProbeStageFailed,
+				Routing: controlplaneapi.ProbeStageSkipped, T2: controlplaneapi.ProbeStageSkipped,
+				Errors: []controlplaneapi.ProbeStageError{{Stage: controlplaneapi.ProbeStageIngest, Message: "synthesized event not in index"}},
 			}
 		})
 		r := &CacheBackendReconciler{
@@ -158,10 +158,10 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 
 	t.Run("annotation bypass keeps Ready=True without calling /probe", func(t *testing.T) {
 		var calls atomic.Int64
-		srv := newProbeIntegrationServer(t, func(cacheserver.ProbeRequest) cacheserver.ProbeResult {
+		srv := newProbeIntegrationServer(t, func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 			calls.Add(1)
 			t.Fatalf("server reached despite bypass annotation")
-			return cacheserver.ProbeResult{}
+			return controlplaneapi.ProbeResult{}
 		})
 		r := &CacheBackendReconciler{
 			Client: k8s, Scheme: scheme, Log: logr.Discard(),
@@ -219,10 +219,10 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 	})
 
 	t.Run("cleanup removes FunctionalProbeOK alongside the other conditions", func(t *testing.T) {
-		srv := newProbeIntegrationServer(t, func(req cacheserver.ProbeRequest) cacheserver.ProbeResult {
-			return cacheserver.ProbeResult{
+		srv := newProbeIntegrationServer(t, func(req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
+			return controlplaneapi.ProbeResult{
 				Backend: req.Backend,
-				Ingest:  cacheserver.ProbeStageOK, Routing: cacheserver.ProbeStageOK, T2: cacheserver.ProbeStageSkipped,
+				Ingest:  controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped,
 			}
 		})
 		r := &CacheBackendReconciler{
@@ -268,10 +268,10 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 // newProbeIntegrationServer returns an httptest.Server that responds to
 // POST /probe with whatever ProbeResult the callback produces, mirroring
 // the server-side handler's JSON contract.
-func newProbeIntegrationServer(t *testing.T, respond func(cacheserver.ProbeRequest) cacheserver.ProbeResult) *httptest.Server {
+func newProbeIntegrationServer(t *testing.T, respond func(controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req cacheserver.ProbeRequest
+		var req controlplaneapi.ProbeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

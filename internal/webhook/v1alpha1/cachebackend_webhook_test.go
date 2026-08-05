@@ -2271,7 +2271,7 @@ func (stubExternalAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 
 // stubRegistry returns a Registry with the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
-// adapterruntime.DefaultRegistry() composition, so they keep passing if a
+// builtin adapter composition, so they keep passing if a
 // future adapter joins or leaves the default set. An External-specific
 // runtime adapter is added by stubRegistryWithExternal so tests that
 // exercise admission of External CRs run against both adapters the
