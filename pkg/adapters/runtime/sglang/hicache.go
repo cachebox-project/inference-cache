@@ -434,9 +434,8 @@ func planHiCacheNFSWiring(
 		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: file binding requires NFS mount configuration")
 	}
 	nfs := binding.NFS
-	if strings.TrimSpace(nfs.Server) == "" || nfs.Server != strings.TrimSpace(nfs.Server) ||
-		strings.ContainsAny(nfs.Server, "/ \t\r\n") || strings.Contains(nfs.Server, "://") {
-		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: NFS server must be a hostname or IP address without a scheme, path, or whitespace")
+	if err := backendadapter.ValidateNFSServer(nfs.Server); err != nil {
+		return hiCacheNFSWiringPlan{}, fmt.Errorf("inject SGLang HiCache config: %w", err)
 	}
 	if err := validateHiCachePath(nfs.Path, "remoteStorage.nfs.path", true); err != nil {
 		return hiCacheNFSWiringPlan{}, err

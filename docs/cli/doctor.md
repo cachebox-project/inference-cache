@@ -97,7 +97,10 @@ Notes:
   it has no endpoint and is diagnosed through the same engine-pod and index
   axes as host-only caching. Passing those observable axes emits `CB008` INFO,
   not `CB006` OK, because inference-cache does not probe the NFS mount or the
-  HiCache L3 store/read data path.
+  HiCache L3 store/read data path. An explicit non-`True` `Ready` condition
+  still wins and is reported as `CB001`; the controller uses that condition to
+  expose adapter/provider capability rejection for stored or admission-bypassed
+  resources, so doctor does not maintain its own combination whitelist.
 - **Host-only backends** (no `spec.remoteStorage`) retain the managed engine
   and index checks but skip endpoint reachability (`CB005`), because they have
   no provider endpoint to publish or dial.

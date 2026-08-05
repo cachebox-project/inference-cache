@@ -682,6 +682,34 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("controller-rejected NFS binding reports Ready failure instead of unverified", func(t *testing.T) {
+		cb := healthyBackend(now)
+		cb.Name = "unsupported-nfs"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			NFS: &cachev1alpha1.NFSRemoteStorageSpec{
+				Server:    "192.0.2.10",
+				Path:      "/lmcache",
+				MountPath: "/mnt/lmcache",
+			},
+		}
+		cb.Status.Endpoint = ""
+		cb.Status.Conditions = []metav1.Condition{
+			readyCond(metav1.ConditionFalse, "UnsupportedRemoteBinding", "vLLM LMCache does not accept file binding"),
+		}
+
+		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, badDial)
+		if f := hasCode(fs, doctor.CodeBackendNotReady); f == nil || !strings.Contains(f.Message, "UnsupportedRemoteBinding") {
+			t.Fatalf("controller-rejected NFS should surface CB001 with controller reason, got %v", fs)
+		}
+		if hasCode(fs, doctor.CodeBackendNFSUnverified) != nil {
+			t.Fatalf("controller-rejected NFS must not report CB008, got %v", codesOf(fs))
+		}
+	})
+
 	t.Run("selectorless managed backend skips the matched-pods axis", func(t *testing.T) {
 		cb := healthyBackend(now)
 		cb.Spec.EngineSelector = nil

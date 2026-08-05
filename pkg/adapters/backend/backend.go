@@ -6,8 +6,11 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
@@ -29,6 +32,23 @@ type NFSBinding struct {
 	Server    string
 	Path      string
 	MountPath string
+}
+
+// ValidateNFSServer enforces the hostname/IP portion of the shared NFS
+// binding contract. Admission and runtime adapters both call this helper so a
+// stored or admission-bypassed CacheBackend cannot reach pod injection with a
+// server value the validating webhook would reject.
+func ValidateNFSServer(server string) error {
+	switch {
+	case strings.TrimSpace(server) == "":
+		return errors.New("NFS server must not be empty")
+	case server != strings.TrimSpace(server):
+		return errors.New("NFS server must not contain surrounding whitespace")
+	case net.ParseIP(server) == nil && len(validation.IsDNS1123Subdomain(server)) != 0:
+		return errors.New("NFS server must be a valid IPv4 address, IPv6 address, or DNS-1123 hostname")
+	default:
+		return nil
+	}
 }
 
 // Binding is the structured connection information an engine adapter accepts.

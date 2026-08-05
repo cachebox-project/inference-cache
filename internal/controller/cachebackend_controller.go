@@ -33,13 +33,14 @@ import (
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
 
-// Status condition types published on a managed CacheBackend.
+// Status condition types published on a CacheBackend.
 //
 // Ready reports whether the managed backend workload is currently serving
 // (gated by the KV-event readiness gate — see evaluateKVEventReadiness).
 // Progressing reports whether the controller is still driving the live state
 // toward the desired state (template render, child apply, rollout in flight,
-// awaiting first KV event). Degraded reports a terminal unhealthy state.
+// awaiting first KV event). Degraded reports a terminal unhealthy state,
+// including a stored configuration the registered capabilities reject.
 // Ready + Progressing together tell a still-converging backend
 // (Ready=False, Progressing=True) apart from a stuck/degraded one
 // (Ready=False, Progressing=False); Degraded names the specific failure.
@@ -47,9 +48,9 @@ const (
 	conditionTypeReady       = "Ready"
 	conditionTypeProgressing = "Progressing"
 	// Degraded is published alongside Ready. It is True only when the
-	// backend is in a genuinely degraded terminal state (rolled out but
-	// replicas unavailable, or the workload is Available but no KV events
-	// observed within firstEventTimeout).
+	// backend is in a genuinely degraded terminal state (unsupported
+	// configuration, rolled out but replicas unavailable, or the workload is
+	// Available but no KV events observed within firstEventTimeout).
 	conditionTypeDegraded = "Degraded"
 )
 
@@ -140,7 +141,7 @@ const DefaultMatchedEnginePodsChurnRequeueInterval = 5 * time.Second
 //
 // The cache is an optimization, never a serving dependency: BackendDegraded
 // and BackendRecovered narrate transitions of the managed workload's
-// availability so operators see backend readiness changes in
+// availability or an unsupported stored configuration so operators see changes in
 // `kubectl describe`. The FailClosedEnabled / FailOpenRestored pair
 // narrates transitions of the spec.integration.failOpen toggle —
 // explicitly fail-closed is loud because the cache then becomes a serving
@@ -181,6 +182,13 @@ const (
 	// LMCACHE_REMOTE_URL the engine connector refuses at startup —
 	// turning a cache misconfiguration into a serving outage).
 	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
+	// Unsupported* reasons are defensive controller backstops for resources
+	// stored before admission installed the corresponding capability check, or
+	// written while admission was bypassed. The adapter/provider registries remain
+	// the source of truth; these reasons only publish their rejection on status.
+	conditionReasonUnsupportedRuntimeBackend = "UnsupportedRuntimeBackend"
+	conditionReasonUnsupportedRemoteStorage  = "UnsupportedRemoteStorage"
+	conditionReasonUnsupportedRemoteBinding  = "UnsupportedRemoteBinding"
 )
 
 // CacheBackendReconciler reconciles a CacheBackend object.
@@ -439,14 +447,16 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// the pod webhook can't select an adapter for it (so it can never inject the
 	// subscriber → no events ever flow). Treat the no-adapter case the same as
 	// the Offload no-adapter path below: shed any workload and reconcile as
-	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
-	// a working routing tier the substrate can never feed.
+	// unsupported with Ready=False, so the CR isn't advertised as a working
+	// routing tier and kubectl/doctor can explain the adapter rejection.
 	if backend.Spec.IsEventsOnly() {
 		if _, err := registry.Select(runtimeID, backend); err != nil {
-			logger.V(1).Info("no runtime adapter for events-only backend; treating as unmanaged",
+			logger.V(1).Info("no runtime adapter for events-only backend; marking unsupported",
 				"runtime", runtimeID, "type", backend.Spec.Type,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+			message := fmt.Sprintf("runtime %s with cache type %s is unsupported: %v",
+				runtimeID, backend.Spec.EffectiveCacheType(), err)
+			return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRuntimeBackend, message)
 		}
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
@@ -463,23 +473,28 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		logger.V(1).Info("no runtime adapter for backend",
 			"runtime", runtimeID, "type", backend.Spec.Type,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		message := fmt.Sprintf("runtime %s with cache type %s is unsupported: %v",
+			runtimeID, backend.Spec.EffectiveCacheType(), err)
+		return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRuntimeBackend, message)
 	}
 
 	if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 		protocol, err := backendadapter.ProtocolFor(storage)
 		if err != nil {
-			logger.V(1).Info("external storage has no supported binding protocol; treating as unmanaged",
+			logger.V(1).Info("external storage has no supported binding protocol; marking unsupported",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "provider", storage.Provider,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+			message := fmt.Sprintf("remote storage provider %s is unsupported: %v", storage.Provider, err)
+			return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteStorage, message)
 		}
 		binding := backendadapter.BindingFor(storage, protocol, storage.Endpoint)
 		if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
-			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
+			logger.V(1).Info("runtime adapter does not accept external-storage binding; marking unsupported",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+			message := fmt.Sprintf("runtime %s with cache type %s does not accept remote-storage binding %s: %v",
+				runtimeID, backend.Spec.EffectiveCacheType(), protocol, err)
+			return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteBinding, message)
 		}
 		// Endpoint-free external bindings are mounted into or otherwise consumed
 		// directly by engine Pods. They have no provider workload or endpoint to
@@ -510,10 +525,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, err
 		}
 		if bindingAware, ok := adapter.(adapterruntime.RemoteBindingAdapter); !ok || !bindingAware.SupportsRemoteBinding(nil) {
-			logger.V(1).Info("runtime adapter does not support host-only caching; treating as unmanaged",
+			logger.V(1).Info("runtime adapter does not support host-only caching; marking unsupported",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(),
 				"namespace", backend.Namespace, "name", backend.Name)
-			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+			message := fmt.Sprintf("runtime %s with cache type %s does not accept host-only caching",
+				runtimeID, backend.Spec.EffectiveCacheType())
+			return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteBinding, message)
 		}
 		// Native HiCache remains endpoint-free and intentionally publishes no
 		// Ready condition until its separate readiness contract is implemented.
@@ -529,10 +546,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	}
 	provider, err := backendRegistry.Select(storage)
 	if err != nil {
-		logger.V(1).Info("no remote-storage provider for backend; treating as unmanaged",
+		logger.V(1).Info("no remote-storage provider for backend; marking unsupported",
 			"provider", storage.Provider, "ownership", storage.Ownership,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		message := fmt.Sprintf("remote storage provider %s with ownership %s is unsupported: %v",
+			storage.Provider, storage.Ownership, err)
+		return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteStorage, message)
 	}
 	rendered, err := provider.Render(backend)
 	if err != nil {
@@ -540,10 +559,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	}
 	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
 	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
-		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
+		logger.V(1).Info("runtime adapter does not accept remote-storage binding; marking unsupported",
 			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
 			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		message := fmt.Sprintf("runtime %s with cache type %s does not accept remote-storage binding %s: %v",
+			runtimeID, backend.Spec.EffectiveCacheType(), rendered.Protocol, err)
+		return ctrl.Result{}, r.reconcileUnsupported(ctx, backend, conditionReasonUnsupportedRemoteBinding, message)
 	}
 
 	return r.reconcileManaged(ctx, logger, backend, rendered)
@@ -859,15 +880,39 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 	return ctrl.Result{RequeueAfter: gate.requeueAfter}, err
 }
 
-// reconcileUnmanaged sheds any previously owned workload and clears managed status
-// for a backend this module no longer provisions (unsupported runtime/backend or
-// deferred kind). The managed conditions are removed; firstKVEventObservedAt and
-// status.indexParticipation are left as-is (see reconcileExternal's comment — the
-// latch is a monotonic marker and indexParticipation is poller-owned). The
+// reconcileUnmanaged sheds any previously owned workload and clears managed
+// status for a valid backend that intentionally has no controller-provisioned
+// workload (for example endpoint-free HiCache) or uses a deferred kind. The
+// managed conditions are removed; firstKVEventObservedAt and
+// status.indexParticipation are left as-is (see reconcileExternal's comment —
+// the latch is a monotonic marker and indexParticipation is poller-owned). The
 // firstAvailableAt gate anchor IS reset, so a later managed/events-only re-entry
 // starts a fresh first-event window instead of reusing a pre-unmanaged
 // availability time.
 func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	return r.reconcileWithoutManagedWorkload(ctx, backend, "", "")
+}
+
+// reconcileUnsupported is the defensive controller-side counterpart to
+// admission's adapter/provider capability checks. It sheds any stale managed
+// workload but, unlike reconcileUnmanaged, publishes why the stored or
+// admission-bypassed resource cannot be provisioned. The registry error is the
+// source of truth; this method does not maintain a second compatibility table.
+func (r *CacheBackendReconciler) reconcileUnsupported(
+	ctx context.Context,
+	backend *cachev1alpha1.CacheBackend,
+	reason string,
+	message string,
+) error {
+	return r.reconcileWithoutManagedWorkload(ctx, backend, reason, message)
+}
+
+func (r *CacheBackendReconciler) reconcileWithoutManagedWorkload(
+	ctx context.Context,
+	backend *cachev1alpha1.CacheBackend,
+	unsupportedReason string,
+	unsupportedMessage string,
+) error {
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
 	}
@@ -889,9 +934,33 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// a stale identifier.
 		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
-		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		if unsupportedReason == "" {
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeDegraded)
+		} else {
+			meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeReady,
+				Status:             metav1.ConditionFalse,
+				Reason:             unsupportedReason,
+				Message:            unsupportedMessage,
+				ObservedGeneration: backend.Generation,
+			})
+			meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeProgressing,
+				Status:             metav1.ConditionFalse,
+				Reason:             unsupportedReason,
+				Message:            unsupportedMessage,
+				ObservedGeneration: backend.Generation,
+			})
+			meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeDegraded,
+				Status:             metav1.ConditionTrue,
+				Reason:             unsupportedReason,
+				Message:            unsupportedMessage,
+				ObservedGeneration: backend.Generation,
+			})
+		}
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeFunctionalProbeOK)
 		// EngineKernelsHealthy is a managed-path-only condition; clear any left
 		// over so an unmanaged CR doesn't carry a stale kernel verdict.

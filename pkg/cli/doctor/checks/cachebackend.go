@@ -67,16 +67,18 @@ func CacheBackendHealth(ctx context.Context, c client.Client, ns string, now tim
 			!nfsBacked
 		endpointBacked := storage != nil && !nfsBacked
 
-		// Endpoint-free NFS bindings are reconciled as unmanaged: the controller
-		// deliberately removes Ready rather than claiming data-plane readiness it
-		// cannot verify. Treat that condition as not applicable instead of CB001.
-		if !nfsBacked {
-			if ready := findCondition(cb.Status.Conditions, conditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
-				note(doctor.Finding{
-					Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
-					Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
-				})
-			}
+		// A supported endpoint-free NFS binding publishes no Ready condition
+		// because the controller cannot verify its data path. An explicit
+		// non-True Ready verdict still applies: the controller uses it to surface
+		// adapter/provider capability failures for stored or admission-bypassed
+		// resources, and doctor consumes that status instead of duplicating the
+		// compatibility table.
+		ready := findCondition(cb.Status.Conditions, conditionReady)
+		if (ready != nil && ready.Status != metav1.ConditionTrue) || (ready == nil && !nfsBacked) {
+			note(doctor.Finding{
+				Code: doctor.CodeBackendNotReady, Status: doctor.StatusWarn,
+				Check: checkCacheBackendHealth, Resource: ref, Message: notReadyMessage(ready),
+			})
 		}
 
 		if !externalEndpoint {

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	pathpkg "path"
 	"reflect"
 	"sort"
@@ -412,7 +411,7 @@ func validateNFSRemoteStorage(storage *cachev1alpha1.NFSRemoteStorageSpec, stora
 	case server != strings.TrimSpace(server):
 		errs = append(errs, field.Invalid(storagePath.Child("server"), server,
 			"must not contain surrounding whitespace"))
-	case net.ParseIP(server) == nil && len(validation.IsDNS1123Subdomain(server)) != 0:
+	case backendadapter.ValidateNFSServer(server) != nil:
 		errs = append(errs, field.Invalid(storagePath.Child("server"), server,
 			"must be a valid IPv4 address, IPv6 address, or DNS-1123 hostname"))
 	}

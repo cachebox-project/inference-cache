@@ -161,6 +161,30 @@ func TestHiCacheFileNFSBindingConflictsFailAtomically(t *testing.T) {
 	}
 }
 
+func TestHiCacheFileNFSBindingRejectsInvalidServerAtomically(t *testing.T) {
+	adapter := NewHiCacheAdapter().(runtimeadapter.RemoteBindingAdapter)
+	for _, server := range []string{"@", "host?query", "-option"} {
+		t.Run(server, func(t *testing.T) {
+			cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
+			binding := addHiCacheNFSBinding(cache)
+			binding.NFS.Server = server
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{
+				Name: enginewire.SGLangEngineContainerName,
+				Args: []string{"--model-path", "model"},
+			}}}
+			before := pod.DeepCopy()
+
+			err := adapter.InjectEngineConfigWithBinding(pod, binding, cache)
+			if err == nil || !strings.Contains(err.Error(), "NFS server") {
+				t.Fatalf("InjectEngineConfigWithBinding error = %v, want NFS server validation error", err)
+			}
+			if !reflect.DeepEqual(pod, before) {
+				t.Fatalf("failed injection partially mutated pod:\nbefore=%+v\nafter=%+v", before, pod)
+			}
+		})
+	}
+}
+
 func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	size := int32(64)
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{
