@@ -139,13 +139,12 @@ const DefaultMatchedEnginePodsChurnRequeueInterval = 5 * time.Second
 
 // Event reasons emitted on a CacheBackend.
 //
-// The cache is an optimization, never a serving dependency: BackendDegraded
-// and BackendRecovered narrate transitions of the managed workload's
-// availability or an unsupported stored configuration so operators see changes in
-// `kubectl describe`. The FailClosedEnabled / FailOpenRestored pair
-// narrates transitions of the spec.integration.failOpen toggle —
-// explicitly fail-closed is loud because the cache then becomes a serving
-// dependency.
+// By default the cache is an optimization, not a serving dependency:
+// BackendDegraded and BackendRecovered narrate transitions of the managed
+// workload's availability or an unsupported stored configuration so operators
+// see changes in `kubectl describe`. The FailClosedEnabled / FailOpenRestored
+// pair narrates transitions of the spec.integration.failOpen toggle — explicitly
+// fail-closed is loud because that backend is intentionally a serving dependency.
 const (
 	eventReasonBackendDegraded         = "BackendDegraded"
 	eventReasonBackendRecovered        = "BackendRecovered"

@@ -475,6 +475,18 @@ explicit `integration.failOpen: false`; omitting the field selects its `true`
 default and is rejected. This initial surface intentionally does not expose NFS
 mount options, credentials, provisioning, or PVC indirection.
 
+Pod-level `NFSVolumeSource` exposes no mount-option control, so this inline
+shape cannot select `hard`/`soft`, `timeo`, or `retrans`. Linux NFS clients
+default to a `hard` mount when neither `hard` nor `soft` is specified: after a
+successful mount, an outage can therefore leave SGLang's HiCache file I/O
+retrying instead of returning an error promptly. `storagePrefetchPolicy`
+controls how long request execution waits for a storage prefetch; it does not
+change the kernel mount policy or interrupt an NFS syscall already blocked in a
+HiCache storage thread. In particular, `wait_complete` can leave an affected
+request queued until the NFS path recovers. Operators must treat NFS server and
+network-path availability as part of the inference serving SLO; the current
+controller and doctor checks do not verify this mounted L3 store/read path.
+
 The webhook injects `--enable-hierarchical-cache` plus the corresponding
 `--hicache-*` flags and, when configured, the NFS wiring at Pod CREATE time. A one-container Pod may use any
 container name; a multi-container Pod must name its engine container `sglang`.

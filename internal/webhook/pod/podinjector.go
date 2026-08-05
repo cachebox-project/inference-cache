@@ -86,7 +86,9 @@ const InjectSkippedReasonSkipAnnotation = "skip-inject-annotation"
 // MutatingWebhookConfiguration AND a fail-open posture in the handler give a
 // belt-and-suspenders guarantee: even if the controller is unreachable or
 // the handler returns an error response, pod admission is never blocked.
-// The cache is always an optimization, never a serving dependency.
+// This describes admission failure only. A successfully injected backend can
+// still be an intentional data-plane serving dependency when its contract
+// requires spec.integration.failOpen=false, as External NFS does.
 type EngineInjector struct {
 	// Reader lists CacheBackends in the pod's namespace. Production wiring
 	// passes the manager's APIReader (an uncached live client) — pod
