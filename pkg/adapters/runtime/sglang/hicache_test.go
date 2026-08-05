@@ -33,7 +33,9 @@ func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.Cac
 }
 
 func addHiCacheNFSBinding(cache *cachev1alpha1.CacheBackend) *backendadapter.Binding {
+	falseValue := false
 	cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cache.Spec.Integration.FailOpen = &falseValue
 	cache.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
 		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
@@ -182,6 +184,26 @@ func TestHiCacheFileNFSBindingRejectsInvalidServerAtomically(t *testing.T) {
 				t.Fatalf("failed injection partially mutated pod:\nbefore=%+v\nafter=%+v", before, pod)
 			}
 		})
+	}
+}
+
+func TestHiCacheFileNFSBindingRequiresFailClosedAtomically(t *testing.T) {
+	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
+	binding := addHiCacheNFSBinding(cache)
+	trueValue := true
+	cache.Spec.Integration.FailOpen = &trueValue
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: enginewire.SGLangEngineContainerName,
+		Args: []string{"--model-path", "model"},
+	}}}
+	before := pod.DeepCopy()
+
+	err := NewHiCacheAdapter().(runtimeadapter.RemoteBindingAdapter).InjectEngineConfigWithBinding(pod, binding, cache)
+	if err == nil || !strings.Contains(err.Error(), "integration.failOpen must be false") {
+		t.Fatalf("InjectEngineConfigWithBinding error = %v, want NFS fail-closed validation error", err)
+	}
+	if !reflect.DeepEqual(pod, before) {
+		t.Fatalf("failed injection partially mutated pod:\nbefore=%+v\nafter=%+v", before, pod)
 	}
 }
 

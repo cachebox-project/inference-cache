@@ -63,9 +63,11 @@ See the
 first implementation intentionally publishes no `Ready` condition; the
 matching Pod's injection annotations are the available wiring signal until the
 separate HiCache readiness contract ships. With `remoteStorage.provider: NFS`,
-the admitted Pod shape also carries the `file` storage arguments,
-storage-directory environment variable, NFS volume, and engine-container
-mount.
+the manifest must explicitly set `integration.failOpen: false`: kubelet must
+mount the export before starting the engine container, so an unavailable NFS
+server blocks Pod startup. The admitted Pod shape also carries the `file`
+storage arguments, storage-directory environment variable, NFS volume, and
+engine-container mount.
 
 `recipe-multi-tenant.yaml` spans two namespaces, so it carries a
 `# verify-samples: skip` marker — server-side dry-run can't create the

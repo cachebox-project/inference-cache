@@ -648,9 +648,11 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 
 	t.Run("canonical NFS-backed HiCache reports unverified after observable axes pass", func(t *testing.T) {
 		cb := healthyBackend(now)
+		falseValue := false
 		cb.Name = "hicache-nfs"
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 		cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: &falseValue}
 		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
 			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
 			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,

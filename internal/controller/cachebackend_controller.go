@@ -2661,7 +2661,7 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 
 	if before.failOpen && !after.failOpen {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, eventReasonFailClosedEnabled, eventReasonFailClosedEnabled,
-			"fail-closed mode enabled — cache is now a serving dependency; engine requests will fail when the cache is unreachable")
+			"fail-closed mode enabled — cache is now a serving dependency; serving may be unavailable when the cache cannot be reached")
 	}
 	if !before.failOpen && after.failOpen {
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonFailOpenRestored, eventReasonFailOpenRestored,

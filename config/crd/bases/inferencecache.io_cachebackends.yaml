@@ -532,21 +532,23 @@ spec:
                     default: true
                     description: |-
                       FailOpen controls whether the engine treats cache lookups as a soft
-                      dependency. When true (the default), an unreachable or degraded cache
-                      backend MUST fall back to local prefill and never fail a serving
-                      request — the cache is an optimization, not a serving dependency. When
-                      explicitly set to false the engine fails requests on cache
-                      unreachability ("fail-closed"); the cache becomes a serving
-                      dependency, which is loud and visible via a Warning Event on the
-                      owning CacheBackend.
+                      dependency. For integrations admitted with true (the default), an
+                      unreachable or degraded cache backend MUST fall back to local prefill
+                      and never fail a serving request — the cache is an optimization, not a
+                      serving dependency. When explicitly set to false the cache becomes a
+                      fail-closed serving dependency, which is loud and visible via a Warning
+                      Event on the owning CacheBackend.
 
                       The flag is plumbed by the engine adapter as INFERENCECACHE_FAIL_OPEN
                       (both shipping LMCache adapters — vLLM+LMCache and SGLang+LMCache —
                       inject it). Per-request fail-open enforcement at the engine level is the
                       engine/connector's responsibility; the cache plane surfaces the bit so
                       the engine can honor it.
-                      SGLangHiCache accepts only the default true value and does not inject this
-                      env var because native HiCache exposes no equivalent fail-closed control.
+                      Host-only SGLangHiCache accepts the default true value and does not inject
+                      this env var because native HiCache exposes no equivalent control.
+                      NFS-backed SGLangHiCache instead requires an explicit false value: kubelet
+                      mounts the inline NFS volume before containers start, so export
+                      availability is inherently a serving dependency.
                     type: boolean
                   firstEventTimeout:
                     default: 5m

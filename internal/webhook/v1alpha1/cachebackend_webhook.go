@@ -465,6 +465,8 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	}
 
 	var errs field.ErrorList
+	nfsStorage := cb.Spec.RemoteStorage != nil &&
+		cb.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 	if cb.Spec.HiCache == nil {
 		errs = append(errs, field.Required(hiCachePath,
 			fmt.Sprintf("required when spec.type=%q", cachev1alpha1.CacheBackendTypeSGLangHiCache)))
@@ -522,8 +524,6 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 				},
 			))
 		}
-		nfsStorage := cb.Spec.RemoteStorage != nil &&
-			cb.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 		if !validHiCacheStoragePrefetchPolicy(spec.StoragePrefetchPolicy) {
 			errs = append(errs, field.NotSupported(
 				hiCachePath.Child("storagePrefetchPolicy"), spec.StoragePrefetchPolicy,
@@ -584,13 +584,20 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 				[]string{string(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)},
 			))
 		}
-		if !cachev1alpha1.IntegrationFailOpen(cb.Spec.Integration) {
-			errs = append(errs, field.NotSupported(
-				field.NewPath("spec", "integration", "failOpen"),
-				false,
-				[]string{"true"},
-			))
-		}
+	}
+	failOpen := cachev1alpha1.IntegrationFailOpen(cb.Spec.Integration)
+	switch {
+	case nfsStorage && failOpen:
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "integration", "failOpen"), true,
+			"must be false with remoteStorage.provider=NFS because the inline NFS volume is a Pod startup dependency",
+		))
+	case !nfsStorage && !failOpen:
+		errs = append(errs, field.NotSupported(
+			field.NewPath("spec", "integration", "failOpen"),
+			false,
+			[]string{"true"},
+		))
 	}
 	for key := range cb.Spec.BackendConfig {
 		if key != "model" {

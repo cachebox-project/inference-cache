@@ -342,9 +342,11 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 func TestHandle_MatchAndInject_CanonicalSGLangHiCacheNFS(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache-nfs", ns, map[string]string{"app": "sglang"})
+	falseValue := false
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
 	cb.Spec.Integration.Engine = ""
+	cb.Spec.Integration.FailOpen = &falseValue
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
 		Ratio:                 "2.0",
 		StoragePrefetchPolicy: cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete,

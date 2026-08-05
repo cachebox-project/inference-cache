@@ -8,6 +8,10 @@ metadata:
 spec:
   runtime: SGLang
   type: SGLangHiCache
+  # Inline NFS volumes are kubelet startup dependencies, so this shape must
+  # explicitly opt into fail-closed serving instead of using the true default.
+  integration:
+    failOpen: false
   engineSelector:
     matchLabels:
       app: sglang

@@ -309,14 +309,20 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if cachev1alpha1.IntegrationMode(cache.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.mode must be Offload")
 	}
+	nfsStorage := cache.Spec.RemoteStorage != nil &&
+		cache.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 	if cache.Spec.Integration != nil {
 		role := cache.Spec.Integration.Role
 		if role != "" && role != cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
 			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.role must be ReadWrite")
 		}
-		if !cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration) {
-			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
-		}
+	}
+	failOpen := cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration)
+	if nfsStorage && failOpen {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be false with remoteStorage.provider=NFS because the inline NFS volume is a Pod startup dependency")
+	}
+	if !nfsStorage && !failOpen {
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
 	}
 	if cache.Spec.Autoscaling != nil {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
@@ -380,8 +386,6 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if !validMemoryLayout(spec.MemoryLayout) {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: unsupported memoryLayout %q", spec.MemoryLayout)
 	}
-	nfsStorage := cache.Spec.RemoteStorage != nil &&
-		cache.Spec.RemoteStorage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderNFS
 	if !validStoragePrefetchPolicy(spec.StoragePrefetchPolicy) {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: unsupported storagePrefetchPolicy %q", spec.StoragePrefetchPolicy)
 	}

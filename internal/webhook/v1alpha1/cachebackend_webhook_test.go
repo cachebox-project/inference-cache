@@ -58,8 +58,10 @@ func newHiCacheBackend() *cachev1alpha1.CacheBackend {
 
 func newCanonicalHiCacheNFSBackend() *cachev1alpha1.CacheBackend {
 	cb := newHiCacheBackend()
+	falseValue := false
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Integration.Engine = ""
+	cb.Spec.Integration.FailOpen = &falseValue
 	cb.Spec.BackendConfig = nil
 	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
 	cb.Spec.HiCache.StoragePrefetchPolicy = cachev1alpha1.SGLangHiCacheStoragePrefetchWaitComplete
@@ -125,6 +127,7 @@ func TestValidator_CanonicalHiCacheNFSServerAccepted(t *testing.T) {
 }
 
 func TestValidator_CanonicalHiCacheNFSContract(t *testing.T) {
+	trueValue := true
 	cases := []struct {
 		name   string
 		mutate func(*cachev1alpha1.CacheBackend)
@@ -133,6 +136,12 @@ func TestValidator_CanonicalHiCacheNFSContract(t *testing.T) {
 		{"managed ownership", func(cb *cachev1alpha1.CacheBackend) {
 			cb.Spec.RemoteStorage.Ownership = cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged
 		}, "remoteStorage.ownership"},
+		{"fail open", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.FailOpen = &trueValue
+		}, "integration.failOpen"},
+		{"omitted failOpen", func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.FailOpen = nil
+		}, "integration.failOpen"},
 		{"endpoint", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.Endpoint = "10.0.0.25:2049" }, "remoteStorage.endpoint"},
 		{"missing NFS block", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS = nil }, "remoteStorage.nfs"},
 		{"server with scheme", func(cb *cachev1alpha1.CacheBackend) { cb.Spec.RemoteStorage.NFS.Server = "nfs://10.0.0.25" }, "remoteStorage.nfs.server"},

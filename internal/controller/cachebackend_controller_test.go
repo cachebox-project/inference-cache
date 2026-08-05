@@ -251,11 +251,15 @@ func TestReconcileCanonicalSGLangHiCacheWithUnsupportedRemoteStorageIsDegraded(t
 
 func TestReconcileCanonicalSGLangHiCacheExternalNFSIsEndpointFree(t *testing.T) {
 	scheme := newScheme(t)
+	falseValue := false
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hicache-nfs", Namespace: "ns1", Generation: 3},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
 			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				FailOpen: &falseValue,
+			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "sglang"},
 			},
@@ -314,11 +318,15 @@ func TestReconcileCanonicalSGLangHiCacheExternalNFSIsEndpointFree(t *testing.T) 
 
 func TestReconcileCanonicalSGLangHiCacheManagedNFSIsUnsupported(t *testing.T) {
 	scheme := newScheme(t)
+	falseValue := false
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hicache-managed-nfs", Namespace: "ns1", Generation: 5},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
 			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				FailOpen: &falseValue,
+			},
 			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
 				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderNFS,
