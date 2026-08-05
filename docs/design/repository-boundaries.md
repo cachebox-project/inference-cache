@@ -77,7 +77,7 @@ behavior-preserving change.
 | `pkg/version` | Internalize | Repository binary build metadata | `internal/version` |
 
 Each move must update package documentation so a remaining `pkg/` package
-states its supported external-consumer contract.
+states its owner or its supported external-consumer contract.
 
 ## Generated protobuf migration
 
