@@ -495,6 +495,10 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 		fi; \
 	done
 
+.PHONY: test-release-image-digests
+test-release-image-digests: ## Test fail-closed release image digest resolution with a fake registry client.
+	@bash hack/resolve-release-image-digests_test.sh
+
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.
 	@if $(KIND) get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \

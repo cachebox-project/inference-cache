@@ -47,6 +47,43 @@ the Image Build job. The verifier is deliberately separate from vulnerability
 scanning and SBOM generation: those gates cover package risk and inventory,
 while this gate enforces the runtime-image shape.
 
+## Release Signatures and Provenance
+
+The `Release Supply Chain` workflow publishes or resolves the controller,
+server, and subscriber images by immutable digest. It signs each digest with
+keyless Cosign, generates signed SLSA v1 build provenance, pushes the
+provenance to GHCR, and verifies both the signature and provenance before
+attaching release artifacts. The Sigstore provenance bundles are also attached
+to the corresponding GitHub Release alongside the SPDX SBOMs. Manual runs must
+select the release tag in GitHub's `Use workflow from` control so the attested
+source revision is the release revision.
+
+Verify a released image after resolving its tag to a digest:
+
+```bash
+image=ghcr.io/cachebox-project/inference-cache-controller
+tag=v0.1.0
+digest=$(docker buildx imagetools inspect \
+  --format '{{json .Manifest}}' "${image}:${tag}" | jq -r .digest)
+
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/cachebox-project/inference-cache/\.github/workflows/release-sbom\.yml@refs/(heads/main|tags/[A-Za-z0-9_.-]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "${image}@${digest}"
+
+gh attestation verify "oci://${image}@${digest}" \
+  --repo cachebox-project/inference-cache \
+  --bundle-from-oci \
+  --deny-self-hosted-runners \
+  --signer-workflow cachebox-project/inference-cache/.github/workflows/release-sbom.yml \
+  --source-ref "refs/tags/${tag}" \
+  --predicate-type https://slsa.dev/provenance/v1
+```
+
+Repeat the same verification for `inference-cache-server` and
+`inference-cache-subscriber`. Verification is intentionally digest-based; a
+mutable release tag is never accepted as the signed subject.
+
 See the upstream [Distroless project](https://github.com/GoogleContainerTools/distroless)
 for image contents, supported Debian variants, and signature-verification
 guidance.
