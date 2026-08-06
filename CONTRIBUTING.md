@@ -8,6 +8,7 @@ Requirements:
 
 - Go 1.26.5 or newer
 - Make
+- Python 3 with `venv` support (`python3-venv` on Debian/Ubuntu)
 - Docker
 - kind
 - protoc
