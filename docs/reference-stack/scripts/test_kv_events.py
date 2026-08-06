@@ -7,9 +7,8 @@ No broker, no pytest — just run it:
 
 Guards the metadata-only contract: decoded events must never carry token_ids.
 """
-import msgspec
-
 import kv_events_subscriber as sub
+import msgspec
 
 
 def _roundtrip(batch) -> list:

@@ -298,6 +298,7 @@ make dev-cluster KIND_CLUSTER=cache-dev KIND_NODE_IMAGE=kindest/node:v1.31.0
 - `make sbom`, `make sbom-release`, `make sbom-images`, `make sbom-registry-images`: generate SPDX JSON SBOMs (see [`docs/operations/sbom.md`](docs/operations/sbom.md))
 - `make verify-minimal-images`: verify built images are non-root, shell-free Distroless runtimes
 - `make ci-lint`: run golangci-lint
+- `make python-lint`: lint Python under `docs/reference-stack/scripts/` with pinned Ruff
 - `make verify-prometheus`: lint + unit-test the Prometheus alerting rules under `config/observability/`
 - `make proto-gen`: regenerate protobuf Go code
 - `make generate`: regenerate Kubernetes deepcopy code

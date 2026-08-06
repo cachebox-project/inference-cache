@@ -116,6 +116,9 @@ jobs:
         git diff --exit-code
         make ci-lint
 
+    - name: Lint reference-stack Python
+      run: make python-lint
+
     # promtool check rules + promtool test rules + drift check that the
     # PrometheusRule CR (config/observability/prometheus-rules.yaml) stays in
     # sync with the flat rules file (alerting-rules.yaml). The promtool

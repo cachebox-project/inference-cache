@@ -49,7 +49,7 @@ try:
 
     # The events list is a tagged union; the field MUST be typed as the union so
     # msgspec dispatches on the tag (the struct name) rather than yielding raw lists.
-    _KVEvent = Union[BlockStored, BlockRemoved, AllBlocksCleared]
+    _KVEvent = Union[BlockStored, BlockRemoved, AllBlocksCleared]  # noqa: UP007 - msgspec StructMeta lacks runtime `|`
 
     class EventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
         ts: float = 0.0
@@ -57,7 +57,7 @@ try:
 
     _DECODER = msgspec.msgpack.Decoder(type=EventBatch)
     _HAVE_MSGSPEC = True
-except Exception:  # pragma: no cover - fallback path
+except Exception:  # noqa: BLE001  # pragma: no cover - tolerate incompatible optional msgspec installs
     _HAVE_MSGSPEC = False
 
 
@@ -83,7 +83,7 @@ def _decode(payload: bytes):
             for ev in batch.events:
                 out.append((type(ev).__name__, _redact({f: getattr(ev, f) for f in ev.__struct_fields__})))
             return batch.ts, out
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - malformed payloads must fail open
             # Surface the error class/message (actionable on schema drift) but
             # never the raw, potentially content-bearing payload.
             return None, [("UNDECODED", {"bytes": len(payload), "error": f"{type(exc).__name__}: {exc}"})]
