@@ -1,5 +1,7 @@
 # inference-cache
 
+[![codecov](https://codecov.io/gh/cachebox-project/inference-cache/graph/badge.svg)](https://codecov.io/gh/cachebox-project/inference-cache)
+
 A **vendor-neutral, Kubernetes-native cache-policy control plane for LLM inference.**
 
 inference-cache makes routing **cache-aware**: it tracks which replica already holds a
