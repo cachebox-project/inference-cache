@@ -1,0 +1,7 @@
+coverage:
+  status:
+    project:
+      default:
+        # Keep Codecov aligned with the local COVER_MIN ratchet in the Makefile.
+        target: 90%
+        threshold: 0%

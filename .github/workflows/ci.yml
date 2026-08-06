@@ -156,6 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
     - name: Checkout
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -189,6 +190,17 @@ jobs:
 
     - name: Coverage gate
       run: make cover-check
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+      with:
+        disable_search: true
+        fail_ci_if_error: true
+        files: ./cover.logic.out
+        flags: logic
+        # Fork PRs use Codecov's public-repository tokenless upload path because
+        # GitHub does not grant them an OIDC token.
+        use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
     # Runs every YAML under config/samples/ through admission against an
     # envtest apiserver + the CacheBackend webhook (server-side dry-run).
