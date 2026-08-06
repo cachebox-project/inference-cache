@@ -1,14 +1,13 @@
 // Package enginewire holds the engine-side wire format shared by every
-// runtime adapter that fronts an LMCache-compatible cache (the in-tree
-// vLLM+LMCache adapter, the vLLM+Mooncake adapter, and the External
-// passthrough adapter today; future adapters that also speak the LMCache
-// connector protocol can import it the same way).
+// runtime adapter that fronts an LMCache-compatible cache. The in-tree
+// vLLM+LMCache adapter uses it for LMCacheServer, Mooncake, and externally
+// owned remote bindings; future adapters that speak the protocol can share it.
 //
 // Centralising the wire keeps the adapters from drifting: an external cache
 // the operator manages themselves still presents the same lm:// endpoint
 // and the engine still parses the same --kv-transfer-config / LMCACHE_*
 // env, so the injection logic is identical and only the endpoint source
-// differs. The Mooncake adapter reuses the same connector wire — vLLM runs
+// differs. The Mooncake binding reuses the same connector wire — vLLM runs
 // the LMCache connector pointed at a mooncakestore:// remote store instead
 // of an lm:// one — so it differs from the LMCache path in nothing but the
 // remote-URL scheme (see [InjectVLLMMooncake]). The package lives under

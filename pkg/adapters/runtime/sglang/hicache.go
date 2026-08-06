@@ -267,9 +267,6 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if cache.Spec.Autoscaling != nil {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
 	}
-	if strings.TrimSpace(cache.Spec.Endpoint) != "" {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.endpoint is unsupported for an engine-local backend")
-	}
 	if cache.Spec.EngineSelector == nil || len(cache.Spec.EngineSelector.MatchLabels) == 0 {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.engineSelector.matchLabels is required")
 	}

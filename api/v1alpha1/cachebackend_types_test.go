@@ -35,13 +35,13 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"hiCache",
 		"backendConfig",
 		"template",
-		"endpoint",
 		"allowCrossNamespace",
 	} {
 		if !hasProperty(specSchema, field) {
 			t.Fatalf("spec.%s is missing from CRD schema", field)
 		}
 	}
+	requireNoProperty(t, specSchema, "endpoint")
 
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
 	// health was removed in an earlier change; capacity is removed in this PR.
@@ -69,7 +69,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		t.Fatalf("status.capacity is present in CRD schema; it was retired alongside spec.storage")
 	}
 
-	requireNoEnum(t, mustProperty(t, specSchema, "type"))
+	requireEnum(t, mustProperty(t, specSchema, "type"), []string{"LMCache", "SGLangHiCache"})
 	requireEnum(t, mustProperty(t, specSchema, "runtime"), []string{"VLLM", "SGLang"})
 	requireEnum(t, mustProperty(t, specSchema, "deploymentKind"), []string{
 		"Deployment",
@@ -302,7 +302,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				RuntimeClassName:              &runtimeClassName,
 				TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 			},
-			Endpoint: "external-cache.default.svc:8080",
 		},
 		Status: CacheBackendStatus{
 			Endpoint: "cache.default.svc:8080",

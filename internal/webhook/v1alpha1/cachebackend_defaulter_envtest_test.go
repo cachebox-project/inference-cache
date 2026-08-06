@@ -234,18 +234,16 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	explicitCR := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "explicit", Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
+			Runtime:  cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:     cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			HiCache:  &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 			Replicas: i32p(5),
-			Endpoint: "team-a-cache.team-a.svc.cluster.local:9000",
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
-			},
-			BackendConfig: map[string]string{
-				"model": "meta-llama/Meta-Llama-3-8B-Instruct",
+				MatchLabels: map[string]string{"app.kubernetes.io/name": "sglang"},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+				Engine: "sglang",
+				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 		},
 	}
@@ -257,14 +255,11 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err := live.Get(ctx, client.ObjectKey{Name: "explicit", Namespace: "team-a"}, &explicit); err != nil {
 		t.Fatalf("get back explicit CR: %v", err)
 	}
-	if explicit.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
-		t.Errorf("operator type clobbered: got %q, want External", explicit.Spec.Type)
+	if explicit.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
+		t.Errorf("operator type clobbered: got %q, want SGLangHiCache", explicit.Spec.Type)
 	}
 	if explicit.Spec.Replicas == nil || *explicit.Spec.Replicas != 5 {
 		t.Errorf("operator replicas clobbered: got %v, want 5", explicit.Spec.Replicas)
-	}
-	if explicit.Spec.Integration.Role != cachev1alpha1.CacheBackendIntegrationRoleReadOnly {
-		t.Errorf("operator integration.role clobbered: got %q, want ReadOnly", explicit.Spec.Integration.Role)
 	}
 
 	// --- Autoscaling defaulter-computed minReplicas ---

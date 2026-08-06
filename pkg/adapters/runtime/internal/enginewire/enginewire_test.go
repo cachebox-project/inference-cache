@@ -158,7 +158,7 @@ func TestLMCacheRemoteURL_ShortInputDoesNotPanic(t *testing.T) {
 	// Defensive: an input shorter than the scheme length must not
 	// index out of bounds. (Admission rejects this at the webhook,
 	// but the helper is part of the engine wire seam and is called
-	// from the External adapter without re-validating.)
+	// from an external remote binding without re-validating.)
 	for _, in := range []string{"", "lm", "lm:", "lm:/"} {
 		got := LMCacheRemoteURL(in)
 		want := "lm://" + in

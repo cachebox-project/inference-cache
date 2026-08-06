@@ -18,16 +18,14 @@ const (
 	CacheBackendRuntimeSGLang CacheBackendRuntime = "SGLang"
 )
 
+// +kubebuilder:validation:Enum=LMCache;SGLangHiCache
+
 // CacheBackendType identifies the backing cache implementation.
 type CacheBackendType string
 
 const (
 	CacheBackendTypeLMCache       CacheBackendType = "LMCache"
 	CacheBackendTypeSGLangHiCache CacheBackendType = "SGLangHiCache"
-	CacheBackendTypeAIBrix        CacheBackendType = "AIBrix"
-	CacheBackendTypeMooncake      CacheBackendType = "Mooncake"
-	CacheBackendTypeNIXL          CacheBackendType = "NIXL"
-	CacheBackendTypeExternal      CacheBackendType = "External"
 )
 
 // +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake
@@ -302,12 +300,9 @@ type CacheBackendSpec struct {
 	Runtime CacheBackendRuntime `json:"runtime,omitempty"`
 
 	// Type identifies the engine-side cache implementation and defaults to
-	// LMCache. Canonical resources select provider technology and ownership
-	// independently through remoteStorage; omitting remoteStorage requests a
-	// host-only hierarchy. Legacy Mooncake and External values remain readable
-	// as compatibility inputs. The CRD does not constrain Type to an enum
-	// today; admission is the authoritative reject for unsupported pairs and
-	// for legacy provider values used in canonical resources.
+	// LMCache. Supported values are LMCache and SGLangHiCache. Provider
+	// technology and ownership are selected independently through remoteStorage;
+	// omitting remoteStorage requests a host-only hierarchy.
 	// +optional
 	// +kubebuilder:default=LMCache
 	Type CacheBackendType `json:"type,omitempty"`
@@ -482,33 +477,11 @@ type CacheBackendSpec struct {
 	// Canonical resources must configure resources under the selected
 	// remoteStorage provider; admission rejects this field when runtime,
 	// lmCache, or remoteStorage selects the canonical API.
-	// External and SGLangHiCache legacy backends provision no workload of
-	// their own, so the field remains inert for those legacy types.
+	// Backends without a managed remote-storage provider provision no workload
+	// of their own, so this field has no rendered target for those shapes.
 	//
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
-
-	// Endpoint is the operator-supplied network address for an
-	// External backend the controller does NOT provision. The field
-	// is type-scoped: it is REQUIRED when spec.type is External and
-	// REJECTED at admission for every other type (managed backends
-	// learn their endpoint from the controller-rendered Service and
-	// would silently overwrite a user-supplied value, so admission
-	// surfaces the misconfiguration loudly at write time).
-	//
-	// Allowed shapes for External (both forms require a non-empty
-	// port — the LMCache connector dials TCP, so admission rejects
-	// portless hosts):
-	//   - bare host:port (canonical; the LMCache engine adapter
-	//     prepends the lm:// scheme on injection)
-	//   - lm://host:port (operators who prefer to be explicit)
-	// IPv6 literals must be bracketed: [::1]:8200. Other schemes
-	// (https://, http://, ...) and path/query/fragment components
-	// are rejected at admission — they would produce an invalid
-	// LMCACHE_REMOTE_URL when concatenated with the lm:// prefix at
-	// injection time.
-	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
 
 	// AllowCrossNamespace opts the CacheBackend into referencing an Endpoint
 	// that resolves into a Kubernetes Service in a different namespace from

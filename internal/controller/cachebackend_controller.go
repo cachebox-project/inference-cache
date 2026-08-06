@@ -413,15 +413,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// StatefulSet routing because the mode decides provisioning regardless of
 	// deploymentKind (a server-less backend ignores deploymentKind).
 	//
-	// EventsOnly is checked BEFORE the External branch so it takes precedence
-	// over spec.type. Admission's rejectEventsOnlyMisconfiguration rejects a
-	// spec.type=External + mode=EventsOnly pair, but an admission-bypassed /
-	// pre-existing stored object with both set must NOT reconcile as External
-	// (which would publish an endpoint and let the pod webhook inject the KV
-	// connector via the External adapter) — that violates the events-only "no
-	// connector, no server" contract. Letting EventsOnly win here mirrors the
+	// EventsOnly is checked before external remote-storage ownership so it takes
+	// precedence over provider lifecycle. An admission-bypassed object carrying
+	// both must not publish an external endpoint or inject a KV connector. Letting
+	// EventsOnly win here mirrors the
 	// webhook's adapter-independent connector skip, so both layers agree on the
-	// mode's precedence over type.
+	// mode's precedence over remote storage.
 	//
 	// First confirm an adapter is selectable for this (runtime, backend) pair.
 	// A stored / admission-bypassed EventsOnly CR with an unsupported (engine,

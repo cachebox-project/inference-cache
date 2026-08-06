@@ -27,70 +27,20 @@ func (s *CacheBackendSpec) EffectiveRuntime() CacheBackendRuntime {
 	return CacheBackendRuntimeVLLM
 }
 
-// EffectiveCacheType returns the engine-side cache implementation. Legacy
-// Mooncake and External values represented remote-provider concerns in
-// spec.type; both use LMCache engine wiring and normalize to LMCache here.
+// EffectiveCacheType returns the engine-side cache implementation, defaulting
+// an omitted value to LMCache for callers that do not pass through admission.
 func (s *CacheBackendSpec) EffectiveCacheType() CacheBackendType {
-	switch s.Type {
-	case CacheBackendTypeMooncake, CacheBackendTypeExternal:
+	if s.Type == "" {
 		return CacheBackendTypeLMCache
-	case "":
-		return CacheBackendTypeLMCache
-	default:
-		return s.Type
 	}
+	return s.Type
 }
 
-// EffectiveRemoteStorage returns the explicit remote-storage declaration, or a
-// synthesized declaration for a legacy resource. In the canonical API a nil
-// remoteStorage remains nil: host-only caching must never select a provider as
-// an adapter side effect.
+// EffectiveRemoteStorage returns the explicit remote-storage declaration. A
+// nil remoteStorage remains nil: host-only caching must never select a provider
+// as an adapter side effect.
 func (s *CacheBackendSpec) EffectiveRemoteStorage() *CacheBackendRemoteStorageSpec {
-	if s.RemoteStorage != nil {
-		return s.RemoteStorage
-	}
-	if s.UsesCanonicalCacheHierarchy() {
-		return nil
-	}
-
-	switch s.Type {
-	case CacheBackendTypeExternal:
-		return &CacheBackendRemoteStorageSpec{
-			Provider:  CacheBackendRemoteStorageProviderLMCacheServer,
-			Ownership: CacheBackendRemoteStorageOwnershipExternal,
-			Endpoint:  s.Endpoint,
-		}
-	case CacheBackendTypeMooncake:
-		return &CacheBackendRemoteStorageSpec{
-			Provider:  CacheBackendRemoteStorageProviderMooncake,
-			Ownership: CacheBackendRemoteStorageOwnershipManaged,
-			Mooncake: &MooncakeRemoteStorageSpec{
-				Image:     s.BackendConfig["serverImage"],
-				Resources: s.Resources,
-			},
-		}
-	case CacheBackendTypeLMCache, "":
-		if s.EffectiveRuntime() == CacheBackendRuntimeSGLang {
-			return &CacheBackendRemoteStorageSpec{
-				Provider:  CacheBackendRemoteStorageProviderRedis,
-				Ownership: CacheBackendRemoteStorageOwnershipManaged,
-				Redis: &RedisRemoteStorageSpec{
-					Image:     s.BackendConfig["redisImage"],
-					Resources: s.Resources,
-				},
-			}
-		}
-		return &CacheBackendRemoteStorageSpec{
-			Provider:  CacheBackendRemoteStorageProviderLMCacheServer,
-			Ownership: CacheBackendRemoteStorageOwnershipManaged,
-			LMCacheServer: &LMCacheServerRemoteStorageSpec{
-				Image:     s.BackendConfig["serverImage"],
-				Resources: s.Resources,
-			},
-		}
-	default:
-		return nil
-	}
+	return s.RemoteStorage
 }
 
 // EffectiveObservationModelID returns the independently-owned observation

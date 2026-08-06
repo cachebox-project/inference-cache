@@ -89,8 +89,8 @@ Notes:
   `lastEventAt` has been cleared by the poller. `CB004` fires only when
   `lastEventAt` IS present but has gone stale — an idle backend with a fresh
   event is healthy (`CB006`).
-- **Externally owned remote storage** (`spec.remoteStorage.ownership=External`,
-  including the legacy `spec.type=External` shape) is checked for `Ready` and
+- **Externally owned remote storage** (`spec.remoteStorage.ownership=External`)
+  is checked for `Ready` and
   endpoint reachability only. Engine-pod matching (`CB002`) and index
   participation (`CB003`/`CB004`) are managed-backend concerns and are skipped,
   so a valid external config is not spuriously flagged.

@@ -45,8 +45,7 @@ func TestVLLMLMCacheSupports(t *testing.T) {
 		want    bool
 	}{
 		{"vllm+lmcache", RuntimeVLLM, newLMCacheBackend(nil), true},
-		{"vllm+external", RuntimeVLLM, newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "vllm"), false},
-		{"vllm+mooncake", RuntimeVLLM, newCacheBackend(cachev1alpha1.CacheBackendTypeMooncake, "vllm"), false},
+		{"vllm+unsupported", RuntimeVLLM, newCacheBackend(cachev1alpha1.CacheBackendType("unsupported"), "vllm"), false},
 		{"sglang+lmcache", RuntimeSGLang, newLMCacheBackend(nil), false},
 		{"reference+lmcache", RuntimeReference, newLMCacheBackend(nil), false},
 		{"nil cache", RuntimeVLLM, nil, false},
@@ -1218,7 +1217,7 @@ func envHasFieldRef(env []corev1.EnvVar, name, path string) bool {
 
 func TestReferenceAdapterObservationSidecarIsNil(t *testing.T) {
 	a := NewReferenceAdapter()
-	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ref-pod"}}
 	c, err := a.ObservationSidecar(cb, pod)
 	if err != nil {

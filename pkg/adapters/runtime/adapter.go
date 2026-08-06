@@ -56,8 +56,8 @@ type KVCacheRuntimeAdapter interface {
 	// ObservationSidecar returns the container that observes the engine pod
 	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
 	// (nil, nil) when no sidecar is needed for this (engine, backend) pair
-	// — for example, the deprecated legacy External adapter, or a future
-	// backend that exports observation data some other way. Returning a
+	// — for example, a future backend that exports observation data some other
+	// way. Returning a
 	// container does not by itself mutate pod;
 	// the Pod webhook appends it after [InjectEngineConfig] (idempotent: if
 	// a container with the same Name is already present, the caller skips
@@ -122,8 +122,8 @@ func ResolveLegacyCacheServer(adapter KVCacheRuntimeAdapter, cache *cachev1alpha
 
 // EndpointRequirement is an optional adapter capability for engine-local
 // integrations that do not dial a separate cache server. Adapters that do not
-// implement it require an endpoint by default, preserving the existing
-// LMCache, Mooncake, and External behavior.
+// implement it require an endpoint by default, preserving network-backed
+// adapter behavior while allowing engine-local caches to opt out.
 type EndpointRequirement interface {
 	RequiresEndpoint() bool
 }
@@ -318,9 +318,9 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 // empty SubscriberImage disables sidecar auto-attach (see the field doc for
 // why).
 type Options struct {
-	// SubscriberImage is the image reference the vLLM/LMCache and
-	// vLLM/Mooncake adapters use for the kvevent-subscriber sidecar (both
-	// share the same builder — the KV-event stream is engine-side, not
+	// SubscriberImage is the image reference the vLLM/LMCache adapter uses for
+	// the kvevent-subscriber sidecar across remote bindings (the KV-event stream
+	// is engine-side, not
 	// store-specific). Empty (the zero value)
 	// **disables** sidecar auto-attach — the adapter returns no sidecar
 	// at all. Auto-attach is opt-in by design: a nonexistent default
@@ -353,30 +353,13 @@ func WithPolicyServerGRPCAddress(addr string) Option {
 	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
 }
 
-// NewCoreRegistry returns a Registry containing only the runtime adapters
-// implemented in this package — currently vLLM+LMCache and vLLM+Mooncake. It
-// deliberately does NOT include
-// the External passthrough adapter under pkg/adapters/runtime/external/: that
-// package imports this one (for the [KVCacheRuntimeAdapter] interface and the
-// [RuntimeID] constants), so registering it here would cycle. The
-// complete shipping composition lives in internal/adapters/builtin, so
-// production and nil-fallback paths agree on one supported set. Direct uses of
-// NewCoreRegistry or the deprecated DefaultRegistry intentionally see only the
-// in-package view (LMCache + Mooncake).
-//
-// Adapter order does not affect selection — [Registry.Select] matches on the
-// (runtime, spec.type) pair and the in-package adapters cover disjoint pairs
-// (vllm/LMCache, vllm/Mooncake) — so registering Mooncake alongside LMCache
-// here is a pure addition.
-//
-// Options the controller cares about (subscriber sidecar image, policy-server
-// address) are passed in via the variadic [Option] helpers and shared by both
-// adapters (the kvevent-subscriber sidecar is identical for either L2 store);
-// the no-arg form preserves the original Phase-1 behavior.
+// NewCoreRegistry returns a Registry containing the vLLM+LMCache runtime
+// adapter implemented in this package. Remote providers such as Mooncake and
+// externally owned storage are selected independently through remoteStorage
+// and passed to this adapter as structured bindings.
 func NewCoreRegistry(opts ...Option) *Registry {
 	r := NewRegistry()
 	r.Register(NewVLLMLMCacheAdapter(opts...))
-	r.Register(NewVLLMMooncakeAdapter(opts...))
 	return r
 }
 

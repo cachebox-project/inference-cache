@@ -60,8 +60,8 @@ const (
 // ObservationSidecar returns the kvevent-subscriber container the webhook
 // appends so the engine pod auto-attaches to the policy server.
 //
-// This adapter wires vLLM+LMCache. The vLLM+Mooncake sibling reuses the same
-// LMCache connector wire via a mooncakestore:// remote. SGLang+LMCache shares
+// This adapter wires vLLM+LMCache, including Mooncake remote bindings via the
+// mooncakestore:// protocol. SGLang+LMCache shares
 // the observation sidecar but uses its own MP engine wire and a Redis provider
 // binding rather than the standalone lmcache-server.
 type vllmLMCacheAdapter struct {
@@ -214,6 +214,19 @@ func (vllmLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, bin
 	}
 }
 
+func injectMooncakeEngineHostNetwork(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend) {
+	if EngineHostNetworkRequested(cache) {
+		pod.HostNetwork = true
+		pod.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	}
+}
+
+// EngineHostNetworkRequested reports whether the operator opted engine pods
+// using a Mooncake remote binding into host networking.
+func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
+	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
+}
+
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no
 // router component the controller needs to wire. Returning nil keeps the
 // interface contract satisfied so a Registry caller can blindly invoke both
@@ -262,8 +275,8 @@ var (
 )
 
 // ValidateLMCacheEndpoint re-exports [enginewire.ValidateLMCacheEndpoint] for
-// the legacy External API and LMCache-specific callers. Canonical
-// remoteStorage callers use [ValidateExternalEndpoint], which dispatches this
+// LMCache-specific callers. External remoteStorage callers use
+// [ValidateExternalEndpoint], which dispatches this
 // same host/port shape check according to the selected provider.
 func ValidateLMCacheEndpoint(s string) error {
 	return enginewire.ValidateLMCacheEndpoint(s)

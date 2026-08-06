@@ -41,8 +41,8 @@ controllers consume the neutral owner directly.
 `internal/adapters/builtin.New` constructs both registries used by the
 controller binary:
 
-- the complete runtime set: vLLM LMCache, vLLM Mooncake, legacy External,
-  SGLang LMCache, and SGLang HiCache;
+- the CRD-admissible runtime set: vLLM LMCache, SGLang LMCache, and SGLang
+  HiCache;
 - the complete managed and external remote-storage provider set.
 
 `pkg/adapters/runtime.NewCoreRegistry` intentionally contains only adapters
@@ -61,7 +61,6 @@ behavior-preserving change.
 | `pkg/adapters/backend` | Supported | Remote-storage provider and binding extension contracts | Keep |
 | `pkg/adapters/backend/provider` | Internalize | Shipping provider implementations | `internal/adapters/builtin/storage` |
 | `pkg/adapters/runtime` | Split | Runtime extension contracts mixed with shipping vLLM implementations | Contracts stay; implementations move under `internal/adapters/builtin/runtime` |
-| `pkg/adapters/runtime/external` | Internalize | Shipping legacy compatibility adapter | `internal/adapters/builtin/runtime` |
 | `pkg/adapters/runtime/sglang` | Internalize | Shipping SGLang implementations | `internal/adapters/builtin/runtime` |
 | `pkg/adapters/runtime/internal/enginewire` | Internalize | Shared implementation detail of built-in runtime adapters | `internal/enginebinding` or built-in runtime subtree |
 | `pkg/adapters/engine` | Internalize | Subscriber-side ingest and metrics implementation | `internal/subscriber` |

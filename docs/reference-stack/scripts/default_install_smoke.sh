@@ -203,10 +203,11 @@
 #  18. The managed Mooncake backend reconciles end-to-end: a busybox
 #      `mooncake_master` stand-in (accepts TCP on the RPC port so the rendered
 #      readiness probe passes — the real kvcacheai/mooncake image is NOT pulled)
-#      lets `CacheBackend{type: Mooncake}` reach an Available Deployment, with
+#      lets `CacheBackend{type: LMCache, remoteStorage.provider: Mooncake}`
+#      reach an Available Deployment, with
 #      `status.endpoint=<svc>:50051` and the Service's first port = the RPC port.
-#      Proves the real installed controller selects the vLLM/Mooncake adapter and
-#      renders the mooncake_master workload via ResolveCacheServer; the real
+#      Proves the real installed controller selects the vLLM/LMCache adapter with
+#      a Mooncake binding and renders the mooncake_master provider workload; the real
 #      engine-over-mooncakestore:// path stays for the Mooncake reference stack.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
@@ -1904,8 +1905,12 @@ kind: CacheBackend
 metadata:
   name: unmatched-cache
 spec:
-  type: External
-  endpoint: unmatched-cache.example.com:8200
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: unmatched-cache.example.com:8200
   engineSelector:
     matchLabels:
       app: definitely-not-qwen
@@ -2403,12 +2408,15 @@ metadata:
   name: smoke-reject-no-endpoint
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
 EOF
 )"
-if ! grep -q "requires spec.endpoint" <<<"$reject_output"; then
-  fail "admission did not reject External with no endpoint as expected; got: $reject_output"
+if ! grep -q "required when remoteStorage.ownership=External" <<<"$reject_output"; then
+  fail "admission did not reject external ownership with no endpoint as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2418,13 +2426,16 @@ metadata:
   name: smoke-reject-https
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  endpoint: https://cache.example.com:443/api
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: https://cache.example.com:443/api
 EOF
 )"
 if ! grep -q 'scheme "https" is not supported' <<<"$reject_output"; then
-  fail "admission did not reject External+https scheme as expected; got: $reject_output"
+  fail "admission did not reject external LMCacheServer+https scheme as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2434,13 +2445,16 @@ metadata:
   name: smoke-reject-no-host
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  endpoint: "lm://"
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: "lm://"
 EOF
 )"
 if ! grep -q "must be a non-empty host AND port" <<<"$reject_output"; then
-  fail "admission did not reject External+lm:// (no host) as expected; got: $reject_output"
+  fail "admission did not reject external LMCacheServer+lm:// (no host) as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2450,13 +2464,16 @@ metadata:
   name: smoke-reject-managed-endpoint
   namespace: $EXT_SMOKE_NS
 spec:
+  runtime: VLLM
   type: LMCache
-  endpoint: user-supplied.example:8080
-  integration: { engine: vllm }
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    endpoint: user-supplied.example:8080
 EOF
 )"
-if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_output"; then
-  fail "admission did not reject non-External + endpoint as expected; got: $reject_output"
+if ! grep -q "managed providers publish their observed endpoint" <<<"$reject_output"; then
+  fail "admission did not reject managed remote storage + endpoint as expected; got: $reject_output"
 fi
 
 # Canonical runtime/cache adapters must explicitly accept their remote binding.
@@ -2483,7 +2500,7 @@ EOF
 if ! grep -q 'does not accept remote binding protocol "resp"' <<<"$reject_output"; then
   fail "admission did not reject canonical SGLangHiCache + Redis as expected; got: $reject_output"
 fi
-log "admission rejected invalid legacy endpoint shapes and canonical SGLangHiCache + Redis"
+log "admission rejected invalid canonical endpoint shapes and SGLangHiCache + Redis"
 
 # --- CacheBackend admission: scale-to-zero + autoscaling + nil minReplicas ---
 # The installed validating webhook must reject the combination
@@ -2649,8 +2666,8 @@ done
 log "events-only CR publishes only Ready/Degraded/Progressing (FunctionalProbeOK/EngineKernelsHealthy/T2Degraded/EngineCompatibility absent)"
 
 # Negative-path admission: the misconfiguration the events-only validator
-# guards. An EventsOnly + spec.type=External pair must be rejected at admission
-# (events-only wires no connector; External provisions a server one would dial).
+# guards. EventsOnly plus externally owned remote storage must be rejected at
+# admission because events-only wires no connector that could dial it.
 eo_reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -2658,17 +2675,20 @@ metadata:
   name: smoke-reject-events-only-external
   namespace: $EVENTSONLY_SMOKE_NS
 spec:
-  type: External
-  endpoint: external-cache.example:8200
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: external-cache.example:8200
   integration:
-    engine: vllm
     mode: EventsOnly
 EOF
 )"
-if ! grep -q "is incompatible with spec.type" <<<"$eo_reject_output"; then
-  fail "admission did not reject EventsOnly+External as expected; got: $eo_reject_output"
+if ! grep -q "provision no remote-storage provider" <<<"$eo_reject_output"; then
+  fail "admission did not reject EventsOnly+external remote storage as expected; got: $eo_reject_output"
 fi
-log "admission rejected EventsOnly+External misconfiguration"
+log "admission rejected EventsOnly+external remote-storage misconfiguration"
 
 # Clean up — keeps the cluster reusable for KEEP_CLUSTER=1 reruns.
 kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
@@ -3874,8 +3894,7 @@ case "$mc_apply_out" in
     log "Mooncake with the opt-in applies without the engine-hostNetwork warning" ;;
 esac
 
-# Pin the fixture to the canonical hierarchy. This keeps the real-install smoke
-# from silently falling back to the legacy spec.type=Mooncake adapter path.
+# Pin the fixture to the canonical hierarchy.
 mc_runtime="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.runtime}')"
 mc_type="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.type}')"
 mc_provider="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.remoteStorage.provider}')"

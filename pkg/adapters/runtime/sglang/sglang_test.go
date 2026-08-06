@@ -66,8 +66,7 @@ func TestSGLangSupports(t *testing.T) {
 	}{
 		{"sglang+lmcache", runtimeadapter.RuntimeSGLang, newSGLangBackend(nil), true},
 		{"vllm+lmcache", runtimeadapter.RuntimeVLLM, newSGLangBackend(nil), false},
-		{"sglang+external", runtimeadapter.RuntimeSGLang, &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal}}, false},
-		{"sglang+mooncake", runtimeadapter.RuntimeSGLang, &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeMooncake}}, false},
+		{"sglang+unsupported", runtimeadapter.RuntimeSGLang, &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendType("unsupported")}}, false},
 		{"nil cache", runtimeadapter.RuntimeSGLang, nil, false},
 	}
 	for _, tc := range cases {

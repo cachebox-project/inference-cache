@@ -144,9 +144,6 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 var DefaultValidationRules = []ValidationRule{
 	validateCanonicalCacheHierarchy,
 	validateCanonicalProviderResources,
-	requireEndpointForExternal,
-	rejectEndpointOnNonExternal,
-	rejectInvalidExternalEndpoint,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectMooncakeMasterScaleOut,
@@ -256,13 +253,6 @@ func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.Error
 	}
 
 	if canonical {
-		switch cb.Spec.Type {
-		case cachev1alpha1.CacheBackendTypeMooncake, cachev1alpha1.CacheBackendTypeExternal:
-			errs = append(errs, field.Invalid(
-				specPath.Child("type"), cb.Spec.Type,
-				"the canonical API uses spec.type only for the engine-side cache; move provider and ownership to spec.remoteStorage",
-			))
-		}
 		if len(cb.Spec.BackendConfig) > 0 {
 			errs = append(errs, field.Forbidden(
 				specPath.Child("backendConfig"),
@@ -998,20 +988,9 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 // reconciler and pod-mutating webhook consult — so admission, reconcile,
 // and pod injection agree on which adapter the registry should pick. In
 // particular, an unset engine defaults to vLLM here just as it does at
-// reconcile, so a CR with an unsupported type (e.g. `type: AIBrix`) and no
-// engine no longer slips past admission only to fail downstream.
-//
-// External backends flow through this check the same way managed types
-// do: they have a real runtime adapter (vllm-only today, see
-// pkg/adapters/runtime/external), and the pod-mutating webhook calls
-// it to wire engine pods. A CR with `type: External, engine: sglang`
-// would be admitted into a state the pod webhook can't realise — the
-// engine pod would silently boot un-wired to the external cache —
-// without this check. Admission reject is the right surface: the
-// reconciler still short-circuits External via reconcileExternal before
-// any adapter lookup, so the only consumer of the (engine, External)
-// pair is the pod webhook, and admission rejecting upstream of it gives
-// the operator a useful error instead of a silent miss.
+// reconcile, so an unsupported pair does not slip past admission only to fail
+// downstream. Remote-storage provider and ownership do not affect runtime
+// adapter selection; they are validated independently as bindings.
 //
 // The check is bypassed only when Spec.Type is empty: a CR that came
 // through admission carries `+kubebuilder:default=LMCache` stamped by
@@ -1114,18 +1093,6 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 	// avoid — so we reject the CR up front.
 	errs = append(errs, checkEngineOverrideEnvShape(overrides.Env, basePath.Child("env"))...)
 
-	// External backends flow through this check the same way managed
-	// types do: the External adapter declares its own ReservedArgs /
-	// ReservedEnv (mirroring the managed-LMCache wire it shares), and
-	// the pod webhook calls the adapter for engine pods that match an
-	// External CR's spec.engineSelector. Suppressing
-	// `--kv-transfer-config` or overriding `LMCACHE_REMOTE_URL` on an
-	// External CR would silently un-wire the cache exactly the way it
-	// would on a managed CR — admission must catch it at write time,
-	// not let the engine crash later. The earlier in-place External
-	// skip was load-bearing only when External had no adapter; it
-	// became a backdoor the moment the adapter shipped.
-	//
 	// Bypassed only for an empty spec.type — the structural rules
 	// already reject that, and piling an "adapter for backend=\"\""
 	// cause on top would not help the user.
@@ -1134,13 +1101,8 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 	}
 	registry := v.Registry
 	if registry == nil {
-		// Mirror checkRuntimeAdapter's fallback exactly: a nil-registry
-		// validator must see the same adapter set in BOTH checks, or
-		// External admits in checkRuntimeAdapter (via the External adapter
-		// in defaultShippingRegistry) and then silently skips its
-		// reserved-arg/env enforcement here. That would let an External
-		// CR suppress `--kv-transfer-config` or override
-		// `LMCACHE_REMOTE_URL` and un-wire the cache at the engine pod.
+		// Mirror checkRuntimeAdapter's fallback exactly so pair selection and
+		// reserved-arg/env enforcement always use the same shipping set.
 		registry = defaultShippingRegistry()
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
@@ -1364,120 +1326,13 @@ func unsupportedPairMessage(engine adapterruntime.RuntimeID, backend cachev1alph
 	)
 }
 
-// requireEndpointForExternal rejects an External backend that has no
-// Endpoint set. An External backend is a pre-existing service the
-// controller only mirrors to status — without an address there is nothing
-// to mirror and the spec is structurally incomplete.
-func requireEndpointForExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
-		return nil
-	}
-	if strings.TrimSpace(cb.Spec.Endpoint) != "" {
-		return nil
-	}
-	return field.ErrorList{
-		field.Required(
-			field.NewPath("spec", "endpoint"),
-			"CacheBackend with spec.type=External requires spec.endpoint to be set to the address of the pre-existing backend",
-		),
-	}
-}
-
-// rejectEndpointOnNonExternal rejects a non-External backend that carries a
-// non-empty spec.endpoint. The field is meaningful only for the External
-// passthrough adapter — for managed types the controller overwrites
-// status.endpoint from the live Service it provisions, so a user-supplied
-// spec.endpoint would be silently ignored. Hard-rejecting at admission
-// makes the misconfiguration visible at write time instead of leaving the
-// operator wondering why their endpoint never took effect.
-//
-// An empty spec.type is left to the External-required rule and CRD-level
-// validation; piling a "remove spec.endpoint" cause on top of a missing-
-// type rejection would not help the user.
-func rejectEndpointOnNonExternal(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Type == "" || cb.Spec.Type == cachev1alpha1.CacheBackendTypeExternal {
-		return nil
-	}
-	if strings.TrimSpace(cb.Spec.Endpoint) == "" {
-		return nil
-	}
-	// field.Invalid (not field.Forbidden) so the bad endpoint flows into
-	// the error's BadValue. ValidateUpdate's diff-vs-old logic keys on
-	// (Type, Field, BadValue, Detail); using Invalid lets it distinguish
-	// "operator edited the bad endpoint to a different bad endpoint"
-	// (newly-introduced violation, reject) from "operator left the same
-	// bad endpoint in place and changed only an unrelated field" (no
-	// fresh violation, allow). field.Forbidden has BadValue="forbidden"
-	// regardless of the actual value and would collapse the two cases.
-	return field.ErrorList{
-		field.Invalid(
-			field.NewPath("spec", "endpoint"),
-			cb.Spec.Endpoint,
-			fmt.Sprintf("spec.endpoint is only valid when spec.type=External; got spec.type=%q with non-empty spec.endpoint. Managed backends learn their endpoint from the controller-rendered Service.", cb.Spec.Type),
-		),
-	}
-}
-
-// rejectInvalidExternalEndpoint rejects an External CacheBackend whose
-// spec.endpoint fails the shared LMCache endpoint shape check —
-// unsupported scheme, missing port, embedded whitespace, unbracketed
-// IPv6, path/query/fragment components, or any other shape that would
-// produce an LMCACHE_REMOTE_URL the engine connector refuses at startup.
-// Catches the misconfiguration loudly at write time instead of leaving
-// the operator to discover it from engine-pod crash logs.
-//
-// Allowed forms (see [adapterruntime.ValidateLMCacheEndpoint] for the
-// full shape contract — admission, the C2 reconciler, and the pod
-// webhook all call the same helper so the three layers agree):
-//   - bare `host:port` (the canonical shape — the helper adds the
-//     `lm://` scheme on injection)
-//   - `lm://host:port` (operators who prefer to be explicit)
-//   - bracketed IPv6 (`[::1]:8200`)
-//
-// Empty endpoint is left to [requireEndpointForExternal]; non-External
-// types are left to [rejectEndpointOnNonExternal].
-//
-// A future SGLang-shaped External adapter (different engine wire) will
-// have its own shape rules; this rule narrows on `Type == External`
-// only because the vLLM wire is the only one we ship today.
-func rejectInvalidExternalEndpoint(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeExternal {
-		return nil
-	}
-	if strings.TrimSpace(cb.Spec.Endpoint) == "" {
-		return nil // requireEndpointForExternal handles this
-	}
-	if err := adapterruntime.ValidateLMCacheEndpoint(cb.Spec.Endpoint); err != nil {
-		// Wrap the helper's plain error in a field-scoped Invalid so
-		// kubectl prints the field path alongside the message. The
-		// reconciler and pod webhook call the same helper and act on
-		// the raw error (degrade Ready, fail-open).
-		return field.ErrorList{
-			field.Invalid(
-				field.NewPath("spec", "endpoint"),
-				cb.Spec.Endpoint,
-				"spec."+err.Error(),
-			),
-		}
-	}
-	return nil
-}
-
 // rejectEventsOnlyMisconfiguration enforces the constraints of the events-only
 // (tier-1 routing) integration mode. EventsOnly provisions no backend server
 // and wires no KV connector, so server-shaped configuration is structurally
 // meaningless:
 //
-//   - spec.type must be LMCache (the default): LMCache's adapter supplies the
-//     kvevent-subscriber the routing tier needs, and its in-memory server is a
-//     no-op when no connector is wired. Every other type is contradictory —
-//     External wires an operator-run offload server the (absent) connector
-//     would dial, and a managed Mooncake backend stands up a mooncake_master
-//     store nothing would use. So LMCache is the ONLY supported events-only
-//     managed type. This must be checked explicitly now that a second managed
-//     adapter (vLLM, Mooncake) is registered: before it shipped, non-LMCache
-//     managed types were caught by the runtime-adapter check, but Mooncake now
-//     passes that check and would otherwise be admitted in events-only mode.
+//   - spec.type must be LMCache (the default), whose adapter supplies the
+//     kvevent-subscriber the routing tier needs.
 //   - spec.remoteStorage requests an offload provider that the controller
 //     deliberately removes in events-only mode.
 //   - spec.autoscaling has no workload to scale — the controller deploys
@@ -1494,20 +1349,12 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 	case "", cachev1alpha1.CacheBackendTypeLMCache:
 		// LMCache is the supported events-only managed type; an empty type
 		// defaults to LMCache via the CRD marker, so both are allowed.
-	case cachev1alpha1.CacheBackendTypeExternal:
-		errs = append(errs, field.Forbidden(
-			field.NewPath("spec", "integration", "mode"),
-			fmt.Sprintf("mode %q is incompatible with spec.type %q: events-only wires no KV connector, while External provisions an operator-run offload server the connector would dial",
-				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeExternal),
-		))
 	default:
-		// Any other managed type (Mooncake today, and any future adapter):
-		// events-only wires no KV connector, so a backend that provisions an
-		// offload store has nothing the mode would use. LMCache is the only
-		// supported events-only managed type.
+		// Any other engine-cache type cannot supply the vLLM event stream
+		// contract this mode currently implements.
 		errs = append(errs, field.Forbidden(
 			field.NewPath("spec", "integration", "mode"),
-			fmt.Sprintf("mode %q is only supported with spec.type %q; got spec.type %q. Events-only wires no KV connector, so a managed backend that provisions an offload store (e.g. a Mooncake master) has nothing the mode would use",
+			fmt.Sprintf("mode %q is only supported with spec.type %q; got spec.type %q. Events-only wires no KV connector",
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeLMCache, cb.Spec.Type),
 		))
 	}
@@ -1532,17 +1379,15 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 // resolves into a Service in a namespace other than the CacheBackend's
 // own, unless spec.allowCrossNamespace is true. Crossing a namespace is
 // a tenancy boundary the operator should explicitly acknowledge; the
-// rule covers both canonical spec.remoteStorage.endpoint and deprecated
-// spec.endpoint, and fires only when the endpoint is a recognisable in-cluster
-// Service DNS. External hostnames and IPs pass through because they expose no
+// rule covers spec.remoteStorage.endpoint and fires only when the endpoint is
+// a recognisable in-cluster Service DNS. External hostnames and IPs pass through because they expose no
 // namespace to compare against.
 func rejectCrossNamespaceEndpointWithoutOptIn(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	endpoint := cb.Spec.Endpoint
-	endpointPath := field.NewPath("spec", "endpoint")
-	if cb.Spec.RemoteStorage != nil && strings.TrimSpace(cb.Spec.RemoteStorage.Endpoint) != "" {
-		endpoint = cb.Spec.RemoteStorage.Endpoint
-		endpointPath = field.NewPath("spec", "remoteStorage", "endpoint")
+	if cb.Spec.RemoteStorage == nil {
+		return nil
 	}
+	endpoint := cb.Spec.RemoteStorage.Endpoint
+	endpointPath := field.NewPath("spec", "remoteStorage", "endpoint")
 
 	ns, ok := serviceDNSNamespace(endpoint)
 	if !ok {
@@ -1627,7 +1472,7 @@ func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorLis
 	if cb.Spec.Autoscaling != nil {
 		errs = append(errs, field.Invalid(
 			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
-			"spec.autoscaling is not supported for type=Mooncake: the master is a singleton on the host network, so scaling it out either cannot bind "+
+			"spec.autoscaling is not supported for remoteStorage.provider=Mooncake: the master is a singleton on the host network, so scaling it out either cannot bind "+
 				"the node's ports or splits the store across independent masters. Remove spec.autoscaling.",
 		))
 	}

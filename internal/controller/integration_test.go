@@ -225,9 +225,9 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 	})
 
 	t.Run("MooncakeMasterWorkloadShape", func(t *testing.T) {
-		// Mooncake reconcile contract against a real apiserver: type=Mooncake
-		// reconciles into a mooncake_master Deployment + Service via the
-		// Mooncake adapter, and status.endpoint resolves the master's RPC port.
+		// Mooncake provider contract against a real apiserver: the canonical
+		// remote binding reconciles into a mooncake_master Deployment + Service,
+		// and status.endpoint resolves the master's RPC port.
 		ns := freshNS(t, k8s)
 		cb := mooncakeBackend("cache", ns)
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -405,7 +405,7 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 	t.Run("ServerImageOverrideAndUpdate", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := lmcacheBackend("cache", ns)
-		cb.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v1"}
+		cb.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v1"
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -415,7 +415,7 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 
 		live := getBackend(t, r, "cache", ns)
-		live.Spec.BackendConfig["serverImage"] = "example.com/lmcache-server:v2"
+		live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v2"
 		if err := k8s.Update(ctx, live); err != nil {
 			t.Fatalf("update image: %v", err)
 		}
@@ -584,8 +584,9 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 
 		live := getBackend(t, r, "cache", ns)
-		live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-		live.Spec.Endpoint = "external.example.svc:8080"
+		live.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		live.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		live.Spec.RemoteStorage = externalLMCacheStorage("external.example.svc:8080")
 		if err := k8s.Update(ctx, live); err != nil {
 			t.Fatalf("switch to external: %v", err)
 		}
@@ -612,10 +613,10 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 	})
 
 	t.Run("ExternalCreateProducesNoWorkloadAndReady", func(t *testing.T) {
-		// A CacheBackend{type: External} reconciled against a real
+		// A CacheBackend with externally owned remote storage reconciled against a real
 		// apiserver must (a) leave the CR's namespace free of any
 		// controller-rendered Deployment or Service, (b) mirror
-		// spec.endpoint into status.endpoint verbatim, and (c) publish
+		// spec.remoteStorage.endpoint into status.endpoint verbatim, and (c) publish
 		// Ready=True with reason ExternalEndpointAccepted so downstream
 		// consumers (the future readiness gate, the indexParticipation
 		// poller) treat the CR as usable.
@@ -623,8 +624,9 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "ext-fresh", Namespace: ns},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type:     cachev1alpha1.CacheBackendTypeExternal,
-				Endpoint: "lm://my-cache.example:8200",
+				Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:          cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: externalLMCacheStorage("lm://my-cache.example:8200"),
 			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -661,7 +663,11 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
-			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal, Endpoint: "ext.example.svc:8080"},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:          cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: externalLMCacheStorage("ext.example.svc:8080"),
+			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
@@ -678,12 +684,11 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 
 	t.Run("UnmanagedTypeNoWorkload", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		// AIBrix has no registered adapter → unmanaged path. (Mooncake now
-		// has an adapter and reconciles managed — see the Managed Mooncake
-		// integration subtest.)
+		// An arbitrary unsupported value has no registered adapter and follows
+		// the unmanaged defense-in-depth path when admission is bypassed.
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns},
-			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeAIBrix},
+			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendType("unsupported")},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
@@ -1457,8 +1462,9 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 		return &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type:           cachev1alpha1.CacheBackendTypeExternal,
-				Endpoint:       "external.example:6379",
+				Runtime:        cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:           cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage:  externalLMCacheStorage("external.example:6379"),
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 			},
 		}
@@ -1591,8 +1597,9 @@ func TestIntegrationCacheBackendPrinterColumnsRenderParticipation(t *testing.T) 
 	active := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "backend-a", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "lm://cache-svc:6379",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("lm://cache-svc:6379"),
 		},
 	}
 	if err := k8s.Create(ctx, active); err != nil {
@@ -1601,8 +1608,9 @@ func TestIntegrationCacheBackendPrinterColumnsRenderParticipation(t *testing.T) 
 	quiet := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "backend-b", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "lm://cache-svc:6379",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("lm://cache-svc:6379"),
 		},
 	}
 	if err := k8s.Create(ctx, quiet); err != nil {

@@ -25,8 +25,14 @@ func gatedLMCacheBackend(name, ns string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Generation: 1},
 		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime:  cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:     cachev1alpha1.CacheBackendTypeLMCache,
 			Replicas: ptrInt32(1),
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			},
 		},
 	}
 }
@@ -320,8 +326,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type:     cachev1alpha1.CacheBackendTypeExternal,
-				Endpoint: "external.example.svc:6379",
+				Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:          cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: externalLMCacheStorage("external.example.svc:6379"),
 			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {

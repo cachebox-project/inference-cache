@@ -245,13 +245,19 @@ func TestIntegrationFunctionalProbeGate(t *testing.T) {
 			t.Fatalf("FunctionalProbeOK should be present before cleanup")
 		}
 
-		// Flip to External so the reconciler runs reconcileExternal → which
-		// invokes cleanupOwnedWorkload → the conditions-clear branch.
+		// Flip to canonical external ownership so the reconciler runs
+		// reconcileExternal → which invokes cleanupOwnedWorkload → the
+		// conditions-clear branch.
 		before := cb.DeepCopy()
-		cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-		cb.Spec.Endpoint = "lm://test.example.com:9999"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			Endpoint:  "lm://test.example.com:9999",
+		}
 		if err := k8s.Patch(ctx, cb, client.MergeFrom(before)); err != nil {
-			t.Fatalf("patch to External: %v", err)
+			t.Fatalf("patch to external ownership: %v", err)
 		}
 		reconcile(t, r, "cache", ns)
 

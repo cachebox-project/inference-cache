@@ -84,62 +84,15 @@ binding (`lm`, `resp`, or `mooncakestore`). The engine adapter declares which
 bindings it accepts. Admission rejects unsupported combinations before an
 engine Pod is created.
 
-### Legacy compatibility
+### Cache type validation
 
-The old fields remain readable during `v1alpha1`. When none of `runtime`,
-`lmCache`, or `remoteStorage` is present, the compatibility resolver preserves
-the historical behavior:
+`spec.type` is a closed CRD enum containing `LMCache` and `SGLangHiCache`.
+Remote-provider technology and lifecycle ownership are not cache types:
+Mooncake is selected through `remoteStorage.provider`, and externally managed
+infrastructure through `remoteStorage.ownership`. The API server rejects the
+old `type: Mooncake` and `type: External` spellings before admission.
 
-| Legacy shape | Effective engine cache | Effective remote storage |
-|---|---|---|
-| `type: LMCache`, `integration.engine: vllm` | LMCache | Managed LMCacheServer |
-| `type: LMCache`, `integration.engine: sglang` | LMCache | Managed Redis |
-| `type: Mooncake` | LMCache | Managed Mooncake |
-| `type: External`, `endpoint: ...` | LMCache | External LMCacheServer |
-
-New manifests should use the canonical fields. In particular, setting
-`runtime: SGLang` plus `type: LMCache` no longer implies Redis; a
-`remoteStorage` block must request it explicitly.
-
-### Migrating a legacy resource
-
-Migration is an all-at-once spec replacement, not a field-by-field transition.
-Adding `runtime`, `lmCache`, or `remoteStorage` selects the canonical hierarchy;
-that same update must remove deprecated `backendConfig` and top-level
-`resources`, move the model ID to `observation.modelID`, and express provider
-ownership under `remoteStorage`. A partial update is rejected at admission so
-the controller never has to interpret a mixed ownership model.
-
-For example, migrate a legacy managed LMCache backend from:
-
-```yaml
-spec:
-  type: LMCache
-  integration:
-    engine: vllm
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
-    serverImage: lmcache/standalone:v0.4.7
-```
-
-to this complete canonical shape in one `kubectl apply`:
-
-```yaml
-spec:
-  runtime: VLLM
-  type: LMCache
-  observation:
-    modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      image: lmcache/standalone:v0.4.7
-```
-
-`runtime` enum values are case-sensitive (`VLLM` and `SGLang`); the old
-`integration.engine` field alone remains case-insensitive. Converted External
-and Mooncake examples are available in
+The canonical External and Mooncake examples are available in
 [`config/samples/cachebackend-external.yaml`](../../config/samples/cachebackend-external.yaml)
 and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cachebackend-mooncake.yaml).
 
@@ -148,7 +101,7 @@ and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cacheback
 | Field | Type | Purpose |
 |---|---|---|
 | `runtime` | enum | Inference runtime: `VLLM` or `SGLang`. Values are case-sensitive. New manifests use this instead of `integration.engine`, whose legacy reader remains case-insensitive. |
-| `type` | string | Engine-side cache implementation identifier. Defaults to `LMCache`. `Mooncake` and `External` remain accepted only as legacy compatibility values. |
+| `type` | enum | Engine-side cache implementation: `LMCache` or `SGLangHiCache`. Defaults to `LMCache`. |
 | `lmCache` | object | Typed LMCache engine configuration: chunk size, host-memory capacity, MP-worker image/port, and remote serde. |
 | `remoteStorage` | object | Optional remote tier. Omitting it means host-only and provisions no provider workload. |
 | `remoteStorage.provider` | enum | `Redis`, `LMCacheServer`, or `Mooncake`. |
@@ -174,8 +127,7 @@ and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cacheback
 | `backendConfig` | map | Deprecated compatibility map. New configuration belongs under `lmCache`, `remoteStorage.<provider>`, or `observation`. |
 | `template` | object | Optional pod-level overrides for managed backend pods. This is a narrow override surface, not a full `PodSpec`; backend containers come from controller defaults. |
 | `resources` | object | Deprecated compatibility resources for legacy provider shapes. Canonical manifests use `remoteStorage.redis.resources`, `remoteStorage.lmCacheServer.resources`, or `remoteStorage.mooncake.resources`. |
-| `endpoint` | string | Deprecated compatibility endpoint for legacy `type: External`. Canonical manifests use `remoteStorage.endpoint` with `ownership: External`. |
-| `allowCrossNamespace` | boolean | Opt-in flag that allows canonical `spec.remoteStorage.endpoint` or deprecated `spec.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
+| `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.remoteStorage.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
 
 > **Per-namespace lookup tuning lives on CachePolicy, not CacheBackend.** The
 > lookup latency budget and the minimum-prefix-token gate are configured via
@@ -246,7 +198,11 @@ Limits-only shapes admit unchanged for any resource — K8s auto-populates `requ
 
 **Resource names must match K8s container-resource rules.** `ResourceList` keys are opaque map keys at the CRD-schema layer; an invalid name like `"foo"` or `""` persists in etcd and only fails when the apiserver later rejects the child pod. The validating webhook (`rejectInvalidResourceNames`) applies the same rules the apiserver applies to a `Container.Resources` map: standard names (`cpu`, `memory`, `ephemeral-storage`) admit unconditionally; a `hugepages-<size>` name admits only when the size suffix parses as a strictly-positive `resource.Quantity` (e.g. `"hugepages-2Mi"`, `"hugepages-1Gi"` — a bare `"hugepages-"` or non-numeric `"hugepages-nope"` is rejected because the apiserver requires the size token); any other name must be **third-party vendor-prefixed** (e.g. `"nvidia.com/gpu"`) and pass `IsQualifiedName`. A bare unqualified `"foo"` is rejected even though `IsQualifiedName` alone admits it, because the apiserver's container-resource layer requires extended resources to carry a vendor identity. Names under the **K8s-reserved prefixes `kubernetes.io/` and `requests.kubernetes.io/`** are also rejected — those prefixes are reserved for native resources, so extended resources may not use them. The rejection names the offending key so multi-key errors surface together.
 
-**Inert for legacy backends with no controller-managed workload.** Legacy `spec.type=External` and `spec.type=SGLangHiCache` provision no cache-server workload of their own, so the compatibility `spec.resources` default has no rendered target. HiCache host memory belongs to the user-owned engine container and must be sized on that workload instead.
+**Inert without a controller-managed workload.** Host-only, externally owned,
+and `SGLangHiCache` configurations provision no cache-server workload of their
+own, so the deprecated top-level `spec.resources` field has no rendered target.
+HiCache host memory belongs to the user-owned engine container and must be sized
+on that workload instead.
 
 ### backendConfig keys (managed LMCache)
 
@@ -284,7 +240,7 @@ Legacy engine-side keys (consumed by `InjectEngineConfig`). The `LMCACHE_*` tuna
 The webhook also injects the flags every vLLM+LMCache engine needs:
 
 - `--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"<role>"}'` — `<role>` is derived from `spec.integration.role`: `ReadOnly → kv_consumer`, `WriteOnly → kv_producer`, `ReadWrite → kv_both` (also the default when `integration` is unset).
-- `LMCACHE_REMOTE_URL` is injected only when the canonical hierarchy has a remote binding. Omitting `spec.remoteStorage` is host-only and deliberately leaves this variable unset. An LMCacheServer binding renders `lm://<endpoint>`; a Mooncake binding renders `mooncakestore://<endpoint>`. For Managed ownership, the endpoint comes from `status.endpoint`, built from the controller-owned Service. For External ownership, the trimmed `spec.remoteStorage.endpoint` is operator-authoritative so a stale status value cannot wire a new pod during an endpoint update. Admission validates the endpoint against the selected provider: LMCacheServer accepts bare `host:port` or `lm://host:port`, Mooncake accepts bare `host:port` or `mooncakestore://host:port`, and Redis requires bare `host:port`. Legacy managed and `type: External` resources synthesize the equivalent LMCacheServer binding from their historical fields.
+- `LMCACHE_REMOTE_URL` is injected only when the hierarchy has a remote binding. Omitting `spec.remoteStorage` is host-only and deliberately leaves this variable unset. An LMCacheServer binding renders `lm://<endpoint>`; a Mooncake binding renders `mooncakestore://<endpoint>`. For Managed ownership, the endpoint comes from `status.endpoint`, built from the controller-owned Service. For External ownership, the trimmed `spec.remoteStorage.endpoint` is operator-authoritative so a stale status value cannot wire a new pod during an endpoint update. Admission validates the endpoint against the selected provider: LMCacheServer accepts bare `host:port` or `lm://host:port`, Mooncake accepts bare `host:port` or `mooncakestore://host:port`, and Redis requires bare `host:port`.
 - `VLLM_USE_V1=1`.
 - `INFERENCECACHE_FAIL_OPEN=<true|false>` — mirrors `spec.integration.failOpen` onto the engine pod (defaults to `true` when the field is unset). The LMCache connector is fail-open by default at runtime regardless of this value; surfacing the bit lets the engine layer enforce fail-closed semantics when that work lands, and keeps the adapter aligned with the contract that this flag is plumbed by the engine adapter.
 - `PYTHONHASHSEED=0` — pins the deterministic `NONE_HASH` that seeds vLLM's prefix-cache block-hash chain across the scheduler and TP worker processes. Under TP>1 those are separate OS processes; with the seed unset (or overridden) each derives a different `NONE_HASH`, so the scheduler's reload lookup never matches the workers' stored hashes and LMCache reload silently 0-hits (full recompute, no crash, no error). A correctness invariant, not a tunable — reserved so an override can't re-break it.
@@ -467,11 +423,7 @@ the KV-event subscriber.
 **Admission constraints.** Because an events-only backend provisions no server, server-shaped configuration is structurally meaningless and is rejected at admission:
 
 - `spec.remoteStorage` is forbidden — any Managed or External declaration requests an offload provider that events-only deliberately does not wire.
-- Legacy `spec.type=External` is incompatible for the same reason: it synthesizes an operator-run LMCacheServer binding that no connector would dial. The supported engine-cache type is `LMCache`, whose adapter supplies the kvevent-subscriber the routing tier needs.
 - `spec.autoscaling` is forbidden — there is no workload to scale. The rejection is field-scoped to `spec.autoscaling`.
-
-Legacy `spec.endpoint` needs no events-only-specific rule: it is already rejected
-on any non-`External` legacy backend (see [Validating](#validating)).
 
 ### LMCache server / client version alignment
 
@@ -581,11 +533,10 @@ that the round-trip probe cannot see.
 
 ### Mooncake provider configuration
 
-Canonical `spec.remoteStorage.mooncake` selects the Mooncake provider adapter
+`spec.remoteStorage.mooncake` selects the Mooncake provider adapter
 (`pkg/adapters/backend/provider/mooncake.go`) to reconcile the standalone
 **Mooncake master** workload. The vLLM runtime adapter
-(`pkg/adapters/runtime/vllm_mooncake.go`) separately wires engine pods to it;
-legacy `spec.type: Mooncake` maps to the same provider/runtime pair. Mooncake is
+separately wires engine pods to it through the LMCache remote-binding contract. Mooncake is
 the durable / shared cache path — the backend-type expression of the persistence
 decision in
 [`docs/design/lmcache-server-persistence.md`](lmcache-server-persistence.md)
@@ -596,9 +547,9 @@ scalable one — durability is a backend choice, not a generic volume knob).
 >
 > * The namespace must **permit `hostNetwork`** — a Pod Security `restricted` namespace will reject the master pod.
 > * The master **reserves its ports (50051 / 8080 / 9003) on its node** (the API server defaults `hostPort=containerPort` for hostNetwork pods), and its Deployment uses the `Recreate` rollout strategy — a rolling surge would collide on those ports.
-> * The master is a **singleton**. `spec.replicas > 1` and `spec.autoscaling` are **rejected at admission** when `remoteStorage.provider: Mooncake` (and for legacy `type: Mooncake`): a second replica either fails to schedule because its node ports are already bound or comes up as an independent master and silently splits the store. `spec.replicas: 0` (disabled) and `1` remain valid. Because update-validation only rejects *newly introduced* violations, the reconciler also clamps a grandfathered object to one replica and removes any HPA it owns.
+> * The master is a **singleton**. `spec.replicas > 1` and `spec.autoscaling` are **rejected at admission** when `remoteStorage.provider: Mooncake`: a second replica either fails to schedule because its node ports are already bound or comes up as an independent master and silently splits the store. `spec.replicas: 0` (disabled) and `1` remain valid.
 > * **Network exposure — plan for it.** Host networking publishes the master's RPC (`50051`), metadata (`8080`) and metrics (`9003`) ports, plus the transfer engine's dynamically negotiated data ports, directly on the **node's interfaces**, outside the pod network. `NetworkPolicy` selects pods by pod IP and therefore **does not constrain a hostNetwork pod's listeners** — the isolation you get from pod-network policy is simply absent here. Restrict access with node-level controls instead: security-group / firewall rules on the node interfaces, and by constraining which nodes the master and its engines may schedule onto. Treat all of these ports as cluster-internal only; none of them authenticate callers.
-> * **Engine pods need host networking too — opt in with `spec.integration.engineHostNetwork: true`.** Mooncake's mesh is dialed *from* the engine, so an overlay engine pod cannot participate. With the flag set, the Pod webhook moves matched engine pods onto the host network (`hostNetwork` + `dnsPolicy: ClusterFirstWithHostNet`) alongside the usual `LMCACHE_*` wiring. Until it is set, admission **warns on every canonical Mooncake `remoteStorage` apply** (and on legacy `type: Mooncake`) and the backend reports `Ready` while transferring **zero KV**.
+> * **Engine pods need host networking too — opt in with `spec.integration.engineHostNetwork: true`.** Mooncake's mesh is dialed *from* the engine, so an overlay engine pod cannot participate. With the flag set, the Pod webhook moves matched engine pods onto the host network (`hostNetwork` + `dnsPolicy: ClusterFirstWithHostNet`) alongside the usual `LMCACHE_*` wiring. Until it is set, admission **warns on every Mooncake `remoteStorage` apply** and the backend reports `Ready` while transferring **zero KV**.
 >
 >   It is opt-in, never injected by default, because it rewrites the networking of a pod **you** own. `hostNetwork` is a privilege, and mutating webhooks run **before** Pod Security validation — so silently adding it would turn a working engine pod into one a `restricted` namespace *rejects*, with an error naming Pod Security rather than this controller. The flag is rejected on backend types that do not need it, so it can never sit inert.
 >
@@ -633,7 +584,7 @@ Engine-side: the adapter injects the same `--kv-transfer-config '{"kv_connector"
 
 | Field | Type | Purpose |
 |---|---|---|
-| `endpoint` | string | Observed endpoint clients should use. For External ownership this mirrors canonical `spec.remoteStorage.endpoint` (or legacy `spec.endpoint`); for Managed remote storage it is populated from the controller-rendered Service. It stays **empty** for host-only and events-only backends because neither has a remote provider address to publish. |
+| `endpoint` | string | Observed endpoint clients should use. For External ownership this mirrors `spec.remoteStorage.endpoint`; for Managed remote storage it is populated from the controller-rendered Service. It stays **empty** for host-only and events-only backends because neither has a remote provider address to publish. |
 | `matchedEnginePods` | integer | Snapshot count, at the last reconcile, of pods in the CacheBackend's namespace whose labels satisfy `spec.engineSelector`. Pointer in Go so nil ("not yet computed") is distinguishable from an observed `0` ("computed and zero pods match"). Refreshed at reconcile cadence — not a real-time per-pod counter. The steady cadence is 30s; during known churn the reconciler uses a conditional 5s cadence when the observed matching Pod count differs from the desired replica sum of Deployments whose pod-template labels match the selector. This keeps the no-Pod-watch design while reducing stale operator output during rolling restarts. The field stays nil when no claim-capable selector is configured — both when `spec.engineSelector` is absent AND when `spec.engineSelector.matchLabels` is present but empty (the webhook treats an empty match map as no-claim by design, so the count is no-claim too). A CR that previously had a non-empty selector and just lost it gets its prior value cleared back to nil so the printer column does not advertise a stale match. |
 | `engineSelectorMessage` | string | Operator-facing diagnosis for selector drift. Set when `spec.engineSelector.matchLabels` is configured and `matchedEnginePods` is observed as `0` while engine pods are expected; the message echoes the selector (`spec.engineSelector.matchLabels={...}`) and states that no Pods in the namespace match. If the selector matches a Deployment that is intentionally scaled to zero, `matchedEnginePods` still reports the observed `0`, but this message stays empty because no engine pods are expected. Cleared once at least one pod matches, the matching Deployment is scaled to zero, or the selector is removed. The controller also emits a Normal `EngineSelectorUnmatched` Event when the initial observation is zero, when a previously non-zero match count transitions to zero, or when upgrading an existing zero-count status that did not yet have the diagnostic message; steady-state zero with an unchanged message does not re-emit. |
 | `failOpen` | boolean | Observed echo of the effective `spec.integration.failOpen`. Represented as a pointer in Go so an explicit `false` is serialized and operators can read the current mode from status alone. |
@@ -671,11 +622,9 @@ When the desired replica count is owned by an HPA (`spec.autoscaling` set) the c
 
 **Externally owned remote storage**:
 
-Canonical resources express this shape with
+Resources express this shape with
 `spec.remoteStorage.ownership: External`, the selected provider, and
-`spec.remoteStorage.endpoint`. The legacy `spec.type: External` +
-`spec.endpoint` shape maps to an external LMCacheServer binding. There is no
-Deployment to roll out in either case, so provider-specific endpoint validation
+`spec.remoteStorage.endpoint`. There is no Deployment to roll out, so provider-specific endpoint validation
 is the only readiness signal the controller has. The controller mirrors the
 trimmed endpoint to `status.endpoint` and publishes both conditions immediately
 on every reconcile (the KV-event gate never applies to external ownership):
@@ -684,7 +633,7 @@ on every reconcile (the KV-event gate never applies to external ownership):
 |---|---|---|---|
 | `Ready` | `True` | `ExternalEndpointAccepted` | The active endpoint field is non-empty and valid for the selected provider. LMCacheServer accepts `host:port` or `lm://host:port`; Mooncake accepts `host:port` or `mooncakestore://host:port`; Redis accepts bare `host:port`. A port is always required, embedded whitespace and URL path/query/fragment components are rejected, and IPv6 must be bracketed. The controller provisions no provider pod for External ownership, so admission acceptance is the readiness signal. |
 | `Ready` | `False` | `ExternalEndpointMissing` | The active endpoint field is empty or whitespace-only. Current admission rejects this, so the state is reachable only for a CR already stored before the webhook was installed. Status reflects the gap loudly rather than dropping the condition. |
-| `Ready` | `False` | `ExternalEndpointInvalid` | The active endpoint is non-empty but fails the selected provider's shape check. Current admission rejects these values; the reason is reachable only for a CR stored before the relevant rule shipped. The message names `spec.remoteStorage.endpoint` for canonical resources or `spec.endpoint` for legacy resources and carries the shape error. The pod webhook applies the same validation and admits the engine pod unwired on failure. |
+| `Ready` | `False` | `ExternalEndpointInvalid` | The active endpoint is non-empty but fails the selected provider's shape check. Current admission rejects these values; the reason is reachable only for a CR stored before the relevant rule shipped. The message names `spec.remoteStorage.endpoint` and carries the shape error. The pod webhook applies the same validation and admits the engine pod unwired on failure. |
 | `Progressing` | `False` | mirrors Ready's reason | External ownership completes admission immediately — there is no rollout the controller is still driving. Always `False`; the reason matches Ready (`ExternalEndpointAccepted` / `ExternalEndpointMissing` / `ExternalEndpointInvalid`) so `kubectl describe` shows a coherent pair. |
 
 Reachability of an externally owned endpoint is **not** probed by the controller;
@@ -716,7 +665,7 @@ The signal source is `status.indexParticipation.lastEventAt` (written by the Cac
 - **at least one event ever observed** → `Ready=True/KVEventsObserved`, `Degraded=False`. An event already present on the first reconcile counts — there is no required transition through `AwaitingFirstKVEvent`. "Ever observed" is durable: the first observation is latched into `status.firstKVEventObservedAt`, because the poller's `lastEventAt` is a current-view value it clears when the backend's replicas drain — without the latch a drained-but-healthy backend would wrongly fall back to `AwaitingFirstKVEvent`. The gate is a first-event startup probe, not an ongoing liveness check.
 - **no event by `firstEventTimeout`** → `Ready=False/NoKVEventsObserved`, `Degraded=True/NoKVEventsObserved`. Once Degraded it stays Degraded until an event arrives, then transitions to Ready.
 
-The gate is **on by default** and opt-out per CR with the annotation `inferencecache.io/require-kv-events: "false"` (alpha soft-rollout knob; an annotation rather than a spec field so it can be retired once the gate is trusted). External ownership is **always exempt** — the control plane does not own a provider workload to gate, so readiness is determined by accepting the provider-specific `spec.remoteStorage.endpoint` (or legacy `spec.endpoint`) as described above.
+The gate is **on by default** and opt-out per CR with the annotation `inferencecache.io/require-kv-events: "false"` (alpha soft-rollout knob; an annotation rather than a spec field so it can be retired once the gate is trusted). External ownership is **always exempt** — the control plane does not own a provider workload to gate, so readiness is determined by accepting the provider-specific `spec.remoteStorage.endpoint` as described above.
 
 **Operator note.** If a backend is stuck at `Ready=False/AwaitingFirstKVEvent` (and then flips to `Degraded=True/NoKVEventsObserved` after `firstEventTimeout`), either no engine pods are attached to the backend or the engine's KV-event publisher is mis-configured — check that engine pods are wired to the backend, then the engine's `--kv-events-config` and that its ZMQ socket bound. In `kubectl get cachebackend` the `Ready` column shows `False` and the `LASTEVENT` column shows `<none>`; the specific reason (`AwaitingFirstKVEvent` / `NoKVEventsObserved`) and the remediation hint live in the `Ready` / `Degraded` conditions, which `kubectl describe` surfaces along with the `NoKVEventsObserved` Warning Event.
 
@@ -786,12 +735,12 @@ Rejects structurally-broken specs that the reconciler cannot do anything useful 
 
 | Rule | Rejects |
 |---|---|
-| Canonical hierarchy fields cannot conflict | `spec.runtime` conflicts with deprecated `integration.engine`; `type` uses legacy provider/ownership values `Mooncake` or `External`; deprecated top-level `backendConfig` or `resources` is supplied; or a provider-specific typed block does not match `remoteStorage.provider`/`ownership`. |
-| External remote storage requires an endpoint | Canonical `remoteStorage.ownership=External` without `remoteStorage.endpoint`, or legacy `spec.type=External` without `spec.endpoint`; managed ownership rejects a user-supplied endpoint. |
+| Canonical hierarchy fields cannot conflict | `spec.runtime` conflicts with deprecated `integration.engine`; deprecated top-level `backendConfig` or `resources` is supplied; or a provider-specific typed block does not match `remoteStorage.provider`/`ownership`. |
+| External remote storage requires an endpoint | `remoteStorage.ownership=External` without `remoteStorage.endpoint`; managed ownership rejects a user-supplied endpoint. |
 | Engine wire must accept the provider binding | Every canonical `(runtime, type)` adapter must explicitly implement the remote-binding contract, and admission rejects a binding it does not accept (`lm`, `resp`, `mooncakestore`, or host-only). Native SGLang HiCache accepts only the nil host-only binding; attaching any `remoteStorage` is rejected. Deprecated legacy resources retain their endpoint-based compatibility fallback. |
 | Provider resources must be valid | Typed provider resource blocks are checked with the same request/limit, claims, quantity, resource-name, extended-resource, and hugepage rules as legacy `spec.resources`, with errors reported at the typed provider path. |
-| Endpoint ownership is explicit | Canonical `spec.remoteStorage.endpoint` is required for External ownership and rejected for Managed ownership. Legacy `spec.endpoint` is valid only with legacy `spec.type=External`. A managed endpoint always comes from the live Service the controller provisions, so a user-supplied value would be misleading. Whitespace-only values are treated as empty. |
-| Cross-namespace endpoint requires opt-in | Canonical `spec.remoteStorage.endpoint` or legacy `spec.endpoint` resolves to a Service in a namespace other than the CacheBackend's, while `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator must acknowledge. Bare hostnames, IPs, and unqualified names pass through because no namespace can be inferred. |
+| Endpoint ownership is explicit | `spec.remoteStorage.endpoint` is required for External ownership and rejected for Managed ownership. A managed endpoint always comes from the live Service the controller provisions, so a user-supplied value would be misleading. Whitespace-only values are treated as empty. |
+| Cross-namespace endpoint requires opt-in | `spec.remoteStorage.endpoint` resolves to a Service in a namespace other than the CacheBackend's, while `spec.allowCrossNamespace` is `false`. Crossing the namespace is a tenancy boundary the operator must acknowledge. Bare hostnames, IPs, and unqualified names pass through because no namespace can be inferred. |
 | `spec.replicas=0` + autoscaling requires explicit `minReplicas` | `spec.replicas=0` with `spec.autoscaling != nil` and `spec.autoscaling.minReplicas == nil`. The defaulter declines to compute `minReplicas` from a 0 replicas value (it would violate the schema's `Minimum=1`), so without this rule the apiserver accepts the CR and the reconciler's HPA fallback silently picks `1` — overriding the operator's "scale to zero" intent with no notification. The rejection tells the operator to either set `minReplicas` explicitly or remove `spec.autoscaling` to scale to zero unconditionally. |
 | `spec.integration.engineOverrides` cannot touch reserved args/env | An entry in `engineOverrides.args` / `engineOverrides.suppressArgs` matches a leading flag token the adapter declares as `ReservedArgs()`, or an entry in `engineOverrides.env` / `engineOverrides.suppressEnv` matches a name in `ReservedEnv()`. The rejection names both the offending flag/env and the adapter so the operator can fix the spec rather than wait for the engine to crash. The reserved set is per-adapter (the vLLM+LMCache adapter reserves `--kv-transfer-config`, `VLLM_USE_V1`, `LMCACHE_REMOTE_URL`, `INFERENCECACHE_FAIL_OPEN`, `PYTHONHASHSEED`). |
 | `spec.resources.limits` and `requests` must agree per-resource | The request/limit relationship is **resource-aware**. For overcommittable resources (`cpu`, `memory`, `ephemeral-storage`) `limits[X]` must be ≥ `requests[X]`. For non-overcommittable resources (`hugepages-*` and vendor-prefixed extended resources) `limits[X]` must EQUAL `requests[X]` — K8s does not allow overcommitting dedicated pages or devices. Limits-only shapes admit unchanged for any resource (K8s auto-populates requests from limits). The rule mirrors K8s' Pod-level validation so the rejection lands at `kubectl apply` rather than at child-pod scheduling. |
@@ -801,8 +750,8 @@ Rejects structurally-broken specs that the reconciler cannot do anything useful 
 | Hugepage quantities must align to the page size | A `hugepages-<size>` quantity in `spec.resources.requests` or `spec.resources.limits` is a positive value that is not a whole multiple of `<size>` (e.g. `hugepages-2Mi: 3Mi`). The Linux kernel allocates hugepages in page-sized chunks, so K8s rejects the misaligned shape on the rendered Pod. Zero is trivially aligned and admits. |
 | `spec.resources.{requests,limits}[*]` must be non-negative | Any quantity in `spec.resources.requests` or `spec.resources.limits` is strictly negative (e.g. `"-1Gi"`). The CRD-schema layer serialises each entry as a `resource.Quantity` string and admits a leading `-` without complaint; the apiserver's Pod resource validator only flags it once the child pod tries to schedule. Reject at admission with a field-scoped error so the regression surfaces at `kubectl apply` rather than chasing it through child Deployment events. Zero is admitted (matches the kubelet's `>= 0` contract — an operator who writes `requests.memory: "0"` is explicitly opting into "no guaranteed minimum"). |
 | `spec.resources.{requests,limits}` keys must be valid container resource names | Any key fails the K8s container-resource rules. `ResourceList` keys are opaque map keys at the CRD-schema layer, so an invalid name is admitted by the schema and only surfaces when the apiserver later rejects the child pod. Reject at admission with a field-scoped error so `kubectl apply` is the breadcrumb. Standard names (`cpu`, `memory`, `ephemeral-storage`) admit unconditionally; `hugepages-<size>` admits only when the size suffix parses as a strictly-positive `resource.Quantity` (e.g. `"hugepages-2Mi"`); any other name must be **third-party vendor-prefixed** (e.g. `"nvidia.com/gpu"`) and satisfy `IsQualifiedName`. A bare unqualified name like `"foo"` is rejected because K8s container resources require extended resources to carry a vendor identity. Names under the K8s-reserved prefixes `kubernetes.io/` and `requests.kubernetes.io/` are also rejected — those prefixes are reserved for native resources, not for operator-declared extended resources. |
-| Runtime/cache pair must be supported by an installed adapter | The effective `(runtime, engine-cache type)` pair has no registered runtime adapter, so the reconciler cannot observe engine compatibility and the pod webhook would fail open without injecting engine config. Canonical runtime comes from `spec.runtime`; legacy resources fall back to lower-cased `spec.integration.engine`, defaulting to vLLM. The canonical shipping pairs are `VLLM/LMCache`, `SGLang/LMCache`, and `SGLang/SGLangHiCache`; remote provider selection is validated independently through `remoteStorage`. Legacy `type: External` and `type: Mooncake` retain compatibility adapters. The registry's `SupportedPairs` list is authoritative and is included in the field-scoped rejection. |
-| Events-only requires `spec.type=LMCache` | `spec.integration.mode=EventsOnly` with any `spec.type` other than `LMCache` (the default). Events-only wires no KV connector, so a backend that provisions an offload store is contradictory: `External` runs an operator-managed offload server the (absent) connector would dial, and a managed `Mooncake` backend stands up a `mooncake_master` store nothing would use. `LMCache` — whose adapter supplies the kvevent-subscriber the routing tier needs, and whose in-memory server is a no-op when no connector is wired — is the only supported events-only managed type. Field-scoped to `spec.integration.mode` (`External` keeps a specific message). Explicitly enforced because the `(vLLM, Mooncake)` adapter is registered — before it shipped, non-`LMCache` managed types were caught by the runtime-adapter check. See [Events-only mode](#events-only-mode-specintegrationmode--eventsonly). |
+| Runtime/cache pair must be supported by an installed adapter | The `(runtime, engine-cache type)` pair has no registered runtime adapter, so the reconciler cannot observe engine compatibility and the pod webhook would fail open without injecting engine config. The shipping pairs are `VLLM/LMCache`, `SGLang/LMCache`, and `SGLang/SGLangHiCache`; remote provider selection is validated independently through `remoteStorage`. The registry's `SupportedPairs` list is included in the field-scoped rejection. |
+| Events-only requires `spec.type=LMCache` | `spec.integration.mode=EventsOnly` with any `spec.type` other than `LMCache` (the default). Events-only wires no KV connector, so declaring an offload-oriented cache type is contradictory. `LMCache` supplies the kvevent-subscriber that the routing tier needs. See [Events-only mode](#events-only-mode-specintegrationmode--eventsonly). |
 | Events-only forbids `spec.autoscaling` | `spec.integration.mode=EventsOnly` with `spec.autoscaling` set. An events-only backend provisions no server workload, so there is nothing to autoscale. Field-scoped to `spec.autoscaling`. |
 
 The structural rules are an ordered, pluggable list (`CacheBackendValidator.Rules`); the runtime/backend compatibility check runs separately because it needs to consult the shared `adapterruntime.Registry` rather than just the spec.
@@ -819,8 +768,6 @@ The validating rules tighten what `v1alpha1` accepts, so they ship together with
 - An operator who wants to bring a stored CR into compliance with the new rules can do so incrementally (clear the offending field, switch type, etc.); the diff-only semantics mean the bring-into-compliance edit doesn't have to atomically fix every existing violation.
 - The cluster-wide rollout knob is the webhook's `failurePolicy`; future tightenings that need a softer rollout can switch to `Ignore` for one release before flipping to `Fail`.
 
-**`spec.endpoint` type-scoping** is a specific tightening worth calling out: the field was always documented as "an existing external backend" but admission did not enforce that scoping in earlier builds. Now `spec.endpoint` is REQUIRED on `External` (admission rejects empty) and REJECTED on every other type (admission rejects non-empty). The locked design contract is that admission is loud about misconfigurations at write time rather than silently overwriting a user-supplied endpoint with the controller-rendered one. The diff-only update semantics above mean existing stored CRs with the legacy `(LMCache, endpoint=foo)` combination remain editable for unrelated changes; only a new CREATE or an edit that introduces (or changes) the offending combination is rejected. Operators bringing a stored CR into compliance clear `spec.endpoint` or switch `spec.type` to `External` — both can be done at update time, no special migration tool required.
-
 **`spec.resources` legacy webhook default** remains operationally significant: an existing legacy CacheBackend with `spec.resources = nil` receives `{requests: {memory: "4Gi"}, limits: {memory: "8Gi"}}` on its next admitted update. The controller then renders the lmcache-server container with those bounds, which can trigger a rolling update. The replacement pod carries a 4Gi memory request, so operators on tightly packed nodes should plan capacity or pre-stamp one of the opt-outs below:
 - **Stamp `spec.resources: {}` on the existing CR before the upgrade rolls past** — the empty struct is honored as suppression of the default (no requests, no limits rendered).
 - **Pre-stamp the operator's intended values** — supply `spec.resources` with the limits/requests the operator actually wants. The defaulter does not clobber non-nil operator values.
@@ -834,7 +781,7 @@ The diff-only update semantics also apply: an existing CR with a now-invalid `re
 
 ### Engine-injection overrides (`spec.integration.engineOverrides`)
 
-`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and other adapters (the vLLM+Mooncake and SGLang+LMCache adapters today) reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
+`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and the SGLang+LMCache adapter reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
 
 Shape, in `corev1` vocabulary:
 
@@ -875,8 +822,7 @@ The vLLM+LMCache adapter (`pkg/adapters/runtime/vllm_lmcache.go`) reserves the a
 The same reserved set applies when the canonical vLLM/LMCache engine cache has
 an External LMCacheServer binding or a Mooncake binding: the selected runtime
 adapter still runs the LMCache connector and varies only the structured
-binding's protocol and endpoint. The legacy External and Mooncake runtime
-adapters declare the same set for compatibility. Admission therefore rejects
+binding's protocol and endpoint. Admission therefore rejects
 an override that would remove connector wiring regardless of provider
 ownership. See
 [Mooncake provider configuration](#mooncake-provider-configuration).
@@ -892,7 +838,7 @@ Two shapes were on the table:
 - **A — typed K8s vocabulary** (`[]string` args, `[]corev1.EnvVar` env, plus suppression). Chosen.
 - **B — backendConfig magic keys** (`cpuMode: "true"`, `gpuLimit: "0"`, `extraArgs: "..."`). Rejected.
 
-A is more general: the Mooncake adapter, the SGLang adapter, and further engine/backend pairs plug in with no per-adapter `backendConfig` schema churn. It keeps the CRD disciplined (no permanent v1alpha1 legacy keys). B is faster to ship but bakes engine-specific knobs into the CRD, which is the trap an "engine-agnostic backend" surface is meant to avoid.
+A is more general: Mooncake remote bindings, the SGLang adapter, and further engine/backend pairs plug in with no per-adapter `backendConfig` schema churn. It keeps the CRD disciplined (no permanent v1alpha1 legacy keys). B is faster to ship but bakes engine-specific knobs into the CRD, which is the trap an "engine-agnostic backend" surface is meant to avoid.
 
 #### Residual risk
 
@@ -909,7 +855,7 @@ A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencec
 | Aspect | Behavior |
 |---|---|
 | Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. The first matching `CacheBackend` wins; one with a nil or empty `EngineSelector` is skipped (a "match-everything" selector would silently claim every pod in the namespace). |
-| Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)`, resolves `spec.EffectiveRemoteStorage()` independently, and constructs a structured provider `Binding{Protocol, Endpoint}`. Managed ownership uses `status.endpoint` from the live Service; External ownership uses the trimmed, provider-validated `spec.remoteStorage.endpoint` (or legacy `spec.endpoint`) with no fallback to stale status; omitted canonical `remoteStorage` produces a nil host-only binding. The webhook calls `runtime.InjectEngineConfigWithBinding`, so the adapter selects the LMCache, RESP, or Mooncake engine wire from the binding protocol instead of inferring storage from `spec.type`. A missing endpoint fails open only when the selected adapter and binding require one. Events-only skips engine injection because it wires no KV connector and appends only the kvevent-subscriber sidecar. Adapters preserve existing user args/env and make repeat injection idempotent. |
+| Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)`, resolves `spec.remoteStorage` independently, and constructs a structured provider `Binding{Protocol, Endpoint}`. Managed ownership uses `status.endpoint` from the live Service; External ownership uses the trimmed, provider-validated `spec.remoteStorage.endpoint` with no fallback to stale status; omitted `remoteStorage` produces a nil host-only binding. The webhook calls `runtime.InjectEngineConfigWithBinding`, so the adapter selects the LMCache, RESP, or Mooncake engine wire from the binding protocol instead of inferring storage from `spec.type`. A missing endpoint fails open only when the selected adapter and binding require one. Events-only skips engine injection because it wires no KV connector and appends only the kvevent-subscriber sidecar. Adapters preserve existing user args/env and make repeat injection idempotent. |
 | Annotations | Stamps TWO annotations on every successfully mutated pod: `inferencecache.io/injected-by: <namespace>/<name>` (operator-readable identity, shows in `kubectl describe pod`) AND `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's metadata.uid). Successful injection also clears any stale `inferencecache.io/inject-skipped` marker. Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out: the webhook returns Allowed, skips engine wiring, clears any stale injected-by/injected-by-uid pair, and stamps `inferencecache.io/inject-skipped: skip-inject-annotation` so explicit operator opt-out is distinguishable from selector drift. On all other fail-open returns after the pod is decoded (list/no match/missing endpoint/adapter errors), the webhook strips stale injected-by/injected-by-uid and inject-skipped annotations so a user cannot trick the events controller by pre-stamping a pod template. Decode failures fail open before a Pod exists to patch, so stale annotations cannot be cleared on that path. |
 | Events | The webhook itself does NOT record events (the apiserver assigns `metadata.uid` after mutating admission, so a webhook-recorded event would carry `involvedObject.uid=""` and be invisible to `kubectl describe pod`). Instead, the pod-watching `engine-pod-events` controller reads the persisted decision annotations after CREATE. For injected pods, it validates `inferencecache.io/injected-by-uid` against the live CR's `metadata.uid` and records a `Normal InjectedByCacheBackend` event on the now-persisted pod. For explicitly skipped pods carrying both a truthy `inferencecache.io/skip-inject` and `inferencecache.io/inject-skipped: skip-inject-annotation`, it records a `Normal SkippedByOperator` event on that pod. The skip marker is not authenticated, and `skipInjection` treats a pre-existing correct marker as already converged; `SkippedByOperator` therefore means the persisted pod carries the explicit opt-out plus skipped marker, not proof that the webhook authored the marker. The UID match REDUCES — but does NOT eliminate — the failurePolicy=Ignore forgery surface for injected pods: a casual copy-paste of an injected pod's annotations into a fresh template won't match the live CR's UID, but `metadata.uid` is not secret, so a pod creator with `get` RBAC on CacheBackends can read it and stamp the pair correctly. The injected Event signals "the webhook claims this pod was injected and the claim is consistent with the live CR," not "the webhook was cryptographically authenticated." The controller skips the injected event when the CR is missing, the UID annotation is absent, or the UID does not match — see the controller godoc for the full skip table. controller-runtime's EventBroadcaster aggregates duplicates on the apiserver side, so a re-enqueue across controller restarts upserts the existing event rather than spamming. |
 | Idempotency | The handler calls the adapter unconditionally on every admission and trusts the adapter to converge the full injected contract. For LMCache this is env plus the engine-specific required surface — `--kv-transfer-config` for vLLM; for SGLang `--enable-lmcache` + `--lmcache-config-file` **plus** the MP-worker native sidecar and the shared config / `/dev/shm` volumes + mounts. Its merge primitives (`upsertEnv` / `upsertArgPair` / `upsertFlag`, and for SGLang `adoptContainer` / `adoptVolume` / `upsertMountByName`) converge on the desired value rather than appending a duplicate. The SGLang `adopt*` pair additionally distinguishes the adapter's own prior injection (converge) from an operator's object squatting a reserved name (reject → fail-open admit) — see [Names the MP wire reserves](#sglang-engine-support). Native HiCache validates all reserved arguments against the original pod before mutation, preserves one matching or well-formed operator-supplied value, appends each missing canonical argument once, and rejects conflicts, malformed values, or duplicates without partially changing the pod. Re-admission of a fully-injected pod therefore produces an empty JSON-patch set. Trusting the adapter rather than a handler-side env-presence shortcut avoids the trap where a partially-injected pod is admitted permanently missing the rest of the contract. |

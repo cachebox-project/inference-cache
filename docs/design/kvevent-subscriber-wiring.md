@@ -31,7 +31,7 @@ KV events to nobody. Closing that gap is what this ADR is about.
 |---|---|---|---|
 | 1 | **Sidecar on the engine pod**, injected by the C6 mutating Pod webhook. | Identity unambiguous (sidecar shares the engine pod's network namespace; flags derived from the same CR the webhook already reads); one webhook, no new controller; lifecycle tied to the engine pod is *correct* (when the engine dies its KV events stop). | Adds one small container per engine pod. |
 | 2 | **DaemonSet** watching `CacheBackend` CRs; multiplexes subscriptions across all matching pods on the node. | One subscriber per node; survives engine pod restarts independently. | Identity discovery (which engine pods on this node? what's their CacheBackend? what's the engine port?) is real work, with nothing won at Phase-1 scale; pod-IP churn during rollouts; new controller surface. |
-| 3 | **C5 owns it.** Add `EnsureObservation(pod)` to `KVCacheRuntimeAdapter`; each adapter decides how to subscribe. | Cleanest seam; SGLang / Mooncake adapters can override naturally. | The seam alone doesn't say *where* the subscription runs — option 1 or 2 still has to be picked underneath. |
+| 3 | **C5 owns it.** Add `EnsureObservation(pod)` to `KVCacheRuntimeAdapter`; each adapter decides how to subscribe. | Cleanest seam; SGLang and future runtimes can override naturally. | The seam alone doesn't say *where* the subscription runs — option 1 or 2 still has to be picked underneath. |
 
 ## Decision
 
@@ -46,9 +46,8 @@ Concretely:
   The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
   container spec (via the shared `RenderSubscriberSidecar` — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
-  `--hash-scheme` tag + ZMQ port); the reference adapter and the deprecated
-  legacy `type: External` adapter return `(nil, nil)`. Canonical external
-  ownership stays on the runtime/cache adapter and can attach observation.
+  `--hash-scheme` tag + ZMQ port); the reference adapter returns `(nil, nil)`.
+  External ownership stays on the runtime/cache adapter and can attach observation.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
@@ -83,15 +82,12 @@ Concretely:
   The SGLang adapter reuses the same shared subscriber, only its `--hash-scheme` tag
   differs (SGLang adopted vLLM's ZMQ KV-event wire); the seam is what would let a genuinely
   different future engine return a different sidecar (e.g. a different ZMQ port or a
-  completely different observation mechanism). The shipped Mooncake adapter, by contrast,
-  returns the *same* vLLM kvevent-subscriber the LMCache adapter does — Mooncake integrates
-  as an LMCache remote backend, so the engine is still vLLM and its KV events still come
+  completely different observation mechanism). A Mooncake remote binding uses the same
+  vLLM kvevent-subscriber because the engine is still vLLM and its KV events still come
   from vLLM's ZMQ publisher (scheme-tagged `vllm`); only the backend store differs. A
   future backend that fronts a non-vLLM engine, or exposes observation data some other way,
   could still return `nil` or a different container here. **DaemonSet remains an option for
   any future adapter** that wants it — it just isn't this PR.
-* `External` backends explicitly return `nil` — we don't manage that backend's lifecycle,
-  per the ticket test plan.
 * Subscriber lifecycle tied to the engine pod is correctness, not a regression: when the
   engine dies its KV events stop; pairing the subscriber with the engine matches that.
 
@@ -186,9 +182,8 @@ integration mode**, because the L2 tier is present only in one of them:
   holding the block. `BlockRemoved` genuinely means the prefix is gone and the
   hint MUST be pruned, so the helper **omits** the flag (subscriber default off,
   forwarding the eviction as `PREFIX_EVICTED`). EventsOnly is restricted to
-  `spec.type=LMCache` at admission (a managed Mooncake backend always provisions
-  its store, so `Mooncake` + `EventsOnly` is rejected), so a Mooncake backend
-  always takes the Offload branch and sets the flag.
+  `spec.type=LMCache` at admission, and any `remoteStorage` is rejected because
+  EventsOnly provisions no provider workload.
 
 Other adapters (e.g. plain vLLM, or future runtimes with no L2 tier) leave
 the flag off for the same reason as `EventsOnly` — their stored prefixes stay

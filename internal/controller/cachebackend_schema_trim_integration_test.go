@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,6 +81,27 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 			t.Fatalf("get %s: %v", name, err)
 		}
 		return got
+	}
+
+	for _, tc := range []struct {
+		name        string
+		backendType string
+	}{
+		{name: "legacy-mooncake", backendType: "Mooncake"},
+		{name: "legacy-external", backendType: "External"},
+		{name: "unsupported-aibrix", backendType: "AIBrix"},
+		{name: "unsupported-nixl", backendType: "NIXL"},
+		{name: "unknown", backendType: "Unknown"},
+	} {
+		t.Run("reject-type-"+tc.name, func(t *testing.T) {
+			u := newManaged("reject-type-" + tc.name)
+			if err := unstructured.SetNestedField(u.Object, tc.backendType, "spec", "type"); err != nil {
+				t.Fatalf("set spec.type: %v", err)
+			}
+			if err := c.Create(ctx, u); !apierrors.IsInvalid(err) {
+				t.Fatalf("create with spec.type=%q error = %v, want Invalid from CRD enum", tc.backendType, err)
+			}
+		})
 	}
 
 	// Removed spec fields are pruned on create and never round-trip. obj is a

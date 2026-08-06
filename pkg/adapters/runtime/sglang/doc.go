@@ -1,11 +1,10 @@
 // Package sglang holds the controller-side runtime adapters that wire SGLang
 // engine pods to LMCache or native HiCache.
-// It is the SGLang sibling of the in-tree vLLM+LMCache adapter
-// (pkg/adapters/runtime) and the External passthrough adapter
-// (pkg/adapters/runtime/external): a separate package, gated on the SGLang
-// runtime id, registered alongside the others by internal/adapters/builtin.
+// It is the SGLang sibling of the in-tree vLLM+LMCache adapter: a separate
+// package gated on the SGLang runtime id and registered by
+// internal/adapters/builtin.
 //
-// Owner: the controller. Like external, this package imports its parent
+// Owner: the controller. This package imports its parent
 // pkg/adapters/runtime for the [runtime.KVCacheRuntimeAdapter] interface and
 // the [runtime.RuntimeID] constants, so it cannot be registered inside
 // runtime.NewCoreRegistry without an import cycle. The built-in composition

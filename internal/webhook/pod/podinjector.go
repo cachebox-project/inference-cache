@@ -259,9 +259,9 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// model's KV-cache manager is not disabled by a connector it cannot load.
 	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
 	// adapter's own no-op: the connector no-op currently lives ONLY in the
-	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
-	// mode=EventsOnly object would otherwise select the External adapter and
-	// inject the LMCache connector — violating the events-only "no connector"
+	// vLLM+LMCache adapter, so an admission-bypassed external remote-storage +
+	// mode=EventsOnly object could otherwise inject the LMCache connector —
+	// violating the events-only "no connector"
 	// contract. Gating here makes the no-connector guarantee adapter-independent.
 	// The observation-sidecar append and the wired/injected-by logic below stay
 	// as-is (events-only's only wiring is the subscriber sidecar).

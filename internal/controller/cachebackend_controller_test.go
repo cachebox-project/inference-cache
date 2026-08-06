@@ -28,7 +28,6 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -61,6 +60,14 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 	}
 }
 
+func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
+	return &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  endpoint,
+	}
+}
+
 func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) {
 	t.Helper()
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -87,7 +94,15 @@ func lmcacheBackend(name, namespace string) *cachev1alpha1.CacheBackend {
 			Generation:  1,
 			Annotations: map[string]string{"inferencecache.io/require-kv-events": "false"},
 		},
-		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeLMCache},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			},
+		},
 	}
 }
 
@@ -192,6 +207,7 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	scheme := newScheme(t)
 	cb := lmcacheBackend("host-only", "ns1")
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.RemoteStorage = nil
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
 	r := newReconciler(scheme, cb)
 
@@ -323,13 +339,20 @@ func mooncakeBackend(name, namespace string) *cachev1alpha1.CacheBackend {
 			Generation:  1,
 			Annotations: map[string]string{"inferencecache.io/require-kv-events": "false"},
 		},
-		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeMooncake},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			},
+		},
 	}
 }
 
-// TestReconcileManagedMooncake is the C2-reconciles-Mooncake DoD: a
-// CacheBackend{type: Mooncake} must reconcile into a managed mooncake_master
-// Deployment + Service via the Mooncake adapter's ResolveCacheServer, and
+// TestReconcileManagedMooncake is the C2-reconciles-Mooncake DoD: a canonical
+// Mooncake remote provider must reconcile into a managed mooncake_master
+// Deployment + Service, and
 // status.endpoint must be the master's RPC host:port (the engine-agnostic
 // address the pod webhook later turns into mooncakestore://). The RPC port
 // being first in the rendered Service is what makes serviceEndpoint resolve it.
@@ -410,7 +433,7 @@ func TestReconcileCanonicalManagedMooncake(t *testing.T) {
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.BackendConfig = map[string]string{"serverImage": "registry.example.com/lmcache-server:pinned"}
+	cb.Spec.RemoteStorage.LMCacheServer.Image = "registry.example.com/lmcache-server:pinned"
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
@@ -467,7 +490,7 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v2"}
+	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v2"
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
@@ -661,8 +684,9 @@ func TestReconcileTypeSwitchToExternalCleansUpChildren(t *testing.T) {
 	}
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	live.Spec.Endpoint = "external.ns1.svc:8080"
+	live.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	live.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	live.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("switch to external: %v", err)
 	}
@@ -729,8 +753,9 @@ func TestReconcileTypeSwitchToExternalClearsObservedServerInstance(t *testing.T)
 
 	// Switch to External.
 	switching := getBackend(t, r, "cache", "ns1")
-	switching.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	switching.Spec.Endpoint = "external.ns1.svc:8080"
+	switching.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	switching.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	switching.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
 	if err := r.Update(context.Background(), switching); err != nil {
 		t.Fatalf("switch to external: %v", err)
 	}
@@ -899,8 +924,9 @@ func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
 		{
 			name: "managed → External",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
-				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-				cb.Spec.Endpoint = "external.ns1.svc:8080"
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+				cb.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
 			},
 		},
 		{
@@ -959,8 +985,9 @@ func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
 		{
 			name: "managed → External",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
-				cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-				cb.Spec.Endpoint = "external.ns1.svc:8080"
+				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+				cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+				cb.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
 			},
 		},
 		{
@@ -1125,8 +1152,9 @@ func TestReconcileExternalAdvancesObservedGeneration(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "default", Generation: 7},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "external.default.svc:8080",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("external.default.svc:8080"),
 		},
 		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "external.default.svc:8080"},
 	}
@@ -1142,13 +1170,11 @@ func TestReconcileExternalAdvancesObservedGeneration(t *testing.T) {
 
 func TestReconcileUnmanagedTypeNoop(t *testing.T) {
 	scheme := newScheme(t)
-	// AIBrix has no registered runtime adapter, so it exercises the
-	// "unsupported managed type → reconcileUnmanaged" path. (Mooncake is no
-	// longer a stand-in for an unsupported type — it has an adapter now and
-	// reconciles managed; see TestReconcileManagedMooncake.)
+	// An arbitrary unsupported value exercises the admission-bypassed
+	// "unsupported type → reconcileUnmanaged" path.
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeAIBrix},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendType("unsupported")},
 	}
 	r := newReconciler(scheme, cb)
 
@@ -1172,14 +1198,13 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 	// adapter for an unsupported pair, so it could never inject the
 	// kvevent-subscriber and no KV event would ever flow. dispatch confirms an
 	// adapter is selectable before routing to reconcileEventsOnly; on failure it
-	// falls to reconcileUnmanaged. AIBrix has no shipping adapter (the default
-	// registry supports (vllm, LMCache) + (vllm, Mooncake) + External), so it
-	// is the unsupported-type fixture here — Mooncake is no longer unsupported.
+	// falls to reconcileUnmanaged. The arbitrary value below is the unsupported
+	// fixture.
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeAIBrix,
+			Type: cachev1alpha1.CacheBackendType("unsupported"),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Engine: "vllm",
 				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
@@ -1212,23 +1237,21 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 }
 
 func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
-	// An admission-bypassed / stored object that sets BOTH spec.type=External
-	// AND integration.mode=EventsOnly must reconcile via the events-only path,
-	// NOT the External path. Admission's rejectEventsOnlyMisconfiguration rejects
-	// this pair, so this is defense-in-depth for a stored CR: dispatch checks
-	// IsEventsOnly() before the Type==External branch, so EventsOnly wins. If it
-	// reconciled as External it would mirror spec.endpoint to status and mark
-	// Ready=True/ExternalEndpointAccepted, letting the pod webhook's External
-	// adapter inject the KV connector — violating events-only's "no connector,
-	// no server" contract. The (vllm, External) pair has a registered adapter, so
+	// An admission-bypassed object that sets both externally owned remote storage
+	// and integration.mode=EventsOnly must reconcile via the events-only path.
+	// Admission rejects this pair, so this is defense-in-depth for stored CRs. If
+	// it reconciled as external storage it would publish an endpoint and allow KV
+	// connector injection, violating events-only's "no connector, no server"
+	// contract. The vLLM/LMCache pair has a registered adapter, so
 	// the events-only adapter-selectability check passes and the events-only
 	// reconcile runs.
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "external-cache.ns1.svc:8200",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("external-cache.ns1.svc:8200"),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Engine: "vllm",
 				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
@@ -1236,14 +1259,7 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 		},
 	}
 	r := newReconciler(scheme, cb)
-	// Build the relevant subset of the built-in composition: the External
-	// adapter is registered on the core registry because it cannot live in its
-	// parent package without an import cycle. Without it the (vllm, External)
-	// pair is unselectable and the events-only branch falls to
-	// reconcileUnmanaged — masking the precedence we want to assert.
-	reg := adapterruntime.NewCoreRegistry()
-	reg.Register(externaladapter.NewAdapter())
-	r.Registry = reg
+	r.Registry = adapterruntime.NewCoreRegistry()
 
 	reconcile(t, r, "cache", "ns1")
 
@@ -1291,8 +1307,9 @@ func TestReconcileExternalMirrorsEndpointToStatus(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "external-cache.default.svc:8080",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("external-cache.default.svc:8080"),
 		},
 	}
 	r := newReconciler(scheme, cb)
@@ -1314,8 +1331,9 @@ func TestReconcileExternalSetsReadyTrue(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "default", Generation: 3},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "ext.default.svc:8080",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("ext.default.svc:8080"),
 		},
 	}
 	r := newReconciler(scheme, cb)
@@ -1365,8 +1383,9 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 			cb := &cachev1alpha1.CacheBackend{
 				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: "default"},
 				Spec: cachev1alpha1.CacheBackendSpec{
-					Type:     cachev1alpha1.CacheBackendTypeExternal,
-					Endpoint: tc.endpoint,
+					Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+					Type:          cachev1alpha1.CacheBackendTypeLMCache,
+					RemoteStorage: externalLMCacheStorage(tc.endpoint),
 				},
 			}
 			r := newReconciler(scheme, cb)
@@ -1380,8 +1399,8 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 			if ready.Reason != "ExternalEndpointInvalid" {
 				t.Fatalf("Ready reason = %q, want ExternalEndpointInvalid", ready.Reason)
 			}
-			if !strings.Contains(ready.Message, "spec.endpoint") {
-				t.Fatalf("Ready message = %q, want legacy field spec.endpoint", ready.Message)
+			if !strings.Contains(ready.Message, "spec.remoteStorage.endpoint") {
+				t.Fatalf("Ready message = %q, want canonical field spec.remoteStorage.endpoint", ready.Message)
 			}
 		})
 	}
@@ -1517,7 +1536,11 @@ func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext-no-ep", Namespace: "default"},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(""),
+		},
 	}
 	r := newReconciler(scheme, cb)
 
@@ -1550,8 +1573,9 @@ func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext-ws", Namespace: "default"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: "   \t  ",
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage("   \t  "),
 		},
 	}
 	r := newReconciler(scheme, cb)
@@ -1575,8 +1599,12 @@ func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 	scheme := newScheme(t)
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeExternal},
-		Status:     cachev1alpha1.CacheBackendStatus{Endpoint: "stale-cache.default.svc:8080"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(""),
+		},
+		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "stale-cache.default.svc:8080"},
 	}
 	r := newReconciler(scheme, cb)
 
@@ -1908,7 +1936,7 @@ func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 	// (Image override mutates the managed container in-place; a no-op reconcile
 	// would not call Update at all.)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
@@ -1968,7 +1996,7 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	// an Update to happen by changing the image in the CR.
 	blockDeploymentUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)

@@ -67,7 +67,7 @@ type adapter struct {
 // the SGLang subscriber sidecar auto-attaches with identical operator wiring.
 //
 // The internal/adapters/builtin composition wires it into the shared
-// [runtimeadapter.Registry] alongside the core and External adapters. This
+// [runtimeadapter.Registry] alongside the core adapters. This
 // package imports its parent pkg/adapters/runtime, so it cannot be registered
 // by [runtimeadapter.NewCoreRegistry] without an import cycle.
 func NewAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
@@ -83,7 +83,7 @@ func NewAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdap
 
 // Supports matches SGLang engines against an LMCache CacheBackend. Every other
 // (runtime, backend) combination is left for another adapter — vLLM+LMCache,
-// the External passthrough, or a future SGLang+Mooncake adapter — and an
+// an externally owned remote binding, or a future SGLang+Mooncake binding — and an
 // unsupported pair surfaces as ErrNoAdapter at admission.
 func (adapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
 	if cache == nil {

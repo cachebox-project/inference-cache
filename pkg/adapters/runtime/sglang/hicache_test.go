@@ -262,9 +262,6 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 		{"autoscaling", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 2}
 		}},
-		{"endpoint", func(cache *cachev1alpha1.CacheBackend) {
-			cache.Spec.Endpoint = "cache.example.com:8200"
-		}},
 		{"missing selector", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.EngineSelector = nil
 		}},

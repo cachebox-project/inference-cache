@@ -51,22 +51,23 @@ spec:
 
 ## Backend types (`spec.type`)
 
-`spec.type` selects the backing implementation. The default is `LMCache`.
+`spec.type` is the engine-side cache implementation. It is a CRD enum and
+defaults to `LMCache`.
 
 | Type | What it is |
 |---|---|
-| **`LMCache`** (default) | An in-memory `lm://` LMCache server, provisioned by the controller as a Deployment + ClusterIP Service. The simple, node-agnostic default. Not durable. |
-| **`Mooncake`** | A durable, shared, peer-to-peer transfer-engine store. Requires host networking (see below). |
-| **`External`** | You provide `spec.endpoint`; the controller skips all provisioning and only wires the engine side. |
-| `SGLangHiCache`, `AIBrix`, `NIXL` | Reserved for future adapters. |
+| **`LMCache`** (default) | LMCache engine integration. `spec.remoteStorage` independently selects an optional remote provider. |
+| **`SGLangHiCache`** | SGLang's native engine-local host cache; it accepts no remote-storage binding. |
 
-The runtime + backend **pair** selects the adapter — `(vllm, LMCache)`, `(vllm, Mooncake)`,
-`(vllm, External)`, `(sglang, LMCache)`. Admission rejects unsupported pairs.
+The runtime + cache-type **pair** selects the engine adapter. Remote provider
+technology (`Redis`, `LMCacheServer`, or `Mooncake`) and lifecycle ownership
+(`Managed` or `External`) are selected under `spec.remoteStorage`. Admission
+rejects unsupported combinations.
 
 {{% alert title="LMCache durability" color="info" %}}
 The `lm://` LMCache server is **in-memory only.** Durability is a *backend choice*, not a
 generic volume knob — there is no per-`CacheBackend` PVC field. If you need a durable or
-shared store, use `type: Mooncake`.
+shared store, use `remoteStorage.provider: Mooncake`.
 {{% /alert %}}
 
 ### Mooncake needs host networking

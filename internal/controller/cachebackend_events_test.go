@@ -220,7 +220,7 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	// drives the readiness transition.
 	blockUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
