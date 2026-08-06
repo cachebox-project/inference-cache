@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to attach SBOM artifacts to
+        description: Release tag to build, sign, attest, and attach supply-chain artifacts to
         required: true
 
 permissions:
@@ -170,29 +170,26 @@ jobs:
 
     - name: Generate controller SLSA provenance
       id: attest-controller
-      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
       with:
         subject-name: ${{ env.CONTROLLER_IMAGE_REPO }}
         subject-digest: ${{ steps.built-image-digests.outputs.controller }}
-        subject-version: ${{ env.RELEASE_TAG }}
         push-to-registry: true
 
     - name: Generate server SLSA provenance
       id: attest-server
-      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
       with:
         subject-name: ${{ env.SERVER_IMAGE_REPO }}
         subject-digest: ${{ steps.built-image-digests.outputs.server }}
-        subject-version: ${{ env.RELEASE_TAG }}
         push-to-registry: true
 
     - name: Generate subscriber SLSA provenance
       id: attest-subscriber
-      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
       with:
         subject-name: ${{ env.SUBSCRIBER_IMAGE_REPO }}
         subject-digest: ${{ steps.built-image-digests.outputs.subscriber }}
-        subject-version: ${{ env.RELEASE_TAG }}
         push-to-registry: true
 
     - name: Collect provenance bundles
